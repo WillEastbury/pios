@@ -72,6 +72,9 @@ Pin 10      GPIO15    TX (adapter sends to Pi's RX)
 
 **Important**: Use a 3.3V adapter. Do NOT connect 5V TX to the Pi's GPIO — it will damage the SoC.
 
+For detailed adapter wiring (FTDI colour codes, breakout boards), terminal
+software commands, and troubleshooting see [serial.md](serial.md).
+
 ### Ethernet
 Connect the Pi 5's Ethernet port to your network switch/router. PIOS uses a static IP configured at compile time.
 

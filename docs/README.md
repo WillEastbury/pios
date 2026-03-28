@@ -10,4 +10,5 @@
 | [ipc.md](ipc.md) | Inter-core FIFO messaging protocol and message types |
 | [mmu.md](mmu.md) | MMU configuration, page tables, cache management |
 | [tensor.md](tensor.md) | NEON/QPU tensor compute, SIMD operations |
+| [serial.md](serial.md) | Serial console setup — adapter pinout, wiring, terminal settings |
 | [deployment.md](deployment.md) | SD card preparation, hardware wiring, boot process |
