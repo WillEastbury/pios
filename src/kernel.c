@@ -37,6 +37,7 @@
 #include "rp1_uart.h"
 #include "usb.h"
 #include "usb_storage.h"
+#include "usb_kbd.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -256,6 +257,7 @@ void kernel_main(void) {
             rp1_clk_init();
             rp1_gpio_init();
             usb_storage_register();
+            usb_kbd_register();
             usb_init();
         }
     }
