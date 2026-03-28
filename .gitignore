@@ -3,9 +3,31 @@ build/
 *.o
 *.elf
 *.img
+*.bin
+*.map
 
 # IDE / Editor
 .vscode/
+.idea/
 *.swp
 *.swo
 *~
+*.bak
+tags
+TAGS
+compile_commands.json
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Toolchain downloads
+arm-toolchain/
+*.zip
+*.tar.gz
+*.tar.xz
+
+# Debug
+*.log
+core.*
