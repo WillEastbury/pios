@@ -103,6 +103,14 @@ static bool bbb_transfer(const u8 *scsi_cmd, u8 cmd_len, u8 dir,
         uart_puts("[usb_stor] Bad CSW signature\n");
         return false;
     }
+    if (csw->dCSWTag != cbw->dCBWTag) {
+        uart_puts("[usb_stor] CSW tag mismatch\n");
+        return false;
+    }
+    if (csw->dCSWDataResidue > data_len) {
+        uart_puts("[usb_stor] CSW residue invalid\n");
+        return false;
+    }
     if (csw->bCSWStatus != 0) {
         return false;
     }

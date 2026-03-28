@@ -15,6 +15,16 @@ static u32 current_proc;   /* index into procs[] */
 static u32 next_pid;
 static bool initialized;
 
+/* Validate a user pointer is within the current process's memory slot */
+static bool ptr_valid(const void *ptr, u32 len) {
+    struct process *p = &procs[current_proc];
+    u64 addr = (u64)(usize)ptr;
+    u64 end = addr + len;
+    u64 slot_start = (u64)(usize)p->base;
+    u64 slot_end = slot_start + p->mem_size;
+    return addr >= slot_start && end <= slot_end && end >= addr;
+}
+
 static i32 sys_yield(void);
 static i32 sys_exit(u32 code);
 static i32 sys_open(const char *path, u32 flags);
@@ -243,6 +253,7 @@ static i32 sys_close(i32 d) { (void)d; return -1; }
 
 static void sys_print(const char *msg)
 {
+    if (!ptr_valid(msg, 1)) return;
     uart_puts(msg);
 }
 
@@ -266,10 +277,12 @@ static i32 sys_connect(i32 fd, u32 ip, u16 port)
 
 static i32 sys_send(i32 fd, const void *data, u32 len)
 {
+    if (!ptr_valid(data, len)) return -1;
     return sock_send(fd, data, len);
 }
 
 static i32 sys_recv(i32 fd, void *buf, u32 len)
 {
+    if (!ptr_valid(buf, len)) return -1;
     return sock_recv(fd, buf, len);
 }

@@ -267,6 +267,13 @@ bool walfs_init(void)
             uart_puts("[walfs] bad superblock crc\n");
             return false;
         }
+        /* Validate wal_head is within sane bounds */
+        if (super.wal_head < WAL_START ||
+            (super.total_blocks > 0 &&
+             super.wal_head > (u64)super.total_blocks * SD_BLOCK_SIZE)) {
+            uart_puts("[walfs] wal_head out of bounds\n");
+            return false;
+        }
         scan_recovery();
         mounted = true;
         uart_puts("[walfs] mounted, records=");

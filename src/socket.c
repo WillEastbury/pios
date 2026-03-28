@@ -310,6 +310,7 @@ i32 sock_send_nb(i32 fd, const void *data, u32 len) {
     if (!s || s->state != SOCK_STATE_CONN) return SOCK_ENOTCONN;
 
     if (s->type == SOCK_STREAM) {
+        dmb(); /* ensure visibility of Core 0's ring buffer updates */
         u32 avail = tcp_writable(s->tcp_conn);
         if (avail == 0) return SOCK_EAGAIN;
         if (len > avail) len = avail;
@@ -322,6 +323,7 @@ i32 sock_recv_nb(i32 fd, void *buf, u32 len) {
     if (!s) return SOCK_ERR;
 
     if (s->type == SOCK_STREAM && s->state == SOCK_STATE_CONN) {
+        dmb(); /* ensure visibility of Core 0's ring buffer updates */
         if (tcp_readable(s->tcp_conn) == 0)
             return SOCK_EAGAIN;
     }

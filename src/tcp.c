@@ -93,10 +93,13 @@ static u32 ring_write(struct ring_buf *r, const void *src, u32 len) {
     u32 avail = ring_free(r);
     if (len > avail) len = avail;
     const u8 *s = (const u8 *)src;
-    for (u32 i = 0; i < len; i++) {
-        r->data[r->head & (TCP_BUF_SIZE - 1)] = s[i];
-        r->head++;
-    }
+    u32 idx = r->head & (TCP_BUF_SIZE - 1);
+    u32 first = TCP_BUF_SIZE - idx;
+    if (first > len) first = len;
+    simd_memcpy(r->data + idx, s, first);
+    if (len > first)
+        simd_memcpy(r->data, s + first, len - first);
+    r->head += len;
     return len;
 }
 
@@ -104,10 +107,13 @@ static u32 ring_read(struct ring_buf *r, void *dst, u32 len) {
     u32 avail = ring_used(r);
     if (len > avail) len = avail;
     u8 *d = (u8 *)dst;
-    for (u32 i = 0; i < len; i++) {
-        d[i] = r->data[r->tail & (TCP_BUF_SIZE - 1)];
-        r->tail++;
-    }
+    u32 idx = r->tail & (TCP_BUF_SIZE - 1);
+    u32 first = TCP_BUF_SIZE - idx;
+    if (first > len) first = len;
+    simd_memcpy(d, r->data + idx, first);
+    if (len > first)
+        simd_memcpy(d + first, r->data, len - first);
+    r->tail += len;
     return len;
 }
 
@@ -317,19 +323,28 @@ static bool validate_syn_cookie(u32 local_port, u32 remote_ip, u16 remote_port,
 
 static u16 tcp_checksum(u32 src_ip, u32 dst_ip,
                         const void *tcp_data, u32 tcp_len) {
-    /* Build pseudo-header + TCP into a contiguous buffer on stack for checksum.
-     * Max TCP segment in our case: TCP_OVERHEAD data is limited by MSS (~1460)
-     * plus 20 byte TCP header plus 12 byte pseudo = ~1492. Safe on stack. */
-    u8 buf[1600];
-    struct tcp_pseudo *ph = (struct tcp_pseudo *)buf;
-    ph->src_ip   = htonl(src_ip);
-    ph->dst_ip   = htonl(dst_ip);
-    ph->zero     = 0;
-    ph->protocol = IP_PROTO_TCP;
-    ph->tcp_len  = htons((u16)tcp_len);
-    memcpy(buf + sizeof(struct tcp_pseudo), tcp_data, tcp_len);
-    u32 total = sizeof(struct tcp_pseudo) + tcp_len;
-    return simd_checksum(buf, total);
+    /* Two-pass checksum: pseudo-header on stack (12 bytes), then TCP data in-place */
+    struct tcp_pseudo ph;
+    ph.src_ip   = htonl(src_ip);
+    ph.dst_ip   = htonl(dst_ip);
+    ph.zero     = 0;
+    ph.protocol = IP_PROTO_TCP;
+    ph.tcp_len  = htons((u16)tcp_len);
+
+    /* Accumulate checksum manually: pseudo-header then TCP data */
+    u32 sum = 0;
+    const u16 *p = (const u16 *)&ph;
+    for (u32 i = 0; i < sizeof(ph) / 2; i++)
+        sum += p[i];
+    p = (const u16 *)tcp_data;
+    u32 words = tcp_len / 2;
+    for (u32 i = 0; i < words; i++)
+        sum += p[i];
+    if (tcp_len & 1)
+        sum += ((const u8 *)tcp_data)[tcp_len - 1];
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return (u16)~sum;
 }
 
 /* ================================================================== */
@@ -349,8 +364,8 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
 
     /* Ethernet */
     struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
-    memcpy(eth->dst, dst_mac, 6);
-    memcpy(eth->src, tcp_local_mac, 6);
+    simd_memcpy(eth->dst, dst_mac, 6);
+    simd_memcpy(eth->src, tcp_local_mac, 6);
     eth->ethertype = htons(ETH_P_IP);
 
     /* IP */
@@ -380,7 +395,7 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     tcp->urgent    = 0;
 
     if (data_len > 0)
-        memcpy(tx_frame + TCP_OVERHEAD, data, data_len);
+        simd_memcpy(tx_frame + TCP_OVERHEAD, data, data_len);
 
     tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
 
@@ -398,8 +413,8 @@ static void tcp_send_rst(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port,
     u32 frame_len = ETH_HDR_SIZE + ip_total;
 
     struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
-    memcpy(eth->dst, dst_mac, 6);
-    memcpy(eth->src, tcp_local_mac, 6);
+    simd_memcpy(eth->dst, dst_mac, 6);
+    simd_memcpy(eth->src, tcp_local_mac, 6);
     eth->ethertype = htons(ETH_P_IP);
 
     struct ip_hdr *ip = (struct ip_hdr *)(tx_frame + ETH_HDR_SIZE);
@@ -443,8 +458,8 @@ static void tcp_send_synack_cookie(u32 remote_ip, u16 remote_port,
     u32 frame_len = ETH_HDR_SIZE + ip_total;
 
     struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
-    memcpy(eth->dst, dst_mac, 6);
-    memcpy(eth->src, tcp_local_mac, 6);
+    simd_memcpy(eth->dst, dst_mac, 6);
+    simd_memcpy(eth->src, tcp_local_mac, 6);
     eth->ethertype = htons(ETH_P_IP);
 
     struct ip_hdr *ip = (struct ip_hdr *)(tx_frame + ETH_HDR_SIZE);

@@ -12,6 +12,13 @@
 #include "uart.h"
 #include "timer.h"
 
+/* Constant-time comparison to prevent timing side-channel attacks */
+static bool ct_eq(const u8 *a, const u8 *b, u32 len) {
+    u8 diff = 0;
+    for (u32 i = 0; i < len; i++) diff |= a[i] ^ b[i];
+    return diff == 0;
+}
+
 static struct principal principals[PRINCIPAL_MAX];
 static u32 principal_count;
 static u32 current_principal[4];  /* one slot per core */
@@ -113,7 +120,7 @@ bool principal_auth(const char *name, const char *pass, u32 *id_out)
 
     u8 h[4];
     hash_pass(pass, h);
-    if (memcmp(principals[idx].secret_hash, h, 4) != 0)
+    if (!ct_eq(principals[idx].secret_hash, h, 4))
         return false;
 
     current_principal[core_id()] = principals[idx].id;
