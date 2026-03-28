@@ -35,6 +35,7 @@
 #include "rp1_gpio.h"
 #include "rp1_clk.h"
 #include "rp1_uart.h"
+#include "xhci.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -253,6 +254,7 @@ void kernel_main(void) {
         if (rp1_init()) {
             rp1_clk_init();
             rp1_gpio_init();
+            xhci_init();
         }
     }
 
