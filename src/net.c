@@ -1,12 +1,13 @@
 /*
- * net.c - Hardened network stack: IPv4 + ICMP + UDP
+ * net.c - Hardened network stack: IPv4 + ICMP + UDP + ARP
  *
- * ZERO: TCP, ARP, DHCP, DNS, IP fragmentation, IP options.
- * Static neighbor table. NEON checksums. Rate-limited ICMP.
+ * ZERO: TCP, DHCP, DNS, IP fragmentation, IP options.
+ * Hardened ARP with anti-spoofing. NEON checksums. Rate-limited ICMP.
  * Every ingress byte is validated before processing.
  */
 
 #include "net.h"
+#include "arp.h"
 #include "genet.h"
 #include "simd.h"
 #include "core_env.h"
@@ -23,6 +24,10 @@ static u8  our_mac[6];
 
 static udp_recv_cb udp_callback;
 static net_stats_t stats;
+
+static bool mac_is_zero_6(const u8 *m) {
+    return m[0]==0 && m[1]==0 && m[2]==0 && m[3]==0 && m[4]==0 && m[5]==0;
+}
 
 /* ---- Static neighbor table (replaces ARP) ---- */
 
@@ -51,6 +56,7 @@ void net_add_neighbor(u32 ip, const u8 *mac) {
     for (u32 i = 0; i < neighbor_count; i++) {
         if (neighbors[i].ip == ip) {
             simd_memcpy(neighbors[i].mac, mac, 6);
+            arp_add_static(ip, mac);
             return;
         }
     }
@@ -59,6 +65,7 @@ void net_add_neighbor(u32 ip, const u8 *mac) {
         simd_memcpy(neighbors[neighbor_count].mac, mac, 6);
         neighbor_count++;
     }
+    arp_add_static(ip, mac);
 }
 
 static const u8 *neighbor_lookup(u32 ip) {
@@ -246,27 +253,37 @@ static void handle_ip(const u8 *frame, u32 len) {
 }
 
 /* ================================================================== */
-/*  TX path - static neighbor resolution                               */
+/*  TX path - neighbor resolution (static table + ARP)                 */
 /* ================================================================== */
 
 static bool resolve_mac(u32 dst_ip, const u8 **mac_out) {
     u32 next_hop = ((dst_ip & our_mask) == (our_ip & our_mask))
                     ? dst_ip : our_gw;
 
+    /* Broadcast */
+    if (dst_ip == 0xFFFFFFFF) {
+        static const u8 bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+        *mac_out = bcast;
+        return true;
+    }
+
+    /* Try static gateway MAC first */
     if (next_hop == our_gw && gw_mac_set) {
         *mac_out = gw_mac;
         return true;
     }
 
+    /* Try static neighbor table */
     const u8 *mac = neighbor_lookup(next_hop);
     if (mac) {
         *mac_out = mac;
         return true;
     }
 
-    if (dst_ip == 0xFFFFFFFF) {
-        static const u8 bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-        *mac_out = bcast;
+    /* Fall through to ARP */
+    mac = arp_resolve(next_hop);
+    if (mac) {
+        *mac_out = mac;
         return true;
     }
 
@@ -384,12 +401,15 @@ void net_poll(void) {
         struct eth_hdr *eth = (struct eth_hdr *)rx_frame;
         u16 etype = ntohs(eth->ethertype);
 
-        /* We only speak IP. Everything else dropped silently. */
+        /* Dispatch by EtherType */
         if (likely(etype == ETH_P_IP))
             handle_ip(rx_frame, len);
+        else if (etype == ETH_P_ARP)
+            arp_input(rx_frame, len);
     }
 
     net_handle_fifo_request();
+    arp_tick();
 }
 
 void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
@@ -413,11 +433,21 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     icmp_min_interval = freq / 10;
     icmp_last_tick    = 0;
 
+    /* Init ARP subsystem */
+    arp_init(ip, netmask, our_mac);
+
+    /* Add gateway as static ARP entry if MAC provided */
+    if (gateway_mac && !mac_is_zero_6(gateway_mac))
+        arp_add_static(gateway, gateway_mac);
+
     uart_puts("[net] Hardened stack: IP=");
     uart_hex(ip);
     uart_puts(" GW=");
     uart_hex(gateway);
-    uart_puts(" (NO ARP/TCP/DHCP)\n");
+    uart_puts(" (ARP hardened, NO TCP/DHCP)\n");
+
+    /* Announce our presence on the network */
+    arp_announce();
 }
 
 void net_set_udp_callback(udp_recv_cb cb) {
