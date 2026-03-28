@@ -31,6 +31,8 @@
 #include "gpu.h"
 #include "tensor.h"
 #include "walfs.h"
+#include "bcache.h"
+#include "principal.h"
 #include "pcie.h"
 #include "rp1.h"
 #include "rp1_gpio.h"
@@ -279,8 +281,12 @@ void kernel_main(void) {
     /* 9. SD card - raw block access */
     if (!sd_init())
         uart_puts("[sd] SD init FAILED (continuing)\n");
-    else
+    else {
+        bcache_init();
+        bcache_pin(0);
         walfs_init();
+        principal_init();
+    }
 
     /* 10. Ethernet MAC */
     if (!genet_init())
