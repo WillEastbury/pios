@@ -169,9 +169,11 @@ u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
         return 0;
     }
 
-    /* Check memory requirements */
-    u32 total_needed = hdr->code_size + hdr->data_size + hdr->bss_size;
-    if (hdr->min_memory > slot_size || total_needed > slot_size)
+    /* Check memory requirements (overflow-safe) */
+    if (hdr->code_size > slot_size ||
+        hdr->data_size > slot_size - hdr->code_size ||
+        hdr->bss_size > slot_size - hdr->code_size - hdr->data_size ||
+        hdr->min_memory > slot_size)
         return 0;
 
     /* Validate offsets within file */
@@ -309,9 +311,9 @@ u64 elf64_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size)
             continue;
 
         u64 dest_off = ph->p_vaddr - vaddr_min;
-        if (dest_off + ph->p_memsz > slot_size)
+        if (dest_off > (u64)slot_size || ph->p_memsz > (u64)slot_size - dest_off)
             return 0;
-        if (ph->p_offset + ph->p_filesz > file_size)
+        if (ph->p_offset > file_size || ph->p_filesz > file_size - ph->p_offset)
             return 0;
 
         u8 *dest = base + dest_off;

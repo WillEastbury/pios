@@ -136,11 +136,15 @@ static u32 read_u32_be(const u8 *p) {
 
 /* Skip a DNS name (handles compression pointers) */
 static u32 skip_name(const u8 *buf, u32 off, u32 len) {
-    while (off < len) {
+    u32 hops = 0;
+    while (off < len && hops < 128) {
         u8 label = buf[off];
         if (label == 0) { off++; break; }
         if ((label & 0xC0) == 0xC0) { off += 2; break; } /* pointer */
+        if (label & 0xC0) return len;   /* reserved label type — reject */
+        if (off + 1 + label > len) return len; /* bounds check */
         off += 1 + label;
+        hops++;
     }
     return off;
 }

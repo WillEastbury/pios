@@ -19,6 +19,15 @@
 #include "core.h"
 
 #define WAL_START  SD_BLOCK_SIZE
+#define WAL_REC_MIN  sizeof(struct wal_record)
+#define WAL_REC_MAX  (WALFS_DATA_MAX + 256)
+
+/* Validate record header length — prevents infinite loops on corrupt data */
+static inline bool wal_rec_valid(const struct wal_record *h) {
+    return h->magic == WALFS_REC_MAGIC &&
+           h->length >= WAL_REC_MIN &&
+           h->length <= WAL_REC_MAX;
+}
 
 static struct walfs_super super;
 static u64 next_inode;
@@ -128,6 +137,10 @@ static void write_super(void)
 static u64 wal_append(u32 type, const void *meta, u32 meta_len,
                       const void *data, u32 data_len)
 {
+    /* Bounds check: prevent rec_buf overflow */
+    if (meta_len + data_len > sizeof(rec_buf) - sizeof(struct wal_record))
+        return 0;
+
     u32 total = (u32)sizeof(struct wal_record) + meta_len + data_len;
     struct wal_record *r = (struct wal_record *)rec_buf;
 
@@ -164,7 +177,7 @@ static bool is_deleted(u64 inode_id)
 
     while (pos < super.wal_head) {
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
-        if (hdr.magic != WALFS_REC_MAGIC) break;
+        if (!wal_rec_valid(&hdr)) break;
         if (hdr.type == RECORD_DELETE) {
             struct walfs_delete d;
             if (wal_read(pos + sizeof(hdr), &d, sizeof(d)))
@@ -189,7 +202,7 @@ static void scan_recovery(void)
 
     while (pos < super.wal_head) {
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
-        if (hdr.magic != WALFS_REC_MAGIC) break;
+        if (!wal_rec_valid(&hdr)) break;
         if (hdr.seq >= next_seq) next_seq = hdr.seq + 1;
         if (hdr.type == RECORD_INODE) {
             struct walfs_inode ino;
@@ -349,7 +362,7 @@ u32 walfs_read(u64 inode_id, u64 offset, void *buf, u32 len)
 
     while (pos < super.wal_head) {
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
-        if (hdr.magic != WALFS_REC_MAGIC) break;
+        if (!wal_rec_valid(&hdr)) break;
         if (hdr.length < sizeof(struct wal_record)) break;
 
         if (hdr.type == RECORD_DATA) {
@@ -400,7 +413,7 @@ bool walfs_stat(u64 inode_id, struct walfs_inode *out)
 
     while (pos < super.wal_head) {
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
-        if (hdr.magic != WALFS_REC_MAGIC) break;
+        if (!wal_rec_valid(&hdr)) break;
 
         if (hdr.type == RECORD_INODE) {
             struct walfs_inode ino;
@@ -443,7 +456,7 @@ u64 walfs_find(const char *path)
         struct wal_record hdr;
         while (pos < super.wal_head) {
             if (!wal_read(pos, &hdr, sizeof(hdr))) break;
-            if (hdr.magic != WALFS_REC_MAGIC) break;
+            if (!wal_rec_valid(&hdr)) break;
             if (hdr.type == RECORD_DIRENT) {
                 struct walfs_dirent de;
                 if (wal_read(pos + sizeof(hdr), &de, sizeof(de)) &&
@@ -468,7 +481,7 @@ void walfs_readdir(u64 parent_id, walfs_readdir_cb cb)
 
     while (pos < super.wal_head) {
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
-        if (hdr.magic != WALFS_REC_MAGIC) break;
+        if (!wal_rec_valid(&hdr)) break;
 
         if (hdr.type == RECORD_DIRENT) {
             struct walfs_dirent de;

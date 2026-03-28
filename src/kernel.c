@@ -33,6 +33,8 @@
 #include "walfs.h"
 #include "bcache.h"
 #include "principal.h"
+#include "proc.h"
+#include "pxe.h"
 #include "pcie.h"
 #include "rp1.h"
 #include "rp1_gpio.h"
@@ -156,24 +158,20 @@ NORETURN void core1_main(void) {
     }
 }
 
-/* Core 2: User core 0 - initialise env, then idle */
+/* Core 2: User core 0 - process scheduler */
 NORETURN void core2_main(void) {
     core_env_init(CORE_USER0);
-    struct core_env *env = core_env_of(CORE_USER0);
-    for (;;) {
-        env->idle_count++;
-        wfe();
-    }
+    proc_init();
+    proc_schedule(); /* never returns */
+    for (;;) wfe();
 }
 
-/* Core 3: User core 1 - initialise env, then idle */
+/* Core 3: User core 1 - process scheduler */
 NORETURN void core3_main(void) {
     core_env_init(CORE_USER1);
-    struct core_env *env = core_env_of(CORE_USER1);
-    for (;;) {
-        env->idle_count++;
-        wfe();
-    }
+    proc_init();
+    proc_schedule(); /* never returns */
+    for (;;) wfe();
 }
 
 /* ---- Boot diagnostics display ---- */
@@ -300,6 +298,9 @@ void kernel_main(void) {
 
     /* Core 0 environment */
     core_env_init(CORE_NET);
+
+    /* Module system */
+    module_init();
 
     /* 13. Boot diagnostics on HDMI */
     boot_diag();

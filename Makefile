@@ -1,4 +1,4 @@
-CROSS   = aarch64-none-elf-
+CROSS   = aarch64-linux-gnu-
 CC      = $(CROSS)gcc
 LD      = $(CROSS)ld
 OBJCOPY = $(CROSS)objcopy

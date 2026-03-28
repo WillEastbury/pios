@@ -176,7 +176,7 @@ static void ring_init(struct xhci_trb *ring, u32 *enq, u32 *cycle) {
         ring[i].param = 0; ring[i].status = 0; ring[i].control = 0;
     }
     ring[RING_SIZE - 1].param = (u64)(usize)ring;
-    ring[RING_SIZE - 1].control = TRB_TYPE(TRB_LINK) | (1U << 1);
+    ring[RING_SIZE - 1].control = TRB_TYPE(TRB_LINK) | (1U << 1) | TRB_CYCLE;
     *enq = 0; *cycle = 1;
 }
 
