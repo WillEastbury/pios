@@ -191,15 +191,15 @@ u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
     u64 load_base = (u64)base;
 
     /* Copy code section */
-    memcpy(base, file + hdr->code_offset, hdr->code_size);
+    simd_memcpy(base, file + hdr->code_offset, hdr->code_size);
 
     /* Copy data section (right after code) */
     if (hdr->data_size)
-        memcpy(base + hdr->code_size, file + hdr->data_offset, hdr->data_size);
+        simd_memcpy(base + hdr->code_size, file + hdr->data_offset, hdr->data_size);
 
     /* Zero BSS */
     if (hdr->bss_size)
-        memset(base + hdr->code_size + hdr->data_size, 0, hdr->bss_size);
+        simd_zero(base + hdr->code_size + hdr->data_size, hdr->bss_size);
 
     /* Apply relocations */
     if (hdr->reloc_count) {
@@ -317,11 +317,11 @@ u64 elf64_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size)
             return 0;
 
         u8 *dest = base + dest_off;
-        memcpy(dest, file + ph->p_offset, (usize)ph->p_filesz);
+        simd_memcpy(dest, file + ph->p_offset, (usize)ph->p_filesz);
 
         /* Zero remainder (BSS portion) */
         if (ph->p_memsz > ph->p_filesz)
-            memset(dest + ph->p_filesz, 0, (usize)(ph->p_memsz - ph->p_filesz));
+            simd_zero(dest + ph->p_filesz, (usize)(ph->p_memsz - ph->p_filesz));
 
         u64 seg_end = dest_off + ph->p_memsz;
         if (seg_end > code_end)

@@ -8,6 +8,8 @@
 #include "uart.h"
 #include "timer.h"
 #include "socket.h"
+#include "dma.h"
+#include "simd.h"
 
 static struct process  procs[MAX_PROCS_PER_CORE];
 static struct proc_context scheduler_ctx;
@@ -133,7 +135,7 @@ i32 proc_exec(const char *path)
     }
 
     u8 *base = slot_base((u32)slot);
-    memset(base, 0, PROC_SLOT_SIZE);
+    dma_zero(5, base, PROC_SLOT_SIZE); /* DMA ch5 (SPARE) */
     u32 loaded = walfs_read(inode, 0, base, (u32)info.size);
     if (loaded != (u32)info.size) {
         uart_puts("[proc] load incomplete\n");
@@ -149,7 +151,7 @@ i32 proc_exec(const char *path)
     p->ticks = timer_ticks();
     p->exit_code = 0;
 
-    memset(&p->ctx, 0, sizeof(p->ctx));
+    simd_zero(&p->ctx, sizeof(p->ctx));
     p->ctx.x19_x30[0] = (u64)(usize)&syscall_tab;  /* x19 */
     p->ctx.x19_x30[1] = (u64)(usize)base;           /* x20 */
     p->ctx.x19_x30[11] = (u64)(usize)proc_trampoline; /* x30 = LR */

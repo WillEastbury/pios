@@ -90,7 +90,7 @@ static bool wal_read(u64 off, void *buf, u32 len)
             if (!bcache_read(lba, iobuf)) return false;
             cached_lba = lba;
         }
-        memcpy(d, iobuf + blk_off, n);
+        simd_memcpy(d, iobuf + blk_off, n);
         d += n;
         off += n;
         len -= n;
@@ -111,7 +111,7 @@ static bool wal_write(u64 off, const void *buf, u32 len)
                 if (!bcache_read(lba, iobuf)) return false;
             }
         }
-        memcpy(iobuf + blk_off, s, n);
+        simd_memcpy(iobuf + blk_off, s, n);
         if (!bcache_write(lba, iobuf)) return false;
         cached_lba = lba;
         s += n;
@@ -152,9 +152,9 @@ static u64 wal_append(u32 type, const void *meta, u32 meta_len,
     r->timestamp = read_cntvct();
 
     if (meta_len)
-        memcpy(rec_buf + sizeof(struct wal_record), meta, meta_len);
+        simd_memcpy(rec_buf + sizeof(struct wal_record), meta, meta_len);
     if (data_len)
-        memcpy(rec_buf + sizeof(struct wal_record) + meta_len, data, data_len);
+        simd_memcpy(rec_buf + sizeof(struct wal_record) + meta_len, data, data_len);
 
     r->crc32 = hw_crc32c(rec_buf, total);
 
@@ -426,7 +426,7 @@ bool walfs_stat(u64 inode_id, struct walfs_inode *out)
             struct walfs_inode ino;
             if (wal_read(pos + sizeof(hdr), &ino, sizeof(ino)) &&
                 ino.inode_id == inode_id) {
-                memcpy(out, &ino, sizeof(ino));
+                simd_memcpy(out, &ino, sizeof(ino));
                 found   = true;
                 deleted = (ino.flags & WALFS_DELETED) != 0;
             }

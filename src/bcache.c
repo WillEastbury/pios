@@ -68,6 +68,7 @@ static bcache_entry_t *find_victim(void)
     u64 global_oldest = (u64)-1;
 
     for (u32 i = 0; i < BCACHE_ENTRIES; i++) {
+        if (i + 1 < BCACHE_ENTRIES) prefetch_r(&cache[i + 1]);
         bcache_entry_t *e = &cache[i];
         if (!(e->flags & FLAG_VALID) || (e->flags & FLAG_PINNED))
             continue;
