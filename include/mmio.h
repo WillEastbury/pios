@@ -22,6 +22,12 @@
 /* GENET v5 Ethernet MAC */
 #define GENET_BASE          0x107D580000UL
 
+/* BCM2712 PCIe Root Complex (PCIe2, quad-lane, connected to RP1) */
+#define PCIE_RC_BASE        0x1000120000UL
+
+/* RP1 southbridge register window (mapped via PCIe outbound ATU) */
+#define RP1_BAR_BASE        0x1F00000000UL
+
 static inline void mmio_write(u64 addr, u32 val) {
     *(volatile u32 *)addr = val;
 }

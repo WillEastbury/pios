@@ -4,7 +4,7 @@ LD      = $(CROSS)ld
 OBJCOPY = $(CROSS)objcopy
 
 CFLAGS  = -Wall -Wextra -ffreestanding -nostdlib -nostartfiles \
-          -march=armv8.2-a+simd+crc+crypto -Iinclude -O2
+          -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2
 ASFLAGS = -march=armv8.2-a+simd+crc+crypto
 
 SRC_S   = $(wildcard src/*.S)

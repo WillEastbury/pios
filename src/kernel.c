@@ -30,6 +30,8 @@
 #include "dma.h"
 #include "gpu.h"
 #include "tensor.h"
+#include "pcie.h"
+#include "rp1.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -243,7 +245,12 @@ void kernel_main(void) {
     /* 6. DMA engine */
     dma_init();
 
-    /* 7. HDMI framebuffer (1280x720) */
+    /* 7. PCIe Root Complex + RP1 southbridge */
+    if (pcie_init()) {
+        rp1_init();
+    }
+
+    /* 8. HDMI framebuffer (1280x720) */
     if (fb_init(1280, 720)) {
         uart_puts("[fb] Framebuffer OK\n");
     } else {
