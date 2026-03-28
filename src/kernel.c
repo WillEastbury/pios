@@ -32,6 +32,9 @@
 #include "tensor.h"
 #include "pcie.h"
 #include "rp1.h"
+#include "rp1_gpio.h"
+#include "rp1_clk.h"
+#include "rp1_uart.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -247,7 +250,10 @@ void kernel_main(void) {
 
     /* 7. PCIe Root Complex + RP1 southbridge */
     if (pcie_init()) {
-        rp1_init();
+        if (rp1_init()) {
+            rp1_clk_init();
+            rp1_gpio_init();
+        }
     }
 
     /* 8. HDMI framebuffer (1280x720) */
