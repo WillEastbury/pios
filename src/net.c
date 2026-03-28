@@ -1,13 +1,13 @@
 /*
- * net.c - Hardened network stack: IPv4 + ICMP + UDP + ARP
+ * net.c - Hardened network stack: IPv4 + ICMP + UDP + TCP + ARP
  *
- * ZERO: TCP, DHCP, DNS, IP fragmentation, IP options.
  * Hardened ARP with anti-spoofing. NEON checksums. Rate-limited ICMP.
  * Every ingress byte is validated before processing.
  */
 
 #include "net.h"
 #include "arp.h"
+#include "tcp.h"
 #include "genet.h"
 #include "simd.h"
 #include "core_env.h"
@@ -247,6 +247,10 @@ static void handle_ip(const u8 *frame, u32 len) {
 
     switch (ip->protocol) {
     case IP_PROTO_ICMP: handle_icmp(frame, len, ip, payload_off); break;
+    case IP_PROTO_TCP:
+        tcp_input(frame, len, ntohl(ip->src_ip), ntohl(ip->dst_ip),
+                  frame + payload_off, ntohs(ip->total_len) - 20);
+        break;
     case IP_PROTO_UDP:  handle_udp(frame, len, ip, payload_off);  break;
     default: stats.drop_bad_proto++; break;
     }
@@ -410,6 +414,7 @@ void net_poll(void) {
 
     net_handle_fifo_request();
     arp_tick();
+    tcp_tick();
 }
 
 void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
@@ -436,6 +441,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     /* Init ARP subsystem */
     arp_init(ip, netmask, our_mac);
 
+    /* Init TCP subsystem */
+    tcp_init();
+
     /* Add gateway as static ARP entry if MAC provided */
     if (gateway_mac && !mac_is_zero_6(gateway_mac))
         arp_add_static(gateway, gateway_mac);
@@ -452,6 +460,10 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
 
 void net_set_udp_callback(udp_recv_cb cb) {
     udp_callback = cb;
+}
+
+u32 net_get_our_ip(void) {
+    return our_ip;
 }
 
 const net_stats_t *net_get_stats(void) {

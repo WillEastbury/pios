@@ -19,6 +19,7 @@
 #define ETH_P_IP        0x0800
 #define ETH_P_ARP       0x0806
 #define IP_PROTO_ICMP   1
+#define IP_PROTO_TCP    6
 #define IP_PROTO_UDP    17
 
 /* Network byte order helpers */
@@ -125,3 +126,6 @@ typedef struct {
 } net_stats_t;
 
 const net_stats_t *net_get_stats(void);
+
+/* Get our configured IP address (for use by TCP, etc.) */
+u32 net_get_our_ip(void);
