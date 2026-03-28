@@ -1,26 +1,47 @@
 /*
- * xhci.h - xHCI USB Host Controller driver
+ * xhci.h - xHCI Host Controller Interface (HCI layer)
  *
- * Minimal xHCI driver for one USB device (keyboard) via RP1 DWC3.
- * RP1 has two DWC3 controllers: USB0 at BAR+0x200000, USB1 at BAR+0x300000.
- * DWC3 wraps xHCI and requires host-mode init before xHCI registers are usable.
+ * Low-level xHCI API for the RP1 DWC3 USB controllers.
+ * Does NOT do enumeration — that's handled by usb.c.
  *
- * Reference: xHCI Spec 1.2, OSDev wiki, Linux drivers/usb/host/xhci*.c
- *            rp1.dtsi: usb@200000 { compatible = "snps,dwc3"; }
+ * Reference: xHCI Spec 1.2, Linux drivers/usb/host/xhci*.c
  */
 
 #pragma once
 #include "types.h"
 
-/* RP1 DWC3 controller offsets from RP1_BAR_BASE */
 #define XHCI_USB0_OFFSET    0x200000
 #define XHCI_USB1_OFFSET    0x300000
 
-/* Initialise xHCI controller (USB0) and enumerate first connected device */
+/* Endpoint info for configure_endpoints */
+struct xhci_ep_info {
+    u8  address;        /* endpoint address (bit 7 = direction) */
+    u8  attributes;     /* bits [1:0]: 0=ctrl, 1=isoc, 2=bulk, 3=intr */
+    u16 max_packet;
+    u8  interval;
+};
+
+/* USB speed values (from PORTSC) */
+#define USB_SPEED_FULL      1
+#define USB_SPEED_LOW       2
+#define USB_SPEED_HIGH      3
+#define USB_SPEED_SUPER     4
+
+/* Controller lifecycle */
 bool xhci_init(void);
 
-/* Poll for keyboard input. Returns USB HID keycode, or -1 if none. */
-i32 xhci_get_keypress(void);
+/* Port operations */
+u32  xhci_port_count(void);
+bool xhci_port_connected(u32 port);
+bool xhci_port_reset(u32 port, u32 *speed);
 
-/* Check if a USB device is connected and enumerated */
-bool xhci_device_connected(void);
+/* Device slot management */
+bool xhci_enable_slot(u32 *slot);
+bool xhci_address_device(u32 slot, u32 port, u32 speed, u32 max_packet);
+bool xhci_configure_endpoints(u32 slot, u32 port, u32 speed,
+                               const struct xhci_ep_info *eps, u32 count);
+
+/* Transfer operations */
+bool xhci_control_transfer(u32 slot, u8 bmReq, u8 bReq, u16 wVal,
+                            u16 wIdx, u16 wLen, void *data, u32 *actual);
+bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual);
