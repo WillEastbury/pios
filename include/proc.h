@@ -59,12 +59,16 @@ struct syscall_table {
 
     /* ---- Filesystem (WALFS via FIFO to Core 1) ---- */
     i32 (*open)(const char *path, u32 flags);
+    i32 (*creat)(const char *path, u32 flags, u32 mode); /* create new file/dir */
     i32 (*read)(i32 fd, void *buf, u32 len);
     i32 (*write)(i32 fd, const void *buf, u32 len);
+    i32 (*pread)(i32 fd, void *buf, u32 len, u64 offset);  /* positioned read */
+    i32 (*pwrite)(i32 fd, const void *buf, u32 len, u64 offset); /* positioned write */
     i32 (*close)(i32 fd);
     i32 (*stat)(const char *path, void *out);  /* fills walfs_inode */
     i32 (*mkdir)(const char *path);
     i32 (*unlink)(const char *path);
+    i32 (*readdir)(const char *path, void *entries, u32 max_entries); /* list directory */
 
     /* ---- Framebuffer ---- */
     void (*fb_putc)(char c);
@@ -94,6 +98,19 @@ struct syscall_table {
 
     /* ---- Memory ---- */
     void *(*sbrk)(i32 increment);
+    void *(*memset)(void *dst, i32 c, u32 n);
+    void *(*memcpy)(void *dst, const void *src, u32 n);
+    u32   (*strlen)(const char *s);
+
+    /* ---- Process management ---- */
+    i32 (*spawn)(const char *path);     /* load + start child process */
+    i32 (*wait)(i32 pid);               /* wait for child to exit, return exit code */
+    u32 (*nprocs)(void);                /* count active processes on this core */
+
+    /* ---- Inter-process sync ---- */
+    i32 (*sem_create)(u32 initial);     /* create semaphore, returns id */
+    i32 (*sem_wait)(i32 id);            /* decrement (blocks if 0) */
+    i32 (*sem_post)(i32 id);            /* increment */
 
     /* ---- Tensor / GPU compute ---- */
     i32 (*tensor_alloc)(void *t, u32 rows, u32 cols, u32 elem_size);

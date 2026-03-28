@@ -43,6 +43,10 @@ static void fs_request(struct fifo_msg *msg, struct fifo_msg *reply)
         wfe();
 }
 
+/* ---- Semaphore state ---- */
+#define MAX_SEMS 8
+static struct { bool used; volatile i32 count; } sems[MAX_SEMS];
+
 /* ---- Forward declarations ---- */
 static i32   sys_yield(void);
 static i32   sys_exit(u32 code);
@@ -55,12 +59,16 @@ static u64   sys_ticks(void);
 static void  sys_sleep_ms(u64 ms);
 static void  sys_sleep_us(u64 us);
 static i32   sys_open(const char *path, u32 flags);
+static i32   sys_creat(const char *path, u32 flags, u32 mode);
 static i32   sys_read(i32 fd, void *buf, u32 len);
 static i32   sys_write(i32 fd, const void *buf, u32 len);
+static i32   sys_pread(i32 fd, void *buf, u32 len, u64 offset);
+static i32   sys_pwrite(i32 fd, const void *buf, u32 len, u64 offset);
 static i32   sys_close(i32 fd);
 static i32   sys_stat(const char *path, void *out);
 static i32   sys_mkdir(const char *path);
 static i32   sys_unlink(const char *path);
+static i32   sys_readdir(const char *path, void *entries, u32 max_entries);
 static void  sys_fb_putc(char c);
 static void  sys_fb_print(const char *s);
 static void  sys_fb_color(u32 fg, u32 bg);
@@ -80,6 +88,15 @@ static i32   sys_resolve(const char *hostname, u32 *ip_out);
 static u32   sys_whoami(void);
 static i32   sys_auth(const char *user, const char *pass);
 static void *sys_sbrk(i32 increment);
+static void *sys_memset(void *dst, i32 c, u32 n);
+static void *sys_memcpy(void *dst, const void *src, u32 n);
+static u32   sys_strlen(const char *s);
+static i32   sys_spawn(const char *path);
+static i32   sys_wait(i32 pid);
+static u32   sys_nprocs(void);
+static i32   sys_sem_create(u32 initial);
+static i32   sys_sem_wait(i32 id);
+static i32   sys_sem_post(i32 id);
 static i32   sys_tensor_alloc(void *t, u32 rows, u32 cols, u32 elem_size);
 static void  sys_tensor_free(void *t);
 static void  sys_tensor_upload(void *t, const void *data);
@@ -106,12 +123,16 @@ static struct syscall_table syscall_tab = {
     .sleep_us        = sys_sleep_us,
     /* Filesystem */
     .open            = sys_open,
+    .creat           = sys_creat,
     .read            = sys_read,
     .write           = sys_write,
+    .pread           = sys_pread,
+    .pwrite          = sys_pwrite,
     .close           = sys_close,
     .stat            = sys_stat,
     .mkdir           = sys_mkdir,
     .unlink          = sys_unlink,
+    .readdir         = sys_readdir,
     /* Framebuffer */
     .fb_putc         = sys_fb_putc,
     .fb_print        = sys_fb_print,
@@ -136,6 +157,17 @@ static struct syscall_table syscall_tab = {
     .auth            = sys_auth,
     /* Memory */
     .sbrk            = sys_sbrk,
+    .memset          = sys_memset,
+    .memcpy          = sys_memcpy,
+    .strlen          = sys_strlen,
+    /* Process management */
+    .spawn           = sys_spawn,
+    .wait            = sys_wait,
+    .nprocs          = sys_nprocs,
+    /* Semaphores */
+    .sem_create      = sys_sem_create,
+    .sem_wait        = sys_sem_wait,
+    .sem_post        = sys_sem_post,
     /* Tensor */
     .tensor_alloc    = sys_tensor_alloc,
     .tensor_free     = sys_tensor_free,
@@ -454,6 +486,121 @@ static i32 sys_unlink(const char *path)
     return reply.status == 0 ? 0 : -1;
 }
 
+static i32 sys_creat(const char *path, u32 flags, u32 mode)
+{
+    if (!ptr_valid(path, 1)) return -1;
+
+    /* Split path into parent directory and filename */
+    u32 len = pios_strlen(path);
+    if (len == 0) return -1;
+
+    /* Find last '/' to separate parent path from filename */
+    i32 sep = -1;
+    for (u32 i = 0; i < len; i++) {
+        if (path[i] == '/')
+            sep = (i32)i;
+    }
+
+    /* Resolve parent directory inode */
+    u64 parent_inode;
+    if (sep <= 0) {
+        /* File in root directory — find "/" */
+        struct fifo_msg fmsg = {0};
+        fmsg.type   = MSG_FS_FIND;
+        fmsg.buffer = (u64)(usize)"/";
+        fmsg.length = 2;
+        struct fifo_msg freply;
+        fs_request(&fmsg, &freply);
+        if (freply.status != 0) return -1;
+        parent_inode = freply.param;
+    } else {
+        /* Build parent path on the stack (reuse the buffer up to sep) */
+        struct fifo_msg fmsg = {0};
+        fmsg.type   = MSG_FS_FIND;
+        fmsg.buffer = (u64)(usize)path;
+        fmsg.length = (u32)sep + 1; /* length up to but not including sep slash */
+        fmsg.tag    = (u64)(u32)sep; /* hint: path length to consider */
+        struct fifo_msg freply;
+        fs_request(&fmsg, &freply);
+        if (freply.status != 0) return -1;
+        parent_inode = freply.param;
+    }
+
+    /* Create file under parent */
+    struct fifo_msg msg = {0};
+    msg.type   = MSG_FS_CREATE;
+    msg.param  = (u32)parent_inode;
+    msg.buffer = (u64)(usize)(path + sep + 1); /* filename portion */
+    msg.length = len - (u32)(sep + 1) + 1;     /* include null terminator */
+    msg.tag    = ((u64)flags << 32) | mode;
+    struct fifo_msg reply;
+    fs_request(&msg, &reply);
+    if (reply.status != 0) return -1;
+    return (i32)reply.param;
+}
+
+static i32 sys_pread(i32 fd, void *buf, u32 len, u64 offset)
+{
+    if (!ptr_valid(buf, len)) return -1;
+    struct fifo_msg msg = {0};
+    msg.type   = MSG_FS_READ;
+    msg.param  = (u32)fd;
+    msg.buffer = (u64)(usize)buf;
+    msg.length = len;
+    msg.tag    = offset;
+    struct fifo_msg reply;
+    fs_request(&msg, &reply);
+    if (reply.status != 0) return -1;
+    return (i32)reply.length;
+}
+
+static i32 sys_pwrite(i32 fd, const void *buf, u32 len, u64 offset)
+{
+    if (!ptr_valid(buf, len)) return -1;
+    struct fifo_msg msg = {0};
+    msg.type   = MSG_FS_WRITE;
+    msg.param  = (u32)fd;
+    msg.buffer = (u64)(usize)buf;
+    msg.length = len;
+    msg.tag    = offset;
+    struct fifo_msg reply;
+    fs_request(&msg, &reply);
+    if (reply.status != 0) return -1;
+    return (i32)reply.length;
+}
+
+struct readdir_entry {
+    u64 inode_id;
+    u8 name[128];
+};
+
+static i32 sys_readdir(const char *path, void *entries, u32 max_entries)
+{
+    if (!ptr_valid(path, 1)) return -1;
+    if (!ptr_valid(entries, max_entries * sizeof(struct readdir_entry))) return -1;
+
+    /* Resolve path to inode */
+    struct fifo_msg fmsg = {0};
+    fmsg.type   = MSG_FS_FIND;
+    fmsg.buffer = (u64)(usize)path;
+    fmsg.length = pios_strlen(path) + 1;
+    struct fifo_msg freply;
+    fs_request(&fmsg, &freply);
+    if (freply.status != 0) return -1;
+
+    /* Read directory entries */
+    struct fifo_msg msg = {0};
+    msg.type   = MSG_FS_READDIR;
+    msg.param  = freply.param;
+    msg.buffer = (u64)(usize)entries;
+    msg.length = max_entries * (u32)sizeof(struct readdir_entry);
+    msg.tag    = max_entries;
+    struct fifo_msg reply;
+    fs_request(&msg, &reply);
+    if (reply.status != 0) return -1;
+    return (i32)reply.param;
+}
+
 /* ---- Framebuffer ---- */
 
 static void sys_fb_putc(char c)                    { fb_putc(c); }
@@ -560,6 +707,77 @@ static void *sys_sbrk(i32 increment)
         return (void *)(usize)-1;
     heap_top[current_proc] = new_top;
     return (void *)(usize)old;
+}
+
+/* ---- libc stubs ---- */
+
+static void *sys_memset(void *dst, i32 c, u32 n)
+{
+    if (!ptr_valid(dst, n)) return dst;
+    return memset(dst, c, n);
+}
+
+static void *sys_memcpy(void *dst, const void *src, u32 n)
+{
+    if (!ptr_valid(dst, n) || !ptr_valid(src, n)) return dst;
+    return memcpy(dst, src, n);
+}
+
+static u32 sys_strlen(const char *s)
+{
+    if (!ptr_valid(s, 1)) return 0;
+    return pios_strlen(s);
+}
+
+/* ---- Process management ---- */
+
+static i32 sys_spawn(const char *path)
+{
+    if (!ptr_valid(path, 1)) return -1;
+    return proc_exec(path);
+}
+
+static i32 sys_wait(i32 pid)
+{
+    for (;;) {
+        for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+            if (procs[i].pid == (u32)pid && procs[i].state == PROC_DEAD)
+                return (i32)procs[i].exit_code;
+        }
+        proc_yield();
+    }
+}
+
+static u32 sys_nprocs(void) { return proc_count(); }
+
+/* ---- Semaphores ---- */
+
+static i32 sys_sem_create(u32 initial)
+{
+    for (u32 i = 0; i < MAX_SEMS; i++) {
+        if (!sems[i].used) {
+            sems[i].used = true;
+            sems[i].count = (i32)initial;
+            return (i32)i;
+        }
+    }
+    return -1;
+}
+
+static i32 sys_sem_wait(i32 id)
+{
+    if (id < 0 || id >= MAX_SEMS || !sems[id].used) return -1;
+    while (sems[id].count <= 0)
+        proc_yield();
+    sems[id].count--;
+    return 0;
+}
+
+static i32 sys_sem_post(i32 id)
+{
+    if (id < 0 || id >= MAX_SEMS || !sems[id].used) return -1;
+    sems[id].count++;
+    return 0;
 }
 
 /* ---- Tensor / GPU compute ---- */
