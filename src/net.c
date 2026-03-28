@@ -8,6 +8,7 @@
 #include "net.h"
 #include "arp.h"
 #include "tcp.h"
+#include "socket.h"
 #include "genet.h"
 #include "simd.h"
 #include "core_env.h"
@@ -378,6 +379,10 @@ void net_handle_fifo_request(void) {
             fifo_push(CORE_NET, CORE_USER1, &reply);
         }
     }
+
+    /* Process socket-layer FIFO requests from user cores */
+    socket_handle_fifo(CORE_USER0);
+    socket_handle_fifo(CORE_USER1);
 }
 
 /* ================================================================== */
@@ -443,6 +448,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
 
     /* Init TCP subsystem */
     tcp_init();
+
+    /* Init socket layer */
+    socket_init();
 
     /* Add gateway as static ARP entry if MAC provided */
     if (gateway_mac && !mac_is_zero_6(gateway_mac))
