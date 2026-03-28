@@ -194,19 +194,55 @@ static void neon_vec_relu_f32(float *b, const float *a, u32 n) {
  * Uses FMLA (fused multiply-accumulate) for inner loop. */
 static void neon_matmul_f32(float *c, const float *a, const float *b,
                             u32 m, u32 n, u32 p) {
+    /* Transpose B into a scratch area so inner-loop columns become rows.
+     * This makes the inner product operate on contiguous memory → NEON-friendly. */
+    static float bt[4096] ALIGNED(64); /* max 4096 floats = 64×64 */
+    bool transposed = (n * p <= 4096);
+
+    if (transposed) {
+        for (u32 j = 0; j < p; j++)
+            for (u32 k = 0; k < n; k++)
+                bt[j * n + k] = b[k * p + j];
+    }
+
     for (u32 i = 0; i < m; i++) {
+        const float *a_row = a + i * n;
         for (u32 j = 0; j < p; j++) {
-            float sum = 0.0f;
-            const float *a_row = a + i * n;
-            const float *b_col = b + j;  /* column-strided */
+            const float *b_row = transposed ? (bt + j * n) : NULL;
             u32 k = 0;
 
-            /* Inner product with NEON (4 lanes) for contiguous A,
-             * but B is column-strided so we go scalar for B access */
-            for (; k < n; k++) {
-                sum += a_row[k] * b_col[k * p];
+            if (transposed && n >= 4) {
+                /* NEON FMLA: 4 floats per cycle */
+                __asm__ volatile("movi v4.4s, #0" ::: "v4");
+                const float *ap = a_row;
+                const float *bp = b_row;
+                for (; k + 4 <= n; k += 4) {
+                    __asm__ volatile(
+                        "ld1  {v0.4s}, [%0], #16  \n"
+                        "ld1  {v1.4s}, [%1], #16  \n"
+                        "fmla v4.4s, v0.4s, v1.4s \n"
+                        : "+r"(ap), "+r"(bp)
+                        :: "v0","v1","v4","memory"
+                    );
+                }
+                float sum;
+                __asm__ volatile(
+                    "faddp v4.4s, v4.4s, v4.4s \n"
+                    "faddp s4, v4.2s           \n"
+                    "fmov  %w0, s4             \n"
+                    : "=r"(*(u32 *)&sum) :: "v4"
+                );
+                for (; k < n; k++)
+                    sum += a_row[k] * b_row[k];
+                c[i * p + j] = sum;
+            } else {
+                /* Scalar fallback for strided B or small n */
+                float sum = 0.0f;
+                const float *b_col = b + j;
+                for (k = 0; k < n; k++)
+                    sum += a_row[k] * b_col[k * p];
+                c[i * p + j] = sum;
             }
-            c[i * p + j] = sum;
         }
     }
 }
@@ -299,7 +335,6 @@ bool tensor_relu(tensor_t *b, const tensor_t *a) {
 bool tensor_softmax(tensor_t *b, const tensor_t *a) {
     if (b->rows != a->rows || b->cols != a->cols) return false;
 
-    /* Softmax per row: exp(x_i) / sum(exp(x_j)) */
     float *src = (float *)a->arm_ptr;
     float *dst = (float *)b->arm_ptr;
     u32 rows = a->rows;
@@ -308,32 +343,67 @@ bool tensor_softmax(tensor_t *b, const tensor_t *a) {
     for (u32 r = 0; r < rows; r++) {
         float *row_s = src + r * cols;
         float *row_d = dst + r * cols;
+        u32 c;
 
-        /* Find max for numerical stability */
+        /* NEON max-finding: 4 lanes parallel compare */
         float max_val = row_s[0];
-        for (u32 c = 1; c < cols; c++)
-            if (row_s[c] > max_val) max_val = row_s[c];
+        if (cols >= 8) {
+            __asm__ volatile(
+                "ld1  {v0.4s}, [%1]    \n"
+                :: "r"(&max_val), "r"(row_s) : "v0"
+            );
+            c = 4;
+            for (; c + 4 <= cols; c += 4) {
+                __asm__ volatile(
+                    "ld1  {v1.4s}, [%0], #16  \n"
+                    "fmax v0.4s, v0.4s, v1.4s \n"
+                    : "+r"(row_s) :: "v0","v1","memory"
+                );
+            }
+            row_s = src + r * cols; /* reset pointer */
+            /* Horizontal max reduction */
+            __asm__ volatile(
+                "fmaxp v0.4s, v0.4s, v0.4s \n"
+                "fmaxp s0, v0.2s           \n"
+                "fmov  %w0, s0             \n"
+                : "=r"(*(u32 *)&max_val) :: "v0"
+            );
+            for (; c < cols; c++)
+                if (row_s[c] > max_val) max_val = row_s[c];
+        } else {
+            for (c = 1; c < cols; c++)
+                if (row_s[c] > max_val) max_val = row_s[c];
+        }
 
-        /* exp(x - max) and sum */
+        /* exp(x - max) via Schraudolph's approximation and sum */
         float sum = 0.0f;
-        for (u32 c = 0; c < cols; c++) {
-            /* Fast exp approximation using integer bit manipulation:
-             * exp(x) ≈ 2^(x * 1.4426950f) via float bit trick */
+        for (c = 0; c < cols; c++) {
             float x = row_s[c] - max_val;
-            /* Clamp to avoid overflow */
             if (x < -87.0f) x = -87.0f;
-            /* Schraudolph's exp approximation */
             union { float f; u32 i; } v;
             v.i = (u32)(12102203.2f * x + 1065353216.0f);
             row_d[c] = v.f;
             sum += row_d[c];
         }
 
-        /* Normalize */
+        /* NEON normalize: multiply all by 1/sum */
         if (sum > 0.0f) {
             float inv_sum = 1.0f / sum;
-            for (u32 c = 0; c < cols; c++)
-                row_d[c] *= inv_sum;
+            c = 0;
+            if (cols >= 4) {
+                __asm__ volatile("dup v2.4s, %w0" :: "r"(*(u32 *)&inv_sum) : "v2");
+                for (; c + 4 <= cols; c += 4) {
+                    __asm__ volatile(
+                        "ld1  {v0.4s}, [%0]       \n"
+                        "fmul v0.4s, v0.4s, v2.4s \n"
+                        "st1  {v0.4s}, [%0], #16  \n"
+                        : "+r"(row_d) :: "v0","v2","memory"
+                    );
+                }
+                row_d = dst + r * cols + c; /* adjust for tail */
+            }
+            for (; c < cols; c++)
+                row_d[c - c] = (dst + r * cols)[c] * inv_sum; /* tail scalar */
         }
     }
     dsb();
