@@ -30,6 +30,7 @@
 #include "dma.h"
 #include "gpu.h"
 #include "tensor.h"
+#include "walfs.h"
 #include "pcie.h"
 #include "rp1.h"
 #include "rp1_gpio.h"
@@ -141,6 +142,8 @@ NORETURN void core1_main(void) {
     for (;;) {
         disk_handle_request(CORE_USER0);
         disk_handle_request(CORE_USER1);
+        walfs_handle_fifo(CORE_USER0);
+        walfs_handle_fifo(CORE_USER1);
         env->poll_count++;
 
         if (fifo_empty(CORE_DISK, CORE_USER0) &&
@@ -276,6 +279,8 @@ void kernel_main(void) {
     /* 9. SD card - raw block access */
     if (!sd_init())
         uart_puts("[sd] SD init FAILED (continuing)\n");
+    else
+        walfs_init();
 
     /* 10. Ethernet MAC */
     if (!genet_init())
