@@ -23,6 +23,13 @@
 #include "core.h"
 #include "core_env.h"
 #include "simd.h"
+#include "mmu.h"
+#include "gic.h"
+#include "exception.h"
+#include "timer.h"
+#include "dma.h"
+#include "gpu.h"
+#include "tensor.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -217,41 +224,61 @@ static void boot_diag(void) {
 void kernel_main(void) {
     /* 1. Debug serial */
     uart_init();
-    uart_puts("\n\nPIOS v0.1 booting...\n");
+    uart_puts("\n\nPIOS v0.3 booting...\n");
 
-    /* 2. HDMI framebuffer (1280x720) */
+    /* 2. Exception vectors + GIC */
+    exception_init();
+    gic_init();
+    uart_puts("[kernel] Exceptions + GIC ready\n");
+
+    /* 3. MMU — identity map, enables caches */
+    mmu_init();
+
+    /* 4. Timer — 1000 Hz tick */
+    timer_init(1000);
+
+    /* 5. Unmask IRQs on core 0 (DAIF.I clear) */
+    __asm__ volatile("msr daifclr, #2");
+
+    /* 6. DMA engine */
+    dma_init();
+
+    /* 7. HDMI framebuffer (1280x720) */
     if (fb_init(1280, 720)) {
         uart_puts("[fb] Framebuffer OK\n");
     } else {
         uart_puts("[fb] Framebuffer FAILED\n");
     }
 
-    /* 3. Inter-core FIFOs */
+    /* 8. Inter-core FIFOs */
     fifo_init_all();
     uart_puts("[fifo] Init OK\n");
 
-    /* 4. SD card - raw block access */
+    /* 9. SD card - raw block access */
     if (!sd_init())
         uart_puts("[sd] SD init FAILED (continuing)\n");
 
-    /* 5. Ethernet MAC */
+    /* 10. Ethernet MAC */
     if (!genet_init())
         uart_puts("[genet] GENET init FAILED (continuing)\n");
 
-    /* 6. Network stack (static IP, static neighbor, NO ARP) */
+    /* 11. Network stack (static IP, static neighbor, NO ARP) */
     net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
+
+    /* 12. GPU + Tensor compute */
+    tensor_init();
 
     /* Core 0 environment */
     core_env_init(CORE_NET);
 
-    /* 7. Boot diagnostics on HDMI */
+    /* 13. Boot diagnostics on HDMI */
     boot_diag();
 
-    /* 8. Start secondary cores */
+    /* 14. Start secondary cores (they get EL2→EL1, MMU, VBAR, SP from start.S) */
     uart_puts("[kernel] Starting secondary cores...\n");
     core_start_all();
     uart_puts("[kernel] All cores running. Entering net loop.\n");
 
-    /* 9. Core 0 -> network poll loop (never returns) */
+    /* 15. Core 0 -> network poll loop (never returns) */
     core0_main();
 }

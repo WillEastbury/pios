@@ -1,13 +1,22 @@
 /*
  * mmu.c - AArch64 MMU with identity-mapped page tables
  *
- * 4KB granule, 2-level (L1 1GB blocks + L2 2MB blocks for fine control).
- * Identity map: VA == PA. Attribute control only.
+ * Identity map: VA == PA.
  *
- * Memory map:
- *   0x00000000 - 0x3FFFFFFF  RAM (Normal, cacheable, inner-shareable)
- *   0x40000000 - 0x7FFFFFFF  RAM continued
- *   0x107C000000+            Device (nGnRnE, non-cacheable)
+ * Three regions:
+ *   1. LOW MEMORY  (RAM)          — Normal WB cacheable, inner-shareable
+ *   2. PERIPHERALS (BCM2712+RP1)  — Device-nGnRnE, non-cacheable
+ *   3. CACHES ENABLED             — L1 I-cache + D-cache + TLB
+ *
+ * 4KB granule. L1 = 1GB blocks. L2 = 2MB blocks for first 1GB.
+ *
+ * Memory layout (BCM2712 / Pi 5 with 36-bit PA):
+ *   0x0_00000000 - 0x0_3FFFFFFF  1GB  RAM (L2 fine-grained)
+ *   0x0_40000000 - 0x0_FFFFFFFF  3GB  RAM (L1 1GB blocks)
+ *   0x1_00000000 - 0x1_0FFFFFFF  ~256MB  More peripherals / PCIe
+ *   0x1_07C00000 - 0x1_07FFFFFF  4MB  BCM2712 ARM peripherals
+ *   0x1_08000000 - 0x1_09FFFFFF  32MB GIC-400
+ *   0x1_F0000000 - 0x1_F0FFFFFF  16MB RP1 BAR0 (via PCIe)
  */
 
 #include "mmu.h"
@@ -15,113 +24,186 @@
 #include "uart.h"
 #include "simd.h"
 
-/* Page tables — 4KB aligned.
- * L1: 512 entries × 1GB blocks = 512GB coverage (enough for Pi 5 36-bit PA).
- * L2: one table for finer 2MB granularity where needed. */
+/* Page tables — 4KB aligned */
 static u64 l1_table[512] ALIGNED(4096);
-static u64 l2_table_low[512] ALIGNED(4096);  /* covers 0x00000000-0x3FFFFFFF */
+static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
 
-/* MAIR: define the 4 attribute sets we use */
+/* Exported for secondary cores (read by start.S) */
+u64 shared_ttbr0;
+u64 shared_mair;
+u64 shared_tcr;
+
+/*
+ * MAIR_EL1: Memory Attribute Indirection Register
+ *   Index 0: Device-nGnRnE (0x00) — strongly-ordered MMIO
+ *   Index 1: Normal Non-Cacheable (0x44)
+ *   Index 2: Normal Write-Back R/W Allocate (0xFF) — main RAM
+ *   Index 3: Normal Write-Through R/W Allocate (0xBB)
+ */
 #define MAIR_VALUE ( \
-    (0x00UL <<  0) | /* Index 0: Device-nGnRnE */ \
-    (0x44UL <<  8) | /* Index 1: Normal Non-Cacheable */ \
-    (0xFFUL << 16) | /* Index 2: Normal WB RW-Alloc */ \
-    (0xBBUL << 24)   /* Index 3: Normal WT RW-Alloc */ \
+    (0x00UL <<  0) |  \
+    (0x44UL <<  8) |  \
+    (0xFFUL << 16) |  \
+    (0xBBUL << 24)    \
 )
 
-/* TCR_EL1: 4KB granule, 36-bit PA, 48-bit VA space, inner-shareable */
+/*
+ * TCR_EL1: Translation Control Register
+ *   T0SZ  = 16  → 48-bit VA (256TB, way more than we need)
+ *   IRGN0 = WB WA  (inner cache for page walks)
+ *   ORGN0 = WB WA  (outer cache for page walks)
+ *   SH0   = Inner Shareable (multi-core coherency)
+ *   TG0   = 4KB granule
+ *   IPS   = 36-bit PA (64GB physical, Pi 5 max)
+ *   EPD1  = 1 → disable TTBR1 walks (no kernel/user split)
+ */
 #define TCR_VALUE ( \
-    (16UL << 0)  |   /* T0SZ = 16 → 48-bit VA space */ \
-    (0UL  << 6)  |   /* !EPD0 = walks enabled for TTBR0 */ \
-    (1UL  << 8)  |   /* IRGN0 = WB WA */ \
-    (1UL  << 10) |   /* ORGN0 = WB WA */ \
-    (3UL  << 12) |   /* SH0 = Inner Shareable */ \
-    (0UL  << 14) |   /* TG0 = 4KB granule */ \
-    (2UL  << 32)     /* IPS = 36-bit PA (4GB addressable) */ \
+    (16UL << 0)  |    \
+    (0UL  << 6)  |    \
+    (1UL  << 8)  |    \
+    (1UL  << 10) |    \
+    (3UL  << 12) |    \
+    (0UL  << 14) |    \
+    (1UL  << 23) |    \
+    (2UL  << 32)      \
 )
+
+/* Helper: create a 1GB L1 block entry for normal cacheable RAM */
+static inline u64 ram_block_1g(u64 addr) {
+    return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+}
+
+/* Helper: create a 1GB L1 block entry for device MMIO */
+static inline u64 dev_block_1g(u64 addr) {
+    return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
+           PTE_ATTR(MT_DEVICE_nGnRnE) |
+           PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+}
+
+/* Helper: create a 2MB L2 block entry for normal cacheable RAM */
+static inline u64 ram_block_2m(u64 addr) {
+    return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+}
+
+/* Helper: create a 2MB L2 block entry for device MMIO */
+static inline u64 dev_block_2m(u64 addr) {
+    return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
+           PTE_ATTR(MT_DEVICE_nGnRnE) |
+           PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+}
 
 void mmu_init(void) {
-    /* Zero tables */
+    /* Zero all tables */
     simd_zero(l1_table, sizeof(l1_table));
     simd_zero(l2_table_low, sizeof(l2_table_low));
 
-    /*
-     * L2 table: covers 0x00000000 - 0x3FFFFFFF in 2MB blocks.
-     * All normal cacheable RAM.
-     */
+    /* ============================================================
+     * L2 TABLE: First 1GB (0x00000000 - 0x3FFFFFFF) in 2MB blocks
+     *   All normal cacheable RAM.
+     * ============================================================ */
     for (u32 i = 0; i < 512; i++) {
-        u64 addr = (u64)i * L2_BLOCK_SIZE;
-        l2_table_low[i] = addr | PTE_VALID | PTE_BLOCK | PTE_AF |
-                          PTE_SH_INNER | PTE_ATTR(MT_NORMAL) |
-                          PTE_AP_RW_EL1 | PTE_UXN;
+        l2_table_low[i] = ram_block_2m((u64)i * L2_BLOCK_SIZE);
     }
 
-    /* L1[0] → L2 table (first 1GB, fine-grained control) */
+    /* L1[0] → L2 table descriptor (first 1GB) */
     l1_table[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
 
-    /* L1[1]: 0x40000000 - 0x7FFFFFFF — RAM, 1GB block, cacheable */
-    l1_table[1] = 0x40000000UL | PTE_VALID | PTE_BLOCK | PTE_AF |
-                  PTE_SH_INNER | PTE_ATTR(MT_NORMAL) |
-                  PTE_AP_RW_EL1 | PTE_UXN;
+    /* ============================================================
+     * L1 BLOCKS: RAM at 1GB granularity
+     *   0x40000000 - 0xFFFFFFFF (indices 1-3)
+     * ============================================================ */
+    l1_table[1] = ram_block_1g(0x40000000UL);
+    l1_table[2] = ram_block_1g(0x80000000UL);
+    l1_table[3] = ram_block_1g(0xC0000000UL);
 
-    /* L1[2]: 0x80000000 - 0xBFFFFFFF — more RAM if present */
-    l1_table[2] = 0x80000000UL | PTE_VALID | PTE_BLOCK | PTE_AF |
-                  PTE_SH_INNER | PTE_ATTR(MT_NORMAL) |
-                  PTE_AP_RW_EL1 | PTE_UXN;
-
-    /* L1[3]: 0xC0000000 - 0xFFFFFFFF — more RAM */
-    l1_table[3] = 0xC0000000UL | PTE_VALID | PTE_BLOCK | PTE_AF |
-                  PTE_SH_INNER | PTE_ATTR(MT_NORMAL) |
-                  PTE_AP_RW_EL1 | PTE_UXN;
-
-    /* Peripheral regions: device memory.
-     * BCM2712 peripherals at 0x107C000000 → L1 index = 0x107C000000 >> 30 = 65 */
-    for (u32 idx = 64; idx < 72; idx++) {
-        u64 addr = (u64)idx * L1_BLOCK_SIZE;
-        l1_table[idx] = addr | PTE_VALID | PTE_BLOCK | PTE_AF |
-                        PTE_ATTR(MT_DEVICE_nGnRnE) |
-                        PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+    /* ============================================================
+     * L1 BLOCKS: PERIPHERALS at 1GB granularity
+     *
+     * BCM2712 peripherals: 0x1_00000000 - 0x1_0FFFFFFF
+     *   L1 index = 0x100000000 >> 30 = 4
+     *   Covers: UART, EMMC2, Mailbox, GENET, DMA, GIC, etc.
+     *
+     * More peripheral space: indices 4-7 (4GB peripheral window)
+     * ============================================================ */
+    for (u32 idx = 4; idx < 8; idx++) {
+        l1_table[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
     }
 
-    /* RP1 at 0x1F00000000 → L1 index = 124 */
+    /* ============================================================
+     * RP1 southbridge: 0x1_F0000000 (via PCIe BAR0)
+     *   L1 index = 0x1F0000000 >> 30 = 7 (already covered above)
+     *   But the actual mapping may be at higher addresses:
+     *   0x1F_00000000 → L1 index = 124
+     * ============================================================ */
     for (u32 idx = 124; idx < 128; idx++) {
-        u64 addr = (u64)idx * L1_BLOCK_SIZE;
-        l1_table[idx] = addr | PTE_VALID | PTE_BLOCK | PTE_AF |
-                        PTE_ATTR(MT_DEVICE_nGnRnE) |
-                        PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+        l1_table[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
     }
 
     dsb();
     isb();
 
-    /* Set MAIR */
-    __asm__ volatile("msr mair_el1, %0" :: "r"(MAIR_VALUE));
+    /* ============================================================
+     * PROGRAM SYSTEM REGISTERS
+     * ============================================================ */
 
-    /* Set TCR */
-    __asm__ volatile("msr tcr_el1, %0" :: "r"(TCR_VALUE));
+    /* Store values for secondary cores to replicate */
+    shared_ttbr0 = (u64)(usize)l1_table;
+    shared_mair  = MAIR_VALUE;
+    shared_tcr   = TCR_VALUE;
 
-    /* Set TTBR0 */
-    u64 ttbr = (u64)(usize)l1_table;
-    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(ttbr));
+    /* MAIR_EL1: memory attribute encodings */
+    __asm__ volatile("msr mair_el1, %0" :: "r"((u64)MAIR_VALUE));
 
-    /* TTBR1 unused — disable walks */
-    __asm__ volatile("msr ttbr1_el1, %0" :: "r"(0UL));
+    /* TCR_EL1: translation control */
+    __asm__ volatile("msr tcr_el1, %0" :: "r"((u64)TCR_VALUE));
 
-    /* Invalidate TLB */
-    __asm__ volatile("tlbi vmalle1" ::: "memory");
-    dsb();
-    isb();
+    /* TTBR0_EL1: base of page table hierarchy */
+    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(shared_ttbr0));
 
-    /* Enable MMU: SCTLR_EL1 bits M=1, C=1, I=1 */
+    /* TTBR1_EL1: unused, EPD1 disables walks but zero it anyway */
+    __asm__ volatile("msr ttbr1_el1, xzr");
+
+    /* Full TLB invalidate before enabling */
+    __asm__ volatile(
+        "tlbi vmalle1    \n"
+        "dsb  sy         \n"
+        "isb             \n"
+        ::: "memory"
+    );
+
+    /* ============================================================
+     * SCTLR_EL1: Enable MMU + Caches
+     *   M  (bit 0)  = 1: MMU ON
+     *   A  (bit 1)  = 1: Alignment check ON
+     *   C  (bit 2)  = 1: Data cache ON
+     *   SA (bit 3)  = 1: Stack alignment check ON
+     *   I  (bit 12) = 1: Instruction cache ON
+     *   WXN(bit 19) = 0: No write-implies-XN
+     *   EE (bit 25) = 0: Little-endian
+     * ============================================================ */
     u64 sctlr;
     __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
-    sctlr |= (1 << 0);     /* M — MMU enable */
-    sctlr |= (1 << 2);     /* C — Data cache enable */
-    sctlr |= (1 << 12);    /* I — Instruction cache enable */
-    __asm__ volatile("msr sctlr_el1, %0" :: "r"(sctlr));
-    isb();
+    sctlr |=  (1UL << 0);      /* M  — MMU enable */
+    sctlr |=  (1UL << 1);      /* A  — Alignment check */
+    sctlr |=  (1UL << 2);      /* C  — Data cache enable */
+    sctlr |=  (1UL << 3);      /* SA — Stack alignment check */
+    sctlr |=  (1UL << 12);     /* I  — Instruction cache enable */
+    sctlr &= ~(1UL << 19);     /* WXN — clear */
+    sctlr &= ~(1UL << 25);     /* EE — little-endian */
+    __asm__ volatile(
+        "msr sctlr_el1, %0  \n"
+        "isb                 \n"
+        :: "r"(sctlr)
+    );
 
-    uart_puts("[mmu] Enabled: identity map, 4KB granule, WB cacheable\n");
+    uart_puts("[mmu] SCTLR_EL1=");
+    uart_hex(sctlr);
+    uart_puts(" TTBR0_EL1=");
+    uart_hex(shared_ttbr0);
+    uart_puts("\n");
+    uart_puts("[mmu] Identity map: low mem + periph, caches ON\n");
 }
 
 void mmu_invalidate_tlb(void) {

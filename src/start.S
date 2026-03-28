@@ -14,15 +14,38 @@ _start:
     and     x0, x0, #0x3
     cbnz    x0, .Lpark          /* only core 0 continues */
 
+    /* ---- EL2 → EL1 transition ---- */
+    bl      el2_to_el1
+
+    /* ---- SCTLR_EL1: safe baseline (MMU off, caches off, alignment check on) ---- */
+    mrs     x1, sctlr_el1
+    bic     x1, x1, #(1 << 0)      /* M=0: MMU off initially */
+    bic     x1, x1, #(1 << 2)      /* C=0: data cache off initially */
+    bic     x1, x1, #(1 << 12)     /* I=0: instruction cache off initially */
+    orr     x1, x1, #(1 << 1)      /* A=1: alignment check */
+    orr     x1, x1, #(1 << 3)      /* SA=1: stack alignment check */
+    msr     sctlr_el1, x1
+    isb
+
     /* Enable NEON / FPU (CPACR_EL1 bits [21:20] = 0b11) */
     mrs     x1, cpacr_el1
     orr     x1, x1, #(3 << 20)
     msr     cpacr_el1, x1
     isb
 
-    /* Core 0: set stack */
+    /* Core 0: set SP_EL0 (main stack) */
     ldr     x1, =__stack_top_core0
     mov     sp, x1
+
+    /* Also set SP_EL1 for exception handlers (separate stack, 16KB below) */
+    ldr     x1, =__stack_top_core0
+    sub     x1, x1, #0x4000        /* 16KB below main stack */
+    msr     sp_el1, x1
+
+    /* Install exception vector table */
+    ldr     x1, =vector_table
+    msr     vbar_el1, x1
+    isb
 
     /* Clear BSS */
     ldr     x1, =__bss_start
@@ -50,36 +73,95 @@ secondary_entry:
     b.eq    .Lstack3
     b       .Lhalt
 
-.Lstack1:
-    /* Enable NEON on secondary core */
+/*
+ * Secondary core setup macro:
+ *   1. EL2→EL1 transition
+ *   2. SCTLR_EL1 safe baseline
+ *   3. NEON enable
+ *   4. Per-core SP (main + exception)
+ *   5. VBAR_EL1 (exception vectors)
+ *   6. TTBR0_EL1 (share same page tables as core 0)
+ *   7. Jump to per-core C entry
+ */
+.macro SECONDARY_SETUP core_id, stack_sym, entry_fn
+    /* Save core_id across bl */
+    mov     x19, #\core_id
+
+    /* EL2 → EL1 */
+    bl      el2_to_el1
+
+    /* SCTLR_EL1: safe baseline */
+    mrs     x1, sctlr_el1
+    bic     x1, x1, #(1 << 0)
+    bic     x1, x1, #(1 << 2)
+    bic     x1, x1, #(1 << 12)
+    orr     x1, x1, #(1 << 1)
+    orr     x1, x1, #(1 << 3)
+    msr     sctlr_el1, x1
+    isb
+
+    /* Enable NEON */
     mrs     x1, cpacr_el1
     orr     x1, x1, #(3 << 20)
     msr     cpacr_el1, x1
     isb
-    ldr     x1, =__stack_top_core1
+
+    /* Per-core SP_EL0 (main stack) */
+    ldr     x1, =\stack_sym
     mov     sp, x1
-    bl      core1_main
+
+    /* Per-core SP_EL1 (exception stack, 16KB below) */
+    sub     x1, x1, #0x4000
+    msr     sp_el1, x1
+
+    /* VBAR_EL1: same vector table as core 0 */
+    ldr     x1, =vector_table
+    msr     vbar_el1, x1
+    isb
+
+    /* TTBR0_EL1: point to shared L1 page table (set by core 0's mmu_init).
+     * We read the symbol directly — core 0 has already populated it. */
+    ldr     x1, =shared_ttbr0
+    ldr     x1, [x1]
+    msr     ttbr0_el1, x1
+
+    /* MAIR_EL1 + TCR_EL1: replicate core 0's values */
+    ldr     x1, =shared_mair
+    ldr     x1, [x1]
+    msr     mair_el1, x1
+
+    ldr     x1, =shared_tcr
+    ldr     x1, [x1]
+    msr     tcr_el1, x1
+
+    /* TLB invalidate before enabling MMU */
+    tlbi    vmalle1
+    dsb     sy
+    isb
+
+    /* Enable MMU + caches (M=1, C=1, I=1) */
+    mrs     x1, sctlr_el1
+    orr     x1, x1, #(1 << 0)
+    orr     x1, x1, #(1 << 2)
+    orr     x1, x1, #(1 << 12)
+    msr     sctlr_el1, x1
+    isb
+
+    /* Unmask IRQs (clear DAIF.I bit) */
+    msr     daifclr, #2
+
+    bl      \entry_fn
     b       .Lhalt
+.endm
+
+.Lstack1:
+    SECONDARY_SETUP 1, __stack_top_core1, core1_main
 
 .Lstack2:
-    mrs     x1, cpacr_el1
-    orr     x1, x1, #(3 << 20)
-    msr     cpacr_el1, x1
-    isb
-    ldr     x1, =__stack_top_core2
-    mov     sp, x1
-    bl      core2_main
-    b       .Lhalt
+    SECONDARY_SETUP 2, __stack_top_core2, core2_main
 
 .Lstack3:
-    mrs     x1, cpacr_el1
-    orr     x1, x1, #(3 << 20)
-    msr     cpacr_el1, x1
-    isb
-    ldr     x1, =__stack_top_core3
-    mov     sp, x1
-    bl      core3_main
-    b       .Lhalt
+    SECONDARY_SETUP 3, __stack_top_core3, core3_main
 
 .Lpark:
     wfe
