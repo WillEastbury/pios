@@ -37,20 +37,74 @@ struct process {
     u32 exit_code;
 };
 
-/* Syscall table passed to processes in x0 */
+/* Syscall table passed to processes in x0 at entry.
+ * This is the COMPLETE userland API surface.
+ * All pointers passed by userland are bounds-checked. */
 struct syscall_table {
+    /* ---- Process control ---- */
     i32 (*yield)(void);
     i32 (*exit)(u32 code);
+    u32 (*getpid)(void);
+
+    /* ---- Console I/O ---- */
+    void (*print)(const char *msg);
+    void (*putc)(char c);
+    i32  (*getc)(void);             /* blocking keyboard read */
+    i32  (*try_getc)(void);         /* non-blocking, returns -1 if none */
+
+    /* ---- Timer ---- */
+    u64 (*ticks)(void);
+    void (*sleep_ms)(u64 ms);
+    void (*sleep_us)(u64 us);
+
+    /* ---- Filesystem (WALFS via FIFO to Core 1) ---- */
     i32 (*open)(const char *path, u32 flags);
     i32 (*read)(i32 fd, void *buf, u32 len);
     i32 (*write)(i32 fd, const void *buf, u32 len);
     i32 (*close)(i32 fd);
-    void (*print)(const char *msg);
-    u64 (*ticks)(void);
+    i32 (*stat)(const char *path, void *out);  /* fills walfs_inode */
+    i32 (*mkdir)(const char *path);
+    i32 (*unlink)(const char *path);
+
+    /* ---- Framebuffer ---- */
+    void (*fb_putc)(char c);
+    void (*fb_print)(const char *s);
+    void (*fb_color)(u32 fg, u32 bg);
+    void (*fb_clear)(u32 color);
+    void (*fb_pixel)(u32 x, u32 y, u32 color);
+
+    /* ---- Networking: sockets ---- */
     i32 (*socket)(u32 type);
+    i32 (*bind)(i32 fd, u32 ip, u16 port);
     i32 (*connect)(i32 fd, u32 ip, u16 port);
+    i32 (*listen)(i32 fd, u32 backlog);
+    i32 (*accept)(i32 fd, u32 *client_ip, u16 *client_port);
     i32 (*send)(i32 fd, const void *data, u32 len);
     i32 (*recv)(i32 fd, void *buf, u32 len);
+    i32 (*sendto)(i32 fd, const void *data, u32 len, u32 ip, u16 port);
+    i32 (*recvfrom)(i32 fd, void *buf, u32 len, u32 *src_ip, u16 *src_port);
+    i32 (*sock_close)(i32 fd);
+
+    /* ---- DNS ---- */
+    i32 (*resolve)(const char *hostname, u32 *ip_out);
+
+    /* ---- Identity ---- */
+    u32 (*whoami)(void);
+    i32 (*auth)(const char *user, const char *pass);
+
+    /* ---- Memory ---- */
+    void *(*sbrk)(i32 increment);
+
+    /* ---- Tensor / GPU compute ---- */
+    i32 (*tensor_alloc)(void *t, u32 rows, u32 cols, u32 elem_size);
+    void (*tensor_free)(void *t);
+    void (*tensor_upload)(void *t, const void *data);
+    void (*tensor_download)(const void *t, void *data);
+    i32 (*tensor_matmul)(void *c, const void *a, const void *b);
+    i32 (*tensor_relu)(void *b, const void *a);
+    i32 (*tensor_softmax)(void *b, const void *a);
+    i32 (*tensor_add)(void *c, const void *a, const void *b);
+    i32 (*tensor_dot)(void *result, const void *a, const void *b);
 };
 
 /* Assembly context switch: save callee-saved regs to old, restore from new */
