@@ -1,0 +1,257 @@
+/*
+ * kernel.c - PIOS main entry point
+ *
+ * Boot flow (all on core 0):
+ *   1. UART init (debug serial)
+ *   2. Framebuffer init (HDMI text diagnostics)
+ *   3. FIFO init (inter-core messaging)
+ *   4. SD init (raw block storage)
+ *   5. GENET init (Ethernet MAC/PHY)
+ *   6. Net stack init (ARP/IP/UDP/ICMP)
+ *   7. Boot diagnostics screen
+ *   8. Start cores 1-3
+ *   9. Core 0 enters network poll loop
+ */
+
+#include "types.h"
+#include "uart.h"
+#include "fb.h"
+#include "fifo.h"
+#include "sd.h"
+#include "genet.h"
+#include "net.h"
+#include "core.h"
+#include "core_env.h"
+#include "simd.h"
+
+/* ---- libc replacements (linked globally for compiler-generated calls) ---- */
+
+void *memset(void *dst, int c, usize n) {
+    u8 *p = (u8 *)dst;
+    while (n--) *p++ = (u8)c;
+    return dst;
+}
+
+void *memcpy(void *dst, const void *src, usize n) {
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+int memcmp(const void *a, const void *b, usize n) {
+    const u8 *pa = (const u8 *)a;
+    const u8 *pb = (const u8 *)b;
+    while (n--) {
+        if (*pa != *pb) return *pa - *pb;
+        pa++; pb++;
+    }
+    return 0;
+}
+
+u32 pios_strlen(const char *s) {
+    u32 n = 0;
+    while (*s++) n++;
+    return n;
+}
+
+/* ---- Network configuration (static - no ARP/DHCP) ---- */
+
+#define MY_IP       IP4(10, 0, 0, 2)
+#define MY_GW       IP4(10, 0, 0, 1)
+#define MY_MASK     IP4(255, 255, 255, 0)
+
+/* Gateway MAC - MUST be configured (no ARP to discover it) */
+static const u8 MY_GW_MAC[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+/* ---- Core entry points ---- */
+
+/* Core 0: Network - tight poll loop */
+NORETURN void core0_main(void) {
+    struct core_env *env = core_env_of(CORE_NET);
+    for (;;) {
+        net_poll();
+        env->poll_count++;
+    }
+}
+
+/* Core 1: Disk I/O - waits for FIFO commands from user cores */
+static void disk_handle_request(u32 from_core) {
+    struct fifo_msg msg;
+    struct fifo_msg reply;
+    /* Per-core block buffer in core 1's private RAM */
+    static u8 block_buf[SD_BLOCK_SIZE] ALIGNED(64);
+
+    if (!fifo_pop(CORE_DISK, from_core, &msg))
+        return;
+
+    reply.tag = msg.tag;
+    reply.buffer = msg.buffer;
+    reply.length = SD_BLOCK_SIZE;
+
+    switch (msg.type) {
+    case MSG_DISK_READ:
+        if (sd_read_block(msg.param, block_buf)) {
+            simd_memcpy((void *)(usize)msg.buffer, block_buf, SD_BLOCK_SIZE);
+            reply.type   = MSG_DISK_DONE;
+            reply.status = 0;
+        } else {
+            reply.type   = MSG_DISK_ERROR;
+            reply.status = 1;
+        }
+        fifo_push(CORE_DISK, from_core, &reply);
+        break;
+
+    case MSG_DISK_WRITE:
+        simd_memcpy(block_buf, (void *)(usize)msg.buffer, SD_BLOCK_SIZE);
+        if (sd_write_block(msg.param, block_buf)) {
+            reply.type   = MSG_DISK_DONE;
+            reply.status = 0;
+        } else {
+            reply.type   = MSG_DISK_ERROR;
+            reply.status = 1;
+        }
+        fifo_push(CORE_DISK, from_core, &reply);
+        break;
+
+    default:
+        break;
+    }
+}
+
+NORETURN void core1_main(void) {
+    core_env_init(CORE_DISK);
+    struct core_env *env = core_env_of(CORE_DISK);
+
+    for (;;) {
+        disk_handle_request(CORE_USER0);
+        disk_handle_request(CORE_USER1);
+        env->poll_count++;
+
+        if (fifo_empty(CORE_DISK, CORE_USER0) &&
+            fifo_empty(CORE_DISK, CORE_USER1)) {
+            env->idle_count++;
+            wfe();
+        }
+    }
+}
+
+/* Core 2: User core 0 - initialise env, then idle */
+NORETURN void core2_main(void) {
+    core_env_init(CORE_USER0);
+    struct core_env *env = core_env_of(CORE_USER0);
+    for (;;) {
+        env->idle_count++;
+        wfe();
+    }
+}
+
+/* Core 3: User core 1 - initialise env, then idle */
+NORETURN void core3_main(void) {
+    core_env_init(CORE_USER1);
+    struct core_env *env = core_env_of(CORE_USER1);
+    for (;;) {
+        env->idle_count++;
+        wfe();
+    }
+}
+
+/* ---- Boot diagnostics display ---- */
+
+static void print_ip(u32 ip) {
+    fb_printf("%d.%d.%d.%d",
+        (ip >> 24) & 0xFF, (ip >> 16) & 0xFF,
+        (ip >> 8) & 0xFF, ip & 0xFF);
+}
+
+static void boot_diag(void) {
+    fb_set_color(0x0000FF00, 0x00000000);
+    fb_printf("PIOS v0.2 - Pi 5 Bare Metal Microkernel\n");
+
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("========================================\n\n");
+
+    fb_set_color(0x00FF9900, 0x00000000);
+
+    fb_printf("Core 0: Network     [16MB @ 0x%x]\n", CORE0_RAM_BASE);
+    fb_printf("Core 1: Disk I/O    [16MB @ 0x%x]\n", CORE1_RAM_BASE);
+    fb_printf("Core 2: User        [16MB @ 0x%x]\n", CORE2_RAM_BASE);
+    fb_printf("Core 3: User        [16MB @ 0x%x]\n\n", CORE3_RAM_BASE);
+
+    /* Network */
+    u8 mac[6];
+    genet_get_mac(mac);
+    fb_printf("NET:  GENET v5 + NEON checksum\n");
+    fb_printf("  IP:   ");
+    print_ip(MY_IP);
+    fb_printf(" / ");
+    print_ip(MY_MASK);
+    fb_printf("\n  GW:   ");
+    print_ip(MY_GW);
+    fb_printf("\n  PHY:  %s\n", genet_link_up() ? "Link UP" : "Link DOWN");
+    fb_printf("  Mode: HARDENED (no ARP/TCP/DHCP/frag)\n");
+    fb_printf("  ICMP: rate-limited 10/sec\n\n");
+
+    /* SD */
+    const sd_card_t *sd = sd_get_card_info();
+    if (sd->type) {
+        fb_printf("DISK: %s raw block (no FS)\n\n",
+            sd->type == 2 ? "SDHC/SDXC" : "SDSC");
+    } else {
+        fb_set_color(0x00FF0000, 0x00000000);
+        fb_printf("DISK: NOT DETECTED\n\n");
+        fb_set_color(0x00FF9900, 0x00000000);
+    }
+
+    fb_printf("FIFO: 12ch SPSC  depth=%u  msg=%u bytes\n",
+              FIFO_CAPACITY, FIFO_MSG_SIZE);
+    fb_printf("SIMD: NEON memcpy/zero/checksum + CRC32\n\n");
+
+    fb_set_color(0x0000FF00, 0x00000000);
+    fb_printf("System ready. Cores launching.\n");
+    fb_set_color(0x00FF9900, 0x00000000);
+}
+
+/* ---- Main kernel entry (runs on core 0) ---- */
+
+void kernel_main(void) {
+    /* 1. Debug serial */
+    uart_init();
+    uart_puts("\n\nPIOS v0.1 booting...\n");
+
+    /* 2. HDMI framebuffer (1280x720) */
+    if (fb_init(1280, 720)) {
+        uart_puts("[fb] Framebuffer OK\n");
+    } else {
+        uart_puts("[fb] Framebuffer FAILED\n");
+    }
+
+    /* 3. Inter-core FIFOs */
+    fifo_init_all();
+    uart_puts("[fifo] Init OK\n");
+
+    /* 4. SD card - raw block access */
+    if (!sd_init())
+        uart_puts("[sd] SD init FAILED (continuing)\n");
+
+    /* 5. Ethernet MAC */
+    if (!genet_init())
+        uart_puts("[genet] GENET init FAILED (continuing)\n");
+
+    /* 6. Network stack (static IP, static neighbor, NO ARP) */
+    net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
+
+    /* Core 0 environment */
+    core_env_init(CORE_NET);
+
+    /* 7. Boot diagnostics on HDMI */
+    boot_diag();
+
+    /* 8. Start secondary cores */
+    uart_puts("[kernel] Starting secondary cores...\n");
+    core_start_all();
+    uart_puts("[kernel] All cores running. Entering net loop.\n");
+
+    /* 9. Core 0 -> network poll loop (never returns) */
+    core0_main();
+}

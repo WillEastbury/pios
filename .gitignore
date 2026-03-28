@@ -1,0 +1,11 @@
+# Build artifacts
+build/
+*.o
+*.elf
+*.img
+
+# IDE / Editor
+.vscode/
+*.swp
+*.swo
+*~
