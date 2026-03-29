@@ -13,9 +13,16 @@ typedef enum {
     V3D_STATUS_NOT_IMPLEMENTED = -5,
 } v3d_status_t;
 
+typedef enum {
+    V3D_BACKEND_AUTO = 0,
+    V3D_BACKEND_MAILBOX = 1,
+    V3D_BACKEND_MMIO_CSD = 2,
+} v3d_backend_t;
+
 struct v3d_caps {
     bool mailbox_qpu;
     bool mmio_probe_ok;
+    bool mmio_csd;
     bool dispatch_supported;
     u64 reg_base;
     u32 ident0;
@@ -28,6 +35,7 @@ struct v3d_dispatch_cfg {
     u32 control_list_bus;
     bool noflush;
     u32 timeout_ms;
+    v3d_backend_t backend;
 };
 
 void v3d_init(void);

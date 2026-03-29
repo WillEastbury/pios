@@ -494,6 +494,7 @@ bool qpu_dispatch(const qpu_program_t *prog, struct qpu_job *jobs,
         cfg.control_list_bus = control_bus;
         cfg.noflush = false;
         cfg.timeout_ms = 25;
+        cfg.backend = V3D_BACKEND_AUTO;
         ok = (v3d_dispatch_compute(&cfg) == V3D_STATUS_OK);
     } else {
         ok = qpu_execute(num_qpus, control_bus, false);
