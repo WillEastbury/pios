@@ -6,8 +6,10 @@
  */
 
 #include "gpu.h"
+#include "dma.h"
 #include "mailbox.h"
 #include "mmio.h"
+#include "mmu.h"
 #include "uart.h"
 
 /* Mailbox property tags for GPU operations */
@@ -141,20 +143,16 @@ bool qpu_execute(u32 num_qpus, u32 control, bool noflush) {
 /* ---- GPU DMA Copy ---- */
 
 bool gpu_dma_copy(u32 dst_bus, u32 src_bus, u32 len) {
-    /*
-     * There's no direct "DMA copy" mailbox tag. Instead we use
-     * the VPU execute path with a tiny VC program that does:
-     *   memcpy(r0, r1, r2); return 0;
-     *
-     * The VPU firmware has a built-in memcpy at well-known addresses.
-     * For now, we fall back to reporting this as unsupported and
-     * the caller should use BCM2712 DMA instead.
-     *
-     * This stub exists so the API is ready when we have the VC
-     * firmware entry point mapped.
-     */
-    (void)dst_bus;
-    (void)src_bus;
-    (void)len;
-    return false;
+    if (len == 0) return true;
+    u64 src_pa = (u64)(src_bus & 0x3FFFFFFFU);
+    u64 dst_pa = (u64)(dst_bus & 0x3FFFFFFFU);
+    if (src_pa == 0 || dst_pa == 0)
+        return false;
+
+    dcache_clean_range(src_pa, len);
+    dcache_clean_invalidate_range(dst_pa, len);
+    if (!dma_memcpy(DMA_CHAN_GPU, (void *)(usize)dst_pa, (const void *)(usize)src_pa, len))
+        return false;
+    dcache_invalidate_range(dst_pa, len);
+    return true;
 }

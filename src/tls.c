@@ -1,5 +1,6 @@
 #include "tls.h"
 #include "crypto.h"
+#include "principal.h"
 #include "simd.h"
 #include "timer.h"
 
@@ -33,10 +34,6 @@ struct tls_conn_state {
 };
 
 static struct tls_conn_state tls_conns[TLS_MAX_CONNECTIONS];
-
-/* PSK placeholder for issue #19 minimal channel.
- * TODO(issue #19): Replace with per-principal secret provisioning. */
-static const u8 tls_psk[] = "PIOS_TLS_PSK_v1";
 
 static inline u16 load_be16(const u8 *p) {
     return (u16)(((u16)p[0] << 8) | (u16)p[1]);
@@ -130,7 +127,9 @@ static bool tls_derive_keys(struct tls_conn_state *c,
     u8 transcript_hash[32];
     u8 prk[32];
     u8 keymat[(TLS_KEY_LEN + TLS_IV_LEN) * 2];
+    u8 psk[32];
     u8 role = c->is_client ? 0x43 : 0x53;
+    u32 pid = principal_current();
 
     if (!c || !ch || !sh) return false;
 
@@ -139,7 +138,9 @@ static bool tls_derive_keys(struct tls_conn_state *c,
     transcript[64] = role;
     sha256(transcript, sizeof(transcript), transcript_hash);
 
-    hkdf_extract(tls_psk, (u32)(sizeof(tls_psk) - 1), transcript_hash, sizeof(transcript_hash), prk);
+    if (!principal_tls_psk(pid, psk, sizeof(psk)))
+        return false;
+    hkdf_extract(psk, sizeof(psk), transcript_hash, sizeof(transcript_hash), prk);
     hkdf_expand(prk, sizeof(prk), (const u8 *)"PIOS-TLS-KEYMAT", 14, keymat, sizeof(keymat));
 
     if (c->is_client) {

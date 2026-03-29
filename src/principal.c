@@ -227,6 +227,41 @@ bool principal_set_password(const char *name, const char *pass)
     return flush_principals();
 }
 
+bool principal_tls_psk(u32 id, u8 *out, u32 out_len)
+{
+    if (!out || out_len == 0) return false;
+    const struct principal *p = NULL;
+    for (u32 i = 0; i < principal_count; i++) {
+        if (principals[i].id == id) {
+            p = &principals[i];
+            break;
+        }
+    }
+    if (!p) return false;
+
+    struct {
+        u32 id;
+        u32 flags;
+        u8  secret_hash[4];
+        u32 ctr;
+        u32 domain;
+    } PACKED seed;
+    seed.id = p->id;
+    seed.flags = p->flags;
+    for (u32 i = 0; i < 4; i++) seed.secret_hash[i] = p->secret_hash[i];
+    seed.domain = 0x50494F53U; /* "PIOS" */
+
+    for (u32 off = 0; off < out_len; off += 4) {
+        seed.ctr = off / 4;
+        u32 v = hw_crc32c(&seed, sizeof(seed));
+        out[off + 0] = (u8)v;
+        if (off + 1 < out_len) out[off + 1] = (u8)(v >> 8);
+        if (off + 2 < out_len) out[off + 2] = (u8)(v >> 16);
+        if (off + 3 < out_len) out[off + 3] = (u8)(v >> 24);
+    }
+    return true;
+}
+
 bool principal_root_present(void)
 {
     return find_by_name("root") >= 0;
