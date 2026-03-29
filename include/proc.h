@@ -161,6 +161,10 @@ struct syscall_table {
     i32 (*tensor_softmax)(void *b, const void *a);
     i32 (*tensor_add)(void *c, const void *a, const void *b);
     i32 (*tensor_dot)(void *result, const void *a, const void *b);
+    i32 (*tensor_mul)(void *c, const void *a, const void *b);
+    i32 (*tensor_scale)(void *b, const void *a, float scalar);
+    i32 (*tensor_bind_kernel_blob)(u32 kernel_id, const void *uniform_data, u32 uniform_bytes,
+                                   const u64 *shader_code, u32 shader_insts);
 };
 
 /* Assembly context switch: save callee-saved regs to old, restore from new */

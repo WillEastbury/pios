@@ -14,6 +14,7 @@
 #include "usb_kbd.h"
 #include "dns.h"
 #include "tensor.h"
+#include "v3d.h"
 #include "fifo.h"
 #include "mmu.h"
 #include "ipc_queue.h"
@@ -175,6 +176,10 @@ static i32   sys_tensor_relu(void *b, const void *a);
 static i32   sys_tensor_softmax(void *b, const void *a);
 static i32   sys_tensor_add(void *c, const void *a, const void *b);
 static i32   sys_tensor_dot(void *result, const void *a, const void *b);
+static i32   sys_tensor_mul(void *c, const void *a, const void *b);
+static i32   sys_tensor_scale(void *b, const void *a, float scalar);
+static i32   sys_tensor_bind_kernel_blob(u32 kernel_id, const void *uniform_data, u32 uniform_bytes,
+                                         const u64 *shader_code, u32 shader_insts);
 static void  proc_tick_hook(u32 core, u64 tick);
 static void  proc_preempt_trampoline(void);
 
@@ -280,6 +285,9 @@ static struct syscall_table syscall_tab = {
     .tensor_softmax  = sys_tensor_softmax,
     .tensor_add      = sys_tensor_add,
     .tensor_dot      = sys_tensor_dot,
+    .tensor_mul      = sys_tensor_mul,
+    .tensor_scale    = sys_tensor_scale,
+    .tensor_bind_kernel_blob = sys_tensor_bind_kernel_blob,
 };
 
 static u8 *core_ram_base(void)
@@ -1357,4 +1365,28 @@ static i32 sys_tensor_dot(void *result, const void *a, const void *b)
 {
     if (!ptr_valid(result, sizeof(float))) return -1;
     return tensor_dot((float *)result, (const tensor_t *)a, (const tensor_t *)b) ? 0 : -1;
+}
+
+static i32 sys_tensor_mul(void *c, const void *a, const void *b)
+{
+    return tensor_mul((tensor_t *)c, (const tensor_t *)a, (const tensor_t *)b) ? 0 : -1;
+}
+
+static i32 sys_tensor_scale(void *b, const void *a, float scalar)
+{
+    return tensor_scale((tensor_t *)b, (const tensor_t *)a, scalar) ? 0 : -1;
+}
+
+static i32 sys_tensor_bind_kernel_blob(u32 kernel_id, const void *uniform_data, u32 uniform_bytes,
+                                       const u64 *shader_code, u32 shader_insts)
+{
+    if (!has_cap(PRINCIPAL_ADMIN)) return -1;
+    if (uniform_bytes == 0 || shader_insts == 0) return -1;
+    if (!ptr_valid(uniform_data, uniform_bytes)) return -1;
+    u64 shader_bytes = (u64)shader_insts * 8U;
+    if (shader_bytes > 0xFFFFFFFFU) return -1;
+    if (!ptr_valid(shader_code, (u32)shader_bytes)) return -1;
+    return (i32)v3d_kernel_bind_blob((v3d_kernel_id_t)kernel_id,
+                                     uniform_data, uniform_bytes,
+                                     shader_code, shader_insts);
 }
