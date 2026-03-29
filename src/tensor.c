@@ -124,6 +124,21 @@ static bool tensor_any_bound_v3d_kernel(void)
     return false;
 }
 
+static bool tensor_verify_add_sample(const float *c, const float *a,
+                                     const float *b, u32 n)
+{
+    u32 sample = (n < 16U) ? n : 16U;
+    for (u32 i = 0; i < sample; i++) {
+        float expected = a[i] + b[i];
+        float diff = c[i] - expected;
+        if (diff < 0.0f)
+            diff = -diff;
+        if (diff > 0.0001f)
+            return false;
+    }
+    return true;
+}
+
 /* ---- Tensor lifecycle ---- */
 
 bool tensor_alloc(tensor_t *t, u32 rows, u32 cols, u32 elem_size) {
@@ -375,8 +390,18 @@ bool tensor_add(tensor_t *c, const tensor_t *a, const tensor_t *b) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n || c->rows * c->cols != n) return false;
 
-    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_ADD, n))
-        return true;
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_ADD, n)) {
+        if (tensor_verify_add_sample((const float *)c->arm_ptr,
+                                     (const float *)a->arm_ptr,
+                                     (const float *)b->arm_ptr, n))
+            return true;
+
+        v3d_kernel_disabled[V3D_KERNEL_ADD] = true;
+        if (!v3d_kernel_warned[V3D_KERNEL_ADD]) {
+            uart_puts("[tensor] disable V3D add kernel: verification mismatch\n");
+            v3d_kernel_warned[V3D_KERNEL_ADD] = true;
+        }
+    }
     neon_vec_add_f32((float *)c->arm_ptr,
                      (const float *)a->arm_ptr,
                      (const float *)b->arm_ptr, n);

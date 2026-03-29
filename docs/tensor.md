@@ -8,6 +8,8 @@ By default, operations run on the ARM Cortex-A76 using 128-bit NEON SIMD (4 floa
 
 V3D attempts are also gated by operation-size thresholds (to avoid offload overhead on tiny work units), and a kernel is quarantined after a failed dispatch so repeated calls do not get stuck in timeout-heavy retry loops.
 
+For `tensor_add`, successful V3D dispatch is additionally sample-verified against CPU math; any mismatch immediately quarantines that kernel and the call falls back to NEON.
+
 When backend selection is `AUTO`, MMIO CSD dispatch is attempted first; if it times out/fails while mailbox QPU is available, MMIO is quarantined for subsequent AUTO dispatches and mailbox becomes the stable fast fallback path.
 
 MMIO CSD submission now performs an idle handshake before queue programming and uses memory barriers around queue-kick/completion visibility.
