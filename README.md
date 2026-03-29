@@ -31,7 +31,7 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 | Feature | Description |
 |---------|-------------|
 | **4-Core Architecture** | Core 0=Network, Core 1=Disk, Core 2-3=User. Each core has 16MB private RAM. |
-| **Hardened Network Stack** | IP/UDP/ICMP/ARP. No TCP (yet). No fragmentation. Rate-limited ICMP. Source IP validation. |
+| **Hardened Network Stack** | IP/TCP/UDP/ICMP/ARP with strict ingress validation and no fragmentation. |
 | **Raw Block Storage** | SDHCI driver for SD/eMMC. Pure LBA addressing, no filesystem. |
 | **HDMI Boot Console** | 1280×720 framebuffer with 8×8 bitmap font, `fb_printf()`. |
 | **UART Serial I/O** | PL011 TX+RX at 115200 baud. Line editing with backspace. |
@@ -137,7 +137,7 @@ PIOS v0.2 booting...
 [fifo] Init OK
 [sd] Card ready: SDHC/SDXC RCA=0x...
 [genet] Link UP
-[net] Hardened stack: IP=0x0A000002 (NO ARP/TCP/DHCP)
+[net] Hardened stack: IP=0x0A000002 (ARP hardened, TCP/UDP, NO DHCP)
 [dma] 6 channels initialised
 [mmu] Enabled: identity map, 4KB granule, WB cacheable
 [gic] GIC-400 initialised
@@ -257,7 +257,7 @@ The network stack is hardened by omission:
 | Attack Vector | Status | Why |
 |--------------|--------|-----|
 | ARP spoofing | **Immune** | Static neighbor table, no dynamic ARP |
-| SYN floods | **Immune** | No TCP |
+| SYN floods | **Mitigated** | SYN cookies + backlog limits + strict validation |
 | IP fragmentation attacks | **Immune** | All fragments dropped |
 | Source-routing | **Immune** | IP options rejected (IHL must be 5) |
 | Ping floods | **Mitigated** | ICMP rate-limited to 10/sec |
@@ -267,6 +267,14 @@ The network stack is hardened by omission:
 
 Every dropped packet increments a specific counter (17 drop reason categories)
 accessible via `net_get_stats()`.
+
+### Performance Methodology
+
+The network/runtime path follows three rules:
+
+- **Fast path first**: keep the hot path branch-light and cache-friendly (SPSC FIFO, fixed-size rings, burst send, SIMD primitives).
+- **Offload where deterministic**: use ARMv8.2-A NEON + CRC32 instructions and hardware assist (GENET checksum, DMA) when behavior is explicit and verifiable.
+- **Fail closed**: validate early, drop fast, and preserve deterministic fallback behavior when hardware/offload paths are unavailable.
 
 ### Tensor / ML Compute
 

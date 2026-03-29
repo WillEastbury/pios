@@ -137,6 +137,23 @@ static u32 ring_peek_at(const struct ring_buf *r, u32 offset, void *dst, u32 len
     return len;
 }
 
+/* Copy from ring at offset without temporary segment buffer. */
+static u32 ring_copy_from_offset(const struct ring_buf *r, u32 offset, void *dst, u32 len) {
+    u32 avail = ring_used(r);
+    if (offset >= avail) return 0;
+    if (len > avail - offset) len = avail - offset;
+    u8 *d = (u8 *)dst;
+    u32 pos = r->tail + offset;
+    u32 idx = pos & (TCP_BUF_SIZE - 1);
+    u32 first = TCP_BUF_SIZE - idx;
+    if (first > len) first = len;
+    dmb();
+    simd_memcpy(d, r->data + idx, first);
+    if (len > first)
+        simd_memcpy(d + first, r->data, len - first);
+    return len;
+}
+
 /* Discard n bytes from front of buffer */
 static void ring_consume(struct ring_buf *r, u32 n) {
     u32 avail = ring_used(r);
@@ -409,6 +426,53 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     genet_send(tx_frame, frame_len);
 }
 
+static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
+                                        u32 tx_off, u32 data_len) {
+    const u8 *dst_mac = arp_resolve(t->remote_ip);
+    if (unlikely(!dst_mac)) return;
+
+    u16 tcp_len = TCP_HDR_SIZE + data_len;
+    u16 ip_total = IP_HDR_SIZE + tcp_len;
+    u32 frame_len = ETH_HDR_SIZE + ip_total;
+    if (frame_len > MAX_FRAME) return;
+
+    struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
+    simd_memcpy(eth->dst, dst_mac, 6);
+    simd_memcpy(eth->src, tcp_local_mac, 6);
+    eth->ethertype = htons(ETH_P_IP);
+
+    struct ip_hdr *ip = (struct ip_hdr *)(tx_frame + ETH_HDR_SIZE);
+    ip->ver_ihl    = 0x45;
+    ip->tos        = 0;
+    ip->total_len  = htons(ip_total);
+    ip->id         = htons(tcp_ip_id++);
+    ip->flags_frag = htons(0x4000);
+    ip->ttl        = 64;
+    ip->protocol   = IP_PROTO_TCP;
+    ip->checksum   = 0;
+    ip->src_ip     = htonl(t->local_ip);
+    ip->dst_ip     = htonl(t->remote_ip);
+    ip->checksum   = simd_checksum(ip, IP_HDR_SIZE);
+
+    struct tcp_hdr *tcp = (struct tcp_hdr *)(tx_frame + ETH_HDR_SIZE + IP_HDR_SIZE);
+    tcp->src_port  = htons(t->local_port);
+    tcp->dst_port  = htons(t->remote_port);
+    tcp->seq       = htonl(t->snd_nxt);
+    tcp->ack       = htonl(t->rcv_nxt);
+    tcp->data_off  = (TCP_HDR_SIZE / 4) << 4;
+    tcp->flags     = flags;
+    tcp->window    = htons((u16)min32(t->rcv_wnd, 0xFFFF));
+    tcp->checksum  = 0;
+    tcp->urgent    = 0;
+
+    if (data_len > 0)
+        ring_copy_from_offset(&t->tx_buf, tx_off, tx_frame + TCP_OVERHEAD, data_len);
+
+    tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
+    if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
+    genet_send(tx_frame, frame_len);
+}
+
 /* Send a raw RST/ACK without a TCB (for rejecting unexpected segments) */
 static void tcp_send_rst(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port,
                          u32 seq, u32 ack) {
@@ -539,43 +603,41 @@ static void tcp_output(struct tcb *t) {
         t->state != TCP_CLOSE_WAIT)
         return;
 
-    /* Effective send window */
-    u32 eff_wnd = min32(t->snd_wnd, t->cwnd);
-    u32 in_flight = t->snd_nxt - t->snd_una;
-    if (in_flight >= eff_wnd) return;
-    u32 can_send = eff_wnd - in_flight;
+    bool sent_any = false;
+    for (u32 burst = 0; burst < 4; burst++) {
+        u32 eff_wnd = min32(t->snd_wnd, t->cwnd);
+        u32 in_flight = t->snd_nxt - t->snd_una;
+        if (in_flight >= eff_wnd) break;
+        u32 can_send = eff_wnd - in_flight;
 
-    u32 buffered = ring_used(&t->tx_buf);
-    /* Data in buffer that hasn't been sent yet */
-    u32 unsent_off = t->snd_nxt - t->snd_una;
-    if (unsent_off >= buffered) return;
-    u32 unsent = buffered - unsent_off;
+        u32 buffered = ring_used(&t->tx_buf);
+        u32 unsent_off = t->snd_nxt - t->snd_una;
+        if (unsent_off >= buffered) break;
+        u32 unsent = buffered - unsent_off;
 
-    u32 to_send = min32(unsent, can_send);
-    to_send = min32(to_send, TCP_MSS);
-    if (to_send == 0) return;
+        u32 to_send = min32(unsent, can_send);
+        to_send = min32(to_send, TCP_MSS);
+        if (to_send == 0) break;
 
-    u8 seg_data[TCP_MSS];
-    u32 got = ring_peek_at(&t->tx_buf, unsent_off, seg_data, to_send);
-    if (got == 0) return;
+        if (!t->rtt_active) {
+            t->rtt_seq    = t->snd_nxt;
+            t->rtt_start  = timer_ticks();
+            t->rtt_active = true;
+        }
 
-    /* Start RTT measurement on this segment if not already timing one */
-    if (!t->rtt_active) {
-        t->rtt_seq    = t->snd_nxt;
-        t->rtt_start  = timer_ticks();
-        t->rtt_active = true;
+        u8 flags = TCP_ACK;
+        if (to_send >= unsent)
+            flags |= TCP_PSH;
+
+        tcp_send_segment_from_txbuf(t, flags, unsent_off, to_send);
+        t->snd_nxt += to_send;
+        sent_any = true;
+
+        if (to_send < TCP_MSS)
+            break;
     }
-
-    u8 flags = TCP_ACK;
-    if (got < unsent && ring_free(&t->tx_buf) > 0) {
-        /* More data buffered, don't push yet */
-    } else {
-        flags |= TCP_PSH;
-    }
-
-    tcp_send_segment(t, flags, seg_data, got);
-    t->snd_nxt += got;
-    tcp_arm_rto(t);
+    if (sent_any)
+        tcp_arm_rto(t);
 }
 
 static void tcp_retransmit(struct tcb *t) {
@@ -597,12 +659,10 @@ static void tcp_retransmit(struct tcb *t) {
 
     /* Retransmit from snd_una */
     u32 len = min32(buffered, TCP_MSS);
-    u8 seg_data[TCP_MSS];
-    ring_peek_at(&t->tx_buf, 0, seg_data, len);
 
     u32 saved_nxt = t->snd_nxt;
     t->snd_nxt = t->snd_una;
-    tcp_send_segment(t, TCP_ACK | TCP_PSH, seg_data, len);
+    tcp_send_segment_from_txbuf(t, TCP_ACK | TCP_PSH, 0, len);
     t->snd_nxt = saved_nxt;
     if (seq_lt(t->snd_una + len, t->snd_nxt))
         ; /* snd_nxt stays */

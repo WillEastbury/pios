@@ -114,6 +114,7 @@ static bool icmp_rate_ok(void) {
 
 static void handle_icmp(const u8 *frame, u32 len,
                         struct ip_hdr *ip, u32 payload_off) {
+    (void)len;
     u16 ipt = ntohs(ip->total_len);
     if (ipt < 20 + sizeof(struct icmp_hdr)) return;
     u32 icmp_len = ipt - 20;
@@ -481,6 +482,11 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     /* Init socket layer */
     socket_init();
 
+    /* Enable safe NIC checksum assist paths by default. */
+    genet_set_rx_checksum_offload(true);
+    genet_set_tx_checksum_offload(true);
+    genet_set_tso(false);
+
     net_maint_queued = false;
     timer_set_tick_hook(net_tick_hook);
 
@@ -495,7 +501,7 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     uart_hex(ip);
     uart_puts(" GW=");
     uart_hex(gateway);
-    uart_puts(" (ARP hardened, NO TCP/DHCP)\n");
+    uart_puts(" (ARP hardened, TCP/UDP, NO DHCP)\n");
 
     /* Announce our presence on the network */
     arp_announce();

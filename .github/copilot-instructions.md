@@ -75,9 +75,14 @@ Each driver is one `.c` + one `.h`. They talk directly to MMIO registers via `mm
 - **GIC** (`gic.c`) — GIC-400 distributor + CPU interface.
 - **MMU** (`mmu.c`) — Page tables, SCTLR/TTBR0/MAIR/TCR setup, cache ops.
 
-### Network Stack Security Model
+### Network Stack Security + Performance Model
 
-The network stack (`net.c`) is **hardened by omission**: no ARP, no TCP, no DHCP, no fragmentation, no IP options. Static neighbor table only. Every received packet passes through strict validation before dispatch. There are 17 distinct drop-reason counters. When adding network features, maintain this paranoid validation posture — validate early, drop fast, never trust wire data.
+The network stack (`net.c`) is hardened with strict ingress validation (drop fast, reject fragmentation/options, validate checksums and source addressing) plus minimal trusted feature scope (static neighbor table, no DHCP). TCP/UDP are supported, and all new features must preserve deterministic behavior and explicit failure modes.
+
+Methodology for network/runtime changes:
+- Keep hot paths cache-friendly and branch-light.
+- Prefer ARMv8.2-A hardware acceleration (NEON, CRC32, DMA, validated NIC assists) when behavior is explicit.
+- Maintain behavior-safe fallbacks and avoid hidden “success-shaped” paths.
 
 ## Conventions
 

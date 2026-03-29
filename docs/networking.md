@@ -23,8 +23,11 @@ EtherType Dispatch
     │             ├── ICMP (proto 1)
     │             │   └── Echo request → rate-limited reply
     │             │
-    │             └── UDP (proto 17)
-    │                 └── Validate length → callback
+    │             ├── UDP (proto 17)
+    │             │   └── Validate length → callback
+    │             │
+    │             └── TCP (proto 6)
+    │                 └── RFC793 state machine + SYN cookies
     │
     └── anything else → drop silently
 ```
@@ -44,7 +47,7 @@ The stack is **secure by omission**. Features that aren't implemented can't be a
 | IP options (IHL > 5) | `drop_ip_options` | Source routing, record route, etc. |
 | Bad source IP | `drop_bad_src` | 0.0.0.0, broadcast, self, loopback, multicast |
 | Not our IP | `drop_not_for_us` | Wrong destination |
-| Unknown protocol | `drop_bad_proto` | Anything not ICMP/UDP |
+| Unknown protocol | `drop_bad_proto` | Anything not ICMP/UDP/TCP |
 | ICMP too fast | `drop_icmp_ratelimit` | >10 pings/sec |
 | UDP length mismatch | `drop_udp_malformed` | Header says more bytes than frame contains |
 | No neighbor MAC | `drop_no_neighbor` | Can't resolve next-hop (static table miss) |
@@ -73,6 +76,15 @@ net_send_udp(dst_ip, src_port, dst_port, data, len)
     ├── Build Ethernet header
     └── genet_send(frame)
 ```
+
+## TCP Send Fast Path (chimney-style)
+
+Core 0 TCP TX now uses a burst send path that segments directly from the per-connection ring buffer into the NIC frame buffer (avoiding an intermediate stack segment copy).
+
+- Sends up to 4 MSS segments per output pass when window/cwnd permit.
+- Uses direct ring-offset copy into wire frame payload.
+- Keeps retransmit path on the same direct-copy routine.
+- Enables validated GENET checksum assist by default while preserving software checksum correctness.
 
 ## FIFO Integration
 
