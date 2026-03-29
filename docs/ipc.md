@@ -129,3 +129,13 @@ Persistence hooks:
 
 - Queue/topic objects support optional persistence flags plus `flush` APIs internally
 - Current build ships safe WALFS-path stubs (`/var/ipc/queues`, `/var/ipc/topics`) that return explicit unsupported when durability is requested
+
+## Kernel Deferred Execution + Semaphores (Issue #22)
+
+- **Kernel semaphores (`ksem`)** are bounded, core-owned objects (`KSEM_MAX_PER_CORE=16`) with `create`, `wait`, `trywait`, and `post`.
+- IDs encode owner core + slot; operations are intentionally owner-core only for lock-free multicore safety without atomics.
+- User ABI remains `sem_create/sem_wait/sem_post`; `trywait` is kernel-internal for now.
+
+- **Per-core work queues (`workq`)** are bounded rings (`WORKQ_DEPTH=64`) storing `function + context`.
+- `workq_enqueue()` is IRQ-safe on the local core (DAIF-masked ring update), and `workq_drain()` runs at safe loop drain points.
+- Network maintenance (`arp_tick`/`tcp_tick`) is now timer-IRQ scheduled and deferred to the Core 0 work queue, so IRQ context does no blocking maintenance work.

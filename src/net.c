@@ -17,6 +17,7 @@
 #include "core.h"
 #include "uart.h"
 #include "timer.h"
+#include "workq.h"
 
 /* ---- Network state ---- */
 
@@ -50,6 +51,27 @@ static u8 rx_frame[2048] ALIGNED(64);
 static u8 tx_frame[2048] ALIGNED(64);
 
 static u16 ip_id_counter;
+static volatile bool net_maint_queued;
+
+static void net_maintenance_work(void *ctx)
+{
+    (void)ctx;
+    arp_tick();
+    tcp_tick();
+    net_maint_queued = false;
+}
+
+static void net_tick_hook(u32 core, u64 tick)
+{
+    if (core != CORE_NET)
+        return;
+    if ((tick % 100U) != 0)
+        return;
+    if (net_maint_queued)
+        return;
+    if (workq_enqueue(CORE_NET, net_maintenance_work, NULL))
+        net_maint_queued = true;
+}
 
 /* ================================================================== */
 /*  Static neighbor table                                              */
@@ -426,16 +448,7 @@ void net_poll(void) {
 
     net_handle_fifo_request();
 
-    /* Timer-gate slow maintenance tasks (~10Hz, not every packet) */
-    {
-        static u64 last_tick;
-        u64 now = timer_ticks();
-        if (now - last_tick >= 100) { /* every 100ms */
-            last_tick = now;
-            arp_tick();
-            tcp_tick();
-        }
-    }
+    workq_drain(4);
 }
 
 void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
@@ -467,6 +480,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
 
     /* Init socket layer */
     socket_init();
+
+    net_maint_queued = false;
+    timer_set_tick_hook(net_tick_hook);
 
     /* Init TLS wrapper subsystem */
     tls_init();

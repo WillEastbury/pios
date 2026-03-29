@@ -47,6 +47,8 @@
 #include "ipc_stream.h"
 #include "pipe.h"
 #include "setup.h"
+#include "ksem.h"
+#include "workq.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -95,6 +97,7 @@ NORETURN void core0_main(void) {
     struct core_env *env = core_env_of(CORE_NET);
     for (;;) {
         net_poll();
+        workq_drain(8);
         env->poll_count++;
     }
 }
@@ -145,6 +148,8 @@ static void disk_handle_request(u32 from_core) {
 
 NORETURN void core1_main(void) {
     core_env_init(CORE_DISK);
+    ksem_init_core();
+    workq_init_core();
     struct core_env *env = core_env_of(CORE_DISK);
 
     for (;;) {
@@ -152,6 +157,7 @@ NORETURN void core1_main(void) {
         disk_handle_request(CORE_USER1);
         walfs_handle_fifo(CORE_USER0);
         walfs_handle_fifo(CORE_USER1);
+        workq_drain(8);
         env->poll_count++;
 
         if (fifo_empty(CORE_DISK, CORE_USER0) &&
@@ -320,6 +326,8 @@ void kernel_main(void) {
 
     /* Core 0 environment */
     core_env_init(CORE_NET);
+    ksem_init_core();
+    workq_init_core();
 
     /* Module system */
     module_init();

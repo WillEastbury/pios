@@ -20,6 +20,8 @@
 #include "ipc_stream.h"
 #include "pipe.h"
 #include "exception.h"
+#include "ksem.h"
+#include "workq.h"
 
 #define CORE_DISK  1
 
@@ -72,10 +74,6 @@ static bool has_cap(u32 cap) {
 static bool has_disk_cap(void) { return has_cap(PRINCIPAL_DISK); }
 static bool has_net_cap(void)  { return has_cap(PRINCIPAL_NET); }
 static bool has_ipc_cap(void)  { return has_cap(PRINCIPAL_IPC); }
-
-/* ---- Semaphore state ---- */
-#define MAX_SEMS 8
-static struct { bool used; volatile i32 count; } sems[MAX_SEMS];
 
 /* ---- Forward declarations ---- */
 static i32   sys_yield(void);
@@ -308,6 +306,8 @@ void proc_init(void)
         preempt_quantum_ticks[uc] = 1;
         preempt_count_core[uc] = 0;
     }
+    ksem_init_core();
+    workq_init_core();
     mmu_switch_to_kernel();
 }
 
@@ -436,6 +436,7 @@ void proc_schedule(void)
     uart_putc('\n');
 
     for (;;) {
+        workq_drain(8);
         bool found = false;
 
         for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
@@ -474,8 +475,10 @@ void proc_schedule(void)
             principal_set_current(PRINCIPAL_ROOT);
         }
 
-        if (!found)
+        if (!found) {
+            workq_drain(8);
             wfe();
+        }
     }
 }
 
@@ -1005,30 +1008,26 @@ static u32 sys_nprocs(void) { return proc_count(); }
 
 static i32 sys_sem_create(u32 initial)
 {
-    for (u32 i = 0; i < MAX_SEMS; i++) {
-        if (!sems[i].used) {
-            sems[i].used = true;
-            sems[i].count = (i32)initial;
-            return (i32)i;
-        }
-    }
-    return -1;
+    /* User ABI remains create/wait/post. trywait is kernel-internal for now. */
+    return ksem_create(initial, 0x7FFFFFFFU);
 }
 
 static i32 sys_sem_wait(i32 id)
 {
-    if (id < 0 || id >= MAX_SEMS || !sems[id].used) return -1;
-    while (sems[id].count <= 0)
+    for (;;) {
+        i32 r = ksem_trywait(id);
+        if (r == KSEM_OK)
+            return 0;
+        if (r != KSEM_WOULD_BLOCK)
+            return -1;
         proc_yield();
-    sems[id].count--;
-    return 0;
+    }
 }
 
 static i32 sys_sem_post(i32 id)
 {
-    if (id < 0 || id >= MAX_SEMS || !sems[id].used) return -1;
-    sems[id].count++;
-    return 0;
+    i32 r = ksem_post(id);
+    return (r == KSEM_OK) ? 0 : -1;
 }
 
 /* ---- In-memory IPC ---- */
