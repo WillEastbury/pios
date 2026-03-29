@@ -13,10 +13,8 @@
 /* ---- Hash ---- */
 
 static u32 hash_key(const u8 *key, u32 len) {
-    u32 h = 5381;
-    for (u32 i = 0; i < len; i++)
-        h = ((h << 5) + h) + key[i];
-    return h & (LRU_HASH_BUCKETS - 1);
+    /* Use hardware CRC32C for speed — one instruction for ≤8 byte keys */
+    return hw_crc32c(key, len) & (LRU_HASH_BUCKETS - 1);
 }
 
 static bool key_eq(const struct lru_entry *e, const u8 *key, u32 len) {

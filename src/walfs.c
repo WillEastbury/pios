@@ -36,6 +36,15 @@ static u64 next_inode;
 static u64 next_seq;
 static bool mounted;
 
+/* Transaction recovery: seq range of an uncommitted TX_BEGIN (0 = none) */
+static u64 uncommitted_tx_start;
+static u64 uncommitted_tx_end;
+
+static inline bool is_uncommitted(u64 seq) {
+    return uncommitted_tx_start != 0 &&
+           seq >= uncommitted_tx_start && seq <= uncommitted_tx_end;
+}
+
 static u8 ALIGNED(64) iobuf[SD_BLOCK_SIZE];
 static u8 ALIGNED(64) rec_buf[sizeof(struct wal_record) +
                                sizeof(struct walfs_data) + WALFS_DATA_MAX];
@@ -231,7 +240,8 @@ static bool is_deleted(u64 inode_id)
     u64 cached_pos;
     if (icache_get(inode_id, &cached_pos)) {
         struct wal_record hdr;
-        if (wal_read(cached_pos, &hdr, sizeof(hdr)) && wal_rec_valid(&hdr)) {
+        if (wal_read(cached_pos, &hdr, sizeof(hdr)) && wal_rec_valid(&hdr) &&
+            !is_uncommitted(hdr.seq)) {
             if (hdr.type == RECORD_DELETE) return true;
             if (hdr.type == RECORD_INODE) {
                 struct walfs_inode ino;
@@ -251,6 +261,7 @@ static bool is_deleted(u64 inode_id)
     while (pos < super.wal_head) {
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
         if (!wal_rec_valid(&hdr)) break;
+        if (is_uncommitted(hdr.seq)) { pos += hdr.length; continue; }
         if (hdr.type == RECORD_DELETE) {
             struct walfs_delete d;
             if (wal_read(pos + sizeof(hdr), &d, sizeof(d)))
@@ -276,6 +287,7 @@ static void scan_recovery(void)
     u64 pos = WAL_START;
     u64 last_valid_pos = WAL_START;
     struct wal_record hdr;
+    u64 open_tx_id = 0, open_tx_seq = 0;
 
     /* Scan from start, ignoring superblock's wal_head — trust the data,
      * not the metadata. Stop at first record that fails CRC. */
@@ -297,11 +309,34 @@ static void scan_recovery(void)
             struct walfs_inode *ino = (struct walfs_inode *)(rec_buf + sizeof(hdr));
             if (ino->inode_id >= next_inode)
                 next_inode = ino->inode_id + 1;
-            /* Populate inode cache */
             icache_put(ino->inode_id, pos);
+        } else if (hdr.type == RECORD_DELETE) {
+            struct walfs_delete *d = (struct walfs_delete *)(rec_buf + sizeof(hdr));
+            icache_put(d->inode_id, pos);
+        } else if (hdr.type == RECORD_TX_BEGIN) {
+            u64 tx_id;
+            memcpy(&tx_id, rec_buf + sizeof(hdr), sizeof(tx_id));
+            open_tx_id = tx_id;
+            open_tx_seq = hdr.seq;
+        } else if (hdr.type == RECORD_TX_COMMIT) {
+            u64 tx_id;
+            memcpy(&tx_id, rec_buf + sizeof(hdr), sizeof(tx_id));
+            if (tx_id == open_tx_id) {
+                open_tx_id = 0;
+                open_tx_seq = 0;
+            }
         }
         last_valid_pos = pos + hdr.length;
         pos += hdr.length;
+    }
+
+    /* Track uncommitted transaction from recovery */
+    if (open_tx_id != 0) {
+        uncommitted_tx_start = open_tx_seq;
+        uncommitted_tx_end = next_seq > 0 ? next_seq - 1 : 0;
+    } else {
+        uncommitted_tx_start = 0;
+        uncommitted_tx_end = 0;
     }
 
     /* Repair wal_head if it's inconsistent with actual data */
@@ -407,7 +442,10 @@ u64 walfs_create(u64 parent_id, const char *name, u32 flags, u32 mode)
     u64 tx_id = next_seq;
 
     /* Transaction: BEGIN → INODE → DIRENT → COMMIT */
-    wal_append(RECORD_TX_BEGIN, &tx_id, sizeof(tx_id), NULL, 0);
+    if (!wal_append(RECORD_TX_BEGIN, &tx_id, sizeof(tx_id), NULL, 0)) {
+        next_inode--;
+        return 0;
+    }
 
     struct walfs_inode ino;
     memset(&ino, 0, sizeof(ino));
@@ -419,11 +457,12 @@ u64 walfs_create(u64 parent_id, const char *name, u32 flags, u32 mode)
     ino.modified  = ts;
     name_copy(ino.name, name);
 
-    if (!wal_append(RECORD_INODE, &ino, sizeof(ino), NULL, 0)) {
+    u64 ino_pos = wal_append(RECORD_INODE, &ino, sizeof(ino), NULL, 0);
+    if (!ino_pos) {
         next_inode--;
         return 0;
     }
-    icache_put(id, super.wal_head - sizeof(struct wal_record) - sizeof(ino));
+    icache_put(id, ino_pos);
 
     struct walfs_dirent de;
     memset(&de, 0, sizeof(de));
@@ -445,6 +484,11 @@ bool walfs_write(u64 inode_id, u64 offset, const void *data, u32 len)
     u64 cur = offset;
     u32 rem = len;
 
+    /* Begin transaction */
+    u64 tx_id = next_seq;
+    if (!wal_append(RECORD_TX_BEGIN, &tx_id, sizeof(tx_id), NULL, 0))
+        return false;
+
     while (rem > 0) {
         u32 chunk = rem > WALFS_DATA_MAX ? WALFS_DATA_MAX : rem;
         struct walfs_data dh;
@@ -463,13 +507,23 @@ bool walfs_write(u64 inode_id, u64 offset, const void *data, u32 len)
     if (!walfs_stat(inode_id, &ino)) return false;
     if (cur > ino.size) ino.size = cur;
     ino.modified = read_cntvct();
-    if (!wal_append(RECORD_INODE, &ino, sizeof(ino), NULL, 0))
-        return false;
+    u64 ino_pos = wal_append(RECORD_INODE, &ino, sizeof(ino), NULL, 0);
+    if (!ino_pos) return false;
+    icache_put(inode_id, ino_pos);
 
+    /* Commit transaction */
+    wal_append(RECORD_TX_COMMIT, &tx_id, sizeof(tx_id), NULL, 0);
     write_super();
     return true;
 }
 
+/*
+ * walfs_read — O(N) WAL scan for data records.
+ * TODO: A per-inode data-block index would make this O(1), but requires
+ * an in-memory index structure that survives across calls.  For now the
+ * inode_cache accelerates stat/is_deleted (the main hotspots); read
+ * remains a linear scan.
+ */
 u32 walfs_read(u64 inode_id, u64 offset, void *buf, u32 len)
 {
     if (!mounted) return 0;
@@ -483,6 +537,7 @@ u32 walfs_read(u64 inode_id, u64 offset, void *buf, u32 len)
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
         if (!wal_rec_valid(&hdr)) break;
         if (hdr.length < sizeof(struct wal_record)) break;
+        if (is_uncommitted(hdr.seq)) { pos += hdr.length; continue; }
 
         if (hdr.type == RECORD_DATA) {
             struct walfs_data dh;
@@ -516,12 +571,12 @@ bool walfs_delete(u64 inode_id)
 
     struct walfs_delete del;
     del.inode_id = inode_id;
-    if (!wal_append(RECORD_DELETE, &del, sizeof(del), NULL, 0))
-        return false;
+    u64 del_pos = wal_append(RECORD_DELETE, &del, sizeof(del), NULL, 0);
+    if (!del_pos) return false;
 
-    /* Invalidate caches */
-    lru_remove(&inode_cache, (const u8 *)&inode_id, sizeof(inode_id));
-    lru_flush(&path_cache); /* conservative — could be smarter */
+    /* Update cache to point to delete record */
+    icache_put(inode_id, del_pos);
+    lru_flush(&path_cache);
 
     write_super();
     return true;
@@ -535,7 +590,8 @@ bool walfs_stat(u64 inode_id, struct walfs_inode *out)
     u64 cached_pos;
     if (icache_get(inode_id, &cached_pos)) {
         struct wal_record hdr;
-        if (wal_read(cached_pos, &hdr, sizeof(hdr)) && wal_rec_valid(&hdr)) {
+        if (wal_read(cached_pos, &hdr, sizeof(hdr)) && wal_rec_valid(&hdr) &&
+            !is_uncommitted(hdr.seq)) {
             if (hdr.type == RECORD_DELETE) return false;
             if (hdr.type == RECORD_INODE) {
                 struct walfs_inode ino;
@@ -557,6 +613,7 @@ bool walfs_stat(u64 inode_id, struct walfs_inode *out)
     while (pos < super.wal_head) {
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
         if (!wal_rec_valid(&hdr)) break;
+        if (is_uncommitted(hdr.seq)) { pos += hdr.length; continue; }
 
         if (hdr.type == RECORD_INODE) {
             struct walfs_inode ino;
@@ -609,6 +666,7 @@ u64 walfs_find(const char *path)
         while (pos < super.wal_head) {
             if (!wal_read(pos, &hdr, sizeof(hdr))) break;
             if (!wal_rec_valid(&hdr)) break;
+            if (is_uncommitted(hdr.seq)) { pos += hdr.length; continue; }
             if (hdr.type == RECORD_DIRENT) {
                 struct walfs_dirent de;
                 if (wal_read(pos + sizeof(hdr), &de, sizeof(de)) &&
@@ -641,27 +699,34 @@ void walfs_readdir(u64 parent_id, walfs_readdir_cb cb)
     while (pos < super.wal_head) {
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
         if (!wal_rec_valid(&hdr)) break;
+        if (is_uncommitted(hdr.seq)) { pos += hdr.length; continue; }
 
         if (hdr.type == RECORD_DIRENT && dir_count < RDIR_MAX) {
             struct walfs_dirent de;
             if (wal_read(pos + sizeof(hdr), &de, sizeof(de)) &&
                 de.parent_id == parent_id) {
                 /* Deduplicate: replace existing entry for same child_id */
-                bool found = false;
+                bool dup = false;
                 for (u32 i = 0; i < dir_count; i++) {
                     if (dir_buf[i].child_id == de.child_id) {
                         dir_buf[i] = de;
-                        found = true;
+                        dup = true;
                         break;
                     }
                 }
-                if (!found)
+                if (!dup)
                     dir_buf[dir_count++] = de;
             }
-        } else if (hdr.type == RECORD_DELETE && del_count < RDIR_MAX) {
+        } else if (hdr.type == RECORD_DELETE) {
             struct walfs_delete d;
-            if (wal_read(pos + sizeof(hdr), &d, sizeof(d)))
+            if (wal_read(pos + sizeof(hdr), &d, sizeof(d)) &&
+                del_count < RDIR_MAX)
                 del_set[del_count++] = d.inode_id;
+        } else if (hdr.type == RECORD_INODE) {
+            struct walfs_inode ino;
+            if (wal_read(pos + sizeof(hdr), &ino, sizeof(ino)) &&
+                (ino.flags & WALFS_DELETED) && del_count < RDIR_MAX)
+                del_set[del_count++] = ino.inode_id;
         }
         pos += hdr.length;
     }
@@ -688,11 +753,12 @@ bool walfs_compact(void)
     if (!mounted) return false;
     uart_puts("[walfs] Compacting WAL...\n");
 
-    /* Phase 1: Scan WAL, collect live inode IDs (not deleted) */
+    /* Phase 1: Scan WAL, determine live inodes + latest RECORD_INODE pos */
     #define COMPACT_MAX 256
-    static u64 live_ids[COMPACT_MAX];
-    static u64 dead_ids[COMPACT_MAX];
-    u32 live_count = 0, dead_count = 0;
+    static u64 cmp_ids[COMPACT_MAX];
+    static u64 cmp_ipos[COMPACT_MAX]; /* position of LATEST RECORD_INODE */
+    static u8  cmp_dead[COMPACT_MAX];
+    u32 cmp_n = 0;
 
     u64 pos = WAL_START;
     struct wal_record hdr;
@@ -700,41 +766,51 @@ bool walfs_compact(void)
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
         if (!wal_rec_valid(&hdr)) break;
 
-        if (hdr.type == RECORD_INODE && live_count < COMPACT_MAX) {
+        if (hdr.type == RECORD_INODE) {
             struct walfs_inode ino;
             if (wal_read(pos + sizeof(hdr), &ino, sizeof(ino))) {
-                bool seen = false;
-                for (u32 i = 0; i < live_count; i++)
-                    if (live_ids[i] == ino.inode_id) { seen = true; break; }
-                if (!seen)
-                    live_ids[live_count++] = ino.inode_id;
+                u32 idx = cmp_n;
+                for (u32 i = 0; i < cmp_n; i++)
+                    if (cmp_ids[i] == ino.inode_id) { idx = i; break; }
+                if (idx == cmp_n && cmp_n < COMPACT_MAX) {
+                    cmp_ids[cmp_n] = ino.inode_id;
+                    cmp_dead[cmp_n] = 0;
+                    cmp_ipos[cmp_n] = pos;
+                    cmp_n++;
+                }
+                if (idx < cmp_n) {
+                    cmp_ipos[idx] = pos; /* always update to latest */
+                    cmp_dead[idx] = (ino.flags & WALFS_DELETED) ? 1 : 0;
+                }
             }
-        } else if (hdr.type == RECORD_DELETE && dead_count < COMPACT_MAX) {
+        } else if (hdr.type == RECORD_DELETE) {
             struct walfs_delete d;
-            if (wal_read(pos + sizeof(hdr), &d, sizeof(d)))
-                dead_ids[dead_count++] = d.inode_id;
+            if (wal_read(pos + sizeof(hdr), &d, sizeof(d))) {
+                for (u32 i = 0; i < cmp_n; i++)
+                    if (cmp_ids[i] == d.inode_id) { cmp_dead[i] = 1; break; }
+            }
         }
         pos += hdr.length;
     }
 
-    /* Remove dead IDs from live list */
-    for (u32 d = 0; d < dead_count; d++) {
-        for (u32 i = 0; i < live_count; i++) {
-            if (live_ids[i] == dead_ids[d]) {
-                live_ids[i] = live_ids[--live_count];
-                break;
-            }
-        }
-    }
+    /* Build live set: remove dead entries */
+    u32 live_count = 0;
+    for (u32 i = 0; i < cmp_n; i++)
+        if (!cmp_dead[i]) { cmp_ids[live_count] = cmp_ids[i];
+                            cmp_ipos[live_count] = cmp_ipos[i];
+                            live_count++; }
 
     /* Phase 2: Reset WAL and re-append only live records */
     u64 old_head = super.wal_head;
     super.wal_head = WAL_START;
     super.record_count = 0;
+    super.tree_root = 0;
     next_seq = 0;
+    cached_lba = 0xFFFFFFFF;
 
     pos = WAL_START;
     while (pos < old_head) {
+        cached_lba = 0xFFFFFFFF; /* force disk reads (avoid stale cache) */
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
         if (!wal_rec_valid(&hdr)) break;
         if (hdr.length > sizeof(rec_buf)) { pos += hdr.length; continue; }
@@ -743,21 +819,42 @@ bool walfs_compact(void)
         bool keep = false;
         if (hdr.type == RECORD_INODE) {
             struct walfs_inode *ino = (struct walfs_inode *)(rec_buf + sizeof(hdr));
-            for (u32 i = 0; i < live_count; i++)
-                if (live_ids[i] == ino->inode_id) { keep = true; break; }
+            for (u32 i = 0; i < live_count; i++) {
+                if (cmp_ids[i] == ino->inode_id && cmp_ipos[i] == pos) {
+                    keep = true;
+                    break;
+                }
+            }
         } else if (hdr.type == RECORD_DIRENT) {
             struct walfs_dirent *de = (struct walfs_dirent *)(rec_buf + sizeof(hdr));
-            for (u32 i = 0; i < live_count; i++)
-                if (live_ids[i] == de->child_id) { keep = true; break; }
+            bool parent_live = false, child_live = false;
+            for (u32 i = 0; i < live_count; i++) {
+                if (cmp_ids[i] == de->parent_id) parent_live = true;
+                if (cmp_ids[i] == de->child_id)  child_live = true;
+            }
+            keep = parent_live && child_live;
         } else if (hdr.type == RECORD_DATA) {
             struct walfs_data *d = (struct walfs_data *)(rec_buf + sizeof(hdr));
             for (u32 i = 0; i < live_count; i++)
-                if (live_ids[i] == d->inode_id) { keep = true; break; }
+                if (cmp_ids[i] == d->inode_id) { keep = true; break; }
         }
-        /* Skip TX markers and DELETE records during compaction */
+        /* TX markers and DELETE records are not re-written */
 
         if (keep) {
+            /* Assign fresh seq and recompute CRC */
+            struct wal_record *rh = (struct wal_record *)rec_buf;
+            rh->seq  = next_seq;
+            rh->crc32 = 0;
+            rh->crc32 = hw_crc32c(rec_buf, hdr.length);
+
             wal_write(super.wal_head, rec_buf, hdr.length);
+
+            if (hdr.type == RECORD_INODE) {
+                struct walfs_inode *ino = (struct walfs_inode *)(rec_buf + sizeof(hdr));
+                if (ino->inode_id == WALFS_ROOT_INODE)
+                    super.tree_root = super.wal_head;
+                icache_put(ino->inode_id, super.wal_head);
+            }
             super.wal_head += hdr.length;
             super.record_count++;
             next_seq++;
@@ -766,8 +863,10 @@ bool walfs_compact(void)
         pos += hdr.length;
     }
 
-    /* Flush caches and write new superblock */
-    lru_flush(&inode_cache);
+    /* Reset transaction state and flush caches */
+    uncommitted_tx_start = 0;
+    uncommitted_tx_end = 0;
+    cached_lba = 0xFFFFFFFF;
     lru_flush(&path_cache);
     write_super();
 

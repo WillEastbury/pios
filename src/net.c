@@ -15,6 +15,7 @@
 #include "fifo.h"
 #include "core.h"
 #include "uart.h"
+#include "timer.h"
 
 /* ---- Network state ---- */
 
@@ -418,8 +419,17 @@ void net_poll(void) {
     }
 
     net_handle_fifo_request();
-    arp_tick();
-    tcp_tick();
+
+    /* Timer-gate slow maintenance tasks (~10Hz, not every packet) */
+    {
+        static u64 last_tick;
+        u64 now = timer_ticks();
+        if (now - last_tick >= 100) { /* every 100ms */
+            last_tick = now;
+            arp_tick();
+            tcp_tick();
+        }
+    }
 }
 
 void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {

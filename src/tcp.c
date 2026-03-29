@@ -672,7 +672,7 @@ static void cc_on_timeout(struct tcb *t) {
 /* ================================================================== */
 
 static void tcb_reset(struct tcb *t) {
-    memset(t, 0, sizeof(struct tcb));
+    simd_zero(t, sizeof(struct tcb));
     t->state = TCP_CLOSED;
 }
 
@@ -1113,7 +1113,7 @@ tcp_conn_t tcp_connect(u32 dst_ip, u16 dst_port) {
 
     u16 src_port = alloc_port();
 
-    memset(t, 0, sizeof(struct tcb));
+    simd_zero(t, sizeof(struct tcb));
     t->local_ip    = tcp_local_ip;
     t->remote_ip   = dst_ip;
     t->local_port  = src_port;
@@ -1140,7 +1140,7 @@ tcp_conn_t tcp_listen(u16 port) {
     struct tcb *t = tcb_alloc();
     if (!t) return -1;
 
-    memset(t, 0, sizeof(struct tcb));
+    simd_zero(t, sizeof(struct tcb));
     t->local_ip   = tcp_local_ip;
     t->local_port = port;
     t->state      = TCP_LISTEN;
@@ -1169,7 +1169,7 @@ tcp_conn_t tcp_accept(tcp_conn_t listen_conn) {
     struct tcb *t = tcb_alloc();
     if (!t) return -1;
 
-    memset(t, 0, sizeof(struct tcb));
+    simd_zero(t, sizeof(struct tcb));
     t->local_ip    = tcp_local_ip;
     t->remote_ip   = remote_ip;
     t->local_port  = lt->local_port;

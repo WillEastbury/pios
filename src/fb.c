@@ -7,6 +7,7 @@
 #include "fb.h"
 #include "mailbox.h"
 #include "mmio.h"
+#include "dma.h"
 
 /* Framebuffer state */
 static u32 *fb_ptr;
@@ -196,14 +197,15 @@ void fb_set_color(u32 fg, u32 bg) {
     fb_bg = bg;
 }
 
-/* Scroll screen up by one text row (8 pixels) */
+/* Scroll screen up by one text row (8 pixels) — DMA-accelerated */
 static void fb_scroll(void) {
     u32 row_bytes = fb_pitch * 8;
     u32 total_bytes = fb_pitch * fb_height;
     u8 *base = (u8 *)fb_ptr;
 
-    memcpy(base, base + row_bytes, total_bytes - row_bytes);
-    memset(base + total_bytes - row_bytes, 0, row_bytes);
+    /* Use DMA for the bulk copy (~2.7MB at 1280x720x32bpp) */
+    dma_memcpy(3, base, base + row_bytes, total_bytes - row_bytes);
+    dma_zero(3, base + total_bytes - row_bytes, row_bytes);
 }
 
 /* Draw one 8x8 character at text position (cx, cy) */

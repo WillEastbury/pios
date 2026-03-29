@@ -135,8 +135,8 @@ bool walfs_mmap(u64 inode_id, u64 offset, u32 length, void *dest);
 /* Process filesystem FIFO requests on Core 1 (called from disk loop). */
 void walfs_handle_fifo(u32 from_core);
 
+/* Compact WAL: rewrite with only live records, removing deleted inodes. */
+bool walfs_compact(void);
+
 /* Flush superblock to disk. */
 void walfs_sync(void);
-
-/* Compact WAL: rewrite with only live records, reclaim space. */
-bool walfs_compact(void);
