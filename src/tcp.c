@@ -99,6 +99,7 @@ static u32 ring_write(struct ring_buf *r, const void *src, u32 len) {
     simd_memcpy(r->data + idx, s, first);
     if (len > first)
         simd_memcpy(r->data, s + first, len - first);
+    dmb(); /* payload visible before producer index update */
     r->head += len;
     return len;
 }
@@ -110,9 +111,11 @@ static u32 ring_read(struct ring_buf *r, void *dst, u32 len) {
     u32 idx = r->tail & (TCP_BUF_SIZE - 1);
     u32 first = TCP_BUF_SIZE - idx;
     if (first > len) first = len;
+    dmb(); /* consume producer index before reading payload */
     simd_memcpy(d, r->data + idx, first);
     if (len > first)
         simd_memcpy(d + first, r->data, len - first);
+    dmb(); /* payload consumed before consumer index update */
     r->tail += len;
     return len;
 }
@@ -124,6 +127,7 @@ static u32 ring_peek_at(const struct ring_buf *r, u32 offset, void *dst, u32 len
     if (len > avail - offset) len = avail - offset;
     u8 *d = (u8 *)dst;
     u32 pos = r->tail + offset;
+    dmb(); /* observe producer writes before peeking */
     for (u32 i = 0; i < len; i++) {
         d[i] = r->data[pos & (TCP_BUF_SIZE - 1)];
         pos++;
@@ -1242,10 +1246,16 @@ u32 tcp_state(tcp_conn_t conn) {
 
 u32 tcp_readable(tcp_conn_t conn) {
     if (!tcb_valid(conn)) return 0;
-    return ring_used(&tcbs[conn].rx_buf);
+    dmb();
+    u32 n = ring_used(&tcbs[conn].rx_buf);
+    dmb();
+    return n;
 }
 
 u32 tcp_writable(tcp_conn_t conn) {
     if (!tcb_valid(conn)) return 0;
-    return ring_free(&tcbs[conn].tx_buf);
+    dmb();
+    u32 n = ring_free(&tcbs[conn].tx_buf);
+    dmb();
+    return n;
 }
