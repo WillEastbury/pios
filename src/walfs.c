@@ -107,6 +107,9 @@ static inline u64 read_cntvct(void)
 static bool valid_name(const char *name)
 {
     if (!name || !name[0]) return false;
+    /* Block path traversal: reject '.' and '..' as names */
+    if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+        return false;
     for (u32 i = 0; name[i]; i++) {
         if (i >= WALFS_NAME_MAX) return false;
         u8 c = (u8)name[i];
@@ -659,6 +662,9 @@ u64 walfs_find(const char *path)
         comp[ci] = '\0';
         if (*p == '/') p++;
         if (ci == 0) continue;
+        /* Block path traversal */
+        if (comp[0] == '.' && (ci == 1 || (ci == 2 && comp[1] == '.')))
+            return 0;
 
         u64 found = 0;
         u64 pos = WAL_START;

@@ -43,6 +43,11 @@ static void fs_request(struct fifo_msg *msg, struct fifo_msg *reply)
         wfe();
 }
 
+/* OWASP A01: capability gate — check before privileged operations */
+static bool has_cap(u32 cap) {
+    return principal_has_cap(principal_current(), cap);
+}
+
 /* ---- Semaphore state ---- */
 #define MAX_SEMS 8
 static struct { bool used; volatile i32 count; } sems[MAX_SEMS];
@@ -464,7 +469,7 @@ static i32 sys_stat(const char *path, void *out)
 
 static i32 sys_mkdir(const char *path)
 {
-    if (!ptr_valid(path, 1)) return -1;
+    if (!ptr_valid(path, 1) || !has_cap(PRINCIPAL_DISK)) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_MKDIR;
     msg.buffer = (u64)(usize)path;
@@ -476,7 +481,7 @@ static i32 sys_mkdir(const char *path)
 
 static i32 sys_unlink(const char *path)
 {
-    if (!ptr_valid(path, 1)) return -1;
+    if (!ptr_valid(path, 1) || !has_cap(PRINCIPAL_DISK)) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_DELETE;
     msg.buffer = (u64)(usize)path;
@@ -488,7 +493,7 @@ static i32 sys_unlink(const char *path)
 
 static i32 sys_creat(const char *path, u32 flags, u32 mode)
 {
-    if (!ptr_valid(path, 1)) return -1;
+    if (!ptr_valid(path, 1) || !has_cap(PRINCIPAL_DISK)) return -1;
 
     /* Split path into parent directory and filename */
     u32 len = pios_strlen(path);
@@ -611,7 +616,7 @@ static void sys_fb_pixel(u32 x, u32 y, u32 color)  { fb_pixel(x, y, color); }
 
 /* ---- Networking ---- */
 
-static i32 sys_socket(u32 type) { return sock_socket(type); }
+static i32 sys_socket(u32 type) { if (!has_cap(PRINCIPAL_NET)) return -1; return sock_socket(type); }
 
 static i32 sys_bind(i32 fd, u32 ip, u16 port)
 {
@@ -733,7 +738,7 @@ static u32 sys_strlen(const char *s)
 
 static i32 sys_spawn(const char *path)
 {
-    if (!ptr_valid(path, 1)) return -1;
+    if (!ptr_valid(path, 1) || !has_cap(PRINCIPAL_EXEC)) return -1;
     return proc_exec(path);
 }
 

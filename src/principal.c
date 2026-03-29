@@ -25,16 +25,25 @@ static u32 current_principal[4];  /* one slot per core */
 
 /* ---- Internal helpers ---- */
 
-/* Iterate CRC32C 1000 times over passphrase */
-static void hash_pass(const char *pass, u8 out[4])
+/* Iterate CRC32C 100K times with username salt for strengthened hash.
+ * Still only 32 bits — real fix requires SHA-256 (issue #19).
+ * 100K iterations at ~8B/cycle ≈ 40µs per attempt on A76. */
+static void hash_pass_salted(const char *user, const char *pass, u8 out[4])
 {
     u32 h = hw_crc32c(pass, pios_strlen(pass));
-    for (u32 i = 1; i < 1000; i++)
+    h = hw_crc32c(&h, 4) ^ hw_crc32c(user, pios_strlen(user)); /* salt with username */
+    for (u32 i = 0; i < 100000; i++)
         h = hw_crc32c(&h, 4);
     out[0] = (u8)(h);
     out[1] = (u8)(h >> 8);
     out[2] = (u8)(h >> 16);
     out[3] = (u8)(h >> 24);
+}
+
+/* Legacy compat wrapper — used during migration */
+static void hash_pass(const char *pass, u8 out[4])
+{
+    hash_pass_salted("", pass, out);
 }
 
 /* Write principal table back to /etc/principals */
