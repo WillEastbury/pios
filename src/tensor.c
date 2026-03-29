@@ -468,6 +468,7 @@ bool tensor_softmax(tensor_t *b, const tensor_t *a) {
         /* NEON normalize: multiply all by 1/sum */
         if (sum > 0.0f) {
             float inv_sum = 1.0f / sum;
+            float *row_n = row_d;
             c = 0;
             if (cols >= 4) {
                 __asm__ volatile("dup v2.4s, %w0" :: "r"(f32_bits(inv_sum)) : "v2");
@@ -476,13 +477,12 @@ bool tensor_softmax(tensor_t *b, const tensor_t *a) {
                         "ld1  {v0.4s}, [%0]       \n"
                         "fmul v0.4s, v0.4s, v2.4s \n"
                         "st1  {v0.4s}, [%0], #16  \n"
-                        : "+r"(row_d) :: "v0","v2","memory"
+                        : "+r"(row_n) :: "v0","v2","memory"
                     );
                 }
-                row_d = dst + r * cols + c; /* adjust for tail */
             }
             for (; c < cols; c++)
-                row_d[c - c] *= inv_sum; /* tail scalar */
+                row_d[c] *= inv_sum;
         }
     }
     dsb();
