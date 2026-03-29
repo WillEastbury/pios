@@ -6,6 +6,7 @@
 #include "gic.h"
 #include "uart.h"
 #include "mmio.h"
+#include "proc.h"
 
 /* Vector table defined in vectors.S */
 extern void vector_table(void);
@@ -44,6 +45,13 @@ void irq_dispatch(void) {
 /* Called from vectors.S sync_handler */
 void sync_exception(u64 esr, u64 elr, u64 far) {
     u32 ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
+
+    if ((ec == EC_DABT_CUR || ec == EC_DABT_LOW ||
+         ec == EC_IABT_CUR || ec == EC_IABT_LOW) &&
+        proc_handle_fault(esr, elr, far)) {
+        return;
+    }
+
     uart_puts("\n!!! SYNC EXCEPTION !!!\n");
     uart_puts("  EC="); uart_hex(ec);
     uart_puts("  ESR="); uart_hex(esr);

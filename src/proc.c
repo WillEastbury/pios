@@ -15,6 +15,7 @@
 #include "dns.h"
 #include "tensor.h"
 #include "fifo.h"
+#include "mmu.h"
 
 #define CORE_DISK  1
 
@@ -47,6 +48,9 @@ static void fs_request(struct fifo_msg *msg, struct fifo_msg *reply)
 static bool has_cap(u32 cap) {
     return principal_has_cap(principal_current(), cap);
 }
+
+static bool has_disk_cap(void) { return has_cap(PRINCIPAL_DISK); }
+static bool has_net_cap(void)  { return has_cap(PRINCIPAL_NET); }
 
 /* ---- Semaphore state ---- */
 #define MAX_SEMS 8
@@ -226,6 +230,7 @@ void proc_init(void)
     current_proc = 0;
     next_pid = (core_id() << 16) | 1;  /* encode core in upper bits */
     initialized = true;
+    mmu_switch_to_kernel();
 }
 
 i32 proc_exec(const char *path)
@@ -289,6 +294,12 @@ i32 proc_exec(const char *path)
     p->ctx.x19_x30[11] = (u64)(usize)proc_trampoline; /* x30 = LR */
     p->ctx.sp = (u64)(usize)(base + PROC_SLOT_SIZE - 16);
 
+    if (!mmu_user_table_build(core_id(), (u32)slot, (u64)(usize)base, PROC_SLOT_SIZE)) {
+        p->state = PROC_EMPTY;
+        p->pid = 0;
+        return -1;
+    }
+
     uart_puts("[proc] loaded pid=");
     uart_hex(p->pid);
     uart_puts(" path=");
@@ -346,14 +357,53 @@ void proc_schedule(void)
             current_proc = i;
             procs[i].state = PROC_RUNNING;
             procs[i].ticks = timer_ticks();
+            principal_set_current(procs[i].principal_id);
+            if (!mmu_switch_to_user(core_id(), i)) {
+                procs[i].state = PROC_DEAD;
+                procs[i].exit_code = 0xFFFF0002U;
+                mmu_switch_to_kernel();
+                principal_set_current(PRINCIPAL_ROOT);
+                continue;
+            }
 
             ctx_switch(&scheduler_ctx, &procs[i].ctx);
             /* Returns here when process yields or exits */
+            mmu_switch_to_kernel();
+            principal_set_current(PRINCIPAL_ROOT);
         }
 
         if (!found)
             wfe();
     }
+}
+
+bool proc_handle_fault(u64 esr, u64 elr, u64 far)
+{
+    if (!initialized)
+        return false;
+    if ((core_id() != CORE_USER0 && core_id() != CORE_USER1))
+        return false;
+    struct process *p = &procs[current_proc];
+    if (p->state != PROC_RUNNING)
+        return false;
+
+    p->state = PROC_DEAD;
+    p->exit_code = 0xFFFF0001U;
+    mmu_switch_to_kernel();
+    principal_set_current(PRINCIPAL_ROOT);
+
+    uart_puts("[proc] fault pid=");
+    uart_hex(p->pid);
+    uart_puts(" esr=");
+    uart_hex(esr);
+    uart_puts(" elr=");
+    uart_hex(elr);
+    uart_puts(" far=");
+    uart_hex(far);
+    uart_putc('\n');
+
+    ctx_switch(&p->ctx, &scheduler_ctx);
+    return true;
 }
 
 u32 proc_count(void)
@@ -411,6 +461,7 @@ static void sys_sleep_us(u64 us)      { timer_delay_us(us); }
 static i32 sys_open(const char *path, u32 flags)
 {
     (void)flags;
+    if (!has_disk_cap()) return -1;
     if (!ptr_valid(path, 1)) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_FIND;
@@ -424,6 +475,7 @@ static i32 sys_open(const char *path, u32 flags)
 
 static i32 sys_read(i32 fd, void *buf, u32 len)
 {
+    if (!has_disk_cap()) return -1;
     if (!ptr_valid(buf, len)) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_READ;
@@ -438,6 +490,7 @@ static i32 sys_read(i32 fd, void *buf, u32 len)
 
 static i32 sys_write(i32 fd, const void *buf, u32 len)
 {
+    if (!has_disk_cap()) return -1;
     if (!ptr_valid(buf, len)) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_WRITE;
@@ -450,10 +503,11 @@ static i32 sys_write(i32 fd, const void *buf, u32 len)
     return (i32)reply.length;
 }
 
-static i32 sys_close(i32 fd) { (void)fd; return 0; }
+static i32 sys_close(i32 fd) { if (!has_disk_cap()) return -1; (void)fd; return 0; }
 
 static i32 sys_stat(const char *path, void *out)
 {
+    if (!has_disk_cap()) return -1;
     if (!ptr_valid(path, 1)) return -1;
     if (!ptr_valid(out, sizeof(struct walfs_inode))) return -1;
     struct fifo_msg msg = {0};
@@ -469,7 +523,7 @@ static i32 sys_stat(const char *path, void *out)
 
 static i32 sys_mkdir(const char *path)
 {
-    if (!ptr_valid(path, 1) || !has_cap(PRINCIPAL_DISK)) return -1;
+    if (!ptr_valid(path, 1) || !has_disk_cap()) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_MKDIR;
     msg.buffer = (u64)(usize)path;
@@ -481,7 +535,7 @@ static i32 sys_mkdir(const char *path)
 
 static i32 sys_unlink(const char *path)
 {
-    if (!ptr_valid(path, 1) || !has_cap(PRINCIPAL_DISK)) return -1;
+    if (!ptr_valid(path, 1) || !has_disk_cap()) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_DELETE;
     msg.buffer = (u64)(usize)path;
@@ -493,7 +547,7 @@ static i32 sys_unlink(const char *path)
 
 static i32 sys_creat(const char *path, u32 flags, u32 mode)
 {
-    if (!ptr_valid(path, 1) || !has_cap(PRINCIPAL_DISK)) return -1;
+    if (!ptr_valid(path, 1) || !has_disk_cap()) return -1;
 
     /* Split path into parent directory and filename */
     u32 len = pios_strlen(path);
@@ -546,6 +600,7 @@ static i32 sys_creat(const char *path, u32 flags, u32 mode)
 
 static i32 sys_pread(i32 fd, void *buf, u32 len, u64 offset)
 {
+    if (!has_disk_cap()) return -1;
     if (!ptr_valid(buf, len)) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_READ;
@@ -561,6 +616,7 @@ static i32 sys_pread(i32 fd, void *buf, u32 len, u64 offset)
 
 static i32 sys_pwrite(i32 fd, const void *buf, u32 len, u64 offset)
 {
+    if (!has_disk_cap()) return -1;
     if (!ptr_valid(buf, len)) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_WRITE;
@@ -581,6 +637,7 @@ struct readdir_entry {
 
 static i32 sys_readdir(const char *path, void *entries, u32 max_entries)
 {
+    if (!has_disk_cap()) return -1;
     if (!ptr_valid(path, 1)) return -1;
     if (!ptr_valid(entries, max_entries * sizeof(struct readdir_entry))) return -1;
 
@@ -616,24 +673,27 @@ static void sys_fb_pixel(u32 x, u32 y, u32 color)  { fb_pixel(x, y, color); }
 
 /* ---- Networking ---- */
 
-static i32 sys_socket(u32 type) { if (!has_cap(PRINCIPAL_NET)) return -1; return sock_socket(type); }
+static i32 sys_socket(u32 type) { if (!has_net_cap()) return -1; return sock_socket(type); }
 
 static i32 sys_bind(i32 fd, u32 ip, u16 port)
 {
+    if (!has_net_cap()) return -1;
     struct sockaddr_in addr = { .ip = ip, .port = port };
     return sock_bind(fd, &addr);
 }
 
 static i32 sys_connect(i32 fd, u32 ip, u16 port)
 {
+    if (!has_net_cap()) return -1;
     struct sockaddr_in addr = { .ip = ip, .port = port };
     return sock_connect(fd, &addr);
 }
 
-static i32 sys_listen(i32 fd, u32 backlog) { return sock_listen(fd, backlog); }
+static i32 sys_listen(i32 fd, u32 backlog) { if (!has_net_cap()) return -1; return sock_listen(fd, backlog); }
 
 static i32 sys_accept(i32 fd, u32 *client_ip, u16 *client_port)
 {
+    if (!has_net_cap()) return -1;
     if (client_ip   && !ptr_valid(client_ip, sizeof(u32))) return -1;
     if (client_port && !ptr_valid(client_port, sizeof(u16))) return -1;
     struct sockaddr_in client = {0};
@@ -647,18 +707,21 @@ static i32 sys_accept(i32 fd, u32 *client_ip, u16 *client_port)
 
 static i32 sys_send(i32 fd, const void *data, u32 len)
 {
+    if (!has_net_cap()) return -1;
     if (!ptr_valid(data, len)) return -1;
     return sock_send(fd, data, len);
 }
 
 static i32 sys_recv(i32 fd, void *buf, u32 len)
 {
+    if (!has_net_cap()) return -1;
     if (!ptr_valid(buf, len)) return -1;
     return sock_recv(fd, buf, len);
 }
 
 static i32 sys_sendto(i32 fd, const void *data, u32 len, u32 ip, u16 port)
 {
+    if (!has_net_cap()) return -1;
     if (!ptr_valid(data, len)) return -1;
     struct sockaddr_in dest = { .ip = ip, .port = port };
     return sock_sendto(fd, data, len, &dest);
@@ -666,6 +729,7 @@ static i32 sys_sendto(i32 fd, const void *data, u32 len, u32 ip, u16 port)
 
 static i32 sys_recvfrom(i32 fd, void *buf, u32 len, u32 *src_ip, u16 *src_port)
 {
+    if (!has_net_cap()) return -1;
     if (!ptr_valid(buf, len)) return -1;
     if (src_ip   && !ptr_valid(src_ip, sizeof(u32))) return -1;
     if (src_port && !ptr_valid(src_port, sizeof(u16))) return -1;
@@ -678,12 +742,13 @@ static i32 sys_recvfrom(i32 fd, void *buf, u32 len, u32 *src_ip, u16 *src_port)
     return r;
 }
 
-static i32 sys_sock_close(i32 fd) { return sock_close(fd); }
+static i32 sys_sock_close(i32 fd) { if (!has_net_cap()) return -1; return sock_close(fd); }
 
 /* ---- DNS ---- */
 
 static i32 sys_resolve(const char *hostname, u32 *ip_out)
 {
+    if (!has_net_cap()) return -1;
     if (!ptr_valid(hostname, 1)) return -1;
     if (!ptr_valid(ip_out, sizeof(u32))) return -1;
     return dns_resolve(hostname, ip_out) ? 0 : -1;

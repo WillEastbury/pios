@@ -133,3 +133,4 @@ void proc_yield(void);             /* cooperative context switch */
 NORETURN void proc_exit(u32 code); /* terminate current process */
 void proc_schedule(void);          /* run scheduler loop (called from coreN_main) */
 u32  proc_count(void);             /* number of active processes on this core */
+bool proc_handle_fault(u64 esr, u64 elr, u64 far); /* kill faulting user proc */

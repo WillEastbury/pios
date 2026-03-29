@@ -43,6 +43,18 @@ void mmu_init(void);
 /* Invalidate all TLB entries */
 void mmu_invalidate_tlb(void);
 
+/* Kernel TTBR0 base used by service cores and scheduler context */
+u64 mmu_kernel_ttbr0(void);
+
+/* Build an isolated user table for a process slot on core 2 or 3 */
+bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size);
+
+/* Switch active TTBR0 to a process table on core 2/3 */
+bool mmu_switch_to_user(u32 core, u32 slot);
+
+/* Switch active TTBR0 back to the global kernel table */
+void mmu_switch_to_kernel(void);
+
 /* Data cache operations */
 void dcache_clean_range(u64 start, u64 size);
 void dcache_invalidate_range(u64 start, u64 size);

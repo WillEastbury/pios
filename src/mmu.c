@@ -23,10 +23,17 @@
 #include "mmio.h"
 #include "uart.h"
 #include "simd.h"
+#include "core_env.h"
+#include "proc.h"
 
 /* Page tables — 4KB aligned */
 static u64 l1_table[512] ALIGNED(4096);
 static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
+
+/* Per-process user tables for user cores (core2/core3). */
+static u64 user_l1[2][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
+static u64 user_l2_low[2][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
+static bool user_table_valid[2][MAX_PROCS_PER_CORE];
 
 /* Exported for secondary cores (read by start.S) */
 u64 shared_ttbr0;
@@ -94,10 +101,27 @@ static inline u64 dev_block_2m(u64 addr) {
            PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
 }
 
+static inline bool is_user_core(u32 core) {
+    return core == 2 || core == 3;
+}
+
+static inline u32 user_core_index(u32 core) {
+    return core - 2;
+}
+
+static inline void map_user_low_2m(u64 *l2, u32 idx, u64 pa, u64 attrs)
+{
+    if (idx < 512)
+        l2[idx] = (pa & ~(L2_BLOCK_SIZE - 1)) | attrs;
+}
+
 void mmu_init(void) {
     /* Zero all tables */
     simd_zero(l1_table, sizeof(l1_table));
     simd_zero(l2_table_low, sizeof(l2_table_low));
+    simd_zero(user_l1, sizeof(user_l1));
+    simd_zero(user_l2_low, sizeof(user_l2_low));
+    simd_zero(user_table_valid, sizeof(user_table_valid));
 
     /* ============================================================
      * L2 TABLE: First 1GB (0x00000000 - 0x3FFFFFFF) in 2MB blocks
@@ -210,6 +234,65 @@ void mmu_invalidate_tlb(void) {
     __asm__ volatile("tlbi vmalle1" ::: "memory");
     dsb();
     isb();
+}
+
+u64 mmu_kernel_ttbr0(void) {
+    return shared_ttbr0;
+}
+
+bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
+{
+    if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
+        return false;
+    if ((slot_base & (L2_BLOCK_SIZE - 1)) != 0 || slot_size != PROC_SLOT_SIZE)
+        return false;
+
+    u32 uc = user_core_index(core);
+    u64 *l1 = user_l1[uc][slot];
+    u64 *l2 = user_l2_low[uc][slot];
+    simd_zero(l1, 512 * sizeof(u64));
+    simd_zero(l2, 512 * sizeof(u64));
+
+    l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
+
+    /* Keep only minimum low RAM: kernel image/BSS/stacks (first 2MB). */
+    const u64 ram_attrs = PTE_VALID | PTE_BLOCK | PTE_AF |
+                          PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+    map_user_low_2m(l2, 0, 0, ram_attrs);
+
+    /* Map this process slot and shared FIFO/DMA windows. */
+    map_user_low_2m(l2, (u32)(slot_base / L2_BLOCK_SIZE), slot_base, ram_attrs);
+    for (u64 pa = SHARED_FIFO_BASE; pa < DMA_DISK_BASE + DMA_DISK_SIZE; pa += L2_BLOCK_SIZE)
+        map_user_low_2m(l2, (u32)(pa / L2_BLOCK_SIZE), pa, ram_attrs);
+
+    /* Keep peripheral MMIO mapped for current direct-call syscall ABI. */
+    for (u32 idx = 4; idx < 8; idx++)
+        l1[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
+    for (u32 idx = 124; idx < 128; idx++)
+        l1[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
+
+    user_table_valid[uc][slot] = true;
+    return true;
+}
+
+bool mmu_switch_to_user(u32 core, u32 slot)
+{
+    if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
+        return false;
+    u32 uc = user_core_index(core);
+    if (!user_table_valid[uc][slot])
+        return false;
+
+    u64 ttbr = (u64)(usize)user_l1[uc][slot];
+    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(ttbr));
+    mmu_invalidate_tlb();
+    return true;
+}
+
+void mmu_switch_to_kernel(void)
+{
+    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(shared_ttbr0));
+    mmu_invalidate_tlb();
 }
 
 void dcache_clean_range(u64 start, u64 size) {

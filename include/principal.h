@@ -31,6 +31,7 @@ bool principal_init(void);
 bool principal_auth(const char *name, const char *pass, u32 *id_out);
 u32  principal_current(void);
 u32  principal_current_for(u32 core);  /* get principal for a specific core */
+void principal_set_current(u32 id);
 bool principal_has_cap(u32 id, u32 cap_flag);
 bool principal_create(const char *name, const char *pass, u32 flags);
 bool principal_can_read(u32 principal_id, const struct walfs_inode *inode);

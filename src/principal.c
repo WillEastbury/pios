@@ -148,6 +148,11 @@ u32 principal_current_for(u32 core)
     return current_principal[core];
 }
 
+void principal_set_current(u32 id)
+{
+    current_principal[core_id()] = id;
+}
+
 bool principal_has_cap(u32 id, u32 cap_flag)
 {
     if (id == PRINCIPAL_ROOT) return true;

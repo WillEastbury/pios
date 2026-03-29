@@ -2,11 +2,12 @@
 
 ## Overview
 
-PIOS uses the AArch64 MMU with an **identity map** (VA == PA). The MMU is not used for virtual memory or process isolation — it's used for:
+PIOS uses the AArch64 MMU with an **identity map** (VA == PA). Core 0/1 use a global kernel table, while cores 2/3 can switch to per-process tables for user slot isolation.
 
 1. **Cache control** — marking RAM as cacheable and peripherals as non-cacheable
 2. **Access attributes** — preventing speculative fetches to device memory
 3. **Shareability** — ensuring cache coherency across all 4 cores
+4. **Process slot isolation (incremental)** — only the running process slot is mapped on user cores
 
 ## Translation Scheme
 
@@ -71,7 +72,15 @@ IPS   = 2      36-bit PA
 
 ### TTBR0_EL1
 
-Points to the L1 table. Same table shared by all 4 cores (secondary cores read `shared_ttbr0` during boot).
+- Core 0/1: points to shared kernel L1 table (`shared_ttbr0`)
+- Core 2/3 scheduler: switches back to shared kernel table when not running a process
+- Core 2/3 running process: points to process-specific table containing:
+  - kernel low 2MB (kernel image + scheduler data/stack)
+  - current process 2MB slot
+  - shared FIFO + DMA windows
+  - peripheral MMIO windows required by current syscall ABI
+
+This blocks direct access to other process slots and other cores' private 16MB regions.
 
 ## Cache Operations
 

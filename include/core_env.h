@@ -3,7 +3,7 @@
  *
  * Each core gets 16MB of private RAM (heap/buffers).
  * Shared regions for FIFO and DMA are at fixed addresses.
- * No MMU - isolation is by convention, not hardware.
+ * User cores additionally apply per-process MMU slot windows at runtime.
  *
  * Memory Map (Pi 5, assuming ≥1GB RAM):
  *   0x00080000 - 0x001FFFFF  Kernel image + BSS + stacks (~1.5MB)
