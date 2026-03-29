@@ -8,6 +8,7 @@
 
 #pragma once
 #include "types.h"
+#include "pipe.h"
 
 #define MAX_PROCS_PER_CORE  6
 #define PROC_SLOT_SIZE      (2 * 1024 * 1024)   /* 2MB per process */
@@ -125,6 +126,16 @@ struct syscall_table {
     i32 (*topic_publish)(i32 tid, const void *data, u32 len);
     i32 (*topic_subscribe)(i32 tid);                        /* returns subscriber handle */
     i32 (*topic_read)(i32 sub_id, void *out, u32 out_max); /* returns event len */
+
+    /* ---- Unified virtual device stream IPC (pipes) ---- */
+    i32 (*pipe_create)(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max);
+    i32 (*pipe_open)(const char *path, u32 type);
+    i32 (*pipe_close)(i32 pipe_id);
+    i32 (*pipe_read)(i32 pipe_id, void *buf, u32 len);        /* stream-only */
+    i32 (*pipe_write)(i32 pipe_id, const void *buf, u32 len); /* stream-only */
+    i32 (*pipe_send)(i32 pipe_id, const void *msg, u32 len);  /* slot-only */
+    i32 (*pipe_recv)(i32 pipe_id, void *msg, u32 len);        /* slot-only */
+    i32 (*pipe_stat)(i32 pipe_id, struct pipe_stat *out);
 
     /* ---- Tensor / GPU compute ---- */
     i32 (*tensor_alloc)(void *t, u32 rows, u32 cols, u32 elem_size);

@@ -18,6 +18,7 @@
 #include "mmu.h"
 #include "ipc_queue.h"
 #include "ipc_stream.h"
+#include "pipe.h"
 
 #define CORE_DISK  1
 
@@ -121,6 +122,14 @@ static i32   sys_topic_create(const char *name, u32 replay_window, u32 flags, u3
 static i32   sys_topic_publish(i32 tid, const void *data, u32 len);
 static i32   sys_topic_subscribe(i32 tid);
 static i32   sys_topic_read(i32 sub_id, void *out, u32 out_max);
+static i32   sys_pipe_create(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max);
+static i32   sys_pipe_open(const char *path, u32 type);
+static i32   sys_pipe_close(i32 pipe_id);
+static i32   sys_pipe_read(i32 pipe_id, void *buf, u32 len);
+static i32   sys_pipe_write(i32 pipe_id, const void *buf, u32 len);
+static i32   sys_pipe_send(i32 pipe_id, const void *msg, u32 len);
+static i32   sys_pipe_recv(i32 pipe_id, void *msg, u32 len);
+static i32   sys_pipe_stat(i32 pipe_id, struct pipe_stat *out);
 static i32   sys_tensor_alloc(void *t, u32 rows, u32 cols, u32 elem_size);
 static void  sys_tensor_free(void *t);
 static void  sys_tensor_upload(void *t, const void *data);
@@ -205,6 +214,15 @@ static struct syscall_table syscall_tab = {
     .topic_publish   = sys_topic_publish,
     .topic_subscribe = sys_topic_subscribe,
     .topic_read      = sys_topic_read,
+    /* Unified IPC pipes */
+    .pipe_create     = sys_pipe_create,
+    .pipe_open       = sys_pipe_open,
+    .pipe_close      = sys_pipe_close,
+    .pipe_read       = sys_pipe_read,
+    .pipe_write      = sys_pipe_write,
+    .pipe_send       = sys_pipe_send,
+    .pipe_recv       = sys_pipe_recv,
+    .pipe_stat       = sys_pipe_stat,
     /* Tensor */
     .tensor_alloc    = sys_tensor_alloc,
     .tensor_free     = sys_tensor_free,
@@ -978,6 +996,73 @@ static i32 sys_topic_read(i32 sub_id, void *out, u32 out_max)
     i32 r = ipc_topic_read(sub_id, out, out_max, &len);
     if (r != IPC_OK) return r;
     return (i32)len;
+}
+
+/* ---- Unified pipes (/ipc functional, net/fs/hw explicit stubs) ---- */
+
+static bool path_is_ipc(const char *path)
+{
+    return path &&
+           path[0] == '/' &&
+           path[1] == 'i' &&
+           path[2] == 'p' &&
+           path[3] == 'c' &&
+           path[4] == '/';
+}
+
+static i32 sys_pipe_create(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
+{
+    if (!ptr_valid_cstr(path, PIPE_PATH_MAX + 1)) return -1;
+    if (path_is_ipc(path) && !has_ipc_cap()) return -1;
+    return pipe_create(path, type, depth, flags, frame_max);
+}
+
+static i32 sys_pipe_open(const char *path, u32 type)
+{
+    if (!ptr_valid_cstr(path, PIPE_PATH_MAX + 1)) return -1;
+    if (path_is_ipc(path) && !has_ipc_cap()) return -1;
+    return pipe_open(path, type);
+}
+
+static i32 sys_pipe_close(i32 pipe_id)
+{
+    if (!has_ipc_cap()) return -1;
+    return pipe_close(pipe_id);
+}
+
+static i32 sys_pipe_read(i32 pipe_id, void *buf, u32 len)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(buf, len)) return -1;
+    return pipe_read(pipe_id, buf, len);
+}
+
+static i32 sys_pipe_write(i32 pipe_id, const void *buf, u32 len)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(buf, len)) return -1;
+    return pipe_write(pipe_id, buf, len);
+}
+
+static i32 sys_pipe_send(i32 pipe_id, const void *msg, u32 len)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(msg, len)) return -1;
+    return pipe_send(pipe_id, msg, len);
+}
+
+static i32 sys_pipe_recv(i32 pipe_id, void *msg, u32 len)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(msg, len)) return -1;
+    return pipe_recv(pipe_id, msg, len);
+}
+
+static i32 sys_pipe_stat(i32 pipe_id, struct pipe_stat *out)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(out, sizeof(*out))) return -1;
+    return pipe_stat(pipe_id, out);
 }
 
 /* ---- Tensor / GPU compute ---- */

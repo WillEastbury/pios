@@ -45,6 +45,7 @@
 #include "usb_kbd.h"
 #include "ipc_queue.h"
 #include "ipc_stream.h"
+#include "pipe.h"
 #include "setup.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
@@ -287,6 +288,7 @@ void kernel_main(void) {
     uart_puts("[fifo] Init OK\n");
     ipc_queue_init();
     ipc_stream_init();
+    pipe_init();
     uart_puts("[ipc] In-memory IPC ready\n");
 
     /* 9. SD card - raw block access */
