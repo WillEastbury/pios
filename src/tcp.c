@@ -127,11 +127,13 @@ static u32 ring_peek_at(const struct ring_buf *r, u32 offset, void *dst, u32 len
     if (len > avail - offset) len = avail - offset;
     u8 *d = (u8 *)dst;
     u32 pos = r->tail + offset;
+    u32 idx = pos & (TCP_BUF_SIZE - 1);
+    u32 first = TCP_BUF_SIZE - idx;
+    if (first > len) first = len;
     dmb(); /* observe producer writes before peeking */
-    for (u32 i = 0; i < len; i++) {
-        d[i] = r->data[pos & (TCP_BUF_SIZE - 1)];
-        pos++;
-    }
+    simd_memcpy(d, r->data + idx, first);
+    if (len > first)
+        simd_memcpy(d + first, r->data, len - first);
     return len;
 }
 
