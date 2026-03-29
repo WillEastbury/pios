@@ -94,7 +94,7 @@ Core 0 receive polling drains frames in small bursts per `net_poll()` pass (`NET
 
 - Burst receive loop processes up to 4 frames per poll tick.
 - TCP in-order payload ingest uses direct ring writes (`tcp_rx_ingest_in_order`) without extra staging buffers.
-- TCP checksum verification can be skipped in an explicit RX checksum-trust window when GENET RX checksum offload is enabled.
+- TCP checksum verification can be skipped only when the per-packet GENET RX status metadata marks checksum-complete (not just global offload enablement).
 - Existing validation posture remains unchanged: malformed/unsafe packets are still dropped early.
 
 ## FIFO Integration

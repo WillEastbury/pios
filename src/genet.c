@@ -116,6 +116,15 @@ struct genet_desc {
     u32 addr_hi;
 } PACKED;
 
+struct genet_status64 {
+    u32 length_status;
+    u32 ext_status;
+    u32 rx_csum;
+    u32 unused1[9];
+    u32 tx_csum_info;
+    u32 unused2[3];
+} PACKED;
+
 static struct genet_desc rx_ring[NUM_DESC] ALIGNED(4096);
 static struct genet_desc tx_ring[NUM_DESC] ALIGNED(4096);
 static u8 rx_bufs[NUM_DESC][BUF_SIZE] ALIGNED(64);
@@ -298,9 +307,9 @@ bool genet_init(void) {
     /* Max frame size */
     gw(UMAC_MAX_FRAME, ETH_FRAME_MAX);
 
-    /* Disable 64-byte receive status block */
-    gw(RBUF_CTRL, gr(RBUF_CTRL) & ~(1 << 0));
-    gw(RBUF_64B_EN, 0);
+    /* Enable 64-byte receive status metadata block for per-packet offload trust. */
+    gw(RBUF_CTRL, gr(RBUF_CTRL) | (1 << 0));
+    gw(RBUF_64B_EN, 1);
     gw(TBUF_CTRL, gr(TBUF_CTRL) | TBUF_64B_EN);
     genet_apply_offloads();
 
@@ -406,20 +415,31 @@ bool genet_send_parts(const void *head, u32 head_len, const void *tail, u32 tail
     return true;
 }
 
-bool genet_recv(u8 *frame, u32 *len) {
+bool genet_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
     u32 idx = rx_index % NUM_DESC;
     u32 ls = rx_ring[idx].length_status;
+    const struct genet_status64 *st;
 
     if (ls & DESC_OWN)
         return false;   /* DMA still owns this descriptor */
 
-    u32 pkt_len = (ls >> DESC_LEN_SHIFT) & 0xFFFF;
-    if (pkt_len > BUF_SIZE)
-        pkt_len = BUF_SIZE;
+    st = (const struct genet_status64 *)&rx_bufs[idx][0];
+    u32 pkt_len = (st->length_status >> DESC_LEN_SHIFT) & 0xFFFF;
+    u32 max_payload = BUF_SIZE - sizeof(struct genet_status64);
+    if (pkt_len > max_payload)
+        pkt_len = max_payload;
+
+    if (checksum_trusted) {
+        /*
+         * RX checksum trust is granted only when checksum assist is enabled
+         * and GENET reports a non-zero accumulated receive checksum.
+         */
+        *checksum_trusted = rx_csum_offload && ((st->rx_csum & 0xFFFFU) != 0U);
+    }
 
     /* NEON copy from DMA buffer */
-    prefetch_r(rx_bufs[idx]);
-    simd_memcpy(frame, rx_bufs[idx], pkt_len);
+    prefetch_r(rx_bufs[idx] + sizeof(struct genet_status64));
+    simd_memcpy(frame, rx_bufs[idx] + sizeof(struct genet_status64), pkt_len);
     *len = pkt_len;
 
     /* Return descriptor to DMA */

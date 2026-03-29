@@ -12,7 +12,7 @@
 bool genet_init(void);
 bool genet_send(const u8 *frame, u32 len);
 bool genet_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_len);
-bool genet_recv(u8 *frame, u32 *len);
+bool genet_recv(u8 *frame, u32 *len, bool *checksum_trusted);
 void genet_get_mac(u8 *mac);
 bool genet_link_up(void);
 

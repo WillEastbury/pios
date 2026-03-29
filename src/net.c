@@ -209,7 +209,7 @@ static void handle_udp(const u8 *frame, u32 len,
 /*  IP - hardened ingress validation                                   */
 /* ================================================================== */
 
-static void handle_ip(const u8 *frame, u32 len) {
+static void handle_ip(const u8 *frame, u32 len, bool checksum_trusted) {
     if (unlikely(len < sizeof(struct eth_hdr) + 20)) {
         stats.drop_runt++;
         return;
@@ -282,7 +282,7 @@ static void handle_ip(const u8 *frame, u32 len) {
         if (ipt > 20)
             tcp_input(frame, len, ntohl(ip->src_ip), ntohl(ip->dst_ip),
                       frame + payload_off, ipt - 20,
-                      genet_rx_checksum_offload_enabled());
+                      checksum_trusted);
         break;
     }
     case IP_PROTO_UDP:  handle_udp(frame, len, ip, payload_off);  break;
@@ -437,11 +437,13 @@ void net_handle_fifo_request(void) {
 
 void net_poll(void) {
     u32 len;
+    bool checksum_trusted;
 
     prefetch_r(rx_frame);
 
     for (u32 burst = 0; burst < NET_RX_BURST_MAX; burst++) {
-        if (!likely(genet_recv(rx_frame, &len)))
+        checksum_trusted = false;
+        if (!likely(genet_recv(rx_frame, &len, &checksum_trusted)))
             break;
 
         stats.rx_packets++;
@@ -461,7 +463,7 @@ void net_poll(void) {
 
         /* Dispatch by EtherType */
         if (likely(etype == ETH_P_IP))
-            handle_ip(rx_frame, len);
+            handle_ip(rx_frame, len, checksum_trusted);
         else if (etype == ETH_P_ARP)
             arp_input(rx_frame, len);
     }

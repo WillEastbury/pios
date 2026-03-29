@@ -49,7 +49,7 @@ Software reset → set MAC address → set max frame → disable RBUF status →
 | `genet_init()` | Full MAC+PHY init |
 | `genet_send(frame, len)` | Copy frame to TX DMA buffer, hardware-consumer-aware producer advance with bounded TX ring backpressure |
 | `genet_send_parts(head, head_len, tail, tail_len)` | Two-part TX path for single-pass copy into TX DMA buffer (header + payload) |
-| `genet_recv(frame, len)` | Check RX descriptor, copy frame out, return to DMA |
+| `genet_recv(frame, len, checksum_trusted)` | Check RX descriptor, parse RX status metadata, copy frame out, return to DMA |
 | `genet_get_mac(mac)` | Return 6-byte MAC address |
 | `genet_link_up()` | Poll PHY BMSR link status bit |
 | `genet_set_tx_checksum_offload(enable)` | Toggle TX checksum offload (`DMA_TX_DO_CSUM` descriptor bit + GENET offload control) |
