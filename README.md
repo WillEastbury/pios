@@ -272,9 +272,8 @@ accessible via `net_get_stats()`.
 
 The network/runtime path follows three rules:
 
-- **Fast path first**: keep the hot path branch-light and cache-friendly (SPSC FIFO, fixed-size rings, burst send, SIMD primitives).
 - **Fast path first**: keep the hot path branch-light and cache-friendly (SPSC FIFO, fixed-size rings, RX/TX burst loops, SIMD primitives).
-- **Offload where deterministic**: use ARMv8.2-A NEON + CRC32 instructions and hardware assist (GENET checksum, DMA) when behavior is explicit and verifiable.
+- **Offload where deterministic**: use ARMv8.2-A NEON + CRC32 instructions and hardware assist (GENET checksum windows, DMA copy paths) when behavior is explicit and verifiable.
 - **Fail closed**: validate early, drop fast, and preserve deterministic fallback behavior when hardware/offload paths are unavailable.
 
 ### Tensor / ML Compute

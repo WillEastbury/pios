@@ -14,6 +14,7 @@
 #include "net.h"
 #include "genet.h"
 #include "arp.h"
+#include "dma.h"
 #include "simd.h"
 #include "uart.h"
 #include "timer.h"
@@ -45,6 +46,7 @@ extern u32 net_get_our_ip(void);
 #define MAX_RETRIES         8
 
 #define LISTEN_BACKLOG      4
+#define TCP_DMA_COPY_THRESHOLD 256U
 
 /* ================================================================== */
 /*  TCP header (wire format)                                           */
@@ -85,6 +87,14 @@ static u32 ring_used(const struct ring_buf *r) {
     return (r->head - r->tail) & (TCP_BUF_SIZE - 1);
 }
 
+static inline void tcp_memcpy_accel(void *dst, const void *src, u32 len)
+{
+    if (len >= TCP_DMA_COPY_THRESHOLD &&
+        dma_memcpy(DMA_CHAN_MEMCPY, dst, src, len))
+        return;
+    simd_memcpy(dst, src, len);
+}
+
 static u32 ring_free(const struct ring_buf *r) {
     return (TCP_BUF_SIZE - 1) - ring_used(r);
 }
@@ -96,9 +106,9 @@ static u32 ring_write(struct ring_buf *r, const void *src, u32 len) {
     u32 idx = r->head & (TCP_BUF_SIZE - 1);
     u32 first = TCP_BUF_SIZE - idx;
     if (first > len) first = len;
-    simd_memcpy(r->data + idx, s, first);
+    tcp_memcpy_accel(r->data + idx, s, first);
     if (len > first)
-        simd_memcpy(r->data, s + first, len - first);
+        tcp_memcpy_accel(r->data, s + first, len - first);
     dmb(); /* payload visible before producer index update */
     r->head += len;
     return len;
@@ -112,9 +122,9 @@ static u32 ring_read(struct ring_buf *r, void *dst, u32 len) {
     u32 first = TCP_BUF_SIZE - idx;
     if (first > len) first = len;
     dmb(); /* consume producer index before reading payload */
-    simd_memcpy(d, r->data + idx, first);
+    tcp_memcpy_accel(d, r->data + idx, first);
     if (len > first)
-        simd_memcpy(d + first, r->data, len - first);
+        tcp_memcpy_accel(d + first, r->data, len - first);
     dmb(); /* payload consumed before consumer index update */
     r->tail += len;
     return len;
@@ -131,9 +141,9 @@ static u32 ring_peek_at(const struct ring_buf *r, u32 offset, void *dst, u32 len
     u32 first = TCP_BUF_SIZE - idx;
     if (first > len) first = len;
     dmb(); /* observe producer writes before peeking */
-    simd_memcpy(d, r->data + idx, first);
+    tcp_memcpy_accel(d, r->data + idx, first);
     if (len > first)
-        simd_memcpy(d + first, r->data, len - first);
+        tcp_memcpy_accel(d + first, r->data, len - first);
     return len;
 }
 
@@ -148,9 +158,9 @@ static u32 ring_copy_from_offset(const struct ring_buf *r, u32 offset, void *dst
     u32 first = TCP_BUF_SIZE - idx;
     if (first > len) first = len;
     dmb();
-    simd_memcpy(d, r->data + idx, first);
+    tcp_memcpy_accel(d, r->data + idx, first);
     if (len > first)
-        simd_memcpy(d + first, r->data, len - first);
+        tcp_memcpy_accel(d + first, r->data, len - first);
     return len;
 }
 
@@ -418,9 +428,10 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     tcp->urgent    = 0;
 
     if (data_len > 0)
-        simd_memcpy(tx_frame + TCP_OVERHEAD, data, data_len);
+        tcp_memcpy_accel(tx_frame + TCP_OVERHEAD, data, data_len);
 
-    tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
+    if (!(genet_tx_checksum_offload_enabled() && data_len > 0))
+        tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
 
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
     genet_send(tx_frame, frame_len);
@@ -468,7 +479,8 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
     if (data_len > 0)
         ring_copy_from_offset(&t->tx_buf, tx_off, tx_frame + TCP_OVERHEAD, data_len);
 
-    tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
+    if (!(genet_tx_checksum_offload_enabled() && data_len > 0))
+        tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
     genet_send(tx_frame, frame_len);
 }
