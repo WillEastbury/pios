@@ -77,12 +77,16 @@ static bool apply_relocations(u8 *base, const u8 *file,
     const struct pxe_reloc *relocs =
         (const struct pxe_reloc *)(file + hdr->reloc_offset);
 
+    u32 image_span = hdr->code_size + hdr->data_size;
+    if (image_span < hdr->code_size)
+        return false;
+
     for (u32 i = 0; i < hdr->reloc_count; i++) {
         const struct pxe_reloc *r = &relocs[i];
         u32 off = r->offset;
 
         /* Bounds check */
-        if (off + 8 > hdr->code_size + hdr->data_size)
+        if (off > image_span - 8U)
             return false;
 
         switch (r->type) {
@@ -130,6 +134,9 @@ static bool resolve_imports(u8 *base, const u8 *file,
 {
     const struct pxe_import *imports =
         (const struct pxe_import *)(file + hdr->import_offset);
+    u32 image_span = hdr->code_size + hdr->data_size;
+    if (image_span < hdr->code_size)
+        return false;
 
     for (u32 i = 0; i < hdr->import_count; i++) {
         func_ptr fn = resolve_import(imports[i].name_hash, syscall_tbl);
@@ -139,7 +146,7 @@ static bool resolve_imports(u8 *base, const u8 *file,
         }
 
         u32 off = imports[i].patch_offset;
-        if (off + 8 > hdr->code_size + hdr->data_size)
+        if (off > image_span - 8U)
             return false;
 
         /* Patch with absolute function pointer (64-bit) */
@@ -154,6 +161,8 @@ static bool resolve_imports(u8 *base, const u8 *file,
 u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
              void *syscall_table)
 {
+    if (!file || !base || slot_size == 0)
+        return 0;
     if (file_size < sizeof(struct pxe_header))
         return 0;
 
@@ -177,15 +186,26 @@ u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
         return 0;
 
     /* Validate offsets within file */
-    if (hdr->code_offset + hdr->code_size > file_size)
+    if (hdr->code_offset > file_size || hdr->code_size > file_size - hdr->code_offset)
         return 0;
-    if (hdr->data_size && hdr->data_offset + hdr->data_size > file_size)
+    if (hdr->data_size &&
+        (hdr->data_offset > file_size || hdr->data_size > file_size - hdr->data_offset))
         return 0;
-    if (hdr->reloc_count &&
-        hdr->reloc_offset + hdr->reloc_count * sizeof(struct pxe_reloc) > file_size)
+    if (hdr->reloc_count) {
+        u64 reloc_bytes = (u64)hdr->reloc_count * sizeof(struct pxe_reloc);
+        if (hdr->reloc_offset > file_size || reloc_bytes > (u64)file_size - hdr->reloc_offset)
+            return 0;
+    }
+    if (hdr->import_count) {
+        u64 import_bytes = (u64)hdr->import_count * sizeof(struct pxe_import);
+        if (hdr->import_offset > file_size || import_bytes > (u64)file_size - hdr->import_offset)
+            return 0;
+    }
+
+    u32 image_span = hdr->code_size + hdr->data_size;
+    if (image_span < hdr->code_size || image_span > slot_size)
         return 0;
-    if (hdr->import_count &&
-        hdr->import_offset + hdr->import_count * sizeof(struct pxe_import) > file_size)
+    if (hdr->bss_size > slot_size - image_span)
         return 0;
 
     u64 load_base = (u64)base;
@@ -199,7 +219,7 @@ u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
 
     /* Zero BSS */
     if (hdr->bss_size)
-        simd_zero(base + hdr->code_size + hdr->data_size, hdr->bss_size);
+        simd_zero(base + image_span, hdr->bss_size);
 
     /* Apply relocations */
     if (hdr->reloc_count) {
@@ -264,6 +284,8 @@ struct elf64_phdr {
 
 u64 elf64_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size)
 {
+    if (!file || !base || slot_size == 0)
+        return 0;
     if (file_size < sizeof(struct elf64_ehdr))
         return 0;
 
@@ -282,10 +304,12 @@ u64 elf64_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size)
 
     if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0)
         return 0;
+    if (ehdr->e_phentsize < sizeof(struct elf64_phdr))
+        return 0;
 
     /* Validate program header table is within file */
-    u64 ph_end = ehdr->e_phoff + (u64)ehdr->e_phnum * ehdr->e_phentsize;
-    if (ph_end > file_size)
+    u64 ph_bytes = (u64)ehdr->e_phnum * ehdr->e_phentsize;
+    if (ehdr->e_phoff > file_size || ph_bytes > (u64)file_size - ehdr->e_phoff)
         return 0;
 
     /* Find lowest vaddr to compute base offset */
@@ -313,6 +337,8 @@ u64 elf64_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size)
         u64 dest_off = ph->p_vaddr - vaddr_min;
         if (dest_off > (u64)slot_size || ph->p_memsz > (u64)slot_size - dest_off)
             return 0;
+        if (ph->p_filesz > ph->p_memsz)
+            return 0;
         if (ph->p_offset > file_size || ph->p_filesz > file_size - ph->p_offset)
             return 0;
 
@@ -332,5 +358,7 @@ u64 elf64_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size)
     flush_icache(load_base, code_end);
 
     /* Return rebased entry point */
+    if (ehdr->e_entry < vaddr_min || ehdr->e_entry - vaddr_min >= code_end)
+        return 0;
     return load_base + (ehdr->e_entry - vaddr_min);
 }
