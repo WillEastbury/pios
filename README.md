@@ -41,6 +41,7 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 | **QPU Tensor Compute** | VideoCore VII GPU offload framework. NEON fallback for matmul/relu/softmax. |
 | **MMU** | Identity-mapped page tables. Cacheable RAM, device memory for MMIO. |
 | **GIC-400 Interrupts** | Full interrupt controller with timer IRQ support. |
+| **Preemptive User Scheduling** | Cores 2-3 run timer-driven quanta (default 5ms @ 1kHz) with safe deferred preemption. |
 | **EL2→EL1 Boot** | Proper exception level transition with NEON/timer access enabled. |
 
 ## Building

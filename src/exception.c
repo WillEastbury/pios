@@ -31,12 +31,14 @@ void irq_register(u32 intid, irq_handler_t handler) {
 }
 
 /* Called from vectors.S irq_handler */
-void irq_dispatch(void) {
+void irq_dispatch(struct irq_frame *frame) {
     u32 intid = gic_acknowledge();
 
     if (intid < GIC_MAX_IRQ && irq_handlers[intid]) {
         irq_handlers[intid]();
     }
+
+    proc_irq_maybe_preempt(frame);
 
     if (intid != GIC_INTID_SPURIOUS)
         gic_end_of_interrupt(intid);

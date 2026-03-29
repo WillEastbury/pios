@@ -3,12 +3,13 @@
  *
  * Each user core runs an independent scheduler with up to 6 processes.
  * Processes occupy fixed 2MB slots within the core's 16MB private RAM.
- * Scheduling is cooperative: processes yield voluntarily via the syscall table.
+ * Scheduling is preemptive on user cores via timer quanta and cooperative yield.
  */
 
 #pragma once
 #include "types.h"
 #include "pipe.h"
+struct irq_frame;
 
 #define MAX_PROCS_PER_CORE  6
 #define PROC_SLOT_SIZE      (2 * 1024 * 1024)   /* 2MB per process */
@@ -36,6 +37,7 @@ struct process {
     struct proc_context ctx;
     u64 ticks;          /* tick count at last schedule */
     u32 exit_code;
+    u32 preemptions;
 };
 
 /* Syscall table passed to processes in x0 at entry.
@@ -159,3 +161,10 @@ NORETURN void proc_exit(u32 code); /* terminate current process */
 void proc_schedule(void);          /* run scheduler loop (called from coreN_main) */
 u32  proc_count(void);             /* number of active processes on this core */
 bool proc_handle_fault(u64 esr, u64 elr, u64 far); /* kill faulting user proc */
+
+/* Preemption (user cores only) */
+#define PROC_PREEMPT_TIMER_HZ    1000U
+#define PROC_PREEMPT_QUANTUM_MS  5U
+void proc_preempt_init(u32 timer_hz, u32 quantum_ms);
+void proc_irq_maybe_preempt(struct irq_frame *frame);
+u64  proc_preemptions(void);

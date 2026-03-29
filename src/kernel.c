@@ -166,6 +166,8 @@ NORETURN void core1_main(void) {
 NORETURN void core2_main(void) {
     core_env_init(CORE_USER0);
     proc_init();
+    timer_init(PROC_PREEMPT_TIMER_HZ);
+    proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }
@@ -174,6 +176,8 @@ NORETURN void core2_main(void) {
 NORETURN void core3_main(void) {
     core_env_init(CORE_USER1);
     proc_init();
+    timer_init(PROC_PREEMPT_TIMER_HZ);
+    proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }

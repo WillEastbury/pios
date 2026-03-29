@@ -19,6 +19,7 @@
 #include "ipc_queue.h"
 #include "ipc_stream.h"
 #include "pipe.h"
+#include "exception.h"
 
 #define CORE_DISK  1
 
@@ -28,6 +29,22 @@ static u32 current_proc;   /* index into procs[] */
 static u32 next_pid;
 static bool initialized;
 static u64 heap_top[MAX_PROCS_PER_CORE];
+static volatile bool preempt_enabled[2];
+static volatile bool preempt_armed[2];
+static volatile bool preempt_pending[2];
+static u64 preempt_quantum_ticks[2];
+static u64 preempt_count_core[2];
+
+static inline bool on_user_core(void)
+{
+    u32 c = core_id();
+    return c == CORE_USER0 || c == CORE_USER1;
+}
+
+static inline u32 user_core_slot(void)
+{
+    return core_id() - CORE_USER0;
+}
 
 /* Validate a user pointer is within the current process's memory slot */
 static bool ptr_valid(const void *ptr, u32 len) {
@@ -139,6 +156,8 @@ static i32   sys_tensor_relu(void *b, const void *a);
 static i32   sys_tensor_softmax(void *b, const void *a);
 static i32   sys_tensor_add(void *c, const void *a, const void *b);
 static i32   sys_tensor_dot(void *result, const void *a, const void *b);
+static void  proc_tick_hook(u32 core, u64 tick);
+static void  proc_preempt_trampoline(void);
 
 static struct syscall_table syscall_tab = {
     /* Process control */
@@ -267,8 +286,14 @@ static NORETURN void proc_trampoline(void)
     __builtin_unreachable();
 }
 
+static void proc_preempt_trampoline(void)
+{
+    proc_yield();
+}
+
 void proc_init(void)
 {
+    u32 uc = on_user_core() ? user_core_slot() : 0;
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
         procs[i].state = PROC_EMPTY;
         procs[i].pid = 0;
@@ -276,6 +301,13 @@ void proc_init(void)
     current_proc = 0;
     next_pid = (core_id() << 16) | 1;  /* encode core in upper bits */
     initialized = true;
+    if (on_user_core()) {
+        preempt_enabled[uc] = false;
+        preempt_armed[uc] = false;
+        preempt_pending[uc] = false;
+        preempt_quantum_ticks[uc] = 1;
+        preempt_count_core[uc] = 0;
+    }
     mmu_switch_to_kernel();
 }
 
@@ -331,6 +363,7 @@ i32 proc_exec(const char *path)
     p->mem_size = PROC_SLOT_SIZE;
     p->ticks = timer_ticks();
     p->exit_code = 0;
+    p->preemptions = 0;
 
     heap_top[(u32)slot] = ((u64)(usize)base + loaded + 15) & ~15UL;
 
@@ -357,14 +390,27 @@ i32 proc_exec(const char *path)
 
 void proc_yield(void)
 {
+    bool user = on_user_core();
+    u32 uc = user ? user_core_slot() : 0;
     struct process *p = &procs[current_proc];
+    if (user) {
+        preempt_armed[uc] = false;
+        preempt_pending[uc] = false;
+    }
     if (p->state == PROC_RUNNING)
         p->state = PROC_READY;
     ctx_switch(&p->ctx, &scheduler_ctx);
+    if (user && preempt_enabled[uc] && p->state == PROC_RUNNING)
+        preempt_armed[uc] = true;
 }
 
 NORETURN void proc_exit(u32 code)
 {
+    if (on_user_core()) {
+        u32 uc = user_core_slot();
+        preempt_armed[uc] = false;
+        preempt_pending[uc] = false;
+    }
     struct process *p = &procs[current_proc];
     p->state = PROC_DEAD;
     p->exit_code = code;
@@ -380,6 +426,8 @@ NORETURN void proc_exit(u32 code)
 
 void proc_schedule(void)
 {
+    bool user = on_user_core();
+    u32 uc = user ? user_core_slot() : 0;
     if (!initialized)
         proc_init();
 
@@ -412,8 +460,16 @@ void proc_schedule(void)
                 continue;
             }
 
+            if (user && preempt_enabled[uc]) {
+                preempt_pending[uc] = false;
+                preempt_armed[uc] = true;
+            }
             ctx_switch(&scheduler_ctx, &procs[i].ctx);
             /* Returns here when process yields or exits */
+            if (user) {
+                preempt_armed[uc] = false;
+                preempt_pending[uc] = false;
+            }
             mmu_switch_to_kernel();
             principal_set_current(PRINCIPAL_ROOT);
         }
@@ -429,10 +485,13 @@ bool proc_handle_fault(u64 esr, u64 elr, u64 far)
         return false;
     if ((core_id() != CORE_USER0 && core_id() != CORE_USER1))
         return false;
+    u32 uc = user_core_slot();
     struct process *p = &procs[current_proc];
     if (p->state != PROC_RUNNING)
         return false;
 
+    preempt_armed[uc] = false;
+    preempt_pending[uc] = false;
     p->state = PROC_DEAD;
     p->exit_code = 0xFFFF0001U;
     mmu_switch_to_kernel();
@@ -461,6 +520,82 @@ u32 proc_count(void)
             n++;
     }
     return n;
+}
+
+void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
+{
+    if (!on_user_core())
+        return;
+
+    if (timer_hz == 0)
+        timer_hz = 1;
+    if (quantum_ms == 0)
+        quantum_ms = 1;
+
+    u32 uc = user_core_slot();
+    u64 q = ((u64)timer_hz * (u64)quantum_ms + 999UL) / 1000UL;
+    if (q == 0)
+        q = 1;
+
+    preempt_quantum_ticks[uc] = q;
+    preempt_pending[uc] = false;
+    preempt_armed[uc] = false;
+    preempt_enabled[uc] = true;
+    timer_set_tick_hook(proc_tick_hook);
+
+    uart_puts("[proc] preempt core=");
+    uart_hex(core_id());
+    uart_puts(" quantum_ticks=");
+    uart_hex(q);
+    uart_putc('\n');
+}
+
+static void proc_tick_hook(u32 core, u64 tick)
+{
+    if (core != CORE_USER0 && core != CORE_USER1)
+        return;
+
+    u32 uc = core - CORE_USER0;
+    if (!preempt_enabled[uc] || !preempt_armed[uc] || preempt_pending[uc])
+        return;
+
+    struct process *p = &procs[current_proc];
+    if (p->state != PROC_RUNNING)
+        return;
+
+    u64 elapsed = tick - p->ticks;
+    if (elapsed >= preempt_quantum_ticks[uc])
+        preempt_pending[uc] = true;
+}
+
+void proc_irq_maybe_preempt(struct irq_frame *frame)
+{
+    if (!frame || !on_user_core())
+        return;
+
+    u32 uc = user_core_slot();
+    if (!preempt_enabled[uc] || !preempt_armed[uc] || !preempt_pending[uc])
+        return;
+
+    struct process *p = &procs[current_proc];
+    if (p->state != PROC_RUNNING) {
+        preempt_pending[uc] = false;
+        return;
+    }
+
+    preempt_pending[uc] = false;
+    p->state = PROC_READY;
+    p->preemptions++;
+    preempt_count_core[uc]++;
+    frame->x[30] = frame->elr;
+    frame->elr = (u64)(usize)proc_preempt_trampoline;
+}
+
+u64 proc_preemptions(void)
+{
+    if (!on_user_core())
+        return 0;
+    return preempt_count_core[user_core_slot()];
 }
 
 /* ==== Syscall implementations ==== */

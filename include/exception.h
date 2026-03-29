@@ -33,8 +33,19 @@ struct exception_frame {
 /* IRQ handler type */
 typedef void (*irq_handler_t)(void);
 
+/* IRQ save frame as laid out by SAVE_CONTEXT in vectors.S */
+struct irq_frame {
+    u64 x[31];   /* x0-x30 */
+    u64 elr;     /* return PC */
+    u64 spsr;    /* saved PSTATE */
+    u64 pad;     /* reserved/alignment */
+} ALIGNED(16);
+
 /* Install the exception vector table */
 void exception_init(void);
 
 /* Register an IRQ handler for a GIC interrupt ID */
 void irq_register(u32 intid, irq_handler_t handler);
+
+/* IRQ dispatcher called from vectors.S */
+void irq_dispatch(struct irq_frame *frame);

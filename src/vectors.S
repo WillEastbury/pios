@@ -147,6 +147,7 @@ vector_table:
 
 irq_handler:
     SAVE_CONTEXT
+    mov     x0, sp
     bl      irq_dispatch        /* C function */
     RESTORE_CONTEXT
     eret
