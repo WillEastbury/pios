@@ -115,6 +115,8 @@ User Core 2/3                         Core 0
 
 Incoming UDP is dispatched via `udp_callback` — currently only callable from Core 0 code. To route received UDP to user cores, register a callback that pushes `MSG_NET_UDP_RECV` into the appropriate FIFO.
 
+Core 0 also drains user→net FIFO requests in bounded bursts per `net_poll()` pass (`NET_FIFO_BURST_MAX`) to reduce syscall/message overhead under load while preserving fairness.
+
 ## Configuration
 
 In `kernel.c`:

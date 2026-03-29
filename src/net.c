@@ -50,6 +50,7 @@ static u64 icmp_min_interval;
 static u8 rx_frame[2048] ALIGNED(64);
 static u8 tx_frame[2048] ALIGNED(64);
 #define NET_RX_BURST_MAX 4U
+#define NET_FIFO_BURST_MAX 4U
 
 static u16 ip_id_counter;
 static volatile bool net_maint_queued;
@@ -386,7 +387,9 @@ void net_handle_fifo_request(void) {
     struct fifo_msg msg;
     struct fifo_msg reply;
 
-    if (fifo_pop(CORE_NET, CORE_USER0, &msg)) {
+    for (u32 i = 0; i < NET_FIFO_BURST_MAX; i++) {
+        if (!fifo_pop(CORE_NET, CORE_USER0, &msg))
+            break;
         if (msg.type == MSG_NET_UDP_SEND && msg.buffer && msg.length <= 1472) {
             u16 sp = (u16)(msg.tag >> 16);
             u16 dp = (u16)(msg.tag & 0xFFFF);
@@ -399,7 +402,9 @@ void net_handle_fifo_request(void) {
         }
     }
 
-    if (fifo_pop(CORE_NET, CORE_USER1, &msg)) {
+    for (u32 i = 0; i < NET_FIFO_BURST_MAX; i++) {
+        if (!fifo_pop(CORE_NET, CORE_USER1, &msg))
+            break;
         if (msg.type == MSG_NET_UDP_SEND && msg.buffer && msg.length <= 1472) {
             u16 sp = (u16)(msg.tag >> 16);
             u16 dp = (u16)(msg.tag & 0xFFFF);
@@ -412,9 +417,11 @@ void net_handle_fifo_request(void) {
         }
     }
 
-    /* Process socket-layer FIFO requests from user cores */
-    socket_handle_fifo(CORE_USER0);
-    socket_handle_fifo(CORE_USER1);
+    /* Drain socket-layer FIFO requests in small bursts per poll pass. */
+    for (u32 i = 0; i < NET_FIFO_BURST_MAX; i++)
+        socket_handle_fifo(CORE_USER0);
+    for (u32 i = 0; i < NET_FIFO_BURST_MAX; i++)
+        socket_handle_fifo(CORE_USER1);
 }
 
 /* ================================================================== */
