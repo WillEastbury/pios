@@ -77,7 +77,7 @@ net_send_udp(dst_ip, src_port, dst_port, data, len)
     └── genet_send(frame)
 ```
 
-## TCP Send Fast Path (chimney-style)
+## TCP Send Fast Path (toe-enable-window)
 
 Core 0 TCP TX now uses a burst send path that segments directly from the per-connection ring buffer into the NIC frame buffer (avoiding an intermediate stack segment copy).
 
