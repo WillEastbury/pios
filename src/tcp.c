@@ -164,6 +164,20 @@ static u32 ring_copy_from_offset(const struct ring_buf *r, u32 offset, void *dst
     return len;
 }
 
+static const u8 *ring_linear_ptr_at(const struct ring_buf *r, u32 offset, u32 *contig_out)
+{
+    u32 avail = ring_used(r);
+    if (offset >= avail) return NULL;
+    u32 pos = r->tail + offset;
+    u32 idx = pos & (TCP_BUF_SIZE - 1);
+    u32 contig = TCP_BUF_SIZE - idx;
+    u32 rem = avail - offset;
+    if (contig > rem) contig = rem;
+    if (contig_out) *contig_out = contig;
+    dmb();
+    return &r->data[idx];
+}
+
 /* Discard n bytes from front of buffer */
 static void ring_consume(struct ring_buf *r, u32 n) {
     u32 avail = ring_used(r);
@@ -380,6 +394,37 @@ static u16 tcp_checksum(u32 src_ip, u32 dst_ip,
     return (u16)~sum;
 }
 
+static u16 tcp_checksum_split(u32 src_ip, u32 dst_ip,
+                              const void *tcp_hdr, u32 tcp_hdr_len,
+                              const void *payload, u32 payload_len)
+{
+    struct tcp_pseudo ph;
+    ph.src_ip   = htonl(src_ip);
+    ph.dst_ip   = htonl(dst_ip);
+    ph.zero     = 0;
+    ph.protocol = IP_PROTO_TCP;
+    ph.tcp_len  = htons((u16)(tcp_hdr_len + payload_len));
+
+    u32 sum = 0;
+    const u16 *p = (const u16 *)&ph;
+    for (u32 i = 0; i < sizeof(ph) / 2; i++)
+        sum += p[i];
+
+    p = (const u16 *)tcp_hdr;
+    for (u32 i = 0; i < (tcp_hdr_len / 2); i++)
+        sum += p[i];
+
+    p = (const u16 *)payload;
+    for (u32 i = 0; i < (payload_len / 2); i++)
+        sum += p[i];
+    if (payload_len & 1)
+        sum += ((const u8 *)payload)[payload_len - 1];
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return (u16)~sum;
+}
+
 /* ================================================================== */
 /*  TX path: build Ethernet + IP + TCP and send                        */
 /* ================================================================== */
@@ -427,14 +472,28 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     tcp->checksum  = 0;
     tcp->urgent    = 0;
 
-    if (data_len > 0)
+    bool tx_offload_window = genet_tx_checksum_offload_enabled() && data_len > 0;
+    bool need_pad = frame_len < MIN_FRAME;
+    if (need_pad) frame_len = MIN_FRAME;
+
+    if (!tx_offload_window) {
+        if (data_len > 0)
+            tcp->checksum = tcp_checksum_split(t->local_ip, t->remote_ip,
+                                               tcp, TCP_HDR_SIZE, data, data_len);
+        else
+            tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
+    }
+
+    if (data_len == 0) {
+        genet_send(tx_frame, frame_len);
+        return;
+    }
+    if (need_pad) {
         tcp_memcpy_accel(tx_frame + TCP_OVERHEAD, data, data_len);
-
-    if (!(genet_tx_checksum_offload_enabled() && data_len > 0))
-        tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
-
-    if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
-    genet_send(tx_frame, frame_len);
+        genet_send(tx_frame, frame_len);
+        return;
+    }
+    genet_send_parts(tx_frame, TCP_OVERHEAD, data, data_len);
 }
 
 static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
@@ -476,12 +535,30 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
     tcp->checksum  = 0;
     tcp->urgent    = 0;
 
-    if (data_len > 0)
-        ring_copy_from_offset(&t->tx_buf, tx_off, tx_frame + TCP_OVERHEAD, data_len);
+    bool tx_offload_window = genet_tx_checksum_offload_enabled() && data_len > 0;
+    bool need_pad = frame_len < MIN_FRAME;
+    if (need_pad) frame_len = MIN_FRAME;
 
-    if (!(genet_tx_checksum_offload_enabled() && data_len > 0))
+    if (data_len == 0) {
+        if (!tx_offload_window)
+            tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
+        genet_send(tx_frame, frame_len);
+        return;
+    }
+
+    u32 contig = 0;
+    const u8 *lin = ring_linear_ptr_at(&t->tx_buf, tx_off, &contig);
+    if (!need_pad && lin && contig >= data_len) {
+        if (!tx_offload_window)
+            tcp->checksum = tcp_checksum_split(t->local_ip, t->remote_ip,
+                                               tcp, TCP_HDR_SIZE, lin, data_len);
+        genet_send_parts(tx_frame, TCP_OVERHEAD, lin, data_len);
+        return;
+    }
+
+    ring_copy_from_offset(&t->tx_buf, tx_off, tx_frame + TCP_OVERHEAD, data_len);
+    if (!tx_offload_window)
         tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
-    if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
     genet_send(tx_frame, frame_len);
 }
 

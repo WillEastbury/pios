@@ -83,6 +83,7 @@ Core 0 TCP TX now uses a burst send path that segments directly from the per-con
 
 - Sends up to 4 MSS segments per output pass when window/cwnd permit.
 - Uses direct ring-offset copy into wire frame payload.
+- Uses header/payload split TX (`genet_send_parts`) when payload is contiguous.
 - Keeps retransmit path on the same direct-copy routine.
 - Uses DMA-assisted copies for larger ring/frame moves (`DMA_CHAN_MEMCPY`) with SIMD fallback.
 - Enables a TX checksum offload window for data segments when GENET checksum assist is enabled.
