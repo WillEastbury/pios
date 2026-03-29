@@ -59,6 +59,16 @@ static bool ptr_valid(const void *ptr, u32 len) {
     return addr >= slot_start && end <= slot_end && end >= addr;
 }
 
+static bool ptr_valid_cstr(const char *s, u32 max_len)
+{
+    if (!s || max_len == 0) return false;
+    for (u32 i = 0; i < max_len; i++) {
+        if (!ptr_valid(s + i, 1)) return false;
+        if (s[i] == 0) return i != 0;
+    }
+    return false;
+}
+
 /* Send a FIFO request to the disk core and block until reply */
 static void fs_request(struct fifo_msg *msg, struct fifo_msg *reply)
 {
@@ -666,7 +676,7 @@ static i32 sys_open(const char *path, u32 flags)
 {
     (void)flags;
     if (!has_disk_cap()) return -1;
-    if (!ptr_valid(path, 1)) return -1;
+    if (!ptr_valid_cstr(path, 256)) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_FIND;
     msg.buffer = (u64)(usize)path;
@@ -712,7 +722,7 @@ static i32 sys_close(i32 fd) { if (!has_disk_cap()) return -1; (void)fd; return 
 static i32 sys_stat(const char *path, void *out)
 {
     if (!has_disk_cap()) return -1;
-    if (!ptr_valid(path, 1)) return -1;
+    if (!ptr_valid_cstr(path, 256)) return -1;
     if (!ptr_valid(out, sizeof(struct walfs_inode))) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_STAT;
@@ -727,7 +737,7 @@ static i32 sys_stat(const char *path, void *out)
 
 static i32 sys_mkdir(const char *path)
 {
-    if (!ptr_valid(path, 1) || !has_disk_cap()) return -1;
+    if (!ptr_valid_cstr(path, 256) || !has_disk_cap()) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_MKDIR;
     msg.buffer = (u64)(usize)path;
@@ -739,7 +749,7 @@ static i32 sys_mkdir(const char *path)
 
 static i32 sys_unlink(const char *path)
 {
-    if (!ptr_valid(path, 1) || !has_disk_cap()) return -1;
+    if (!ptr_valid_cstr(path, 256) || !has_disk_cap()) return -1;
     struct fifo_msg msg = {0};
     msg.type   = MSG_FS_DELETE;
     msg.buffer = (u64)(usize)path;
@@ -751,7 +761,7 @@ static i32 sys_unlink(const char *path)
 
 static i32 sys_creat(const char *path, u32 flags, u32 mode)
 {
-    if (!ptr_valid(path, 1) || !has_disk_cap()) return -1;
+    if (!ptr_valid_cstr(path, 256) || !has_disk_cap()) return -1;
 
     /* Split path into parent directory and filename */
     u32 len = pios_strlen(path);
@@ -842,7 +852,7 @@ struct readdir_entry {
 static i32 sys_readdir(const char *path, void *entries, u32 max_entries)
 {
     if (!has_disk_cap()) return -1;
-    if (!ptr_valid(path, 1)) return -1;
+    if (!ptr_valid_cstr(path, 256)) return -1;
     if (!ptr_valid(entries, max_entries * sizeof(struct readdir_entry))) return -1;
 
     /* Resolve path to inode */
@@ -953,7 +963,7 @@ static i32 sys_sock_close(i32 fd) { if (!has_net_cap()) return -1; return sock_c
 static i32 sys_resolve(const char *hostname, u32 *ip_out)
 {
     if (!has_net_cap()) return -1;
-    if (!ptr_valid(hostname, 1)) return -1;
+    if (!ptr_valid_cstr(hostname, 254)) return -1;
     if (!ptr_valid(ip_out, sizeof(u32))) return -1;
     return dns_resolve(hostname, ip_out) ? 0 : -1;
 }
@@ -964,8 +974,8 @@ static u32 sys_whoami(void) { return principal_current(); }
 
 static i32 sys_auth(const char *user, const char *pass)
 {
-    if (!ptr_valid(user, 1)) return -1;
-    if (!ptr_valid(pass, 1)) return -1;
+    if (!ptr_valid_cstr(user, 32)) return -1;
+    if (!ptr_valid_cstr(pass, 128)) return -1;
     return principal_auth(user, pass, NULL) ? 0 : -1;
 }
 
@@ -999,7 +1009,7 @@ static void *sys_memcpy(void *dst, const void *src, u32 n)
 
 static u32 sys_strlen(const char *s)
 {
-    if (!ptr_valid(s, 1)) return 0;
+    if (!ptr_valid_cstr(s, 4096)) return 0;
     return pios_strlen(s);
 }
 
@@ -1007,7 +1017,7 @@ static u32 sys_strlen(const char *s)
 
 static i32 sys_spawn(const char *path)
 {
-    if (!ptr_valid(path, 1) || !has_cap(PRINCIPAL_EXEC)) return -1;
+    if (!ptr_valid_cstr(path, 256) || !has_cap(PRINCIPAL_EXEC)) return -1;
     return proc_exec(path);
 }
 
@@ -1051,16 +1061,6 @@ static i32 sys_sem_post(i32 id)
 }
 
 /* ---- In-memory IPC ---- */
-
-static bool ptr_valid_cstr(const char *s, u32 max_len)
-{
-    if (!s || max_len == 0) return false;
-    for (u32 i = 0; i < max_len; i++) {
-        if (!ptr_valid(s + i, 1)) return false;
-        if (s[i] == 0) return i != 0;
-    }
-    return false;
-}
 
 static i32 sys_queue_create(const char *name, u32 depth, u32 flags, u32 frame_max)
 {
