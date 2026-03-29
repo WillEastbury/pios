@@ -504,7 +504,7 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     /* Enable safe NIC checksum assist paths by default. */
     genet_set_rx_checksum_offload(true);
     genet_set_tx_checksum_offload(true);
-    genet_set_tso(false);
+    genet_set_tso(true);
 
     net_maint_queued = false;
     timer_set_tick_hook(net_tick_hook);

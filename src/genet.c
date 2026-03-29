@@ -162,7 +162,7 @@ static void genet_apply_offloads(void)
      * On GENET v3+, this register must be set for correct RX/TX status
      * sizing when checksum metadata is enabled.
      */
-    gw(RBUF_TBUF_SIZE_CTRL, tx_csum_offload ? 1U : 0U);
+    gw(RBUF_TBUF_SIZE_CTRL, (tx_csum_offload || tso_enabled) ? 1U : 0U);
 }
 
 /* ---- MDIO / PHY ---- */
@@ -454,10 +454,18 @@ void genet_set_rx_checksum_offload(bool enable) {
 }
 
 void genet_set_tso(bool enable) {
-    /* Descriptor-level segmentation is not implemented yet in this driver. */
-    tso_enabled = false;
+    /*
+     * GENET TSO depends on TX checksum assist being active.
+     * Keep the dependency explicit so callers can enable TSO directly.
+     */
+    if (enable && !tx_csum_offload)
+        tx_csum_offload = true;
+
+    tso_enabled = enable;
+    genet_apply_offloads();
+
     if (enable && !tso_warned) {
-        uart_puts("[genet] TSO unsupported: keeping disabled\n");
+        uart_puts("[genet] TSO assist enabled\n");
         tso_warned = true;
     }
 }
