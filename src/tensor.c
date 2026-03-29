@@ -43,6 +43,7 @@ static bool v3d_kernel_warned[V3D_KERNEL_MAX];
 #define TENSOR_V3D_VEC_MIN_ELEMS   128U
 #define TENSOR_V3D_DOT_MIN_ELEMS   256U
 #define TENSOR_V3D_MATMUL_MIN_MACS 4096U
+#define TENSOR_V3D_SOFTMAX_MIN_ELEMS 256U
 
 static inline u32 f32_bits(float f)
 {
@@ -74,6 +75,8 @@ static bool tensor_v3d_work_eligible(v3d_kernel_id_t id, u64 work_hint)
         return false;
     case V3D_KERNEL_MATMUL:
         return work_hint >= TENSOR_V3D_MATMUL_MIN_MACS;
+    case V3D_KERNEL_SOFTMAX:
+        return work_hint >= TENSOR_V3D_SOFTMAX_MIN_ELEMS;
     default:
         return false;
     }
@@ -260,6 +263,37 @@ static float neon_vec_dot_f32(const float *a, const float *b, u32 n) {
     return result;
 }
 
+static float neon_sum_f32(const float *a, u32 n)
+{
+    float result = 0.0f;
+    u32 i = 0;
+
+    if (n >= 4) {
+        u32 result_bits = 0;
+        __asm__ volatile("movi v4.4s, #0" ::: "v4");
+        for (; i + 4 <= n; i += 4) {
+            __asm__ volatile(
+                "ld1  {v0.4s}, [%0], #16  \n"
+                "fadd v4.4s, v4.4s, v0.4s \n"
+                : "+r"(a)
+                :: "v0","v4","memory"
+            );
+        }
+        __asm__ volatile(
+            "faddp v4.4s, v4.4s, v4.4s \n"
+            "faddp s4, v4.2s           \n"
+            "fmov  %w0, s4             \n"
+            : "=r"(result_bits)
+            :: "v4"
+        );
+        result = bits_f32(result_bits);
+    }
+
+    for (; i < n; i++)
+        result += a[i];
+    return result;
+}
+
 static void neon_vec_relu_f32(float *b, const float *a, u32 n) {
     u32 i = 0;
     __asm__ volatile("movi v1.4s, #0" ::: "v1");
@@ -418,6 +452,10 @@ bool tensor_softmax(tensor_t *b, const tensor_t *a) {
     float *dst = (float *)b->arm_ptr;
     u32 rows = a->rows;
     u32 cols = a->cols;
+    u64 elems = (u64)rows * (u64)cols;
+
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_SOFTMAX, elems))
+        return true;
 
     for (u32 r = 0; r < rows; r++) {
         float *row_s = src + r * cols;
@@ -457,15 +495,14 @@ bool tensor_softmax(tensor_t *b, const tensor_t *a) {
         }
 
         /* exp(x - max) via Schraudolph's approximation and sum */
-        float sum = 0.0f;
         for (c = 0; c < cols; c++) {
             float x = row_s[c] - max_val;
             if (x < -87.0f) x = -87.0f;
             union { float f; u32 i; } v;
             v.i = (u32)(12102203.2f * x + 1065353216.0f);
             row_d[c] = v.f;
-            sum += row_d[c];
         }
+        float sum = neon_sum_f32(row_d, cols);
 
         /* NEON normalize: multiply all by 1/sum */
         if (sum > 0.0f) {

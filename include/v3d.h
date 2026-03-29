@@ -26,6 +26,7 @@ typedef enum {
     V3D_KERNEL_RELU = 3,
     V3D_KERNEL_DOT = 4,
     V3D_KERNEL_SCALE = 5,
+    V3D_KERNEL_SOFTMAX = 6,
     V3D_KERNEL_MAX
 } v3d_kernel_id_t;
 

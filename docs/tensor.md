@@ -22,7 +22,7 @@ MMIO CSD submission now performs an idle handshake before queue programming and 
 | Dot product | `tensor_dot(&result, a, b)` | `fmla` (fused multiply-accumulate), `faddp` (pairwise reduce); forced NEON path pending V3D scalar writeback plumbing |
 | Matrix multiply | `tensor_matmul(c, a, b)` | Scalar inner loop (NEON for row operations) |
 | ReLU | `tensor_relu(b, a)` | `fmax` with zero vector |
-| Softmax | `tensor_softmax(b, a)` | Schraudolph exp approximation, scalar normalize |
+| Softmax | `tensor_softmax(b, a)` | Schraudolph exp approximation + NEON lane-sum normalize; optional V3D dispatch when a bound softmax kernel exists |
 
 ## Tensor Lifecycle
 

@@ -31,6 +31,7 @@ static struct v3d_kernel_desc g_kernels[V3D_KERNEL_MAX] = {
     { V3D_KERNEL_RELU,   "relu",    4, 0, false, false },
     { V3D_KERNEL_DOT,    "dot",     8, 0, false, false },
     { V3D_KERNEL_SCALE,  "scale",   4, 0, false, false },
+    { V3D_KERNEL_SOFTMAX,"softmax", 8, 0, false, false },
 };
 struct v3d_kernel_blob {
     u32 control_handle;
