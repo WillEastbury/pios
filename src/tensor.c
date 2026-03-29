@@ -37,6 +37,12 @@
 /* Kernel dispatch is enabled only when V3D kernel descriptors are bound.
  * Until then, operations run on ARM/NEON. */
 static bool use_qpu_fallback = true;
+static bool v3d_kernel_disabled[V3D_KERNEL_MAX];
+static bool v3d_kernel_warned[V3D_KERNEL_MAX];
+
+#define TENSOR_V3D_VEC_MIN_ELEMS   128U
+#define TENSOR_V3D_DOT_MIN_ELEMS   256U
+#define TENSOR_V3D_MATMUL_MIN_MACS 4096U
 
 static inline u32 f32_bits(float f)
 {
@@ -52,22 +58,60 @@ static inline float bits_f32(u32 u)
     return v.f;
 }
 
-static bool tensor_try_v3d(v3d_kernel_id_t id)
+static bool tensor_v3d_work_eligible(v3d_kernel_id_t id, u64 work_hint)
+{
+    switch (id) {
+    case V3D_KERNEL_ADD:
+    case V3D_KERNEL_MUL:
+    case V3D_KERNEL_SCALE:
+    case V3D_KERNEL_RELU:
+        return work_hint >= TENSOR_V3D_VEC_MIN_ELEMS;
+    case V3D_KERNEL_DOT:
+        return work_hint >= TENSOR_V3D_DOT_MIN_ELEMS;
+    case V3D_KERNEL_MATMUL:
+        return work_hint >= TENSOR_V3D_MATMUL_MIN_MACS;
+    default:
+        return false;
+    }
+}
+
+static bool tensor_try_v3d(v3d_kernel_id_t id, u64 work_hint)
 {
     if (!v3d_dispatch_supported())
+        return false;
+    if (id >= V3D_KERNEL_MAX || v3d_kernel_disabled[id])
+        return false;
+    if (!tensor_v3d_work_eligible(id, work_hint))
         return false;
     const struct v3d_kernel_desc *k = v3d_kernel_desc_get(id);
     if (!k || !k->ready || k->control_list_bus == 0 || k->qpu_count == 0)
         return false;
     v3d_status_t r = v3d_dispatch_kernel(id, 25);
-    return r == V3D_STATUS_OK;
+    if (r == V3D_STATUS_OK)
+        return true;
+
+    /*
+     * Quarantine kernels that fail dispatch so we preserve deterministic
+     * NEON fallback behavior and avoid timeout-heavy retry loops.
+     */
+    v3d_kernel_disabled[id] = true;
+    if (!v3d_kernel_warned[id]) {
+        uart_puts("[tensor] disable V3D kernel: ");
+        uart_puts(k->name);
+        uart_puts(" status=");
+        uart_hex((u32)r);
+        uart_puts("\n");
+        v3d_kernel_warned[id] = true;
+    }
+    return false;
 }
 
 static bool tensor_any_bound_v3d_kernel(void)
 {
     for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
         const struct v3d_kernel_desc *k = v3d_kernel_desc_get((v3d_kernel_id_t)i);
-        if (k && k->ready && k->control_list_bus != 0 && k->qpu_count != 0)
+        if (k && k->ready && !v3d_kernel_disabled[i] &&
+            k->control_list_bus != 0 && k->qpu_count != 0)
             return true;
     }
     return false;
@@ -293,7 +337,7 @@ bool tensor_add(tensor_t *c, const tensor_t *a, const tensor_t *b) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n || c->rows * c->cols != n) return false;
 
-    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_ADD))
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_ADD, n))
         return true;
     neon_vec_add_f32((float *)c->arm_ptr,
                      (const float *)a->arm_ptr,
@@ -306,7 +350,7 @@ bool tensor_mul(tensor_t *c, const tensor_t *a, const tensor_t *b) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n || c->rows * c->cols != n) return false;
 
-    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_MUL))
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_MUL, n))
         return true;
     neon_vec_mul_f32((float *)c->arm_ptr,
                      (const float *)a->arm_ptr,
@@ -319,7 +363,7 @@ bool tensor_scale(tensor_t *b, const tensor_t *a, float scalar) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n) return false;
 
-    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_SCALE))
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_SCALE, n))
         return true;
     neon_vec_scale_f32((float *)b->arm_ptr,
                        (const float *)a->arm_ptr, scalar, n);
@@ -331,7 +375,7 @@ bool tensor_dot(float *result, const tensor_t *a, const tensor_t *b) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n) return false;
 
-    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_DOT))
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_DOT, n))
         return true;
     *result = neon_vec_dot_f32((const float *)a->arm_ptr,
                                (const float *)b->arm_ptr, n);
@@ -342,7 +386,8 @@ bool tensor_matmul(tensor_t *c, const tensor_t *a, const tensor_t *b) {
     if (a->cols != b->rows) return false;
     if (c->rows != a->rows || c->cols != b->cols) return false;
 
-    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_MATMUL))
+    u64 macs = (u64)a->rows * (u64)a->cols * (u64)b->cols;
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_MATMUL, macs))
         return true;
     neon_matmul_f32((float *)c->arm_ptr,
                     (const float *)a->arm_ptr,
@@ -356,7 +401,7 @@ bool tensor_relu(tensor_t *b, const tensor_t *a) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n) return false;
 
-    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_RELU))
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_RELU, n))
         return true;
     neon_vec_relu_f32((float *)b->arm_ptr,
                       (const float *)a->arm_ptr, n);
@@ -522,6 +567,10 @@ bool qpu_dispatch(const qpu_program_t *prog, struct qpu_job *jobs,
 void tensor_init(void) {
     gpu_init();
     v3d_init();
+    for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
+        v3d_kernel_disabled[i] = false;
+        v3d_kernel_warned[i] = false;
+    }
     use_qpu_fallback = !v3d_dispatch_supported();
     if (qpu_enable(true)) {
         uart_puts("[tensor] QPU enabled (12 QPUs)\n");

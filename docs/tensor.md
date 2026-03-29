@@ -6,6 +6,8 @@ PIOS provides NEON-accelerated tensor operations with a V3D/QPU dispatch framewo
 
 By default, operations run on the ARM Cortex-A76 using 128-bit NEON SIMD (4 floats per instruction, dual-issue capable). Tensor ops only attempt V3D dispatch when a kernel descriptor is bound and marked ready; otherwise they stay on deterministic NEON fallback paths.
 
+V3D attempts are also gated by operation-size thresholds (to avoid offload overhead on tiny work units), and a kernel is quarantined after a failed dispatch so repeated calls do not get stuck in timeout-heavy retry loops.
+
 ## Available Operations
 
 | Operation | Function | NEON Instructions Used |
