@@ -65,6 +65,9 @@ bool v3d_dispatch_supported(void);
 const struct v3d_kernel_desc *v3d_kernel_desc_get(v3d_kernel_id_t id);
 v3d_status_t v3d_dispatch_kernel(v3d_kernel_id_t id, u32 timeout_ms);
 v3d_status_t v3d_kernel_bind(v3d_kernel_id_t id, u32 uniform_bus, u32 shader_bus);
+v3d_status_t v3d_kernel_bind_blob(v3d_kernel_id_t id,
+                                  const void *uniform_data, u32 uniform_bytes,
+                                  const u64 *shader_code, u32 shader_insts);
 
 u32 v3d_reg_read(u32 reg_off, bool *ok_out);
 v3d_status_t v3d_reg_write(u32 reg_off, u32 val);

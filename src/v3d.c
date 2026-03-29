@@ -24,6 +24,10 @@
 static struct v3d_caps g_v3d_caps;
 static bool g_mmio_auto_quarantined;
 static bool g_mmio_auto_warned;
+static u32 g_kernel_uniform_handle[V3D_KERNEL_MAX];
+static u32 g_kernel_uniform_bus[V3D_KERNEL_MAX];
+static u32 g_kernel_shader_handle[V3D_KERNEL_MAX];
+static u32 g_kernel_shader_bus[V3D_KERNEL_MAX];
 static struct v3d_kernel_desc g_kernels[V3D_KERNEL_MAX] = {
     { V3D_KERNEL_MATMUL, "matmul", 12, 0, false, false },
     { V3D_KERNEL_ADD,    "add",     4, 0, false, false },
@@ -61,6 +65,10 @@ static bool v3d_reg_allowed(u32 reg_off)
 static void v3d_kernel_blobs_init(void)
 {
     for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
+        g_kernel_uniform_handle[i] = 0;
+        g_kernel_uniform_bus[i] = 0;
+        g_kernel_shader_handle[i] = 0;
+        g_kernel_shader_bus[i] = 0;
         g_kernel_blobs[i].control_handle = 0;
         g_kernel_blobs[i].control_bus = 0;
         g_kernel_blobs[i].control_ptr = NULL;
@@ -291,5 +299,73 @@ v3d_status_t v3d_kernel_bind(v3d_kernel_id_t id, u32 uniform_bus, u32 shader_bus
     dmb();
     g_kernels[id].ready = true;
     g_kernels[id].control_list_bus = b->control_bus;
+    return V3D_STATUS_OK;
+}
+
+v3d_status_t v3d_kernel_bind_blob(v3d_kernel_id_t id,
+                                  const void *uniform_data, u32 uniform_bytes,
+                                  const u64 *shader_code, u32 shader_insts)
+{
+    if (id >= V3D_KERNEL_MAX)
+        return V3D_STATUS_INVALID;
+    if (!uniform_data || uniform_bytes == 0 || !shader_code || shader_insts == 0)
+        return V3D_STATUS_INVALID;
+    if (!g_v3d_caps.dispatch_supported)
+        return V3D_STATUS_UNSUPPORTED;
+
+    u32 shader_bytes = shader_insts * 8U;
+    u32 uniform_alloc = (uniform_bytes + 15U) & ~15U;
+    u32 shader_alloc = (shader_bytes + 15U) & ~15U;
+
+    u32 uniform_handle = gpu_mem_alloc(uniform_alloc, 16, GPU_MEM_FLAG_COHERENT);
+    if (!uniform_handle)
+        return V3D_STATUS_FAILED;
+    u32 uniform_bus = gpu_mem_lock(uniform_handle);
+    if (!uniform_bus) {
+        gpu_mem_free(uniform_handle);
+        return V3D_STATUS_FAILED;
+    }
+
+    u32 shader_handle = gpu_mem_alloc(shader_alloc, 16, GPU_MEM_FLAG_COHERENT);
+    if (!shader_handle) {
+        gpu_mem_unlock(uniform_handle);
+        gpu_mem_free(uniform_handle);
+        return V3D_STATUS_FAILED;
+    }
+    u32 shader_bus = gpu_mem_lock(shader_handle);
+    if (!shader_bus) {
+        gpu_mem_free(shader_handle);
+        gpu_mem_unlock(uniform_handle);
+        gpu_mem_free(uniform_handle);
+        return V3D_STATUS_FAILED;
+    }
+
+    void *uniform_ptr = (void *)(usize)(uniform_bus & 0x3FFFFFFF);
+    void *shader_ptr = (void *)(usize)(shader_bus & 0x3FFFFFFF);
+    memcpy(uniform_ptr, uniform_data, uniform_bytes);
+    memcpy(shader_ptr, shader_code, shader_bytes);
+    dsb();
+
+    v3d_status_t r = v3d_kernel_bind(id, uniform_bus, shader_bus);
+    if (r != V3D_STATUS_OK) {
+        gpu_mem_unlock(shader_handle);
+        gpu_mem_free(shader_handle);
+        gpu_mem_unlock(uniform_handle);
+        gpu_mem_free(uniform_handle);
+        return r;
+    }
+
+    if (g_kernel_uniform_handle[id]) {
+        gpu_mem_unlock(g_kernel_uniform_handle[id]);
+        gpu_mem_free(g_kernel_uniform_handle[id]);
+    }
+    if (g_kernel_shader_handle[id]) {
+        gpu_mem_unlock(g_kernel_shader_handle[id]);
+        gpu_mem_free(g_kernel_shader_handle[id]);
+    }
+    g_kernel_uniform_handle[id] = uniform_handle;
+    g_kernel_uniform_bus[id] = uniform_bus;
+    g_kernel_shader_handle[id] = shader_handle;
+    g_kernel_shader_bus[id] = shader_bus;
     return V3D_STATUS_OK;
 }

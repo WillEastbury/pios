@@ -75,4 +75,6 @@ qpu_dispatch(&prog, jobs, num_qpus); // Submit to 1-12 QPUs
 qpu_free_program(&prog);
 ```
 
+For real bound kernels, the V3D layer now exposes `v3d_kernel_bind_blob(...)` to upload externally generated uniform/shader blobs into GPU-coherent memory and bind them into the dispatch descriptor table.
+
 VideoCore VII has 12 QPUs (3 slices × 4), each a 4-wide float SIMD unit at 800MHz. Peak theoretical: 76.8 GFLOPS. The VC VII ISA is still incomplete publicly, so the production path remains NEON unless valid kernel blobs are explicitly bound in the V3D layer.
