@@ -167,6 +167,16 @@ static v3d_status_t v3d_dispatch_mmio_csd(const struct v3d_dispatch_cfg *cfg, u3
     if (!g_v3d_caps.mmio_csd)
         return V3D_STATUS_UNSUPPORTED;
 
+    /* Wait for CSD idle before submitting a new queue entry. */
+    for (u32 i = 0; i < timeout_ms * 1000U; i++) {
+        u32 st = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OFF);
+        if ((st & V3D_CSD_STATUS_BUSY_MASK) == 0U)
+            break;
+        if (i + 1U == timeout_ms * 1000U)
+            return V3D_STATUS_TIMEOUT;
+        timer_delay_us(1);
+    }
+
     /* Minimal CSD queue programming: control list pointer + launch config. */
     mmio_write(g_v3d_caps.reg_base + V3D_CSD_QUEUED_CFG0_OFF, cfg->control_list_bus);
     mmio_write(g_v3d_caps.reg_base + V3D_CSD_QUEUED_CFG1_OFF, cfg->qpu_count);
@@ -174,12 +184,15 @@ static v3d_status_t v3d_dispatch_mmio_csd(const struct v3d_dispatch_cfg *cfg, u3
     mmio_write(g_v3d_caps.reg_base + V3D_CSD_QUEUED_CFG3_OFF, 0U);
     mmio_write(g_v3d_caps.reg_base + V3D_CSD_QUEUED_CFG4_OFF, 0U);
     mmio_write(g_v3d_caps.reg_base + V3D_CSD_QUEUED_CFG5_OFF, 0U);
+    dmb();
     mmio_write(g_v3d_caps.reg_base + V3D_CSD_QUEUED_CFG6_OFF, 1U); /* queue kick */
 
     for (u32 i = 0; i < timeout_ms * 1000U; i++) {
         u32 st = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OFF);
-        if ((st & V3D_CSD_STATUS_BUSY_MASK) == 0U)
+        if ((st & V3D_CSD_STATUS_BUSY_MASK) == 0U) {
+            dmb();
             return V3D_STATUS_OK;
+        }
         timer_delay_us(1);
     }
     return V3D_STATUS_TIMEOUT;

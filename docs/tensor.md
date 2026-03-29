@@ -10,6 +10,8 @@ V3D attempts are also gated by operation-size thresholds (to avoid offload overh
 
 When backend selection is `AUTO`, MMIO CSD dispatch is attempted first; if it times out/fails while mailbox QPU is available, MMIO is quarantined for subsequent AUTO dispatches and mailbox becomes the stable fast fallback path.
 
+MMIO CSD submission now performs an idle handshake before queue programming and uses memory barriers around queue-kick/completion visibility.
+
 ## Available Operations
 
 | Operation | Function | NEON Instructions Used |
