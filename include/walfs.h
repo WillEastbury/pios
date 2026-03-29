@@ -25,6 +25,8 @@
 #define RECORD_DATA         2
 #define RECORD_DIRENT       3
 #define RECORD_DELETE       4
+#define RECORD_TX_BEGIN     5
+#define RECORD_TX_COMMIT    6
 
 /* Inode flags */
 #define WALFS_DIR           0x01
@@ -135,3 +137,6 @@ void walfs_handle_fifo(u32 from_core);
 
 /* Flush superblock to disk. */
 void walfs_sync(void);
+
+/* Compact WAL: rewrite with only live records, reclaim space. */
+bool walfs_compact(void);

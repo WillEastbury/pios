@@ -227,8 +227,25 @@ static u64 wal_append(u32 type, const void *meta, u32 meta_len,
 
 static bool is_deleted(u64 inode_id)
 {
+    /* Fast path: check inode_cache for last known record position */
+    u64 cached_pos;
+    if (icache_get(inode_id, &cached_pos)) {
+        struct wal_record hdr;
+        if (wal_read(cached_pos, &hdr, sizeof(hdr)) && wal_rec_valid(&hdr)) {
+            if (hdr.type == RECORD_DELETE) return true;
+            if (hdr.type == RECORD_INODE) {
+                struct walfs_inode ino;
+                if (wal_read(cached_pos + sizeof(hdr), &ino, sizeof(ino)))
+                    if (ino.inode_id == inode_id)
+                        return (ino.flags & WALFS_DELETED) != 0;
+            }
+        }
+    }
+
+    /* Slow path: full scan, updating cache as we go */
     bool del = false;
     u64 pos = WAL_START;
+    u64 last_pos = 0;
     struct wal_record hdr;
 
     while (pos < super.wal_head) {
@@ -237,15 +254,18 @@ static bool is_deleted(u64 inode_id)
         if (hdr.type == RECORD_DELETE) {
             struct walfs_delete d;
             if (wal_read(pos + sizeof(hdr), &d, sizeof(d)))
-                if (d.inode_id == inode_id) del = true;
+                if (d.inode_id == inode_id) { del = true; last_pos = pos; }
         } else if (hdr.type == RECORD_INODE) {
             struct walfs_inode ino;
             if (wal_read(pos + sizeof(hdr), &ino, sizeof(ino)))
-                if (ino.inode_id == inode_id)
+                if (ino.inode_id == inode_id) {
                     del = (ino.flags & WALFS_DELETED) != 0;
+                    last_pos = pos;
+                }
         }
         pos += hdr.length;
     }
+    if (last_pos) icache_put(inode_id, last_pos);
     return del;
 }
 
@@ -384,6 +404,10 @@ u64 walfs_create(u64 parent_id, const char *name, u32 flags, u32 mode)
 
     u64 id = next_inode++;
     u64 ts = read_cntvct();
+    u64 tx_id = next_seq;
+
+    /* Transaction: BEGIN → INODE → DIRENT → COMMIT */
+    wal_append(RECORD_TX_BEGIN, &tx_id, sizeof(tx_id), NULL, 0);
 
     struct walfs_inode ino;
     memset(&ino, 0, sizeof(ino));
@@ -399,6 +423,7 @@ u64 walfs_create(u64 parent_id, const char *name, u32 flags, u32 mode)
         next_inode--;
         return 0;
     }
+    icache_put(id, super.wal_head - sizeof(struct wal_record) - sizeof(ino));
 
     struct walfs_dirent de;
     memset(&de, 0, sizeof(de));
@@ -407,6 +432,8 @@ u64 walfs_create(u64 parent_id, const char *name, u32 flags, u32 mode)
     name_copy(de.name, name);
 
     wal_append(RECORD_DIRENT, &de, sizeof(de), NULL, 0);
+    wal_append(RECORD_TX_COMMIT, &tx_id, sizeof(tx_id), NULL, 0);
+    lru_flush(&path_cache);
     write_super();
     return id;
 }
@@ -503,8 +530,28 @@ bool walfs_delete(u64 inode_id)
 bool walfs_stat(u64 inode_id, struct walfs_inode *out)
 {
     if (!mounted) return false;
+
+    /* Fast path: check inode_cache for cached WAL position */
+    u64 cached_pos;
+    if (icache_get(inode_id, &cached_pos)) {
+        struct wal_record hdr;
+        if (wal_read(cached_pos, &hdr, sizeof(hdr)) && wal_rec_valid(&hdr)) {
+            if (hdr.type == RECORD_DELETE) return false;
+            if (hdr.type == RECORD_INODE) {
+                struct walfs_inode ino;
+                if (wal_read(cached_pos + sizeof(hdr), &ino, sizeof(ino)) &&
+                    ino.inode_id == inode_id && !(ino.flags & WALFS_DELETED)) {
+                    simd_memcpy(out, &ino, sizeof(ino));
+                    return true;
+                }
+            }
+        }
+    }
+
+    /* Slow path: full scan, updating cache */
     bool found = false, deleted = false;
     u64 pos = WAL_START;
+    u64 last_pos = 0;
     struct wal_record hdr;
 
     while (pos < super.wal_head) {
@@ -518,15 +565,19 @@ bool walfs_stat(u64 inode_id, struct walfs_inode *out)
                 simd_memcpy(out, &ino, sizeof(ino));
                 found   = true;
                 deleted = (ino.flags & WALFS_DELETED) != 0;
+                last_pos = pos;
             }
         } else if (hdr.type == RECORD_DELETE) {
             struct walfs_delete d;
             if (wal_read(pos + sizeof(hdr), &d, sizeof(d)) &&
-                d.inode_id == inode_id)
+                d.inode_id == inode_id) {
                 deleted = true;
+                last_pos = pos;
+            }
         }
         pos += hdr.length;
     }
+    if (last_pos) icache_put(inode_id, last_pos);
     return found && !deleted;
 }
 
@@ -578,35 +629,155 @@ u64 walfs_find(const char *path)
 void walfs_readdir(u64 parent_id, walfs_readdir_cb cb)
 {
     if (!mounted || !cb) return;
+
+    /* Single-pass O(N): collect dirents + deleted set in one WAL scan */
+    #define RDIR_MAX 64
+    static struct walfs_dirent dir_buf[RDIR_MAX];
+    static u64 del_set[RDIR_MAX];
+    u32 dir_count = 0, del_count = 0;
+
     u64 pos = WAL_START;
     struct wal_record hdr;
-    u64 seen[128];
-    u32 nseen = 0;
-
     while (pos < super.wal_head) {
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
         if (!wal_rec_valid(&hdr)) break;
 
-        if (hdr.type == RECORD_DIRENT) {
+        if (hdr.type == RECORD_DIRENT && dir_count < RDIR_MAX) {
             struct walfs_dirent de;
             if (wal_read(pos + sizeof(hdr), &de, sizeof(de)) &&
-                de.parent_id == parent_id && !is_deleted(de.child_id)) {
-                bool dup = false;
-                for (u32 i = 0; i < nseen; i++)
-                    if (seen[i] == de.child_id) { dup = true; break; }
-                if (!dup) {
-                    if (nseen < 128) seen[nseen++] = de.child_id;
-                    cb(&de);
+                de.parent_id == parent_id) {
+                /* Deduplicate: replace existing entry for same child_id */
+                bool found = false;
+                for (u32 i = 0; i < dir_count; i++) {
+                    if (dir_buf[i].child_id == de.child_id) {
+                        dir_buf[i] = de;
+                        found = true;
+                        break;
+                    }
                 }
+                if (!found)
+                    dir_buf[dir_count++] = de;
             }
+        } else if (hdr.type == RECORD_DELETE && del_count < RDIR_MAX) {
+            struct walfs_delete d;
+            if (wal_read(pos + sizeof(hdr), &d, sizeof(d)))
+                del_set[del_count++] = d.inode_id;
         }
         pos += hdr.length;
     }
+
+    /* Emit non-deleted entries */
+    for (u32 i = 0; i < dir_count; i++) {
+        bool deleted = false;
+        for (u32 j = 0; j < del_count; j++) {
+            if (del_set[j] == dir_buf[i].child_id) { deleted = true; break; }
+        }
+        if (!deleted)
+            cb(&dir_buf[i]);
+    }
+    #undef RDIR_MAX
 }
 
 bool walfs_mmap(u64 inode_id, u64 offset, u32 length, void *dest)
 {
     return walfs_read(inode_id, offset, dest, length) > 0;
+}
+
+bool walfs_compact(void)
+{
+    if (!mounted) return false;
+    uart_puts("[walfs] Compacting WAL...\n");
+
+    /* Phase 1: Scan WAL, collect live inode IDs (not deleted) */
+    #define COMPACT_MAX 256
+    static u64 live_ids[COMPACT_MAX];
+    static u64 dead_ids[COMPACT_MAX];
+    u32 live_count = 0, dead_count = 0;
+
+    u64 pos = WAL_START;
+    struct wal_record hdr;
+    while (pos < super.wal_head) {
+        if (!wal_read(pos, &hdr, sizeof(hdr))) break;
+        if (!wal_rec_valid(&hdr)) break;
+
+        if (hdr.type == RECORD_INODE && live_count < COMPACT_MAX) {
+            struct walfs_inode ino;
+            if (wal_read(pos + sizeof(hdr), &ino, sizeof(ino))) {
+                bool seen = false;
+                for (u32 i = 0; i < live_count; i++)
+                    if (live_ids[i] == ino.inode_id) { seen = true; break; }
+                if (!seen)
+                    live_ids[live_count++] = ino.inode_id;
+            }
+        } else if (hdr.type == RECORD_DELETE && dead_count < COMPACT_MAX) {
+            struct walfs_delete d;
+            if (wal_read(pos + sizeof(hdr), &d, sizeof(d)))
+                dead_ids[dead_count++] = d.inode_id;
+        }
+        pos += hdr.length;
+    }
+
+    /* Remove dead IDs from live list */
+    for (u32 d = 0; d < dead_count; d++) {
+        for (u32 i = 0; i < live_count; i++) {
+            if (live_ids[i] == dead_ids[d]) {
+                live_ids[i] = live_ids[--live_count];
+                break;
+            }
+        }
+    }
+
+    /* Phase 2: Reset WAL and re-append only live records */
+    u64 old_head = super.wal_head;
+    super.wal_head = WAL_START;
+    super.record_count = 0;
+    next_seq = 0;
+
+    pos = WAL_START;
+    while (pos < old_head) {
+        if (!wal_read(pos, &hdr, sizeof(hdr))) break;
+        if (!wal_rec_valid(&hdr)) break;
+        if (hdr.length > sizeof(rec_buf)) { pos += hdr.length; continue; }
+        if (!wal_read(pos, rec_buf, hdr.length)) break;
+
+        bool keep = false;
+        if (hdr.type == RECORD_INODE) {
+            struct walfs_inode *ino = (struct walfs_inode *)(rec_buf + sizeof(hdr));
+            for (u32 i = 0; i < live_count; i++)
+                if (live_ids[i] == ino->inode_id) { keep = true; break; }
+        } else if (hdr.type == RECORD_DIRENT) {
+            struct walfs_dirent *de = (struct walfs_dirent *)(rec_buf + sizeof(hdr));
+            for (u32 i = 0; i < live_count; i++)
+                if (live_ids[i] == de->child_id) { keep = true; break; }
+        } else if (hdr.type == RECORD_DATA) {
+            struct walfs_data *d = (struct walfs_data *)(rec_buf + sizeof(hdr));
+            for (u32 i = 0; i < live_count; i++)
+                if (live_ids[i] == d->inode_id) { keep = true; break; }
+        }
+        /* Skip TX markers and DELETE records during compaction */
+
+        if (keep) {
+            wal_write(super.wal_head, rec_buf, hdr.length);
+            super.wal_head += hdr.length;
+            super.record_count++;
+            next_seq++;
+        }
+
+        pos += hdr.length;
+    }
+
+    /* Flush caches and write new superblock */
+    lru_flush(&inode_cache);
+    lru_flush(&path_cache);
+    write_super();
+
+    uart_puts("[walfs] Compacted: ");
+    uart_hex(super.record_count);
+    uart_puts(" records, head=");
+    uart_hex((u32)super.wal_head);
+    uart_puts("\n");
+    return true;
+    #undef COMPACT_MAX
 }
 
 /* ---- FIFO handler for Core 1 ---- */
