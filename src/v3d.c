@@ -23,13 +23,19 @@
 
 static struct v3d_caps g_v3d_caps;
 static struct v3d_kernel_desc g_kernels[V3D_KERNEL_MAX] = {
-    { V3D_KERNEL_MATMUL, "matmul", 12, 0, false },
-    { V3D_KERNEL_ADD,    "add",     4, 0, false },
-    { V3D_KERNEL_MUL,    "mul",     4, 0, false },
-    { V3D_KERNEL_RELU,   "relu",    4, 0, false },
-    { V3D_KERNEL_DOT,    "dot",     8, 0, false },
-    { V3D_KERNEL_SCALE,  "scale",   4, 0, false },
+    { V3D_KERNEL_MATMUL, "matmul", 12, 0, false, false },
+    { V3D_KERNEL_ADD,    "add",     4, 0, false, false },
+    { V3D_KERNEL_MUL,    "mul",     4, 0, false, false },
+    { V3D_KERNEL_RELU,   "relu",    4, 0, false, false },
+    { V3D_KERNEL_DOT,    "dot",     8, 0, false, false },
+    { V3D_KERNEL_SCALE,  "scale",   4, 0, false, false },
 };
+struct v3d_kernel_blob {
+    u32 control_handle;
+    u32 control_bus;
+    u32 *control_ptr;
+};
+static struct v3d_kernel_blob g_kernel_blobs[V3D_KERNEL_MAX];
 
 static bool v3d_ident_plausible(u32 ident0)
 {
@@ -47,6 +53,32 @@ static bool v3d_reg_allowed(u32 reg_off)
     if (reg_off == V3D_CSD_STATUS_OFF)
         return true;
     return (reg_off >= V3D_CSD_QUEUED_CFG0_OFF && reg_off <= V3D_CSD_QUEUED_CFG6_OFF);
+}
+
+static void v3d_kernel_blobs_init(void)
+{
+    for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
+        g_kernel_blobs[i].control_handle = 0;
+        g_kernel_blobs[i].control_bus = 0;
+        g_kernel_blobs[i].control_ptr = NULL;
+        g_kernels[i].control_list_bus = 0;
+        g_kernels[i].ready = false;
+
+        u32 bytes = g_kernels[i].qpu_count * 8U;
+        u32 handle = gpu_mem_alloc(bytes, 16, GPU_MEM_FLAG_COHERENT | GPU_MEM_FLAG_ZERO);
+        if (!handle)
+            continue;
+        u32 control_bus = gpu_mem_lock(handle);
+        if (!control_bus) {
+            gpu_mem_free(handle);
+            continue;
+        }
+
+        g_kernel_blobs[i].control_handle = handle;
+        g_kernel_blobs[i].control_bus = control_bus;
+        g_kernel_blobs[i].control_ptr = (u32 *)(usize)(control_bus & 0x3FFFFFFF);
+        g_kernels[i].control_list_bus = control_bus;
+    }
 }
 
 void v3d_init(void)
@@ -75,6 +107,7 @@ void v3d_init(void)
         g_v3d_caps.ident2 = mmio_read(V3D_BASE_ADDR + V3D_IDENT2_OFF);
     }
     g_v3d_caps.dispatch_supported = g_v3d_caps.mailbox_qpu || g_v3d_caps.mmio_csd;
+    v3d_kernel_blobs_init();
 
     uart_puts("[v3d] mailbox_qpu=");
     uart_hex(g_v3d_caps.mailbox_qpu ? 1 : 0);
@@ -200,7 +233,7 @@ v3d_status_t v3d_dispatch_kernel(v3d_kernel_id_t id, u32 timeout_ms)
     if (id >= V3D_KERNEL_MAX)
         return V3D_STATUS_INVALID;
     const struct v3d_kernel_desc *k = &g_kernels[id];
-    if (k->qpu_count == 0 || k->control_list_bus == 0)
+    if (k->qpu_count == 0 || k->control_list_bus == 0 || !k->ready)
         return V3D_STATUS_NOT_IMPLEMENTED;
 
     struct v3d_dispatch_cfg cfg;
@@ -210,4 +243,24 @@ v3d_status_t v3d_dispatch_kernel(v3d_kernel_id_t id, u32 timeout_ms)
     cfg.timeout_ms = timeout_ms;
     cfg.backend = V3D_BACKEND_AUTO;
     return v3d_dispatch_compute(&cfg);
+}
+
+v3d_status_t v3d_kernel_bind(v3d_kernel_id_t id, u32 uniform_bus, u32 shader_bus)
+{
+    if (id >= V3D_KERNEL_MAX)
+        return V3D_STATUS_INVALID;
+    if ((uniform_bus & 0xFU) != 0U || (shader_bus & 0xFU) != 0U)
+        return V3D_STATUS_INVALID;
+    struct v3d_kernel_blob *b = &g_kernel_blobs[id];
+    if (!b->control_ptr || b->control_bus == 0)
+        return V3D_STATUS_FAILED;
+
+    for (u32 i = 0; i < g_kernels[id].qpu_count; i++) {
+        b->control_ptr[i * 2 + 0] = uniform_bus;
+        b->control_ptr[i * 2 + 1] = shader_bus;
+    }
+    dmb();
+    g_kernels[id].ready = true;
+    g_kernels[id].control_list_bus = b->control_bus;
+    return V3D_STATUS_OK;
 }
