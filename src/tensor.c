@@ -52,6 +52,14 @@ static inline float bits_f32(u32 u)
     return v.f;
 }
 
+static bool tensor_try_v3d(v3d_kernel_id_t id)
+{
+    if (!v3d_dispatch_supported())
+        return false;
+    v3d_status_t r = v3d_dispatch_kernel(id, 25);
+    return r == V3D_STATUS_OK;
+}
+
 /* ---- Tensor lifecycle ---- */
 
 bool tensor_alloc(tensor_t *t, u32 rows, u32 cols, u32 elem_size) {
@@ -272,83 +280,75 @@ bool tensor_add(tensor_t *c, const tensor_t *a, const tensor_t *b) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n || c->rows * c->cols != n) return false;
 
-    if (use_qpu_fallback) {
-        neon_vec_add_f32((float *)c->arm_ptr,
-                         (const float *)a->arm_ptr,
-                         (const float *)b->arm_ptr, n);
-        dsb();
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_ADD))
         return true;
-    }
-
-    /* QPU path would go here when shaders are ready */
-    return false;
+    neon_vec_add_f32((float *)c->arm_ptr,
+                     (const float *)a->arm_ptr,
+                     (const float *)b->arm_ptr, n);
+    dsb();
+    return true;
 }
 
 bool tensor_mul(tensor_t *c, const tensor_t *a, const tensor_t *b) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n || c->rows * c->cols != n) return false;
 
-    if (use_qpu_fallback) {
-        neon_vec_mul_f32((float *)c->arm_ptr,
-                         (const float *)a->arm_ptr,
-                         (const float *)b->arm_ptr, n);
-        dsb();
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_MUL))
         return true;
-    }
-    return false;
+    neon_vec_mul_f32((float *)c->arm_ptr,
+                     (const float *)a->arm_ptr,
+                     (const float *)b->arm_ptr, n);
+    dsb();
+    return true;
 }
 
 bool tensor_scale(tensor_t *b, const tensor_t *a, float scalar) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n) return false;
 
-    if (use_qpu_fallback) {
-        neon_vec_scale_f32((float *)b->arm_ptr,
-                           (const float *)a->arm_ptr, scalar, n);
-        dsb();
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_SCALE))
         return true;
-    }
-    return false;
+    neon_vec_scale_f32((float *)b->arm_ptr,
+                       (const float *)a->arm_ptr, scalar, n);
+    dsb();
+    return true;
 }
 
 bool tensor_dot(float *result, const tensor_t *a, const tensor_t *b) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n) return false;
 
-    if (use_qpu_fallback) {
-        *result = neon_vec_dot_f32((const float *)a->arm_ptr,
-                                   (const float *)b->arm_ptr, n);
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_DOT))
         return true;
-    }
-    return false;
+    *result = neon_vec_dot_f32((const float *)a->arm_ptr,
+                               (const float *)b->arm_ptr, n);
+    return true;
 }
 
 bool tensor_matmul(tensor_t *c, const tensor_t *a, const tensor_t *b) {
     if (a->cols != b->rows) return false;
     if (c->rows != a->rows || c->cols != b->cols) return false;
 
-    if (use_qpu_fallback) {
-        neon_matmul_f32((float *)c->arm_ptr,
-                        (const float *)a->arm_ptr,
-                        (const float *)b->arm_ptr,
-                        a->rows, a->cols, b->cols);
-        dsb();
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_MATMUL))
         return true;
-    }
-    return false;
+    neon_matmul_f32((float *)c->arm_ptr,
+                    (const float *)a->arm_ptr,
+                    (const float *)b->arm_ptr,
+                    a->rows, a->cols, b->cols);
+    dsb();
+    return true;
 }
 
 bool tensor_relu(tensor_t *b, const tensor_t *a) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n) return false;
 
-    if (use_qpu_fallback) {
-        neon_vec_relu_f32((float *)b->arm_ptr,
-                          (const float *)a->arm_ptr, n);
-        dsb();
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_RELU))
         return true;
-    }
-    return false;
+    neon_vec_relu_f32((float *)b->arm_ptr,
+                      (const float *)a->arm_ptr, n);
+    dsb();
+    return true;
 }
 
 bool tensor_softmax(tensor_t *b, const tensor_t *a) {
@@ -509,11 +509,12 @@ bool qpu_dispatch(const qpu_program_t *prog, struct qpu_job *jobs,
 void tensor_init(void) {
     gpu_init();
     v3d_init();
+    use_qpu_fallback = !v3d_dispatch_supported();
     if (qpu_enable(true)) {
         uart_puts("[tensor] QPU enabled (12 QPUs)\n");
-        /* In future: set use_qpu_fallback = false when shaders ready */
     } else {
         uart_puts("[tensor] QPU enable failed, using NEON fallback\n");
+        use_qpu_fallback = true;
     }
     uart_puts("[tensor] NEON float: add/mul/scale/dot/matmul/relu/softmax\n");
 }

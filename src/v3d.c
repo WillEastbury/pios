@@ -9,7 +9,6 @@
 #define V3D_IDENT0_OFF           0x000U
 #define V3D_IDENT1_OFF           0x004U
 #define V3D_IDENT2_OFF           0x008U
-#define V3D_REG_PROBE_LIMIT      0x1000U
 #define V3D_MAX_TIMEOUT_MS       5000U
 #define V3D_DEFAULT_TIMEOUT_MS   25U
 #define V3D_CSD_STATUS_OFF       0x3C00U
@@ -23,12 +22,31 @@
 #define V3D_CSD_STATUS_BUSY_MASK (1U << 0)
 
 static struct v3d_caps g_v3d_caps;
+static struct v3d_kernel_desc g_kernels[V3D_KERNEL_MAX] = {
+    { V3D_KERNEL_MATMUL, "matmul", 12, 0, false },
+    { V3D_KERNEL_ADD,    "add",     4, 0, false },
+    { V3D_KERNEL_MUL,    "mul",     4, 0, false },
+    { V3D_KERNEL_RELU,   "relu",    4, 0, false },
+    { V3D_KERNEL_DOT,    "dot",     8, 0, false },
+    { V3D_KERNEL_SCALE,  "scale",   4, 0, false },
+};
 
 static bool v3d_ident_plausible(u32 ident0)
 {
     if (ident0 == 0U || ident0 == 0xFFFFFFFFU)
         return false;
     return true;
+}
+
+static bool v3d_reg_allowed(u32 reg_off)
+{
+    if ((reg_off & 3U) != 0U)
+        return false;
+    if (reg_off <= V3D_IDENT2_OFF)
+        return true;
+    if (reg_off == V3D_CSD_STATUS_OFF)
+        return true;
+    return (reg_off >= V3D_CSD_QUEUED_CFG0_OFF && reg_off <= V3D_CSD_QUEUED_CFG6_OFF);
 }
 
 void v3d_init(void)
@@ -89,7 +107,7 @@ u32 v3d_reg_read(u32 reg_off, bool *ok_out)
     bool ok = false;
     u32 val = 0;
 
-    if (g_v3d_caps.mmio_probe_ok && (reg_off & 3U) == 0U && reg_off <= V3D_REG_PROBE_LIMIT) {
+    if (g_v3d_caps.mmio_probe_ok && v3d_reg_allowed(reg_off)) {
         val = mmio_read(g_v3d_caps.reg_base + reg_off);
         ok = true;
     }
@@ -101,7 +119,7 @@ u32 v3d_reg_read(u32 reg_off, bool *ok_out)
 
 v3d_status_t v3d_reg_write(u32 reg_off, u32 val)
 {
-    if (!g_v3d_caps.mmio_probe_ok || (reg_off & 3U) != 0U || reg_off > V3D_REG_PROBE_LIMIT)
+    if (!g_v3d_caps.mmio_probe_ok || !v3d_reg_allowed(reg_off))
         return V3D_STATUS_UNSUPPORTED;
     mmio_write(g_v3d_caps.reg_base + reg_off, val);
     return V3D_STATUS_OK;
@@ -168,4 +186,28 @@ v3d_status_t v3d_dispatch_compute(const struct v3d_dispatch_cfg *cfg)
     if (r == V3D_STATUS_OK)
         return r;
     return v3d_dispatch_mailbox(cfg, timeout_ms);
+}
+
+const struct v3d_kernel_desc *v3d_kernel_desc_get(v3d_kernel_id_t id)
+{
+    if (id >= V3D_KERNEL_MAX)
+        return NULL;
+    return &g_kernels[id];
+}
+
+v3d_status_t v3d_dispatch_kernel(v3d_kernel_id_t id, u32 timeout_ms)
+{
+    if (id >= V3D_KERNEL_MAX)
+        return V3D_STATUS_INVALID;
+    const struct v3d_kernel_desc *k = &g_kernels[id];
+    if (k->qpu_count == 0 || k->control_list_bus == 0)
+        return V3D_STATUS_NOT_IMPLEMENTED;
+
+    struct v3d_dispatch_cfg cfg;
+    cfg.qpu_count = k->qpu_count;
+    cfg.control_list_bus = k->control_list_bus;
+    cfg.noflush = k->noflush;
+    cfg.timeout_ms = timeout_ms;
+    cfg.backend = V3D_BACKEND_AUTO;
+    return v3d_dispatch_compute(&cfg);
 }
