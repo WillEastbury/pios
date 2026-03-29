@@ -37,7 +37,7 @@ void tcp_init(void);
 
 /* Process incoming TCP segment (called from net.c IP dispatch) */
 void tcp_input(const u8 *frame, u32 len, u32 src_ip, u32 dst_ip,
-               const u8 *payload, u32 payload_len);
+               const u8 *payload, u32 payload_len, bool checksum_trusted);
 
 /* Timer tick (call once per ~100ms from net_poll or timer) */
 void tcp_tick(void);

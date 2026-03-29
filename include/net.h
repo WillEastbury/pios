@@ -2,14 +2,14 @@
 #include "types.h"
 
 /*
- * Hardened minimal network stack: IPv4 + ICMP + UDP + ARP.
- * NO TCP. NO DHCP. NO DNS. NO fragmentation.
- * Static IP. Hardened ARP with anti-spoofing. Maximum attack resistance.
+ * Hardened minimal network stack: IPv4 + ICMP + UDP + TCP + ARP.
+ * NO DHCP. NO DNS. NO fragmentation.
+ * Static IP + static-neighbor model with strict ingress validation.
  *
  * Security posture:
  *   - ARP hardened: rate-limited, anti-gratuitous, MAC consistency checks
  *   - No DHCP = immune to rogue DHCP / starvation
- *   - No TCP = immune to SYN floods / RST / seq prediction
+ *   - TCP hardened with SYN cookies and strict sequence/RST validation
  *   - No fragments = immune to teardrop / overlap / ping-of-death
  *   - No IP options = immune to source-routing attacks
  *   - ICMP rate-limited = resistant to ping floods

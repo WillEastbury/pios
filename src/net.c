@@ -280,7 +280,8 @@ static void handle_ip(const u8 *frame, u32 len) {
         u16 ipt = ntohs(ip->total_len);
         if (ipt > 20)
             tcp_input(frame, len, ntohl(ip->src_ip), ntohl(ip->dst_ip),
-                      frame + payload_off, ipt - 20);
+                      frame + payload_off, ipt - 20,
+                      genet_rx_checksum_offload_enabled());
         break;
     }
     case IP_PROTO_UDP:  handle_udp(frame, len, ip, payload_off);  break;

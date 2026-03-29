@@ -845,14 +845,15 @@ static void handle_established(struct tcb *t, u32 seg_seq, u32 seg_ack,
 }
 
 void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
-               const u8 *payload, u32 payload_len) {
+               const u8 *payload, u32 payload_len, bool checksum_trusted) {
     if (unlikely(payload_len < TCP_HDR_SIZE))
         return;
 
     const struct tcp_hdr *tcp = (const struct tcp_hdr *)payload;
 
-    /* Verify TCP checksum */
-    if (unlikely(tcp_checksum(src_ip, dst_ip, payload, payload_len) != 0))
+    /* Verify TCP checksum unless explicitly trusted by RX offload window. */
+    if (!checksum_trusted &&
+        unlikely(tcp_checksum(src_ip, dst_ip, payload, payload_len) != 0))
         return;
 
     u16 src_port = ntohs(tcp->src_port);
