@@ -91,9 +91,11 @@ static bool icmp_rate_ok(void) {
 
 static void handle_icmp(const u8 *frame, u32 len,
                         struct ip_hdr *ip, u32 payload_off) {
-    u32 icmp_len = ntohs(ip->total_len) - 20;
-    if (unlikely(icmp_len < sizeof(struct icmp_hdr)))
-        return;
+    u16 ipt = ntohs(ip->total_len);
+    if (ipt < 20 + sizeof(struct icmp_hdr)) return;
+    u32 icmp_len = ipt - 20;
+    /* Cap to tx_frame capacity (prevent buffer overflow on large ICMP) */
+    if (sizeof(struct eth_hdr) + ipt > sizeof(tx_frame)) return;
 
     struct icmp_hdr *icmp = (struct icmp_hdr *)(frame + payload_off);
 
@@ -249,10 +251,13 @@ static void handle_ip(const u8 *frame, u32 len) {
 
     switch (ip->protocol) {
     case IP_PROTO_ICMP: handle_icmp(frame, len, ip, payload_off); break;
-    case IP_PROTO_TCP:
-        tcp_input(frame, len, ntohl(ip->src_ip), ntohl(ip->dst_ip),
-                  frame + payload_off, ntohs(ip->total_len) - 20);
+    case IP_PROTO_TCP: {
+        u16 ipt = ntohs(ip->total_len);
+        if (ipt > 20)
+            tcp_input(frame, len, ntohl(ip->src_ip), ntohl(ip->dst_ip),
+                      frame + payload_off, ipt - 20);
         break;
+    }
     case IP_PROTO_UDP:  handle_udp(frame, len, ip, payload_off);  break;
     default: stats.drop_bad_proto++; break;
     }
@@ -356,7 +361,7 @@ void net_handle_fifo_request(void) {
     struct fifo_msg reply;
 
     if (fifo_pop(CORE_NET, CORE_USER0, &msg)) {
-        if (msg.type == MSG_NET_UDP_SEND) {
+        if (msg.type == MSG_NET_UDP_SEND && msg.buffer && msg.length <= 1472) {
             u16 sp = (u16)(msg.tag >> 16);
             u16 dp = (u16)(msg.tag & 0xFFFF);
             bool ok = net_send_udp(msg.param, sp, dp,
@@ -369,7 +374,7 @@ void net_handle_fifo_request(void) {
     }
 
     if (fifo_pop(CORE_NET, CORE_USER1, &msg)) {
-        if (msg.type == MSG_NET_UDP_SEND) {
+        if (msg.type == MSG_NET_UDP_SEND && msg.buffer && msg.length <= 1472) {
             u16 sp = (u16)(msg.tag >> 16);
             u16 dp = (u16)(msg.tag & 0xFFFF);
             bool ok = net_send_udp(msg.param, sp, dp,

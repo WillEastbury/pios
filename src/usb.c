@@ -159,14 +159,14 @@ static bool enumerate_device(u32 port, u32 speed) {
     while (off + 2 <= got && dev->num_eps < USB_MAX_ENDPOINTS) {
         u8 len = desc_buf[off];
         u8 type = desc_buf[off + 1];
-        if (len == 0) break;
+        if (len < 2 || off + len > got) break; /* bounds check */
 
-        if (type == DESC_INTERFACE && len >= 9) {
+        if (type == DESC_INTERFACE && len >= 9 && off + 9 <= got) {
             struct usb_iface_desc *id = (struct usb_iface_desc *)(desc_buf + off);
             cur_class = id->bInterfaceClass;
             cur_sub = id->bInterfaceSubClass;
             cur_proto = id->bInterfaceProtocol;
-        } else if (type == DESC_ENDPOINT && len >= 7) {
+        } else if (type == DESC_ENDPOINT && len >= 7 && off + 7 <= got) {
             struct usb_ep_desc *ep = (struct usb_ep_desc *)(desc_buf + off);
             u32 idx = dev->num_eps;
             dev->eps[idx].address = ep->bEndpointAddress;

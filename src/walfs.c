@@ -949,9 +949,11 @@ void walfs_handle_fifo(u32 from_core)
         break;
     }
     case MSG_FS_READDIR:
-        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
-        walfs_readdir(msg.tag, (walfs_readdir_cb)(usize)msg.buffer);
-        reply.type = MSG_FS_DONE;
+        /* msg.buffer is a user-space data buffer, NOT a function pointer.
+         * We cannot call it as a callback. Instead, do nothing — readdir
+         * from userland should use the proc.c syscall path which handles
+         * serialization safely via FIFO reply messages. */
+        reply.type = MSG_FS_ERROR;
         break;
     default:
         reply.type = MSG_FS_ERROR;

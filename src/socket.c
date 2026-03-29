@@ -271,10 +271,11 @@ i32 sock_recvfrom(i32 fd, void *buf, u32 len, struct sockaddr_in *src) {
     while (!recv_from_net(&msg))
         wfe();
 
-    if (msg.type != MSG_NET_UDP_RECV)
+    if (msg.type != MSG_NET_UDP_RECV || !msg.buffer)
         return SOCK_ERR;
 
     u32 copy = (msg.length < len) ? msg.length : len;
+    if (copy > 1472) copy = 1472; /* cap to max UDP payload */
     simd_memcpy(buf, (void *)(usize)msg.buffer, copy);
 
     if (src) {
