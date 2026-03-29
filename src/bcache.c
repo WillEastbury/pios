@@ -31,6 +31,37 @@ typedef struct {
 static bcache_entry_t cache[BCACHE_ENTRIES] ALIGNED(64);
 static bcache_stats_t stats;
 
+/* Hash index: LBA → cache entry index for O(1) lookup.
+ * 128 buckets, open addressing with linear probe. */
+#define HASH_BUCKETS 128
+static i32 hash_index[HASH_BUCKETS]; /* -1 = empty */
+
+static inline u32 lba_hash(u32 lba) { return (lba * 2654435761U) >> 25; } /* Knuth mult hash → 7 bits */
+
+static void hash_insert(u32 lba, u32 idx) {
+    u32 bucket = lba_hash(lba);
+    for (u32 i = 0; i < HASH_BUCKETS; i++) {
+        u32 b = (bucket + i) & (HASH_BUCKETS - 1);
+        if (hash_index[b] < 0 || ((u32)hash_index[b] < BCACHE_ENTRIES &&
+            cache[hash_index[b]].lba == lba)) {
+            hash_index[b] = (i32)idx;
+            return;
+        }
+    }
+}
+
+static void hash_remove(u32 lba) {
+    u32 bucket = lba_hash(lba);
+    for (u32 i = 0; i < HASH_BUCKETS; i++) {
+        u32 b = (bucket + i) & (HASH_BUCKETS - 1);
+        if (hash_index[b] < 0) return;
+        if ((u32)hash_index[b] < BCACHE_ENTRIES && cache[hash_index[b]].lba == lba) {
+            hash_index[b] = -1;
+            return;
+        }
+    }
+}
+
 /* Sequential access detector: ring buffer of last 4 LBAs */
 static u32 history[PREFETCH_WINDOW];
 static u32 history_idx;
@@ -39,9 +70,14 @@ static u32 history_idx;
 
 static bcache_entry_t *find_entry(u32 lba)
 {
-    for (u32 i = 0; i < BCACHE_ENTRIES; i++) {
-        if ((cache[i].flags & FLAG_VALID) && cache[i].lba == lba)
-            return &cache[i];
+    /* Fast path: hash lookup */
+    u32 bucket = lba_hash(lba);
+    for (u32 i = 0; i < HASH_BUCKETS; i++) {
+        u32 b = (bucket + i) & (HASH_BUCKETS - 1);
+        if (hash_index[b] < 0) break;
+        u32 idx = (u32)hash_index[b];
+        if (idx < BCACHE_ENTRIES && (cache[idx].flags & FLAG_VALID) && cache[idx].lba == lba)
+            return &cache[idx];
     }
     return NULL;
 }
@@ -118,6 +154,7 @@ static bcache_entry_t *evict(void)
         stats.dirty_count--;
     }
 
+    hash_remove(victim->lba);
     victim->flags = 0;
     stats.evictions++;
     stats.valid_count--;
@@ -137,6 +174,7 @@ static bool populate(bcache_entry_t *e, u32 lba)
     e->flags = FLAG_VALID;
     e->last_access = timer_ticks();
     e->access_count = 1;
+    hash_insert(lba, (u32)(e - cache));
     stats.valid_count++;
     return true;
 }
@@ -217,6 +255,8 @@ void bcache_init(void)
 {
     simd_zero(cache, sizeof(cache));
     simd_zero(&stats, sizeof(stats));
+    for (u32 i = 0; i < HASH_BUCKETS; i++)
+        hash_index[i] = -1;
     for (u32 i = 0; i < PREFETCH_WINDOW; i++)
         history[i] = 0xFFFFFFFF;
     history_idx = 0;
@@ -284,6 +324,7 @@ bool bcache_write(u32 lba, const u8 *buf)
     e->last_access = timer_ticks();
     e->access_count = 1;
     simd_memcpy(e->data, buf, SD_BLOCK_SIZE);
+    hash_insert(lba, (u32)(e - cache));
     stats.valid_count++;
     stats.dirty_count++;
     return true;
@@ -310,6 +351,7 @@ void bcache_invalidate(u32 lba)
     if (e->flags & FLAG_DIRTY)
         writeback(e);
 
+    hash_remove(e->lba);
     e->flags = 0;
     recount_stats();
 }
@@ -324,8 +366,10 @@ void bcache_invalidate_all(void)
         if (e->flags & FLAG_DIRTY)
             writeback(e);
 
-        if (!(e->flags & FLAG_PINNED))
+        if (!(e->flags & FLAG_PINNED)) {
+            hash_remove(e->lba);
             e->flags = 0;
+        }
     }
     recount_stats();
 }
