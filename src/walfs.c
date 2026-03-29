@@ -63,6 +63,43 @@ static struct lru_cache inode_cache;
  */
 static struct lru_cache path_cache;
 
+/*
+ * Append-ordered RECORD_DATA index for faster reads.
+ * Falls back to linear scan if index capacity is exceeded.
+ */
+#define WAL_DATA_INDEX_MAX 2048
+struct wal_data_index_entry {
+    u64 inode_id;
+    u64 data_off;
+    u32 data_len;
+    u64 payload_pos;
+    u64 seq;
+};
+static struct wal_data_index_entry data_index[WAL_DATA_INDEX_MAX];
+static u32 data_index_count;
+static bool data_index_overflow;
+
+static void dindex_reset(void)
+{
+    data_index_count = 0;
+    data_index_overflow = false;
+}
+
+static void dindex_add(u64 inode_id, u64 data_off, u32 data_len, u64 payload_pos, u64 seq)
+{
+    if (data_index_overflow) return;
+    if (data_index_count >= WAL_DATA_INDEX_MAX) {
+        data_index_overflow = true;
+        return;
+    }
+    struct wal_data_index_entry *e = &data_index[data_index_count++];
+    e->inode_id = inode_id;
+    e->data_off = data_off;
+    e->data_len = data_len;
+    e->payload_pos = payload_pos;
+    e->seq = seq;
+}
+
 /* Cache helpers */
 static void icache_put(u64 inode_id, u64 wal_offset) {
     lru_put(&inode_cache, (const u8 *)&inode_id, sizeof(inode_id),
@@ -232,6 +269,14 @@ static u64 wal_append(u32 type, const void *meta, u32 meta_len,
     super.wal_head += total;
     super.record_count++;
     next_seq++;
+
+    if (type == RECORD_DATA && meta_len >= sizeof(struct walfs_data)) {
+        const struct walfs_data *dh = (const struct walfs_data *)meta;
+        if (dh->length == data_len) {
+            u64 payload_pos = pos + sizeof(struct wal_record) + sizeof(struct walfs_data);
+            dindex_add(dh->inode_id, dh->offset, dh->length, payload_pos, r->seq);
+        }
+    }
     return pos;
 }
 
@@ -285,6 +330,7 @@ static bool is_deleted(u64 inode_id)
 
 static void scan_recovery(void)
 {
+    dindex_reset();
     next_inode = WALFS_ROOT_INODE + 1;
     next_seq = 0;
     u64 pos = WAL_START;
@@ -316,6 +362,13 @@ static void scan_recovery(void)
         } else if (hdr.type == RECORD_DELETE) {
             struct walfs_delete *d = (struct walfs_delete *)(rec_buf + sizeof(hdr));
             icache_put(d->inode_id, pos);
+        } else if (hdr.type == RECORD_DATA) {
+            struct walfs_data *dh = (struct walfs_data *)(rec_buf + sizeof(hdr));
+            if (dh->length <= WALFS_DATA_MAX &&
+                (u32)sizeof(hdr) + (u32)sizeof(*dh) + dh->length <= hdr.length) {
+                u64 payload_pos = pos + sizeof(hdr) + sizeof(*dh);
+                dindex_add(dh->inode_id, dh->offset, dh->length, payload_pos, hdr.seq);
+            }
         } else if (hdr.type == RECORD_TX_BEGIN) {
             u64 tx_id;
             memcpy(&tx_id, rec_buf + sizeof(hdr), sizeof(tx_id));
@@ -396,6 +449,7 @@ bool walfs_init(void)
 {
     mounted = false;
     cached_lba = 0xFFFFFFFF;
+    dindex_reset();
     lru_init(&inode_cache, NULL, 0);  /* no TTL — invalidated on write */
     lru_init(&path_cache, NULL, 30000); /* 30s TTL for path lookups */
 
@@ -520,14 +574,7 @@ bool walfs_write(u64 inode_id, u64 offset, const void *data, u32 len)
     return true;
 }
 
-/*
- * walfs_read — O(N) WAL scan for data records.
- * TODO: A per-inode data-block index would make this O(1), but requires
- * an in-memory index structure that survives across calls.  For now the
- * inode_cache accelerates stat/is_deleted (the main hotspots); read
- * remains a linear scan.
- */
-u32 walfs_read(u64 inode_id, u64 offset, void *buf, u32 len)
+static u32 walfs_read_linear(u64 inode_id, u64 offset, void *buf, u32 len)
 {
     if (!mounted) return 0;
     u8 *dst = (u8 *)buf;
@@ -561,6 +608,37 @@ u32 walfs_read(u64 inode_id, u64 offset, void *buf, u32 len)
             }
         }
         pos += hdr.length;
+    }
+    return high;
+}
+
+u32 walfs_read(u64 inode_id, u64 offset, void *buf, u32 len)
+{
+    if (!mounted) return 0;
+    if (len == 0) return 0;
+    if (data_index_overflow || data_index_count == 0)
+        return walfs_read_linear(inode_id, offset, buf, len);
+
+    u8 *dst = (u8 *)buf;
+    simd_zero(dst, len);
+    u32 high = 0;
+    u64 rs = offset, re = offset + len;
+
+    for (u32 i = 0; i < data_index_count; i++) {
+        const struct wal_data_index_entry *e = &data_index[i];
+        if (e->inode_id != inode_id) continue;
+        if (is_uncommitted(e->seq)) continue;
+        u64 ds = e->data_off;
+        u64 de = ds + e->data_len;
+        if (ds < re && de > rs) {
+            u64 cs = ds > rs ? ds : rs;
+            u64 ce = de < re ? de : re;
+            u32 cl = (u32)(ce - cs);
+            u32 soff = (u32)(cs - ds);
+            u32 doff = (u32)(cs - rs);
+            wal_read(e->payload_pos + soff, dst + doff, cl);
+            if (doff + cl > high) high = doff + cl;
+        }
     }
     return high;
 }
@@ -813,6 +891,7 @@ bool walfs_compact(void)
     super.tree_root = 0;
     next_seq = 0;
     cached_lba = 0xFFFFFFFF;
+    dindex_reset();
 
     pos = WAL_START;
     while (pos < old_head) {
@@ -860,6 +939,13 @@ bool walfs_compact(void)
                 if (ino->inode_id == WALFS_ROOT_INODE)
                     super.tree_root = super.wal_head;
                 icache_put(ino->inode_id, super.wal_head);
+            } else if (hdr.type == RECORD_DATA) {
+                struct walfs_data *dh = (struct walfs_data *)(rec_buf + sizeof(hdr));
+                if (dh->length <= WALFS_DATA_MAX &&
+                    (u32)sizeof(hdr) + (u32)sizeof(*dh) + dh->length <= hdr.length) {
+                    u64 payload_pos = super.wal_head + sizeof(hdr) + sizeof(*dh);
+                    dindex_add(dh->inode_id, dh->offset, dh->length, payload_pos, next_seq);
+                }
             }
             super.wal_head += hdr.length;
             super.record_count++;
