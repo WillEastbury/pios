@@ -365,18 +365,25 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
     udp->length    = htons(udp_len);
     udp->checksum  = 0;    /* optional in IPv4 */
 
-    if (likely(len > 0))
-        simd_memcpy(tx_frame + sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr),
-                    data, len);
-
     u32 frame_len = sizeof(struct eth_hdr) + ip_total;
-    if (frame_len < 60) frame_len = 60;
+    bool need_pad = frame_len < 60;
+    if (need_pad) frame_len = 60;
 
     stats.tx_packets++;
     stats.tx_bytes += frame_len;
     stats.udp_sent++;
 
-    return genet_send(tx_frame, frame_len);
+    if (len == 0)
+        return genet_send(tx_frame, frame_len);
+
+    if (need_pad) {
+        simd_memcpy(tx_frame + sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr),
+                    data, len);
+        return genet_send(tx_frame, frame_len);
+    }
+
+    u32 head_len = sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr);
+    return genet_send_parts(tx_frame, head_len, data, len);
 }
 
 /* ================================================================== */

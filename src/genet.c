@@ -370,6 +370,42 @@ bool genet_send(const u8 *frame, u32 len) {
     return true;
 }
 
+bool genet_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_len) {
+    u32 len = head_len + tail_len;
+    if (len > ETH_FRAME_MAX || len < 14)
+        return false;
+    if (!head || (head_len == 0))
+        return false;
+    if (tail_len > 0 && !tail)
+        return false;
+
+    u32 spins = 256;
+    while (!genet_tx_slot_available() && spins--)
+        ;
+    if (!genet_tx_slot_available())
+        return false;
+
+    u32 idx = tx_prod % NUM_DESC;
+    prefetch_r(head);
+    prefetch_w(tx_bufs[idx]);
+    simd_memcpy(tx_bufs[idx], head, head_len);
+    if (tail_len > 0)
+        simd_memcpy(tx_bufs[idx] + head_len, tail, tail_len);
+    dsb();
+
+    tx_ring[idx].length_status =
+        (len << DESC_LEN_SHIFT) | DESC_SOP | DESC_EOP | DESC_CRC;
+    if (tx_csum_offload)
+        tx_ring[idx].length_status |= DESC_TX_DO_CSUM;
+    if (idx == NUM_DESC - 1)
+        tx_ring[idx].length_status |= DESC_WRAP;
+    dsb();
+
+    tx_prod++;
+    gw(TDMA_RING16 + DMA_PROD_INDEX, tx_prod & 0xFFFF);
+    return true;
+}
+
 bool genet_recv(u8 *frame, u32 *len) {
     u32 idx = rx_index % NUM_DESC;
     u32 ls = rx_ring[idx].length_status;

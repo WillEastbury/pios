@@ -73,8 +73,8 @@ net_send_udp(dst_ip, src_port, dst_port, data, len)
     │   ├── ID from counter
     │   └── UDP checksum = 0 (optional in IPv4)
     │
-    ├── Build Ethernet header
-    └── genet_send(frame)
+    ├── Build Ethernet + IP + UDP headers in local TX header buffer
+    └── genet_send_parts(header, payload) for single-pass NIC DMA copy
 ```
 
 ## TCP Send Fast Path (toe-enable-window)
