@@ -74,6 +74,13 @@ static bool bbb_transfer(const u8 *scsi_cmd, u8 cmd_len, u8 dir,
     struct usb_csw *csw = (struct usb_csw *)csw_buf;
     u32 actual;
 
+    if (!scsi_cmd || cmd_len == 0 || cmd_len > 16)
+        return false;
+    if (dir != 0x00 && dir != 0x80)
+        return false;
+    if (data_len > 0 && !data)
+        return false;
+
     /* Build CBW */
     cbw->dCBWSignature = CBW_SIGNATURE;
     cbw->dCBWTag = ++tag_counter;
@@ -87,17 +94,29 @@ static bool bbb_transfer(const u8 *scsi_cmd, u8 cmd_len, u8 dir,
     /* Send CBW via bulk OUT */
     if (!usb_bulk_msg(stor_dev, bulk_out_addr, cbw_buf, 31, &actual))
         return false;
+    if (actual != 31) {
+        uart_puts("[usb_stor] Short CBW write\n");
+        return false;
+    }
 
     /* Data phase (if any) */
     if (data_len > 0 && data) {
         u8 ep = (dir & 0x80) ? bulk_in_addr : bulk_out_addr;
         if (!usb_bulk_msg(stor_dev, ep, data, data_len, &actual))
             return false;
+        if (actual != data_len) {
+            uart_puts("[usb_stor] Short data phase\n");
+            return false;
+        }
     }
 
     /* Receive CSW via bulk IN */
     if (!usb_bulk_msg(stor_dev, bulk_in_addr, csw_buf, 13, &actual))
         return false;
+    if (actual != 13) {
+        uart_puts("[usb_stor] Short CSW read\n");
+        return false;
+    }
 
     if (csw->dCSWSignature != CSW_SIGNATURE) {
         uart_puts("[usb_stor] Bad CSW signature\n");
@@ -109,6 +128,14 @@ static bool bbb_transfer(const u8 *scsi_cmd, u8 cmd_len, u8 dir,
     }
     if (csw->dCSWDataResidue > data_len) {
         uart_puts("[usb_stor] CSW residue invalid\n");
+        return false;
+    }
+    if (csw->bCSWStatus > 2) {
+        uart_puts("[usb_stor] CSW status invalid\n");
+        return false;
+    }
+    if (csw->bCSWStatus == 0 && csw->dCSWDataResidue != 0) {
+        uart_puts("[usb_stor] CSW residue on success\n");
         return false;
     }
     if (csw->bCSWStatus != 0) {
