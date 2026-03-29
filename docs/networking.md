@@ -86,6 +86,14 @@ Core 0 TCP TX now uses a burst send path that segments directly from the per-con
 - Keeps retransmit path on the same direct-copy routine.
 - Enables validated GENET checksum assist by default while preserving software checksum correctness.
 
+## RX Fast Path (toe-enable-window)
+
+Core 0 receive polling drains frames in small bursts per `net_poll()` pass (`NET_RX_BURST_MAX`), reducing per-frame loop overhead and improving cache locality under load.
+
+- Burst receive loop processes up to 4 frames per poll tick.
+- TCP in-order payload ingest uses direct ring writes (`tcp_rx_ingest_in_order`) without extra staging buffers.
+- Existing validation posture remains unchanged: malformed/unsafe packets are still dropped early.
+
 ## FIFO Integration
 
 User cores send/receive UDP through FIFO messages to Core 0:

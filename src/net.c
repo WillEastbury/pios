@@ -49,6 +49,7 @@ static u64 icmp_min_interval;
 
 static u8 rx_frame[2048] ALIGNED(64);
 static u8 tx_frame[2048] ALIGNED(64);
+#define NET_RX_BURST_MAX 4U
 
 static u16 ip_id_counter;
 static volatile bool net_maint_queued;
@@ -424,7 +425,10 @@ void net_poll(void) {
 
     prefetch_r(rx_frame);
 
-    if (likely(genet_recv(rx_frame, &len))) {
+    for (u32 burst = 0; burst < NET_RX_BURST_MAX; burst++) {
+        if (!likely(genet_recv(rx_frame, &len)))
+            break;
+
         stats.rx_packets++;
         stats.rx_bytes += len;
 

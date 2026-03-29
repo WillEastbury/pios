@@ -763,6 +763,16 @@ static bool seq_acceptable(struct tcb *t, u32 seg_seq, u32 seg_len) {
     return false;
 }
 
+static u32 tcp_rx_ingest_in_order(struct tcb *t, u32 seg_seq, const u8 *data, u32 data_len)
+{
+    if (data_len == 0 || seg_seq != t->rcv_nxt)
+        return 0;
+    u32 written = ring_write(&t->rx_buf, data, data_len);
+    t->rcv_nxt += written;
+    t->rcv_wnd = ring_free(&t->rx_buf);
+    return written;
+}
+
 static void handle_established(struct tcb *t, u32 seg_seq, u32 seg_ack,
                                u8 flags, u16 seg_wnd,
                                const u8 *data, u32 data_len) {
@@ -803,11 +813,8 @@ static void handle_established(struct tcb *t, u32 seg_seq, u32 seg_ack,
     /* Update send window */
     t->snd_wnd = seg_wnd;
 
-    /* Process data */
-    if (data_len > 0 && seg_seq == t->rcv_nxt) {
-        u32 written = ring_write(&t->rx_buf, data, data_len);
-        t->rcv_nxt += written;
-        t->rcv_wnd = ring_free(&t->rx_buf);
+    /* Process data (direct ingest fast path) */
+    if (tcp_rx_ingest_in_order(t, seg_seq, data, data_len) > 0) {
         tcp_send_ack(t);
     }
 
@@ -1010,12 +1017,8 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
                 t->snd_una = seg_ack;
             }
         }
-        /* Accept incoming data */
-        if (data_len > 0 && seg_seq == t->rcv_nxt) {
-            u32 written = ring_write(&t->rx_buf, seg_data, data_len);
-            t->rcv_nxt += written;
-            t->rcv_wnd = ring_free(&t->rx_buf);
-        }
+        /* Accept incoming data (direct ingest fast path) */
+        (void)tcp_rx_ingest_in_order(t, seg_seq, seg_data, data_len);
         /* Check if our FIN has been ACKed */
         if (t->fin_sent && seg_ack == t->fin_seq + 1) {
             t->state = TCP_FIN_WAIT_2;
@@ -1036,12 +1039,8 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
         break;
 
     case TCP_FIN_WAIT_2:
-        /* Accept data */
-        if (data_len > 0 && seg_seq == t->rcv_nxt) {
-            u32 written = ring_write(&t->rx_buf, seg_data, data_len);
-            t->rcv_nxt += written;
-            t->rcv_wnd = ring_free(&t->rx_buf);
-        }
+        /* Accept data (direct ingest fast path) */
+        (void)tcp_rx_ingest_in_order(t, seg_seq, seg_data, data_len);
         if (flags & TCP_FIN) {
             t->rcv_nxt++;
             t->state     = TCP_TIME_WAIT;
