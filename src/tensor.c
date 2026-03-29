@@ -10,6 +10,7 @@
 
 #include "tensor.h"
 #include "gpu.h"
+#include "v3d.h"
 #include "simd.h"
 #include "uart.h"
 
@@ -36,6 +37,20 @@
 /* Placeholder: the actual QPU shader dispatch works but we
  * run the math on ARM/NEON until VC VII ISA is fully mapped. */
 static bool use_qpu_fallback = true;
+
+static inline u32 f32_bits(float f)
+{
+    union { float f; u32 u; } v;
+    v.f = f;
+    return v.u;
+}
+
+static inline float bits_f32(u32 u)
+{
+    union { float f; u32 u; } v;
+    v.u = u;
+    return v.f;
+}
 
 /* ---- Tensor lifecycle ---- */
 
@@ -136,7 +151,7 @@ static void neon_vec_scale_f32(float *b, const float *a, float s, u32 n) {
             "fmul v2.4s, v0.4s, v1.4s \n"
             "st1  {v2.4s}, [%0], #16 \n"
             : "+r"(b), "+r"(a)
-            : "r"(b), "r"(*(u32 *)&s)
+            : "r"(b), "r"(f32_bits(s))
             : "v0","v1","v2","memory"
         );
     }
@@ -150,6 +165,7 @@ static float neon_vec_dot_f32(const float *a, const float *b, u32 n) {
 
     if (n >= 16) {
         /* Accumulate in 4 NEON lanes */
+        u32 result_bits = 0;
         __asm__ volatile("movi v4.4s, #0" ::: "v4"); /* accumulator */
         for (; i + 4 <= n; i += 4) {
             __asm__ volatile(
@@ -165,9 +181,10 @@ static float neon_vec_dot_f32(const float *a, const float *b, u32 n) {
             "faddp v4.4s, v4.4s, v4.4s \n"
             "faddp s4, v4.2s           \n"
             "fmov  %w0, s4             \n"
-            : "=r"(*(u32 *)&result)
+            : "=r"(result_bits)
             :: "v4"
         );
+        result = bits_f32(result_bits);
     }
     for (; i < n; i++)
         result += a[i] * b[i];
@@ -226,12 +243,14 @@ static void neon_matmul_f32(float *c, const float *a, const float *b,
                     );
                 }
                 float sum;
+                u32 sum_bits = 0;
                 __asm__ volatile(
                     "faddp v4.4s, v4.4s, v4.4s \n"
                     "faddp s4, v4.2s           \n"
                     "fmov  %w0, s4             \n"
-                    : "=r"(*(u32 *)&sum) :: "v4"
+                    : "=r"(sum_bits) :: "v4"
                 );
+                sum = bits_f32(sum_bits);
                 for (; k < n; k++)
                     sum += a_row[k] * b_row[k];
                 c[i * p + j] = sum;
@@ -348,6 +367,7 @@ bool tensor_softmax(tensor_t *b, const tensor_t *a) {
         /* NEON max-finding: 4 lanes parallel compare */
         float max_val = row_s[0];
         if (cols >= 8) {
+            u32 max_bits = 0;
             __asm__ volatile(
                 "ld1  {v0.4s}, [%1]    \n"
                 :: "r"(&max_val), "r"(row_s) : "v0"
@@ -366,8 +386,9 @@ bool tensor_softmax(tensor_t *b, const tensor_t *a) {
                 "fmaxp v0.4s, v0.4s, v0.4s \n"
                 "fmaxp s0, v0.2s           \n"
                 "fmov  %w0, s0             \n"
-                : "=r"(*(u32 *)&max_val) :: "v0"
+                : "=r"(max_bits) :: "v0"
             );
+            max_val = bits_f32(max_bits);
             for (; c < cols; c++)
                 if (row_s[c] > max_val) max_val = row_s[c];
         } else {
@@ -391,7 +412,7 @@ bool tensor_softmax(tensor_t *b, const tensor_t *a) {
             float inv_sum = 1.0f / sum;
             c = 0;
             if (cols >= 4) {
-                __asm__ volatile("dup v2.4s, %w0" :: "r"(*(u32 *)&inv_sum) : "v2");
+                __asm__ volatile("dup v2.4s, %w0" :: "r"(f32_bits(inv_sum)) : "v2");
                 for (; c + 4 <= cols; c += 4) {
                     __asm__ volatile(
                         "ld1  {v0.4s}, [%0]       \n"
@@ -403,7 +424,7 @@ bool tensor_softmax(tensor_t *b, const tensor_t *a) {
                 row_d = dst + r * cols + c; /* adjust for tail */
             }
             for (; c < cols; c++)
-                row_d[c - c] = (dst + r * cols)[c] * inv_sum; /* tail scalar */
+                row_d[c - c] *= inv_sum; /* tail scalar */
         }
     }
     dsb();
@@ -446,6 +467,7 @@ void qpu_free_program(qpu_program_t *prog) {
 
 bool qpu_dispatch(const qpu_program_t *prog, struct qpu_job *jobs,
                   u32 num_qpus) {
+    if (!prog || !jobs) return false;
     if (num_qpus == 0 || num_qpus > QPU_MAX_INSTANCES) return false;
 
     /* The control list is the jobs array itself — must be in GPU-visible mem.
@@ -465,7 +487,17 @@ bool qpu_dispatch(const qpu_program_t *prog, struct qpu_job *jobs,
     }
     dsb();
 
-    bool ok = qpu_execute(num_qpus, control_bus, false);
+    bool ok = false;
+    if (v3d_dispatch_supported()) {
+        struct v3d_dispatch_cfg cfg;
+        cfg.qpu_count = num_qpus;
+        cfg.control_list_bus = control_bus;
+        cfg.noflush = false;
+        cfg.timeout_ms = 25;
+        ok = (v3d_dispatch_compute(&cfg) == V3D_STATUS_OK);
+    } else {
+        ok = qpu_execute(num_qpus, control_bus, false);
+    }
 
     gpu_mem_unlock(control_handle);
     gpu_mem_free(control_handle);
@@ -475,6 +507,7 @@ bool qpu_dispatch(const qpu_program_t *prog, struct qpu_job *jobs,
 
 void tensor_init(void) {
     gpu_init();
+    v3d_init();
     if (qpu_enable(true)) {
         uart_puts("[tensor] QPU enabled (12 QPUs)\n");
         /* In future: set use_qpu_fallback = false when shaders ready */

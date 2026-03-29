@@ -58,6 +58,9 @@ u32 gpu_execute(u32 func_ptr, u32 r0, u32 r1, u32 r2,
  */
 bool qpu_execute(u32 num_qpus, u32 control, bool noflush);
 
+/* Submit with an explicit firmware timeout (milliseconds). */
+bool qpu_execute_timeout(u32 num_qpus, u32 control, bool noflush, u32 timeout_ms);
+
 /* Enable/disable QPU access (must call before qpu_execute) */
 bool qpu_enable(bool enable);
 

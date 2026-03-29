@@ -119,7 +119,7 @@ bool qpu_enable(bool enable) {
     return mbox_call(MBOX_CH_PROP, gpu_mbox);
 }
 
-bool qpu_execute(u32 num_qpus, u32 control, bool noflush) {
+bool qpu_execute_timeout(u32 num_qpus, u32 control, bool noflush, u32 timeout_ms) {
     gpu_mbox[0]  = 10 * 4;
     gpu_mbox[1]  = 0;
     gpu_mbox[2]  = TAG_QPU_EXECUTE;
@@ -128,10 +128,14 @@ bool qpu_execute(u32 num_qpus, u32 control, bool noflush) {
     gpu_mbox[5]  = num_qpus;
     gpu_mbox[6]  = control;    /* bus addr of (uniform, code) pairs */
     gpu_mbox[7]  = noflush ? 1 : 0;
-    gpu_mbox[8]  = 0;          /* timeout (0 = default) */
+    gpu_mbox[8]  = timeout_ms;
     gpu_mbox[9]  = 0;
 
     return mbox_call(MBOX_CH_PROP, gpu_mbox);
+}
+
+bool qpu_execute(u32 num_qpus, u32 control, bool noflush) {
+    return qpu_execute_timeout(num_qpus, control, noflush, 0);
 }
 
 /* ---- GPU DMA Copy ---- */

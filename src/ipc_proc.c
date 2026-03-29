@@ -46,6 +46,22 @@ static struct proc_fifo_channel g_fifos[PROC_IPC_FIFO_MAX];
 static struct proc_shm_region g_regions[PROC_IPC_SHM_MAX_REGIONS];
 static struct proc_shm_map g_maps[PROC_IPC_SHM_MAX_MAPS];
 static u32 g_shm_pool_off;
+static volatile u32 g_shm_alloc_lock;
+
+static void shm_alloc_lock(void)
+{
+    for (;;) {
+        if (__sync_lock_test_and_set(&g_shm_alloc_lock, 1) == 0)
+            break;
+        wfe();
+    }
+}
+
+static void shm_alloc_unlock(void)
+{
+    __sync_lock_release(&g_shm_alloc_lock);
+    sev();
+}
 
 static bool ascii_name_ok(const char *name)
 {
@@ -214,6 +230,8 @@ i32 ipc_proc_shm_create(u32 owner_principal, u32 owner_pid, const char *name,
                         u32 peer_principal, u32 owner_acl, u32 peer_acl,
                         u32 size)
 {
+    i32 ret = PROC_IPC_ERR_NOSPC;
+
     if (!ascii_name_ok(name)) return PROC_IPC_ERR_INVAL;
     if (peer_principal != PROC_IPC_PEER_ANY && peer_principal >= PRINCIPAL_MAX)
         return PROC_IPC_ERR_INVAL;
@@ -223,11 +241,23 @@ i32 ipc_proc_shm_create(u32 owner_principal, u32 owner_pid, const char *name,
     if ((peer_acl & (PROC_IPC_PERM_MAP_READ | PROC_IPC_PERM_MAP_WRITE)) == 0 &&
         peer_principal != owner_principal && peer_principal != PROC_IPC_PEER_ANY)
         return PROC_IPC_ERR_INVAL;
-    if (region_find_by_name(name) >= 0) return PROC_IPC_ERR_EXISTS;
+    if (size > (0xFFFFFFFFU - 63U)) return PROC_IPC_ERR_INVAL;
+
+    shm_alloc_lock();
+    if (region_find_by_name(name) >= 0) {
+        ret = PROC_IPC_ERR_EXISTS;
+        goto out_unlock;
+    }
 
     u32 aligned = (size + 63U) & ~63U;
-    if ((g_shm_pool_off + aligned) > IPC_SHM_SIZE)
-        return PROC_IPC_ERR_NOSPC;
+    if (aligned < size || aligned == 0 || aligned > IPC_SHM_SIZE) {
+        ret = PROC_IPC_ERR_INVAL;
+        goto out_unlock;
+    }
+    if (g_shm_pool_off > (IPC_SHM_SIZE - aligned)) {
+        ret = PROC_IPC_ERR_NOSPC;
+        goto out_unlock;
+    }
 
     for (u32 i = 0; i < PROC_IPC_SHM_MAX_REGIONS; i++) {
         if (g_regions[i].used) continue;
@@ -246,9 +276,13 @@ i32 ipc_proc_shm_create(u32 owner_principal, u32 owner_pid, const char *name,
         simd_zero((void *)(usize)(IPC_SHM_BASE + r->offset), aligned);
         g_shm_pool_off += aligned;
         dmb();
-        return (i32)i;
+        ret = (i32)i;
+        goto out_unlock;
     }
-    return PROC_IPC_ERR_NOSPC;
+
+out_unlock:
+    shm_alloc_unlock();
+    return ret;
 }
 
 i32 ipc_proc_shm_open(u32 principal, u32 pid, const char *name, u32 want_acl)
