@@ -102,3 +102,30 @@ while (!fifo_pop(CORE_USER0, CORE_DISK, &reply))
 - Message push/pop: ~20ns (cache-line write + barrier + SEV)
 - FIFO depth 512: can absorb bursts without backpressure
 - `sev`/`wfe` wakes sleeping cores within ~100ns
+
+## Userland IPC Primitives (Issue #26, initial milestone)
+
+In addition to inter-core FIFO channels, user processes now get bounded in-memory IPC objects through the syscall table:
+
+- Queue (FIFO): `queue_create/push/pop/len`
+- Stack (LIFO): `stack_create/push/pop/len`
+- Event stream pub/sub: `topic_create/publish/subscribe/read`
+
+Limits are fixed and compile-time bounded:
+
+- Max named objects: 16 queues/stacks, 16 topics
+- Queue/stack depth: up to 32 frames/object
+- Event replay window: up to 32 events/topic
+- Max frame/event size: 512 bytes
+- Names: printable ASCII, max 31 chars
+
+Security:
+
+- All IPC syscalls are capability-gated by `PRINCIPAL_IPC`
+- User pointers are validated in syscall handlers
+- No user callback pointers are accepted
+
+Persistence hooks:
+
+- Queue/topic objects support optional persistence flags plus `flush` APIs internally
+- Current build ships safe WALFS-path stubs (`/var/ipc/queues`, `/var/ipc/topics`) that return explicit unsupported when durability is requested

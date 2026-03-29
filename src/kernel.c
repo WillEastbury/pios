@@ -43,6 +43,8 @@
 #include "usb.h"
 #include "usb_storage.h"
 #include "usb_kbd.h"
+#include "ipc_queue.h"
+#include "ipc_stream.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -275,6 +277,9 @@ void kernel_main(void) {
     /* 8. Inter-core FIFOs */
     fifo_init_all();
     uart_puts("[fifo] Init OK\n");
+    ipc_queue_init();
+    ipc_stream_init();
+    uart_puts("[ipc] In-memory IPC ready\n");
 
     /* 9. SD card - raw block access */
     if (!sd_init())

@@ -113,7 +113,8 @@ bool principal_init(void)
     /* Seed with root principal (all capabilities) */
     struct principal *r = &principals[0];
     r->id    = PRINCIPAL_ROOT;
-    r->flags = PRINCIPAL_ADMIN | PRINCIPAL_NET | PRINCIPAL_DISK | PRINCIPAL_EXEC;
+    r->flags = PRINCIPAL_ADMIN | PRINCIPAL_NET | PRINCIPAL_DISK |
+               PRINCIPAL_EXEC | PRINCIPAL_IPC;
     memcpy(r->name, "root", 5);
     hash_pass("pios", r->secret_hash);
     principal_count = 1;
@@ -157,8 +158,12 @@ bool principal_has_cap(u32 id, u32 cap_flag)
 {
     if (id == PRINCIPAL_ROOT) return true;
     for (u32 i = 0; i < principal_count; i++) {
-        if (principals[i].id == id)
+        if (principals[i].id == id) {
+            if (cap_flag == PRINCIPAL_IPC &&
+                (principals[i].flags & PRINCIPAL_ADMIN))
+                return true;
             return (principals[i].flags & cap_flag) != 0;
+        }
     }
     return false;
 }
@@ -167,6 +172,7 @@ bool principal_create(const char *name, const char *pass, u32 flags)
 {
     if (principal_count >= PRINCIPAL_MAX) return false;
     if (find_by_name(name) >= 0) return false;
+    if (flags & PRINCIPAL_ADMIN) flags |= PRINCIPAL_IPC;
 
     struct principal *p = &principals[principal_count];
     simd_zero(p, sizeof(*p));

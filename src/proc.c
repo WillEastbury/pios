@@ -16,6 +16,8 @@
 #include "tensor.h"
 #include "fifo.h"
 #include "mmu.h"
+#include "ipc_queue.h"
+#include "ipc_stream.h"
 
 #define CORE_DISK  1
 
@@ -51,6 +53,7 @@ static bool has_cap(u32 cap) {
 
 static bool has_disk_cap(void) { return has_cap(PRINCIPAL_DISK); }
 static bool has_net_cap(void)  { return has_cap(PRINCIPAL_NET); }
+static bool has_ipc_cap(void)  { return has_cap(PRINCIPAL_IPC); }
 
 /* ---- Semaphore state ---- */
 #define MAX_SEMS 8
@@ -106,6 +109,18 @@ static u32   sys_nprocs(void);
 static i32   sys_sem_create(u32 initial);
 static i32   sys_sem_wait(i32 id);
 static i32   sys_sem_post(i32 id);
+static i32   sys_queue_create(const char *name, u32 depth, u32 flags, u32 frame_max);
+static i32   sys_queue_push(i32 qid, const void *data, u32 len);
+static i32   sys_queue_pop(i32 qid, void *out, u32 out_max);
+static i32   sys_queue_len(i32 qid);
+static i32   sys_stack_create(const char *name, u32 depth, u32 flags, u32 frame_max);
+static i32   sys_stack_push(i32 sid, const void *data, u32 len);
+static i32   sys_stack_pop(i32 sid, void *out, u32 out_max);
+static i32   sys_stack_len(i32 sid);
+static i32   sys_topic_create(const char *name, u32 replay_window, u32 flags, u32 event_max);
+static i32   sys_topic_publish(i32 tid, const void *data, u32 len);
+static i32   sys_topic_subscribe(i32 tid);
+static i32   sys_topic_read(i32 sub_id, void *out, u32 out_max);
 static i32   sys_tensor_alloc(void *t, u32 rows, u32 cols, u32 elem_size);
 static void  sys_tensor_free(void *t);
 static void  sys_tensor_upload(void *t, const void *data);
@@ -177,6 +192,19 @@ static struct syscall_table syscall_tab = {
     .sem_create      = sys_sem_create,
     .sem_wait        = sys_sem_wait,
     .sem_post        = sys_sem_post,
+    /* In-memory IPC */
+    .queue_create    = sys_queue_create,
+    .queue_push      = sys_queue_push,
+    .queue_pop       = sys_queue_pop,
+    .queue_len       = sys_queue_len,
+    .stack_create    = sys_stack_create,
+    .stack_push      = sys_stack_push,
+    .stack_pop       = sys_stack_pop,
+    .stack_len       = sys_stack_len,
+    .topic_create    = sys_topic_create,
+    .topic_publish   = sys_topic_publish,
+    .topic_subscribe = sys_topic_subscribe,
+    .topic_read      = sys_topic_read,
     /* Tensor */
     .tensor_alloc    = sys_tensor_alloc,
     .tensor_free     = sys_tensor_free,
@@ -848,6 +876,108 @@ static i32 sys_sem_post(i32 id)
     if (id < 0 || id >= MAX_SEMS || !sems[id].used) return -1;
     sems[id].count++;
     return 0;
+}
+
+/* ---- In-memory IPC ---- */
+
+static bool ptr_valid_cstr(const char *s, u32 max_len)
+{
+    if (!s || max_len == 0) return false;
+    for (u32 i = 0; i < max_len; i++) {
+        if (!ptr_valid(s + i, 1)) return false;
+        if (s[i] == 0) return i != 0;
+    }
+    return false;
+}
+
+static i32 sys_queue_create(const char *name, u32 depth, u32 flags, u32 frame_max)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid_cstr(name, IPC_NAME_MAX + 1)) return -1;
+    return ipc_queue_create(name, depth, flags, frame_max);
+}
+
+static i32 sys_queue_push(i32 qid, const void *data, u32 len)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(data, len)) return -1;
+    return ipc_queue_push(qid, data, len);
+}
+
+static i32 sys_queue_pop(i32 qid, void *out, u32 out_max)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(out, out_max)) return -1;
+    u32 len = 0;
+    i32 r = ipc_queue_pop(qid, out, out_max, &len);
+    if (r != IPC_OK) return r;
+    return (i32)len;
+}
+
+static i32 sys_queue_len(i32 qid)
+{
+    if (!has_ipc_cap()) return -1;
+    return ipc_queue_len(qid);
+}
+
+static i32 sys_stack_create(const char *name, u32 depth, u32 flags, u32 frame_max)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid_cstr(name, IPC_NAME_MAX + 1)) return -1;
+    return ipc_stack_create(name, depth, flags, frame_max);
+}
+
+static i32 sys_stack_push(i32 sid, const void *data, u32 len)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(data, len)) return -1;
+    return ipc_stack_push(sid, data, len);
+}
+
+static i32 sys_stack_pop(i32 sid, void *out, u32 out_max)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(out, out_max)) return -1;
+    u32 len = 0;
+    i32 r = ipc_stack_pop(sid, out, out_max, &len);
+    if (r != IPC_OK) return r;
+    return (i32)len;
+}
+
+static i32 sys_stack_len(i32 sid)
+{
+    if (!has_ipc_cap()) return -1;
+    return ipc_stack_len(sid);
+}
+
+static i32 sys_topic_create(const char *name, u32 replay_window, u32 flags, u32 event_max)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid_cstr(name, IPC_NAME_MAX + 1)) return -1;
+    return ipc_topic_create(name, replay_window, flags, event_max);
+}
+
+static i32 sys_topic_publish(i32 tid, const void *data, u32 len)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(data, len)) return -1;
+    return ipc_topic_publish(tid, data, len);
+}
+
+static i32 sys_topic_subscribe(i32 tid)
+{
+    if (!has_ipc_cap()) return -1;
+    return ipc_topic_subscribe(tid);
+}
+
+static i32 sys_topic_read(i32 sub_id, void *out, u32 out_max)
+{
+    if (!has_ipc_cap()) return -1;
+    if (!ptr_valid(out, out_max)) return -1;
+    u32 len = 0;
+    i32 r = ipc_topic_read(sub_id, out, out_max, &len);
+    if (r != IPC_OK) return r;
+    return (i32)len;
 }
 
 /* ---- Tensor / GPU compute ---- */

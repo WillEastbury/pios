@@ -14,6 +14,7 @@
 #define PRINCIPAL_NET    0x02
 #define PRINCIPAL_DISK   0x04
 #define PRINCIPAL_EXEC   0x08
+#define PRINCIPAL_IPC    0x10
 #define PRINCIPAL_MAX    16
 #define PRINCIPAL_ROOT   0
 

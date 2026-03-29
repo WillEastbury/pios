@@ -112,6 +112,20 @@ struct syscall_table {
     i32 (*sem_wait)(i32 id);            /* decrement (blocks if 0) */
     i32 (*sem_post)(i32 id);            /* increment */
 
+    /* ---- In-memory IPC ---- */
+    i32 (*queue_create)(const char *name, u32 depth, u32 flags, u32 frame_max);
+    i32 (*queue_push)(i32 qid, const void *data, u32 len);
+    i32 (*queue_pop)(i32 qid, void *out, u32 out_max);      /* returns frame len */
+    i32 (*queue_len)(i32 qid);
+    i32 (*stack_create)(const char *name, u32 depth, u32 flags, u32 frame_max);
+    i32 (*stack_push)(i32 sid, const void *data, u32 len);
+    i32 (*stack_pop)(i32 sid, void *out, u32 out_max);      /* returns frame len */
+    i32 (*stack_len)(i32 sid);
+    i32 (*topic_create)(const char *name, u32 replay_window, u32 flags, u32 event_max);
+    i32 (*topic_publish)(i32 tid, const void *data, u32 len);
+    i32 (*topic_subscribe)(i32 tid);                        /* returns subscriber handle */
+    i32 (*topic_read)(i32 sub_id, void *out, u32 out_max); /* returns event len */
+
     /* ---- Tensor / GPU compute ---- */
     i32 (*tensor_alloc)(void *t, u32 rows, u32 cols, u32 elem_size);
     void (*tensor_free)(void *t);
