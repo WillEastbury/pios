@@ -65,6 +65,7 @@ Physical Address        Size    Region              Cacheability
 0x0000_0000_0420_0000   1MB     Shared FIFO rings     Normal WB
 0x0000_0000_0430_0000   2MB     DMA NET buffers       Normal WB
 0x0000_0000_0450_0000   2MB     DMA DISK buffers      Normal WB
+0x0000_0000_0470_0000   1MB     IPC shared regions    Normal WB
 0x0000_0001_07C0_0000   4MB     BCM2712 peripherals   Device-nGnRnE
 0x0000_001F_0000_0000   16MB    RP1 BAR0 (PCIe)       Device-nGnRnE
 ```

@@ -18,6 +18,7 @@
 #include "mmu.h"
 #include "ipc_queue.h"
 #include "ipc_stream.h"
+#include "ipc_proc.h"
 #include "pipe.h"
 #include "exception.h"
 #include "ksem.h"
@@ -145,6 +146,16 @@ static i32   sys_pipe_write(i32 pipe_id, const void *buf, u32 len);
 static i32   sys_pipe_send(i32 pipe_id, const void *msg, u32 len);
 static i32   sys_pipe_recv(i32 pipe_id, void *msg, u32 len);
 static i32   sys_pipe_stat(i32 pipe_id, struct pipe_stat *out);
+static i32   sys_ipc_fifo_create(const char *name, u32 peer_principal, u32 owner_acl,
+                                 u32 peer_acl, u32 depth, u32 msg_max);
+static i32   sys_ipc_fifo_open(const char *name, u32 want_acl);
+static i32   sys_ipc_fifo_send(i32 channel_id, const void *data, u32 len);
+static i32   sys_ipc_fifo_recv(i32 channel_id, void *out, u32 out_max);
+static i32   sys_ipc_shm_create(const char *name, u32 peer_principal, u32 owner_acl,
+                                u32 peer_acl, u32 size);
+static i32   sys_ipc_shm_open(const char *name, u32 want_acl);
+static i32   sys_ipc_shm_map(i32 region_id, u32 flags, void **addr_out, u32 *size_out);
+static i32   sys_ipc_shm_unmap(i32 map_handle);
 static i32   sys_tensor_alloc(void *t, u32 rows, u32 cols, u32 elem_size);
 static void  sys_tensor_free(void *t);
 static void  sys_tensor_upload(void *t, const void *data);
@@ -240,6 +251,15 @@ static struct syscall_table syscall_tab = {
     .pipe_send       = sys_pipe_send,
     .pipe_recv       = sys_pipe_recv,
     .pipe_stat       = sys_pipe_stat,
+    /* Kernel-enforced IPC */
+    .ipc_fifo_create = sys_ipc_fifo_create,
+    .ipc_fifo_open   = sys_ipc_fifo_open,
+    .ipc_fifo_send   = sys_ipc_fifo_send,
+    .ipc_fifo_recv   = sys_ipc_fifo_recv,
+    .ipc_shm_create  = sys_ipc_shm_create,
+    .ipc_shm_open    = sys_ipc_shm_open,
+    .ipc_shm_map     = sys_ipc_shm_map,
+    .ipc_shm_unmap   = sys_ipc_shm_unmap,
     /* Tensor */
     .tensor_alloc    = sys_tensor_alloc,
     .tensor_free     = sys_tensor_free,
@@ -1197,6 +1217,76 @@ static i32 sys_pipe_stat(i32 pipe_id, struct pipe_stat *out)
     if (!has_ipc_cap()) return -1;
     if (!ptr_valid(out, sizeof(*out))) return -1;
     return pipe_stat(pipe_id, out);
+}
+
+/* ---- Kernel-enforced process IPC ---- */
+
+static i32 sys_ipc_fifo_create(const char *name, u32 peer_principal, u32 owner_acl,
+                               u32 peer_acl, u32 depth, u32 msg_max)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    if (!ptr_valid_cstr(name, PROC_IPC_NAME_MAX + 1)) return PROC_IPC_ERR_INVAL;
+    if (peer_principal != PROC_IPC_PEER_ANY && peer_principal >= PRINCIPAL_MAX)
+        return PROC_IPC_ERR_INVAL;
+    return ipc_proc_fifo_create(principal_current(), procs[current_proc].pid, name,
+                                peer_principal, owner_acl, peer_acl, depth, msg_max);
+}
+
+static i32 sys_ipc_fifo_open(const char *name, u32 want_acl)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    if (!ptr_valid_cstr(name, PROC_IPC_NAME_MAX + 1)) return PROC_IPC_ERR_INVAL;
+    return ipc_proc_fifo_open(principal_current(), procs[current_proc].pid, name, want_acl);
+}
+
+static i32 sys_ipc_fifo_send(i32 channel_id, const void *data, u32 len)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    if (!ptr_valid(data, len)) return PROC_IPC_ERR_INVAL;
+    return ipc_proc_fifo_send(principal_current(), channel_id, data, len);
+}
+
+static i32 sys_ipc_fifo_recv(i32 channel_id, void *out, u32 out_max)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    if (!ptr_valid(out, out_max)) return PROC_IPC_ERR_INVAL;
+    u32 len = 0;
+    i32 r = ipc_proc_fifo_recv(principal_current(), channel_id, out, out_max, &len);
+    if (r != PROC_IPC_OK) return r;
+    return (i32)len;
+}
+
+static i32 sys_ipc_shm_create(const char *name, u32 peer_principal, u32 owner_acl,
+                              u32 peer_acl, u32 size)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    if (!ptr_valid_cstr(name, PROC_IPC_NAME_MAX + 1)) return PROC_IPC_ERR_INVAL;
+    if (peer_principal != PROC_IPC_PEER_ANY && peer_principal >= PRINCIPAL_MAX)
+        return PROC_IPC_ERR_INVAL;
+    return ipc_proc_shm_create(principal_current(), procs[current_proc].pid, name,
+                               peer_principal, owner_acl, peer_acl, size);
+}
+
+static i32 sys_ipc_shm_open(const char *name, u32 want_acl)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    if (!ptr_valid_cstr(name, PROC_IPC_NAME_MAX + 1)) return PROC_IPC_ERR_INVAL;
+    return ipc_proc_shm_open(principal_current(), procs[current_proc].pid, name, want_acl);
+}
+
+static i32 sys_ipc_shm_map(i32 region_id, u32 flags, void **addr_out, u32 *size_out)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    if (!ptr_valid(addr_out, sizeof(*addr_out))) return PROC_IPC_ERR_INVAL;
+    if (!ptr_valid(size_out, sizeof(*size_out))) return PROC_IPC_ERR_INVAL;
+    return ipc_proc_shm_map(principal_current(), procs[current_proc].pid, region_id,
+                            flags, addr_out, size_out);
+}
+
+static i32 sys_ipc_shm_unmap(i32 map_handle)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    return ipc_proc_shm_unmap(principal_current(), procs[current_proc].pid, map_handle);
 }
 
 /* ---- Tensor / GPU compute ---- */

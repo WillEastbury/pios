@@ -260,9 +260,9 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
                           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
     map_user_low_2m(l2, 0, 0, ram_attrs);
 
-    /* Map this process slot and shared FIFO/DMA windows. */
+    /* Map this process slot and shared FIFO/DMA/IPC-SHM windows. */
     map_user_low_2m(l2, (u32)(slot_base / L2_BLOCK_SIZE), slot_base, ram_attrs);
-    for (u64 pa = SHARED_FIFO_BASE; pa < DMA_DISK_BASE + DMA_DISK_SIZE; pa += L2_BLOCK_SIZE)
+    for (u64 pa = SHARED_FIFO_BASE; pa < IPC_SHM_BASE + IPC_SHM_SIZE; pa += L2_BLOCK_SIZE)
         map_user_low_2m(l2, (u32)(pa / L2_BLOCK_SIZE), pa, ram_attrs);
 
     /* Keep peripheral MMIO mapped for current direct-call syscall ABI. */

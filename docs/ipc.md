@@ -130,6 +130,35 @@ Persistence hooks:
 - Queue/topic objects support optional persistence flags plus `flush` APIs internally
 - Current build ships safe WALFS-path stubs (`/var/ipc/queues`, `/var/ipc/topics`) that return explicit unsupported when durability is requested
 
+## Kernel-enforced process IPC (Issue #21)
+
+The kernel now exposes capability-gated process IPC syscalls for:
+
+- **Bounded FIFO channels** (`ipc_fifo_create/open/send/recv`)
+- **Bounded shared memory regions** (`ipc_shm_create/open/map/unmap`)
+
+Security model:
+
+- Every FIFO/SHM object has kernel-owned metadata: owner principal, peer principal (or `PROC_IPC_PEER_ANY`), ACL bits, bounds.
+- Access is enforced on every operation by principal ACL (root bypass remains).
+- Users only receive opaque IDs / map handles and data pointers; control metadata is never user-writable.
+- Syscall handlers validate all user pointers before touching kernel state.
+- Unsupported access modes return explicit error codes (`PROC_IPC_ERR_UNSUPPORTED`) rather than falling through.
+
+Fence semantics:
+
+- FIFO enqueue: payload copy → `dmb()` → queue metadata publish.
+- FIFO dequeue: metadata observe (`dmb()`) → payload read → `dmb()` → head/count advance.
+- SHM map/unmap paths use `dmb()` so handle publication/release is ordered with shared-memory visibility.
+
+Current scope and MMU integration:
+
+- SHM regions come from a bounded kernel-managed 1MB pool at `IPC_SHM_BASE` (`0x04700000`).
+- User process tables map this window alongside existing FIFO/DMA shared windows.
+- Mapping granularity is region-level via handles (no user page-table edits from userspace).
+- FIFO/SHM objects are core-local in this milestone; cross-core open/send/map attempts return `PROC_IPC_ERR_UNSUPPORTED`.
+- Executable SHM mappings are intentionally unsupported in this milestone and return `PROC_IPC_ERR_UNSUPPORTED`.
+
 ## Kernel Deferred Execution + Semaphores (Issue #22)
 
 - **Kernel semaphores (`ksem`)** are bounded, core-owned objects (`KSEM_MAX_PER_CORE=16`) with `create`, `wait`, `trywait`, and `post`.

@@ -14,6 +14,7 @@
  *   0x04200000 - 0x042FFFFF  Shared FIFO ring (1MB)
  *   0x04300000 - 0x044FFFFF  DMA NET buffers (2MB)
  *   0x04500000 - 0x046FFFFF  DMA DISK buffers (2MB)
+ *   0x04700000 - 0x047FFFFF  Shared process IPC SHM pool (1MB)
  */
 
 #pragma once
@@ -34,6 +35,9 @@
 
 #define DMA_DISK_BASE       0x04500000UL
 #define DMA_DISK_SIZE       0x00200000UL  /* 2MB */
+
+#define IPC_SHM_BASE        0x04700000UL
+#define IPC_SHM_SIZE        0x00100000UL  /* 1MB */
 
 static const u64 core_ram_bases[4] = {
     CORE0_RAM_BASE, CORE1_RAM_BASE, CORE2_RAM_BASE, CORE3_RAM_BASE
