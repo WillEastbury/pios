@@ -19,6 +19,17 @@ static bool ct_eq(const u8 *a, const u8 *b, u32 len) {
     return diff == 0;
 }
 
+static void name_pack_32(const char *src, u8 out[32])
+{
+    simd_zero(out, 32);
+    if (!src) return;
+    for (u32 i = 0; i < 31; i++) {
+        u8 c = (u8)src[i];
+        out[i] = c;
+        if (c == 0) return;
+    }
+}
+
 static struct principal principals[PRINCIPAL_MAX];
 static u32 principal_count;
 static u32 current_principal[4];  /* one slot per core */
@@ -77,6 +88,9 @@ static u32 read_secret(char *buf, u32 max)
 /* Find principal by name. Returns index or -1. */
 static i32 find_by_name(const char *name)
 {
+    if (!name) return -1;
+    u32 n = pios_strlen(name);
+    if (n >= sizeof(principals[0].name)) return -1;
     u32 len = pios_strlen(name) + 1;
     for (u32 i = 0; i < principal_count; i++) {
         if (memcmp(principals[i].name, name, len) == 0)
@@ -125,16 +139,31 @@ bool principal_init(void)
 
 bool principal_auth(const char *name, const char *pass, u32 *id_out)
 {
-    i32 idx = find_by_name(name);
-    if (idx < 0) return false;
+    if (!name || !pass) return false;
 
     u8 h[4];
+    u8 name32[32];
+    u8 chosen_hash[4] = {0, 0, 0, 0};
+    u32 chosen_id = PRINCIPAL_ROOT;
+    bool found = false;
+
+    name_pack_32(name, name32);
     hash_pass(pass, h);
-    if (!ct_eq(principals[idx].secret_hash, h, 4))
+
+    for (u32 i = 0; i < principal_count; i++) {
+        bool match = ct_eq(principals[i].name, name32, 32);
+        u8 mask = (u8)(0U - (u8)match);
+        for (u32 j = 0; j < 4; j++)
+            chosen_hash[j] = (u8)((chosen_hash[j] & (u8)~mask) |
+                                  (principals[i].secret_hash[j] & mask));
+        chosen_id = (chosen_id & ~(u32)mask) | (principals[i].id & (u32)mask);
+        found = found || match;
+    }
+    if (!found || !ct_eq(chosen_hash, h, 4))
         return false;
 
-    current_principal[core_id()] = principals[idx].id;
-    if (id_out) *id_out = principals[idx].id;
+    current_principal[core_id()] = chosen_id;
+    if (id_out) *id_out = chosen_id;
     return true;
 }
 
