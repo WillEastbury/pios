@@ -105,7 +105,7 @@ while (!fifo_pop(CORE_USER0, CORE_DISK, &reply))
 
 ## Userland IPC Primitives (Issue #26, initial milestone)
 
-In addition to inter-core FIFO channels, user processes now get bounded in-memory IPC objects through the syscall table:
+In addition to inter-core FIFO channels, user processes now get bounded in-memory IPC objects through the kernel program interface (KPI) table:
 
 - Queue (FIFO): `queue_create/push/pop/len`
 - Stack (LIFO): `stack_create/push/pop/len`
@@ -121,8 +121,8 @@ Limits are fixed and compile-time bounded:
 
 Security:
 
-- All IPC syscalls are capability-gated by `PRINCIPAL_IPC`
-- User pointers are validated in syscall handlers
+- All IPC calls are capability-gated by `PRINCIPAL_IPC`
+- User pointers are validated in KPI handlers
 - No user callback pointers are accepted
 
 Persistence hooks:
@@ -132,7 +132,7 @@ Persistence hooks:
 
 ## Kernel-enforced process IPC (Issue #21)
 
-The kernel now exposes capability-gated process IPC syscalls for:
+The kernel now exposes capability-gated process IPC calls for:
 
 - **Bounded FIFO channels** (`ipc_fifo_create/open/send/recv`)
 - **Bounded shared memory regions** (`ipc_shm_create/open/map/unmap`)
@@ -142,7 +142,7 @@ Security model:
 - Every FIFO/SHM object has kernel-owned metadata: owner principal, peer principal (or `PROC_IPC_PEER_ANY`), ACL bits, bounds.
 - Access is enforced on every operation by principal ACL (root bypass remains).
 - Users only receive opaque IDs / map handles and data pointers; control metadata is never user-writable.
-- Syscall handlers validate all user pointers before touching kernel state.
+- KPI handlers validate all user pointers before touching kernel state.
 - Unsupported access modes return explicit error codes (`PROC_IPC_ERR_UNSUPPORTED`) rather than falling through.
 
 Fence semantics:

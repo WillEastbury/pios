@@ -2,12 +2,12 @@
 
 This document describes the current kernel API surface in two layers:
 
-- Userland ABI (`struct syscall_table` in `include/proc.h`)
+- Userland Kernel Program Interface (`struct kernel_api` in `include/proc.h`)
 - Kernel subsystem C APIs (`include/*.h`) used by core runtime/components
 
-## 1) Userland ABI (syscall table)
+## 1) Userland Kernel Program Interface (KPI table)
 
-Authoritative definition: `include/proc.h` (`struct syscall_table`).
+Authoritative definition: `include/proc.h` (`struct kernel_api`).
 
 ### Process control
 
@@ -41,6 +41,15 @@ Authoritative definition: `include/proc.h` (`struct syscall_table`).
 - `mkdir(path)`
 - `unlink(path)`
 - `readdir(path, entries, max_entries)`
+
+### Paged I/O primitive
+
+- `page_open(path, page_size, flags)`
+- `page_read(page_id, page_idx, out_page, out_len)`
+- `page_write(page_id, page_idx, in_page, in_len)`
+- `page_flush(page_id)`
+- `page_stat(page_id, out)`
+- `page_close(page_id)`
 
 ### Framebuffer
 
@@ -157,6 +166,6 @@ For exact signatures, use the corresponding header as source of truth.
 
 ## 3) Userland vs kernel-only notes
 
-- If an operation is in `struct syscall_table`, it is userland-callable.
-- Raw driver entrypoints (`genet_*`, `sd_*`, `v3d_*`, etc.) are kernel C APIs unless explicitly bridged by a syscall/IPC surface.
+- If an operation is in `struct kernel_api`, it is userland-callable.
+- Raw driver entrypoints (`genet_*`, `sd_*`, `v3d_*`, etc.) are kernel C APIs unless explicitly bridged by a KPI/IPC surface.
 - `tensor_bind_kernel_blob` is now bridged to userland for controlled real-kernel bring-up (admin capability required).

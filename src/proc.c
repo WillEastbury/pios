@@ -39,6 +39,16 @@ static volatile bool preempt_pending[2];
 static u64 preempt_quantum_ticks[2];
 static u64 preempt_count_core[2];
 
+#define MAX_PAGED_IO_HANDLES 16
+struct paged_io_handle {
+    bool used;
+    u32 owner_pid;
+    u32 page_size;
+    u32 flags;
+    u64 inode_id;
+};
+static struct paged_io_handle paged_io_tab[MAX_PAGED_IO_HANDLES];
+
 static inline bool on_user_core(void)
 {
     u32 c = core_id();
@@ -109,6 +119,12 @@ static i32   sys_stat(const char *path, void *out);
 static i32   sys_mkdir(const char *path);
 static i32   sys_unlink(const char *path);
 static i32   sys_readdir(const char *path, void *entries, u32 max_entries);
+static i32   sys_page_open(const char *path, u32 page_size, u32 flags);
+static i32   sys_page_read(i32 page_id, u64 page_idx, void *out_page, u32 out_len);
+static i32   sys_page_write(i32 page_id, u64 page_idx, const void *in_page, u32 in_len);
+static i32   sys_page_flush(i32 page_id);
+static i32   sys_page_stat(i32 page_id, struct paged_io_stat *out);
+static i32   sys_page_close(i32 page_id);
 static void  sys_fb_putc(char c);
 static void  sys_fb_print(const char *s);
 static void  sys_fb_color(u32 fg, u32 bg);
@@ -183,7 +199,7 @@ static i32   sys_tensor_bind_kernel_blob(u32 kernel_id, const void *uniform_data
 static void  proc_tick_hook(u32 core, u64 tick);
 static void  proc_preempt_trampoline(void);
 
-static struct syscall_table syscall_tab = {
+static struct kernel_api kernel_api_tab = {
     /* Process control */
     .yield           = sys_yield,
     .exit            = sys_exit,
@@ -209,6 +225,12 @@ static struct syscall_table syscall_tab = {
     .mkdir           = sys_mkdir,
     .unlink          = sys_unlink,
     .readdir         = sys_readdir,
+    .page_open       = sys_page_open,
+    .page_read       = sys_page_read,
+    .page_write      = sys_page_write,
+    .page_flush      = sys_page_flush,
+    .page_stat       = sys_page_stat,
+    .page_close      = sys_page_close,
     /* Framebuffer */
     .fb_putc         = sys_fb_putc,
     .fb_print        = sys_fb_print,
@@ -309,15 +331,15 @@ static i32 find_empty_slot(void)
     return -1;
 }
 
-/* Trampoline: x19=&syscall_tab, x20=entry. First schedule lands here via LR. */
+/* Trampoline: x19=&kernel_api_tab, x20=entry. First schedule lands here via LR. */
 static NORETURN void proc_trampoline(void)
 {
-    struct syscall_table *tab;
+    struct kernel_api *tab;
     u64 entry;
     __asm__ volatile("mov %0, x19" : "=r"(tab));
     __asm__ volatile("mov %0, x20" : "=r"(entry));
 
-    ((void (*)(struct syscall_table *))entry)(tab);
+    ((void (*)(struct kernel_api *))entry)(tab);
     proc_exit(0);  /* if process returns */
     __builtin_unreachable();
 }
@@ -334,6 +356,8 @@ void proc_init(void)
         procs[i].state = PROC_EMPTY;
         procs[i].pid = 0;
     }
+    for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++)
+        paged_io_tab[i].used = false;
     current_proc = 0;
     next_pid = (core_id() << 16) | 1;  /* encode core in upper bits */
     initialized = true;
@@ -406,7 +430,7 @@ i32 proc_exec(const char *path)
     heap_top[(u32)slot] = ((u64)(usize)base + loaded + 15) & ~15UL;
 
     simd_zero(&p->ctx, sizeof(p->ctx));
-    p->ctx.x19_x30[0] = (u64)(usize)&syscall_tab;  /* x19 */
+    p->ctx.x19_x30[0] = (u64)(usize)&kernel_api_tab;  /* x19 */
     p->ctx.x19_x30[1] = (u64)(usize)base;           /* x20 */
     p->ctx.x19_x30[11] = (u64)(usize)proc_trampoline; /* x30 = LR */
     p->ctx.sp = (u64)(usize)(base + PROC_SLOT_SIZE - 16);
@@ -680,6 +704,41 @@ static void sys_sleep_us(u64 us)      { timer_delay_us(us); }
 
 /* ---- Filesystem (WALFS via FIFO to Core 1) ---- */
 
+static bool page_size_valid(u32 page_size)
+{
+    if (page_size < 512 || page_size > WALFS_DATA_MAX)
+        return false;
+    return (page_size & (page_size - 1U)) == 0;
+}
+
+static i32 page_handle_alloc(u64 inode_id, u32 page_size, u32 flags)
+{
+    u32 owner_pid = procs[current_proc].pid;
+    for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++) {
+        if (!paged_io_tab[i].used) {
+            paged_io_tab[i].used = true;
+            paged_io_tab[i].owner_pid = owner_pid;
+            paged_io_tab[i].page_size = page_size;
+            paged_io_tab[i].flags = flags;
+            paged_io_tab[i].inode_id = inode_id;
+            return (i32)i;
+        }
+    }
+    return -1;
+}
+
+static struct paged_io_handle *page_handle_get(i32 page_id)
+{
+    if (page_id < 0 || page_id >= MAX_PAGED_IO_HANDLES)
+        return NULL;
+    struct paged_io_handle *h = &paged_io_tab[(u32)page_id];
+    if (!h->used)
+        return NULL;
+    if (h->owner_pid != procs[current_proc].pid)
+        return NULL;
+    return h;
+}
+
 static i32 sys_open(const char *path, u32 flags)
 {
     (void)flags;
@@ -883,6 +942,112 @@ static i32 sys_readdir(const char *path, void *entries, u32 max_entries)
     fs_request(&msg, &reply);
     if (reply.status != 0) return -1;
     return (i32)reply.param;
+}
+
+static i32 sys_page_open(const char *path, u32 page_size, u32 flags)
+{
+    (void)flags;
+    if (!has_disk_cap()) return -1;
+    if (!ptr_valid_cstr(path, 256)) return -1;
+    if (!page_size_valid(page_size)) return -1;
+
+    struct fifo_msg msg = {0};
+    msg.type   = MSG_FS_FIND;
+    msg.buffer = (u64)(usize)path;
+    msg.length = pios_strlen(path) + 1;
+    struct fifo_msg reply;
+    fs_request(&msg, &reply);
+    if (reply.status != 0) return -1;
+
+    u64 inode_id = reply.tag ? reply.tag : (u64)reply.param;
+    if (!inode_id) return -1;
+    return page_handle_alloc(inode_id, page_size, flags);
+}
+
+static i32 sys_page_read(i32 page_id, u64 page_idx, void *out_page, u32 out_len)
+{
+    if (!has_disk_cap()) return -1;
+    struct paged_io_handle *h = page_handle_get(page_id);
+    if (!h) return -1;
+    if (out_len != h->page_size) return -1;
+    if (!ptr_valid(out_page, out_len)) return -1;
+
+    u64 offset = page_idx * (u64)h->page_size;
+    struct fifo_msg msg = {0};
+    msg.type   = MSG_FS_READ;
+    msg.param  = (u32)h->inode_id;
+    msg.tag    = offset;
+    msg.buffer = (u64)(usize)out_page;
+    msg.length = h->page_size;
+    struct fifo_msg reply;
+    fs_request(&msg, &reply);
+    if (reply.status != 0) return -1;
+    return (i32)reply.length;
+}
+
+static i32 sys_page_write(i32 page_id, u64 page_idx, const void *in_page, u32 in_len)
+{
+    if (!has_disk_cap()) return -1;
+    struct paged_io_handle *h = page_handle_get(page_id);
+    if (!h) return -1;
+    if (in_len != h->page_size) return -1;
+    if (!ptr_valid(in_page, in_len)) return -1;
+
+    u64 offset = page_idx * (u64)h->page_size;
+    struct fifo_msg msg = {0};
+    msg.type   = MSG_FS_WRITE;
+    msg.param  = (u32)h->inode_id;
+    msg.tag    = offset;
+    msg.buffer = (u64)(usize)in_page;
+    msg.length = h->page_size;
+    struct fifo_msg reply;
+    fs_request(&msg, &reply);
+    if (reply.status != 0) return -1;
+    return (i32)reply.length;
+}
+
+static i32 sys_page_flush(i32 page_id)
+{
+    if (!has_disk_cap()) return -1;
+    if (!page_handle_get(page_id)) return -1;
+
+    struct fifo_msg msg = {0};
+    msg.type = MSG_FS_SYNC;
+    struct fifo_msg reply;
+    fs_request(&msg, &reply);
+    return (reply.status == 0) ? 0 : -1;
+}
+
+static i32 sys_page_stat(i32 page_id, struct paged_io_stat *out)
+{
+    if (!has_disk_cap()) return -1;
+    struct paged_io_handle *h = page_handle_get(page_id);
+    if (!h) return -1;
+    if (!ptr_valid(out, sizeof(*out))) return -1;
+
+    struct walfs_inode ino;
+    struct fifo_msg msg = {0};
+    msg.type   = MSG_FS_STAT;
+    msg.tag    = h->inode_id;
+    msg.buffer = (u64)(usize)&ino;
+    msg.length = sizeof(ino);
+    struct fifo_msg reply;
+    fs_request(&msg, &reply);
+    if (reply.status != 0) return -1;
+
+    out->inode_id = h->inode_id;
+    out->file_size = ino.size;
+    out->page_size = h->page_size;
+    out->flags = h->flags;
+    return 0;
+}
+
+static i32 sys_page_close(i32 page_id)
+{
+    struct paged_io_handle *h = page_handle_get(page_id);
+    if (!h) return -1;
+    h->used = false;
+    return 0;
 }
 
 /* ---- Framebuffer ---- */

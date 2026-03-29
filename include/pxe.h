@@ -71,7 +71,7 @@ struct pxe_module_info {
 
 /* Load a PXE executable into memory at base. Returns entry point or 0. */
 u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
-             void *syscall_table);
+             void *kernel_api_table);
 
 /* Load a minimal ELF64 binary. Returns entry point or 0. */
 u64 elf64_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size);

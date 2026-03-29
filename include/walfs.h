@@ -48,6 +48,7 @@
 #define MSG_FS_STAT         42
 #define MSG_FS_FIND         43
 #define MSG_FS_SCAN_RESULT  44
+#define MSG_FS_SYNC         45
 
 /* ---- On-disk Structures ---- */
 

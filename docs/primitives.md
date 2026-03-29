@@ -63,17 +63,23 @@ Common invariants:
 - Ops: `open/creat/read/write/pread/pwrite/stat/mkdir/unlink/readdir`
 - Policy: `PRINCIPAL_DISK` + inode ACL checks.
 
-## 5) Paged I/O (`paged_io`) *(target next)*
+## 5) Paged I/O (`paged_io`)
 
 - Explicit page/block object for fixed-size reads/writes.
-- Proposed ops:
+- Ops:
   - `page_open(dev_or_file, page_size)`
   - `page_read(page_idx, out_page)`
   - `page_write(page_idx, in_page)`
   - `page_flush()`
   - `page_stat()`
+  - `page_close()`
 - Policy: disk capability + object ACL.
 - Purpose: deterministic block/page semantics independent of stream/file APIs.
+- Contract:
+  - page size is power-of-two in `[512, 4096]`
+  - reads/writes are positioned at `page_idx * page_size`
+  - buffer length must equal object page size
+  - handles are process-owned and non-transferable
 
 ## 6) FIFO Channel (`fifo`)
 
@@ -113,7 +119,7 @@ Common invariants:
 - Principal identity + capability + ACL envelope attached to every object.
 - Current primitives:
   - `whoami/auth`
-  - capability checks in syscall handlers
+  - capability checks in kernel API handlers
   - inode ACL checks
   - IPC owner/peer ACL checks
 - Target extension: explicit `sec_ctx_stat(handle)` for any object.
@@ -123,7 +129,7 @@ Common invariants:
 - Queue/Stack: **implemented**
 - RAM (SHM): **implemented**
 - File: **implemented**
-- Paged I/O: **not yet first-class** (next implementation candidate)
+- Paged I/O: **implemented**
 - FIFO: **implemented** (core + process IPC)
 - Cache: **partially implemented** (internal only)
 - TCP/UDP: **implemented** (socket + net primitives)
@@ -137,9 +143,4 @@ Common invariants:
 
 ## Immediate Next Step
 
-Implement `paged_io` as a first-class primitive with:
-
-- fixed page-size contract
-- explicit flush/consistency semantics
-- capability + ACL enforcement
-- bounded request/response path via existing IPC/service-core model
+Extend paged I/O with explicit create/open mode flags and per-object ACL metadata export in `page_stat()`.

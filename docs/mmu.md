@@ -79,7 +79,7 @@ IPS   = 2      36-bit PA
   - current process 2MB slot
   - shared FIFO + DMA windows
   - shared process IPC SHM pool (`0x04700000-0x047FFFFF`)
-  - peripheral MMIO windows required by current syscall ABI
+  - peripheral MMIO windows required by current kernel API ABI
 
 This blocks direct access to other process slots and other cores' private 16MB regions.
 

@@ -11,7 +11,7 @@
 
 typedef void (*func_ptr)(void);
 
-struct syscall_entry {
+struct api_entry {
     u32       name_hash;
     func_ptr  addr;
 };
@@ -25,7 +25,7 @@ extern void *memset(void *dst, int c, usize n);
 extern void *memcpy(void *dst, const void *src, usize n);
 extern u32  hw_crc32c(const void *data, u32 len);
 
-/* Pre-computed CRC32C hashes of syscall name strings.
+/* Pre-computed CRC32C hashes of kernel API symbol name strings.
  * Generated offline via: hw_crc32c("uart_puts", 9) etc. */
 #define HASH_UART_PUTS      0x5B1F29D3
 #define HASH_WALFS_READ     0xA43E7C10
@@ -34,7 +34,7 @@ extern u32  hw_crc32c(const void *data, u32 len);
 #define HASH_MEMCPY         0x2F5A4B19
 #define HASH_HW_CRC32C      0x84D1F206
 
-static const struct syscall_entry syscall_table_builtin[] = {
+static const struct api_entry kernel_api_table_builtin[] = {
     { HASH_UART_PUTS,    (func_ptr)uart_puts    },
     { HASH_WALFS_READ,   (func_ptr)walfs_read   },
     { HASH_WALFS_WRITE,  (func_ptr)walfs_write  },
@@ -114,14 +114,14 @@ static func_ptr resolve_import(u32 name_hash, void *user_table)
 {
     /* Check user-provided table first (if any) */
     if (user_table) {
-        const struct syscall_entry *e = (const struct syscall_entry *)user_table;
+        const struct api_entry *e = (const struct api_entry *)user_table;
         for (; e->addr; e++) {
             if (e->name_hash == name_hash)
                 return e->addr;
         }
     }
     /* Fall back to built-in table */
-    const struct syscall_entry *e = syscall_table_builtin;
+    const struct api_entry *e = kernel_api_table_builtin;
     for (; e->addr; e++) {
         if (e->name_hash == name_hash)
             return e->addr;
@@ -130,7 +130,7 @@ static func_ptr resolve_import(u32 name_hash, void *user_table)
 }
 
 static bool resolve_imports(u8 *base, const u8 *file,
-                            const struct pxe_header *hdr, void *syscall_tbl)
+                            const struct pxe_header *hdr, void *kernel_api_tbl)
 {
     const struct pxe_import *imports =
         (const struct pxe_import *)(file + hdr->import_offset);
@@ -139,7 +139,7 @@ static bool resolve_imports(u8 *base, const u8 *file,
         return false;
 
     for (u32 i = 0; i < hdr->import_count; i++) {
-        func_ptr fn = resolve_import(imports[i].name_hash, syscall_tbl);
+        func_ptr fn = resolve_import(imports[i].name_hash, kernel_api_tbl);
         if (!fn) {
             uart_puts("pxe: unresolved import\n");
             return false;
@@ -159,7 +159,7 @@ static bool resolve_imports(u8 *base, const u8 *file,
 /* ---- PXE loader ---- */
 
 u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
-             void *syscall_table)
+             void *kernel_api_table)
 {
     if (!file || !base || slot_size == 0)
         return 0;
@@ -231,7 +231,7 @@ u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
 
     /* Resolve imports */
     if (hdr->import_count) {
-        if (!resolve_imports(base, file, hdr, syscall_table))
+        if (!resolve_imports(base, file, hdr, kernel_api_table))
             return 0;
     }
 

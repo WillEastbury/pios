@@ -990,65 +990,117 @@ void walfs_handle_fifo(u32 from_core)
     case MSG_FS_CREATE:
     case MSG_FS_MKDIR: {
         if (!principal_has_cap(pid, PRINCIPAL_DISK)) {
-            reply.type = MSG_FS_ERROR; break;
+            reply.type = MSG_FS_ERROR;
+            reply.status = 1;
+            break;
         }
-        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
+        if (!msg.buffer) {
+            reply.type = MSG_FS_ERROR;
+            reply.status = 1;
+            break;
+        }
         u32 flags = (msg.type == MSG_FS_MKDIR) ? WALFS_DIR : WALFS_FILE;
-        u64 id = walfs_create(msg.tag, (const char *)(usize)msg.buffer,
-                              flags, msg.param);
+        u32 mode = (u32)(msg.tag & 0xFFFFFFFFU);
+        u64 id = walfs_create((u64)msg.param, (const char *)(usize)msg.buffer, flags, mode);
         reply.type = id ? MSG_FS_DONE : MSG_FS_ERROR;
-        reply.tag  = id;
+        reply.status = id ? 0 : 1;
+        reply.param = (u32)id;
+        reply.tag = id;
         break;
     }
     case MSG_FS_WRITE: {
         if (!principal_has_cap(pid, PRINCIPAL_DISK)) {
-            reply.type = MSG_FS_ERROR; break;
+            reply.type = MSG_FS_ERROR;
+            reply.status = 1;
+            break;
         }
-        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
-        bool ok = walfs_write(msg.tag, (u64)msg.param,
+        if (!msg.buffer || msg.param == 0) {
+            reply.type = MSG_FS_ERROR;
+            reply.status = 1;
+            break;
+        }
+        bool ok = walfs_write((u64)msg.param, msg.tag,
                               (const void *)(usize)msg.buffer, msg.length);
         reply.type = ok ? MSG_FS_DONE : MSG_FS_ERROR;
+        reply.status = ok ? 0 : 1;
+        reply.length = ok ? msg.length : 0;
         break;
     }
     case MSG_FS_READ: {
-        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
-        u32 n = walfs_read(msg.tag, (u64)msg.param,
+        if (!msg.buffer || msg.param == 0) {
+            reply.type = MSG_FS_ERROR;
+            reply.status = 1;
+            break;
+        }
+        u32 n = walfs_read((u64)msg.param, msg.tag,
                            (void *)(usize)msg.buffer, msg.length);
         reply.type   = MSG_FS_DONE;
+        reply.status = 0;
         reply.length = n;
         break;
     }
     case MSG_FS_DELETE: {
         if (!principal_has_cap(pid, PRINCIPAL_DISK)) {
-            reply.type = MSG_FS_ERROR; break;
+            reply.type = MSG_FS_ERROR;
+            reply.status = 1;
+            break;
         }
-        bool ok = walfs_delete(msg.tag);
+        u64 inode_id = msg.tag;
+        if (msg.buffer)
+            inode_id = walfs_find((const char *)(usize)msg.buffer);
+        bool ok = inode_id && walfs_delete(inode_id);
         reply.type = ok ? MSG_FS_DONE : MSG_FS_ERROR;
+        reply.status = ok ? 0 : 1;
         break;
     }
     case MSG_FS_STAT: {
-        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
-        bool ok = walfs_stat(msg.tag,
-                             (struct walfs_inode *)(usize)msg.buffer);
+        bool ok = false;
+        if (msg.buffer && msg.length == sizeof(struct walfs_inode)) {
+            ok = walfs_stat(msg.tag, (struct walfs_inode *)(usize)msg.buffer);
+        } else if (msg.buffer && msg.tag) {
+            u64 inode_id = walfs_find((const char *)(usize)msg.buffer);
+            if (inode_id)
+                ok = walfs_stat(inode_id, (struct walfs_inode *)(usize)msg.tag);
+        }
         reply.type = ok ? MSG_FS_DONE : MSG_FS_ERROR;
+        reply.status = ok ? 0 : 1;
         break;
     }
     case MSG_FS_FIND: {
-        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
+        if (!msg.buffer) {
+            reply.type = MSG_FS_ERROR;
+            reply.status = 1;
+            break;
+        }
         u64 id = walfs_find((const char *)(usize)msg.buffer);
         reply.type = id ? MSG_FS_DONE : MSG_FS_ERROR;
-        reply.tag  = id;
+        reply.status = id ? 0 : 1;
+        reply.param = (u32)id;
+        reply.tag = id;
+        break;
+    }
+    case MSG_FS_SYNC: {
+        if (!principal_has_cap(pid, PRINCIPAL_DISK)) {
+            reply.type = MSG_FS_ERROR;
+            reply.status = 1;
+            break;
+        }
+        walfs_sync();
+        reply.type = MSG_FS_DONE;
+        reply.status = 0;
         break;
     }
     case MSG_FS_READDIR:
         /* msg.buffer is a user-space data buffer, NOT a function pointer.
          * We cannot call it as a callback. Instead, do nothing — readdir
-         * from userland should use the proc.c syscall path which handles
+         * from userland should use the proc.c kernel API path which handles
          * serialization safely via FIFO reply messages. */
         reply.type = MSG_FS_ERROR;
+        reply.status = 1;
         break;
     default:
         reply.type = MSG_FS_ERROR;
+        reply.status = 1;
         break;
     }
 

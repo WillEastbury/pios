@@ -265,7 +265,7 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
     for (u64 pa = SHARED_FIFO_BASE; pa < IPC_SHM_BASE + IPC_SHM_SIZE; pa += L2_BLOCK_SIZE)
         map_user_low_2m(l2, (u32)(pa / L2_BLOCK_SIZE), pa, ram_attrs);
 
-    /* Keep peripheral MMIO mapped for current direct-call syscall ABI. */
+    /* Keep peripheral MMIO mapped for current direct-call kernel API ABI. */
     for (u32 idx = 4; idx < 8; idx++)
         l1[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
     for (u32 idx = 124; idx < 128; idx++)

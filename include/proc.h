@@ -11,6 +11,13 @@
 #include "pipe.h"
 struct irq_frame;
 
+struct paged_io_stat {
+    u64 inode_id;
+    u64 file_size;
+    u32 page_size;
+    u32 flags;
+} PACKED;
+
 #define MAX_PROCS_PER_CORE  6
 #define PROC_SLOT_SIZE      (2 * 1024 * 1024)   /* 2MB per process */
 #define PROC_SLOT_OFFSET    0x100000             /* slots start 1MB into core RAM */
@@ -40,10 +47,10 @@ struct process {
     u32 preemptions;
 };
 
-/* Syscall table passed to processes in x0 at entry.
+/* Kernel Program Interface (KPI) table passed to processes in x0 at entry.
  * This is the COMPLETE userland API surface.
  * All pointers passed by userland are bounds-checked. */
-struct syscall_table {
+struct kernel_api {
     /* ---- Process control ---- */
     i32 (*yield)(void);
     i32 (*exit)(u32 code);
@@ -72,6 +79,12 @@ struct syscall_table {
     i32 (*mkdir)(const char *path);
     i32 (*unlink)(const char *path);
     i32 (*readdir)(const char *path, void *entries, u32 max_entries); /* list directory */
+    i32 (*page_open)(const char *path, u32 page_size, u32 flags);
+    i32 (*page_read)(i32 page_id, u64 page_idx, void *out_page, u32 out_len);
+    i32 (*page_write)(i32 page_id, u64 page_idx, const void *in_page, u32 in_len);
+    i32 (*page_flush)(i32 page_id);
+    i32 (*page_stat)(i32 page_id, struct paged_io_stat *out);
+    i32 (*page_close)(i32 page_id);
 
     /* ---- Framebuffer ---- */
     void (*fb_putc)(char c);
