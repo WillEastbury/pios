@@ -34,8 +34,8 @@
  * while the QPU dispatch infrastructure is ready and waiting.
  */
 
-/* Placeholder: the actual QPU shader dispatch works but we
- * run the math on ARM/NEON until VC VII ISA is fully mapped. */
+/* Kernel dispatch is enabled only when V3D kernel descriptors are bound.
+ * Until then, operations run on ARM/NEON. */
 static bool use_qpu_fallback = true;
 
 static inline u32 f32_bits(float f)
@@ -56,8 +56,21 @@ static bool tensor_try_v3d(v3d_kernel_id_t id)
 {
     if (!v3d_dispatch_supported())
         return false;
+    const struct v3d_kernel_desc *k = v3d_kernel_desc_get(id);
+    if (!k || !k->ready || k->control_list_bus == 0 || k->qpu_count == 0)
+        return false;
     v3d_status_t r = v3d_dispatch_kernel(id, 25);
     return r == V3D_STATUS_OK;
+}
+
+static bool tensor_any_bound_v3d_kernel(void)
+{
+    for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
+        const struct v3d_kernel_desc *k = v3d_kernel_desc_get((v3d_kernel_id_t)i);
+        if (k && k->ready && k->control_list_bus != 0 && k->qpu_count != 0)
+            return true;
+    }
+    return false;
 }
 
 /* ---- Tensor lifecycle ---- */
@@ -516,5 +529,7 @@ void tensor_init(void) {
         uart_puts("[tensor] QPU enable failed, using NEON fallback\n");
         use_qpu_fallback = true;
     }
+    if (!tensor_any_bound_v3d_kernel())
+        use_qpu_fallback = true;
     uart_puts("[tensor] NEON float: add/mul/scale/dot/matmul/relu/softmax\n");
 }
