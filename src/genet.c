@@ -82,6 +82,11 @@
 #define DESC_CRC            (1 << 6)
 #define DESC_TX_DO_CSUM     (1 << 4)
 #define DESC_LEN_SHIFT      16
+/* RX status64 checksum/protocol interpretation */
+#define RXSTS_CSUM_OK       (1U << 16)
+#define RXSTS_PROTO_SHIFT   18
+#define RXSTS_PROTO_MASK    0x3U
+#define RXSTS_PROTO_TCP     0U
 
 /* MDIO */
 #define MDIO_START_BUSY     (1 << 29)
@@ -431,10 +436,14 @@ bool genet_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
 
     if (checksum_trusted) {
         /*
-         * RX checksum trust is granted only when checksum assist is enabled
-         * and GENET reports a non-zero accumulated receive checksum.
+         * Trust only when checksum offload is enabled and hardware explicitly
+         * marks the packet checksum OK for TCP.
          */
-        *checksum_trusted = rx_csum_offload && ((st->rx_csum & 0xFFFFU) != 0U);
+        u32 csum_status = st->rx_csum;
+        u32 proto = (csum_status >> RXSTS_PROTO_SHIFT) & RXSTS_PROTO_MASK;
+        *checksum_trusted = rx_csum_offload &&
+                            ((csum_status & RXSTS_CSUM_OK) != 0U) &&
+                            (proto == RXSTS_PROTO_TCP);
     }
 
     /* NEON copy from DMA buffer */
