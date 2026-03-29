@@ -85,6 +85,26 @@ static bool parse_path(const char *path, u32 *domain_out, const char **name_out,
     return true;
 }
 
+static bool build_backend_name(u32 domain, const char *name, u8 out[IPC_NAME_MAX + 1])
+{
+    const char *prefix = "";
+    if (domain == PIPE_DOMAIN_NET) prefix = "net.";
+    else if (domain == PIPE_DOMAIN_FS) prefix = "fs.";
+    else if (domain == PIPE_DOMAIN_HW) prefix = "hw.";
+
+    u32 pi = 0;
+    while (prefix[pi]) pi++;
+    u32 ni = 0;
+    while (name[ni]) ni++;
+    if (pi + ni > IPC_NAME_MAX) return false;
+
+    u32 o = 0;
+    for (u32 i = 0; i < pi; i++) out[o++] = (u8)prefix[i];
+    for (u32 i = 0; i < ni; i++) out[o++] = (u8)name[i];
+    out[o] = 0;
+    return true;
+}
+
 static struct pipe_obj *pipe_from_id(i32 pipe_id)
 {
     if (pipe_id < 0 || pipe_id >= PIPE_MAX_OBJECTS) return NULL;
@@ -163,14 +183,15 @@ i32 pipe_create(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
     if (type != PIPE_SLOT && type != PIPE_STREAM) return IPC_ERR_INVAL;
     if (pipe_find(path, type) >= 0) return IPC_ERR_EXISTS;
 
-    if (domain != PIPE_DOMAIN_IPC)
-        return IPC_ERR_UNSUPPORTED; /* /net, /fs, /hw adapters are not shipped yet. */
-
     i32 slot = pipe_alloc_slot();
     if (slot < 0) return slot;
 
+    u8 backend_name[IPC_NAME_MAX + 1];
+    if (!build_backend_name(domain, name, backend_name))
+        return IPC_ERR_TOOLONG;
+
     i32 stream_sub = -1;
-    i32 backend = backend_create_ipc(name, type, depth, flags, frame_max, &stream_sub);
+    i32 backend = backend_create_ipc((const char *)backend_name, type, depth, flags, frame_max, &stream_sub);
     if (backend < 0) return backend;
 
     struct pipe_obj *p = &g_pipes[slot];
@@ -202,17 +223,18 @@ i32 pipe_open(const char *path, u32 type)
         return existing;
     }
 
-    if (domain != PIPE_DOMAIN_IPC)
-        return IPC_ERR_UNSUPPORTED; /* /net, /fs, /hw adapters are explicit stubs for milestone 1. */
-
     if (type == PIPE_TYPE_ANY)
         return IPC_ERR_INVAL;
 
     i32 slot = pipe_alloc_slot();
     if (slot < 0) return slot;
 
+    u8 backend_name[IPC_NAME_MAX + 1];
+    if (!build_backend_name(domain, name, backend_name))
+        return IPC_ERR_TOOLONG;
+
     i32 stream_sub = -1;
-    i32 backend = backend_open_ipc(name, type, &stream_sub);
+    i32 backend = backend_open_ipc((const char *)backend_name, type, &stream_sub);
     if (backend < 0) return backend;
 
     struct pipe_obj *p = &g_pipes[slot];

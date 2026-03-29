@@ -1152,29 +1152,43 @@ static i32 sys_topic_read(i32 sub_id, void *out, u32 out_max)
     return (i32)len;
 }
 
-/* ---- Unified pipes (/ipc functional, net/fs/hw explicit stubs) ---- */
+/* ---- Unified pipes ---- */
 
-static bool path_is_ipc(const char *path)
+static u32 pipe_path_domain(const char *path)
 {
-    return path &&
-           path[0] == '/' &&
-           path[1] == 'i' &&
-           path[2] == 'p' &&
-           path[3] == 'c' &&
-           path[4] == '/';
+    if (!path || path[0] != '/') return 0;
+    if (path[1] == 'i' && path[2] == 'p' && path[3] == 'c' && path[4] == '/')
+        return PIPE_DOMAIN_IPC;
+    if (path[1] == 'n' && path[2] == 'e' && path[3] == 't' && path[4] == '/')
+        return PIPE_DOMAIN_NET;
+    if (path[1] == 'f' && path[2] == 's' && path[3] == '/')
+        return PIPE_DOMAIN_FS;
+    if (path[1] == 'h' && path[2] == 'w' && path[3] == '/')
+        return PIPE_DOMAIN_HW;
+    return 0;
+}
+
+static bool pipe_path_allowed(const char *path)
+{
+    u32 d = pipe_path_domain(path);
+    if (d == PIPE_DOMAIN_IPC) return has_ipc_cap();
+    if (d == PIPE_DOMAIN_NET) return has_net_cap();
+    if (d == PIPE_DOMAIN_FS) return has_disk_cap();
+    if (d == PIPE_DOMAIN_HW) return has_cap(PRINCIPAL_ADMIN);
+    return false;
 }
 
 static i32 sys_pipe_create(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
 {
     if (!ptr_valid_cstr(path, PIPE_PATH_MAX + 1)) return -1;
-    if (path_is_ipc(path) && !has_ipc_cap()) return -1;
+    if (!pipe_path_allowed(path)) return -1;
     return pipe_create(path, type, depth, flags, frame_max);
 }
 
 static i32 sys_pipe_open(const char *path, u32 type)
 {
     if (!ptr_valid_cstr(path, PIPE_PATH_MAX + 1)) return -1;
-    if (path_is_ipc(path) && !has_ipc_cap()) return -1;
+    if (!pipe_path_allowed(path)) return -1;
     return pipe_open(path, type);
 }
 
