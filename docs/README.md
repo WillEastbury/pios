@@ -9,6 +9,7 @@
 | [networking.md](networking.md) | Network stack design, security model, packet flow |
 | [ipc.md](ipc.md) | Inter-core FIFO messaging protocol and message types |
 | [api.md](api.md) | Full kernel API surface: userland syscall ABI + kernel subsystem APIs |
+| [primitives.md](primitives.md) | First-class kernel primitives model and target contract |
 | [mmu.md](mmu.md) | MMU configuration, page tables, cache management |
 | [tensor.md](tensor.md) | NEON/QPU tensor compute, SIMD operations |
 | [serial.md](serial.md) | Serial console setup — adapter pinout, wiring, terminal settings |
