@@ -14,6 +14,7 @@
 #include "simd.h"
 #include "uart.h"
 #include "timer.h"
+#include "lru.h"
 
 /* ---- DNS wire format constants ---- */
 
@@ -36,18 +37,9 @@
 #define MAX_RETRIES     3
 #define SRC_PORT_BASE   49152
 
-/* ---- Cache ---- */
+/* ---- Cache (LRU with TTL) ---- */
 
-#define CACHE_SIZE      16
-
-struct dns_cache_entry {
-    u32 hash;
-    u32 ip;
-    u64 expires;    /* timer_ticks() value */
-    bool valid;
-};
-
-static struct dns_cache_entry cache[CACHE_SIZE];
+static struct lru_cache dns_cache;
 static u32 dns_server;
 static u16 txid_counter;
 
@@ -219,32 +211,17 @@ static void dns_udp_handler(u32 src_ip, u16 src_port, u16 dst_port,
     parse_response(data, len);
 }
 
-/* ---- Cache operations ---- */
+/* ---- Cache operations (via LRU) ---- */
 
-static struct dns_cache_entry *cache_lookup(u32 hash) {
-    for (u32 i = 0; i < CACHE_SIZE; i++)
-        if (cache[i].valid && cache[i].hash == hash && timer_ticks() < cache[i].expires)
-            return &cache[i];
-    return NULL;
+static u32 *cache_lookup(u32 hash) {
+    struct lru_entry *e = lru_get(&dns_cache, (const u8 *)&hash, sizeof(hash));
+    if (!e) return NULL;
+    return (u32 *)e->value;
 }
 
 static void cache_insert(u32 hash, u32 ip, u32 ttl_sec) {
-    /* Find free or LRU slot */
-    struct dns_cache_entry *slot = NULL;
-    u64 oldest = ~0ULL;
-    for (u32 i = 0; i < CACHE_SIZE; i++) {
-        if (!cache[i].valid) { slot = &cache[i]; break; }
-        if (cache[i].expires < oldest) {
-            oldest = cache[i].expires;
-            slot = &cache[i];
-        }
-    }
-    if (slot) {
-        slot->hash = hash;
-        slot->ip = ip;
-        slot->expires = timer_ticks() + (u64)ttl_sec * 1000;
-        slot->valid = true;
-    }
+    (void)ttl_sec; /* TTL handled by LRU cache-wide ttl_ms */
+    lru_put(&dns_cache, (const u8 *)&hash, sizeof(hash), &ip, sizeof(ip));
 }
 
 /* ---- Public API ---- */
@@ -252,15 +229,14 @@ static void cache_insert(u32 hash, u32 ip, u32 ttl_sec) {
 void dns_init(u32 server_ip) {
     dns_server = server_ip;
     txid_counter = 0;
-    dns_cache_flush();
+    lru_init(&dns_cache, NULL, 60000); /* 60s TTL */
     uart_puts("[dns] Server: ");
     uart_hex(server_ip);
     uart_puts("\n");
 }
 
 void dns_cache_flush(void) {
-    for (u32 i = 0; i < CACHE_SIZE; i++)
-        cache[i].valid = false;
+    lru_flush(&dns_cache);
 }
 
 bool dns_resolve(const char *hostname, u32 *ip_out) {
@@ -268,9 +244,9 @@ bool dns_resolve(const char *hostname, u32 *ip_out) {
 
     /* Check cache */
     u32 hash = str_hash(hostname);
-    struct dns_cache_entry *ce = cache_lookup(hash);
-    if (ce) {
-        *ip_out = ce->ip;
+    u32 *cached_ip = cache_lookup(hash);
+    if (cached_ip) {
+        *ip_out = *cached_ip;
         return true;
     }
 

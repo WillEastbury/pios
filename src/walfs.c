@@ -17,6 +17,7 @@
 #include "timer.h"
 #include "fifo.h"
 #include "core.h"
+#include "lru.h"
 
 #define WAL_START  SD_BLOCK_SIZE
 #define WAL_REC_MIN  sizeof(struct wal_record)
@@ -38,6 +39,51 @@ static u8 ALIGNED(64) iobuf[SD_BLOCK_SIZE];
 static u8 ALIGNED(64) rec_buf[sizeof(struct wal_record) +
                                sizeof(struct walfs_data) + WALFS_DATA_MAX];
 static u32 cached_lba = 0xFFFFFFFF;
+
+/*
+ * Inode cache: inode_id → latest WAL byte offset of its RECORD_INODE.
+ * Avoids full WAL scan on walfs_stat() and is_deleted().
+ * Populated during scan_recovery() at mount and on every write.
+ */
+static struct lru_cache inode_cache;
+
+/*
+ * Path cache: hash(path) → inode_id.
+ * Avoids repeated WAL scans for walfs_find().
+ */
+static struct lru_cache path_cache;
+
+/* Cache helpers */
+static void icache_put(u64 inode_id, u64 wal_offset) {
+    lru_put(&inode_cache, (const u8 *)&inode_id, sizeof(inode_id),
+            &wal_offset, sizeof(wal_offset));
+}
+
+static bool icache_get(u64 inode_id, u64 *wal_offset) {
+    struct lru_entry *e = lru_get(&inode_cache, (const u8 *)&inode_id, sizeof(inode_id));
+    if (!e) return false;
+    *wal_offset = *(u64 *)e->value;
+    return true;
+}
+
+static u32 path_hash(const char *path) {
+    u32 h = 5381;
+    while (*path) h = ((h << 5) + h) + (u8)*path++;
+    return h;
+}
+
+static void pcache_put(const char *path, u64 inode_id) {
+    u32 h = path_hash(path);
+    lru_put(&path_cache, (const u8 *)&h, sizeof(h), &inode_id, sizeof(inode_id));
+}
+
+static bool pcache_get(const char *path, u64 *inode_id) {
+    u32 h = path_hash(path);
+    struct lru_entry *e = lru_get(&path_cache, (const u8 *)&h, sizeof(h));
+    if (!e) return false;
+    *inode_id = *(u64 *)e->value;
+    return true;
+}
 
 static inline u64 read_cntvct(void)
 {
@@ -255,6 +301,8 @@ bool walfs_init(void)
 {
     mounted = false;
     cached_lba = 0xFFFFFFFF;
+    lru_init(&inode_cache, NULL, 0);  /* no TTL — invalidated on write */
+    lru_init(&path_cache, NULL, 30000); /* 30s TTL for path lookups */
 
     if (!bcache_read(0, (u8 *)&super)) return false;
 
@@ -407,6 +455,10 @@ bool walfs_delete(u64 inode_id)
     if (!wal_append(RECORD_DELETE, &del, sizeof(del), NULL, 0))
         return false;
 
+    /* Invalidate caches */
+    lru_remove(&inode_cache, (const u8 *)&inode_id, sizeof(inode_id));
+    lru_flush(&path_cache); /* conservative — could be smarter */
+
     write_super();
     return true;
 }
@@ -446,6 +498,11 @@ u64 walfs_find(const char *path)
     if (!mounted || !path || path[0] != '/') return 0;
     if (path[1] == '\0') return WALFS_ROOT_INODE;
 
+    /* Fast path: check path cache */
+    u64 cached_id;
+    if (pcache_get(path, &cached_id) && cached_id != 0)
+        return cached_id;
+
     u64 cur = WALFS_ROOT_INODE;
     const char *p = path + 1;
 
@@ -475,6 +532,9 @@ u64 walfs_find(const char *path)
         if (!found || is_deleted(found)) return 0;
         cur = found;
     }
+
+    /* Cache the result */
+    pcache_put(path, cur);
     return cur;
 }
 

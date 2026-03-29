@@ -24,6 +24,7 @@
 #include "simd.h"
 #include "uart.h"
 #include "timer.h"
+#include "lru.h"
 
 /* ---- ARP opcodes ---- */
 
@@ -74,6 +75,9 @@ static u32 my_ip, my_mask;
 static u8  my_mac[6];
 static arp_stats_t arp_stats;
 
+/* LRU index: IP → table index for O(1) lookup */
+static struct lru_cache arp_index;
+
 static u64 last_reply_time;   /* global reply rate limiter */
 
 static u8 arp_tx[60] ALIGNED(64);  /* min Ethernet frame */
@@ -115,12 +119,33 @@ static bool ip_valid_sender(u32 ip) {
     return true;
 }
 
-/* ---- Table operations ---- */
+/* ---- Table operations (LRU-accelerated) ---- */
+
+static void arp_index_update(u32 ip, u32 table_idx) {
+    lru_put(&arp_index, (const u8 *)&ip, sizeof(ip), &table_idx, sizeof(table_idx));
+}
+
+static void arp_index_remove(u32 ip) {
+    lru_remove(&arp_index, (const u8 *)&ip, sizeof(ip));
+}
 
 static struct arp_entry *find_entry(u32 ip) {
-    for (u32 i = 0; i < ARP_TABLE_SIZE; i++)
-        if (table[i].state != ARP_FREE && table[i].ip == ip)
+    /* Fast path: LRU index lookup */
+    struct lru_entry *le = lru_get(&arp_index, (const u8 *)&ip, sizeof(ip));
+    if (le) {
+        u32 idx = *(u32 *)le->value;
+        if (idx < ARP_TABLE_SIZE && table[idx].state != ARP_FREE && table[idx].ip == ip)
+            return &table[idx];
+        /* Stale index entry — remove and fall through */
+        arp_index_remove(ip);
+    }
+    /* Slow path: linear scan (shouldn't happen often) */
+    for (u32 i = 0; i < ARP_TABLE_SIZE; i++) {
+        if (table[i].state != ARP_FREE && table[i].ip == ip) {
+            arp_index_update(ip, i);
             return &table[i];
+        }
+    }
     return NULL;
 }
 
@@ -192,6 +217,7 @@ void arp_init(u32 ip, u32 mask, const u8 *mac) {
     for (u32 i = 0; i < ARP_TABLE_SIZE; i++)
         table[i].state = ARP_FREE;
     simd_zero(&arp_stats, sizeof(arp_stats));
+    lru_init(&arp_index, NULL, 0); /* no TTL — managed by arp_tick */
     last_reply_time = 0;
 }
 
@@ -206,6 +232,7 @@ void arp_add_static(u32 ip, const u8 *mac) {
     e->state = ARP_STATIC;
     e->timestamp = now_ms();
     e->retries = 0;
+    arp_index_update(ip, (u32)(e - table));
 }
 
 const u8 *arp_resolve(u32 ip) {
