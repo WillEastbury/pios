@@ -18,6 +18,7 @@
 #include "fifo.h"
 #include "core.h"
 #include "lru.h"
+#include "principal.h"
 
 #define WAL_START  SD_BLOCK_SIZE
 #define WAL_REC_MIN  sizeof(struct wal_record)
@@ -171,11 +172,20 @@ static bool wal_write(u64 off, const void *buf, u32 len)
 
 static void write_super(void)
 {
+    /* CRITICAL: flush WAL data blocks to SD BEFORE updating superblock.
+     * This ensures wal_head never points past actually-written data.
+     * Without this ordering, power loss after superblock write but before
+     * WAL data write causes unrecoverable data loss. */
+    bcache_flush();
+
     super.crc32 = 0;
     super.crc32 = hw_crc32c(&super, SD_BLOCK_SIZE);
     cached_lba = 0xFFFFFFFF;
-    bcache_write(0, (const u8 *)&super);
-    bcache_flush();
+
+    /* Write superblock directly to SD, bypassing cache, to ensure
+     * it hits disk AFTER all WAL data blocks are persisted. */
+    sd_write_block(0, (const u8 *)&super);
+    bcache_invalidate(0); /* keep cache consistent */
 }
 
 /* ---- WAL append (two-part payload to avoid large stack buffers) ---- */
@@ -244,19 +254,46 @@ static void scan_recovery(void)
     next_inode = WALFS_ROOT_INODE + 1;
     next_seq = 0;
     u64 pos = WAL_START;
+    u64 last_valid_pos = WAL_START;
     struct wal_record hdr;
 
-    while (pos < super.wal_head) {
+    /* Scan from start, ignoring superblock's wal_head — trust the data,
+     * not the metadata. Stop at first record that fails CRC. */
+    while (pos + sizeof(hdr) <= super.wal_head + WAL_REC_MAX) {
         if (!wal_read(pos, &hdr, sizeof(hdr))) break;
         if (!wal_rec_valid(&hdr)) break;
+
+        /* CRC validation: read full record and verify */
+        if (hdr.length > sizeof(rec_buf)) break;
+        if (!wal_read(pos, rec_buf, hdr.length)) break;
+        u32 stored_crc = ((struct wal_record *)rec_buf)->crc32;
+        ((struct wal_record *)rec_buf)->crc32 = 0;
+        u32 calc_crc = hw_crc32c(rec_buf, hdr.length);
+        ((struct wal_record *)rec_buf)->crc32 = stored_crc;
+        if (calc_crc != stored_crc) break; /* corrupt record — stop */
+
         if (hdr.seq >= next_seq) next_seq = hdr.seq + 1;
         if (hdr.type == RECORD_INODE) {
-            struct walfs_inode ino;
-            if (wal_read(pos + sizeof(hdr), &ino, sizeof(ino)))
-                if (ino.inode_id >= next_inode)
-                    next_inode = ino.inode_id + 1;
+            struct walfs_inode *ino = (struct walfs_inode *)(rec_buf + sizeof(hdr));
+            if (ino->inode_id >= next_inode)
+                next_inode = ino->inode_id + 1;
+            /* Populate inode cache */
+            icache_put(ino->inode_id, pos);
         }
+        last_valid_pos = pos + hdr.length;
         pos += hdr.length;
+    }
+
+    /* Repair wal_head if it's inconsistent with actual data */
+    if (last_valid_pos != super.wal_head) {
+        uart_puts("[walfs] Repaired wal_head: ");
+        uart_hex((u32)(super.wal_head >> 32));
+        uart_hex((u32)super.wal_head);
+        uart_puts(" -> ");
+        uart_hex((u32)(last_valid_pos >> 32));
+        uart_hex((u32)last_valid_pos);
+        uart_puts("\n");
+        super.wal_head = last_valid_pos;
     }
 }
 
@@ -583,28 +620,36 @@ void walfs_handle_fifo(u32 from_core)
     memset(&reply, 0, sizeof(reply));
     reply.tag = msg.tag;
 
+    /* Permission checks: derive principal from requesting core.
+     * Core 2 = CORE_USER0 (principal slot 0), Core 3 = CORE_USER1 (slot 1). */
+    u32 pid = principal_current_for(from_core);
+
     switch (msg.type) {
-    case MSG_FS_CREATE: {
-        u64 id = walfs_create(msg.tag, (const char *)(usize)msg.buffer,
-                              WALFS_FILE, msg.param);
-        reply.type = id ? MSG_FS_DONE : MSG_FS_ERROR;
-        reply.tag  = id;
-        break;
-    }
+    case MSG_FS_CREATE:
     case MSG_FS_MKDIR: {
+        if (!principal_has_cap(pid, PRINCIPAL_DISK)) {
+            reply.type = MSG_FS_ERROR; break;
+        }
+        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
+        u32 flags = (msg.type == MSG_FS_MKDIR) ? WALFS_DIR : WALFS_FILE;
         u64 id = walfs_create(msg.tag, (const char *)(usize)msg.buffer,
-                              WALFS_DIR, msg.param);
+                              flags, msg.param);
         reply.type = id ? MSG_FS_DONE : MSG_FS_ERROR;
         reply.tag  = id;
         break;
     }
     case MSG_FS_WRITE: {
+        if (!principal_has_cap(pid, PRINCIPAL_DISK)) {
+            reply.type = MSG_FS_ERROR; break;
+        }
+        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
         bool ok = walfs_write(msg.tag, (u64)msg.param,
                               (const void *)(usize)msg.buffer, msg.length);
         reply.type = ok ? MSG_FS_DONE : MSG_FS_ERROR;
         break;
     }
     case MSG_FS_READ: {
+        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
         u32 n = walfs_read(msg.tag, (u64)msg.param,
                            (void *)(usize)msg.buffer, msg.length);
         reply.type   = MSG_FS_DONE;
@@ -612,23 +657,29 @@ void walfs_handle_fifo(u32 from_core)
         break;
     }
     case MSG_FS_DELETE: {
+        if (!principal_has_cap(pid, PRINCIPAL_DISK)) {
+            reply.type = MSG_FS_ERROR; break;
+        }
         bool ok = walfs_delete(msg.tag);
         reply.type = ok ? MSG_FS_DONE : MSG_FS_ERROR;
         break;
     }
     case MSG_FS_STAT: {
+        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
         bool ok = walfs_stat(msg.tag,
                              (struct walfs_inode *)(usize)msg.buffer);
         reply.type = ok ? MSG_FS_DONE : MSG_FS_ERROR;
         break;
     }
     case MSG_FS_FIND: {
+        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
         u64 id = walfs_find((const char *)(usize)msg.buffer);
         reply.type = id ? MSG_FS_DONE : MSG_FS_ERROR;
         reply.tag  = id;
         break;
     }
     case MSG_FS_READDIR:
+        if (!msg.buffer) { reply.type = MSG_FS_ERROR; break; }
         walfs_readdir(msg.tag, (walfs_readdir_cb)(usize)msg.buffer);
         reply.type = MSG_FS_DONE;
         break;
