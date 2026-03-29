@@ -36,9 +36,10 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 | **HDMI Boot Console** | 1280×720 framebuffer with 8×8 bitmap font, `fb_printf()`. |
 | **UART Serial I/O** | PL011 TX+RX at 115200 baud. Line editing with backspace. |
 | **Inter-Core FIFO** | 12 lock-free SPSC ring buffers (4×4 grid). 64-byte messages. |
+| **Unified Pipes** | `/ipc`, `/net`, `/fs`, `/hw` domains mapped through capability-gated pipe adapters. |
 | **NEON/SIMD** | Hardware-accelerated memcpy (64B/iter), IP checksum, CRC32C. |
 | **DMA Engine** | BCM2712 scatter-gather DMA. 6 channels. Frees CPU from bulk copies. |
-| **QPU Tensor Compute** | VideoCore VII GPU offload framework. NEON fallback for matmul/relu/softmax. |
+| **QPU Tensor Compute** | VideoCore VII dispatch framework with bound-kernel gating; NEON remains default fallback. |
 | **MMU** | Identity-mapped page tables. Cacheable RAM, device memory for MMIO. |
 | **GIC-400 Interrupts** | Full interrupt controller with timer IRQ support. |
 | **Preemptive User Scheduling** | Cores 2-3 run timer-driven quanta (default 5ms @ 1kHz) with safe deferred preemption. |

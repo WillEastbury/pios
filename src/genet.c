@@ -19,6 +19,15 @@
 /* RBUF control */
 #define RBUF_CTRL           0x0300
 #define RBUF_64B_EN         0x0308
+#define RBUF_CHK_CTRL       0x0314
+#define RBUF_TBUF_SIZE_CTRL 0x03B4
+#define RBUF_RXCHK_EN       (1 << 0)
+#define RBUF_SKIP_FCS       (1 << 4)
+#define RBUF_L3_PARSE_DIS   (1 << 5)
+
+/* TBUF control */
+#define TBUF_CTRL           0x0600
+#define TBUF_64B_EN         (1 << 0)
 
 /* UniMAC */
 #define UMAC_CMD            0x0808
@@ -71,6 +80,7 @@
 #define DESC_SOP            (1 << 13)
 #define DESC_WRAP           (1 << 12)
 #define DESC_CRC            (1 << 6)
+#define DESC_TX_DO_CSUM     (1 << 4)
 #define DESC_LEN_SHIFT      16
 
 /* MDIO */
@@ -117,6 +127,7 @@ static u32 tx_cons;
 static bool tx_csum_offload;
 static bool rx_csum_offload;
 static bool tso_enabled;
+static bool tso_warned;
 
 static u8 mac_addr[6] = { 0xDC, 0xA6, 0x32, 0x01, 0x02, 0x03 };
 
@@ -124,6 +135,24 @@ static u8 mac_addr[6] = { 0xDC, 0xA6, 0x32, 0x01, 0x02, 0x03 };
 
 static inline void gw(u32 off, u32 val) { mmio_write(GENET_BASE + off, val); }
 static inline u32  gr(u32 off)          { return mmio_read(GENET_BASE + off); }
+
+static void genet_apply_offloads(void)
+{
+    u32 rchk = gr(RBUF_CHK_CTRL);
+    if (rx_csum_offload) {
+        rchk |= (RBUF_RXCHK_EN | RBUF_L3_PARSE_DIS);
+        rchk &= ~RBUF_SKIP_FCS;
+    } else {
+        rchk &= ~(RBUF_RXCHK_EN | RBUF_L3_PARSE_DIS);
+    }
+    gw(RBUF_CHK_CTRL, rchk);
+
+    /*
+     * On GENET v3+, this register must be set for correct RX/TX status
+     * sizing when checksum metadata is enabled.
+     */
+    gw(RBUF_TBUF_SIZE_CTRL, tx_csum_offload ? 1U : 0U);
+}
 
 /* ---- MDIO / PHY ---- */
 
@@ -238,6 +267,7 @@ bool genet_init(void) {
     tx_csum_offload = false;
     rx_csum_offload = false;
     tso_enabled = false;
+    tso_warned = false;
 
     /* Software reset */
     gw(SYS_RBUF_FLUSH, 1);
@@ -260,6 +290,8 @@ bool genet_init(void) {
     /* Disable 64-byte receive status block */
     gw(RBUF_CTRL, gr(RBUF_CTRL) & ~(1 << 0));
     gw(RBUF_64B_EN, 0);
+    gw(TBUF_CTRL, gr(TBUF_CTRL) | TBUF_64B_EN);
+    genet_apply_offloads();
 
     /* Init PHY */
     if (!phy_init())
@@ -307,6 +339,8 @@ bool genet_send(const u8 *frame, u32 len) {
     /* Set descriptor */
     tx_ring[idx].length_status =
         (len << DESC_LEN_SHIFT) | DESC_SOP | DESC_EOP | DESC_CRC;
+    if (tx_csum_offload)
+        tx_ring[idx].length_status |= DESC_TX_DO_CSUM;
     if (idx == NUM_DESC - 1)
         tx_ring[idx].length_status |= DESC_WRAP;
     dsb();
@@ -356,18 +390,22 @@ bool genet_link_up(void) {
 }
 
 void genet_set_tx_checksum_offload(bool enable) {
-    /* TODO(issue #19): program GENET TX checksum offload registers when validated. */
     tx_csum_offload = enable;
+    genet_apply_offloads();
 }
 
 void genet_set_rx_checksum_offload(bool enable) {
-    /* TODO(issue #19): program GENET RX checksum offload registers when validated. */
     rx_csum_offload = enable;
+    genet_apply_offloads();
 }
 
 void genet_set_tso(bool enable) {
-    /* TODO(issue #19): program GENET TSO registers when descriptor format is finalized. */
-    tso_enabled = enable;
+    /* Descriptor-level segmentation is not implemented yet in this driver. */
+    tso_enabled = false;
+    if (enable && !tso_warned) {
+        uart_puts("[genet] TSO unsupported: keeping disabled\n");
+        tso_warned = true;
+    }
 }
 
 bool genet_tx_checksum_offload_enabled(void) {

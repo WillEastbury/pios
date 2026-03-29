@@ -51,6 +51,9 @@ Software reset → set MAC address → set max frame → disable RBUF status →
 | `genet_recv(frame, len)` | Check RX descriptor, copy frame out, return to DMA |
 | `genet_get_mac(mac)` | Return 6-byte MAC address |
 | `genet_link_up()` | Poll PHY BMSR link status bit |
+| `genet_set_tx_checksum_offload(enable)` | Toggle TX checksum offload (`DMA_TX_DO_CSUM` descriptor bit + GENET offload control) |
+| `genet_set_rx_checksum_offload(enable)` | Toggle RX checksum parser/check metadata path |
+| `genet_set_tso(enable)` | TSO is currently unsupported in this minimal driver and remains disabled |
 
 **Registers**: `GENET_BASE` = `0x107D580000`
 

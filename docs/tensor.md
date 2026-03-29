@@ -2,9 +2,9 @@
 
 ## Overview
 
-PIOS provides NEON-accelerated tensor operations with a QPU offload framework ready for when VideoCore VII ISA documentation matures.
+PIOS provides NEON-accelerated tensor operations with a V3D/QPU dispatch framework.
 
-Currently all operations run on the ARM Cortex-A76 using 128-bit NEON SIMD (4 floats per instruction, dual-issue capable).
+By default, operations run on the ARM Cortex-A76 using 128-bit NEON SIMD (4 floats per instruction, dual-issue capable). Tensor ops only attempt V3D dispatch when a kernel descriptor is bound and marked ready; otherwise they stay on deterministic NEON fallback paths.
 
 ## Available Operations
 
@@ -58,7 +58,7 @@ Lower-level NEON operations used throughout the kernel:
 | `simd_checksum(data, len)` | IP checksum via `uaddlp`/`uadalp` | 32 bytes/iteration |
 | `hw_crc32c(data, len)` | Hardware CRC32C | 8 bytes/cycle |
 
-## QPU Framework (future)
+## QPU Framework (experimental dispatch path)
 
 The QPU dispatch infrastructure is implemented and tested:
 
@@ -69,4 +69,4 @@ qpu_dispatch(&prog, jobs, num_qpus); // Submit to 1-12 QPUs
 qpu_free_program(&prog);
 ```
 
-VideoCore VII has 12 QPUs (3 slices × 4), each a 4-wide float SIMD unit at 800MHz. Peak theoretical: 76.8 GFLOPS. The QPU ISA is not fully documented for VC VII; when it is, tensor operations can be offloaded by replacing the NEON fallback paths in `tensor.c`.
+VideoCore VII has 12 QPUs (3 slices × 4), each a 4-wide float SIMD unit at 800MHz. Peak theoretical: 76.8 GFLOPS. The VC VII ISA is still incomplete publicly, so the production path remains NEON unless valid kernel blobs are explicitly bound in the V3D layer.
