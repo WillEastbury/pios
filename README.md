@@ -143,6 +143,35 @@ PIOS v0.2 booting...
 [kernel] All cores running.
 ```
 
+### First-Boot Setup Flow
+
+On first boot, PIOS checks for WALFS marker file `/etc/setup_done`.
+
+- If marker exists: setup is skipped.
+- If marker is missing: kernel runs first-boot setup before user cores launch.
+
+Setup reports readiness for:
+- network stack + PHY link
+- HDMI/framebuffer console
+- USB subsystem + keyboard presence
+
+Console behavior:
+- Uses framebuffer console when available.
+- Always mirrors to UART; if HDMI is unavailable, UART is the fallback path.
+- If no USB keyboard is present, setup stays non-interactive, prints next steps,
+  and continues boot safely.
+
+Credential hardening on first boot:
+- If root still uses the built-in default secret behavior, setup rotates root to a
+  one-time random token and prints it to console.
+- The default hardcoded password does not persist after setup.
+- Only password hashes are stored in WALFS (no plaintext password files).
+
+Setup completion is persisted only when minimum criteria are met:
+- console path available (HDMI or UART),
+- principal store initialized,
+- WALFS writable (marker write succeeds).
+
 ### Step 4: Configure Network
 
 Edit `src/kernel.c` and set your network parameters:

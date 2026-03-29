@@ -189,6 +189,29 @@ bool principal_create(const char *name, const char *pass, u32 flags)
     return flush_principals();
 }
 
+bool principal_set_password(const char *name, const char *pass)
+{
+    i32 idx = find_by_name(name);
+    if (idx < 0) return false;
+    if (!pass || pass[0] == '\0') return false;
+    hash_pass(pass, principals[idx].secret_hash);
+    return flush_principals();
+}
+
+bool principal_root_present(void)
+{
+    return find_by_name("root") >= 0;
+}
+
+bool principal_root_uses_default_secret(void)
+{
+    i32 idx = find_by_name("root");
+    if (idx < 0) return false;
+    u8 h[4];
+    hash_pass("pios", h);
+    return ct_eq(principals[idx].secret_hash, h, 4);
+}
+
 /*
  * Permission model: root (id 0) bypasses all checks.
  * Non-root principals are checked against the "other" permission

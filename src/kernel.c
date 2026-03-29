@@ -45,6 +45,7 @@
 #include "usb_kbd.h"
 #include "ipc_queue.h"
 #include "ipc_stream.h"
+#include "setup.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -235,6 +236,12 @@ static void boot_diag(void) {
 /* ---- Main kernel entry (runs on core 0) ---- */
 
 void kernel_main(void) {
+    bool usb_ok = false;
+    bool fb_ok = false;
+    bool sd_ok = false;
+    bool walfs_ok = false;
+    bool genet_ok = false;
+
     /* 1. Debug serial */
     uart_init();
     uart_puts("\n\nPIOS v0.3 booting...\n");
@@ -263,12 +270,13 @@ void kernel_main(void) {
             rp1_gpio_init();
             usb_storage_register();
             usb_kbd_register();
-            usb_init();
+            usb_ok = usb_init();
         }
     }
 
     /* 8. HDMI framebuffer (1280x720) */
     if (fb_init(1280, 720)) {
+        fb_ok = true;
         uart_puts("[fb] Framebuffer OK\n");
     } else {
         uart_puts("[fb] Framebuffer FAILED\n");
@@ -282,17 +290,20 @@ void kernel_main(void) {
     uart_puts("[ipc] In-memory IPC ready\n");
 
     /* 9. SD card - raw block access */
-    if (!sd_init())
+    sd_ok = sd_init();
+    if (!sd_ok)
         uart_puts("[sd] SD init FAILED (continuing)\n");
     else {
         bcache_init();
         bcache_pin(0);
-        walfs_init();
-        principal_init();
+        walfs_ok = walfs_init();
+        if (walfs_ok)
+            principal_init();
     }
 
     /* 10. Ethernet MAC */
-    if (!genet_init())
+    genet_ok = genet_init();
+    if (!genet_ok)
         uart_puts("[genet] GENET init FAILED (continuing)\n");
 
     /* 11. Network stack (static IP, static neighbor, NO ARP) */
@@ -306,6 +317,15 @@ void kernel_main(void) {
 
     /* Module system */
     module_init();
+
+    /* First-boot setup flow (before launching user cores) */
+    if (walfs_ok) {
+        setup_run(fb_ok, genet_ok, usb_ok);
+    } else if (sd_ok) {
+        uart_puts("[setup] skipped: WALFS unavailable\n");
+    } else {
+        uart_puts("[setup] skipped: storage unavailable\n");
+    }
 
     /* 13. Boot diagnostics on HDMI */
     boot_diag();
