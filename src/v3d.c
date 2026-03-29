@@ -22,6 +22,8 @@
 #define V3D_CSD_STATUS_BUSY_MASK (1U << 0)
 
 static struct v3d_caps g_v3d_caps;
+static bool g_mmio_auto_quarantined;
+static bool g_mmio_auto_warned;
 static struct v3d_kernel_desc g_kernels[V3D_KERNEL_MAX] = {
     { V3D_KERNEL_MATMUL, "matmul", 12, 0, false, false },
     { V3D_KERNEL_ADD,    "add",     4, 0, false, false },
@@ -91,6 +93,8 @@ void v3d_init(void)
     g_v3d_caps.ident0 = 0;
     g_v3d_caps.ident1 = 0;
     g_v3d_caps.ident2 = 0;
+    g_mmio_auto_quarantined = false;
+    g_mmio_auto_warned = false;
 
     if (qpu_enable(true)) {
         g_v3d_caps.mailbox_qpu = true;
@@ -215,9 +219,20 @@ v3d_status_t v3d_dispatch_compute(const struct v3d_dispatch_cfg *cfg)
     if (cfg->backend == V3D_BACKEND_MAILBOX)
         return v3d_dispatch_mailbox(cfg, timeout_ms);
 
-    v3d_status_t r = v3d_dispatch_mmio_csd(cfg, timeout_ms);
-    if (r == V3D_STATUS_OK)
-        return r;
+    v3d_status_t r = V3D_STATUS_UNSUPPORTED;
+    if (!g_mmio_auto_quarantined) {
+        r = v3d_dispatch_mmio_csd(cfg, timeout_ms);
+        if (r == V3D_STATUS_OK)
+            return r;
+        if ((r == V3D_STATUS_TIMEOUT || r == V3D_STATUS_FAILED) &&
+            g_v3d_caps.mailbox_qpu) {
+            g_mmio_auto_quarantined = true;
+            if (!g_mmio_auto_warned) {
+                uart_puts("[v3d] auto: quarantining MMIO CSD, using mailbox fallback\n");
+                g_mmio_auto_warned = true;
+            }
+        }
+    }
     return v3d_dispatch_mailbox(cfg, timeout_ms);
 }
 
