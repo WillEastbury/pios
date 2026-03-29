@@ -80,9 +80,17 @@ static u32 encode_qname(u8 *buf, const char *hostname) {
         while (*dot && *dot != '.') dot++;
         u32 label_len = (u32)(dot - p);
         if (label_len == 0 || label_len > 63) return 0;
+        if (p[0] == '-' || p[label_len - 1] == '-') return 0;
         buf[off++] = (u8)label_len;
-        for (u32 i = 0; i < label_len; i++)
-            buf[off++] = (u8)p[i];
+        for (u32 i = 0; i < label_len; i++) {
+            u8 c = (u8)p[i];
+            bool ok = ((c >= 'a' && c <= 'z') ||
+                       (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') ||
+                       c == '-');
+            if (!ok) return 0;
+            buf[off++] = c;
+        }
         p = (*dot == '.') ? dot + 1 : dot;
     }
     buf[off++] = 0; /* root label */
@@ -132,12 +140,17 @@ static u32 skip_name(const u8 *buf, u32 off, u32 len) {
     while (off < len && hops < 128) {
         u8 label = buf[off];
         if (label == 0) { off++; break; }
-        if ((label & 0xC0) == 0xC0) { off += 2; break; } /* pointer */
+        if ((label & 0xC0) == 0xC0) {
+            if (off + 1 >= len) return len; /* truncated pointer */
+            off += 2;
+            break;
+        }
         if (label & 0xC0) return len;   /* reserved label type — reject */
         if (off + 1 + label > len) return len; /* bounds check */
         off += 1 + label;
         hops++;
     }
+    if (hops >= 128) return len;
     return off;
 }
 
@@ -167,6 +180,7 @@ static void parse_response(const u8 *data, u16 len) {
     /* Skip question section */
     u32 off = DNS_HDR_SIZE;
     off = skip_name(data, off, len);
+    if (off + 4 > len) return;
     off += 4; /* QTYPE + QCLASS */
 
     /* Parse answers, find first A record */
