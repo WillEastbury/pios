@@ -47,7 +47,7 @@ Software reset → set MAC address → set max frame → disable RBUF status →
 | Function | Description |
 |----------|-------------|
 | `genet_init()` | Full MAC+PHY init |
-| `genet_send(frame, len)` | Copy frame to TX DMA buffer, advance producer index |
+| `genet_send(frame, len)` | Copy frame to TX DMA buffer, hardware-consumer-aware producer advance with bounded TX ring backpressure |
 | `genet_recv(frame, len)` | Check RX descriptor, copy frame out, return to DMA |
 | `genet_get_mac(mac)` | Return 6-byte MAC address |
 | `genet_link_up()` | Poll PHY BMSR link status bit |

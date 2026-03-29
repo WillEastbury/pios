@@ -136,6 +136,17 @@ static u8 mac_addr[6] = { 0xDC, 0xA6, 0x32, 0x01, 0x02, 0x03 };
 static inline void gw(u32 off, u32 val) { mmio_write(GENET_BASE + off, val); }
 static inline u32  gr(u32 off)          { return mmio_read(GENET_BASE + off); }
 
+static bool genet_tx_slot_available(void)
+{
+    /*
+     * Producer/consumer are 16-bit hardware-visible indices.
+     * Keep one descriptor free to distinguish full vs empty.
+     */
+    tx_cons = gr(TDMA_RING16 + DMA_CONS_INDEX) & 0xFFFF;
+    u32 used = (tx_prod - tx_cons) & 0xFFFF;
+    return used < (NUM_DESC - 1);
+}
+
 static void genet_apply_offloads(void)
 {
     u32 rchk = gr(RBUF_CHK_CTRL);
@@ -326,6 +337,13 @@ bool genet_init(void) {
 
 bool genet_send(const u8 *frame, u32 len) {
     if (len > ETH_FRAME_MAX || len < 14)
+        return false;
+
+    /* Bounded wait for a free TX descriptor under sustained load. */
+    u32 spins = 256;
+    while (!genet_tx_slot_available() && spins--)
+        ;
+    if (!genet_tx_slot_available())
         return false;
 
     u32 idx = tx_prod % NUM_DESC;
