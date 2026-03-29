@@ -114,6 +114,9 @@ static u8 tx_bufs[NUM_DESC][BUF_SIZE] ALIGNED(64);
 static u32 rx_index;
 static u32 tx_prod;
 static u32 tx_cons;
+static bool tx_csum_offload;
+static bool rx_csum_offload;
+static bool tso_enabled;
 
 static u8 mac_addr[6] = { 0xDC, 0xA6, 0x32, 0x01, 0x02, 0x03 };
 
@@ -232,6 +235,9 @@ static void init_tx_ring(void) {
 
 bool genet_init(void) {
     uart_puts("[genet] Init GENET v5...\n");
+    tx_csum_offload = false;
+    rx_csum_offload = false;
+    tso_enabled = false;
 
     /* Software reset */
     gw(SYS_RBUF_FLUSH, 1);
@@ -347,4 +353,31 @@ void genet_get_mac(u8 *mac) {
 
 bool genet_link_up(void) {
     return (mdio_read(PHY_ADDR, MII_BMSR) & BMSR_LSTATUS) != 0;
+}
+
+void genet_set_tx_checksum_offload(bool enable) {
+    /* TODO(issue #19): program GENET TX checksum offload registers when validated. */
+    tx_csum_offload = enable;
+}
+
+void genet_set_rx_checksum_offload(bool enable) {
+    /* TODO(issue #19): program GENET RX checksum offload registers when validated. */
+    rx_csum_offload = enable;
+}
+
+void genet_set_tso(bool enable) {
+    /* TODO(issue #19): program GENET TSO registers when descriptor format is finalized. */
+    tso_enabled = enable;
+}
+
+bool genet_tx_checksum_offload_enabled(void) {
+    return tx_csum_offload;
+}
+
+bool genet_rx_checksum_offload_enabled(void) {
+    return rx_csum_offload;
+}
+
+bool genet_tso_enabled(void) {
+    return tso_enabled;
 }

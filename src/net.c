@@ -9,6 +9,7 @@
 #include "arp.h"
 #include "tcp.h"
 #include "socket.h"
+#include "tls.h"
 #include "genet.h"
 #include "simd.h"
 #include "core_env.h"
@@ -466,6 +467,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
 
     /* Init socket layer */
     socket_init();
+
+    /* Init TLS wrapper subsystem */
+    tls_init();
 
     /* Add gateway as static ARP entry if MAC provided */
     if (gateway_mac && !mac_is_zero_6(gateway_mac))
