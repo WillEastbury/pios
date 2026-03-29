@@ -67,7 +67,11 @@ static bool tensor_v3d_work_eligible(v3d_kernel_id_t id, u64 work_hint)
     case V3D_KERNEL_RELU:
         return work_hint >= TENSOR_V3D_VEC_MIN_ELEMS;
     case V3D_KERNEL_DOT:
-        return work_hint >= TENSOR_V3D_DOT_MIN_ELEMS;
+        /*
+         * DOT returns a scalar to ARM-visible memory; keep this on NEON
+         * until V3D scalar writeback/result-plumbing is implemented.
+         */
+        return false;
     case V3D_KERNEL_MATMUL:
         return work_hint >= TENSOR_V3D_MATMUL_MIN_MACS;
     default:
@@ -375,8 +379,6 @@ bool tensor_dot(float *result, const tensor_t *a, const tensor_t *b) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n) return false;
 
-    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_DOT, n))
-        return true;
     *result = neon_vec_dot_f32((const float *)a->arm_ptr,
                                (const float *)b->arm_ptr, n);
     return true;

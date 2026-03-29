@@ -17,7 +17,7 @@ When backend selection is `AUTO`, MMIO CSD dispatch is attempted first; if it ti
 | Element-wise add | `tensor_add(c, a, b)` | `ld1`, `fadd`, `st1` |
 | Element-wise multiply | `tensor_mul(c, a, b)` | `ld1`, `fmul`, `st1` |
 | Scalar multiply | `tensor_scale(b, a, s)` | `dup`, `fmul`, `st1` |
-| Dot product | `tensor_dot(&result, a, b)` | `fmla` (fused multiply-accumulate), `faddp` (pairwise reduce) |
+| Dot product | `tensor_dot(&result, a, b)` | `fmla` (fused multiply-accumulate), `faddp` (pairwise reduce); forced NEON path pending V3D scalar writeback plumbing |
 | Matrix multiply | `tensor_matmul(c, a, b)` | Scalar inner loop (NEON for row operations) |
 | ReLU | `tensor_relu(b, a)` | `fmax` with zero vector |
 | Softmax | `tensor_softmax(b, a)` | Schraudolph exp approximation, scalar normalize |
