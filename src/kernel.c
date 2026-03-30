@@ -158,6 +158,7 @@ static void ui_cmd_source(const char *path);
 static void ui_cmd_edit(const char *path);
 static void ui_cmd_capsule(u32 argc, char **argv);
 static void ui_cmd_obs(u32 argc, char **argv);
+static void ui_cmd_update(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -189,12 +190,27 @@ extern u8 __el2_integrity_end;
 #define BOOT_POLICY_CARD    0U
 #define BOOT_POLICY_REC     10U
 #define BOOT_ROLLBACK_REC   11U
+#define BOOT_UPDATE_REC     12U
+#define BOOT_UPDATE_MAGIC   0x42555044U /* BUPD */
+#define BOOT_UPDATE_VERSION 1U
 
 struct boot_policy_record {
     u32 magic;
     u32 version;
     u32 el1_hash;
     u32 el2_hash;
+    u8 mac[32];
+} PACKED;
+
+struct boot_update_record {
+    u32 magic;
+    u32 version;
+    u32 active_slot;
+    u32 pending_slot;
+    u32 previous_slot;
+    u32 tries_left;
+    u32 committed;
+    u32 generation;
     u8 mac[32];
 } PACKED;
 
@@ -205,6 +221,7 @@ static const u8 boot_policy_hmac_key[32] = {
 
 static u32 boot_el1_expected_hash;
 static u32 boot_el2_expected_hash;
+static struct boot_update_record g_boot_update_state;
 
 #define UI_SVC_MAX 16
 #define UI_SVC_TARGET_DEFAULT 1U
@@ -320,6 +337,79 @@ static bool boot_policy_mac_ok(const struct boot_policy_record *r)
     return diff == 0;
 }
 
+static void boot_update_mac(const struct boot_update_record *r, u8 out[32])
+{
+    if (!r || !out) return;
+    hmac_sha256(boot_policy_hmac_key, sizeof(boot_policy_hmac_key),
+                (const u8 *)r, (u32)(sizeof(*r) - sizeof(r->mac)), out);
+}
+
+static bool boot_update_mac_ok(const struct boot_update_record *r)
+{
+    if (!r) return false;
+    u8 calc[32];
+    boot_update_mac(r, calc);
+    u32 diff = 0;
+    for (u32 i = 0; i < 32; i++)
+        diff |= (u32)(calc[i] ^ r->mac[i]);
+    return diff == 0;
+}
+
+static bool boot_update_store(struct boot_update_record *r)
+{
+    if (!r) return false;
+    r->magic = BOOT_UPDATE_MAGIC;
+    r->version = BOOT_UPDATE_VERSION;
+    r->active_slot &= 1U;
+    r->pending_slot &= 1U;
+    r->previous_slot &= 1U;
+    if (r->tries_left > 16U) r->tries_left = 16U;
+    r->committed = r->committed ? 1U : 0U;
+    boot_update_mac(r, r->mac);
+    return picowal_db_put(BOOT_POLICY_CARD, BOOT_UPDATE_REC, r, sizeof(*r)) >= 0;
+}
+
+static void boot_update_load_or_seed(void)
+{
+    struct boot_update_record rec;
+    i32 n = picowal_db_get(BOOT_POLICY_CARD, BOOT_UPDATE_REC, &rec, sizeof(rec));
+    if (n < (i32)sizeof(rec) || rec.magic != BOOT_UPDATE_MAGIC || !boot_update_mac_ok(&rec)) {
+        simd_zero(&rec, sizeof(rec));
+        rec.active_slot = 0;
+        rec.pending_slot = 0;
+        rec.previous_slot = 0;
+        rec.tries_left = 0;
+        rec.committed = 1;
+        rec.generation = 1;
+        if (!boot_update_store(&rec))
+            exception_pisod("Boot update seed failed", 5, 0x3A, 0, 0, 0);
+    }
+    g_boot_update_state = rec;
+}
+
+static void boot_update_reconcile(void)
+{
+    struct boot_update_record rec = g_boot_update_state;
+    bool changed = false;
+    if (!rec.committed && rec.pending_slot == rec.active_slot) {
+        if (rec.tries_left == 0) {
+            rec.active_slot = rec.previous_slot;
+            rec.pending_slot = rec.active_slot;
+            rec.committed = 1;
+            changed = true;
+        } else {
+            rec.tries_left--;
+            changed = true;
+        }
+    }
+    if (changed) {
+        rec.generation++;
+        if (!boot_update_store(&rec))
+            exception_pisod("Boot update state write failed", 5, 0x3F, 0, 0, 0);
+        g_boot_update_state = rec;
+    }
+}
+
 static void boot_policy_verify_or_seed(void)
 {
     u32 cur_el1 = 0, cur_el2 = 0;
@@ -358,6 +448,8 @@ static void boot_policy_verify_or_seed(void)
 
     boot_el1_expected_hash = rec.el1_hash;
     boot_el2_expected_hash = rec.el2_hash;
+    boot_update_load_or_seed();
+    boot_update_reconcile();
 }
 
 static bool ui_streq(const char *a, const char *b)
@@ -2669,6 +2761,71 @@ static void ui_cmd_obs(u32 argc, char **argv)
     uart_puts("\n");
 }
 
+static void ui_cmd_update(u32 argc, char **argv)
+{
+    if (!principal_has_cap(principal_current(), PRINCIPAL_ADMIN)) {
+        ui_console_write("ERR: admin required\n");
+        return;
+    }
+    if (argc < 2 || ui_streq(argv[1], "help")) {
+        ui_console_write("update status | update stage <slot:0|1> [tries] | update success\n");
+        return;
+    }
+    if (ui_streq(argv[1], "status")) {
+        fb_printf("update slot=%u pending=%u prev=%u tries=%u committed=%u gen=%u\n",
+                  g_boot_update_state.active_slot, g_boot_update_state.pending_slot,
+                  g_boot_update_state.previous_slot, g_boot_update_state.tries_left,
+                  g_boot_update_state.committed, g_boot_update_state.generation);
+        return;
+    }
+    if (ui_streq(argv[1], "stage")) {
+        if (argc < 3) {
+            ui_console_write("ERR: usage update stage <slot:0|1> [tries]\n");
+            return;
+        }
+        u32 slot = 0;
+        if (!ui_parse_u32(argv[2], &slot) || slot > 1) {
+            ui_console_write("ERR: slot must be 0 or 1\n");
+            return;
+        }
+        u32 tries = 2;
+        if (argc >= 4 && (!ui_parse_u32(argv[3], &tries) || tries == 0 || tries > 16)) {
+            ui_console_write("ERR: tries must be 1..16\n");
+            return;
+        }
+        struct boot_update_record rec = g_boot_update_state;
+        rec.previous_slot = rec.active_slot;
+        rec.active_slot = slot;
+        rec.pending_slot = slot;
+        rec.tries_left = tries;
+        rec.committed = 0;
+        rec.generation++;
+        if (!boot_update_store(&rec)) {
+            ui_console_write("ERR: update stage write failed\n");
+            return;
+        }
+        g_boot_update_state = rec;
+        ui_console_write("OK: update staged\n");
+        return;
+    }
+    if (ui_streq(argv[1], "success")) {
+        struct boot_update_record rec = g_boot_update_state;
+        rec.previous_slot = rec.active_slot;
+        rec.pending_slot = rec.active_slot;
+        rec.tries_left = 0;
+        rec.committed = 1;
+        rec.generation++;
+        if (!boot_update_store(&rec)) {
+            ui_console_write("ERR: update success write failed\n");
+            return;
+        }
+        g_boot_update_state = rec;
+        ui_console_write("OK: update marked successful\n");
+        return;
+    }
+    ui_console_write("ERR: unknown update subcommand\n");
+}
+
 static bool ui_batch_pid_active(i32 pid)
 {
     if (pid <= 0) return false;
@@ -3244,7 +3401,7 @@ static void ui_console_exec(char *line)
     if (ui_streq(argv[0], "help")) {
         ui_console_write("help echo clear time ps kill launch run pwd cd lsdir mkdir touch\n");
         ui_console_write("copy cp cpdir mv cat stat rm find hexdump df mount umount\n");
-        ui_console_write("stream if for foreach source env batch svc edit\n");
+        ui_console_write("stream if for foreach source env batch svc update edit\n");
         ui_console_write("hexsec fsinspect netcfg disk db capsule obs\n");
         ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d> | netcfg apply\n");
         ui_console_write("netcfg dhcp <on|off> [timeout_ms] | netcfg addnbr <ip> <mac>\n");
@@ -3252,6 +3409,7 @@ static void ui_console_exec(char *line)
         ui_console_write("batch add|at|every supports [core] [priority] [principal] [retries]\n");
         ui_console_write("batch run [parallel] | batch stop | batch status | batch list\n");
         ui_console_write("svc add|start|stop|restart|run|pause|target|list|clear\n");
+        ui_console_write("update status|stage <slot> [tries]|success\n");
         ui_console_write("launch <path> [1|2|3] [lazy|low|normal|high|realtime]\n");
         ui_console_write("prio <pid> <lazy|low|normal|high|realtime> | affinity <pid> <1|2|3>\n");
         ui_console_write("source <script[.pis]> (auto-adds .pis)\n");
@@ -3506,6 +3664,8 @@ static void ui_console_exec(char *line)
         ui_cmd_capsule(argc, argv);
     } else if (ui_streq(argv[0], "obs")) {
         ui_cmd_obs(argc, argv);
+    } else if (ui_streq(argv[0], "update")) {
+        ui_cmd_update(argc, argv);
     } else {
         ui_console_write("ERR: unknown command\n");
     }

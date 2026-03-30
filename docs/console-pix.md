@@ -24,6 +24,7 @@ Goal: a tiny interactive shell process that feels like BusyBox/bash/cmd, built o
 - `svc add|start|stop|restart|run|pause|target|list|clear` (service supervisor with dependency + restart policy controls)
   - `svc add <name> <path> [dep|-] [target] [core] [priority] [principal] [restart] [max_restarts] [backoff_ms]`
   - targets: `default|rescue|all`, restart: `never|onfail|always`
+- `update status|stage <slot> [tries]|success` (A/B rollout state: stage candidate slot with bounded boot attempts, then confirm success)
 - `echo ... > <path>` (simple file write redirection)
 - `prio <pid> <lazy|low|normal|high|realtime>` (update process priority class)
 - `affinity <pid> <1|2|3>` (migrates process to target core by relaunching same executable/principal/priority under capsule policy, then retires old pid)

@@ -196,6 +196,12 @@ Storage hardening baseline:
 - Boot now performs `walfs_verify` and halts (PiSOD) on WAL metadata/record-chain corruption.
 - Operator tooling now exposes `disk verify` to run the same integrity scan on demand.
 
+Update/rollback baseline:
+
+- Boot update state is persisted in Picowal (`deck0/record12`) with HMAC authentication.
+- Console command `update stage <slot> [tries]` arms a staged A/B candidate with bounded boot attempts.
+- If staged update is not confirmed (`update success`) before attempts are exhausted, boot state auto-rolls back to the previous slot.
+
 ### Paged I/O primitive
 
 - `page_open(path, page_size, flags)`
