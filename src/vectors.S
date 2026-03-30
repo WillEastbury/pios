@@ -122,6 +122,11 @@ el2_sync_handler:
     bl      el2_hvc_trap          /* x0=fid, x1..x4 args, x0 return */
     b       .Lel2_sync_out
 .Lel2_sync_bad:
+    ldr     x12, =0x107C201000
+1:  ldr     w13, [x12, #0x18]
+    tbnz    w13, #5, 1b
+    mov     w13, #'2'
+    str     w13, [x12, #0x00]
     mrs     x0, esr_el2
     mrs     x1, elr_el2
     bl      el2_sync_fault_trap
@@ -234,6 +239,11 @@ irq_handler:
     eret
 
 sync_handler:
+    ldr     x12, =0x107C201000
+1:  ldr     w13, [x12, #0x18]
+    tbnz    w13, #5, 1b
+    mov     w13, #'1'
+    str     w13, [x12, #0x00]
     SAVE_CONTEXT
     mrs     x0, esr_el1
     mrs     x1, elr_el1

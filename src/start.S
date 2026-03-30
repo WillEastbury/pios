@@ -9,6 +9,39 @@
 .global _start
 .global secondary_entry
 
+/* PL011 raw MMIO helpers for pre-C diagnostics */
+.equ UART_DR_OFF,   0x00
+.equ UART_FR_OFF,   0x18
+.equ UART_IBRD_OFF, 0x24
+.equ UART_FBRD_OFF, 0x28
+.equ UART_LCRH_OFF, 0x2C
+.equ UART_CR_OFF,   0x30
+.equ UART_ICR_OFF,  0x44
+
+boot_uart_raw_init:
+    ldr     x9, =0x107C201000
+    mov     w10, #0
+    str     w10, [x9, #UART_CR_OFF]
+    mov     w10, #0x7FF
+    str     w10, [x9, #UART_ICR_OFF]
+    mov     w10, #26
+    str     w10, [x9, #UART_IBRD_OFF]
+    mov     w10, #3
+    str     w10, [x9, #UART_FBRD_OFF]
+    mov     w10, #0x70              /* 8N1 + FIFO */
+    str     w10, [x9, #UART_LCRH_OFF]
+    mov     w10, #0x301             /* UARTEN|TXE|RXE */
+    str     w10, [x9, #UART_CR_OFF]
+    ret
+
+boot_uart_raw_putc:
+    ldr     x9, =0x107C201000
+.Lraw_wait_tx:
+    ldr     w10, [x9, #UART_FR_OFF]
+    tbnz    w10, #5, .Lraw_wait_tx  /* TXFF */
+    str     w0, [x9, #UART_DR_OFF]
+    ret
+
 _start:
     mrs     x0, mpidr_el1
     and     x0, x0, #0x3
@@ -17,9 +50,14 @@ _start:
     /* Ensure EL2 trap path has a valid stack before EL2->EL1 drop */
     ldr     x1, =__stack_top_core0
     mov     sp, x1
+    bl      boot_uart_raw_init
+    mov     w0, #'S'
+    bl      boot_uart_raw_putc
 
     /* ---- EL2 → EL1 transition ---- */
     bl      el2_to_el1
+    mov     w0, #'E'
+    bl      boot_uart_raw_putc
 
     /* ---- SCTLR_EL1: safe baseline (MMU off, caches off, alignment check on) ---- */
     mrs     x1, sctlr_el1
@@ -30,6 +68,8 @@ _start:
     orr     x1, x1, #(1 << 3)      /* SA=1: stack alignment check */
     msr     sctlr_el1, x1
     isb
+    mov     w0, #'C'
+    bl      boot_uart_raw_putc
 
     /* Enable NEON / FPU (CPACR_EL1 bits [21:20] = 0b11) */
     mrs     x1, cpacr_el1
@@ -50,6 +90,8 @@ _start:
     ldr     x1, =vector_table
     msr     vbar_el1, x1
     isb
+    mov     w0, #'V'
+    bl      boot_uart_raw_putc
 
     /* Clear BSS */
     ldr     x1, =__bss_start
@@ -60,6 +102,8 @@ _start:
     str     xzr, [x1], #8
     b       .Lbss_loop
 .Lbss_done:
+    mov     w0, #'B'
+    bl      boot_uart_raw_putc
 
     bl      kernel_main
     b       .Lhalt
