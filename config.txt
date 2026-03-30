@@ -3,6 +3,7 @@ kernel=kernel8.img
 kernel_address=0x80000
 enable_uart=1
 enable_rp1_uart=1
+pciex4_reset=0
 gpu_mem=64
 disable_overscan=1
 hdmi_force_hotplug=1
