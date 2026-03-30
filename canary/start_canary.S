@@ -2,64 +2,27 @@
 .global _start
 
 /*
- * Canary v9: blind writes to TWO UARTs, no FIFO status check.
- * PL011 TX FIFO is 16-deep so a few chars won't overflow.
+ * Canary v10: absolute minimum — first instruction writes UART.
+ * No core check, no branching. Just write 'X' and hang.
  *
- * UART A: 0x1F00030000 (RP1 UART0 via PCIe BAR — firmware reported address)
- * UART B: 0x107D001000 (BCM2712 debug UART — SoC-internal, no PCIe needed)
+ * Try both:
+ *   0x1F00030000 — RP1 UART (GPIO14/15, if firmware PCIe ATU survives)
+ *   0x107D001000 — BCM2712 debug UART (3-pin JST header, not GPIO!)
+ *
+ * If you see nothing on GPIO serial, the PCIe BAR is gone after handoff.
  */
 _start:
-    mrs     x1, mpidr_el1
-    and     x1, x1, #3
-    cbnz    x1, park
-
-    /* Load both UART base addresses */
-    ldr     x10, =0x107D001000     /* BCM2712 debug UART — try first (on-SoC) */
-    ldr     x9, =0x1F00030000      /* RP1 UART via PCIe BAR — try second */
-
-    /* Blind write to debug UART first (guaranteed on-SoC, no PCIe) */
-    mov     w0, #'P'
-    str     w0, [x10]
-    mov     w0, #'I'
-    str     w0, [x10]
-    mov     w0, #'O'
-    str     w0, [x10]
-    mov     w0, #'S'
-    str     w0, [x10]
-    mov     w0, #'1'
-    str     w0, [x10]
-    mov     w0, #'\r'
-    str     w0, [x10]
-    mov     w0, #'\n'
-    str     w0, [x10]
-
-    /* Now try RP1 UART (may fault if PCIe BAR not mapped) */
-    mov     w0, #'P'
-    str     w0, [x9]
-    mov     w0, #'I'
-    str     w0, [x9]
-    mov     w0, #'O'
-    str     w0, [x9]
-    mov     w0, #'S'
-    str     w0, [x9]
-    mov     w0, #'2'
+    /* RP1 UART — the one connected to GPIO header pins 8/10 */
+    mov     x9, #0x1F00000000
+    add     x9, x9, #0x30000
+    mov     w0, #'X'
     str     w0, [x9]
     mov     w0, #'\r'
     str     w0, [x9]
     mov     w0, #'\n'
     str     w0, [x9]
 
-    /* Heartbeat dots to both */
-dot_loop:
-    mov     w0, #'.'
-    str     w0, [x9]
-    str     w0, [x10]
-    mov     x3, #0x800000
-delay:
-    sub     x3, x3, #1
-    cbnz    x3, delay
-    b       dot_loop
-
-park:
+    /* Infinite loop — ACT LED toggle via GPIO would go here */
+halt:
     wfe
-    b       park
+    b       halt
