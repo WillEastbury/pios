@@ -33,6 +33,7 @@ Goal: a tiny interactive shell process that feels like BusyBox/bash/cmd, built o
   - `hexsec <lba>` (sector hex viewer)
   - `fsinspect [path]` (filesystem inspector)
 - `netcfg [addnbr <ip> <mac>]` (network status/config)
+- `obs` (security/network/EL2 observability snapshot: integrity checks/failures, capsule kills, firewall denies, drop counters, stage-2 faults)
 - `netcfg set <ip|mask|gw|dns> <a.b.c.d>` + `netcfg apply`
 - `netcfg dhcp <on|off> [timeout_ms]`
 - `disk [info|sync|compact|read <lba>|writezero <lba>]` (disk manager)

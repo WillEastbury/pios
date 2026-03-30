@@ -315,6 +315,10 @@ Note: this is currently coarse at 2MB block granularity (ARM L2 block map), so I
 - If an EL0 executable hash drifts, **all processes in that capsule namespace are terminated**.
 - EL2 validates both EL2 code integrity and boot-pinned EL1 text integrity during these checks.
 - If EL1 or EL2 integrity drifts, kernel enters PiSOD halt.
+- Kernel observability now exposes a consolidated `obs` console command showing:
+  - process integrity check/failure counters and capsule-kill count
+  - capsule firewall deny counters (manifest policy + EL2 port claim denies)
+  - network drop totals and EL2 stage-2 fault telemetry
 
 ### Semaphores
 

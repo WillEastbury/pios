@@ -41,6 +41,14 @@ struct proc_capsule_ui_entry {
     char vfs_root[96];
 } PACKED;
 
+struct proc_security_stats {
+    u64 integrity_checks;
+    u64 integrity_failures;
+    u64 capsule_kills;
+    u64 port_policy_denies;
+    u64 port_claim_denies;
+} PACKED;
+
 #define APPF_EVENT_DATA_MAX   224U
 #define APPF_LOG_MSG_MAX      224U
 #define APPF_SERVICE_NAME_MAX 31U
@@ -328,6 +336,7 @@ void proc_irq_maybe_preempt(struct irq_frame *frame);
 u64  proc_preemptions(void);
 u32  proc_snapshot(struct proc_ui_entry *out, u32 max_entries);
 u32  proc_capsule_snapshot(struct proc_capsule_ui_entry *out, u32 max_entries);
+void proc_security_stats_snapshot(struct proc_security_stats *out);
 bool proc_kill_pid(u32 pid, u32 code);
 i32  proc_launch_on_core(u32 target_core, const char *path);
 i32  proc_launch_on_core_as(u32 target_core, const char *path, u32 principal_id);

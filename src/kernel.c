@@ -157,6 +157,7 @@ static void ui_cmd_foreach(u32 argc, char **argv);
 static void ui_cmd_source(const char *path);
 static void ui_cmd_edit(const char *path);
 static void ui_cmd_capsule(u32 argc, char **argv);
+static void ui_cmd_obs(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -2626,6 +2627,39 @@ static void ui_cmd_capsule(u32 argc, char **argv)
     ui_console_write("ERR: unknown capsule subcommand\n");
 }
 
+static void ui_cmd_obs(u32 argc, char **argv)
+{
+    (void)argc; (void)argv;
+    const net_stats_t *st = net_get_stats();
+    struct proc_security_stats ps;
+    proc_security_stats_snapshot(&ps);
+    u64 faults = 0;
+    (void)el2_hvc_call(EL2_HVC_STAGE2_FAULTS, 0, 0, 0, 0, &faults);
+    u32 s2_fault_count = (u32)(faults & 0xFFFFFFFFULL);
+    u32 s2_last_esr16 = (u32)((faults >> 32) & 0xFFFFULL);
+    u32 s2_active = (u32)((faults >> 48) & 0xFFULL);
+    u32 s2_last_fault_cap = (u32)((faults >> 56) & 0xFFULL);
+    u64 net_drops = st->drop_runt + st->drop_bad_cksum + st->drop_fragment + st->drop_ip_options +
+                    st->drop_bad_src + st->drop_not_for_us + st->drop_bad_proto +
+                    st->drop_icmp_ratelimit + st->drop_no_neighbor + st->drop_udp_malformed +
+                    st->drop_oversized;
+    fb_printf("obs security: integ_chk=%X integ_fail=%X cap_kill=%X policy_deny=%X claim_deny=%X\n",
+              ps.integrity_checks, ps.integrity_failures, ps.capsule_kills,
+              ps.port_policy_denies, ps.port_claim_denies);
+    fb_printf("obs net: tx=%X rx=%X udp_tx=%X udp_rx=%X drops=%X\n",
+              st->tx_packets, st->rx_packets, st->udp_sent, st->udp_recv, net_drops);
+    fb_printf("obs el2: s2_faults=%X last_esr16=0x%x active_cap=%u last_fault_cap=%u\n",
+              s2_fault_count, s2_last_esr16, s2_active, s2_last_fault_cap);
+    uart_puts("obs integ_chk="); uart_hex((u32)ps.integrity_checks);
+    uart_puts(" integ_fail="); uart_hex((u32)ps.integrity_failures);
+    uart_puts(" cap_kill="); uart_hex((u32)ps.capsule_kills);
+    uart_puts(" policy_deny="); uart_hex((u32)ps.port_policy_denies);
+    uart_puts(" claim_deny="); uart_hex((u32)ps.port_claim_denies);
+    uart_puts(" net_drops="); uart_hex((u32)net_drops);
+    uart_puts(" s2_faults="); uart_hex(s2_fault_count);
+    uart_puts("\n");
+}
+
 static bool ui_batch_pid_active(i32 pid)
 {
     if (pid <= 0) return false;
@@ -3202,7 +3236,7 @@ static void ui_console_exec(char *line)
         ui_console_write("help echo clear time ps kill launch run pwd cd lsdir mkdir touch\n");
         ui_console_write("copy cp cpdir mv cat stat rm find hexdump df mount umount\n");
         ui_console_write("stream if for foreach source env batch svc edit\n");
-        ui_console_write("hexsec fsinspect netcfg disk db capsule\n");
+        ui_console_write("hexsec fsinspect netcfg disk db capsule obs\n");
         ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d> | netcfg apply\n");
         ui_console_write("netcfg dhcp <on|off> [timeout_ms] | netcfg addnbr <ip> <mac>\n");
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
@@ -3461,6 +3495,8 @@ static void ui_console_exec(char *line)
         ui_cmd_db(argc, argv);
     } else if (ui_streq(argv[0], "capsule")) {
         ui_cmd_capsule(argc, argv);
+    } else if (ui_streq(argv[0], "obs")) {
+        ui_cmd_obs(argc, argv);
     } else {
         ui_console_write("ERR: unknown command\n");
     }

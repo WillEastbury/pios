@@ -40,6 +40,7 @@ static volatile bool preempt_armed[3];
 static volatile bool preempt_pending[3];
 static u64 preempt_quantum_ticks[3];
 static u64 preempt_count_core[3];
+static struct proc_security_stats proc_sec_stats;
 
 #define PROC_LAUNCH_PATH_MAX 96
 struct proc_launch_req {
@@ -124,6 +125,7 @@ static u32 proc_el1_integrity_hash_now(void)
 static void proc_kill_capsule_members(const struct process *src, u32 exit_code)
 {
     if (!src) return;
+    proc_sec_stats.capsule_kills++;
     bool cap = src->capsule_enabled;
     u32 hash = src->capsule_manifest_hash;
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
@@ -157,6 +159,7 @@ static bool proc_integrity_maybe_check(u32 slot)
     }
     if (now < p->exec_hash_next_check_tick)
         return true;
+    proc_sec_stats.integrity_checks++;
     u64 out = ~0ULL;
     if (el2_hvc_call(EL2_HVC_INTEGRITY_CHECK,
                      (u64)(usize)p->base,
@@ -164,16 +167,20 @@ static bool proc_integrity_maybe_check(u32 slot)
                      (u64)p->exec_hash_baseline,
                      (u64)p->exec_hash_check_nonce,
                      &out) != 0) {
+        proc_sec_stats.integrity_failures++;
         proc_kill_capsule_members(p, 0xFFFF0007U);
         return false;
     }
     if ((u32)out == EL2_INTEGRITY_EL2_CHANGED) {
+        proc_sec_stats.integrity_failures++;
         exception_pisod("EL2 integrity failure", 3, 0x3E, 0, 0, 0);
     }
     if ((u32)out == EL2_INTEGRITY_EL1_CHANGED) {
+        proc_sec_stats.integrity_failures++;
         exception_pisod("EL1 integrity failure", 4, 0x3D, 0, 0, 0);
     }
     if (out != 0ULL) {
+        proc_sec_stats.integrity_failures++;
         proc_kill_capsule_members(p, 0xFFFF0007U);
         return false;
     }
@@ -1157,6 +1164,7 @@ void proc_init(void)
     next_pid = (core_id() << 16) | 1;  /* encode core in upper bits */
     proc_el1_integrity_baseline = proc_el1_integrity_hash_now();
     proc_el1_integrity_next_check_tick = timer_ticks() + 512ULL;
+    simd_zero(&proc_sec_stats, sizeof(proc_sec_stats));
     initialized = true;
     if (on_user_core()) {
         preempt_enabled[uc] = false;
@@ -1646,6 +1654,12 @@ u32 proc_capsule_snapshot(struct proc_capsule_ui_entry *out, u32 max_entries)
         n++;
     }
     return n;
+}
+
+void proc_security_stats_snapshot(struct proc_security_stats *out)
+{
+    if (!out) return;
+    simd_memcpy(out, &proc_sec_stats, sizeof(*out));
 }
 
 bool proc_kill_pid(u32 pid, u32 code)
@@ -2264,8 +2278,8 @@ static i32 sys_bind(i32 fd, u32 ip, u16 port)
 {
     if (!has_net_cap()) return -1;
     struct process *me = &procs[current_proc];
-    if (!capsule_allows_port(me, port)) return -1;
-    if (!el2_port_bind_claim(me, port)) return -1;
+    if (!capsule_allows_port(me, port)) { proc_sec_stats.port_policy_denies++; return -1; }
+    if (!el2_port_bind_claim(me, port)) { proc_sec_stats.port_claim_denies++; return -1; }
     struct sockaddr_in addr = { .ip = ip, .port = port };
     i32 r = sock_bind(fd, &addr);
     if (r < 0) el2_port_unbind_claim(me, port);
@@ -2275,7 +2289,7 @@ static i32 sys_bind(i32 fd, u32 ip, u16 port)
 static i32 sys_connect(i32 fd, u32 ip, u16 port)
 {
     if (!has_net_cap()) return -1;
-    if (!capsule_allows_port(&procs[current_proc], port)) return -1;
+    if (!capsule_allows_port(&procs[current_proc], port)) { proc_sec_stats.port_policy_denies++; return -1; }
     struct sockaddr_in addr = { .ip = ip, .port = port };
     return sock_connect(fd, &addr);
 }
@@ -2314,7 +2328,7 @@ static i32 sys_sendto(i32 fd, const void *data, u32 len, u32 ip, u16 port)
 {
     if (!has_net_cap()) return -1;
     if (!ptr_valid(data, len)) return -1;
-    if (!capsule_allows_port(&procs[current_proc], port)) return -1;
+    if (!capsule_allows_port(&procs[current_proc], port)) { proc_sec_stats.port_policy_denies++; return -1; }
     struct sockaddr_in dest = { .ip = ip, .port = port };
     return sock_sendto(fd, data, len, &dest);
 }
