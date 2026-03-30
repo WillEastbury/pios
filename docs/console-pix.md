@@ -21,6 +21,9 @@ Goal: a tiny interactive shell process that feels like BusyBox/bash/cmd, built o
   - `db key|put|putf|get|getf|del|list` (Picowal-style card/record DB on Core0->Core1 WALFS path)
 - `batch add|at|every|run|stop|status|list|clear` (queued, timed, recurring scheduling with principal selection)
   - Supports optional core affinity (`1|2|3|auto`) and priority (`lazy|low|normal|high|realtime`)
+- `svc add|start|stop|restart|run|pause|target|list|clear` (service supervisor with dependency + restart policy controls)
+  - `svc add <name> <path> [dep|-] [target] [core] [priority] [principal] [restart] [max_restarts] [backoff_ms]`
+  - targets: `default|rescue|all`, restart: `never|onfail|always`
 - `echo ... > <path>` (simple file write redirection)
 - `prio <pid> <lazy|low|normal|high|realtime>` (update process priority class)
 - `affinity <pid> <1|2|3>` (migrates process to target core by relaunching same executable/principal/priority under capsule policy, then retires old pid)
@@ -64,7 +67,7 @@ Two command classes:
 - `launch <path> [core2|core3]`
 - `pwd`, `cd`, `lsdir`, `mkdir`, `touch`, `copy|cp`, `cpdir`, `mv`
 - `cat`, `stat`, `rm`, `find`, `hexdump`, `df`, `mount`, `umount`
-- `stream`, `batch`, `if`, `for`, `foreach`, `source`, `env`, `echo ... > file`
+- `stream`, `batch`, `svc`, `if`, `for`, `foreach`, `source`, `env`, `echo ... > file`
 - `db` (card/record database commands backed by `/var/picowal`)
   - UDP surface: port `7001`, request header `[op,u8 ver,u16 rsv,u16 card,u32 record,u16 len,payload...]`
 - later aliases: `ls`, `cat`, `stat`, `rm`, `write`

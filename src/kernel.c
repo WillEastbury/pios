@@ -165,6 +165,8 @@ static bool ui_resolve_pix_path(const char *in, char *out, u32 out_max);
 static bool ui_resolve_job_path(const char *in, char *out, u32 out_max, bool *is_script_out);
 static void ui_cmd_batch(u32 argc, char **argv);
 static void ui_batch_tick(void);
+static void ui_cmd_svc(u32 argc, char **argv);
+static void ui_service_tick(void);
 static void ui_render_scheduler(void);
 static void ui_scheduler_feed_char(i32 c);
 static void disk_handle_request(u32 from_core);
@@ -202,6 +204,37 @@ static const u8 boot_policy_hmac_key[32] = {
 
 static u32 boot_el1_expected_hash;
 static u32 boot_el2_expected_hash;
+
+#define UI_SVC_MAX 16
+#define UI_SVC_TARGET_DEFAULT 1U
+#define UI_SVC_TARGET_RESCUE  2U
+#define UI_SVC_TARGET_ALL     3U
+#define UI_SVC_RP_NEVER       0U
+#define UI_SVC_RP_ONFAIL      1U
+#define UI_SVC_RP_ALWAYS      2U
+
+struct ui_service_unit {
+    bool used;
+    char name[32];
+    char path[128];
+    char depends[32];
+    u32 target;
+    u32 preferred_core;
+    u32 principal_id;
+    u32 priority_class;
+    u32 restart_policy;
+    u32 max_restarts;
+    u32 backoff_ms;
+    u32 state; /* 0 stopped, 1 running, 2 backoff, 3 failed */
+    bool stop_requested;
+    i32 pid;
+    u32 restarts;
+    u64 window_start_ms;
+    u64 next_action_ms;
+};
+static struct ui_service_unit ui_services[UI_SVC_MAX];
+static bool ui_service_running;
+static u32 ui_service_target = UI_SVC_TARGET_DEFAULT;
 
 struct ui_batch_job {
     bool used;
@@ -2622,8 +2655,99 @@ static u32 ui_batch_core_load(u32 core)
     return n;
 }
 
+static struct ui_service_unit *ui_service_find(const char *name)
+{
+    if (!name || !name[0]) return NULL;
+    for (u32 i = 0; i < UI_SVC_MAX; i++) {
+        if (!ui_services[i].used) continue;
+        if (ui_streq(ui_services[i].name, name)) return &ui_services[i];
+    }
+    return NULL;
+}
+
+static bool ui_service_pid_active(i32 pid)
+{
+    if (pid <= 0) return false;
+    struct proc_ui_entry snap[UI_SNAPSHOT_MAX];
+    u32 n = proc_snapshot(snap, UI_SNAPSHOT_MAX);
+    for (u32 i = 0; i < n; i++) {
+        if ((i32)snap[i].pid == pid) return true;
+    }
+    return false;
+}
+
+static bool ui_service_target_enabled(const struct ui_service_unit *s)
+{
+    if (!s || !s->used) return false;
+    if (ui_service_target == UI_SVC_TARGET_ALL) return true;
+    return s->target == ui_service_target;
+}
+
+static bool ui_service_dep_ready(const struct ui_service_unit *s)
+{
+    if (!s) return false;
+    if (s->depends[0] == 0) return true;
+    struct ui_service_unit *d = ui_service_find(s->depends);
+    if (!d || !d->used) return false;
+    return d->state == 1;
+}
+
+static void ui_service_tick(void)
+{
+    if (!ui_service_running) return;
+    u64 now = timer_ticks();
+    for (u32 i = 0; i < UI_SVC_MAX; i++) {
+        struct ui_service_unit *s = &ui_services[i];
+        if (!s->used) continue;
+        if (s->state == 1 && s->pid > 0) {
+            if (ui_service_pid_active(s->pid))
+                continue;
+            bool should_restart = (!s->stop_requested) &&
+                                  (s->restart_policy == UI_SVC_RP_ALWAYS || s->restart_policy == UI_SVC_RP_ONFAIL);
+            if (!should_restart) {
+                s->state = s->stop_requested ? 0 : 3;
+                s->pid = -1;
+                s->stop_requested = false;
+                continue;
+            }
+            if (s->window_start_ms == 0 || now - s->window_start_ms > 60000ULL) {
+                s->window_start_ms = now;
+                s->restarts = 0;
+            }
+            s->restarts++;
+            s->pid = -1;
+            if (s->restarts > s->max_restarts) {
+                s->state = 3;
+            } else {
+                s->state = 2;
+                s->next_action_ms = now + (u64)s->backoff_ms;
+            }
+        }
+    }
+
+    for (u32 i = 0; i < UI_SVC_MAX; i++) {
+        struct ui_service_unit *s = &ui_services[i];
+        if (!s->used) continue;
+        if (!ui_service_target_enabled(s)) continue;
+        if (!ui_service_dep_ready(s)) continue;
+        if (s->state == 2 && now < s->next_action_ms) continue;
+        if (s->state == 1 || s->state == 3) continue;
+        i32 pid = proc_launch_on_core_as_prio(s->preferred_core, s->path, s->principal_id, s->priority_class);
+        if (pid > 0) {
+            s->pid = pid;
+            s->state = 1;
+            s->stop_requested = false;
+            if (s->window_start_ms == 0) s->window_start_ms = now;
+        } else {
+            s->state = 2;
+            s->next_action_ms = now + (u64)s->backoff_ms;
+        }
+    }
+}
+
 static void ui_batch_tick(void)
 {
+    ui_service_tick();
     u64 now = timer_ticks();
     for (u32 i = 0; i < UI_BATCH_MAX; i++) {
         struct ui_batch_job *j = &ui_batch_jobs[i];
@@ -2860,6 +2984,136 @@ static void ui_cmd_batch(u32 argc, char **argv)
     ui_console_write("ERR: unknown batch subcommand\n");
 }
 
+static void ui_cmd_svc(u32 argc, char **argv)
+{
+    if (argc < 2 || ui_streq(argv[1], "help")) {
+        ui_console_write("svc add <name> <path> [dep|-] [target:default|rescue|all] [1|2|3] [priority] [principal] [restart] [max_restarts] [backoff_ms]\n");
+        ui_console_write("svc start|stop|restart <name> | svc run|pause | svc target <default|rescue|all> | svc list | svc clear\n");
+        return;
+    }
+    if (ui_streq(argv[1], "add")) {
+        if (argc < 4) { ui_console_write("ERR: usage svc add <name> <path> ...\n"); return; }
+        if (ui_service_find(argv[2])) { ui_console_write("ERR: service exists\n"); return; }
+        i32 slot = -1;
+        for (u32 i = 0; i < UI_SVC_MAX; i++) if (!ui_services[i].used) { slot = (i32)i; break; }
+        if (slot < 0) { ui_console_write("ERR: service table full\n"); return; }
+
+        char path[128];
+        bool is_script = false;
+        if (!ui_resolve_job_path(argv[3], path, sizeof(path), &is_script) || !walfs_find(path)) {
+            ui_console_write("ERR: service path not found\n");
+            return;
+        }
+        if (is_script) {
+            ui_console_write("ERR: svc requires executable .pix path\n");
+            return;
+        }
+
+        struct ui_service_unit *s = &ui_services[(u32)slot];
+        simd_zero(s, sizeof(*s));
+        s->used = true;
+        for (u32 i = 0; argv[2][i] && i + 1 < sizeof(s->name); i++) s->name[i] = argv[2][i];
+        for (u32 i = 0; path[i] && i + 1 < sizeof(s->path); i++) s->path[i] = path[i];
+        s->target = UI_SVC_TARGET_DEFAULT;
+        s->preferred_core = CORE_USERM;
+        s->principal_id = principal_current();
+        s->priority_class = PROC_PRIO_NORMAL;
+        s->restart_policy = UI_SVC_RP_ONFAIL;
+        s->max_restarts = 5;
+        s->backoff_ms = 1000;
+        s->state = 0;
+        s->pid = -1;
+
+        if (argc >= 5 && !ui_streq(argv[4], "-")) {
+            for (u32 i = 0; argv[4][i] && i + 1 < sizeof(s->depends); i++) s->depends[i] = argv[4][i];
+        }
+        if (argc >= 6) {
+            if (ui_streq(argv[5], "default")) s->target = UI_SVC_TARGET_DEFAULT;
+            else if (ui_streq(argv[5], "rescue")) s->target = UI_SVC_TARGET_RESCUE;
+            else if (ui_streq(argv[5], "all")) s->target = UI_SVC_TARGET_ALL;
+        }
+        if (argc >= 7) {
+            if (argv[6][0] == '1') s->preferred_core = CORE_USERM;
+            else if (argv[6][0] == '2') s->preferred_core = CORE_USER0;
+            else if (argv[6][0] == '3') s->preferred_core = CORE_USER1;
+        }
+        if (argc >= 8) {
+            u32 p = 0;
+            if (ui_parse_priority(argv[7], &p)) s->priority_class = p;
+        }
+        if (argc >= 9) {
+            u32 pr = 0;
+            if (ui_parse_u32(argv[8], &pr) && pr < PRINCIPAL_MAX && principal_has_cap(pr, PRINCIPAL_EXEC))
+                s->principal_id = pr;
+        }
+        if (argc >= 10) {
+            if (ui_streq(argv[9], "never")) s->restart_policy = UI_SVC_RP_NEVER;
+            else if (ui_streq(argv[9], "onfail")) s->restart_policy = UI_SVC_RP_ONFAIL;
+            else if (ui_streq(argv[9], "always")) s->restart_policy = UI_SVC_RP_ALWAYS;
+        }
+        if (argc >= 11) { u32 v = 0; if (ui_parse_u32(argv[10], &v)) s->max_restarts = v; }
+        if (argc >= 12) { u32 v = 0; if (ui_parse_u32(argv[11], &v)) s->backoff_ms = v; }
+        ui_console_write("OK: service added\n");
+        return;
+    }
+    if (ui_streq(argv[1], "run")) { ui_service_running = true; ui_console_write("OK: supervisor running\n"); return; }
+    if (ui_streq(argv[1], "pause")) { ui_service_running = false; ui_console_write("OK: supervisor paused\n"); return; }
+    if (ui_streq(argv[1], "target")) {
+        if (argc < 3) { ui_console_write("ERR: usage svc target <default|rescue|all>\n"); return; }
+        if (ui_streq(argv[2], "default")) ui_service_target = UI_SVC_TARGET_DEFAULT;
+        else if (ui_streq(argv[2], "rescue")) ui_service_target = UI_SVC_TARGET_RESCUE;
+        else if (ui_streq(argv[2], "all")) ui_service_target = UI_SVC_TARGET_ALL;
+        else { ui_console_write("ERR: bad target\n"); return; }
+        ui_console_write("OK: target updated\n");
+        return;
+    }
+    if (ui_streq(argv[1], "clear")) {
+        for (u32 i = 0; i < UI_SVC_MAX; i++) {
+            if (!ui_services[i].used) continue;
+            if (ui_services[i].pid > 0) (void)proc_kill_pid((u32)ui_services[i].pid, 0xFFFF4000U);
+            ui_services[i].used = false;
+        }
+        ui_console_write("OK: services cleared\n");
+        return;
+    }
+    if (ui_streq(argv[1], "list")) {
+        for (u32 i = 0; i < UI_SVC_MAX; i++) {
+            struct ui_service_unit *s = &ui_services[i];
+            if (!s->used) continue;
+            fb_printf("svc %-12s state=%u pid=%x dep=%s path=%s\n",
+                      s->name, s->state, (u32)(s->pid > 0 ? s->pid : 0),
+                      s->depends[0] ? s->depends : "-", s->path);
+        }
+        return;
+    }
+    if ((ui_streq(argv[1], "start") || ui_streq(argv[1], "stop") || ui_streq(argv[1], "restart")) && argc >= 3) {
+        struct ui_service_unit *s = ui_service_find(argv[2]);
+        if (!s) { ui_console_write("ERR: service not found\n"); return; }
+        if (ui_streq(argv[1], "start")) {
+            s->state = 0;
+            s->stop_requested = false;
+            s->next_action_ms = timer_ticks();
+            ui_console_write("OK: service start queued\n");
+        } else if (ui_streq(argv[1], "stop")) {
+            s->stop_requested = true;
+            if (s->pid > 0) (void)proc_kill_pid((u32)s->pid, 0xFFFF4001U);
+            s->state = 0;
+            s->pid = -1;
+            ui_console_write("OK: service stopped\n");
+        } else {
+            s->stop_requested = true;
+            if (s->pid > 0) (void)proc_kill_pid((u32)s->pid, 0xFFFF4002U);
+            s->pid = -1;
+            s->stop_requested = false;
+            s->state = 0;
+            s->next_action_ms = timer_ticks();
+            ui_console_write("OK: service restart queued\n");
+        }
+        return;
+    }
+    ui_console_write("ERR: unknown svc subcommand\n");
+}
+
 static void ui_scheduler_exec_line(const char *line)
 {
     if (!line || !*line) return;
@@ -2947,13 +3201,14 @@ static void ui_console_exec(char *line)
     if (ui_streq(argv[0], "help")) {
         ui_console_write("help echo clear time ps kill launch run pwd cd lsdir mkdir touch\n");
         ui_console_write("copy cp cpdir mv cat stat rm find hexdump df mount umount\n");
-        ui_console_write("stream if for foreach source env batch edit\n");
+        ui_console_write("stream if for foreach source env batch svc edit\n");
         ui_console_write("hexsec fsinspect netcfg disk db capsule\n");
         ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d> | netcfg apply\n");
         ui_console_write("netcfg dhcp <on|off> [timeout_ms] | netcfg addnbr <ip> <mac>\n");
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
         ui_console_write("batch add|at|every supports [core] [priority] [principal] [retries]\n");
         ui_console_write("batch run [parallel] | batch stop | batch status | batch list\n");
+        ui_console_write("svc add|start|stop|restart|run|pause|target|list|clear\n");
         ui_console_write("launch <path> [1|2|3] [lazy|low|normal|high|realtime]\n");
         ui_console_write("prio <pid> <lazy|low|normal|high|realtime> | affinity <pid> <1|2|3>\n");
         ui_console_write("source <script[.pis]> (auto-adds .pis)\n");
@@ -3196,6 +3451,8 @@ static void ui_console_exec(char *line)
         else ui_cmd_edit(argv[1]);
     } else if (ui_streq(argv[0], "batch")) {
         ui_cmd_batch(argc, argv);
+    } else if (ui_streq(argv[0], "svc")) {
+        ui_cmd_svc(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "disk")) {
