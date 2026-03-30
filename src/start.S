@@ -8,6 +8,7 @@
 .section .text.boot
 .global _start
 .global secondary_entry
+.extern early_boot_hdmi_mark
 
 /* PL011 raw MMIO helpers for pre-C diagnostics */
 .equ UART_DR_OFF,   0x00
@@ -51,6 +52,8 @@ _start:
     ldr     x1, =__stack_top_core0
     mov     sp, x1
     bl      boot_uart_raw_init
+    mov     w0, #'I'
+    bl      boot_uart_raw_putc
     mov     w0, #'S'
     bl      boot_uart_raw_putc
 
@@ -104,6 +107,8 @@ _start:
 .Lbss_done:
     mov     w0, #'B'
     bl      boot_uart_raw_putc
+    mov     x0, #'B'
+    bl      early_boot_hdmi_mark
 
     bl      kernel_main
     b       .Lhalt

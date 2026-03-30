@@ -321,6 +321,21 @@ static void boot_measurements(u32 *el1_hash, u32 *el2_hash, u64 *el1_start, u32 
     if (el1_len) *el1_len = (u32)(el1_e - el1_s);
 }
 
+void early_boot_hdmi_mark(u32 code)
+{
+    static bool inited;
+    if (!inited) {
+        if (!fb_init(1280, 720))
+            return;
+        fb_clear(0x00000000);
+        fb_set_color(0x0000FF00, 0x00000000);
+        inited = true;
+    }
+    fb_puts("EARLY ");
+    fb_putc((char)code);
+    fb_putc('\n');
+}
+
 static void boot_policy_mac(const struct boot_policy_record *r, u8 out[32])
 {
     if (!r || !out) return;
@@ -4111,6 +4126,7 @@ void kernel_main(void) {
     bool sd_ok = false;
     bool walfs_ok = false;
     bool genet_ok = false;
+    early_boot_hdmi_mark('K');
 
     /* 1. Debug serial */
     uart_init();
