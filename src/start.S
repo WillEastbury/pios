@@ -10,39 +10,6 @@
 .global secondary_entry
 .extern early_boot_hdmi_mark
 
-/* PL011 raw MMIO helpers for pre-C diagnostics */
-.equ UART_DR_OFF,   0x00
-.equ UART_FR_OFF,   0x18
-.equ UART_IBRD_OFF, 0x24
-.equ UART_FBRD_OFF, 0x28
-.equ UART_LCRH_OFF, 0x2C
-.equ UART_CR_OFF,   0x30
-.equ UART_ICR_OFF,  0x44
-
-boot_uart_raw_init:
-    ldr     x9, =0x107C201000
-    mov     w10, #0
-    str     w10, [x9, #UART_CR_OFF]
-    mov     w10, #0x7FF
-    str     w10, [x9, #UART_ICR_OFF]
-    mov     w10, #26
-    str     w10, [x9, #UART_IBRD_OFF]
-    mov     w10, #3
-    str     w10, [x9, #UART_FBRD_OFF]
-    mov     w10, #0x70              /* 8N1 + FIFO */
-    str     w10, [x9, #UART_LCRH_OFF]
-    mov     w10, #0x301             /* UARTEN|TXE|RXE */
-    str     w10, [x9, #UART_CR_OFF]
-    ret
-
-boot_uart_raw_putc:
-    ldr     x9, =0x107C201000
-.Lraw_wait_tx:
-    ldr     w10, [x9, #UART_FR_OFF]
-    tbnz    w10, #5, .Lraw_wait_tx  /* TXFF */
-    str     w0, [x9, #UART_DR_OFF]
-    ret
-
 _start:
     mrs     x0, mpidr_el1
     and     x0, x0, #0x3
@@ -51,9 +18,13 @@ _start:
     /* Ensure EL2 trap path has a valid stack before EL2->EL1 drop */
     ldr     x1, =__stack_top_core0
     mov     sp, x1
-    bl      boot_uart_raw_init
+
+    /* Early UART breadcrumb: write directly to RP1 PL011 DR
+     * (firmware pre-configured UART on GPIO14/15 via enable_rp1_uart=1;
+     *  RP1 BAR at 0x1c00000000, UART0 offset 0x30000) */
+    ldr     x9, =0x1c00030000
     mov     w0, #'I'
-    bl      boot_uart_raw_putc
+    str     w0, [x9]
     mov     w0, #'S'
     bl      boot_uart_raw_putc
 

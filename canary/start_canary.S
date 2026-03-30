@@ -9,6 +9,16 @@ _start:
 
     ldr     x1, =__stack_top
     mov     sp, x1
+
+    /* Clear BSS (mbox buffer lives here) */
+    ldr     x1, =__bss_start
+    ldr     x2, =__bss_end
+.Lbss:
+    cmp     x1, x2
+    b.ge    .Lgo
+    str     xzr, [x1], #8
+    b       .Lbss
+.Lgo:
     bl      canary_main
 
 .Lhang:
