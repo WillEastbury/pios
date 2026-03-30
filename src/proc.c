@@ -27,6 +27,7 @@
 #include "workq.h"
 #include "picowal_db.h"
 #include "pix.h"
+#include "watchdog.h"
 
 static struct process  procs[MAX_PROCS_PER_CORE];
 static struct proc_context scheduler_ctx;
@@ -1383,6 +1384,7 @@ void proc_schedule(void)
     uart_putc('\n');
 
     for (;;) {
+        watchdog_touch(core_id());
         workq_drain(8);
         proc_handle_launch_request();
         bool found = false;

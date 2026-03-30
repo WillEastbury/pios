@@ -56,6 +56,7 @@
 #include "picowal_db.h"
 #include "el2.h"
 #include "crypto.h"
+#include "watchdog.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -159,6 +160,7 @@ static void ui_cmd_edit(const char *path);
 static void ui_cmd_capsule(u32 argc, char **argv);
 static void ui_cmd_obs(u32 argc, char **argv);
 static void ui_cmd_update(u32 argc, char **argv);
+static void ui_cmd_watchdog(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -2826,6 +2828,61 @@ static void ui_cmd_update(u32 argc, char **argv)
     ui_console_write("ERR: unknown update subcommand\n");
 }
 
+static void ui_cmd_watchdog(u32 argc, char **argv)
+{
+    if (!principal_has_cap(principal_current(), PRINCIPAL_ADMIN)) {
+        ui_console_write("ERR: admin required\n");
+        return;
+    }
+    if (argc < 2 || ui_streq(argv[1], "help")) {
+        ui_console_write("watchdog status | watchdog arm|disarm | watchdog timeout <ticks> | watchdog mode <halt|reboot> | watchdog trip\n");
+        return;
+    }
+    if (ui_streq(argv[1], "status")) {
+        struct watchdog_status st;
+        watchdog_status(&st);
+        fb_printf("watchdog armed=%u mode=%s timeout=%u trips=%u last_core=%u\n",
+                  st.armed ? 1U : 0U, st.reboot_on_trip ? "reboot" : "halt",
+                  st.timeout_ticks, st.trip_count, st.last_trip_core);
+        return;
+    }
+    if (ui_streq(argv[1], "arm")) {
+        watchdog_set_armed(true);
+        ui_console_write("OK: watchdog armed\n");
+        return;
+    }
+    if (ui_streq(argv[1], "disarm")) {
+        watchdog_set_armed(false);
+        ui_console_write("OK: watchdog disarmed\n");
+        return;
+    }
+    if (ui_streq(argv[1], "timeout")) {
+        u32 t = 0;
+        if (argc < 3 || !ui_parse_u32(argv[2], &t)) {
+            ui_console_write("ERR: usage watchdog timeout <ticks>\n");
+            return;
+        }
+        watchdog_set_timeout(t);
+        ui_console_write("OK: watchdog timeout updated\n");
+        return;
+    }
+    if (ui_streq(argv[1], "mode")) {
+        if (argc < 3) {
+            ui_console_write("ERR: usage watchdog mode <halt|reboot>\n");
+            return;
+        }
+        if (ui_streq(argv[2], "halt")) watchdog_set_reboot(false);
+        else if (ui_streq(argv[2], "reboot")) watchdog_set_reboot(true);
+        else { ui_console_write("ERR: mode must be halt|reboot\n"); return; }
+        ui_console_write("OK: watchdog mode updated\n");
+        return;
+    }
+    if (ui_streq(argv[1], "trip")) {
+        watchdog_trip(CORE_NET, 0x41U);
+    }
+    ui_console_write("ERR: unknown watchdog subcommand\n");
+}
+
 static bool ui_batch_pid_active(i32 pid)
 {
     if (pid <= 0) return false;
@@ -3401,7 +3458,7 @@ static void ui_console_exec(char *line)
     if (ui_streq(argv[0], "help")) {
         ui_console_write("help echo clear time ps kill launch run pwd cd lsdir mkdir touch\n");
         ui_console_write("copy cp cpdir mv cat stat rm find hexdump df mount umount\n");
-        ui_console_write("stream if for foreach source env batch svc update edit\n");
+        ui_console_write("stream if for foreach source env batch svc update watchdog edit\n");
         ui_console_write("hexsec fsinspect netcfg disk db capsule obs\n");
         ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d> | netcfg apply\n");
         ui_console_write("netcfg dhcp <on|off> [timeout_ms] | netcfg addnbr <ip> <mac>\n");
@@ -3410,6 +3467,7 @@ static void ui_console_exec(char *line)
         ui_console_write("batch run [parallel] | batch stop | batch status | batch list\n");
         ui_console_write("svc add|start|stop|restart|run|pause|target|list|clear\n");
         ui_console_write("update status|stage <slot> [tries]|success\n");
+        ui_console_write("watchdog status|arm|disarm|timeout <ticks>|mode <halt|reboot>|trip\n");
         ui_console_write("launch <path> [1|2|3] [lazy|low|normal|high|realtime]\n");
         ui_console_write("prio <pid> <lazy|low|normal|high|realtime> | affinity <pid> <1|2|3>\n");
         ui_console_write("source <script[.pis]> (auto-adds .pis)\n");
@@ -3666,6 +3724,8 @@ static void ui_console_exec(char *line)
         ui_cmd_obs(argc, argv);
     } else if (ui_streq(argv[0], "update")) {
         ui_cmd_update(argc, argv);
+    } else if (ui_streq(argv[0], "watchdog")) {
+        ui_cmd_watchdog(argc, argv);
     } else {
         ui_console_write("ERR: unknown command\n");
     }
@@ -3885,6 +3945,8 @@ NORETURN void core0_main(void) {
     ui_launch_idx = -1;
     ui_status_code = 0;
     for (;;) {
+        watchdog_touch(CORE_NET);
+        watchdog_poll();
         net_poll();
         disk_handle_request(CORE_USERM);
         disk_handle_request(CORE_USER0);
@@ -4076,6 +4138,7 @@ void kernel_main(void) {
 
     /* 4. Timer — 1000 Hz tick */
     timer_init(1000);
+    watchdog_init(5000, false);
 
     /* 5. Unmask IRQs on core 0 (DAIF.I clear) */
     __asm__ volatile("msr daifclr, #2");

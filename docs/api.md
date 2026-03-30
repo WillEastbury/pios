@@ -202,6 +202,12 @@ Update/rollback baseline:
 - Console command `update stage <slot> [tries]` arms a staged A/B candidate with bounded boot attempts.
 - If staged update is not confirmed (`update success`) before attempts are exhausted, boot state auto-rolls back to the previous slot.
 
+Watchdog/HA baseline:
+
+- Kernel watchdog tracks per-core heartbeats and trips on liveness timeout.
+- Trip policy is operator-configurable: halt/self-fence (default) or best-effort reboot path.
+- Console command `watchdog ...` exposes status, timeout, arm/disarm, mode, and forced trip.
+
 ### Paged I/O primitive
 
 - `page_open(path, page_size, flags)`
