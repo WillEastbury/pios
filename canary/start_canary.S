@@ -2,40 +2,64 @@
 .global _start
 
 /*
- * Ultra-minimal canary: pure assembly, no C, no init.
- * Firmware already configured RP1 UART at 0x1F00030000.
- * Just write chars directly to DR and loop.
+ * Canary v9: blind writes to TWO UARTs, no FIFO status check.
+ * PL011 TX FIFO is 16-deep so a few chars won't overflow.
+ *
+ * UART A: 0x1F00030000 (RP1 UART0 via PCIe BAR — firmware reported address)
+ * UART B: 0x107D001000 (BCM2712 debug UART — SoC-internal, no PCIe needed)
  */
 _start:
     mrs     x1, mpidr_el1
     and     x1, x1, #3
-    cbnz    x1, 1f
+    cbnz    x1, park
 
-    /* UART DR address — confirmed from firmware output */
-    ldr     x9, =0x1F00030000
+    /* Load both UART base addresses */
+    ldr     x10, =0x107D001000     /* BCM2712 debug UART — try first (on-SoC) */
+    ldr     x9, =0x1F00030000      /* RP1 UART via PCIe BAR — try second */
 
-    /* Wait for TX FIFO not full (FR bit 5), then send char */
-.macro PUTC ch
-5:  ldr     w2, [x9, #0x18]    /* PL011_FR */
-    tst     w2, #(1 << 5)      /* TXFF? */
-    b.ne    5b
-    mov     w0, #\ch
-    str     w0, [x9]           /* PL011_DR */
-.endm
+    /* Blind write to debug UART first (guaranteed on-SoC, no PCIe) */
+    mov     w0, #'P'
+    str     w0, [x10]
+    mov     w0, #'I'
+    str     w0, [x10]
+    mov     w0, #'O'
+    str     w0, [x10]
+    mov     w0, #'S'
+    str     w0, [x10]
+    mov     w0, #'1'
+    str     w0, [x10]
+    mov     w0, #'\r'
+    str     w0, [x10]
+    mov     w0, #'\n'
+    str     w0, [x10]
 
-    PUTC 'P'
-    PUTC 'I'
-    PUTC 'O'
-    PUTC 'S'
-    PUTC '\r'
-    PUTC '\n'
+    /* Now try RP1 UART (may fault if PCIe BAR not mapped) */
+    mov     w0, #'P'
+    str     w0, [x9]
+    mov     w0, #'I'
+    str     w0, [x9]
+    mov     w0, #'O'
+    str     w0, [x9]
+    mov     w0, #'S'
+    str     w0, [x9]
+    mov     w0, #'2'
+    str     w0, [x9]
+    mov     w0, #'\r'
+    str     w0, [x9]
+    mov     w0, #'\n'
+    str     w0, [x9]
 
-    /* Heartbeat dots forever */
-2:  PUTC '.'
+    /* Heartbeat dots to both */
+dot_loop:
+    mov     w0, #'.'
+    str     w0, [x9]
+    str     w0, [x10]
     mov     x3, #0x800000
-3:  sub     x3, x3, #1
-    cbnz    x3, 3b
-    b       2b
+delay:
+    sub     x3, x3, #1
+    cbnz    x3, delay
+    b       dot_loop
 
-1:  wfe
-    b       1b
+park:
+    wfe
+    b       park
