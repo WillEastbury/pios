@@ -25,13 +25,11 @@ _start:
     ldr     x9, =0x1c00030000
     mov     w0, #'I'
     str     w0, [x9]
-    mov     w0, #'S'
-    bl      boot_uart_raw_putc
 
     /* ---- EL2 → EL1 transition ---- */
     bl      el2_to_el1
     mov     w0, #'E'
-    bl      boot_uart_raw_putc
+    str     w0, [x9]
 
     /* ---- SCTLR_EL1: safe baseline (MMU off, caches off, alignment check on) ---- */
     mrs     x1, sctlr_el1
@@ -43,7 +41,7 @@ _start:
     msr     sctlr_el1, x1
     isb
     mov     w0, #'C'
-    bl      boot_uart_raw_putc
+    str     w0, [x9]
 
     /* Enable NEON / FPU (CPACR_EL1 bits [21:20] = 0b11) */
     mrs     x1, cpacr_el1
@@ -65,7 +63,7 @@ _start:
     msr     vbar_el1, x1
     isb
     mov     w0, #'V'
-    bl      boot_uart_raw_putc
+    str     w0, [x9]
 
     /* Clear BSS */
     ldr     x1, =__bss_start
@@ -77,9 +75,7 @@ _start:
     b       .Lbss_loop
 .Lbss_done:
     mov     w0, #'B'
-    bl      boot_uart_raw_putc
-    mov     x0, #'B'
-    bl      early_boot_hdmi_mark
+    str     w0, [x9]
 
     bl      kernel_main
     b       .Lhalt

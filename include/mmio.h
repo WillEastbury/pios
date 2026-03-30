@@ -10,11 +10,15 @@
 
 #define PERIPH_BASE         0x107C000000UL
 
-/* PL011 UART0 - pre-configured by firmware for serial console */
+/* PL011 UART0 - pre-configured by firmware for serial console.
+ * On BCM2712 this is at PERIPH_BASE + 0x201000 in the SoC address map,
+ * but GPIO14/15 UART is routed through RP1. For early boot before our
+ * PCIe driver runs, firmware maps RP1 at 0x1c00000000 with enable_rp1_uart=1.
+ * After our PCIe init remaps RP1 to RP1_BAR_BASE, use rp1_uart.h instead. */
 #define UART0_BASE          (PERIPH_BASE + 0x201000)
 
-/* VideoCore Mailbox */
-#define MBOX_BASE           (PERIPH_BASE + 0x00B880)
+/* VideoCore Mailbox (confirmed from bcm2712.dtsi: mailbox@7c013880) */
+#define MBOX_BASE           (PERIPH_BASE + 0x013880)
 
 /* EMMC2 / SD Host Controller */
 #define EMMC2_BASE          (PERIPH_BASE + 0x300000)
