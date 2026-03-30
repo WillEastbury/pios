@@ -305,6 +305,15 @@ i32 sock_close(i32 fd) {
     return SOCK_OK;
 }
 
+bool sock_local_port(i32 fd, u16 *port_out)
+{
+    struct socket_desc *s = get_sock(fd);
+    if (!s || !port_out) return false;
+    if (s->state == SOCK_STATE_NEW || s->state == SOCK_STATE_CLOSED) return false;
+    *port_out = s->local.port;
+    return true;
+}
+
 /* Non-blocking variants */
 i32 sock_send_nb(i32 fd, const void *data, u32 len) {
     struct socket_desc *s = get_sock(fd);

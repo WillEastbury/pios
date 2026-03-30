@@ -101,6 +101,9 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
 void net_handle_fifo_request(void);
 
 void net_set_udp_callback(udp_recv_cb cb);
+udp_recv_cb net_swap_udp_callback(udp_recv_cb cb);
+bool net_udp_subscribe(udp_recv_cb cb);
+bool net_udp_unsubscribe(udp_recv_cb cb);
 
 /* Detailed stats with per-drop-reason counters */
 typedef struct {

@@ -1,21 +1,29 @@
 ENTRY(_start)
 
+PHDRS
+{
+    text PT_LOAD FLAGS(5); /* R|X */
+    data PT_LOAD FLAGS(6); /* R|W */
+}
+
 SECTIONS
 {
     . = 0x80000;
 
-    .text.boot : { *(.text.boot) }
-    .text      : { *(.text) }
-    .rodata    : { *(.rodata*) }
-    .data      : { *(.data) }
+    __text_start = .;
+    .text.boot : { *(.text.boot) } :text
+    .text      : { *(.text*) } :text
+    __text_end = .;
+    .rodata    : { *(.rodata*) } :text
+    .data      : { *(.data*) } :data
 
     . = ALIGN(16);
     .bss (NOLOAD) : {
         __bss_start = .;
-        *(.bss)
+        *(.bss*)
         *(COMMON)
         __bss_end = .;
-    }
+    } :data
 
     /* 256KB stack per core, growing downward */
     . = ALIGN(4096);
@@ -28,6 +36,6 @@ SECTIONS
     . += 0x40000;
     __stack_top_core3 = .;
 
-    . = ALIGN(4096);
+    . = ALIGN(4096); /* inside RW segment for static reservations */
     __heap_start = .;
 }

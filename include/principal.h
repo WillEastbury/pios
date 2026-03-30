@@ -2,7 +2,7 @@
  * principal.h - User / principal identity and capability system
  *
  * Simple multi-user model for the bare-metal OS.
- * Principals are stored persistently in WALFS at /etc/principals.
+ * Principals are stored persistently in Picowal deck 1 (record 1).
  * Authentication uses iterated CRC32C hashing (1000 rounds).
  * Per-core current-principal tracking (no locks needed).
  */

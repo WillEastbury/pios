@@ -79,6 +79,9 @@ i32 sock_recvfrom(i32 fd, void *buf, u32 len, struct sockaddr_in *src);
 /* Close a socket. */
 i32 sock_close(i32 fd);
 
+/* Query local bound port for an fd (returns true if available). */
+bool sock_local_port(i32 fd, u16 *port_out);
+
 /* Non-blocking variants */
 i32 sock_send_nb(i32 fd, const void *data, u32 len);
 i32 sock_recv_nb(i32 fd, void *buf, u32 len);

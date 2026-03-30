@@ -14,6 +14,10 @@ _start:
     and     x0, x0, #0x3
     cbnz    x0, .Lpark          /* only core 0 continues */
 
+    /* Ensure EL2 trap path has a valid stack before EL2->EL1 drop */
+    ldr     x1, =__stack_top_core0
+    mov     sp, x1
+
     /* ---- EL2 → EL1 transition ---- */
     bl      el2_to_el1
 
@@ -86,6 +90,8 @@ secondary_entry:
 .macro SECONDARY_SETUP core_id, stack_sym, entry_fn
     /* Save core_id across bl */
     mov     x19, #\core_id
+    ldr     x1, =\stack_sym
+    mov     sp, x1
 
     /* EL2 → EL1 */
     bl      el2_to_el1

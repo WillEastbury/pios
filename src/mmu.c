@@ -31,9 +31,9 @@ static u64 l1_table[512] ALIGNED(4096);
 static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
 
 /* Per-process user tables for user cores (core2/core3). */
-static u64 user_l1[2][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
-static u64 user_l2_low[2][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
-static bool user_table_valid[2][MAX_PROCS_PER_CORE];
+static u64 user_l1[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
+static u64 user_l2_low[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
+static bool user_table_valid[3][MAX_PROCS_PER_CORE];
 
 /* Exported for secondary cores (read by start.S) */
 u64 shared_ttbr0;
@@ -102,17 +102,23 @@ static inline u64 dev_block_2m(u64 addr) {
 }
 
 static inline bool is_user_core(u32 core) {
-    return core == 2 || core == 3;
+    return core >= 1 && core <= 3;
 }
 
 static inline u32 user_core_index(u32 core) {
-    return core - 2;
+    return core - 1;
 }
 
 static inline void map_user_low_2m(u64 *l2, u32 idx, u64 pa, u64 attrs)
 {
     if (idx < 512)
         l2[idx] = (pa & ~(L2_BLOCK_SIZE - 1)) | attrs;
+}
+
+static inline u64 user_ram_attrs(void)
+{
+    return PTE_VALID | PTE_BLOCK | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
 }
 
 void mmu_init(void) {
@@ -256,14 +262,12 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
     l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
 
     /* Keep only minimum low RAM: kernel image/BSS/stacks (first 2MB). */
-    const u64 ram_attrs = PTE_VALID | PTE_BLOCK | PTE_AF |
-                          PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+    const u64 ram_attrs = user_ram_attrs();
     map_user_low_2m(l2, 0, 0, ram_attrs);
 
-    /* Map this process slot and shared FIFO/DMA/IPC-SHM windows. */
+    /* Map this process slot and shared FIFO window (kernel ABI FIFO path). */
     map_user_low_2m(l2, (u32)(slot_base / L2_BLOCK_SIZE), slot_base, ram_attrs);
-    for (u64 pa = SHARED_FIFO_BASE; pa < IPC_SHM_BASE + IPC_SHM_SIZE; pa += L2_BLOCK_SIZE)
-        map_user_low_2m(l2, (u32)(pa / L2_BLOCK_SIZE), pa, ram_attrs);
+    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
 
     /* Keep peripheral MMIO mapped for current direct-call kernel API ABI. */
     for (u32 idx = 4; idx < 8; idx++)
@@ -293,6 +297,27 @@ void mmu_switch_to_kernel(void)
 {
     __asm__ volatile("msr ttbr0_el1, %0" :: "r"(shared_ttbr0));
     mmu_invalidate_tlb();
+}
+
+bool mmu_user_ipc_shm_window(u32 core, u32 slot, bool enable)
+{
+    if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
+        return false;
+    u32 uc = user_core_index(core);
+    if (!user_table_valid[uc][slot])
+        return false;
+
+    u64 *l2 = user_l2_low[uc][slot];
+    u32 idx = (u32)(IPC_SHM_BASE / L2_BLOCK_SIZE);
+    if (enable) {
+        map_user_low_2m(l2, idx, IPC_SHM_BASE, user_ram_attrs());
+    } else if (idx < 512) {
+        l2[idx] = 0;
+    }
+
+    if (core == core_id())
+        mmu_invalidate_tlb();
+    return true;
 }
 
 void dcache_clean_range(u64 start, u64 size) {

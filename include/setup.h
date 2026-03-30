@@ -3,7 +3,7 @@
 
 /*
  * First-boot setup flow:
- * - detects /etc/setup_done marker
+ * - detects internal setup marker in Picowal deck 0 (record 2)
  * - reports subsystem readiness
  * - hardens root credential bootstrapping
  * - persists setup completion marker

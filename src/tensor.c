@@ -25,13 +25,9 @@
  *     - Process with ALU
  *     - Write results via TLB/VPM
  *
- * NOTE: VideoCore VII QPU ISA is not fully public.
- * These are placeholder shaders that demonstrate the dispatch
- * framework. Real QPU code would be assembled from the
- * VC VII instruction set once fully reverse-engineered.
- *
- * For now, tensor ops fall back to NEON on the ARM side
- * while the QPU dispatch infrastructure is ready and waiting.
+ * VideoCore VII QPU kernels are provided via externally bound
+ * shader/uniform blobs (`v3d_kernel_bind_blob`), with NEON as
+ * deterministic fallback when no validated kernel is bound.
  */
 
 /* Kernel dispatch is enabled only when V3D kernel descriptors are bound.

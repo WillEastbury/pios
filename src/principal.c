@@ -1,7 +1,8 @@
 /*
  * principal.c - User / principal identity and capability system
  *
- * Persistent principal store in WALFS (/etc/principals).
+ * Persistent principal store in WALFS using Picowal deck mapping:
+ *   deck 1 (principals) record 1 -> /var/picowal/c1/r1.rec
  * On first boot, creates root principal with default credentials.
  * Per-core current principal tracked in a static array (no locks).
  */
@@ -11,6 +12,33 @@
 #include "simd.h"
 #include "uart.h"
 #include "timer.h"
+
+#define PRINCIPAL_STORE_DIR   "/var/picowal/c1"
+#define PRINCIPAL_STORE_PATH  "/var/picowal/c1/r1.rec"
+
+static bool ensure_principal_store_path(void)
+{
+    u64 var_id = walfs_find("/var");
+    if (!var_id) {
+        var_id = walfs_create(WALFS_ROOT_INODE, "var", WALFS_DIR, 0755);
+        if (!var_id) return false;
+    }
+    u64 picowal_id = walfs_find("/var/picowal");
+    if (!picowal_id) {
+        picowal_id = walfs_create(var_id, "picowal", WALFS_DIR, 0755);
+        if (!picowal_id) return false;
+    }
+    u64 c1_id = walfs_find(PRINCIPAL_STORE_DIR);
+    if (!c1_id) {
+        c1_id = walfs_create(picowal_id, "c1", WALFS_DIR, 0755);
+        if (!c1_id) return false;
+    }
+    if (!walfs_find(PRINCIPAL_STORE_PATH)) {
+        u64 rid = walfs_create(c1_id, "r1.rec", WALFS_FILE, 0600);
+        if (!rid) return false;
+    }
+    return true;
+}
 
 /* Constant-time comparison to prevent timing side-channel attacks */
 static bool ct_eq(const u8 *a, const u8 *b, u32 len) {
@@ -57,10 +85,10 @@ static void hash_pass(const char *pass, u8 out[4])
     hash_pass_salted("", pass, out);
 }
 
-/* Write principal table back to /etc/principals */
+/* Write principal table to deck 1 / record 1. */
 static bool flush_principals(void)
 {
-    u64 fid = walfs_find("/etc/principals");
+    u64 fid = walfs_find(PRINCIPAL_STORE_PATH);
     if (!fid) return false;
     return walfs_write(fid, 0, principals,
                        principal_count * sizeof(struct principal));
@@ -107,22 +135,16 @@ bool principal_init(void)
     simd_zero(current_principal, sizeof(current_principal));
     principal_count = 0;
 
-    u64 fid = walfs_find("/etc/principals");
+    if (!ensure_principal_store_path())
+        return false;
+
+    u64 fid = walfs_find(PRINCIPAL_STORE_PATH);
     if (fid) {
         u32 n = walfs_read(fid, 0, principals, sizeof(principals));
         principal_count = n / sizeof(struct principal);
-        return principal_count > 0;
+        if (principal_count > 0)
+            return true;
     }
-
-    /* First boot — create /etc directory and principals file */
-    u64 etc_id = walfs_find("/etc");
-    if (!etc_id) {
-        etc_id = walfs_create(WALFS_ROOT_INODE, "etc", WALFS_DIR, 0755);
-        if (!etc_id) return false;
-    }
-
-    fid = walfs_create(etc_id, "principals", WALFS_FILE, 0600);
-    if (!fid) return false;
 
     /* Seed with root principal (all capabilities) */
     struct principal *r = &principals[0];

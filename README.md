@@ -13,7 +13,7 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 │                     PIOS Microkernel                        │
 ├──────────┬──────────┬──────────┬───────────────────────────┤
 │  Core 0  │  Core 1  │  Core 2  │         Core 3            │
-│  NET     │  DISK    │  USER    │         USER              │
+│ KERNEL+NET│  USER   │  USER    │         USER              │
 ├──────────┴──────────┴──────────┴───────────────────────────┤
 │           Inter-Core FIFO (SPSC, lock-free)                │
 ├──────────┬──────────┬──────────────────────────────────────┤
@@ -30,7 +30,7 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 
 | Feature | Description |
 |---------|-------------|
-| **4-Core Architecture** | Core 0=Network, Core 1=Disk, Core 2-3=User. Each core has 16MB private RAM. |
+| **4-Core Architecture** | Core 0=Kernel services+Network, Core 1-3=User schedulers. Each core has 16MB private RAM. |
 | **Hardened Network Stack** | IP/TCP/UDP/ICMP/ARP with strict ingress validation and no fragmentation. |
 | **Raw Block Storage** | SDHCI driver for SD/eMMC. Pure LBA addressing, no filesystem. |
 | **HDMI Boot Console** | 1280×720 framebuffer with 8×8 bitmap font, `fb_printf()`. |
@@ -44,6 +44,7 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 | **GIC-400 Interrupts** | Full interrupt controller with timer IRQ support. |
 | **Preemptive User Scheduling** | Cores 2-3 run timer-driven quanta (default 5ms @ 1kHz) with safe deferred preemption. |
 | **EL2→EL1 Boot** | Proper exception level transition with NEON/timer access enabled. |
+| **EL2 Capsule + Stage-2 Groundwork** | Capsule descriptors plus HVC-managed stage-2 planning/enabling metadata (VMID/IPA policy scaffolding); user apps (including console apps) default to capsule binding, with optional shared capsule groups, virtual fs roots, and capsule-local shared memory via IPC SHM. |
 
 ## Building
 
@@ -197,8 +198,8 @@ Address             Size    Purpose
 ─────────────────────────────────────────────────────
 0x00080000          ~15KB   Kernel image (.text + .rodata + .data)
 0x00080000+         ~1MB    BSS (stacks, static buffers)
-0x00200000          16MB    Core 0 private RAM (Network)
-0x01200000          16MB    Core 1 private RAM (Disk I/O)
+0x00200000          16MB    Core 0 private RAM (Kernel/Network service)
+0x01200000          16MB    Core 1 private RAM (User)
 0x02200000          16MB    Core 2 private RAM (User 0)
 0x03200000          16MB    Core 3 private RAM (User 1)
 0x04200000          1MB     Shared FIFO rings

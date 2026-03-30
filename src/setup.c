@@ -1,10 +1,10 @@
 /*
  * setup.c - First-boot setup flow
  *
- * Runs once when /etc/setup_done is missing:
+ * Runs once when deck 0 internal setup marker is missing:
  *   - reports network/HDMI/USB+keyboard status
  *   - rotates root away from hardcoded default on first boot
- *   - writes /etc/setup_done marker after minimum criteria are met
+ *   - writes marker record after minimum criteria are met
  */
 
 #include "setup.h"
@@ -16,6 +16,9 @@
 #include "principal.h"
 #include "simd.h"
 #include "timer.h"
+
+#define SETUP_MARKER_DIR   "/var/picowal/c0"
+#define SETUP_MARKER_PATH  "/var/picowal/c0/r2.rec"
 
 static bool setup_fb_console;
 
@@ -72,16 +75,27 @@ static void setup_print_temp_token(const char token[17])
 static bool setup_write_marker(void)
 {
     static const char marker_data[] = "setup=done\n";
-    u64 etc_id = walfs_find("/etc");
-    if (!etc_id) {
-        etc_id = walfs_create(WALFS_ROOT_INODE, "etc", WALFS_DIR, 0755);
-        if (!etc_id)
+    u64 var_id = walfs_find("/var");
+    if (!var_id) {
+        var_id = walfs_create(WALFS_ROOT_INODE, "var", WALFS_DIR, 0755);
+        if (!var_id)
             return false;
     }
-
-    u64 marker_id = walfs_find("/etc/setup_done");
+    u64 picowal_id = walfs_find("/var/picowal");
+    if (!picowal_id) {
+        picowal_id = walfs_create(var_id, "picowal", WALFS_DIR, 0755);
+        if (!picowal_id)
+            return false;
+    }
+    u64 c0_id = walfs_find(SETUP_MARKER_DIR);
+    if (!c0_id) {
+        c0_id = walfs_create(picowal_id, "c0", WALFS_DIR, 0755);
+        if (!c0_id)
+            return false;
+    }
+    u64 marker_id = walfs_find(SETUP_MARKER_PATH);
     if (!marker_id) {
-        marker_id = walfs_create(etc_id, "setup_done", WALFS_FILE, 0600);
+        marker_id = walfs_create(c0_id, "r2.rec", WALFS_FILE, 0600);
         if (!marker_id)
             return false;
     }
@@ -93,12 +107,12 @@ bool setup_run(bool fb_available, bool net_ready, bool usb_ready)
 {
     setup_fb_console = fb_available;
 
-    if (walfs_find("/etc/setup_done")) {
-        setup_log("[setup] setup_done marker found, skipping first-boot flow.\n");
+    if (walfs_find(SETUP_MARKER_PATH)) {
+        setup_log("[setup] setup marker found (deck0/record2), skipping first-boot flow.\n");
         return true;
     }
 
-    setup_log("[setup] First boot detected (missing /etc/setup_done)\n");
+    setup_log("[setup] First boot detected (missing deck0/record2 marker)\n");
     setup_log_bool("[setup] Network stack: ", net_ready);
     setup_log_bool("[setup] Network link: ", genet_link_up());
     setup_log_bool("[setup] HDMI/framebuffer: ", fb_available);
@@ -132,7 +146,7 @@ bool setup_run(bool fb_available, bool net_ready, bool usb_ready)
     }
 
     if (!setup_write_marker()) {
-        setup_log("[setup] Setup incomplete: could not persist /etc/setup_done.\n");
+        setup_log("[setup] Setup incomplete: could not persist deck0 setup marker.\n");
         return false;
     }
 

@@ -49,3 +49,5 @@ void irq_register(u32 intid, irq_handler_t handler);
 
 /* IRQ dispatcher called from vectors.S */
 void irq_dispatch(struct irq_frame *frame);
+
+NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far);

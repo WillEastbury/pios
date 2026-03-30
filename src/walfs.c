@@ -24,6 +24,67 @@
 #define WAL_REC_MIN  sizeof(struct wal_record)
 #define WAL_REC_MAX  (WALFS_DATA_MAX + 256)
 
+struct readdir_entry_wire {
+    u64 inode_id;
+    u8 name[128];
+} PACKED;
+
+struct readdir_fill_ctx {
+    struct readdir_entry_wire *out;
+    u32 max;
+    u32 count;
+};
+static struct readdir_fill_ctx readdir_ctx;
+
+static void readdir_fill_cb(const struct walfs_dirent *entry)
+{
+    if (!entry || readdir_ctx.count >= readdir_ctx.max)
+        return;
+    struct readdir_entry_wire *dst = &readdir_ctx.out[readdir_ctx.count++];
+    dst->inode_id = entry->child_id;
+    for (u32 i = 0; i < 127; i++) {
+        dst->name[i] = entry->name[i];
+        if (entry->name[i] == 0) break;
+    }
+    dst->name[127] = 0;
+}
+
+static bool split_path_parent_name(const char *path, char *parent, u32 parent_max, char *name, u32 name_max)
+{
+    if (!path || path[0] != '/' || !parent || !name || parent_max < 2 || name_max < 2)
+        return false;
+    u32 len = pios_strlen(path);
+    if (len < 2)
+        return false;
+    while (len > 1 && path[len - 1] == '/')
+        len--;
+    if (len < 2)
+        return false;
+    i32 slash = -1;
+    for (u32 i = 0; i < len; i++)
+        if (path[i] == '/') slash = (i32)i;
+    if (slash < 0 || (u32)slash >= len - 1)
+        return false;
+    u32 nlen = len - (u32)slash - 1;
+    if (nlen + 1 > name_max)
+        return false;
+    for (u32 i = 0; i < nlen; i++)
+        name[i] = path[(u32)slash + 1 + i];
+    name[nlen] = 0;
+
+    if (slash == 0) {
+        parent[0] = '/';
+        parent[1] = 0;
+        return true;
+    }
+    if ((u32)slash + 1 > parent_max)
+        return false;
+    for (u32 i = 0; i < (u32)slash; i++)
+        parent[i] = path[i];
+    parent[slash] = 0;
+    return true;
+}
+
 /* Validate record header length — prevents infinite loops on corrupt data */
 static inline bool wal_rec_valid(const struct wal_record *h) {
     return h->magic == WALFS_REC_MAGIC &&
@@ -1001,7 +1062,18 @@ void walfs_handle_fifo(u32 from_core)
         }
         u32 flags = (msg.type == MSG_FS_MKDIR) ? WALFS_DIR : WALFS_FILE;
         u32 mode = (u32)(msg.tag & 0xFFFFFFFFU);
-        u64 id = walfs_create((u64)msg.param, (const char *)(usize)msg.buffer, flags, mode);
+        u64 id = 0;
+        if (msg.param != 0) {
+            id = walfs_create((u64)msg.param, (const char *)(usize)msg.buffer, flags, mode);
+        } else {
+            char parent[256];
+            char name[128];
+            if (split_path_parent_name((const char *)(usize)msg.buffer, parent, sizeof(parent), name, sizeof(name))) {
+                u64 pid_parent = walfs_find(parent);
+                if (pid_parent)
+                    id = walfs_create(pid_parent, name, flags, mode);
+            }
+        }
         reply.type = id ? MSG_FS_DONE : MSG_FS_ERROR;
         reply.status = id ? 0 : 1;
         reply.param = (u32)id;
@@ -1091,12 +1163,18 @@ void walfs_handle_fifo(u32 from_core)
         break;
     }
     case MSG_FS_READDIR:
-        /* msg.buffer is a user-space data buffer, NOT a function pointer.
-         * We cannot call it as a callback. Instead, do nothing — readdir
-         * from userland should use the proc.c kernel API path which handles
-         * serialization safely via FIFO reply messages. */
-        reply.type = MSG_FS_ERROR;
-        reply.status = 1;
+        if (!msg.buffer || msg.param == 0 || msg.tag == 0) {
+            reply.type = MSG_FS_ERROR;
+            reply.status = 1;
+            break;
+        }
+        readdir_ctx.out = (struct readdir_entry_wire *)(usize)msg.buffer;
+        readdir_ctx.max = (u32)msg.tag;
+        readdir_ctx.count = 0;
+        walfs_readdir((u64)msg.param, readdir_fill_cb);
+        reply.type = MSG_FS_DONE;
+        reply.status = 0;
+        reply.param = readdir_ctx.count;
         break;
     default:
         reply.type = MSG_FS_ERROR;

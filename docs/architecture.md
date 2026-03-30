@@ -184,3 +184,11 @@ The vector table (`vectors.S`) provides 16 entries (4 exception types × 4 EL/SP
 | **SError** | `serror_handler` | Save context → `serror_exception()` (C) → prints ESR → halts |
 
 IRQ handlers are registered via `irq_register(intid, handler)` in `exception.c`. Currently the only IRQ source is the virtual timer (PPI 27).
+
+## Capsule / Migration Notes
+
+- User processes are capsule-bound by default; scheduler switch selects EL2 stage-2 capsule context and deactivates on return to host context.
+- Core affinity changes migrate by relaunching on the target core with **state carry-over** for PID identity, parent linkage, runtime/preemption accounting, heap watermark, and capsule quota counters, then retiring the old slot.
+- Full in-memory register/heap image transfer and live IPC handle handoff remain future work.
+- Runtime integrity is hash-attested: launch baseline for EL0 image, periodic EL2-side re-hash, capsule-wide kill on EL0 drift, and system PiSOD on EL1/EL2 drift.
+- Boot integrity policy is persisted in Picowal (`deck0/record10` + rollback floor `deck0/record11`) with HMAC-authenticated measurements and monotonic version gating.

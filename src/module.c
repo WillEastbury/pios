@@ -2,7 +2,7 @@
  * module.c - Kernel module loader and hook dispatch
  */
 
-#include "pxe.h"
+#include "pix.h"
 #include "uart.h"
 #include "simd.h"
 
@@ -73,17 +73,17 @@ static u8 *alloc_module_slot(u32 *out_index)
 
 bool module_load(const u8 *file, u32 file_size)
 {
-    if (file_size < sizeof(struct pxe_header) + sizeof(struct pxe_module_info))
+    if (file_size < sizeof(struct pix_header) + sizeof(struct pix_module_info))
         return false;
 
-    const struct pxe_header *hdr = (const struct pxe_header *)file;
+    const struct pix_header *hdr = (const struct pix_header *)file;
 
-    if (hdr->magic != PXE_MAGIC || hdr->type != PXE_MODULE)
+    if (hdr->magic != PIX_MAGIC || hdr->type != PIX_MODULE)
         return false;
 
-    /* Module info sits right after the PXE header */
-    const struct pxe_module_info *info =
-        (const struct pxe_module_info *)(file + sizeof(struct pxe_header));
+    /* Module info sits right after the PIX header */
+    const struct pix_module_info *info =
+        (const struct pix_module_info *)(file + sizeof(struct pix_header));
 
     /* Allocate a module slot */
     u32 slot_idx;
@@ -93,8 +93,8 @@ bool module_load(const u8 *file, u32 file_size)
         return false;
     }
 
-    /* Load the PXE binary */
-    u64 entry = pxe_load(file, file_size, base, MODULE_SLOT_SIZE, NULL);
+    /* Load the PIX binary */
+    u64 entry = pix_load(file, file_size, base, MODULE_SLOT_SIZE, NULL);
     if (!entry) {
         uart_puts("mod: load failed\n");
         return false;

@@ -20,6 +20,8 @@
 #define V3D_CSD_QUEUED_CFG5_OFF  0x3C34U
 #define V3D_CSD_QUEUED_CFG6_OFF  0x3C38U
 #define V3D_CSD_STATUS_BUSY_MASK (1U << 0)
+#define V3D_SHADER_INSTS_MAX     8192U
+#define V3D_UNIFORM_BYTES_MAX    4096U
 
 static struct v3d_caps g_v3d_caps;
 static bool g_mmio_auto_quarantined;
@@ -310,10 +312,15 @@ v3d_status_t v3d_kernel_bind_blob(v3d_kernel_id_t id,
         return V3D_STATUS_INVALID;
     if (!uniform_data || uniform_bytes == 0 || !shader_code || shader_insts == 0)
         return V3D_STATUS_INVALID;
+    if (uniform_bytes > V3D_UNIFORM_BYTES_MAX || shader_insts > V3D_SHADER_INSTS_MAX)
+        return V3D_STATUS_INVALID;
     if (!g_v3d_caps.dispatch_supported)
         return V3D_STATUS_UNSUPPORTED;
 
-    u32 shader_bytes = shader_insts * 8U;
+    u64 shader_bytes64 = (u64)shader_insts * 8U;
+    if (shader_bytes64 > 0xFFFFFFFFU)
+        return V3D_STATUS_INVALID;
+    u32 shader_bytes = (u32)shader_bytes64;
     u32 uniform_alloc = (uniform_bytes + 15U) & ~15U;
     u32 shader_alloc = (shader_bytes + 15U) & ~15U;
 
@@ -367,5 +374,10 @@ v3d_status_t v3d_kernel_bind_blob(v3d_kernel_id_t id,
     g_kernel_uniform_bus[id] = uniform_bus;
     g_kernel_shader_handle[id] = shader_handle;
     g_kernel_shader_bus[id] = shader_bus;
+    uart_puts("[v3d] kernel bound: ");
+    uart_puts(g_kernels[id].name);
+    uart_puts(" qpu=");
+    uart_hex(g_kernels[id].qpu_count);
+    uart_puts("\n");
     return V3D_STATUS_OK;
 }

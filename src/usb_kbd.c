@@ -90,12 +90,22 @@ static const char hid_to_ascii_shift[128] = {
 static char kbd_buf[KBD_BUF_SIZE];
 static volatile u32 kbd_head;
 static volatile u32 kbd_tail;
+static u8 kbd_key_buf[32];
+static volatile u32 kbd_key_head;
+static volatile u32 kbd_key_tail;
 
 static void kbd_push(char c) {
     u32 next = (kbd_head + 1) & (KBD_BUF_SIZE - 1);
     if (next == kbd_tail) return; /* full, drop */
     kbd_buf[kbd_head] = c;
     kbd_head = next;
+}
+
+static void kbd_push_key(u8 code) {
+    u32 next = (kbd_key_head + 1) & 31U;
+    if (next == kbd_key_tail) return;
+    kbd_key_buf[kbd_key_head] = code;
+    kbd_key_head = next;
 }
 
 /* ---- Driver State ---- */
@@ -144,6 +154,13 @@ static void process_report(const u8 *report) {
 
         if (c)
             kbd_push(c);
+        if (code == USB_KBD_KEY_F1 || code == USB_KBD_KEY_F2 ||
+            code == USB_KBD_KEY_F3 || code == USB_KBD_KEY_F4 ||
+            code == USB_KBD_KEY_INSERT || code == USB_KBD_KEY_HOME ||
+            code == USB_KBD_KEY_DELETE || code == USB_KBD_KEY_END ||
+            code == USB_KBD_KEY_RIGHT || code == USB_KBD_KEY_LEFT ||
+            code == USB_KBD_KEY_DOWN || code == USB_KBD_KEY_UP)
+            kbd_push_key(code);
     }
 
     /* Save for next comparison */
@@ -205,6 +222,8 @@ static bool kbd_probe(struct usb_device *dev) {
     for (u32 i = 0; i < 6; i++) prev_keys[i] = 0;
     kbd_head = 0;
     kbd_tail = 0;
+    kbd_key_head = 0;
+    kbd_key_tail = 0;
     poll_pending = false;
     kbd_ready = true;
 
@@ -248,6 +267,14 @@ i32 usb_kbd_try_getc(void) {
     char c = kbd_buf[kbd_tail];
     kbd_tail = (kbd_tail + 1) & (KBD_BUF_SIZE - 1);
     return (i32)c;
+}
+
+i32 usb_kbd_try_getkey(void) {
+    usb_kbd_poll();
+    if (kbd_key_head == kbd_key_tail) return -1;
+    u8 code = kbd_key_buf[kbd_key_tail];
+    kbd_key_tail = (kbd_key_tail + 1) & 31U;
+    return (i32)code;
 }
 
 char usb_kbd_getc(void) {

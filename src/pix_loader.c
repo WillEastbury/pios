@@ -1,8 +1,8 @@
 /*
- * pxe_loader.c - PXE executable loader with relocations + minimal ELF64 loader
+ * pix_loader.c - PIX executable loader with relocations + minimal ELF64 loader
  */
 
-#include "pxe.h"
+#include "pix.h"
 #include "uart.h"
 #include "simd.h"
 #include "mmu.h"
@@ -62,7 +62,7 @@ static void flush_icache(u64 start, u64 size)
 
 /* ---- CRC32 verification ---- */
 
-static u32 compute_header_crc(const struct pxe_header *h)
+static u32 compute_header_crc(const struct pix_header *h)
 {
     /* CRC covers everything except the crc32 field itself (last 4 bytes) */
     u32 header_len = (u32)((u64)&h->crc32 - (u64)h);
@@ -72,17 +72,17 @@ static u32 compute_header_crc(const struct pxe_header *h)
 /* ---- Relocation ---- */
 
 static bool apply_relocations(u8 *base, const u8 *file,
-                              const struct pxe_header *hdr, u64 load_base)
+                              const struct pix_header *hdr, u64 load_base)
 {
-    const struct pxe_reloc *relocs =
-        (const struct pxe_reloc *)(file + hdr->reloc_offset);
+    const struct pix_reloc *relocs =
+        (const struct pix_reloc *)(file + hdr->reloc_offset);
 
     u32 image_span = hdr->code_size + hdr->data_size;
     if (image_span < hdr->code_size)
         return false;
 
     for (u32 i = 0; i < hdr->reloc_count; i++) {
-        const struct pxe_reloc *r = &relocs[i];
+        const struct pix_reloc *r = &relocs[i];
         u32 off = r->offset;
 
         /* Bounds check */
@@ -130,10 +130,10 @@ static func_ptr resolve_import(u32 name_hash, void *user_table)
 }
 
 static bool resolve_imports(u8 *base, const u8 *file,
-                            const struct pxe_header *hdr, void *kernel_api_tbl)
+                            const struct pix_header *hdr, void *kernel_api_tbl)
 {
-    const struct pxe_import *imports =
-        (const struct pxe_import *)(file + hdr->import_offset);
+    const struct pix_import *imports =
+        (const struct pix_import *)(file + hdr->import_offset);
     u32 image_span = hdr->code_size + hdr->data_size;
     if (image_span < hdr->code_size)
         return false;
@@ -141,7 +141,7 @@ static bool resolve_imports(u8 *base, const u8 *file,
     for (u32 i = 0; i < hdr->import_count; i++) {
         func_ptr fn = resolve_import(imports[i].name_hash, kernel_api_tbl);
         if (!fn) {
-            uart_puts("pxe: unresolved import\n");
+            uart_puts("pix: unresolved import\n");
             return false;
         }
 
@@ -156,25 +156,25 @@ static bool resolve_imports(u8 *base, const u8 *file,
     return true;
 }
 
-/* ---- PXE loader ---- */
+/* ---- PIX loader ---- */
 
-u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
+u64 pix_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
              void *kernel_api_table)
 {
     if (!file || !base || slot_size == 0)
         return 0;
-    if (file_size < sizeof(struct pxe_header))
+    if (file_size < sizeof(struct pix_header))
         return 0;
 
-    const struct pxe_header *hdr = (const struct pxe_header *)file;
+    const struct pix_header *hdr = (const struct pix_header *)file;
 
     /* Verify magic and version */
-    if (hdr->magic != PXE_MAGIC || hdr->version != PXE_VERSION)
+    if (hdr->magic != PIX_MAGIC || hdr->version != PIX_VERSION)
         return 0;
 
     /* Verify CRC */
     if (hdr->crc32 != compute_header_crc(hdr)) {
-        uart_puts("pxe: bad crc\n");
+        uart_puts("pix: bad crc\n");
         return 0;
     }
 
@@ -192,12 +192,12 @@ u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
         (hdr->data_offset > file_size || hdr->data_size > file_size - hdr->data_offset))
         return 0;
     if (hdr->reloc_count) {
-        u64 reloc_bytes = (u64)hdr->reloc_count * sizeof(struct pxe_reloc);
+        u64 reloc_bytes = (u64)hdr->reloc_count * sizeof(struct pix_reloc);
         if (hdr->reloc_offset > file_size || reloc_bytes > (u64)file_size - hdr->reloc_offset)
             return 0;
     }
     if (hdr->import_count) {
-        u64 import_bytes = (u64)hdr->import_count * sizeof(struct pxe_import);
+        u64 import_bytes = (u64)hdr->import_count * sizeof(struct pix_import);
         if (hdr->import_offset > file_size || import_bytes > (u64)file_size - hdr->import_offset)
             return 0;
     }
@@ -223,7 +223,7 @@ u64 pxe_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
 
     /* Apply relocations */
     if (hdr->reloc_count) {
-        if (!(hdr->flags & PXE_RELOCATABLE))
+        if (!(hdr->flags & PIX_RELOCATABLE))
             return 0;
         if (!apply_relocations(base, file, hdr, load_base))
             return 0;

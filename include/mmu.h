@@ -52,6 +52,9 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size);
 /* Switch active TTBR0 to a process table on core 2/3 */
 bool mmu_switch_to_user(u32 core, u32 slot);
 
+/* Toggle user-process visibility of the IPC SHM window (coarse 2MB block). */
+bool mmu_user_ipc_shm_window(u32 core, u32 slot, bool enable);
+
 /* Switch active TTBR0 back to the global kernel table */
 void mmu_switch_to_kernel(void);
 

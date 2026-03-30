@@ -27,6 +27,7 @@ static u32 our_mask;
 static u8  our_mac[6];
 
 static udp_recv_cb udp_callback;
+static udp_recv_cb udp_subscribers[4];
 static net_stats_t stats;
 
 static bool mac_is_zero_6(const u8 *m) {
@@ -202,6 +203,14 @@ static void handle_udp(const u8 *frame, u32 len,
                      ntohs(udp->src_port),
                      ntohs(udp->dst_port),
                      data, data_len);
+    }
+    for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++) {
+        if (udp_subscribers[i]) {
+            udp_subscribers[i](ntohl(ip->src_ip),
+                               ntohs(udp->src_port),
+                               ntohs(udp->dst_port),
+                               data, data_len);
+        }
     }
 }
 
@@ -488,6 +497,8 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     simd_zero(neighbors, sizeof(neighbors));
     neighbor_count = 0;
     udp_callback   = NULL;
+    for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++)
+        udp_subscribers[i] = NULL;
     ip_id_counter  = 1;
 
     u64 freq = read_cntfrq();
@@ -530,6 +541,40 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
 
 void net_set_udp_callback(udp_recv_cb cb) {
     udp_callback = cb;
+}
+
+udp_recv_cb net_swap_udp_callback(udp_recv_cb cb) {
+    udp_recv_cb prev = udp_callback;
+    udp_callback = cb;
+    return prev;
+}
+
+bool net_udp_subscribe(udp_recv_cb cb)
+{
+    if (!cb) return false;
+    for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++) {
+        if (udp_subscribers[i] == cb)
+            return true;
+    }
+    for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++) {
+        if (!udp_subscribers[i]) {
+            udp_subscribers[i] = cb;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool net_udp_unsubscribe(udp_recv_cb cb)
+{
+    if (!cb) return false;
+    for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++) {
+        if (udp_subscribers[i] == cb) {
+            udp_subscribers[i] = NULL;
+            return true;
+        }
+    }
+    return false;
 }
 
 u32 net_get_our_ip(void) {
