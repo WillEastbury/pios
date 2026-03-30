@@ -296,6 +296,9 @@ struct ui_stream_udp_rx {
     u8 data[1472];
 };
 static struct ui_stream_udp_rx ui_stream_udp;
+static bool ui_act_led_ready;
+static bool ui_act_led_level;
+static u64 ui_act_led_next_tick;
 
 static const char *const ui_launch_candidates[] = {
     "/bin/console.pix",
@@ -306,6 +309,28 @@ static const char *const ui_launch_candidates[] = {
     "/bin/demo.pix",
     "/app/main.pix",
 };
+
+static void ui_act_led_init(void)
+{
+    /* Pi 5 ACT LED is driven from RP1 GPIO42 on most boards (active-low). */
+    rp1_gpio_set_function(42, RP1_FSEL_GPIO);
+    rp1_gpio_set_dir_output(42);
+    ui_act_led_level = false;
+    rp1_gpio_write(42, true);
+    ui_act_led_ready = true;
+    ui_act_led_next_tick = timer_ticks() + 250ULL;
+}
+
+static void ui_act_led_tick(void)
+{
+    if (!ui_act_led_ready) return;
+    u64 now = timer_ticks();
+    if (now < ui_act_led_next_tick) return;
+    ui_act_led_next_tick = now + 250ULL;
+    ui_act_led_level = !ui_act_led_level;
+    /* Active-low LED: false means on. */
+    rp1_gpio_write(42, ui_act_led_level ? true : false);
+}
 
 static void boot_measurements(u32 *el1_hash, u32 *el2_hash, u64 *el1_start, u32 *el1_len)
 {
@@ -3960,6 +3985,7 @@ NORETURN void core0_main(void) {
     ui_launch_idx = -1;
     ui_status_code = 0;
     for (;;) {
+        ui_act_led_tick();
         watchdog_touch(CORE_NET);
         watchdog_poll();
         net_poll();
@@ -4167,6 +4193,7 @@ void kernel_main(void) {
         if (rp1_init()) {
             rp1_clk_init();
             rp1_gpio_init();
+            ui_act_led_init();
             usb_storage_register();
             usb_kbd_register();
             usb_ok = usb_init();
