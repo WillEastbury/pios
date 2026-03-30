@@ -1185,6 +1185,76 @@ void walfs_handle_fifo(u32 from_core)
     fifo_push(CORE_DISK, from_core, &reply);
 }
 
+bool walfs_verify(struct walfs_health *out)
+{
+    struct walfs_health tmp;
+    simd_zero(&tmp, sizeof(tmp));
+    if (out) simd_zero(out, sizeof(*out));
+    if (!mounted)
+        return false;
+
+    struct walfs_super sb = super;
+    if (sb.magic == WALFS_MAGIC && sb.version == WALFS_VERSION) {
+        u32 saved = sb.crc32;
+        sb.crc32 = 0;
+        tmp.super_ok = (hw_crc32c(&sb, SD_BLOCK_SIZE) == saved);
+        sb.crc32 = saved;
+    }
+    if (!tmp.super_ok) {
+        if (out) simd_memcpy(out, &tmp, sizeof(tmp));
+        return false;
+    }
+
+    u64 cap_bytes = (u64)super.total_blocks * SD_BLOCK_SIZE;
+    tmp.wal_head_ok = super.wal_head >= WAL_START &&
+                      (super.total_blocks == 0 || super.wal_head <= cap_bytes);
+    if (!tmp.wal_head_ok) {
+        if (out) simd_memcpy(out, &tmp, sizeof(tmp));
+        return false;
+    }
+
+    u64 pos = WAL_START;
+    u64 open_tx_id = 0;
+    struct wal_record hdr;
+    while (pos < super.wal_head) {
+        if (!wal_read(pos, &hdr, sizeof(hdr))) {
+            tmp.header_errors++;
+            break;
+        }
+        if (!wal_rec_valid(&hdr) || hdr.length > sizeof(rec_buf) ||
+            pos + hdr.length > super.wal_head) {
+            tmp.header_errors++;
+            break;
+        }
+        if (!wal_read(pos, rec_buf, hdr.length)) {
+            tmp.header_errors++;
+            break;
+        }
+        u32 saved_crc = ((struct wal_record *)rec_buf)->crc32;
+        ((struct wal_record *)rec_buf)->crc32 = 0;
+        u32 calc_crc = hw_crc32c(rec_buf, hdr.length);
+        ((struct wal_record *)rec_buf)->crc32 = saved_crc;
+        if (calc_crc != saved_crc) {
+            tmp.crc_errors++;
+            break;
+        }
+        tmp.valid_records++;
+        if (hdr.type == RECORD_TX_BEGIN) {
+            memcpy(&open_tx_id, rec_buf + sizeof(hdr), sizeof(open_tx_id));
+        } else if (hdr.type == RECORD_TX_COMMIT) {
+            u64 tx_id = 0;
+            memcpy(&tx_id, rec_buf + sizeof(hdr), sizeof(tx_id));
+            if (tx_id == open_tx_id) open_tx_id = 0;
+        }
+        pos += hdr.length;
+    }
+    tmp.open_tx = (open_tx_id != 0);
+    tmp.scan_end = pos;
+
+    if (out) simd_memcpy(out, &tmp, sizeof(tmp));
+    return tmp.super_ok && tmp.wal_head_ok && tmp.crc_errors == 0 && tmp.header_errors == 0;
+}
+
 void walfs_sync(void)
 {
     write_super();

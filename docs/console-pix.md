@@ -36,7 +36,7 @@ Goal: a tiny interactive shell process that feels like BusyBox/bash/cmd, built o
 - `obs` (security/network/EL2 observability snapshot: integrity checks/failures, capsule kills, firewall denies, drop counters, stage-2 faults)
 - `netcfg set <ip|mask|gw|dns> <a.b.c.d>` + `netcfg apply`
 - `netcfg dhcp <on|off> [timeout_ms]`
-- `disk [info|sync|compact|read <lba>|writezero <lba>]` (disk manager)
+- `disk [info|sync|compact|verify|read <lba>|writezero <lba>]` (disk manager)
   - `disk writezero` now requires `--force`
 - `edit|edit.pix <path>` opens a basic TUI editor (arrows move, insert/overwrite, delete/backspace, Ctrl+C/X/V line clipboard, Ctrl+S save, Ctrl+Q exit)
 

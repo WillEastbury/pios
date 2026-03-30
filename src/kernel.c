@@ -943,6 +943,15 @@ static void ui_cmd_disk(u32 argc, char **argv)
         ui_console_write(ok ? "OK: walfs compacted\n" : "ERR: compact failed\n");
         return;
     }
+    if (ui_streq(argv[1], "verify")) {
+        struct walfs_health h;
+        bool ok = walfs_verify(&h);
+        fb_printf("walfs verify: ok=%u super=%u head=%u rec=%u crc_err=%u hdr_err=%u open_tx=%u scan_end=%X\n",
+                  ok ? 1U : 0U, h.super_ok ? 1U : 0U, h.wal_head_ok ? 1U : 0U,
+                  h.valid_records, h.crc_errors, h.header_errors, h.open_tx ? 1U : 0U, h.scan_end);
+        ui_console_write(ok ? "OK: walfs verify clean\n" : "ERR: walfs verify failed\n");
+        return;
+    }
     if (ui_streq(argv[1], "read")) {
         if (argc < 3) {
             ui_console_write("ERR: usage disk read <lba>\n");
@@ -972,7 +981,7 @@ static void ui_cmd_disk(u32 argc, char **argv)
         ui_console_write(ok ? "OK: sector zeroed\n" : "ERR: write failed\n");
         return;
     }
-    ui_console_write("ERR: usage disk [info|sync|compact|read <lba>|writezero <lba> --force]\n");
+    ui_console_write("ERR: usage disk [info|sync|compact|verify|read <lba>|writezero <lba> --force]\n");
 }
 
 static void ui_cmd_db(u32 argc, char **argv)
@@ -3951,6 +3960,9 @@ void kernel_main(void) {
         bcache_pin(0);
         walfs_ok = walfs_init();
         if (walfs_ok) {
+            struct walfs_health wh;
+            if (!walfs_verify(&wh))
+                exception_pisod("WALFS verify failed", 5, 0x34, wh.crc_errors, wh.header_errors, (u32)wh.scan_end);
             principal_init();
             if (!picowal_db_init())
                 exception_pisod("Picowal init failed", 5, 0x33, 0, 0, 0);

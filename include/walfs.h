@@ -103,6 +103,16 @@ struct walfs_delete {
     u64 inode_id;
 } PACKED;
 
+struct walfs_health {
+    bool super_ok;
+    bool wal_head_ok;
+    bool open_tx;
+    u32 valid_records;
+    u32 crc_errors;
+    u32 header_errors;
+    u64 scan_end;
+} PACKED;
+
 /* ---- API ---- */
 
 /* Init/format filesystem on SD card. If not formatted, creates one. */
@@ -138,6 +148,9 @@ void walfs_handle_fifo(u32 from_core);
 
 /* Compact WAL: rewrite with only live records, removing deleted inodes. */
 bool walfs_compact(void);
+
+/* Verify WALFS metadata and record chain integrity. */
+bool walfs_verify(struct walfs_health *out);
 
 /* Flush superblock to disk. */
 void walfs_sync(void);

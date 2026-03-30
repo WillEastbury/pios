@@ -191,6 +191,11 @@ struct kernel_api {
 - `unlink(path)`
 - `readdir(path, entries, max_entries)`
 
+Storage hardening baseline:
+
+- Boot now performs `walfs_verify` and halts (PiSOD) on WAL metadata/record-chain corruption.
+- Operator tooling now exposes `disk verify` to run the same integrity scan on demand.
+
 ### Paged I/O primitive
 
 - `page_open(path, page_size, flags)`
