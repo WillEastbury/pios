@@ -2,27 +2,35 @@
 .global _start
 
 /*
- * Canary v10: absolute minimum — first instruction writes UART.
- * No core check, no branching. Just write 'X' and hang.
+ * Canary v11: proof-of-life via PM watchdog reboot.
+ * NO UART writes (those fault with PCIe BAR gone).
+ * Triggers a hardware reboot via BCM2712 PM registers (on-SoC, no PCIe).
+ * If the Pi reboots in a loop (firmware messages repeat every ~2s),
+ * the kernel IS executing.
  *
- * Try both:
- *   0x1F00030000 — RP1 UART (GPIO14/15, if firmware PCIe ATU survives)
- *   0x107D001000 — BCM2712 debug UART (3-pin JST header, not GPIO!)
- *
- * If you see nothing on GPIO serial, the PCIe BAR is gone after handoff.
+ * PM registers (BCM2712 SoC):
+ *   PM_BASE  = 0x107D200000
+ *   PM_RSTC  = PM_BASE + 0x1C
+ *   PM_WDOG  = PM_BASE + 0x24
+ *   Password = 0x5A000000
  */
 _start:
-    /* RP1 UART — the one connected to GPIO header pins 8/10 */
-    mov     x9, #0x1F00000000
-    add     x9, x9, #0x30000
-    mov     w0, #'X'
-    str     w0, [x9]
-    mov     w0, #'\r'
-    str     w0, [x9]
-    mov     w0, #'\n'
-    str     w0, [x9]
+    /* Small delay so firmware UART output finishes */
+    mov     x3, #0x200000
+1:  sub     x3, x3, #1
+    cbnz    x3, 1b
 
-    /* Infinite loop — ACT LED toggle via GPIO would go here */
-halt:
-    wfe
-    b       halt
+    /* PM_BASE = 0x107D200000 */
+    ldr     x9, =0x107D200000
+
+    /* PM_WDOG = password | 10 ticks (short timeout) */
+    ldr     w0, =0x5A00000A
+    str     w0, [x9, #0x24]
+
+    /* PM_RSTC = password | 0x20 (full reset) */
+    ldr     w0, =0x5A000020
+    str     w0, [x9, #0x1C]
+
+    /* Wait for reboot */
+2:  wfe
+    b       2b
