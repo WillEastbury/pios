@@ -1,14 +1,15 @@
 /*
- * canary_main.c - Exact match of main.lv Pi 5 bare-metal UART example
+ * canary_main.c - Pi 5 bare-metal UART test
  *
- * UART address: 0x1c00030000 (RP1 UART0 via firmware PCIe BAR)
+ * UART address: 0x1F00030000 (RP1 UART0 via firmware PCIe BAR)
+ * Firmware reports: rp1_uart 0000001f00030000
  * Requires enable_rp1_uart=1 in config.txt
  */
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef unsigned long uint64_t;
 
-#define MMIO_BASE       0x1c00000000UL
+#define MMIO_BASE       0x1F00000000UL
 #define PL011_BASE      (MMIO_BASE + 0x30000)
 
 #define PL011_DR        0x00

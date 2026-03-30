@@ -22,7 +22,8 @@ _start:
     /* Early UART breadcrumb: write directly to RP1 PL011 DR
      * (firmware pre-configured UART on GPIO14/15 via enable_rp1_uart=1;
      *  RP1 BAR at 0x1c00000000, UART0 offset 0x30000) */
-    ldr     x9, =0x1c00030000
+    /* RP1 UART0 DR — firmware maps RP1 BAR at 0x1F00000000 */
+    ldr     x9, =0x1F00030000
     mov     w0, #'I'
     str     w0, [x9]
 
