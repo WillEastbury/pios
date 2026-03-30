@@ -90,9 +90,10 @@ static bool fb_try_green(void)
 
 void canary_main(void)
 {
+    bool fb = fb_try_green();
+    /* Only touch UART after framebuffer attempt to avoid early UART faults masking HDMI signal. */
     uart_init_raw();
     uart_puts_raw("\nCANARY: start\n");
-    bool fb = fb_try_green();
     uart_puts_raw(fb ? "CANARY: fb ok\n" : "CANARY: fb fail\n");
     for (;;) {
         for (volatile u32 i = 0; i < 8000000U; i++) {}
