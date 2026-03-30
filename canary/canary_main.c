@@ -1,22 +1,26 @@
 /*
  * canary_main.c - Minimal HDMI green-screen test for Pi 5
  *
- * Uses VideoCore mailbox to allocate a framebuffer and fill it green.
- * No UART, no RP1, no PCIe — just the BCM2712 mailbox at its correct address.
+ * Matched against working main.lv bare-metal framebuffer example.
+ * Mailbox base: 0x107C000000 + 0x13880 = 0x107C013880
  *
- * Mailbox base confirmed from ARM Trusted Firmware (rpi_hw.h):
- *   RPI_IO_BASE + 0x7c013880 = 0x107C013880
+ * Key: BCM2712 mailbox has SEPARATE read/write status registers:
+ *   MBOX0 (read side):  READ=+0x00, STATUS=+0x18
+ *   MBOX1 (write side): WRITE=+0x20, STATUS=+0x38
  */
 #include "types.h"
 
-#define MBOX_BASE     0x107C013880UL
+#define MBOX_BASE       0x107C013880UL
 
-#define MBOX_READ     (MBOX_BASE + 0x00)
-#define MBOX_STATUS   (MBOX_BASE + 0x18)
-#define MBOX_WRITE    (MBOX_BASE + 0x20)
-#define MBOX_FULL     0x80000000U
-#define MBOX_EMPTY    0x40000000U
-#define MBOX_CH_PROP  8U
+#define MBOX0_READ      (MBOX_BASE + 0x00)
+#define MBOX0_STATUS    (MBOX_BASE + 0x18)
+#define MBOX1_WRITE     (MBOX_BASE + 0x20)
+#define MBOX1_STATUS    (MBOX_BASE + 0x38)
+
+#define MBOX_FULL       0x80000000U
+#define MBOX_EMPTY      0x40000000U
+#define MBOX_CH_PROP    8U
+#define MBOX_RESPONSE   0x80000000U
 
 static inline void mmio_write(u64 addr, u32 val) { *(volatile u32 *)addr = val; }
 static inline u32  mmio_read(u64 addr) { return *(volatile u32 *)addr; }
@@ -25,46 +29,47 @@ static volatile u32 __attribute__((aligned(16))) mbox[36];
 
 static bool mailbox_call(u8 ch)
 {
-    u32 addr = ((u32)(usize)&mbox[0] & ~0xFU) | (u32)(ch & 0xFU);
-    while (mmio_read(MBOX_STATUS) & MBOX_FULL) {}
-    mmio_write(MBOX_WRITE, addr);
+    u32 r = ((u32)(usize)&mbox[0] & ~0xFU) | (u32)(ch & 0xFU);
+
+    /* Wait for write mailbox not full (MBOX1 status) */
+    while (mmio_read(MBOX1_STATUS) & MBOX_FULL) {}
+    mmio_write(MBOX1_WRITE, r);
+
+    /* Wait for response on read mailbox (MBOX1 status for empty check) */
     for (;;) {
-        while (mmio_read(MBOX_STATUS) & MBOX_EMPTY) {}
-        u32 r = mmio_read(MBOX_READ);
-        if (r == addr) return mbox[1] == 0x80000000U;
+        while (mmio_read(MBOX1_STATUS) & MBOX_EMPTY) {}
+        if (mmio_read(MBOX0_READ) == r)
+            return mbox[1] == MBOX_RESPONSE;
     }
 }
 
 void canary_main(void)
 {
-    /* Request 1280x720x32 framebuffer via mailbox property interface */
-    mbox[0]  = 35 * 4;          /* total size */
-    mbox[1]  = 0;               /* request */
-    mbox[2]  = 0x00048003;      /* SET_PHYSICAL_WH */
-    mbox[3]  = 8; mbox[4] = 0; mbox[5] = 1280; mbox[6] = 720;
-    mbox[7]  = 0x00048004;      /* SET_VIRTUAL_WH */
-    mbox[8]  = 8; mbox[9] = 0; mbox[10] = 1280; mbox[11] = 720;
-    mbox[12] = 0x00048005;      /* SET_DEPTH */
-    mbox[13] = 4; mbox[14] = 0; mbox[15] = 32;
-    mbox[16] = 0x00048006;      /* SET_PIXEL_ORDER (BGR) */
-    mbox[17] = 4; mbox[18] = 0; mbox[19] = 0;
-    mbox[20] = 0x00040001;      /* ALLOCATE_BUFFER */
-    mbox[21] = 8; mbox[22] = 0; mbox[23] = 4096; mbox[24] = 0;
-    mbox[25] = 0x00040008;      /* GET_PITCH */
-    mbox[26] = 4; mbox[27] = 0; mbox[28] = 0;
-    mbox[29] = 0;               /* TAG_END */
+    /*
+     * Simple approach from working example: just allocate the existing
+     * firmware framebuffer without trying to set resolution/depth.
+     * The firmware's config.txt framebuffer_depth=32 handles that.
+     */
+    mbox[0] = 8 * 4;       /* message size: 8 u32s = 32 bytes */
+    mbox[1] = 0;            /* request code */
+    mbox[2] = 0x00040001;   /* ALLOCATE_BUFFER */
+    mbox[3] = 8;            /* value buffer size */
+    mbox[4] = 4;            /* request size (alignment) */
+    mbox[5] = 0;            /* output: fb base address */
+    mbox[6] = 0;            /* output: fb size */
+    mbox[7] = 0;            /* TAG_END */
 
-    if (!mailbox_call(MBOX_CH_PROP) || mbox[23] == 0)
+    if (!mailbox_call(MBOX_CH_PROP) || mbox[5] == 0)
         goto hang;
 
-    /* GPU returns bus address; mask to physical */
-    u32 *fb = (u32 *)(usize)(mbox[23] & 0x3FFFFFFFU);
-    u32 pitch = mbox[28] / 4U;
+    /* GPU returns bus address; mask to ARM physical */
+    u32 *fb = (u32 *)(usize)(mbox[5] & 0x3FFFFFFFU);
+    u32 fb_size = mbox[6];
 
-    /* Fill entire screen bright green */
-    for (u32 y = 0; y < 720; y++)
-        for (u32 x = 0; x < 1280; x++)
-            fb[y * pitch + x] = 0xFF00FF00U;  /* ARGB green */
+    /* Fill entire framebuffer green (ARGB) */
+    u32 pixels = fb_size / 4;
+    for (u32 i = 0; i < pixels; i++)
+        fb[i] = 0xFF00FF00U;
 
 hang:
     for (;;) __asm__ volatile("wfe");
