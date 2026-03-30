@@ -2,92 +2,149 @@
 .global _start
 
 /*
- * Canary v13: mailbox framebuffer ONLY — no UART, no PCIe addresses.
- * All registers are on BCM2712 SoC (0x107C013880).
- *
- * Requests framebuffer via VideoCore mailbox, fills screen green.
- * If the screen turns green, we have confirmed output.
+ * Canary v14: mailbox framebuffer with proper tag set.
+ * Queries actual pitch, sets resolution, fills solid color.
+ * Uses full tag set like the main.lv example.
  */
-
-.equ MBOX_BASE,     0x107C013880
-.equ MBOX_FULL,     0x80000000
-.equ MBOX_EMPTY,    0x40000000
-.equ MBOX_CH,       8
-
 _start:
     mrs     x1, mpidr_el1
     and     x1, x1, #3
     cbnz    x1, park
 
-    /* Stack just below our code */
     ldr     x1, =_start
     mov     sp, x1
 
-    /* --- Build mailbox framebuffer request --- */
+    /* Build full framebuffer request with all tags */
     ldr     x20, =fb_request
 
-    mov     w0, #32                /* total buffer size (8 * 4) */
+    /* Header */
+    mov     w0, #(35*4)            /* total buffer size */
     str     w0, [x20, #0]
-    str     wzr, [x20, #4]         /* request code = 0 */
-    ldr     w0, =0x00040001        /* TAG: Allocate Buffer */
+    str     wzr, [x20, #4]         /* request code */
+
+    /* Tag 1: Set physical width/height */
+    ldr     w0, =0x00048003
     str     w0, [x20, #8]
-    mov     w0, #8                 /* value buffer size */
-    str     w0, [x20, #12]
-    mov     w0, #4                 /* request length */
-    str     w0, [x20, #16]
-    mov     w0, #16                /* alignment = 16 bytes */
-    str     w0, [x20, #20]
-    str     wzr, [x20, #24]        /* size (response) */
-    str     wzr, [x20, #28]        /* end tag */
+    mov     w0, #8
+    str     w0, [x20, #12]         /* value buf size */
+    mov     w0, #8
+    str     w0, [x20, #16]         /* request size */
+    mov     w0, #1024
+    str     w0, [x20, #20]         /* width */
+    mov     w0, #768
+    str     w0, [x20, #24]         /* height */
 
-    /* Flush cache for request buffer */
-    dc      civac, x20
-    add     x1, x20, #32
-    dc      civac, x1
+    /* Tag 2: Set virtual width/height */
+    ldr     w0, =0x00048004
+    str     w0, [x20, #28]
+    mov     w0, #8
+    str     w0, [x20, #32]
+    mov     w0, #8
+    str     w0, [x20, #36]
+    mov     w0, #1024
+    str     w0, [x20, #40]
+    mov     w0, #768
+    str     w0, [x20, #44]
+
+    /* Tag 3: Set depth */
+    ldr     w0, =0x00048005
+    str     w0, [x20, #48]
+    mov     w0, #4
+    str     w0, [x20, #52]
+    mov     w0, #4
+    str     w0, [x20, #56]
+    mov     w0, #32
+    str     w0, [x20, #60]         /* 32bpp */
+
+    /* Tag 4: Allocate buffer */
+    ldr     w0, =0x00040001
+    str     w0, [x20, #64]
+    mov     w0, #8
+    str     w0, [x20, #68]
+    mov     w0, #4
+    str     w0, [x20, #72]
+    mov     w0, #16                /* alignment */
+    str     w0, [x20, #76]
+    str     wzr, [x20, #80]        /* size (response) */
+
+    /* Tag 5: Get pitch */
+    ldr     w0, =0x00040008
+    str     w0, [x20, #84]
+    mov     w0, #4
+    str     w0, [x20, #88]
+    mov     w0, #4
+    str     w0, [x20, #92]
+    str     wzr, [x20, #96]        /* pitch (response) */
+
+    /* End tag */
+    str     wzr, [x20, #100]
+
+    /* Flush entire request from cache */
+    mov     x4, x20
+    mov     x5, #160               /* flush 160 bytes */
+flush_req:
+    dc      civac, x4
+    add     x4, x4, #64
+    subs    x5, x5, #64
+    b.gt    flush_req
     dsb     sy
 
-    /* Mailbox: send request */
-    ldr     x21, =MBOX_BASE
-
-    /* Construct write value: (addr & ~0xF) | channel */
+    /* Send to mailbox channel 8 */
+    ldr     x21, =0x107C013880
     mov     w1, w20
-    orr     w1, w1, #MBOX_CH
+    orr     w1, w1, #8             /* channel 8 */
 
-    /* Wait for not full */
-1:  ldr     w2, [x21, #0x38]      /* MBOX1_STATUS */
+1:  ldr     w2, [x21, #0x38]
     tbnz    w2, #31, 1b
+    str     w1, [x21, #0x20]
 
-    /* Write to MBOX1 */
-    str     w1, [x21, #0x20]      /* MBOX1_WRITE */
-
-    /* Wait for response (not empty), then read */
-2:  ldr     w2, [x21, #0x18]      /* MBOX0_STATUS */
+2:  ldr     w2, [x21, #0x18]
     tbnz    w2, #30, 2b
-    ldr     w2, [x21, #0x00]      /* MBOX0_READ (discard) */
+    ldr     w2, [x21, #0x00]
 
-    /* Invalidate cache to see response */
-    dc      civac, x20
+    /* Invalidate cache for response */
+    mov     x4, x20
+    mov     x5, #160
+flush_resp:
+    dc      civac, x4
+    add     x4, x4, #64
+    subs    x5, x5, #64
+    b.gt    flush_resp
     dsb     sy
 
-    /* Read FB address from response */
-    ldr     w22, [x20, #20]
+    /* Read framebuffer address and pitch */
+    ldr     w22, [x20, #76]        /* FB base */
     and     w22, w22, #0x3fffffff
-    cbz     w22, no_fb
+    cbz     w22, park
 
-    /* Fill 1920x1080 pixels with bright green (0xFF00FF00) */
+    ldr     w23, [x20, #96]        /* pitch (bytes per row) */
+    cbz     w23, use_default_pitch
+    b       got_pitch
+use_default_pitch:
+    mov     w23, #(1024*4)         /* fallback: 1024 * 4bpp */
+got_pitch:
+
+    /* Fill entire screen solid blue */
     mov     x0, x22
-    ldr     w1, =(1920*1080)
-    ldr     w3, =0xFF00FF00
-fill:
-    str     w3, [x0], #4
-    subs    w1, w1, #1
-    b.ne    fill
+    mov     w24, #768              /* rows */
+row_loop:
+    mov     x1, x0                 /* row start */
+    mov     w25, #1024             /* cols */
+col_loop:
+    ldr     w3, =0xFF0040FF        /* ARGB: bright blue */
+    str     w3, [x1], #4
+    subs    w25, w25, #1
+    b.ne    col_loop
 
-no_fb:
+    /* Advance by pitch (not width*4) */
+    add     x0, x0, x23
+    subs    w24, w24, #1
+    b.ne    row_loop
+
 park:
     wfe
     b       park
 
 .balign 16
 fb_request:
-    .space 64, 0
+    .space 256, 0
