@@ -8,7 +8,6 @@
 .section .text.boot
 .global _start
 .global secondary_entry
-.extern early_boot_hdmi_mark
 
 _start:
     mrs     x0, mpidr_el1
@@ -19,18 +18,8 @@ _start:
     ldr     x1, =__stack_top_core0
     mov     sp, x1
 
-    /* Early UART breadcrumb: write directly to RP1 PL011 DR
-     * (firmware pre-configured UART on GPIO14/15 via enable_rp1_uart=1;
-     *  RP1 BAR at 0x1c00000000, UART0 offset 0x30000) */
-    /* RP1 UART0 DR — firmware maps RP1 BAR at 0x1F00000000 */
-    ldr     x9, =0x1F00030000
-    mov     w0, #'I'
-    str     w0, [x9]
-
     /* ---- EL2 → EL1 transition ---- */
     bl      el2_to_el1
-    mov     w0, #'E'
-    str     w0, [x9]
 
     /* ---- SCTLR_EL1: safe baseline (MMU off, caches off, alignment check on) ---- */
     mrs     x1, sctlr_el1
@@ -41,8 +30,6 @@ _start:
     orr     x1, x1, #(1 << 3)      /* SA=1: stack alignment check */
     msr     sctlr_el1, x1
     isb
-    mov     w0, #'C'
-    str     w0, [x9]
 
     /* Enable NEON / FPU (CPACR_EL1 bits [21:20] = 0b11) */
     mrs     x1, cpacr_el1
@@ -63,8 +50,6 @@ _start:
     ldr     x1, =vector_table
     msr     vbar_el1, x1
     isb
-    mov     w0, #'V'
-    str     w0, [x9]
 
     /* Clear BSS */
     ldr     x1, =__bss_start
@@ -75,8 +60,6 @@ _start:
     str     xzr, [x1], #8
     b       .Lbss_loop
 .Lbss_done:
-    mov     w0, #'B'
-    str     w0, [x9]
 
     bl      kernel_main
     b       .Lhalt

@@ -4152,26 +4152,27 @@ void kernel_main(void) {
     bool sd_ok = false;
     bool walfs_ok = false;
     bool genet_ok = false;
-    early_boot_hdmi_mark('K');
 
-    /* 1. Debug serial */
-    uart_init();
-    uart_puts("\n\nPIOS v0.3 booting...\n");
+    /* 1. Framebuffer FIRST — this is our primary output on Pi 5
+     *    (RP1 UART is inaccessible until PCIe is initialized) */
+    if (fb_init(1280, 720)) {
+        fb_ok = true;
+        fb_puts("PIOS v0.3 booting...\n");
+    }
     el2_init();
-    uart_puts("[el2] boot EL=");
-    uart_hex(el2_boot_el());
-    uart_puts(el2_active() ? " (EL2 host active)\n" : " (running in EL1)\n");
+    if (fb_ok) {
+        fb_printf("[el2] boot EL=%x", (u32)el2_boot_el());
+        fb_puts(el2_active() ? " (EL2 host active)\n" : " (running in EL1)\n");
+    }
     u64 cap_n = 0;
     if (el2_hvc_call(EL2_HVC_CAPSULE_COUNT, 0, 0, 0, 0, &cap_n) == 0) {
-        uart_puts("[el2] capsule descriptors=");
-        uart_hex(cap_n);
-        uart_puts("\n");
+        if (fb_ok) fb_printf("[el2] capsule descriptors=%x\n", (u32)cap_n);
     }
 
     /* 2. Exception vectors + GIC */
     exception_init();
     gic_init();
-    uart_puts("[kernel] Exceptions + GIC ready\n");
+    if (fb_ok) fb_puts("[kernel] Exceptions + GIC ready\n");
 
     /* 3. MMU — identity map, enables caches */
     mmu_init();
@@ -4197,25 +4198,21 @@ void kernel_main(void) {
             usb_storage_register();
             usb_kbd_register();
             usb_ok = usb_init();
+            /* NOW uart is accessible via RP1 */
+            uart_init();
+            uart_puts("\n[uart] RP1 UART online\n");
         }
     }
-
-    /* 8. HDMI framebuffer (1280x720) */
-    if (fb_init(1280, 720)) {
-        fb_ok = true;
-        uart_puts("[fb] Framebuffer OK\n");
-    } else {
-        uart_puts("[fb] Framebuffer FAILED\n");
-    }
+    if (fb_ok) fb_puts("[pcie] PCIe + RP1 init done\n");
 
     /* 8. Inter-core FIFOs */
     fifo_init_all();
-    uart_puts("[fifo] Init OK\n");
+    if (fb_ok) fb_puts("[fifo] Init OK\n");
     ipc_queue_init();
     ipc_stream_init();
     ipc_proc_init();
     pipe_init();
-    uart_puts("[ipc] In-memory IPC ready\n");
+    if (fb_ok) fb_puts("[ipc] In-memory IPC ready\n");
 
     /* 9. SD card - raw block access */
     sd_ok = sd_init();
