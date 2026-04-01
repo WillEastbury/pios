@@ -4597,10 +4597,12 @@ void kernel_main(void) {
         bp_ok("[stack] SP relocated");
 
         bp_log("[mmu] mmu_init...");
-        /* MMU enable crashes — skip for now. Add dsb barriers for MMIO. */
-        bp_warn("[mmu] SKIPPED (debugging)");
-        /* TODO: investigate MMU enable crash — not NEON, not tables,
-         * not TCR. Might need to be done in asm before C code. */
+        /* MMU was enabled in start.S before kernel_main — just
+         * update the shared variables for secondary cores. */
+        shared_ttbr0 = (u64)(usize)l1_table;
+        shared_mair  = 0xBBFF4400UL;
+        shared_tcr   = 0x200803519UL;
+        bp_ok("[mmu] ON (set in start.S asm)");
 
         /* Refresh register panel after MMU changes */
         reg_panel(at_el1);

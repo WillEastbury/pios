@@ -27,8 +27,8 @@
 #include "proc.h"
 #include "fb.h"
 
-/* Page tables — 4KB aligned */
-static u64 l1_table[512] ALIGNED(4096);
+/* Page tables — 4KB aligned (l1_table used by start.S for early MMU) */
+u64 l1_table[512] ALIGNED(4096);
 static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
 
 /* Per-process user tables for user cores (core2/core3). */

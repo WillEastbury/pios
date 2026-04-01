@@ -40,6 +40,14 @@
  * Call from each core after setting up page tables. */
 void mmu_init(void);
 
+/* L1 page table (populated by start.S for early boot) */
+extern u64 l1_table[512];
+
+/* Shared values for secondary cores */
+extern u64 shared_ttbr0;
+extern u64 shared_mair;
+extern u64 shared_tcr;
+
 /* Invalidate all TLB entries */
 void mmu_invalidate_tlb(void);
 

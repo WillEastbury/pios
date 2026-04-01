@@ -32,61 +32,17 @@ _start:
     cbnz    w2, .Lbss_loop
 .Lbss_done:
 
-    /* Init framebuffer + CPU state dump at EL2 */
+    /* Init framebuffer at EL2 */
     bl      kernel_fb_early
 
-    /* ── Install EL2 crash vectors BEFORE attempting eret ── */
-    adr     x0, el2_crash_vectors
-    msr     vbar_el2, x0
-    isb
+    /* Stay at EL2 — go straight to kernel_main */
+    bl      kernel_main
+    b       .Lhalt
 
-    /* ── Minimal EL2 → EL1 drop ── */
-    mov     x0, #(1 << 31)         /* HCR_EL2.RW = AArch64 at EL1 */
-    msr     hcr_el2, x0
-    isb
-
-    mrs     x0, cnthctl_el2        /* Enable EL1 timer access */
-    orr     x0, x0, #3
-    msr     cnthctl_el2, x0
-    msr     cntvoff_el2, xzr
-
-    /* Reset EL1 state so we land in a clean flat world */
-    msr     sctlr_el1, xzr
-    mov     x0, #(3 << 20)
-    msr     cpacr_el1, x0          /* NEON at EL1 */
-    ldr     x0, =_start
-    msr     sp_el0, x0             /* EL1t stack */
-
-    tlbi    alle1
-    ic      iallu
-    dsb     sy
-    isb
-
-    mov     x0, #0x3C4             /* SPSR: EL1t, DAIF masked */
-    msr     spsr_el2, x0
-    ldr     x0, =.Lel1_entry       /* use ldr to handle any distance */
-    msr     elr_el2, x0
-    eret
-
-/* Place EL1 landing pad here BEFORE the vector table so adr/ldr works */
+/* EL1 landing pad (unused for now — EL2-only boot) */
 .Lel1_entry:
-    /* ── EL1 environment setup ── */
-
-    /* Start with safe stack at 0x80000 (same as canary — this works) */
     ldr     x1, =_start
     mov     sp, x1
-
-    /* Enable NEON/FPU */
-    mrs     x1, cpacr_el1
-    orr     x1, x1, #(3 << 20)
-    msr     cpacr_el1, x1
-    isb
-
-    /* Exception vectors */
-    ldr     x1, =vector_table
-    msr     vbar_el1, x1
-    isb
-
     bl      kernel_main
     b       .Lhalt
 
