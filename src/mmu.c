@@ -131,19 +131,21 @@ void mmu_init(void) {
     for (u32 i = 0; i < 512; i++)
         l1[i] = 0;
 
-    /* RAM: 4 × 1GB blocks (indices 0-3) */
+    /* RAM: L1[0] non-cacheable (FB at 0x3F400000), L1[1-3] WB cacheable */
+    u64 ram_nc = PTE_VALID | PTE_BLOCK | PTE_AF |
+                 PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1;
     u64 ram_attr = PTE_VALID | PTE_BLOCK | PTE_AF |
                    PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
-    l1[0] = 0x00000000UL | ram_attr;
+    l1[0] = 0x00000000UL | ram_nc;
     l1[1] = 0x40000000UL | ram_attr;
     l1[2] = 0x80000000UL | ram_attr;
     l1[3] = 0xC0000000UL | ram_attr;
 
-    /* Peripherals: indices 4-7 */
+    /* Peripherals: indices 64-67 (BCM2712 at 0x107C000000 = 65GB) */
     u64 dev_attr = PTE_VALID | PTE_BLOCK | PTE_AF |
                    PTE_ATTR(MT_DEVICE_nGnRnE) |
                    PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
-    for (u32 idx = 4; idx < 8; idx++)
+    for (u32 idx = 64; idx < 68; idx++)
         l1[idx] = ((u64)idx * L1_BLOCK_SIZE) | dev_attr;
 
     /* RP1: indices 124-127 */

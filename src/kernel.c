@@ -4685,9 +4685,10 @@ void kernel_main(void) {
         bp_done(4, sd_ok);
     }
 
-    /* ── Phase 5: GENET ── */
+    /* ── Phase 5: GENET (PHY link can take minutes) ── */
     bp_active(5);
     bp_log("[genet] genet_init (MAC+PHY)...");
+    bp_warn("[genet] PHY link may take 1-2 min...");
     genet_ok = genet_init();
     if (!genet_ok) {
         bp_err("[genet] GENET init FAILED"); bp_done(5, false);
@@ -4699,18 +4700,22 @@ void kernel_main(void) {
     }
 
     /* Network stack */
-    bp_log("[net] net_init (static IP)...");
-    net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
-    ui_cfg_ip = MY_IP;
-    ui_cfg_mask = MY_MASK;
-    ui_cfg_gw = MY_GW;
-    ui_cfg_dns = MY_GW;
-    ui_cfg_dhcp = false;
-    bp_log("[net] dns_init...");
-    dns_init(ui_cfg_dns);
-    bp_log("[net] udp_subscribe...");
-    net_udp_subscribe(ui_db_udp_cb);
-    bp_ok("[net] IP stack ready");
+    if (genet_ok) {
+        bp_log("[net] net_init (static IP)...");
+        net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
+        ui_cfg_ip = MY_IP;
+        ui_cfg_mask = MY_MASK;
+        ui_cfg_gw = MY_GW;
+        ui_cfg_dns = MY_GW;
+        ui_cfg_dhcp = false;
+        bp_log("[net] dns_init...");
+        dns_init(ui_cfg_dns);
+        bp_log("[net] udp_subscribe...");
+        net_udp_subscribe(ui_db_udp_cb);
+        bp_ok("[net] IP stack ready");
+    } else {
+        bp_warn("[net] SKIPPED (no NIC)");
+    }
 
     /* GPU + Tensor */
     bp_log("[gpu] tensor_init...");
