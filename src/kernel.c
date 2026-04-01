@@ -463,18 +463,28 @@ static void bp_done(u32 phase, bool ok) {
     }
 }
 
-/* Update PC in register panel (col 65, row 2) */
+/* Update PC in register panel (col 65, row 2) — shows caller's address */
 static void bp_update_pc(void) {
-    u64 pc;
-    __asm__ volatile("adr %0, ." : "=r"(pc));
+    u64 pc = (u64)(usize)__builtin_return_address(0);
     fb_set_cursor(65, 2);
     fb_set_color(0x00FFFFFF, 0x00000000);
     fb_printf("PC     %X            ", pc);
 }
 
+/* Spinner in top-right corner — shows kernel is alive */
+static u32 bp_spin_idx;
+static void bp_spin(void) {
+    static const char spin[] = "|/-\\";
+    fb_set_cursor(126, 0);
+    fb_set_color(0x0000FF00, 0x00000000);
+    fb_putc(spin[bp_spin_idx & 3]);
+    bp_spin_idx++;
+}
+
 /* Append a line to the scrolling boot log below the phase list */
 static void bp_log(const char *msg) {
     bp_update_pc();
+    bp_spin();
     u32 max_rows = 768 / 8;
     if (bp_log_y >= max_rows) return;
     fb_set_cursor(1, bp_log_y);
@@ -486,6 +496,7 @@ static void bp_log(const char *msg) {
 /* Green log — success */
 static void bp_ok(const char *msg) {
     bp_update_pc();
+    bp_spin();
     u32 max_rows = 768 / 8;
     if (bp_log_y >= max_rows) return;
     fb_set_cursor(1, bp_log_y);
@@ -497,6 +508,7 @@ static void bp_ok(const char *msg) {
 /* Red log — error */
 static void bp_err(const char *msg) {
     bp_update_pc();
+    bp_spin();
     u32 max_rows = 768 / 8;
     if (bp_log_y >= max_rows) return;
     fb_set_cursor(1, bp_log_y);
@@ -508,6 +520,7 @@ static void bp_err(const char *msg) {
 /* Yellow log — warning */
 static void bp_warn(const char *msg) {
     bp_update_pc();
+    bp_spin();
     u32 max_rows = 768 / 8;
     if (bp_log_y >= max_rows) return;
     fb_set_cursor(1, bp_log_y);

@@ -222,15 +222,22 @@ static bool phy_init(void) {
     mdio_write(PHY_ADDR, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);
 
     /* Wait for link */
-    uart_puts("[genet] Waiting for link...\n");
-    timeout = 5000000;
+    uart_puts("[genet] Waiting for link (3s timeout)...\n");
+    timeout = 300000;  /* ~3 seconds at delay_cycles(10000) */
     while (timeout--) {
         u16 bmsr = mdio_read(PHY_ADDR, MII_BMSR);
         if (bmsr & BMSR_LSTATUS) {
             uart_puts("[genet] Link UP\n");
             return true;
         }
-        delay_cycles(1000);
+        delay_cycles(10000);
+        /* Spinner + countdown every ~10k iterations */
+        if ((timeout % 10000) == 0) {
+            static const char spin[] = "|/-\\";
+            fb_set_cursor(126, 0);
+            fb_set_color(0x0000FF00, 0x00000000);
+            fb_putc(spin[(timeout / 10000) & 3]);
+        }
     }
 
     uart_puts("[genet] Link timeout (continuing anyway)\n");
