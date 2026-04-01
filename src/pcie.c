@@ -168,24 +168,20 @@ bool pcie_init(void) {
 
     uart_puts("[pcie] Init BCM2712 PCIe2 RC...\n");
 
-    fb_puts("  [pcie] Asserting bridge + PERST# reset\n");
     /* 1. Assert bridge + endpoint reset */
     bridge_reset(true);
     perst_set(true);
     timer_delay_us(200);
 
-    fb_puts("  [pcie] Deasserting bridge reset\n");
     /* 2. Deassert bridge reset (controller out of reset) */
     bridge_reset(false);
 
-    fb_puts("  [pcie] Powering up SerDes\n");
     /* 3. Power up SerDes (clear IDDQ power-down bit) */
     tmp = pr(HARD_DEBUG);
     tmp &= ~SERDES_IDDQ;
     pw(HARD_DEBUG, tmp);
     timer_delay_us(200);
 
-    fb_puts("  [pcie] Configuring MISC_CTRL\n");
     /* 4. Configure MISC_CTRL */
     tmp = pr(MISC_MISC_CTRL);
     tmp |= MCTRL_SCB_ACCESS_EN;    /* SCB access enable */
@@ -195,22 +191,18 @@ bool pcie_init(void) {
     tmp = (tmp & ~MCTRL_MAX_BURST_MASK) | MCTRL_MAX_BURST_512;
     pw(MISC_MISC_CTRL, tmp);
 
-    fb_puts("  [pcie] Setting RC class code PCI-PCI Bridge\n");
     /* 5. Set RC class code to PCI-PCI Bridge (0x060400) */
     tmp = pr(RC_CFG_PRIV1_ID_VAL3);
     tmp = (tmp & ~0xFFFFFFU) | 0x060400U;
     pw(RC_CFG_PRIV1_ID_VAL3, tmp);
 
-    fb_puts("  [pcie] Programming bus numbers\n");
     /* 6. Bus numbers: primary=0, secondary=1, subordinate=1 */
     pw(PCI_REG_BUS_NUM, 0x00010100);
     dmb();
 
-    fb_puts("  [pcie] Programming outbound ATU window\n");
     /* 7. Outbound ATU window 0: CPU 0x1F00000000 → PCIe 0x80000000 */
     set_outbound_win(PCIE_CPU_WIN_BASE, PCIE_TARGET_ADDR, PCIE_CPU_WIN_SIZE);
 
-    fb_puts("  [pcie] Configuring UBUS/AXI bridge + timeouts\n");
     /* 8. UBUS/AXI bridge: suppress error responses, set timeouts */
     tmp = pr(MISC_UBUS_CTRL);
     tmp |= UBUS_REPLY_ERR_DIS;
@@ -220,12 +212,10 @@ bool pcie_init(void) {
     pw(MISC_UBUS_TIMEOUT, 0x0B2D0000);           /* ~250ms */
     pw(MISC_RC_CFG_RETRY_TIMEOUT, 0x0ABA0000);   /* ~240ms */
 
-    fb_puts("  [pcie] Deasserting PERST# (link training)\n");
     /* 9. Deassert PERST# — endpoint begins link training */
     perst_set(false);
     timer_delay_ms(100);  /* PCIe spec: min 100ms after PERST# deassert */
 
-    fb_puts("  [pcie] Polling for link up\n");
     /* 10. Poll for link up (up to 100ms more) */
     for (u32 i = 0; i < 20; i++) {
         if (pcie_link_up())
@@ -234,21 +224,18 @@ bool pcie_init(void) {
     }
 
     if (!pcie_link_up()) {
-        fb_puts("  [pcie] Link FAILED\n");
         uart_puts("[pcie] Link FAILED (status=");
         uart_hex(pr(MISC_PCIE_STATUS));
         uart_puts(")\n");
         return false;
     }
 
-    fb_puts("  [pcie] Enabling Memory Space + Bus Master\n");
     /* 11. Enable Memory Space + Bus Master on RC */
     tmp = pr(PCI_REG_CMD);
     tmp |= PCI_CMD_MEM | PCI_CMD_MASTER;
     pw(PCI_REG_CMD, tmp);
     dmb();
 
-    fb_puts("  [pcie] Link UP\n");
     uart_puts("[pcie] Link UP\n");
     return true;
 }

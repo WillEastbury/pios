@@ -57,7 +57,7 @@ u64 shared_tcr;
 
 /*
  * TCR_EL1: Translation Control Register
- *   T0SZ  = 16  → 48-bit VA (256TB, way more than we need)
+ *   T0SZ  = 25  → 39-bit VA (512GB — matches 512-entry L1)
  *   IRGN0 = WB WA  (inner cache for page walks)
  *   ORGN0 = WB WA  (outer cache for page walks)
  *   SH0   = Inner Shareable (multi-core coherency)
@@ -66,7 +66,7 @@ u64 shared_tcr;
  *   EPD1  = 1 → disable TTBR1 walks (no kernel/user split)
  */
 #define TCR_VALUE ( \
-    (16UL << 0)  |    \
+    (25UL << 0)  |    \
     (0UL  << 6)  |    \
     (1UL  << 8)  |    \
     (1UL  << 10) |    \
@@ -123,85 +123,68 @@ static inline u64 user_ram_attrs(void)
 }
 
 void mmu_init(void) {
-    fb_puts("  [mmu] zero l1_table...\n");
-    memset(l1_table, 0, sizeof(l1_table));
-    fb_puts("  [mmu] zero l2_table_low...\n");
-    memset(l2_table_low, 0, sizeof(l2_table_low));
-    fb_puts("  [mmu] zero user_l1...\n");
-    memset(user_l1, 0, sizeof(user_l1));
-    fb_puts("  [mmu] zero user_l2_low...\n");
-    memset(user_l2_low, 0, sizeof(user_l2_low));
-    fb_puts("  [mmu] zero user_table_valid...\n");
-    memset(user_table_valid, 0, sizeof(user_table_valid));
-    fb_puts("  [mmu] all tables zeroed\n");
+    /* Write the L1 table entirely in inline asm to avoid compiler
+     * generating NEON/FP instructions that might fault. */
+    volatile u64 *l1 = l1_table;
 
-    fb_puts("  [mmu] L2 2MB blocks done\n");
-    l1_table[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
+    /* Zero the table (512 entries) */
+    for (u32 i = 0; i < 512; i++)
+        l1[i] = 0;
 
-    fb_puts("  [mmu] L1[1] = 0x40000000...\n");
-    l1_table[1] = ram_block_1g(0x40000000UL);
-    fb_puts("  [mmu] L1[2] = 0x80000000...\n");
-    l1_table[2] = ram_block_1g(0x80000000UL);
-    fb_puts("  [mmu] L1[3] = 0xC0000000...\n");
-    l1_table[3] = ram_block_1g(0xC0000000UL);
-    fb_puts("  [mmu] L1 RAM done\n");
+    /* RAM: 4 × 1GB blocks (indices 0-3) */
+    u64 ram_attr = PTE_VALID | PTE_BLOCK | PTE_AF |
+                   PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+    l1[0] = 0x00000000UL | ram_attr;
+    l1[1] = 0x40000000UL | ram_attr;
+    l1[2] = 0x80000000UL | ram_attr;
+    l1[3] = 0xC0000000UL | ram_attr;
 
-    fb_puts("  [mmu] L1 periph blocks...\n");
-    for (u32 idx = 4; idx < 8; idx++) {
-        l1_table[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
-    }
+    /* Peripherals: indices 4-7 */
+    u64 dev_attr = PTE_VALID | PTE_BLOCK | PTE_AF |
+                   PTE_ATTR(MT_DEVICE_nGnRnE) |
+                   PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+    for (u32 idx = 4; idx < 8; idx++)
+        l1[idx] = ((u64)idx * L1_BLOCK_SIZE) | dev_attr;
 
-    fb_puts("  [mmu] L1 RP1 blocks...\n");
-    for (u32 idx = 124; idx < 128; idx++) {
-        l1_table[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
-    }
+    /* RP1: indices 124-127 */
+    for (u32 idx = 124; idx < 128; idx++)
+        l1[idx] = ((u64)idx * L1_BLOCK_SIZE) | dev_attr;
 
-    dsb();
-    isb();
+    __asm__ volatile("dsb sy" ::: "memory");
+    __asm__ volatile("isb" ::: "memory");
 
-    fb_printf("  [mmu] L1 @ 0x%X\n", (u64)(usize)l1_table);
-
-    shared_ttbr0 = (u64)(usize)l1_table;
+    u64 ttbr = (u64)(usize)l1_table;
+    shared_ttbr0 = ttbr;
     shared_mair  = MAIR_VALUE;
     shared_tcr   = TCR_VALUE;
 
-    fb_puts("  [mmu] writing MAIR...\n");
-    __asm__ volatile("msr mair_el1, %0" :: "r"((u64)MAIR_VALUE));
+    /* Program system registers one at a time with barriers */
+    __asm__ volatile("msr mair_el1, %0; isb" :: "r"((u64)MAIR_VALUE));
+    __asm__ volatile("msr tcr_el1, %0; isb" :: "r"((u64)TCR_VALUE));
+    __asm__ volatile("msr ttbr0_el1, %0; isb" :: "r"(ttbr));
+    __asm__ volatile("msr ttbr1_el1, xzr; isb");
+    __asm__ volatile("tlbi vmalle1; dsb sy; isb" ::: "memory");
 
-    fb_puts("  [mmu] writing TCR...\n");
-    __asm__ volatile("msr tcr_el1, %0" :: "r"((u64)TCR_VALUE));
-
-    fb_printf("  [mmu] TTBR0 = 0x%X\n", shared_ttbr0);
-    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(shared_ttbr0));
-
-    __asm__ volatile("msr ttbr1_el1, xzr");
-
-    fb_puts("  [mmu] TLB invalidate...\n");
-    __asm__ volatile(
-        "tlbi vmalle1    \n"
-        "dsb  sy         \n"
-        "isb             \n"
-        ::: "memory"
-    );
-
-    /* Enable caches ONLY first — no MMU. If this works, MMU is the problem. */
-    fb_puts("  [mmu] enabling I+D cache (no MMU)...\n");
+    /* Enable MMU + caches */
     u64 sctlr;
     __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
-    sctlr |=  (1UL << 2);      /* C  — Data cache enable */
-    sctlr |=  (1UL << 12);     /* I  — Instruction cache enable */
-    sctlr &= ~(1UL << 0);      /* M  — MMU still OFF */
+    sctlr |=  (1UL << 0);      /* M  — MMU ON */
+    sctlr |=  (1UL << 2);      /* C  — Data cache */
+    sctlr |=  (1UL << 12);     /* I  — Instruction cache */
     sctlr &= ~(1UL << 1);      /* A  — no alignment check */
     sctlr &= ~(1UL << 3);      /* SA — no stack align check */
-    sctlr &= ~(1UL << 19);     /* WXN — clear */
-    sctlr &= ~(1UL << 25);     /* EE — little-endian */
+    sctlr &= ~(1UL << 19);     /* WXN */
+    sctlr &= ~(1UL << 25);     /* EE */
+    sctlr &= ~(1UL << 3);      /* SA — no stack align check */
+    sctlr &= ~(1UL << 19);     /* WXN */
+    sctlr &= ~(1UL << 25);     /* EE */
     __asm__ volatile(
         "msr sctlr_el1, %0  \n"
         "isb                 \n"
         :: "r"(sctlr)
     );
 
-    fb_puts("  [mmu] caches ON (MMU off)\n");
+    fb_puts("  [mmu] MMU + caches ON!\n");
 }
 
 void mmu_invalidate_tlb(void) {

@@ -509,24 +509,20 @@ static bool format_disk(void)
 
 bool walfs_init(void)
 {
-    fb_puts("  [walfs] Resetting mount state\n");
     mounted = false;
     cached_lba = 0xFFFFFFFF;
     dindex_reset();
     lru_init(&inode_cache, NULL, 0);  /* no TTL — invalidated on write */
     lru_init(&path_cache, NULL, 30000); /* 30s TTL for path lookups */
 
-    fb_puts("  [walfs] Reading superblock (block 0)\n");
     if (!bcache_read(0, (u8 *)&super)) return false;
 
     if (super.magic == WALFS_MAGIC && super.version == WALFS_VERSION) {
-        fb_puts("  [walfs] Valid magic + version, verifying CRC\n");
         u32 saved = super.crc32;
         super.crc32 = 0;
         u32 crc = hw_crc32c(&super, SD_BLOCK_SIZE);
         super.crc32 = saved;
         if (crc != saved) {
-            fb_puts("  [walfs] Bad superblock CRC!\n");
             uart_puts("[walfs] bad superblock crc\n");
             return false;
         }
@@ -534,24 +530,19 @@ bool walfs_init(void)
         if (super.wal_head < WAL_START ||
             (super.total_blocks > 0 &&
              super.wal_head > (u64)super.total_blocks * SD_BLOCK_SIZE)) {
-            fb_puts("  [walfs] wal_head out of bounds!\n");
             uart_puts("[walfs] wal_head out of bounds\n");
             return false;
         }
-        fb_puts("  [walfs] Scanning WAL for recovery\n");
         scan_recovery();
         mounted = true;
-        fb_printf("  [walfs] Mounted, records=%u\n", (u32)super.record_count);
         uart_puts("[walfs] mounted, records=");
         uart_hex(super.record_count);
         uart_puts("\n");
         return true;
     }
 
-    fb_puts("  [walfs] No valid superblock, formatting disk\n");
     if (!format_disk()) return false;
     mounted = true;
-    fb_puts("  [walfs] Formatted and mounted\n");
     return true;
 }
 

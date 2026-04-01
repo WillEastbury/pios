@@ -92,10 +92,7 @@ static inline void rw(u64 off, u32 val) { mmio_write(RP1_BAR_BASE + off, val); }
 /* ---- Public API ---- */
 
 void rp1_gpio_init(void) {
-    fb_puts("  [gpio] Initialising 54 GPIOs (3 banks)\n");
-    fb_puts("  [gpio] Bank0: GPIO 0-27, Bank1: GPIO 28-33, Bank2: GPIO 34-53\n");
     uart_puts("[rp1_gpio] 54 GPIOs (3 banks) ready\n");
-    fb_puts("  [gpio] GPIO controller ready\n");
 }
 
 void rp1_gpio_set_function(u32 pin, u32 fsel) {

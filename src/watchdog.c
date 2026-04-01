@@ -22,19 +22,15 @@ static NORETURN void watchdog_reboot_best_effort(void)
 
 void watchdog_init(u32 timeout_ticks, bool reboot_on_trip)
 {
-    fb_printf("  [wdog] timeout=%u reboot=%u\n", timeout_ticks, (u32)reboot_on_trip);
     if (timeout_ticks < 100U) timeout_ticks = 100U;
-    fb_puts("  [wdog] Setting armed state\n");
     g_wdog.armed = true;
     g_wdog.reboot_on_trip = reboot_on_trip;
     g_wdog.timeout_ticks = timeout_ticks;
     g_wdog.last_trip_core = NUM_CORES;
     g_wdog.trip_count = 0;
-    fb_puts("  [wdog] Initialising per-core touch timestamps\n");
     u64 now = timer_ticks();
     for (u32 i = 0; i < NUM_CORES; i++) g_wdog.last_touch[i] = now;
     g_last_poll = 0;
-    fb_puts("  [wdog] Watchdog armed\n");
 }
 
 void watchdog_touch(u32 core)

@@ -295,7 +295,6 @@ bool genet_init(void) {
     tso_enabled = false;
     tso_warned = false;
 
-    fb_puts("  [genet] Software reset (RBUF flush + UMAC reset)\n");
     /* Software reset */
     gw(SYS_RBUF_FLUSH, 1);
     delay_cycles(10000);
@@ -306,35 +305,28 @@ bool genet_init(void) {
     gw(UMAC_CMD, 0);
     delay_cycles(10000);
 
-    fb_puts("  [genet] Programming MAC address\n");
     /* Set MAC address */
     gw(UMAC_MAC0, (mac_addr[0] << 24) | (mac_addr[1] << 16) |
                   (mac_addr[2] << 8)  |  mac_addr[3]);
     gw(UMAC_MAC1, (mac_addr[4] << 8)  |  mac_addr[5]);
 
-    fb_puts("  [genet] Setting max frame size\n");
     /* Max frame size */
     gw(UMAC_MAX_FRAME, ETH_FRAME_MAX);
 
-    fb_puts("  [genet] Enabling 64-byte status blocks + offloads\n");
     /* Enable 64-byte receive status metadata block for per-packet offload trust. */
     gw(RBUF_CTRL, gr(RBUF_CTRL) | (1 << 0));
     gw(RBUF_64B_EN, 1);
     gw(TBUF_CTRL, gr(TBUF_CTRL) | TBUF_64B_EN);
     genet_apply_offloads();
 
-    fb_puts("  [genet] Initialising PHY\n");
     /* Init PHY */
     if (!phy_init())
         uart_puts("[genet] PHY init warning\n");
 
-    fb_puts("  [genet] Setting up RX DMA ring\n");
     /* Init DMA rings */
     init_rx_ring();
-    fb_puts("  [genet] Setting up TX DMA ring\n");
     init_tx_ring();
 
-    fb_puts("  [genet] Enabling DMA + ring 16\n");
     /* Enable DMA */
     gw(RDMA_CTRL, DMA_EN);
     gw(TDMA_CTRL, DMA_EN);
@@ -343,7 +335,6 @@ bool genet_init(void) {
     gw(RDMA_RING_CFG, (1 << 16));
     gw(TDMA_RING_CFG, (1 << 16));
 
-    fb_puts("  [genet] Enabling TX/RX at 1G\n");
     /* Enable TX and RX, set speed to 1G */
     gw(UMAC_CMD, CMD_TX_EN | CMD_RX_EN | CMD_SPEED_1000);
 

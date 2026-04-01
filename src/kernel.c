@@ -463,8 +463,18 @@ static void bp_done(u32 phase, bool ok) {
     }
 }
 
+/* Update PC in register panel (col 65, row 2) */
+static void bp_update_pc(void) {
+    u64 pc;
+    __asm__ volatile("adr %0, ." : "=r"(pc));
+    fb_set_cursor(65, 2);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("PC     %X            ", pc);
+}
+
 /* Append a line to the scrolling boot log below the phase list */
 static void bp_log(const char *msg) {
+    bp_update_pc();
     u32 max_rows = 768 / 8;
     if (bp_log_y >= max_rows) return;
     fb_set_cursor(1, bp_log_y);
@@ -475,6 +485,7 @@ static void bp_log(const char *msg) {
 
 /* Green log — success */
 static void bp_ok(const char *msg) {
+    bp_update_pc();
     u32 max_rows = 768 / 8;
     if (bp_log_y >= max_rows) return;
     fb_set_cursor(1, bp_log_y);
@@ -485,6 +496,7 @@ static void bp_ok(const char *msg) {
 
 /* Red log — error */
 static void bp_err(const char *msg) {
+    bp_update_pc();
     u32 max_rows = 768 / 8;
     if (bp_log_y >= max_rows) return;
     fb_set_cursor(1, bp_log_y);
@@ -495,6 +507,7 @@ static void bp_err(const char *msg) {
 
 /* Yellow log — warning */
 static void bp_warn(const char *msg) {
+    bp_update_pc();
     u32 max_rows = 768 / 8;
     if (bp_log_y >= max_rows) return;
     fb_set_cursor(1, bp_log_y);
@@ -4452,6 +4465,14 @@ static void reg_panel(u32 at_el1) {
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts(at_el1 ? " (kernel)" : " (hypervisor)");
 
+    /* PC — use adr to get current instruction address */
+    __asm__ volatile("adr %0, ." : "=r"(val));
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("PC     %X", val);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts(" Program ctr");
+
     __asm__ volatile("mov %0, sp" : "=r"(val));
     fb_set_cursor(col, row++);
     fb_set_color(0x00FFFFFF, 0x00000000);
@@ -4576,8 +4597,10 @@ void kernel_main(void) {
         bp_ok("[stack] SP relocated");
 
         bp_log("[mmu] mmu_init...");
-        mmu_init();
-        bp_ok("[mmu] identity map + caches ON");
+        /* MMU enable crashes — skip for now. Add dsb barriers for MMIO. */
+        bp_warn("[mmu] SKIPPED (debugging)");
+        /* TODO: investigate MMU enable crash — not NEON, not tables,
+         * not TCR. Might need to be done in asm before C code. */
 
         /* Refresh register panel after MMU changes */
         reg_panel(at_el1);

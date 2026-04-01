@@ -50,29 +50,24 @@ void rp1_write32(u64 offset, u32 val) {
 bool rp1_init(void) {
     uart_puts("[rp1] Enumerating RP1 on bus 1...\n");
 
-    fb_puts("  [rp1] Reading vendor/device ID\n");
     /* Read vendor/device ID */
     u32 id = pcie_cfg_read(RP1_BUS, RP1_DEV, RP1_FN, PCICFG_ID);
 
     if (id == 0xFFFFFFFF || id == 0x00000000) {
-        fb_puts("  [rp1] No device found on bus 1\n");
         uart_puts("[rp1] No device on bus 1\n");
         return false;
     }
 
     u16 vendor = (u16)(id & 0xFFFF);
     u16 device = (u16)((id >> 16) & 0xFFFF);
-    fb_printf("  [rp1] Found vendor=0x%x device=0x%x\n", vendor, device);
 
     if (vendor != RP1_VENDOR_ID || device != RP1_DEVICE_ID) {
-        fb_puts("  [rp1] Unknown device, aborting\n");
         uart_puts("[rp1] Unknown device: ");
         uart_hex(id);
         uart_puts("\n");
         return false;
     }
 
-    fb_puts("  [rp1] Programming BAR1\n");
     /*
      * Program BAR1 to the PCIe target address.
      * The outbound ATU maps CPU RP1_BAR_BASE → PCIe PCIE_TARGET_ADDR,
@@ -82,7 +77,6 @@ bool rp1_init(void) {
                    (u32)PCIE_TARGET_ADDR);
     dmb();
 
-    fb_puts("  [rp1] Enabling memory space + bus mastering\n");
     /* Enable memory space access + bus mastering on RP1 */
     u32 cmd = pcie_cfg_read(RP1_BUS, RP1_DEV, RP1_FN, PCICFG_CMD);
     cmd |= PCI_CMD_MEM | PCI_CMD_MASTER;
@@ -90,10 +84,8 @@ bool rp1_init(void) {
     dmb();
     timer_delay_us(100);
 
-    fb_puts("  [rp1] Reading chip ID from SYSINFO\n");
     /* Read chip ID from SYSINFO block at base of BAR */
     u32 chip_id = rp1_read32(RP1_SYSINFO + SYSINFO_CHIP_ID);
-    fb_printf("  [rp1] Chip ID: 0x%x\n", chip_id);
     uart_puts("[rp1] Chip ID: ");
     uart_hex(chip_id);
 

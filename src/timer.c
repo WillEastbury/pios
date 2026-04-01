@@ -59,7 +59,6 @@ void timer_init(u32 hz) {
 
     tick_count[cid] = 0;
 
-    fb_printf("  [timer] Reading counter frequency (core %u)\n", cid);
     /* Get counter frequency */
     u64 freq;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
@@ -67,21 +66,17 @@ void timer_init(u32 hz) {
     if (interval == 0)
         interval = 1;
     timer_interval[cid] = interval;
-    fb_printf("  [timer] freq=%u hz=%u interval=%u\n", (u32)freq, hz, (u32)interval);
 
-    fb_puts("  [timer] Registering IRQ handler\n");
     /* Register IRQ handler */
     irq_register(GIC_TIMER_VIRT, timer_irq_handler);
     gic_enable_irq(GIC_TIMER_VIRT);
     gic_set_priority(GIC_TIMER_VIRT, 0x40);
 
-    fb_puts("  [timer] Setting initial compare value\n");
     /* Set initial compare value */
     u64 now;
     __asm__ volatile("mrs %0, cntvct_el0" : "=r"(now));
     __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(now + interval));
 
-    fb_puts("  [timer] Enabling virtual timer\n");
     /* Enable virtual timer, unmask */
     __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(1UL));
 
