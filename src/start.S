@@ -121,17 +121,17 @@ _start:
     orr     x4, x3, x2
     str     x4, [x0, #24]
 
-    /* L1[4..7]: Device (peripherals) — 0x60000000000401 */
+    /* L1[64..67]: Device (BCM2712 peripherals at 0x10_00000000+) */
     mov     x2, #0x401
     movk    x2, #0x0060, lsl #48
-    mov     x5, #4
+    mov     x5, #64
 .Lperiph:
     lsl     x3, x5, #30
     orr     x4, x3, x2
     lsl     x6, x5, #3
     str     x4, [x0, x6]
     add     x5, x5, #1
-    cmp     x5, #8
+    cmp     x5, #68
     b.lt    .Lperiph
 
     /* L1[124..127]: Device (RP1) */
