@@ -39,8 +39,9 @@ el2_to_el1:
     msr     cnthctl_el2, x0
     msr     cntvoff_el2, xzr       /* no virtual offset */
 
-    /* Enable NEON/FPU at EL2 (CPTR_EL2) */
-    mov     x0, #0x33FF
+    /* Enable NEON/FPU at EL2: clear TFP (bit 10) so EL1 SIMD/FP is not trapped.
+     * RES1 bits [13:12] and [9:0] must stay set → 0x33BF. */
+    mov     x0, #0x33BF
     msr     cptr_el2, x0
 
     /* SPSR_EL2: return to EL1h with IRQs masked initially */

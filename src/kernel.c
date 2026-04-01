@@ -4284,6 +4284,24 @@ static void boot_diag(bool sd_ok, bool walfs_ok, bool genet_ok, bool usb_ok) {
 /* ---- Main kernel entry (runs on core 0) ---- */
 
 void kernel_main(void) {
+    /*
+     * MINIMAL BOOT TEST — prove we can reach kernel_main and get HDMI.
+     * If this shows green, the startup asm works. If black, start.S or
+     * el2_to_el1 is broken. Remove this block once HDMI is confirmed.
+     */
+    if (fb_init(1024, 768)) {
+        /* fb_init already fills green as proof-of-life, but repeat
+         * explicitly at 1280x720 in case the canary resolution worked */
+        for (;;) __asm__ volatile("wfe");
+    }
+    /* If fb_init(1024,768) failed, try 1280x720 */
+    if (fb_init(1280, 720)) {
+        for (;;) __asm__ volatile("wfe");
+    }
+    /* Both failed — spin forever (black screen = fb_init never succeeds) */
+    for (;;) __asm__ volatile("wfe");
+
+#if 0  /* ---- Full boot sequence (disabled until HDMI confirmed) ---- */
     bool usb_ok = false;
     bool fb_ok = false;
     bool sd_ok = false;
@@ -4482,4 +4500,5 @@ void kernel_main(void) {
 
     /* Core 0 -> network poll loop (never returns) */
     core0_main();
+#endif  /* Full boot sequence disabled */
 }
