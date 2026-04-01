@@ -14,14 +14,15 @@ _start:
     and     x0, x0, #0x3
     cbnz    x0, .Lpark          /* only core 0 continues */
 
-    /* Stack — use same location as canary: just below kernel load address.
-     * __stack_top_core0 is deep in BSS (~3MB), which may be unmapped by
-     * firmware.  _start (0x80000) grows downward into safe low RAM. */
+    /* Stack — just below kernel at 0x80000 (canary pattern) */
     ldr     x1, =_start
     mov     sp, x1
 
-    /* Skip EL2→EL1 for now — run at whatever EL firmware gave us,
-     * exactly like the working canary kernel. */
+    /* Enable NEON/FPU at EL2 so simd_zero etc. work.
+     * CPTR_EL2: clear TFP (bit 10), keep RES1 bits. */
+    mov     x0, #0x33BF
+    msr     cptr_el2, x0
+    isb
 
     /* Clear BSS */
     ldr     x1, =__bss_start

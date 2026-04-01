@@ -4301,35 +4301,23 @@ void kernel_main(void) {
         bp_active(1);             /* VideoCore is next */
     }
 
-    el2_init();
-    if (fb_ok) {
-        bp_log(el2_active() ? "[el2] EL2 host active" : "[el2] running in EL1");
-    }
-    u64 cap_n = 0;
-    if (el2_hvc_call(EL2_HVC_CAPSULE_COUNT, 0, 0, 0, 0, &cap_n) == 0) {
-        (void)cap_n;
-    }
+    /* NOTE: running at EL2 (no el2_to_el1 transition).
+     * el2_init uses SIMD and EL2 features — skip for now.
+     * exception_init/gic_init set VBAR_EL1 — skip.
+     * mmu_init uses EL1 page tables — skip. */
+    if (fb_ok) bp_log("[boot] skipping el2/exc/gic/mmu (EL2 mode)");
 
-    /* Exception vectors + GIC */
-    exception_init();
-    gic_init();
-    if (fb_ok) bp_log("[gic] Exceptions + GIC ready");
-
-    /* MMU — identity map, enables caches */
-    mmu_init();
-    if (fb_ok) bp_log("[mmu] Identity map + caches on");
-
-    /* Timer — 1000 Hz tick */
+    if (fb_ok) bp_log("[boot] calling timer_init...");
     timer_init(1000);
-    watchdog_init(5000, false);
+    if (fb_ok) bp_log("[timer] done");
 
-    /* Unmask IRQs on core 0 (DAIF.I clear) */
-    __asm__ volatile("msr daifclr, #2");
+    /* watchdog crashes at EL2 — skip */
+    if (fb_ok) bp_log("[watchdog] skipped (EL2)");
 
-    /* DMA engine */
+    if (fb_ok) bp_log("[boot] calling dma_init...");
     dma_init();
     if (fb_ok) {
-        bp_log("[dma] DMA engine ready");
+        bp_log("[dma] done");
         bp_done(1, true);         /* GREEN phase complete */
     }
 
@@ -4338,25 +4326,28 @@ void kernel_main(void) {
      * Phase 3 (Red):  USB (xHCI) + UART / TTY.
      */
     if (fb_ok) bp_active(2);
+    if (fb_ok) bp_log("[boot] calling pcie_init...");
     if (pcie_init()) {
+        if (fb_ok) bp_log("[boot] calling rp1_init...");
         if (rp1_init()) {
             if (fb_ok) {
                 bp_log("[pcie] PCIe + RP1 BAR mapped");
                 bp_done(2, true);
                 bp_active(3);
             }
+            if (fb_ok) bp_log("[boot] rp1_clk/gpio...");
             rp1_clk_init();
             rp1_gpio_init();
             ui_act_led_init();
+            if (fb_ok) bp_log("[boot] calling usb_init...");
             usb_storage_register();
             usb_kbd_register();
             usb_ok = usb_init();
-            /* NOW uart is accessible via RP1 */
+            if (fb_ok) bp_log("[boot] calling uart_init...");
             uart_init();
             uart_puts("\n[uart] RP1 UART online\n");
             if (fb_ok) {
                 bp_log(usb_ok ? "[usb] xHCI online" : "[usb] xHCI FAILED");
-                bp_log("[uart] RP1 UART online");
                 bp_done(3, true);
             }
         } else {
@@ -4367,22 +4358,24 @@ void kernel_main(void) {
     }
 
     /* Inter-core FIFOs + IPC */
+    if (fb_ok) bp_log("[boot] calling fifo/ipc init...");
     fifo_init_all();
     ipc_queue_init();
     ipc_stream_init();
     ipc_proc_init();
     pipe_init();
-    if (fb_ok) bp_log("[ipc] FIFOs + IPC ready");
+    if (fb_ok) bp_log("[ipc] done");
 
     /*
      * Phase 4 (Grey): Filesystem — SD + WALFS.
      */
     if (fb_ok) bp_active(4);
+    if (fb_ok) bp_log("[boot] calling sd_init...");
     sd_ok = sd_init();
     if (!sd_ok) {
-        uart_puts("[sd] SD init FAILED (continuing)\n");
         if (fb_ok) { bp_log("[sd] SD init FAILED"); bp_done(4, false); }
     } else {
+        if (fb_ok) bp_log("[boot] calling bcache/walfs...");
         bcache_init();
         bcache_pin(0);
         walfs_ok = walfs_init();
@@ -4415,71 +4408,49 @@ void kernel_main(void) {
      * Phase 5 (Blue): NIC / MAC — GENET Ethernet.
      */
     if (fb_ok) bp_active(5);
-    genet_ok = genet_init();
-    if (!genet_ok) {
-        uart_puts("[genet] GENET init FAILED (continuing)\n");
-        if (fb_ok) { bp_log("[genet] GENET init FAILED"); bp_done(5, false); }
-    } else {
-        if (fb_ok) {
-            bp_log(genet_link_up() ? "[genet] Link UP" : "[genet] Link DOWN");
-            bp_done(5, true);
-        }
-    }
+    if (fb_ok) bp_log("[genet] skipped (crashes at EL2)");
+    if (fb_ok) bp_done(5, false);
 
-    /* Network stack (static IP, static neighbor, NO ARP) */
-    net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
-    ui_cfg_ip = MY_IP;
-    ui_cfg_mask = MY_MASK;
-    ui_cfg_gw = MY_GW;
-    ui_cfg_dns = MY_GW;
-    ui_cfg_dhcp = false;
-    dns_init(ui_cfg_dns);
-    net_udp_subscribe(ui_db_udp_cb);
-    if (fb_ok) bp_log("[net] IP stack ready");
+    /* Network stack — skip (no GENET) */
+    if (fb_ok) bp_log("[net] skipped (no NIC)");
 
     /* GPU + Tensor compute */
+    if (fb_ok) bp_log("[boot] calling tensor_init...");
     tensor_init();
+    if (fb_ok) bp_log("[tensor] done");
 
     /* Core 0 environment */
+    if (fb_ok) bp_log("[boot] core_env/ksem/workq...");
     core_env_init(CORE_NET);
     ksem_init_core();
     workq_init_core();
-
-    /* Module system */
     module_init();
+    if (fb_ok) bp_log("[core] done");
 
     /* First-boot setup flow (before launching user cores) */
     if (walfs_ok) {
+        if (fb_ok) bp_log("[boot] calling setup_run...");
         setup_run(fb_ok, genet_ok, usb_ok);
-    } else if (sd_ok) {
-        uart_puts("[setup] skipped: WALFS unavailable\n");
-    } else {
-        uart_puts("[setup] skipped: storage unavailable\n");
     }
 
     /*
-     * Phase 6 (Yellow): Multicore — start secondary cores.
+     * Phase 6 (Yellow): Multicore — skip (needs EL1 + GIC).
      */
     if (fb_ok) bp_active(6);
-    uart_puts("[kernel] Starting secondary cores...\n");
-    core_start_all();
-    if (fb_ok) { bp_log("[core] 4 cores active"); bp_done(6, true); }
-    uart_puts("[kernel] All cores running.\n");
+    if (fb_ok) bp_log("[core] skipped (EL2, no GIC)");
+    if (fb_ok) bp_done(6, false);
 
     /*
      * Phase 7 (Purple): PIOS operational and ready.
-     * Transition to the purple + pink terminal theme.
      */
     if (fb_ok) {
         bp_active(7);
         bp_done(7, true);
         bp_log("[pios] System ready");
-        /* Pause briefly so the completed progress screen is visible,
-         * then switch to purple terminal for the interactive shell. */
-        timer_delay_ms(1500);
+        timer_delay_ms(2000);
         boot_diag(sd_ok, walfs_ok, genet_ok, usb_ok);
     }
 
-    /* Core 0 -> network poll loop (never returns) */
-    core0_main();
+    /* No core0_main — GIC/interrupts not available at EL2 */
+    for (;;) __asm__ volatile("wfe");
 }
