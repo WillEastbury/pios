@@ -4543,15 +4543,28 @@ void kernel_main(void) {
     bp_done(0, true);                     /* Firmware handoff */
     bp_done(1, true);                     /* VideoCore (fb from EL2) */
 
+    /* Show FB physical address — needed for MMU mapping */
+    {
+        u64 fb_addr = fb_get_phys_addr();
+        fb_set_cursor(1, bp_log_y);
+        fb_set_color(0x0000CCFF, BOOT_BLACK);
+        fb_printf("FB phys=0x%X  size=%u", fb_addr, fb_addr ? 1024*768*4 : 0);
+        bp_log_y++;
+    }
+
     if (at_el1) {
         bp_ok("[el2->el1] Transition OK!");
     } else {
         bp_warn("[boot] Running at EL2 (eret failed or skipped)");
     }
 
-    /* ── EL1-only inits ── */
+    /* ── EL1 inits (MMU already on from start.S) ── */
     if (at_el1) {
-        bp_warn("[skip] el2_init (hypervisor layer)");
+        /* Update shared vars for secondary cores */
+        shared_ttbr0 = (u64)(usize)l1_table;
+        shared_mair  = 0xBBFF4400UL;
+        shared_tcr   = 0x200803519UL;
+        bp_ok("[mmu] ON (start.S asm)");
 
         bp_log("[exc] exception_init...");
         exception_init();
@@ -4561,43 +4574,21 @@ void kernel_main(void) {
         gic_init();
         bp_ok("[gic] distributor + CPU iface ready");
 
-        /* Move stack to __stack_top_core0 before MMU enable. */
-        bp_log("[stack] relocating to 3MB...");
-        __asm__ volatile(
-            "ldr x1, =__stack_top_core0 \n"
-            "mov sp, x1                 \n"
-            ::: "x1", "memory"
-        );
-        bp_ok("[stack] SP relocated");
+        bp_log("[timer] timer_init(1000Hz)...");
+        timer_init(1000);
+        bp_ok("[timer] 1kHz tick running");
 
-        bp_log("[mmu] mmu_init...");
-        /* MMU was enabled in start.S before kernel_main — just
-         * update the shared variables for secondary cores. */
-        shared_ttbr0 = (u64)(usize)l1_table;
-        shared_mair  = 0xBBFF4400UL;
-        shared_tcr   = 0x200803519UL;
-        bp_ok("[mmu] ON (set in start.S asm)");
-
-        /* Refresh register panel after MMU changes */
-        reg_panel(at_el1);
-    } else {
-        bp_warn("[skip] el2/exc/gic/mmu (need EL1)");
-    }
-
-    /* ── Common inits ── */
-    bp_log("[timer] timer_init(1000Hz)...");
-    timer_init(1000);
-    bp_ok("[timer] 1kHz tick running");
-
-    if (at_el1) {
         bp_log("[wdog] watchdog_init(5s)...");
         watchdog_init(5000, false);
         bp_ok("[wdog] armed");
+
         bp_log("[irq] unmasking IRQs...");
         __asm__ volatile("msr daifclr, #2");
         bp_ok("[irq] IRQs live");
+
+        reg_panel(at_el1);
     } else {
-        bp_warn("[skip] watchdog/IRQ (need EL1)");
+        bp_warn("[skip] all EL1 inits");
     }
 
     bp_log("[dma] dma_init...");
@@ -4759,14 +4750,14 @@ void kernel_main(void) {
     /* ── Phase 7: Ready ── */
     bp_active(7);
     bp_done(7, true);
-    bp_log("[pios] System ready");
-    timer_delay_ms(2000);
+    bp_ok("[pios] System ready");
+    if (at_el1) timer_delay_ms(2000);
+    else delay_cycles(100000000);
     boot_diag(sd_ok, walfs_ok, genet_ok, usb_ok);
 
     if (at_el1) {
         core0_main();
     } else {
-        /* EL2 fallback: no interrupts, just spin */
         for (;;) __asm__ volatile("wfe");
     }
 }

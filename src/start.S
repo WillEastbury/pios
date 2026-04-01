@@ -32,17 +32,156 @@ _start:
     cbnz    w2, .Lbss_loop
 .Lbss_done:
 
-    /* Init framebuffer at EL2 */
+    /* Init framebuffer at EL2 (proven working) */
     bl      kernel_fb_early
 
-    /* Stay at EL2 — go straight to kernel_main */
-    bl      kernel_main
-    b       .Lhalt
+    /* Install EL2 crash vectors so we catch any eret faults */
+    adr     x0, el2_crash_vectors
+    msr     vbar_el2, x0
+    isb
 
-/* EL1 landing pad (unused for now — EL2-only boot) */
+    /* ── EL2 → EL1 drop (matching Circle's proven sequence) ── */
+
+    /* Timers */
+    mrs     x0, cnthctl_el2
+    orr     x0, x0, #3
+    msr     cnthctl_el2, x0
+    msr     cntvoff_el2, xzr
+
+    /* Copy MIDR/MPIDR to virtual regs */
+    mrs     x0, midr_el1
+    mrs     x1, mpidr_el1
+    msr     vpidr_el2, x0
+    msr     vmpidr_el2, x1
+
+    /* Disable coprocessor traps */
+    mov     x0, #0x33FF
+    msr     cptr_el2, x0           /* no traps to EL2 (TFP doesn't matter, we're leaving) */
+    msr     hstr_el2, xzr          /* no hypervisor system traps */
+    mov     x0, #(3 << 20)
+    msr     cpacr_el1, x0          /* NEON at EL1 */
+
+    /* HCR_EL2: 64-bit EL1 */
+    mov     x0, #(1 << 31)
+    msr     hcr_el2, x0
+
+    /* SCTLR_EL1: RES1 bits set (Circle's value: 0x30D00800) */
+    mov     x0, #0x0800
+    movk    x0, #0x30D0, lsl #16
+    msr     sctlr_el1, x0
+
+    /* Return to EL1_SP0 (EL1t) */
+    mov     x0, #0x3C4
+    msr     spsr_el2, x0
+    ldr     x0, =.Lel1_entry
+    msr     elr_el2, x0
+    eret
+
+/* ── EL1 landing pad ── */
 .Lel1_entry:
+    /* Stack */
     ldr     x1, =_start
     mov     sp, x1
+
+    /* NEON (confirm) */
+    mrs     x1, cpacr_el1
+    orr     x1, x1, #(3 << 20)
+    msr     cpacr_el1, x1
+    isb
+
+    /* Exception vectors */
+    ldr     x1, =vector_table
+    msr     vbar_el1, x1
+    isb
+
+    /* ── EL1 MMU setup (same page table, EL1 registers) ── */
+
+    /* Zero L1 table */
+    ldr     x0, =l1_table
+    mov     x1, #512
+.Lzero_l1:
+    str     xzr, [x0], #8
+    subs    x1, x1, #1
+    b.ne    .Lzero_l1
+
+    /* L1[0]: Non-Cacheable RAM (FB at 0x3F400000) — ATTR(1) = 0x705 */
+    ldr     x0, =l1_table
+    mov     x2, #0x705
+    str     x2, [x0, #0]
+
+    /* L1[1..3]: Cacheable RAM — ATTR(2) = 0x709 */
+    mov     x2, #0x709
+    mov     x3, #0x40000000
+    orr     x4, x3, x2
+    str     x4, [x0, #8]
+    ldr     x3, =0x80000000
+    orr     x4, x3, x2
+    str     x4, [x0, #16]
+    ldr     x3, =0xC0000000
+    orr     x4, x3, x2
+    str     x4, [x0, #24]
+
+    /* L1[4..7]: Device (peripherals) — 0x60000000000401 */
+    mov     x2, #0x401
+    movk    x2, #0x0060, lsl #48
+    mov     x5, #4
+.Lperiph:
+    lsl     x3, x5, #30
+    orr     x4, x3, x2
+    lsl     x6, x5, #3
+    str     x4, [x0, x6]
+    add     x5, x5, #1
+    cmp     x5, #8
+    b.lt    .Lperiph
+
+    /* L1[124..127]: Device (RP1) */
+    mov     x5, #124
+.Lrp1:
+    lsl     x3, x5, #30
+    orr     x4, x3, x2
+    lsl     x6, x5, #3
+    str     x4, [x0, x6]
+    add     x5, x5, #1
+    cmp     x5, #128
+    b.lt    .Lrp1
+
+    dsb     sy
+
+    /* MAIR_EL1 */
+    ldr     x1, =0xBBFF4400
+    msr     mair_el1, x1
+    isb
+
+    /* TCR_EL1: T0SZ=25, IRGN0=WB, ORGN0=WB, SH0=Inner, TG0=4K, IPS=36b, EPD1=1 */
+    ldr     x1, =0x200803519
+    msr     tcr_el1, x1
+    isb
+
+    /* TTBR0_EL1 */
+    ldr     x1, =l1_table
+    msr     ttbr0_el1, x1
+    msr     ttbr1_el1, xzr
+    isb
+
+    /* TLB flush */
+    tlbi    vmalle1
+    dsb     sy
+    isb
+
+    /* Enable EL1 MMU + caches */
+    mrs     x1, sctlr_el1
+    orr     x1, x1, #(1 << 0)   /* M  = MMU */
+    orr     x1, x1, #(1 << 2)   /* C  = D-cache */
+    orr     x1, x1, #(1 << 12)  /* I  = I-cache */
+    bic     x1, x1, #(1 << 1)   /* no A */
+    bic     x1, x1, #(1 << 3)   /* no SA */
+    msr     sctlr_el1, x1
+    isb
+
+    /* ── EL1 + MMU ON — move stack and enter C ── */
+    ldr     x1, =__stack_top_core0
+    mov     sp, x1
+
     bl      kernel_main
     b       .Lhalt
 
