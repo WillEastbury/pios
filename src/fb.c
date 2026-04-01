@@ -197,6 +197,11 @@ void fb_set_color(u32 fg, u32 bg) {
     fb_bg = bg;
 }
 
+void fb_set_cursor(u32 col, u32 row) {
+    if (col < cols) cursor_x = col;
+    if (row < rows) cursor_y = row;
+}
+
 /* Scroll screen up by one text row (8 pixels) — DMA-accelerated */
 static void fb_scroll(void) {
     u32 row_bytes = fb_pitch * 8;

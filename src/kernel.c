@@ -352,12 +352,13 @@ static void boot_measurements(u32 *el1_hash, u32 *el2_hash, u64 *el1_start, u32 
 /*
  * ── PIOS Boot Colour Scheme ──────────────────────────────────────────
  *
- * The framebuffer background colour encodes the current boot phase.
- * If boot hangs, the last visible colour identifies the failing subsystem.
+ * Each boot phase has a coloured swatch on the HDMI progress display.
+ * If boot hangs, the last phase showing [..] identifies the failure.
+ * Completed phases show [OK]; failed phases show [!!].
  *
- * Order  Colour   Hex (RRGGBB)  Phase
+ * Phase  Colour   Hex (RRGGBB)  Subsystem
  * ─────  ───────  ───────────   ──────────────────────────────────────
- *   0    Black    0x00000000    Firmware handed off to kernel (pre-fb)
+ *   0    Black    0x00222222    Firmware handed off to kernel (pre-fb)
  *   1    Green    0x0000AA00    VideoCore framebuffer + HDMI online
  *   2    Pink     0x00FF55AA    PCIe root complex + RP1 southbridge
  *   3    Red      0x00CC0000    USB (xHCI) + UART / TTY online
@@ -380,11 +381,96 @@ static void boot_measurements(u32 *el1_hash, u32 *el2_hash, u64 *el1_start, u32 
 #define BOOT_FG_WHITE   0x00FFFFFF
 #define BOOT_FG_DARK    0x00000000
 #define BOOT_FG_PINK    0x00FF88CC
+#define BOOT_FG_DIM     0x00555555
+#define BOOT_FG_LOG     0x00999999
+#define BOOT_FG_OK      0x0000CC00
+#define BOOT_FG_FAIL    0x00FF2200
 
-static void boot_phase(u32 bg, u32 fg, const char *label) {
-    fb_clear(bg);
-    fb_set_color(fg, bg);
-    fb_puts(label);
+/* Boot progress display — 8 phases with coloured swatches + scrolling log */
+#define BP_COUNT     8
+#define BP_LIST_ROW  3      /* first phase at text row 3 */
+#define BP_STAT_COL  36     /* [OK]/[..] column */
+
+static const u32 bp_colors[BP_COUNT] = {
+    0x00222222, BOOT_GREEN, BOOT_PINK, BOOT_RED,
+    BOOT_GREY, BOOT_BLUE, BOOT_YELLOW, BOOT_PURPLE,
+};
+static const char *bp_names[BP_COUNT] = {
+    "Firmware Handoff",
+    "VideoCore HDMI",
+    "PCIe + RP1 Southbridge",
+    "USB + UART / TTY",
+    "Filesystem (SD + WALFS)",
+    "NIC / MAC (GENET)",
+    "Multicore",
+    "PIOS Ready",
+};
+
+static u32 bp_log_y;  /* next row for boot log messages */
+
+/* Draw initial progress screen: header + phase list (all dim/pending) */
+static void bp_init(void) {
+    fb_clear(BOOT_BLACK);
+    fb_set_cursor(0, 0);
+    fb_set_color(BOOT_FG_PINK, BOOT_BLACK);
+    fb_puts("PIOS v0.3 Boot Sequence\n");
+    fb_set_color(0x00444444, BOOT_BLACK);
+    fb_puts("=============================================\n");
+
+    for (u32 i = 0; i < BP_COUNT; i++) {
+        fb_set_cursor(0, BP_LIST_ROW + i);
+        fb_set_color(BOOT_FG_WHITE, BOOT_BLACK);
+        fb_putc(' ');
+        /* 2-char coloured swatch (space glyphs fill with bg colour) */
+        fb_set_color(bp_colors[i], bp_colors[i]);
+        fb_puts("  ");
+        /* Phase name — dim until active */
+        fb_set_color(BOOT_FG_DIM, BOOT_BLACK);
+        fb_putc(' ');
+        fb_puts(bp_names[i]);
+    }
+
+    /* Separator before log area */
+    fb_set_cursor(0, BP_LIST_ROW + BP_COUNT + 1);
+    fb_set_color(0x00444444, BOOT_BLACK);
+    fb_puts("---------------------------------------------");
+    bp_log_y = BP_LIST_ROW + BP_COUNT + 2;
+}
+
+/* Mark a phase as active: brighten name, show [..] */
+static void bp_active(u32 phase) {
+    if (phase >= BP_COUNT) return;
+    u32 row = BP_LIST_ROW + phase;
+    fb_set_cursor(4, row);
+    fb_set_color(BOOT_FG_WHITE, BOOT_BLACK);
+    fb_puts(bp_names[phase]);
+    fb_set_cursor(BP_STAT_COL, row);
+    fb_set_color(BOOT_FG_WHITE, BOOT_BLACK);
+    fb_puts("[..]");
+}
+
+/* Mark a phase as done: show [OK] or [!!] */
+static void bp_done(u32 phase, bool ok) {
+    if (phase >= BP_COUNT) return;
+    u32 row = BP_LIST_ROW + phase;
+    fb_set_cursor(BP_STAT_COL, row);
+    if (ok) {
+        fb_set_color(BOOT_FG_OK, BOOT_BLACK);
+        fb_puts("[OK]");
+    } else {
+        fb_set_color(BOOT_FG_FAIL, BOOT_BLACK);
+        fb_puts("[!!]");
+    }
+}
+
+/* Append a line to the scrolling boot log below the phase list */
+static void bp_log(const char *msg) {
+    u32 max_rows = 720 / 8;
+    if (bp_log_y >= max_rows) return;
+    fb_set_cursor(1, bp_log_y);
+    fb_set_color(BOOT_FG_LOG, BOOT_BLACK);
+    fb_puts(msg);
+    bp_log_y++;
 }
 
 void early_boot_hdmi_mark(u32 code)
@@ -4205,31 +4291,33 @@ void kernel_main(void) {
     bool genet_ok = false;
 
     /*
-     * ── Phase 1: GREEN — VideoCore framebuffer + HDMI online ──
-     * (RP1 UART is inaccessible until PCIe is initialized)
+     * Phase 0 (Black): Firmware handoff — we're running.
+     * Phase 1 (Green): VideoCore framebuffer + HDMI.
      */
     if (fb_init(1280, 720)) {
         fb_ok = true;
-        boot_phase(BOOT_GREEN, BOOT_FG_WHITE, "PIOS v0.3\n[boot] VideoCore HDMI online\n");
+        bp_init();
+        bp_done(0, true);         /* firmware got us here */
+        bp_active(1);             /* VideoCore is next */
     }
 
     el2_init();
     if (fb_ok) {
-        fb_printf("[el2] boot EL=%x", (u32)el2_boot_el());
-        fb_puts(el2_active() ? " (EL2 host active)\n" : " (running in EL1)\n");
+        bp_log(el2_active() ? "[el2] EL2 host active" : "[el2] running in EL1");
     }
     u64 cap_n = 0;
     if (el2_hvc_call(EL2_HVC_CAPSULE_COUNT, 0, 0, 0, 0, &cap_n) == 0) {
-        if (fb_ok) fb_printf("[el2] capsule descriptors=%x\n", (u32)cap_n);
+        (void)cap_n;
     }
 
     /* Exception vectors + GIC */
     exception_init();
     gic_init();
-    if (fb_ok) fb_puts("[kernel] Exceptions + GIC ready\n");
+    if (fb_ok) bp_log("[gic] Exceptions + GIC ready");
 
     /* MMU — identity map, enables caches */
     mmu_init();
+    if (fb_ok) bp_log("[mmu] Identity map + caches on");
 
     /* Timer — 1000 Hz tick */
     timer_init(1000);
@@ -4240,15 +4328,23 @@ void kernel_main(void) {
 
     /* DMA engine */
     dma_init();
+    if (fb_ok) {
+        bp_log("[dma] DMA engine ready");
+        bp_done(1, true);         /* GREEN phase complete */
+    }
 
     /*
-     * ── Phase 2: PINK — PCIe root complex + RP1 southbridge ──
-     * ── Phase 3: RED  — USB (xHCI) + UART / TTY online ──
+     * Phase 2 (Pink): PCIe root complex + RP1 southbridge.
+     * Phase 3 (Red):  USB (xHCI) + UART / TTY.
      */
+    if (fb_ok) bp_active(2);
     if (pcie_init()) {
         if (rp1_init()) {
-            if (fb_ok) boot_phase(BOOT_PINK, BOOT_FG_WHITE,
-                "PIOS v0.3\n[boot] PCIe + RP1 connected\n");
+            if (fb_ok) {
+                bp_log("[pcie] PCIe + RP1 BAR mapped");
+                bp_done(2, true);
+                bp_active(3);
+            }
             rp1_clk_init();
             rp1_gpio_init();
             ui_act_led_init();
@@ -4258,9 +4354,16 @@ void kernel_main(void) {
             /* NOW uart is accessible via RP1 */
             uart_init();
             uart_puts("\n[uart] RP1 UART online\n");
-            if (fb_ok) boot_phase(BOOT_RED, BOOT_FG_WHITE,
-                "PIOS v0.3\n[boot] USB + TTY online\n");
+            if (fb_ok) {
+                bp_log(usb_ok ? "[usb] xHCI online" : "[usb] xHCI FAILED");
+                bp_log("[uart] RP1 UART online");
+                bp_done(3, true);
+            }
+        } else {
+            if (fb_ok) { bp_log("[rp1] RP1 init FAILED"); bp_done(2, false); bp_done(3, false); }
         }
+    } else {
+        if (fb_ok) { bp_log("[pcie] PCIe init FAILED"); bp_done(2, false); bp_done(3, false); }
     }
 
     /* Inter-core FIFOs + IPC */
@@ -4269,14 +4372,17 @@ void kernel_main(void) {
     ipc_stream_init();
     ipc_proc_init();
     pipe_init();
+    if (fb_ok) bp_log("[ipc] FIFOs + IPC ready");
 
     /*
-     * ── Phase 4: GREY — Filesystem (SD + WALFS) online ──
+     * Phase 4 (Grey): Filesystem — SD + WALFS.
      */
+    if (fb_ok) bp_active(4);
     sd_ok = sd_init();
-    if (!sd_ok)
+    if (!sd_ok) {
         uart_puts("[sd] SD init FAILED (continuing)\n");
-    else {
+        if (fb_ok) { bp_log("[sd] SD init FAILED"); bp_done(4, false); }
+    } else {
         bcache_init();
         bcache_pin(0);
         walfs_ok = walfs_init();
@@ -4295,20 +4401,30 @@ void kernel_main(void) {
             if (el2_hvc_call(EL2_HVC_BOOT_INTEGRITY_SET, el1_s, el1_len,
                              boot_el1_expected_hash, boot_el2_expected_hash, &ok) != 0 || ok != 0)
                 exception_pisod("Boot integrity arm failed", 5, 0x3B, 0, 0, 0);
+            if (fb_ok) bp_log("[walfs] Verified + integrity armed");
+        } else {
+            if (fb_ok) bp_log("[walfs] WALFS init FAILED");
         }
-        if (fb_ok) boot_phase(BOOT_GREY, BOOT_FG_WHITE,
-            "PIOS v0.3\n[boot] Filesystem online\n");
+        if (fb_ok) {
+            bp_log(walfs_ok ? "[fs] SD + WALFS online" : "[fs] SD ok, WALFS failed");
+            bp_done(4, sd_ok);
+        }
     }
 
     /*
-     * ── Phase 5: BLUE — NIC / MAC (GENET Ethernet) online ──
+     * Phase 5 (Blue): NIC / MAC — GENET Ethernet.
      */
+    if (fb_ok) bp_active(5);
     genet_ok = genet_init();
-    if (!genet_ok)
+    if (!genet_ok) {
         uart_puts("[genet] GENET init FAILED (continuing)\n");
-    else if (fb_ok)
-        boot_phase(BOOT_BLUE, BOOT_FG_WHITE,
-            "PIOS v0.3\n[boot] NIC/MAC online\n");
+        if (fb_ok) { bp_log("[genet] GENET init FAILED"); bp_done(5, false); }
+    } else {
+        if (fb_ok) {
+            bp_log(genet_link_up() ? "[genet] Link UP" : "[genet] Link DOWN");
+            bp_done(5, true);
+        }
+    }
 
     /* Network stack (static IP, static neighbor, NO ARP) */
     net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
@@ -4319,6 +4435,7 @@ void kernel_main(void) {
     ui_cfg_dhcp = false;
     dns_init(ui_cfg_dns);
     net_udp_subscribe(ui_db_udp_cb);
+    if (fb_ok) bp_log("[net] IP stack ready");
 
     /* GPU + Tensor compute */
     tensor_init();
@@ -4341,19 +4458,27 @@ void kernel_main(void) {
     }
 
     /*
-     * ── Phase 6: YELLOW — Multicore (secondary cores started) ──
+     * Phase 6 (Yellow): Multicore — start secondary cores.
      */
+    if (fb_ok) bp_active(6);
     uart_puts("[kernel] Starting secondary cores...\n");
     core_start_all();
-    if (fb_ok) boot_phase(BOOT_YELLOW, BOOT_FG_DARK,
-        "PIOS v0.3\n[boot] Multicore enabled\n");
+    if (fb_ok) { bp_log("[core] 4 cores active"); bp_done(6, true); }
     uart_puts("[kernel] All cores running.\n");
 
     /*
-     * ── Phase 7: PURPLE — PIOS operational and ready ──
-     * boot_diag prints the summary with pink text on purple background.
+     * Phase 7 (Purple): PIOS operational and ready.
+     * Transition to the purple + pink terminal theme.
      */
-    if (fb_ok) boot_diag(sd_ok, walfs_ok, genet_ok, usb_ok);
+    if (fb_ok) {
+        bp_active(7);
+        bp_done(7, true);
+        bp_log("[pios] System ready");
+        /* Pause briefly so the completed progress screen is visible,
+         * then switch to purple terminal for the interactive shell. */
+        timer_delay_ms(1500);
+        boot_diag(sd_ok, walfs_ok, genet_ok, usb_ok);
+    }
 
     /* Core 0 -> network poll loop (never returns) */
     core0_main();
