@@ -1,16 +1,18 @@
 /*
  * kernel.c - PIOS main entry point
  *
- * Boot flow (all on core 0):
- *   1. UART init (debug serial)
- *   2. Framebuffer init (HDMI text diagnostics)
- *   3. FIFO init (inter-core messaging)
- *   4. SD init (raw block storage)
- *   5. GENET init (Ethernet MAC/PHY)
- *   6. Net stack init (ARP/IP/UDP/ICMP)
- *   7. Boot diagnostics screen
- *   8. Start cores 1-3
- *   9. Core 0 enters network poll loop
+ * Boot flow (all on core 0), colour-coded on HDMI:
+ *   BLACK   - Firmware handed off to kernel (pre-framebuffer)
+ *   GREEN   - VideoCore framebuffer + HDMI online
+ *              EL2, exceptions, GIC, MMU, timer, DMA init
+ *   PINK    - PCIe root complex + RP1 southbridge connected
+ *   RED     - USB (xHCI) + UART / TTY online
+ *   GREY    - Filesystem (SD + WALFS) online
+ *   BLUE    - NIC / MAC (GENET Ethernet) online
+ *   YELLOW  - Multicore — secondary cores started
+ *   PURPLE  - PIOS operational (pink text on purple = terminal)
+ *
+ *   If boot hangs, the last visible colour identifies the subsystem.
  */
 
 #include "types.h"
@@ -111,7 +113,8 @@ static const u8 MY_GW_MAC[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 #define UI_ENV_MAX            32
 #define UI_BATCH_MAX          32
 #define UI_DB_UDP_VER         1
-#define UI_SHELL_TEXT_COLOR   0x004C1966
+#define UI_SHELL_TEXT_COLOR   0x00FF88CC   /* pink on purple terminal */
+#define UI_SHELL_BG_COLOR    0x006600AA   /* purple terminal background */
 #define UI_EDIT_MAX_LINES     128
 #define UI_EDIT_LINE_MAX      120
 
@@ -346,14 +349,52 @@ static void boot_measurements(u32 *el1_hash, u32 *el2_hash, u64 *el1_start, u32 
     if (el1_len) *el1_len = (u32)(el1_e - el1_s);
 }
 
+/*
+ * ── PIOS Boot Colour Scheme ──────────────────────────────────────────
+ *
+ * The framebuffer background colour encodes the current boot phase.
+ * If boot hangs, the last visible colour identifies the failing subsystem.
+ *
+ * Order  Colour   Hex (RRGGBB)  Phase
+ * ─────  ───────  ───────────   ──────────────────────────────────────
+ *   0    Black    0x00000000    Firmware handed off to kernel (pre-fb)
+ *   1    Green    0x0000AA00    VideoCore framebuffer + HDMI online
+ *   2    Pink     0x00FF55AA    PCIe root complex + RP1 southbridge
+ *   3    Red      0x00CC0000    USB (xHCI) + UART / TTY online
+ *   4    Grey     0x00555555    Filesystem (SD + WALFS) online
+ *   5    Blue     0x001144CC    NIC / MAC (GENET Ethernet) online
+ *   6    Yellow   0x00CCAA00    Multicore — secondary cores started
+ *   7    Purple   0x006600AA    PIOS operational and ready
+ *
+ * Final terminal state: pink text (0x00FF88CC) on purple background.
+ * ──────────────────────────────────────────────────────────────────────
+ */
+#define BOOT_BLACK      0x00000000
+#define BOOT_GREEN      0x0000AA00
+#define BOOT_PINK       0x00FF55AA
+#define BOOT_RED        0x00CC0000
+#define BOOT_GREY       0x00555555
+#define BOOT_BLUE       0x001144CC
+#define BOOT_YELLOW     0x00CCAA00
+#define BOOT_PURPLE     0x006600AA
+#define BOOT_FG_WHITE   0x00FFFFFF
+#define BOOT_FG_DARK    0x00000000
+#define BOOT_FG_PINK    0x00FF88CC
+
+static void boot_phase(u32 bg, u32 fg, const char *label) {
+    fb_clear(bg);
+    fb_set_color(fg, bg);
+    fb_puts(label);
+}
+
 void early_boot_hdmi_mark(u32 code)
 {
     static bool inited;
     if (!inited) {
         if (!fb_init(1280, 720))
             return;
-        fb_clear(0x00000000);
-        fb_set_color(0x0000FF00, 0x00000000);
+        fb_clear(BOOT_BLACK);
+        fb_set_color(BOOT_FG_WHITE, BOOT_BLACK);
         inited = true;
     }
     fb_puts("EARLY ");
@@ -1885,8 +1926,8 @@ static void ui_edit_render(const char *abs_path,
                            u32 line_count, u32 cur_line, u32 cur_col, u32 view_top,
                            bool insert_mode, bool dirty, const char *status)
 {
-    fb_clear(0x00000000);
-    fb_set_color(UI_SHELL_TEXT_COLOR, 0x00000000);
+    fb_clear(UI_SHELL_BG_COLOR);
+    fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
     fb_printf("PIOS edit.pix (kernel TUI)  %s\n", abs_path ? abs_path : "(null)");
     fb_printf("Ctrl+S save | Ctrl+Q exit | Ctrl+C copy line | Ctrl+X cut line | Ctrl+V paste line\n");
     fb_printf("Arrows move | Enter split line | Backspace/Delete erase | Insert toggles %s | %s%s\n",
@@ -1894,7 +1935,7 @@ static void ui_edit_render(const char *abs_path,
               status ? status : "");
     fb_printf("--------------------------------------------------------------------------------\n");
 
-    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_set_color(0x00FFFFFF, UI_SHELL_BG_COLOR);
     u32 rows = 20;
     for (u32 r = 0; r < rows; r++) {
         u32 li = view_top + r;
@@ -1903,7 +1944,7 @@ static void ui_edit_render(const char *abs_path,
             continue;
         }
         bool sel = (li == cur_line);
-        fb_set_color(sel ? 0x00FF9900 : 0x00FFFFFF, 0x00000000);
+        fb_set_color(sel ? 0x00FF9900 : 0x00FFFFFF, UI_SHELL_BG_COLOR);
         fb_printf("%c%u ", sel ? '>' : ' ', li + 1);
         char out[UI_EDIT_LINE_MAX + 2];
         u32 op = 0;
@@ -2181,8 +2222,8 @@ static void ui_cmd_edit(const char *path)
         timer_delay_ms(1);
     }
 
-    fb_clear(0x00000000);
-    fb_set_color(UI_SHELL_TEXT_COLOR, 0x00000000);
+    fb_clear(UI_SHELL_BG_COLOR);
+    fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
     ui_console_write("PIOS F3 Console (serial + HDMI)\n");
     ui_console_write("Type 'help' for commands.\n");
     ui_console_prompt();
@@ -3457,10 +3498,10 @@ static void ui_scheduler_feed_char(i32 c)
 
 static void ui_render_scheduler(void)
 {
-    fb_clear(0x00000000);
-    fb_set_color(0x0000FF00, 0x00000000);
+    fb_clear(UI_SHELL_BG_COLOR);
+    fb_set_color(BOOT_FG_PINK, UI_SHELL_BG_COLOR);
     fb_printf("PIOS Scheduler (F4)\n");
-    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_set_color(0x00FFFFFF, UI_SHELL_BG_COLOR);
     fb_printf("========================================\n");
     fb_printf("Type: <path> OR add/at/every/run/stop/status/list/clear then Enter\n");
     fb_printf("Examples: /bin/demo.pix | at 5000 /bin/demo.pix 2 0 1 | every 10000 /bin/job.pis auto 0\n");
@@ -3574,7 +3615,7 @@ static void ui_console_exec(char *line)
             ui_console_write("\n");
         }
     } else if (ui_streq(argv[0], "clear")) {
-        fb_clear(0x00000000);
+        fb_clear(UI_SHELL_BG_COLOR);
     } else if (ui_streq(argv[0], "time")) {
         u64 t = timer_ticks();
         fb_printf("ticks=%X\n", t);
@@ -3824,10 +3865,10 @@ static void ui_render_process_view(void)
 {
     struct proc_ui_entry snap[UI_SNAPSHOT_MAX];
     u32 n = proc_snapshot(snap, UI_SNAPSHOT_MAX);
-    fb_clear(0x00000000);
-    fb_set_color(0x0000FF00, 0x00000000);
+    fb_clear(UI_SHELL_BG_COLOR);
+    fb_set_color(BOOT_FG_PINK, UI_SHELL_BG_COLOR);
     fb_printf("PIOS Process View (F1 cycle, F2 manager)\n");
-    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_set_color(0x00FFFFFF, UI_SHELL_BG_COLOR);
     fb_printf("========================================\n\n");
 
     if (n == 0) {
@@ -3862,10 +3903,10 @@ static void ui_render_process_manager(void)
 {
     struct proc_ui_entry snap[UI_SNAPSHOT_MAX];
     u32 n = proc_snapshot(snap, UI_SNAPSHOT_MAX);
-    fb_clear(0x00000000);
-    fb_set_color(0x0000FF00, 0x00000000);
+    fb_clear(UI_SHELL_BG_COLOR);
+    fb_set_color(BOOT_FG_PINK, UI_SHELL_BG_COLOR);
     fb_printf("PIOS Process Manager (F2)\n");
-    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_set_color(0x00FFFFFF, UI_SHELL_BG_COLOR);
     fb_printf("========================================\n");
     fb_printf("Controls: F1 detail | K kill selected | L launch next | C open console\n\n");
     fb_printf("PID      AFF  CPU%%  MEM(KiB)  STATE\n");
@@ -3876,12 +3917,12 @@ static void ui_render_process_manager(void)
         if (ui_selected >= n)
             ui_selected = 0;
         for (u32 i = 0; i < n; i++) {
-            fb_set_color((i == ui_selected) ? 0x00FF9900 : 0x00FFFFFF, 0x00000000);
+            fb_set_color((i == ui_selected) ? 0x00FF9900 : 0x00FFFFFF, UI_SHELL_BG_COLOR);
             fb_printf("0x%x   %u    %u     %u      %s\n",
                       snap[i].pid, snap[i].affinity_core, snap[i].cpu_percent,
                       snap[i].mem_kib, ui_proc_state_str(snap[i].state));
         }
-        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_set_color(0x00FFFFFF, UI_SHELL_BG_COLOR);
     }
 
     if (ui_status_code == 1) fb_printf("\nstatus: killed selected pid\n");
@@ -3903,8 +3944,8 @@ static void ui_handle_keys(void)
         } else if (key == USB_KBD_KEY_F3) {
             ui_mode = UI_MODE_CONSOLE;
             ui_console_len = 0;
-            fb_clear(0x00000000);
-            fb_set_color(UI_SHELL_TEXT_COLOR, 0x00000000);
+            fb_clear(UI_SHELL_BG_COLOR);
+            fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
             ui_console_write("PIOS F3 Console (serial + HDMI)\n");
             ui_console_write("Type 'help' for commands.\n");
             ui_console_prompt();
@@ -3957,8 +3998,8 @@ static void ui_handle_keys(void)
         } else if (c == 'c' || c == 'C') {
             ui_mode = UI_MODE_CONSOLE;
             ui_console_len = 0;
-            fb_clear(0x00000000);
-            fb_set_color(UI_SHELL_TEXT_COLOR, 0x00000000);
+            fb_clear(UI_SHELL_BG_COLOR);
+            fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
             ui_console_write("PIOS F3 Console (serial + HDMI)\n");
             ui_console_write("Type 'help' for commands.\n");
             ui_console_prompt();
@@ -4096,14 +4137,16 @@ static void print_ip(u32 ip) {
         (ip >> 8) & 0xFF, ip & 0xFF);
 }
 
-static void boot_diag(void) {
-    fb_set_color(0x0000FF00, 0x00000000);
-    fb_printf("PIOS v0.2 - Pi 5 Bare Metal Microkernel\n");
+static void boot_diag(bool sd_ok, bool walfs_ok, bool genet_ok, bool usb_ok) {
+    /* Phase 7: Purple — PIOS operational.  Pink text on purple background. */
+    fb_clear(BOOT_PURPLE);
+    fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
 
-    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("PIOS v0.3 - Pi 5 Bare Metal Microkernel\n");
+    fb_set_color(BOOT_FG_WHITE, BOOT_PURPLE);
     fb_printf("========================================\n\n");
 
-    fb_set_color(0x00FF9900, 0x00000000);
+    fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
 
     fb_printf("Core 0: Kernel/Net  [16MB @ 0x%x]\n", CORE0_RAM_BASE);
     fb_printf("Core 1: User        [16MB @ 0x%x]\n", CORE1_RAM_BASE);
@@ -4111,37 +4154,45 @@ static void boot_diag(void) {
     fb_printf("Core 3: User        [16MB @ 0x%x]\n\n", CORE3_RAM_BASE);
 
     /* Network */
-    u8 mac[6];
-    genet_get_mac(mac);
-    fb_printf("NET:  GENET v5 + NEON checksum\n");
-    fb_printf("  IP:   ");
-    print_ip(MY_IP);
-    fb_printf(" / ");
-    print_ip(MY_MASK);
-    fb_printf("\n  GW:   ");
-    print_ip(MY_GW);
-    fb_printf("\n  PHY:  %s\n", genet_link_up() ? "Link UP" : "Link DOWN");
-    fb_printf("  Mode: HARDENED (no ARP/TCP/DHCP/frag)\n");
-    fb_printf("  ICMP: rate-limited 10/sec\n\n");
-
-    /* SD */
-    const sd_card_t *sd = sd_get_card_info();
-    if (sd->type) {
-        fb_printf("DISK: %s raw block (no FS)\n\n",
-            sd->type == 2 ? "SDHC/SDXC" : "SDSC");
+    if (genet_ok) {
+        u8 mac[6];
+        genet_get_mac(mac);
+        fb_printf("NET:  GENET v5 + NEON checksum\n");
+        fb_printf("  IP:   ");
+        print_ip(MY_IP);
+        fb_printf(" / ");
+        print_ip(MY_MASK);
+        fb_printf("\n  GW:   ");
+        print_ip(MY_GW);
+        fb_printf("\n  PHY:  %s\n", genet_link_up() ? "Link UP" : "Link DOWN");
+        fb_printf("  MAC:  %x:%x:%x:%x:%x:%x\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     } else {
-        fb_set_color(0x00FF0000, 0x00000000);
-        fb_printf("DISK: NOT DETECTED\n\n");
-        fb_set_color(0x00FF9900, 0x00000000);
+        fb_set_color(BOOT_FG_WHITE, BOOT_PURPLE);
+        fb_printf("NET:  GENET init FAILED\n");
+        fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
     }
 
+    /* SD / Filesystem */
+    if (sd_ok) {
+        const sd_card_t *sd = sd_get_card_info();
+        fb_printf("DISK: %s raw block  WALFS: %s\n",
+            sd->type == 2 ? "SDHC/SDXC" : "SDSC",
+            walfs_ok ? "OK" : "FAILED");
+    } else {
+        fb_set_color(BOOT_FG_WHITE, BOOT_PURPLE);
+        fb_printf("DISK: NOT DETECTED\n");
+        fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
+    }
+
+    fb_printf("USB:  %s\n", usb_ok ? "xHCI online" : "not available");
     fb_printf("FIFO: 12ch SPSC  depth=%u  msg=%u bytes\n",
               FIFO_CAPACITY, FIFO_MSG_SIZE);
     fb_printf("SIMD: NEON memcpy/zero/checksum + CRC32\n\n");
 
-    fb_set_color(0x0000FF00, 0x00000000);
-    fb_printf("System ready. Cores launching.\n");
-    fb_set_color(0x00FF9900, 0x00000000);
+    fb_set_color(BOOT_FG_WHITE, BOOT_PURPLE);
+    fb_printf("System ready.\n\n");
+    fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
 }
 
 /* ---- Main kernel entry (runs on core 0) ---- */
@@ -4153,12 +4204,15 @@ void kernel_main(void) {
     bool walfs_ok = false;
     bool genet_ok = false;
 
-    /* 1. Framebuffer FIRST — this is our primary output on Pi 5
-     *    (RP1 UART is inaccessible until PCIe is initialized) */
+    /*
+     * ── Phase 1: GREEN — VideoCore framebuffer + HDMI online ──
+     * (RP1 UART is inaccessible until PCIe is initialized)
+     */
     if (fb_init(1280, 720)) {
         fb_ok = true;
-        fb_puts("PIOS v0.3 booting...\n");
+        boot_phase(BOOT_GREEN, BOOT_FG_WHITE, "PIOS v0.3\n[boot] VideoCore HDMI online\n");
     }
+
     el2_init();
     if (fb_ok) {
         fb_printf("[el2] boot EL=%x", (u32)el2_boot_el());
@@ -4169,29 +4223,32 @@ void kernel_main(void) {
         if (fb_ok) fb_printf("[el2] capsule descriptors=%x\n", (u32)cap_n);
     }
 
-    /* 2. Exception vectors + GIC */
+    /* Exception vectors + GIC */
     exception_init();
     gic_init();
     if (fb_ok) fb_puts("[kernel] Exceptions + GIC ready\n");
 
-    /* 3. MMU — identity map, enables caches */
+    /* MMU — identity map, enables caches */
     mmu_init();
 
-    /* 3b. Boot integrity is verified and armed after WALFS + Picowal become available. */
-
-    /* 4. Timer — 1000 Hz tick */
+    /* Timer — 1000 Hz tick */
     timer_init(1000);
     watchdog_init(5000, false);
 
-    /* 5. Unmask IRQs on core 0 (DAIF.I clear) */
+    /* Unmask IRQs on core 0 (DAIF.I clear) */
     __asm__ volatile("msr daifclr, #2");
 
-    /* 6. DMA engine */
+    /* DMA engine */
     dma_init();
 
-    /* 7. PCIe Root Complex + RP1 southbridge */
+    /*
+     * ── Phase 2: PINK — PCIe root complex + RP1 southbridge ──
+     * ── Phase 3: RED  — USB (xHCI) + UART / TTY online ──
+     */
     if (pcie_init()) {
         if (rp1_init()) {
+            if (fb_ok) boot_phase(BOOT_PINK, BOOT_FG_WHITE,
+                "PIOS v0.3\n[boot] PCIe + RP1 connected\n");
             rp1_clk_init();
             rp1_gpio_init();
             ui_act_led_init();
@@ -4201,20 +4258,21 @@ void kernel_main(void) {
             /* NOW uart is accessible via RP1 */
             uart_init();
             uart_puts("\n[uart] RP1 UART online\n");
+            if (fb_ok) boot_phase(BOOT_RED, BOOT_FG_WHITE,
+                "PIOS v0.3\n[boot] USB + TTY online\n");
         }
     }
-    if (fb_ok) fb_puts("[pcie] PCIe + RP1 init done\n");
 
-    /* 8. Inter-core FIFOs */
+    /* Inter-core FIFOs + IPC */
     fifo_init_all();
-    if (fb_ok) fb_puts("[fifo] Init OK\n");
     ipc_queue_init();
     ipc_stream_init();
     ipc_proc_init();
     pipe_init();
-    if (fb_ok) fb_puts("[ipc] In-memory IPC ready\n");
 
-    /* 9. SD card - raw block access */
+    /*
+     * ── Phase 4: GREY — Filesystem (SD + WALFS) online ──
+     */
     sd_ok = sd_init();
     if (!sd_ok)
         uart_puts("[sd] SD init FAILED (continuing)\n");
@@ -4238,14 +4296,21 @@ void kernel_main(void) {
                              boot_el1_expected_hash, boot_el2_expected_hash, &ok) != 0 || ok != 0)
                 exception_pisod("Boot integrity arm failed", 5, 0x3B, 0, 0, 0);
         }
+        if (fb_ok) boot_phase(BOOT_GREY, BOOT_FG_WHITE,
+            "PIOS v0.3\n[boot] Filesystem online\n");
     }
 
-    /* 10. Ethernet MAC */
+    /*
+     * ── Phase 5: BLUE — NIC / MAC (GENET Ethernet) online ──
+     */
     genet_ok = genet_init();
     if (!genet_ok)
         uart_puts("[genet] GENET init FAILED (continuing)\n");
+    else if (fb_ok)
+        boot_phase(BOOT_BLUE, BOOT_FG_WHITE,
+            "PIOS v0.3\n[boot] NIC/MAC online\n");
 
-    /* 11. Network stack (static IP, static neighbor, NO ARP) */
+    /* Network stack (static IP, static neighbor, NO ARP) */
     net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
     ui_cfg_ip = MY_IP;
     ui_cfg_mask = MY_MASK;
@@ -4255,7 +4320,7 @@ void kernel_main(void) {
     dns_init(ui_cfg_dns);
     net_udp_subscribe(ui_db_udp_cb);
 
-    /* 12. GPU + Tensor compute */
+    /* GPU + Tensor compute */
     tensor_init();
 
     /* Core 0 environment */
@@ -4275,13 +4340,21 @@ void kernel_main(void) {
         uart_puts("[setup] skipped: storage unavailable\n");
     }
 
-    /* 13. Boot diagnostics on HDMI */
-    boot_diag();
-
-    /* 14. Start secondary cores (they get EL2→EL1, MMU, VBAR, SP from start.S) */
+    /*
+     * ── Phase 6: YELLOW — Multicore (secondary cores started) ──
+     */
     uart_puts("[kernel] Starting secondary cores...\n");
     core_start_all();
-    uart_puts("[kernel] All cores running. Entering net loop.\n");
-    /* 15. Core 0 -> network poll loop (never returns) */
+    if (fb_ok) boot_phase(BOOT_YELLOW, BOOT_FG_DARK,
+        "PIOS v0.3\n[boot] Multicore enabled\n");
+    uart_puts("[kernel] All cores running.\n");
+
+    /*
+     * ── Phase 7: PURPLE — PIOS operational and ready ──
+     * boot_diag prints the summary with pink text on purple background.
+     */
+    if (fb_ok) boot_diag(sd_ok, walfs_ok, genet_ok, usb_ok);
+
+    /* Core 0 -> network poll loop (never returns) */
     core0_main();
 }
