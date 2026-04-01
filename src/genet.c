@@ -8,6 +8,7 @@
 #include "uart.h"
 #include "simd.h"
 #include "fb.h"
+#include "timer.h"
 
 /* ---- Register offsets from GENET_BASE ---- */
 
@@ -222,22 +223,19 @@ static bool phy_init(void) {
     mdio_write(PHY_ADDR, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);
 
     /* Wait for link */
-    uart_puts("[genet] Waiting for link (3s timeout)...\n");
-    timeout = 300000;  /* ~3 seconds at delay_cycles(10000) */
-    while (timeout--) {
+    uart_puts("[genet] Waiting for link (5s)...\n");
+    for (u32 s = 0; s < 50; s++) {  /* 50 × 100ms = 5 seconds */
         u16 bmsr = mdio_read(PHY_ADDR, MII_BMSR);
         if (bmsr & BMSR_LSTATUS) {
             uart_puts("[genet] Link UP\n");
             return true;
         }
-        delay_cycles(10000);
-        /* Spinner + countdown every ~10k iterations */
-        if ((timeout % 10000) == 0) {
-            static const char spin[] = "|/-\\";
-            fb_set_cursor(126, 0);
-            fb_set_color(0x0000FF00, 0x00000000);
-            fb_putc(spin[(timeout / 10000) & 3]);
-        }
+        timer_delay_ms(100);
+        /* Spinner */
+        static const char spin[] = "|/-\\";
+        fb_set_cursor(126, 0);
+        fb_set_color(0x0000FF00, 0x00000000);
+        fb_putc(spin[s & 3]);
     }
 
     uart_puts("[genet] Link timeout (continuing anyway)\n");
