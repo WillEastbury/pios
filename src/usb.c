@@ -12,6 +12,7 @@
 #include "uart.h"
 #include "timer.h"
 #include "mmu.h"
+#include "fb.h"
 
 /* ---- USB Descriptor Types ---- */
 
@@ -231,27 +232,34 @@ bool usb_init(void) {
     device_valid = false;
     num_drivers = num_drivers; /* preserve pre-registered drivers */
 
+    fb_puts("  [usb] Initialising xHCI controller\n");
     if (!xhci_init())
         return false;
 
+    fb_puts("  [usb] xHCI ready, settling\n");
     timer_delay_ms(200); /* settling time */
 
+    fb_puts("  [usb] Scanning ports\n");
     /* Scan ports */
     u32 nports = xhci_port_count();
+    fb_printf("  [usb] %u ports detected\n", nports);
     for (u32 p = 0; p < nports; p++) {
         if (!xhci_port_connected(p))
             continue;
 
+        fb_printf("  [usb] Device on port %u, resetting\n", p);
         uart_puts("[usb] Device on port ");
         uart_hex(p);
         uart_puts("\n");
 
         u32 speed = 0;
         if (!xhci_port_reset(p, &speed)) {
+            fb_puts("  [usb] Port reset failed\n");
             uart_puts("[usb] Port reset failed\n");
             continue;
         }
 
+        fb_printf("  [usb] Speed=%u, enumerating\n", speed);
         uart_puts("[usb] Speed=");
         uart_hex(speed);
         uart_puts("\n");
@@ -259,11 +267,13 @@ bool usb_init(void) {
         timer_delay_ms(50);
 
         if (enumerate_device(p, speed)) {
+            fb_puts("  [usb] Device enumerated, probing drivers\n");
             probe_drivers();
             return true;
         }
     }
 
+    fb_puts("  [usb] No USB device found\n");
     uart_puts("[usb] No USB device found\n");
     return false;
 }

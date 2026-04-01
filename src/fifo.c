@@ -7,6 +7,7 @@
 #include "fifo.h"
 #include "simd.h"
 #include "core_env.h"
+#include "fb.h"
 
 /* FIFO pool in shared memory: 4×4 = 16 fifo structs */
 static inline struct fifo *get_fifo(u32 src, u32 dst) {
@@ -15,9 +16,11 @@ static inline struct fifo *get_fifo(u32 src, u32 dst) {
 }
 
 void fifo_init_all(void) {
+    fb_puts("  [fifo] Zeroing shared FIFO region (NEON)\n");
     /* Zero the entire shared FIFO region with NEON */
     simd_zero((void *)SHARED_FIFO_BASE, SHARED_FIFO_SIZE);
     dsb();
+    fb_puts("  [fifo] 16 SPSC channels ready\n");
 }
 
 bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {

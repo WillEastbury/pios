@@ -17,6 +17,7 @@
 #include "rp1_clk.h"
 #include "mmio.h"
 #include "uart.h"
+#include "fb.h"
 
 /* Clock controller base within RP1 BAR */
 #define CLK_BASE    0x018000
@@ -55,11 +56,15 @@ static inline u32 cr(u32 off) { return mmio_read(RP1_BAR_BASE + CLK_BASE + off);
 static inline void cw(u32 off, u32 val) { mmio_write(RP1_BAR_BASE + CLK_BASE + off, val); }
 
 void rp1_clk_init(void) {
+    fb_puts("  [rp1_clk] Reading UART clock ctrl register\n");
     /* Read CLK_UART to verify clock controller is accessible */
     u32 uart_ctrl = cr(clk_table[RP1_CLK_UART].ctrl);
+    fb_printf("  [rp1_clk] UART clk ctrl=0x%x %s\n", uart_ctrl,
+              (uart_ctrl & CLK_CTRL_ENABLE) ? "(enabled)" : "(disabled)");
     uart_puts("[rp1_clk] UART clk ctrl=");
     uart_hex(uart_ctrl);
     uart_puts(uart_ctrl & CLK_CTRL_ENABLE ? " (enabled)\n" : " (disabled)\n");
+    fb_puts("  [rp1_clk] Clock controller ready\n");
 }
 
 bool rp1_clk_enable(u32 clk_id) {

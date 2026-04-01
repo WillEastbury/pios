@@ -10,6 +10,7 @@
 #include "mmio.h"
 #include "simd.h"
 #include "uart.h"
+#include "fb.h"
 
 /* DMA channel register access */
 static inline u64 dma_reg(u32 ch, u32 off) {
@@ -27,10 +28,12 @@ static struct dma_cb cb_pool[DMA_NUM_CHANNELS][CBS_PER_CHAN] ALIGNED(32);
 static const u32 zero_word ALIGNED(32) = 0;
 
 void dma_init(void) {
+    fb_printf("  [dma] Enabling %u channels\n", DMA_NUM_CHANNELS);
     /* Enable all 6 channels */
     mmio_write(DMA_ENABLE_REG, (1 << DMA_NUM_CHANNELS) - 1);
     dsb();
 
+    fb_puts("  [dma] Resetting each channel\n");
     /* Reset each channel */
     for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
         mmio_write(dma_reg(ch, DMA_CH_CS), DMA_CS_RESET);
@@ -39,10 +42,12 @@ void dma_init(void) {
         mmio_write(dma_reg(ch, DMA_CH_CS), DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
     }
 
+    fb_puts("  [dma] Zeroing CB pool\n");
     /* Zero the CB pool */
     simd_zero(cb_pool, sizeof(cb_pool));
     dsb();
 
+    fb_puts("  [dma] DMA engine ready\n");
     uart_puts("[dma] 6 channels initialised\n");
 }
 

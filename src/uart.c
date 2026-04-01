@@ -6,6 +6,7 @@
 
 #include "uart.h"
 #include "mmio.h"
+#include "fb.h"
 
 #define UART_DR     (UART0_BASE + 0x00)
 #define UART_FR     (UART0_BASE + 0x18)
@@ -19,19 +20,24 @@
 #define FR_RXFE     (1 << 4)    /* RX FIFO empty */
 
 void uart_init(void) {
+    fb_puts("  [uart] Disabling PL011\n");
     mmio_write(UART_CR, 0);
     mmio_write(UART_ICR, 0x7FF);
 
+    fb_puts("  [uart] Setting baud 115200 (48MHz clock)\n");
     /* 115200 baud @ 48MHz UART clock
      * IBRD = 26, FBRD = 3 */
     mmio_write(UART_IBRD, 26);
     mmio_write(UART_FBRD, 3);
 
+    fb_puts("  [uart] Configuring 8N1 + FIFO\n");
     /* 8N1, enable FIFO */
     mmio_write(UART_LCRH, (3 << 5) | (1 << 4));
 
+    fb_puts("  [uart] Enabling UART + TX + RX\n");
     /* Enable UART + TX + RX */
     mmio_write(UART_CR, (1 << 0) | (1 << 8) | (1 << 9));
+    fb_puts("  [uart] PL011 ready\n");
 }
 
 void uart_putc(char c) {

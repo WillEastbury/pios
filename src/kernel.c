@@ -465,10 +465,40 @@ static void bp_done(u32 phase, bool ok) {
 
 /* Append a line to the scrolling boot log below the phase list */
 static void bp_log(const char *msg) {
-    u32 max_rows = 720 / 8;
+    u32 max_rows = 768 / 8;
     if (bp_log_y >= max_rows) return;
     fb_set_cursor(1, bp_log_y);
     fb_set_color(BOOT_FG_LOG, BOOT_BLACK);
+    fb_puts(msg);
+    bp_log_y++;
+}
+
+/* Green log — success */
+static void bp_ok(const char *msg) {
+    u32 max_rows = 768 / 8;
+    if (bp_log_y >= max_rows) return;
+    fb_set_cursor(1, bp_log_y);
+    fb_set_color(BOOT_FG_OK, BOOT_BLACK);
+    fb_puts(msg);
+    bp_log_y++;
+}
+
+/* Red log — error */
+static void bp_err(const char *msg) {
+    u32 max_rows = 768 / 8;
+    if (bp_log_y >= max_rows) return;
+    fb_set_cursor(1, bp_log_y);
+    fb_set_color(BOOT_FG_FAIL, BOOT_BLACK);
+    fb_puts(msg);
+    bp_log_y++;
+}
+
+/* Yellow log — warning */
+static void bp_warn(const char *msg) {
+    u32 max_rows = 768 / 8;
+    if (bp_log_y >= max_rows) return;
+    fb_set_cursor(1, bp_log_y);
+    fb_set_color(BOOT_YELLOW, BOOT_BLACK);
     fb_puts(msg);
     bp_log_y++;
 }
@@ -4281,112 +4311,374 @@ static void boot_diag(bool sd_ok, bool walfs_ok, bool genet_ok, bool usb_ok) {
     fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
 }
 
-/* ---- Main kernel entry (runs on core 0) ---- */
+/*
+ * ── CPU State Debugger ──
+ * Ultra-simple: read one register, print it, repeat.
+ * No macros, no helper functions, no optimisation surprises.
+ */
+void kernel_fb_early(void) {
+    if (!fb_init(1024, 768)) return;
+
+    u64 val;
+
+    fb_set_color(0x0000FF00, 0x00000000);
+    fb_puts("PIOS v0.31 CPU State Dump\n");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+
+    __asm__ volatile("mrs %0, CurrentEL" : "=r"(val));
+    fb_printf("CurrentEL  = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, MPIDR_EL1" : "=r"(val));
+    fb_printf("MPIDR_EL1  = 0x%X\n", val);
+
+    __asm__ volatile("mov %0, sp" : "=r"(val));
+    fb_printf("SP         = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, SCTLR_EL1" : "=r"(val));
+    fb_printf("SCTLR_EL1  = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, SCTLR_EL2" : "=r"(val));
+    fb_printf("SCTLR_EL2  = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, HCR_EL2" : "=r"(val));
+    fb_printf("HCR_EL2    = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, CPTR_EL2" : "=r"(val));
+    fb_printf("CPTR_EL2   = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, CPACR_EL1" : "=r"(val));
+    fb_printf("CPACR_EL1  = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, TTBR0_EL1" : "=r"(val));
+    fb_printf("TTBR0_EL1  = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, TTBR0_EL2" : "=r"(val));
+    fb_printf("TTBR0_EL2  = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, TCR_EL2" : "=r"(val));
+    fb_printf("TCR_EL2    = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, VBAR_EL2" : "=r"(val));
+    fb_printf("VBAR_EL2   = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, SP_EL0" : "=r"(val));
+    fb_printf("SP_EL0     = 0x%X\n", val);
+
+    __asm__ volatile("mrs %0, SP_EL1" : "=r"(val));
+    fb_printf("SP_EL1     = 0x%X\n", val);
+
+    fb_putc('\n');
+    fb_set_color(0x00FFFF00, 0x00000000);
+    fb_puts("Dropping to EL1 now...\n");
+}
+
+/*
+ * ── EL2 Crash Handler (PiSOD) ──
+ * Called from start.S el2_crash_vectors with:
+ *   x0 = ESR_EL2, x1 = ELR_EL2, x2 = FAR_EL2, x3 = SPSR_EL2
+ * Framebuffer is already initialised by kernel_fb_early().
+ */
+void kernel_el2_crash(u64 esr, u64 elr, u64 far, u64 spsr) {
+    /* Purple screen, pink text — PiSOD */
+    fb_clear(BOOT_PURPLE);
+    fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
+    fb_puts("!! PIOS CRASH — EL2 EXCEPTION !!\n\n");
+
+    fb_set_color(0x00FFFFFF, BOOT_PURPLE);
+    fb_printf("ESR_EL2    = 0x%X\n", esr);
+    fb_printf("ELR_EL2    = 0x%X\n", elr);
+    fb_printf("FAR_EL2    = 0x%X\n", far);
+    fb_printf("SPSR_EL2   = 0x%X\n", spsr);
+
+    /* Decode ESR exception class */
+    u32 ec = (u32)(esr >> 26) & 0x3F;
+    fb_putc('\n');
+    fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
+    fb_printf("EC = 0x%x  ", ec);
+    switch (ec) {
+    case 0x00: fb_puts("(Unknown reason)"); break;
+    case 0x01: fb_puts("(Trapped WFI/WFE)"); break;
+    case 0x07: fb_puts("(Trapped SIMD/FP)"); break;
+    case 0x0E: fb_puts("(Illegal execution)"); break;
+    case 0x15: fb_puts("(SVC from AArch64)"); break;
+    case 0x16: fb_puts("(HVC from AArch64)"); break;
+    case 0x17: fb_puts("(SMC from AArch64)"); break;
+    case 0x18: fb_puts("(Trapped MSR/MRS)"); break;
+    case 0x20: fb_puts("(Inst abort, lower EL)"); break;
+    case 0x21: fb_puts("(Inst abort, same EL)"); break;
+    case 0x22: fb_puts("(PC alignment)"); break;
+    case 0x24: fb_puts("(Data abort, lower EL)"); break;
+    case 0x25: fb_puts("(Data abort, same EL)"); break;
+    case 0x26: fb_puts("(SP alignment)"); break;
+    default:   fb_puts("(Other)"); break;
+    }
+    fb_putc('\n');
+
+    /* Extra context */
+    u64 val;
+    fb_putc('\n');
+    fb_set_color(0x00AAAAAA, BOOT_PURPLE);
+    __asm__ volatile("mrs %0, CurrentEL" : "=r"(val));
+    fb_printf("CurrentEL  = 0x%X\n", val);
+    __asm__ volatile("mov %0, sp" : "=r"(val));
+    fb_printf("SP         = 0x%X\n", val);
+    __asm__ volatile("mrs %0, SCTLR_EL2" : "=r"(val));
+    fb_printf("SCTLR_EL2  = 0x%X\n", val);
+    __asm__ volatile("mrs %0, HCR_EL2" : "=r"(val));
+    fb_printf("HCR_EL2    = 0x%X\n", val);
+
+    fb_putc('\n');
+    fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
+    fb_puts("System halted. Power cycle to reboot.\n");
+
+    for (;;) __asm__ volatile("wfe");
+}
+
+/* ---- Main kernel entry ---- */
+
+/* Draw register panel on the right side of screen (col 65+) */
+static void reg_panel(u32 at_el1) {
+    u32 col = 65;
+    u32 row = 1;
+    u64 val;
+
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FF9900, 0x00000000);
+    fb_puts("CPU Registers");
+
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("EL = %d", at_el1 ? 1 : 2);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts(at_el1 ? " (kernel)" : " (hypervisor)");
+
+    __asm__ volatile("mov %0, sp" : "=r"(val));
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("SP     %X", val);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts(" Stack ptr");
+
+    __asm__ volatile("mrs %0, SCTLR_EL1" : "=r"(val));
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("SCTLR1 %X", val);
+    fb_set_cursor(col, row++);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_printf(" System Control:");
+    fb_set_cursor(col, row++);
+    fb_printf(" MMU=%u DCache=%u ICache=%u",
+        (u32)(val & 1), (u32)((val >> 2) & 1), (u32)((val >> 12) & 1));
+
+    __asm__ volatile("mrs %0, CPACR_EL1" : "=r"(val));
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("CPACR1 %X", val);
+    fb_set_cursor(col, row++);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    u32 fpen = (u32)((val >> 20) & 3);
+    fb_printf(" Coprocessor Access:");
+    fb_set_cursor(col, row++);
+    fb_printf(" NEON/FPU=%s", fpen == 3 ? "enabled" : "TRAPPED");
+
+    __asm__ volatile("mrs %0, TTBR0_EL1" : "=r"(val));
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("TTBR0  %X", val);
+    fb_set_cursor(col, row++);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts(val ? " Page table base" : " Page table (none)");
+
+    __asm__ volatile("mrs %0, TCR_EL1" : "=r"(val));
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("TCR1   %X", val);
+    fb_set_cursor(col, row++);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts(" Translation Control");
+
+    __asm__ volatile("mrs %0, MAIR_EL1" : "=r"(val));
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("MAIR1  %X", val);
+    fb_set_cursor(col, row++);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts(" Memory Attributes");
+
+    __asm__ volatile("mrs %0, VBAR_EL1" : "=r"(val));
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("VBAR1  %X", val);
+    fb_set_cursor(col, row++);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts(val ? " Exception vectors" : " Vectors (none!)");
+
+    __asm__ volatile("mrs %0, MPIDR_EL1" : "=r"(val));
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("MPIDR  %X", val);
+    fb_set_cursor(col, row++);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_printf(" Core %u / Cluster %u",
+        (u32)(val & 0xFF), (u32)((val >> 8) & 0xFF));
+
+    fb_set_cursor(col, row++);
+    fb_set_color(0x00444444, 0x00000000);
+    fb_puts("---------------------");
+}
 
 void kernel_main(void) {
     bool usb_ok = false;
-    bool fb_ok = false;
+    bool fb_ok = true;  /* fb already init'd by kernel_fb_early */
     bool sd_ok = false;
     bool walfs_ok = false;
     bool genet_ok = false;
 
-    /*
-     * Phase 0 (Black): Firmware handoff — we're running.
-     * Phase 1 (Green): VideoCore framebuffer + HDMI.
-     */
-    if (fb_init(1024, 768)) {
-        fb_ok = true;
-        bp_init();
-        bp_done(0, true);         /* firmware got us here */
-        bp_active(1);             /* VideoCore is next */
+    /* Stack, NEON, VBAR already set by start.S .Lel1_entry */
+
+    /* Detect current EL */
+    u64 cur_el;
+    __asm__ volatile("mrs %0, CurrentEL" : "=r"(cur_el));
+    cur_el = (cur_el >> 2) & 3;
+    bool at_el1 = (cur_el == 1);
+
+    /* ── Progress display (left side) + Register panel (right side) ── */
+    bp_init();
+    reg_panel(at_el1);
+    bp_done(0, true);                     /* Firmware handoff */
+    bp_done(1, true);                     /* VideoCore (fb from EL2) */
+
+    if (at_el1) {
+        bp_ok("[el2->el1] Transition OK!");
+    } else {
+        bp_warn("[boot] Running at EL2 (eret failed or skipped)");
     }
 
-    /* NOTE: running at EL2 (no el2_to_el1 transition).
-     * el2_init uses SIMD and EL2 features — skip for now.
-     * exception_init/gic_init set VBAR_EL1 — skip.
-     * mmu_init uses EL1 page tables — skip. */
-    if (fb_ok) bp_log("[boot] skipping el2/exc/gic/mmu (EL2 mode)");
+    /* ── EL1-only inits ── */
+    if (at_el1) {
+        bp_warn("[skip] el2_init (hypervisor layer)");
 
-    if (fb_ok) bp_log("[boot] calling timer_init...");
+        bp_log("[exc] exception_init...");
+        exception_init();
+        bp_ok("[exc] vectors installed");
+
+        bp_log("[gic] gic_init...");
+        gic_init();
+        bp_ok("[gic] distributor + CPU iface ready");
+
+        /* Move stack to __stack_top_core0 before MMU enable. */
+        bp_log("[stack] relocating to 3MB...");
+        __asm__ volatile(
+            "ldr x1, =__stack_top_core0 \n"
+            "mov sp, x1                 \n"
+            ::: "x1", "memory"
+        );
+        bp_ok("[stack] SP relocated");
+
+        bp_log("[mmu] mmu_init...");
+        mmu_init();
+        bp_ok("[mmu] identity map + caches ON");
+
+        /* Refresh register panel after MMU changes */
+        reg_panel(at_el1);
+    } else {
+        bp_warn("[skip] el2/exc/gic/mmu (need EL1)");
+    }
+
+    /* ── Common inits ── */
+    bp_log("[timer] timer_init(1000Hz)...");
     timer_init(1000);
-    if (fb_ok) bp_log("[timer] done");
+    bp_ok("[timer] 1kHz tick running");
 
-    /* watchdog crashes at EL2 — skip */
-    if (fb_ok) bp_log("[watchdog] skipped (EL2)");
-
-    if (fb_ok) bp_log("[boot] calling dma_init...");
-    dma_init();
-    if (fb_ok) {
-        bp_log("[dma] done");
-        bp_done(1, true);         /* GREEN phase complete */
+    if (at_el1) {
+        bp_log("[wdog] watchdog_init(5s)...");
+        watchdog_init(5000, false);
+        bp_ok("[wdog] armed");
+        bp_log("[irq] unmasking IRQs...");
+        __asm__ volatile("msr daifclr, #2");
+        bp_ok("[irq] IRQs live");
+    } else {
+        bp_warn("[skip] watchdog/IRQ (need EL1)");
     }
 
-    /*
-     * Phase 2 (Pink): PCIe root complex + RP1 southbridge.
-     * Phase 3 (Red):  USB (xHCI) + UART / TTY.
-     */
-    if (fb_ok) bp_active(2);
-    if (fb_ok) bp_log("[boot] calling pcie_init...");
+    bp_log("[dma] dma_init...");
+    dma_init();
+    bp_ok("[dma] 6-channel engine ready");
+    bp_done(1, true);
+
+    /* ── Phase 2+3: PCIe + RP1 + USB ── */
+    bp_active(2);
+    bp_log("[pcie] pcie_init...");
     if (pcie_init()) {
-        if (fb_ok) bp_log("[boot] calling rp1_init...");
+        bp_log("[pcie] RC online, calling rp1_init...");
         if (rp1_init()) {
-            if (fb_ok) {
-                bp_log("[pcie] PCIe + RP1 BAR mapped");
-                bp_done(2, true);
-                bp_active(3);
-            }
-            if (fb_ok) bp_log("[boot] rp1_clk/gpio...");
+            bp_ok("[pcie] RP1 BAR mapped OK");
+            bp_done(2, true);
+            bp_active(3);
+            bp_log("[rp1] rp1_clk_init...");
             rp1_clk_init();
+            bp_log("[rp1] rp1_gpio_init...");
             rp1_gpio_init();
+            bp_log("[rp1] activity LED init...");
             ui_act_led_init();
-            if (fb_ok) bp_log("[boot] calling usb_init...");
+            bp_log("[usb] registering storage+kbd...");
             usb_storage_register();
             usb_kbd_register();
+            bp_log("[usb] usb_init (xHCI)...");
             usb_ok = usb_init();
-            if (fb_ok) bp_log("[boot] calling uart_init...");
+            if (usb_ok) bp_ok("[usb] xHCI online");
+            else bp_err("[usb] xHCI FAILED");
+            bp_log("[uart] uart_init (RP1 PL011)...");
             uart_init();
             uart_puts("\n[uart] RP1 UART online\n");
-            if (fb_ok) {
-                bp_log(usb_ok ? "[usb] xHCI online" : "[usb] xHCI FAILED");
-                bp_done(3, true);
-            }
+            bp_ok("[uart] RP1 UART online");
+            bp_done(3, true);
         } else {
-            if (fb_ok) { bp_log("[rp1] RP1 init FAILED"); bp_done(2, false); bp_done(3, false); }
+            bp_err("[rp1] RP1 init FAILED"); bp_done(2, false); bp_done(3, false);
         }
     } else {
-        if (fb_ok) { bp_log("[pcie] PCIe init FAILED"); bp_done(2, false); bp_done(3, false); }
+        bp_err("[pcie] PCIe init FAILED"); bp_done(2, false); bp_done(3, false);
     }
 
-    /* Inter-core FIFOs + IPC */
-    if (fb_ok) bp_log("[boot] calling fifo/ipc init...");
+    /* IPC */
+    bp_log("[fifo] fifo_init_all...");
     fifo_init_all();
+    bp_log("[ipc] ipc_queue_init...");
     ipc_queue_init();
+    bp_log("[ipc] ipc_stream_init...");
     ipc_stream_init();
     ipc_proc_init();
+    bp_log("[ipc] pipe_init...");
     pipe_init();
-    if (fb_ok) bp_log("[ipc] done");
+    bp_ok("[ipc] all channels ready");
 
-    /*
-     * Phase 4 (Grey): Filesystem — SD + WALFS.
-     */
-    if (fb_ok) bp_active(4);
-    if (fb_ok) bp_log("[boot] calling sd_init...");
+    /* ── Phase 4: Filesystem ── */
+    bp_active(4);
+    bp_log("[sd] sd_init (EMMC2)...");
     sd_ok = sd_init();
     if (!sd_ok) {
-        if (fb_ok) { bp_log("[sd] SD init FAILED"); bp_done(4, false); }
+        bp_err("[sd] SD init FAILED"); bp_done(4, false);
     } else {
-        if (fb_ok) bp_log("[boot] calling bcache/walfs...");
+        bp_ok("[sd] card detected OK");
+        bp_log("[cache] bcache_init...");
         bcache_init();
+        bp_log("[cache] bcache_pin(0)...");
         bcache_pin(0);
+        bp_log("[walfs] walfs_init...");
         walfs_ok = walfs_init();
         if (walfs_ok) {
+            bp_log("[walfs] walfs_verify...");
             struct walfs_health wh;
             if (!walfs_verify(&wh))
                 exception_pisod("WALFS verify failed", 5, 0x34, wh.crc_errors, wh.header_errors, (u32)wh.scan_end);
+            bp_log("[walfs] principal_init...");
             principal_init();
+            bp_log("[walfs] picowal_db_init...");
             if (!picowal_db_init())
                 exception_pisod("Picowal init failed", 5, 0x33, 0, 0, 0);
+            bp_log("[walfs] boot_policy_verify...");
             boot_policy_verify_or_seed();
+            bp_log("[walfs] boot_measurements...");
             u64 el1_s = 0;
             u32 el1_len = 0;
             boot_measurements(NULL, NULL, &el1_s, &el1_len);
@@ -4394,63 +4686,88 @@ void kernel_main(void) {
             if (el2_hvc_call(EL2_HVC_BOOT_INTEGRITY_SET, el1_s, el1_len,
                              boot_el1_expected_hash, boot_el2_expected_hash, &ok) != 0 || ok != 0)
                 exception_pisod("Boot integrity arm failed", 5, 0x3B, 0, 0, 0);
-            if (fb_ok) bp_log("[walfs] Verified + integrity armed");
+            bp_ok("[walfs] integrity armed OK");
         } else {
-            if (fb_ok) bp_log("[walfs] WALFS init FAILED");
+            bp_err("[walfs] WALFS init FAILED");
         }
-        if (fb_ok) {
-            bp_log(walfs_ok ? "[fs] SD + WALFS online" : "[fs] SD ok, WALFS failed");
-            bp_done(4, sd_ok);
-        }
+        if (walfs_ok) bp_ok("[fs] SD + WALFS online");
+        else bp_warn("[fs] SD ok, WALFS failed");
+        bp_done(4, sd_ok);
     }
 
-    /*
-     * Phase 5 (Blue): NIC / MAC — GENET Ethernet.
-     */
-    if (fb_ok) bp_active(5);
-    if (fb_ok) bp_log("[genet] skipped (crashes at EL2)");
-    if (fb_ok) bp_done(5, false);
+    /* ── Phase 5: GENET ── */
+    bp_active(5);
+    bp_log("[genet] genet_init (MAC+PHY)...");
+    genet_ok = genet_init();
+    if (!genet_ok) {
+        bp_err("[genet] GENET init FAILED"); bp_done(5, false);
+    } else {
+        bp_ok("[genet] MAC online");
+        if (genet_link_up()) bp_ok("[genet] PHY link UP");
+        else bp_warn("[genet] PHY link DOWN");
+        bp_done(5, true);
+    }
 
-    /* Network stack — skip (no GENET) */
-    if (fb_ok) bp_log("[net] skipped (no NIC)");
+    /* Network stack */
+    bp_log("[net] net_init (static IP)...");
+    net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
+    ui_cfg_ip = MY_IP;
+    ui_cfg_mask = MY_MASK;
+    ui_cfg_gw = MY_GW;
+    ui_cfg_dns = MY_GW;
+    ui_cfg_dhcp = false;
+    bp_log("[net] dns_init...");
+    dns_init(ui_cfg_dns);
+    bp_log("[net] udp_subscribe...");
+    net_udp_subscribe(ui_db_udp_cb);
+    bp_ok("[net] IP stack ready");
 
-    /* GPU + Tensor compute */
-    if (fb_ok) bp_log("[boot] calling tensor_init...");
+    /* GPU + Tensor */
+    bp_log("[gpu] tensor_init...");
     tensor_init();
-    if (fb_ok) bp_log("[tensor] done");
+    bp_ok("[gpu] tensor compute ready");
 
     /* Core 0 environment */
-    if (fb_ok) bp_log("[boot] core_env/ksem/workq...");
+    bp_log("[core] core_env_init...");
     core_env_init(CORE_NET);
+    bp_log("[core] ksem_init_core...");
     ksem_init_core();
+    bp_log("[core] workq_init_core...");
     workq_init_core();
+    bp_log("[core] module_init...");
     module_init();
-    if (fb_ok) bp_log("[core] done");
+    bp_ok("[core] env ready");
 
-    /* First-boot setup flow (before launching user cores) */
+    /* Setup */
     if (walfs_ok) {
-        if (fb_ok) bp_log("[boot] calling setup_run...");
+        bp_log("[setup] setup_run...");
         setup_run(fb_ok, genet_ok, usb_ok);
+        bp_ok("[setup] done");
     }
 
-    /*
-     * Phase 6 (Yellow): Multicore — skip (needs EL1 + GIC).
-     */
-    if (fb_ok) bp_active(6);
-    if (fb_ok) bp_log("[core] skipped (EL2, no GIC)");
-    if (fb_ok) bp_done(6, false);
-
-    /*
-     * Phase 7 (Purple): PIOS operational and ready.
-     */
-    if (fb_ok) {
-        bp_active(7);
-        bp_done(7, true);
-        bp_log("[pios] System ready");
-        timer_delay_ms(2000);
-        boot_diag(sd_ok, walfs_ok, genet_ok, usb_ok);
+    /* ── Phase 6: Multicore ── */
+    bp_active(6);
+    if (at_el1) {
+        bp_log("[smp] core_start_all (PSCI)...");
+        core_start_all();
+        bp_ok("[smp] cores 0-3 active");
+        bp_done(6, true);
+    } else {
+        bp_warn("[skip] multicore (need EL1)");
+        bp_done(6, false);
     }
 
-    /* No core0_main — GIC/interrupts not available at EL2 */
-    for (;;) __asm__ volatile("wfe");
+    /* ── Phase 7: Ready ── */
+    bp_active(7);
+    bp_done(7, true);
+    bp_log("[pios] System ready");
+    timer_delay_ms(2000);
+    boot_diag(sd_ok, walfs_ok, genet_ok, usb_ok);
+
+    if (at_el1) {
+        core0_main();
+    } else {
+        /* EL2 fallback: no interrupts, just spin */
+        for (;;) __asm__ volatile("wfe");
+    }
 }

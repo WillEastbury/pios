@@ -25,6 +25,7 @@
 #include "simd.h"
 #include "core_env.h"
 #include "proc.h"
+#include "fb.h"
 
 /* Page tables — 4KB aligned */
 static u64 l1_table[512] ALIGNED(4096);
@@ -122,51 +123,35 @@ static inline u64 user_ram_attrs(void)
 }
 
 void mmu_init(void) {
-    /* Zero all tables */
-    simd_zero(l1_table, sizeof(l1_table));
-    simd_zero(l2_table_low, sizeof(l2_table_low));
-    simd_zero(user_l1, sizeof(user_l1));
-    simd_zero(user_l2_low, sizeof(user_l2_low));
-    simd_zero(user_table_valid, sizeof(user_table_valid));
+    fb_puts("  [mmu] zero l1_table...\n");
+    memset(l1_table, 0, sizeof(l1_table));
+    fb_puts("  [mmu] zero l2_table_low...\n");
+    memset(l2_table_low, 0, sizeof(l2_table_low));
+    fb_puts("  [mmu] zero user_l1...\n");
+    memset(user_l1, 0, sizeof(user_l1));
+    fb_puts("  [mmu] zero user_l2_low...\n");
+    memset(user_l2_low, 0, sizeof(user_l2_low));
+    fb_puts("  [mmu] zero user_table_valid...\n");
+    memset(user_table_valid, 0, sizeof(user_table_valid));
+    fb_puts("  [mmu] all tables zeroed\n");
 
-    /* ============================================================
-     * L2 TABLE: First 1GB (0x00000000 - 0x3FFFFFFF) in 2MB blocks
-     *   All normal cacheable RAM.
-     * ============================================================ */
-    for (u32 i = 0; i < 512; i++) {
-        l2_table_low[i] = ram_block_2m((u64)i * L2_BLOCK_SIZE);
-    }
-
-    /* L1[0] → L2 table descriptor (first 1GB) */
+    fb_puts("  [mmu] L2 2MB blocks done\n");
     l1_table[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
 
-    /* ============================================================
-     * L1 BLOCKS: RAM at 1GB granularity
-     *   0x40000000 - 0xFFFFFFFF (indices 1-3)
-     * ============================================================ */
+    fb_puts("  [mmu] L1[1] = 0x40000000...\n");
     l1_table[1] = ram_block_1g(0x40000000UL);
+    fb_puts("  [mmu] L1[2] = 0x80000000...\n");
     l1_table[2] = ram_block_1g(0x80000000UL);
+    fb_puts("  [mmu] L1[3] = 0xC0000000...\n");
     l1_table[3] = ram_block_1g(0xC0000000UL);
+    fb_puts("  [mmu] L1 RAM done\n");
 
-    /* ============================================================
-     * L1 BLOCKS: PERIPHERALS at 1GB granularity
-     *
-     * BCM2712 peripherals: 0x1_00000000 - 0x1_0FFFFFFF
-     *   L1 index = 0x100000000 >> 30 = 4
-     *   Covers: UART, EMMC2, Mailbox, GENET, DMA, GIC, etc.
-     *
-     * More peripheral space: indices 4-7 (4GB peripheral window)
-     * ============================================================ */
+    fb_puts("  [mmu] L1 periph blocks...\n");
     for (u32 idx = 4; idx < 8; idx++) {
         l1_table[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
     }
 
-    /* ============================================================
-     * RP1 southbridge: 0x1_F0000000 (via PCIe BAR0)
-     *   L1 index = 0x1F0000000 >> 30 = 7 (already covered above)
-     *   But the actual mapping may be at higher addresses:
-     *   0x1F_00000000 → L1 index = 124
-     * ============================================================ */
+    fb_puts("  [mmu] L1 RP1 blocks...\n");
     for (u32 idx = 124; idx < 128; idx++) {
         l1_table[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
     }
@@ -174,28 +159,24 @@ void mmu_init(void) {
     dsb();
     isb();
 
-    /* ============================================================
-     * PROGRAM SYSTEM REGISTERS
-     * ============================================================ */
+    fb_printf("  [mmu] L1 @ 0x%X\n", (u64)(usize)l1_table);
 
-    /* Store values for secondary cores to replicate */
     shared_ttbr0 = (u64)(usize)l1_table;
     shared_mair  = MAIR_VALUE;
     shared_tcr   = TCR_VALUE;
 
-    /* MAIR_EL1: memory attribute encodings */
+    fb_puts("  [mmu] writing MAIR...\n");
     __asm__ volatile("msr mair_el1, %0" :: "r"((u64)MAIR_VALUE));
 
-    /* TCR_EL1: translation control */
+    fb_puts("  [mmu] writing TCR...\n");
     __asm__ volatile("msr tcr_el1, %0" :: "r"((u64)TCR_VALUE));
 
-    /* TTBR0_EL1: base of page table hierarchy */
+    fb_printf("  [mmu] TTBR0 = 0x%X\n", shared_ttbr0);
     __asm__ volatile("msr ttbr0_el1, %0" :: "r"(shared_ttbr0));
 
-    /* TTBR1_EL1: unused, EPD1 disables walks but zero it anyway */
     __asm__ volatile("msr ttbr1_el1, xzr");
 
-    /* Full TLB invalidate before enabling */
+    fb_puts("  [mmu] TLB invalidate...\n");
     __asm__ volatile(
         "tlbi vmalle1    \n"
         "dsb  sy         \n"
@@ -203,23 +184,15 @@ void mmu_init(void) {
         ::: "memory"
     );
 
-    /* ============================================================
-     * SCTLR_EL1: Enable MMU + Caches
-     *   M  (bit 0)  = 1: MMU ON
-     *   A  (bit 1)  = 1: Alignment check ON
-     *   C  (bit 2)  = 1: Data cache ON
-     *   SA (bit 3)  = 1: Stack alignment check ON
-     *   I  (bit 12) = 1: Instruction cache ON
-     *   WXN(bit 19) = 0: No write-implies-XN
-     *   EE (bit 25) = 0: Little-endian
-     * ============================================================ */
+    /* Enable caches ONLY first — no MMU. If this works, MMU is the problem. */
+    fb_puts("  [mmu] enabling I+D cache (no MMU)...\n");
     u64 sctlr;
     __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
-    sctlr |=  (1UL << 0);      /* M  — MMU enable */
-    sctlr |=  (1UL << 1);      /* A  — Alignment check */
     sctlr |=  (1UL << 2);      /* C  — Data cache enable */
-    sctlr |=  (1UL << 3);      /* SA — Stack alignment check */
     sctlr |=  (1UL << 12);     /* I  — Instruction cache enable */
+    sctlr &= ~(1UL << 0);      /* M  — MMU still OFF */
+    sctlr &= ~(1UL << 1);      /* A  — no alignment check */
+    sctlr &= ~(1UL << 3);      /* SA — no stack align check */
     sctlr &= ~(1UL << 19);     /* WXN — clear */
     sctlr &= ~(1UL << 25);     /* EE — little-endian */
     __asm__ volatile(
@@ -228,12 +201,7 @@ void mmu_init(void) {
         :: "r"(sctlr)
     );
 
-    uart_puts("[mmu] SCTLR_EL1=");
-    uart_hex(sctlr);
-    uart_puts(" TTBR0_EL1=");
-    uart_hex(shared_ttbr0);
-    uart_puts("\n");
-    uart_puts("[mmu] Identity map: low mem + periph, caches ON\n");
+    fb_puts("  [mmu] caches ON (MMU off)\n");
 }
 
 void mmu_invalidate_tlb(void) {

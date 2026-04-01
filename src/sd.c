@@ -6,6 +6,7 @@
 #include "sd.h"
 #include "mmio.h"
 #include "uart.h"
+#include "fb.h"
 
 /* SDHCI register offsets from EMMC2_BASE */
 #define REG_ARG2            0x00
@@ -176,37 +177,47 @@ bool sd_init(void) {
     card.type = 0;
     card.rca  = 0;
 
+    fb_puts("  [sd] Resetting SDHCI controller\n");
     /* Reset controller */
     sd_write(REG_CONTROL1, sd_read(REG_CONTROL1) | C1_SRST_HC);
     u32 timeout = 100000;
     while ((sd_read(REG_CONTROL1) & C1_SRST_HC) && timeout--)
         delay_cycles(10);
     if (!timeout) {
+        fb_puts("  [sd] Reset timeout!\n");
         uart_puts("[sd] Reset timeout\n");
         return false;
     }
 
+    fb_puts("  [sd] Enabling interrupts\n");
     /* Enable interrupts we care about */
     sd_write(REG_IRPT_MASK, INT_ALL);
     sd_write(REG_IRPT_EN, 0);
 
+    fb_puts("  [sd] Setting identification clock (400 KHz)\n");
     /* Set slow clock for identification (400 KHz) */
     sd_set_clock(400);
 
+    fb_puts("  [sd] CMD0: GO_IDLE\n");
     /* CMD0: GO_IDLE */
     if (!sd_send_cmd(SD_CMD0, 0, NULL)) {
+        fb_puts("  [sd] CMD0 failed\n");
         uart_puts("[sd] CMD0 failed\n");
         return false;
     }
 
+    fb_puts("  [sd] CMD8: SEND_IF_COND (SD v2 check)\n");
     /* CMD8: SEND_IF_COND (SD v2 check, 0x1AA = 2.7-3.6V + check pattern) */
     u32 resp[4];
     bool sd_v2 = sd_send_cmd(SD_CMD8, 0x1AA, resp);
     if (sd_v2 && (resp[0] & 0xFFF) != 0x1AA) {
+        fb_puts("  [sd] CMD8 bad response\n");
         uart_puts("[sd] CMD8 bad response\n");
         return false;
     }
+    fb_printf("  [sd] SD v2=%u\n", (u32)sd_v2);
 
+    fb_puts("  [sd] ACMD41: polling card ready\n");
     /* ACMD41: SD_SEND_OP_COND - poll until ready */
     u32 acmd41_arg = 0x00FF8000;  /* 3.2-3.4V */
     if (sd_v2)
@@ -215,6 +226,7 @@ bool sd_init(void) {
     timeout = 100;
     do {
         if (!sd_send_acmd(SD_ACMD41, acmd41_arg, resp)) {
+            fb_puts("  [sd] ACMD41 failed\n");
             uart_puts("[sd] ACMD41 failed\n");
             return false;
         }
@@ -222,18 +234,22 @@ bool sd_init(void) {
     } while (!(resp[0] & (1 << 31)) && timeout--);
 
     if (!timeout) {
+        fb_puts("  [sd] Card init timeout\n");
         uart_puts("[sd] Card init timeout\n");
         return false;
     }
 
     card.type = (resp[0] & (1 << 30)) ? 2 : 1;  /* SDHC or SDSC */
+    fb_printf("  [sd] Card type=%u (%s)\n", card.type, card.type == 2 ? "SDHC" : "SDSC");
 
+    fb_puts("  [sd] CMD2: ALL_SEND_CID\n");
     /* CMD2: ALL_SEND_CID */
     if (!sd_send_cmd(SD_CMD2, 0, resp)) {
         uart_puts("[sd] CMD2 failed\n");
         return false;
     }
 
+    fb_puts("  [sd] CMD3: SEND_RELATIVE_ADDR\n");
     /* CMD3: SEND_RELATIVE_ADDR */
     if (!sd_send_cmd(SD_CMD3, 0, resp)) {
         uart_puts("[sd] CMD3 failed\n");
@@ -241,15 +257,18 @@ bool sd_init(void) {
     }
     card.rca = resp[0] >> 16;
 
+    fb_puts("  [sd] CMD7: SELECT_CARD\n");
     /* CMD7: SELECT_CARD */
     if (!sd_send_cmd(SD_CMD7, card.rca << 16, resp)) {
         uart_puts("[sd] CMD7 failed\n");
         return false;
     }
 
+    fb_puts("  [sd] Switching to 25 MHz clock\n");
     /* Switch to high-speed clock (25 MHz) */
     sd_set_clock(25000);
 
+    fb_puts("  [sd] ACMD6: SET_BUS_WIDTH 4-bit\n");
     /* ACMD6: SET_BUS_WIDTH to 4-bit */
     if (sd_send_acmd(SD_ACMD6, 2, resp)) {
         u32 c0 = sd_read(REG_CONTROL0);
@@ -258,8 +277,12 @@ bool sd_init(void) {
     }
 
     /* CMD16: SET_BLOCKLEN to 512 (for SDSC cards) */
-    if (card.type == 1)
+    if (card.type == 1) {
+        fb_puts("  [sd] CMD16: SET_BLOCKLEN 512\n");
         sd_send_cmd(SD_CMD16, 512, resp);
+    }
+
+    fb_puts("  [sd] Card ready\n");
 
     uart_puts("[sd] Card ready: ");
     uart_puts(card.type == 2 ? "SDHC/SDXC" : "SDSC");

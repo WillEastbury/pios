@@ -5,6 +5,7 @@
 
 #include "core.h"
 #include "uart.h"
+#include "fb.h"
 
 /* PSCI function IDs (SMC64 convention) */
 #define PSCI_CPU_ON         0xC4000003
@@ -43,7 +44,11 @@ void core_start_secondary(u32 id, void (*entry)(void)) {
 void core_start_all(void) {
     dsb();
     isb();
+    fb_puts("  [core] Starting core 1 (PSCI CPU_ON)\n");
     core_start_secondary(1, NULL);
+    fb_puts("  [core] Starting core 2 (PSCI CPU_ON)\n");
     core_start_secondary(2, NULL);
+    fb_puts("  [core] Starting core 3 (PSCI CPU_ON)\n");
     core_start_secondary(3, NULL);
+    fb_puts("  [core] All secondary cores started\n");
 }

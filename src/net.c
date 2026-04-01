@@ -18,6 +18,7 @@
 #include "uart.h"
 #include "timer.h"
 #include "workq.h"
+#include "fb.h"
 
 /* ---- Network state ---- */
 
@@ -483,16 +484,19 @@ void net_poll(void) {
 }
 
 void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
+    fb_printf("  [net] Configuring IP=0x%x GW=0x%x\n", ip, gateway);
     our_ip   = ip;
     our_gw   = gateway;
     our_mask = netmask;
     genet_get_mac(our_mac);
 
     if (gateway_mac) {
+        fb_puts("  [net] Setting gateway MAC\n");
         simd_memcpy(gw_mac, gateway_mac, 6);
         gw_mac_set = true;
     }
 
+    fb_puts("  [net] Clearing stats and state\n");
     simd_zero(&stats, sizeof(stats));
     simd_zero(neighbors, sizeof(neighbors));
     neighbor_count = 0;
@@ -505,29 +509,39 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     icmp_min_interval = freq / 10;
     icmp_last_tick    = 0;
 
+    fb_puts("  [net] Initialising ARP subsystem\n");
     /* Init ARP subsystem */
     arp_init(ip, netmask, our_mac);
 
+    fb_puts("  [net] Initialising TCP subsystem\n");
     /* Init TCP subsystem */
     tcp_init();
 
+    fb_puts("  [net] Initialising socket layer\n");
     /* Init socket layer */
     socket_init();
 
+    fb_puts("  [net] Enabling NIC checksum offload + TSO\n");
     /* Enable safe NIC checksum assist paths by default. */
     genet_set_rx_checksum_offload(true);
     genet_set_tx_checksum_offload(true);
     genet_set_tso(true);
 
     net_maint_queued = false;
+    fb_puts("  [net] Installing tick hook\n");
     timer_set_tick_hook(net_tick_hook);
 
+    fb_puts("  [net] Initialising TLS subsystem\n");
     /* Init TLS wrapper subsystem */
     tls_init();
 
     /* Add gateway as static ARP entry if MAC provided */
-    if (gateway_mac && !mac_is_zero_6(gateway_mac))
+    if (gateway_mac && !mac_is_zero_6(gateway_mac)) {
+        fb_puts("  [net] Adding gateway static ARP entry\n");
         arp_add_static(gateway, gateway_mac);
+    }
+
+    fb_puts("  [net] Announcing on network (gratuitous ARP)\n");
 
     uart_puts("[net] Hardened stack: IP=");
     uart_hex(ip);

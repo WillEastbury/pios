@@ -85,14 +85,17 @@ NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 
 }
 
 void exception_init(void) {
+    fb_puts("  [exc] Installing vector table\n");
     /* Install vector table */
     u64 vbar = (u64)(usize)&vector_table;
     __asm__ volatile("msr vbar_el1, %0" :: "r"(vbar));
     isb();
 
+    fb_puts("  [exc] Clearing IRQ handler table\n");
     /* Clear handler table */
     for (u32 i = 0; i < GIC_MAX_IRQ; i++)
         irq_handlers[i] = NULL;
+    fb_puts("  [exc] Exception vectors ready\n");
 }
 
 void irq_register(u32 intid, irq_handler_t handler) {
