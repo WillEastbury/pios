@@ -4162,11 +4162,20 @@ static void ui_handle_keys(void)
 /* Core 0: Kernel services + network */
 NORETURN void core0_main(void) {
     struct core_env *env = core_env_of(CORE_NET);
-    ui_mode = UI_MODE_NONE;
+    ui_mode = UI_MODE_CONSOLE;  /* Auto-enter console for serial input */
+    ui_console_len = 0;
     ui_selected = 0;
     ui_last_render = 0;
     ui_launch_idx = -1;
     ui_status_code = 0;
+
+    /* Print console prompt on HDMI + serial */
+    fb_clear(UI_SHELL_BG_COLOR);
+    fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
+    ui_console_write("PIOS F3 Console (serial + HDMI)\n");
+    ui_console_write("Type 'help' for commands.\n");
+    ui_console_prompt();
+    uart_puts("\r\nPIOS Console ready. Type 'help'.\r\n> ");
     for (;;) {
         ui_act_led_tick();
         watchdog_touch(CORE_NET);

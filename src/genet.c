@@ -9,6 +9,7 @@
 #include "simd.h"
 #include "fb.h"
 #include "timer.h"
+#include "mailbox.h"
 
 /* ---- Register offsets from GENET_BASE ---- */
 
@@ -300,15 +301,24 @@ bool genet_init(void) {
     tso_enabled = false;
     tso_warned = false;
 
-    /* Read firmware-programmed MAC before reset clobbers it */
-    u32 mac0 = gr(UMAC_MAC0);
-    u32 mac1 = gr(UMAC_MAC1);
-    mac_addr[0] = (mac0 >> 24) & 0xFF;
-    mac_addr[1] = (mac0 >> 16) & 0xFF;
-    mac_addr[2] = (mac0 >> 8)  & 0xFF;
-    mac_addr[3] =  mac0        & 0xFF;
-    mac_addr[4] = (mac1 >> 8)  & 0xFF;
-    mac_addr[5] =  mac1        & 0xFF;
+    /* Get MAC from VideoCore mailbox (tag 0x00010003) */
+    {
+        static volatile u32 __attribute__((aligned(16))) mb[8];
+        mb[0] = 8 * 4;
+        mb[1] = 0;
+        mb[2] = 0x00010003;    /* GET_BOARD_MAC_ADDRESS */
+        mb[3] = 6;
+        mb[4] = 6;
+        mb[5] = 0;
+        mb[6] = 0;
+        mb[7] = 0;
+        if (mbox_call(8, mb)) {
+            u8 *raw = (u8 *)&mb[5];
+            mac_addr[0] = raw[0]; mac_addr[1] = raw[1];
+            mac_addr[2] = raw[2]; mac_addr[3] = raw[3];
+            mac_addr[4] = raw[4]; mac_addr[5] = raw[5];
+        }
+    }
 
     /* Software reset */
     gw(SYS_RBUF_FLUSH, 1);
