@@ -128,46 +128,65 @@ static const u8 font8x8[95][8] = {
 /* ---- Framebuffer init via mailbox ---- */
 
 bool fb_init(u32 width, u32 height) {
-    mbox_fb[ 0] = 35 * 4;          /* buffer size */
-    mbox_fb[ 1] = 0;               /* request */
+    /*
+     * Mailbox tag format: [tag_id] [value_buf_size] [req_indicator] [values...]
+     * req_indicator must equal the request data size in bytes (bits 30:0),
+     * with bit 31 = 0 for request.  The canary kernel sets these correctly;
+     * setting them to 0 causes the VideoCore to ignore our values.
+     */
+    int i = 0;
+    mbox_fb[i++] = 0;               /* [0] total size (filled below) */
+    mbox_fb[i++] = 0;               /* [1] request code */
 
-    mbox_fb[ 2] = TAG_SET_PHYS_WH;
-    mbox_fb[ 3] = 8; mbox_fb[ 4] = 0;
-    mbox_fb[ 5] = width; mbox_fb[ 6] = height;
+    mbox_fb[i++] = TAG_SET_PHYS_WH;
+    mbox_fb[i++] = 8;               /* value buffer size */
+    mbox_fb[i++] = 8;               /* request: sending 8 bytes */
+    mbox_fb[i++] = width;
+    mbox_fb[i++] = height;
 
-    mbox_fb[ 7] = TAG_SET_VIRT_WH;
-    mbox_fb[ 8] = 8; mbox_fb[ 9] = 0;
-    mbox_fb[10] = width; mbox_fb[11] = height;
+    mbox_fb[i++] = TAG_SET_VIRT_WH;
+    mbox_fb[i++] = 8;
+    mbox_fb[i++] = 8;
+    mbox_fb[i++] = width;
+    mbox_fb[i++] = height;
 
-    mbox_fb[12] = TAG_SET_DEPTH;
-    mbox_fb[13] = 4; mbox_fb[14] = 0;
-    mbox_fb[15] = 32;              /* 32 bpp */
+    mbox_fb[i++] = TAG_SET_DEPTH;
+    mbox_fb[i++] = 4;
+    mbox_fb[i++] = 4;
+    mbox_fb[i++] = 32;              /* 32 bpp */
 
-    mbox_fb[16] = TAG_SET_PIXEL_ORDER;
-    mbox_fb[17] = 4; mbox_fb[18] = 0;
-    mbox_fb[19] = 0;               /* BGR */
+    mbox_fb[i++] = TAG_SET_PIXEL_ORDER;
+    mbox_fb[i++] = 4;
+    mbox_fb[i++] = 4;
+    mbox_fb[i++] = 0;               /* BGR */
 
-    mbox_fb[20] = TAG_ALLOCATE_BUFFER;
-    mbox_fb[21] = 8; mbox_fb[22] = 0;
-    mbox_fb[23] = 4096;            /* alignment */
-    mbox_fb[24] = 0;
+    mbox_fb[i++] = TAG_ALLOCATE_BUFFER;
+    int fb_idx = i + 1;             /* response: base address */
+    mbox_fb[i++] = 8;
+    mbox_fb[i++] = 4;               /* request: sending 4 bytes (alignment) */
+    mbox_fb[i++] = 16;              /* alignment (match canary) */
+    mbox_fb[i++] = 0;               /* size (response) */
 
-    mbox_fb[25] = TAG_GET_PITCH;
-    mbox_fb[26] = 4; mbox_fb[27] = 0;
-    mbox_fb[28] = 0;
+    mbox_fb[i++] = TAG_GET_PITCH;
+    int pitch_idx = i + 1;          /* response: pitch */
+    mbox_fb[i++] = 4;
+    mbox_fb[i++] = 4;
+    mbox_fb[i++] = 0;               /* pitch (response) */
 
-    mbox_fb[29] = TAG_END;
+    mbox_fb[i++] = TAG_END;
+    mbox_fb[0] = (u32)(i * 4);      /* actual buffer size */
 
     if (!mbox_call(MBOX_CH_PROP, mbox_fb))
         return false;
 
-    if (mbox_fb[23] == 0)
+    u32 fb_addr = mbox_fb[fb_idx];
+    if (fb_addr == 0)
         return false;
 
-    fb_ptr    = (u32 *)(usize)(mbox_fb[23] & 0x3FFFFFFF);
+    fb_ptr    = (u32 *)(usize)(fb_addr & 0x3FFFFFFF);
     fb_width  = width;
     fb_height = height;
-    fb_pitch  = mbox_fb[28];
+    fb_pitch  = mbox_fb[pitch_idx];
     cursor_x  = 0;
     cursor_y  = 0;
     cols      = width / 8;
