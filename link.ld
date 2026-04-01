@@ -39,3 +39,4 @@ SECTIONS
     . = ALIGN(4096); /* inside RW segment for static reservations */
     __heap_start = .;
 }
+__bss_size = (__bss_end - __bss_start) >> 3;

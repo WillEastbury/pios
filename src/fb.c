@@ -14,6 +14,7 @@ static u32 *fb_ptr;
 static u32  fb_width;
 static u32  fb_height;
 static u32  fb_pitch;   /* bytes per row */
+static u32  fb_size;    /* total framebuffer bytes (from VideoCore) */
 static u32  fb_fg = 0x00FF9900;  /* amber */
 static u32  fb_bg = 0x00000000;  /* black */
 
@@ -197,7 +198,7 @@ bool fb_init(u32 width, u32 height) {
     fb_mbox[i++] = 0x00048006;
     fb_mbox[i++] = 4;
     fb_mbox[i++] = 4;
-    fb_mbox[i++] = 1;           /* RGB — matches canary */
+    fb_mbox[i++] = 0;           /* BGR — matches our 0x00RRGGBB color constants */
 
     /* Allocate framebuffer */
     int fb_idx = i + 3;
@@ -221,8 +222,8 @@ bool fb_init(u32 width, u32 height) {
     if (!fb_mbox_call())
         return false;
 
-    u32 fb_addr = fb_mbox[fb_idx] & 0x3FFFFFFF;
-    u32 fb_size = fb_mbox[fb_idx + 1];
+    u32 fb_addr  = fb_mbox[fb_idx] & 0x3FFFFFFF;
+    u32 raw_size = fb_mbox[fb_idx + 1];
 
     if (!fb_addr)
         return false;
@@ -231,6 +232,7 @@ bool fb_init(u32 width, u32 height) {
     fb_width  = width;
     fb_height = height;
     fb_pitch  = fb_mbox[pitch_idx];
+    fb_size   = raw_size;
     cursor_x  = 0;
     cursor_y  = 0;
     cols      = width / 8;
@@ -240,19 +242,18 @@ bool fb_init(u32 width, u32 height) {
     if (fb_pitch == 0)
         fb_pitch = width * 4;
 
-    /* Fill screen to prove it works — green like the canary */
-    u32 pixels = fb_size / 4;
-    if (!pixels) pixels = width * height;
-    for (u32 p = 0; p < pixels; p++)
-        ((volatile u32 *)(u64)fb_addr)[p] = 0xFF00FF00;
+    /* Fallback if size wasn't returned */
+    if (fb_size == 0)
+        fb_size = fb_pitch * height;
 
-    /* Now clear to bg for text rendering */
     fb_clear(fb_bg);
     return true;
 }
 
 void fb_clear(u32 color) {
-    u32 total = (fb_pitch / 4) * fb_height;
+    /* Use VideoCore-reported size to cover the entire allocation */
+    u32 total = fb_size / 4;
+    if (!total) total = (fb_pitch / 4) * fb_height;
     for (u32 i = 0; i < total; i++)
         fb_ptr[i] = color;
     cursor_x = 0;
@@ -301,7 +302,7 @@ static void fb_draw_char(u32 cx, u32 cy, char c) {
         u32 *scanline = (u32 *)((u8 *)fb_ptr + (py + row) * fb_pitch);
         u8 bits = glyph[row];
         for (u32 col = 0; col < 8; col++) {
-            scanline[px + col] = (bits & (0x80 >> col)) ? fb_fg : fb_bg;
+            scanline[px + col] = (bits & (1 << col)) ? fb_fg : fb_bg;
         }
     }
 }

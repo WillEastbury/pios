@@ -14,51 +14,23 @@ _start:
     and     x0, x0, #0x3
     cbnz    x0, .Lpark          /* only core 0 continues */
 
-    /* Ensure EL2 trap path has a valid stack before EL2->EL1 drop */
-    ldr     x1, =__stack_top_core0
+    /* Stack — use same location as canary: just below kernel load address.
+     * __stack_top_core0 is deep in BSS (~3MB), which may be unmapped by
+     * firmware.  _start (0x80000) grows downward into safe low RAM. */
+    ldr     x1, =_start
     mov     sp, x1
 
-    /* ---- EL2 → EL1 transition ---- */
-    bl      el2_to_el1
-
-    /* ---- SCTLR_EL1: safe baseline (MMU off, caches off, alignment check on) ---- */
-    mrs     x1, sctlr_el1
-    bic     x1, x1, #(1 << 0)      /* M=0: MMU off initially */
-    bic     x1, x1, #(1 << 2)      /* C=0: data cache off initially */
-    bic     x1, x1, #(1 << 12)     /* I=0: instruction cache off initially */
-    orr     x1, x1, #(1 << 1)      /* A=1: alignment check */
-    orr     x1, x1, #(1 << 3)      /* SA=1: stack alignment check */
-    msr     sctlr_el1, x1
-    isb
-
-    /* Enable NEON / FPU (CPACR_EL1 bits [21:20] = 0b11) */
-    mrs     x1, cpacr_el1
-    orr     x1, x1, #(3 << 20)
-    msr     cpacr_el1, x1
-    isb
-
-    /* Core 0: set SP_EL0 (main stack) */
-    ldr     x1, =__stack_top_core0
-    mov     sp, x1
-
-    /* Also set SP_EL1 for exception handlers (separate stack, 16KB below) */
-    ldr     x1, =__stack_top_core0
-    sub     x1, x1, #0x4000        /* 16KB below main stack */
-    msr     sp_el1, x1
-
-    /* Install exception vector table */
-    ldr     x1, =vector_table
-    msr     vbar_el1, x1
-    isb
+    /* Skip EL2→EL1 for now — run at whatever EL firmware gave us,
+     * exactly like the working canary kernel. */
 
     /* Clear BSS */
     ldr     x1, =__bss_start
-    ldr     x2, =__bss_end
+    ldr     w2, =__bss_size
 .Lbss_loop:
-    cmp     x1, x2
-    b.ge    .Lbss_done
+    cbz     w2, .Lbss_done
     str     xzr, [x1], #8
-    b       .Lbss_loop
+    sub     w2, w2, #1
+    cbnz    w2, .Lbss_loop
 .Lbss_done:
 
     bl      kernel_main
