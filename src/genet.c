@@ -300,6 +300,16 @@ bool genet_init(void) {
     tso_enabled = false;
     tso_warned = false;
 
+    /* Read firmware-programmed MAC before reset clobbers it */
+    u32 mac0 = gr(UMAC_MAC0);
+    u32 mac1 = gr(UMAC_MAC1);
+    mac_addr[0] = (mac0 >> 24) & 0xFF;
+    mac_addr[1] = (mac0 >> 16) & 0xFF;
+    mac_addr[2] = (mac0 >> 8)  & 0xFF;
+    mac_addr[3] =  mac0        & 0xFF;
+    mac_addr[4] = (mac1 >> 8)  & 0xFF;
+    mac_addr[5] =  mac1        & 0xFF;
+
     /* Software reset */
     gw(SYS_RBUF_FLUSH, 1);
     delay_cycles(10000);
