@@ -161,16 +161,16 @@ bool fb_init(u32 width, u32 height) {
     mbox_fb[i++] = 0;               /* BGR */
 
     mbox_fb[i++] = TAG_ALLOCATE_BUFFER;
-    int fb_idx = i + 1;             /* response: base address */
     mbox_fb[i++] = 8;
     mbox_fb[i++] = 4;               /* request: sending 4 bytes (alignment) */
+    int fb_idx = i;                  /* response: base address lands here */
     mbox_fb[i++] = 16;              /* alignment (match canary) */
     mbox_fb[i++] = 0;               /* size (response) */
 
     mbox_fb[i++] = TAG_GET_PITCH;
-    int pitch_idx = i + 1;          /* response: pitch */
     mbox_fb[i++] = 4;
     mbox_fb[i++] = 4;
+    int pitch_idx = i;              /* response: pitch lands here */
     mbox_fb[i++] = 0;               /* pitch (response) */
 
     mbox_fb[i++] = TAG_END;
