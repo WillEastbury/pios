@@ -380,3 +380,7 @@ void fb_printf(const char *fmt, ...) {
 
     __builtin_va_end(args);
 }
+
+u64 fb_get_phys_addr(void) {
+    return (u64)(usize)fb_ptr;
+}

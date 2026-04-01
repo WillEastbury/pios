@@ -4335,54 +4335,10 @@ void kernel_fb_early(void) {
     u64 val;
 
     fb_set_color(0x0000FF00, 0x00000000);
-    fb_puts("PIOS v0.31 CPU State Dump\n");
+    fb_puts("PIOS v0.31\n");
     fb_set_color(0x00FFFFFF, 0x00000000);
-
-    __asm__ volatile("mrs %0, CurrentEL" : "=r"(val));
-    fb_printf("CurrentEL  = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, MPIDR_EL1" : "=r"(val));
-    fb_printf("MPIDR_EL1  = 0x%X\n", val);
-
-    __asm__ volatile("mov %0, sp" : "=r"(val));
-    fb_printf("SP         = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, SCTLR_EL1" : "=r"(val));
-    fb_printf("SCTLR_EL1  = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, SCTLR_EL2" : "=r"(val));
-    fb_printf("SCTLR_EL2  = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, HCR_EL2" : "=r"(val));
-    fb_printf("HCR_EL2    = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, CPTR_EL2" : "=r"(val));
-    fb_printf("CPTR_EL2   = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, CPACR_EL1" : "=r"(val));
-    fb_printf("CPACR_EL1  = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, TTBR0_EL1" : "=r"(val));
-    fb_printf("TTBR0_EL1  = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, TTBR0_EL2" : "=r"(val));
-    fb_printf("TTBR0_EL2  = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, TCR_EL2" : "=r"(val));
-    fb_printf("TCR_EL2    = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, VBAR_EL2" : "=r"(val));
-    fb_printf("VBAR_EL2   = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, SP_EL0" : "=r"(val));
-    fb_printf("SP_EL0     = 0x%X\n", val);
-
-    __asm__ volatile("mrs %0, SP_EL1" : "=r"(val));
-    fb_printf("SP_EL1     = 0x%X\n", val);
-
-    fb_putc('\n');
-    fb_set_color(0x00FFFF00, 0x00000000);
-    fb_puts("Dropping to EL1 now...\n");
+    fb_printf("FB addr = 0x%X\n", fb_get_phys_addr());
+    fb_puts("Entering kernel_main...\n");
 }
 
 /*
@@ -4465,7 +4421,7 @@ static void reg_panel(u32 at_el1) {
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts(at_el1 ? " (kernel)" : " (hypervisor)");
 
-    /* PC — use adr to get current instruction address */
+    /* PC */
     __asm__ volatile("adr %0, ." : "=r"(val));
     fb_set_cursor(col, row++);
     fb_set_color(0x00FFFFFF, 0x00000000);
@@ -4473,6 +4429,7 @@ static void reg_panel(u32 at_el1) {
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts(" Program ctr");
 
+    /* SP */
     __asm__ volatile("mov %0, sp" : "=r"(val));
     fb_set_cursor(col, row++);
     fb_set_color(0x00FFFFFF, 0x00000000);
@@ -4480,60 +4437,7 @@ static void reg_panel(u32 at_el1) {
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts(" Stack ptr");
 
-    __asm__ volatile("mrs %0, SCTLR_EL1" : "=r"(val));
-    fb_set_cursor(col, row++);
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("SCTLR1 %X", val);
-    fb_set_cursor(col, row++);
-    fb_set_color(0x0000CCFF, 0x00000000);
-    fb_printf(" System Control:");
-    fb_set_cursor(col, row++);
-    fb_printf(" MMU=%u DCache=%u ICache=%u",
-        (u32)(val & 1), (u32)((val >> 2) & 1), (u32)((val >> 12) & 1));
-
-    __asm__ volatile("mrs %0, CPACR_EL1" : "=r"(val));
-    fb_set_cursor(col, row++);
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("CPACR1 %X", val);
-    fb_set_cursor(col, row++);
-    fb_set_color(0x0000CCFF, 0x00000000);
-    u32 fpen = (u32)((val >> 20) & 3);
-    fb_printf(" Coprocessor Access:");
-    fb_set_cursor(col, row++);
-    fb_printf(" NEON/FPU=%s", fpen == 3 ? "enabled" : "TRAPPED");
-
-    __asm__ volatile("mrs %0, TTBR0_EL1" : "=r"(val));
-    fb_set_cursor(col, row++);
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("TTBR0  %X", val);
-    fb_set_cursor(col, row++);
-    fb_set_color(0x0000CCFF, 0x00000000);
-    fb_puts(val ? " Page table base" : " Page table (none)");
-
-    __asm__ volatile("mrs %0, TCR_EL1" : "=r"(val));
-    fb_set_cursor(col, row++);
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("TCR1   %X", val);
-    fb_set_cursor(col, row++);
-    fb_set_color(0x0000CCFF, 0x00000000);
-    fb_puts(" Translation Control");
-
-    __asm__ volatile("mrs %0, MAIR_EL1" : "=r"(val));
-    fb_set_cursor(col, row++);
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("MAIR1  %X", val);
-    fb_set_cursor(col, row++);
-    fb_set_color(0x0000CCFF, 0x00000000);
-    fb_puts(" Memory Attributes");
-
-    __asm__ volatile("mrs %0, VBAR_EL1" : "=r"(val));
-    fb_set_cursor(col, row++);
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("VBAR1  %X", val);
-    fb_set_cursor(col, row++);
-    fb_set_color(0x0000CCFF, 0x00000000);
-    fb_puts(val ? " Exception vectors" : " Vectors (none!)");
-
+    /* MPIDR */
     __asm__ volatile("mrs %0, MPIDR_EL1" : "=r"(val));
     fb_set_cursor(col, row++);
     fb_set_color(0x00FFFFFF, 0x00000000);
@@ -4542,6 +4446,76 @@ static void reg_panel(u32 at_el1) {
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_printf(" Core %u / Cluster %u",
         (u32)(val & 0xFF), (u32)((val >> 8) & 0xFF));
+
+    if (at_el1) {
+        /* ── EL1 registers ── */
+        __asm__ volatile("mrs %0, SCTLR_EL1" : "=r"(val));
+        fb_set_cursor(col, row++);
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_printf("SCTLR1 %X", val);
+        fb_set_cursor(col, row++);
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_printf(" MMU=%u DC=%u IC=%u",
+            (u32)(val & 1), (u32)((val >> 2) & 1), (u32)((val >> 12) & 1));
+
+        __asm__ volatile("mrs %0, CPACR_EL1" : "=r"(val));
+        fb_set_cursor(col, row++);
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_printf("CPACR1 %X", val);
+        fb_set_cursor(col, row++);
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_printf(" NEON=%s", ((val >> 20) & 3) == 3 ? "enabled" : "TRAPPED");
+
+        __asm__ volatile("mrs %0, TTBR0_EL1" : "=r"(val));
+        fb_set_cursor(col, row++);
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_printf("TTBR0  %X", val);
+        fb_set_cursor(col, row++);
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_puts(val ? " Page table base" : " (none)");
+
+        __asm__ volatile("mrs %0, VBAR_EL1" : "=r"(val));
+        fb_set_cursor(col, row++);
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_printf("VBAR1  %X", val);
+        fb_set_cursor(col, row++);
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_puts(val ? " Exception vectors" : " (none!)");
+    } else {
+        /* ── EL2 registers ── */
+        __asm__ volatile("mrs %0, SCTLR_EL2" : "=r"(val));
+        fb_set_cursor(col, row++);
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_printf("SCTLR2 %X", val);
+        fb_set_cursor(col, row++);
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_printf(" MMU=%u DC=%u IC=%u",
+            (u32)(val & 1), (u32)((val >> 2) & 1), (u32)((val >> 12) & 1));
+
+        __asm__ volatile("mrs %0, HCR_EL2" : "=r"(val));
+        fb_set_cursor(col, row++);
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_printf("HCR_EL2 %X", val);
+        fb_set_cursor(col, row++);
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_printf(" RW=%u VM=%u", (u32)((val >> 31) & 1), (u32)(val & 1));
+
+        __asm__ volatile("mrs %0, CPTR_EL2" : "=r"(val));
+        fb_set_cursor(col, row++);
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_printf("CPTR2  %X", val);
+        fb_set_cursor(col, row++);
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_printf(" NEON=%s", ((val >> 10) & 1) ? "TRAPPED" : "enabled");
+
+        __asm__ volatile("mrs %0, VBAR_EL2" : "=r"(val));
+        fb_set_cursor(col, row++);
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_printf("VBAR2  %X", val);
+        fb_set_cursor(col, row++);
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_puts(val ? " EL2 vectors" : " (none)");
+    }
 
     fb_set_cursor(col, row++);
     fb_set_color(0x00444444, 0x00000000);

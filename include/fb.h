@@ -13,3 +13,6 @@ void fb_set_cursor(u32 col, u32 row);
 
 /* Direct pixel access */
 void fb_pixel(u32 x, u32 y, u32 color);
+
+/* Get framebuffer physical address (for MMU mapping) */
+u64 fb_get_phys_addr(void);
