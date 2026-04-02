@@ -25,25 +25,26 @@ static bool use_rp1;
 #define FR_RXFE     (1 << 4)    /* RX FIFO empty */
 
 void uart_init(void) {
-    /* Pi 5: GPIO14 TX = ALT4, GPIO15 RX = ALT4 (from Circle) */
-    rp1_gpio_set_function(14, RP1_FSEL_ALT4);
-    rp1_gpio_set_function(15, RP1_FSEL_ALT4);
+    /* Enable RX on RP1 UART0. Don't touch GPIO mux — just enable
+     * the RXE bit and set pad15 input enable + pull-up directly. */
 
-    /* GPIO15 RX needs pull-up (Circle: SetPullMode(GPIOPullModeUp)) */
-    {
-        u64 pad15 = 0x1F000F0000UL + 0x04 + 15 * 4;  /* PADS_BANK0 + pin offset */
-        u32 pad = *(volatile u32 *)pad15;
-        pad |= (1 << 3);   /* PUE — pull-up enable */
-        pad &= ~(1 << 2);  /* PDE — clear pull-down */
-        pad |= (1 << 6);   /* IE  — input enable */
-        *(volatile u32 *)pad15 = pad;
-    }
+    /* PAD15: input enable + pull-up (raw register, no gpio driver) */
+    volatile u32 *pad15 = (volatile u32 *)(0x1F000F0000UL + 0x04 + 15 * 4);
+    u32 pad = *pad15;
+    pad |= (1 << 6);   /* IE  — input enable */
+    pad |= (1 << 3);   /* PUE — pull-up */
+    pad &= ~(1 << 2);  /* PDE — clear pull-down */
+    *pad15 = pad;
 
-    /* Just enable RXE without touching baud/LCRH */
-    u64 cr_addr = 0x1F00030000UL + 0x30;
-    u32 cr = *(volatile u32 *)cr_addr;
-    cr |= (1 << 9);  /* RXE */
-    *(volatile u32 *)cr_addr = cr;
+    /* GPIO15 CTRL: set funcsel to 4 (ALT4 = UART0 RX) directly */
+    volatile u32 *gpio15_ctrl = (volatile u32 *)(0x1F000D0000UL + 15 * 8 + 0x04);
+    u32 ctrl = *gpio15_ctrl;
+    ctrl = (ctrl & ~0x1F) | 4;  /* funcsel = 4 */
+    *gpio15_ctrl = ctrl;
+
+    /* Enable RXE in UART CR */
+    volatile u32 *cr = (volatile u32 *)(0x1F00030000UL + 0x30);
+    *cr = *cr | (1 << 9);
 
     use_rp1 = true;
 }
