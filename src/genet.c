@@ -311,26 +311,46 @@ bool genet_init(void) {
     tso_enabled = false;
     tso_warned = false;
 
-    /* Get MAC from VideoCore mailbox (tag 0x00010003) */
+    /* Verify GENET is alive */
+    u32 rev = gr(SYS_REV_CTRL);
+    u32 major = (rev >> 24) & 0x0F;
+    if (major == 6) major = 5;
+    uart_puts("[genet] REV=");
+    uart_hex(rev);
+    uart_puts(major == 5 ? " (v5 OK)\n" : " (unexpected!)\n");
+
+    /* Read firmware MAC from UMAC registers BEFORE reset clobbers them */
     {
-        static volatile u32 __attribute__((aligned(16))) mb[8];
-        mb[0] = 8 * 4;
-        mb[1] = 0;
-        mb[2] = 0x00010003;    /* GET_BOARD_MAC_ADDRESS */
-        mb[3] = 6;
-        mb[4] = 6;
-        mb[5] = 0;
-        mb[6] = 0;
-        mb[7] = 0;
-        if (mbox_call(8, mb)) {
-            u8 *raw = (u8 *)&mb[5];
-            mac_addr[0] = raw[0]; mac_addr[1] = raw[1];
-            mac_addr[2] = raw[2]; mac_addr[3] = raw[3];
-            mac_addr[4] = raw[4]; mac_addr[5] = raw[5];
+        u32 mac0 = gr(UMAC_MAC0);
+        u32 mac1 = gr(UMAC_MAC1);
+        if (mac0 | mac1) {
+            mac_addr[0] = (mac0 >> 24) & 0xFF;
+            mac_addr[1] = (mac0 >> 16) & 0xFF;
+            mac_addr[2] = (mac0 >> 8)  & 0xFF;
+            mac_addr[3] =  mac0        & 0xFF;
+            mac_addr[4] = (mac1 >> 8)  & 0xFF;
+            mac_addr[5] =  mac1        & 0xFF;
+            uart_puts("[genet] MAC from UMAC regs\n");
+        } else {
+            /* Try mailbox */
+            static volatile u32 __attribute__((aligned(16))) mb[8];
+            mb[0] = 8 * 4; mb[1] = 0;
+            mb[2] = 0x00010003; mb[3] = 6; mb[4] = 6;
+            mb[5] = 0; mb[6] = 0; mb[7] = 0;
+            if (mbox_call(8, mb)) {
+                u8 *raw = (u8 *)&mb[5];
+                mac_addr[0] = raw[0]; mac_addr[1] = raw[1];
+                mac_addr[2] = raw[2]; mac_addr[3] = raw[3];
+                mac_addr[4] = raw[4]; mac_addr[5] = raw[5];
+                uart_puts("[genet] MAC from mailbox\n");
+            } else {
+                uart_puts("[genet] MAC: using default\n");
+            }
         }
     }
 
-    /* reset_umac (Circle sequence) */
+    /* Phase A: reset_umac (Circle) */
+    uart_puts("[genet] reset_umac...\n");
     gw(SYS_RBUF_FLUSH, 0);
     delay_cycles(10000);
     gw(UMAC_CMD, 0);
@@ -338,14 +358,57 @@ bool genet_init(void) {
     delay_cycles(2000);
     gw(UMAC_CMD, 0);
 
-    /* umac_reset2 (Circle sequence) */
-    gw(SYS_RBUF_FLUSH, 0);
-    delay_cycles(10000);
-    gw(SYS_RBUF_FLUSH, (1 << 1));  /* toggle bit 1 */
-    delay_cycles(10000);
-    gw(SYS_RBUF_FLUSH, 0);
+    /* Phase B: umac_reset2 */
+    uart_puts("[genet] umac_reset2...\n");
+    {
+        u32 r = gr(SYS_RBUF_FLUSH);
+        gw(SYS_RBUF_FLUSH, r | (1 << 1));
+        delay_cycles(10000);
+        gw(SYS_RBUF_FLUSH, r & ~(1 << 1));
+        delay_cycles(10000);
+    }
 
-    /* RGMII mode for external GPHY (Circle: PORT_MODE_EXT_GPHY) */
+    /* Phase C: init_umac — reset again + MIB + frame config */
+    uart_puts("[genet] init_umac...\n");
+    gw(SYS_RBUF_FLUSH, 0);
+    delay_cycles(10000);
+    gw(UMAC_CMD, 0);
+    gw(UMAC_CMD, CMD_SW_RESET | (1 << 15));
+    delay_cycles(2000);
+    gw(UMAC_CMD, 0);
+
+    gw(0x0D80, 7);  /* MIB_CTRL: reset RX+RUNT+TX */
+    gw(0x0D80, 0);
+
+    gw(UMAC_MAX_FRAME, ETH_FRAME_MAX);
+    gw(RBUF_CTRL, gr(RBUF_CTRL) | (1 << 1));  /* RBUF_ALIGN_2B */
+    gw(RBUF_TBUF_SIZE_CTRL, 1);
+
+    /* Mask all interrupts (polling mode) */
+    gw(0x0210, 0xFFFFFFFF);  /* INTRL2_0 MASK_SET */
+    gw(0x0208, 0xFFFFFFFF);  /* INTRL2_0 CLEAR */
+    gw(0x0250, 0xFFFFFFFF);  /* INTRL2_1 MASK_SET */
+    gw(0x0248, 0xFFFFFFFF);  /* INTRL2_1 CLEAR */
+
+    /* Phase D: Set MAC address */
+    gw(UMAC_MAC0, (mac_addr[0] << 24) | (mac_addr[1] << 16) |
+                  (mac_addr[2] << 8)  |  mac_addr[3]);
+    gw(UMAC_MAC1, (mac_addr[4] << 8)  |  mac_addr[5]);
+
+    /* Phase E+F: DMA disable, init, enable */
+    uart_puts("[genet] DMA init...\n");
+    init_rx_ring();
+    init_tx_ring();
+    gw(RDMA_CTRL, DMA_EN);
+    gw(TDMA_CTRL, DMA_EN);
+    gw(RDMA_RING_CFG, (1 << 16));
+    gw(TDMA_RING_CFG, (1 << 16));
+
+    /* Phase I: PHY probe + RGMII config (after DMA per Circle sequence) */
+    uart_puts("[genet] MDIO dummy read...\n");
+    mdio_read(PHY_ADDR, 0x01);  /* BCM7xxx workaround: wake MDIO */
+
+    uart_puts("[genet] RGMII config...\n");
     gw(SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
     {
         u32 oob = gr(EXT_RGMII_OOB_CTRL);
@@ -353,47 +416,19 @@ bool genet_init(void) {
         gw(EXT_RGMII_OOB_CTRL, oob);
     }
 
-    /* init_umac: MIB counter reset */
-    gw(0x0D80, (1 << 0) | (1 << 1) | (1 << 2));  /* MIB_CTRL: reset RX+RUNT+TX */
-    delay_cycles(1000);
-    gw(0x0D80, 0);
-
-    /* Set MAC address */
-    gw(UMAC_MAC0, (mac_addr[0] << 24) | (mac_addr[1] << 16) |
-                  (mac_addr[2] << 8)  |  mac_addr[3]);
-    gw(UMAC_MAC1, (mac_addr[4] << 8)  |  mac_addr[5]);
-
-    /* Max frame size */
-    gw(UMAC_MAX_FRAME, ETH_FRAME_MAX);
-
-    /* RBUF config (Circle init_umac) */
-    gw(RBUF_TBUF_SIZE_CTRL, 1);
-    gw(RBUF_CTRL, gr(RBUF_CTRL) | (1 << 1));  /* RBUF_ALIGN_2B */
-    gw(RBUF_64B_EN, 1);
-
-    /* Disable all interrupts (polling mode) */
-    gw(0x0200 + 0x10, 0xFFFFFFFF);  /* INTRL2_0 MASK_SET = mask all */
-    gw(0x0200 + 0x08, 0xFFFFFFFF);  /* INTRL2_0 CLEAR = clear all */
-    gw(0x0240 + 0x10, 0xFFFFFFFF);  /* INTRL2_1 MASK_SET */
-    gw(0x0240 + 0x08, 0xFFFFFFFF);  /* INTRL2_1 CLEAR */
-
-    /* Init PHY */
+    /* Phase I continued: PHY init + link wait */
+    uart_puts("[genet] PHY init...\n");
     if (!phy_init())
         uart_puts("[genet] PHY init warning\n");
 
-    /* Init DMA rings */
-    init_rx_ring();
-    init_tx_ring();
-
-    /* Enable DMA */
-    gw(RDMA_CTRL, DMA_EN);
-    gw(TDMA_CTRL, DMA_EN);
-
-    /* Enable ring 16 */
-    gw(RDMA_RING_CFG, (1 << 16));
-    gw(TDMA_RING_CFG, (1 << 16));
-
-    /* Enable TX and RX, set speed to 1G */
+    /* Phase J: Enable TX/RX + set speed */
+    uart_puts("[genet] Enable TX/RX...\n");
+    {
+        u32 oob = gr(EXT_RGMII_OOB_CTRL);
+        oob &= ~OOB_DISABLE;
+        oob |= RGMII_LINK;
+        gw(EXT_RGMII_OOB_CTRL, oob);
+    }
     gw(UMAC_CMD, CMD_TX_EN | CMD_RX_EN | CMD_SPEED_1000);
 
     uart_puts("[genet] MAC ");
