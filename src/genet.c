@@ -22,10 +22,11 @@
 /* SYS_PORT_CTRL modes */
 #define PORT_MODE_EXT_GPHY  3
 
-/* EXT block (external PHY control) */
-#define EXT_RGMII_OOB_CTRL  0x078C
-#define RGMII_MODE_EN       (1 << 0)
+/* EXT block (external PHY control) — at GENET_BASE + 0x0080 */
+#define EXT_RGMII_OOB_CTRL  0x008C  /* GENET_EXT_OFF(0x80) + 0x0C */
+#define RGMII_MODE_EN       (1 << 6)
 #define RGMII_LINK          (1 << 4)
+#define OOB_DISABLE          (1 << 5)
 #define RGMII_ID_MODE_DIS   (1 << 16)
 
 /* RBUF control */
@@ -329,23 +330,33 @@ bool genet_init(void) {
         }
     }
 
-    /* Software reset */
-    gw(SYS_RBUF_FLUSH, 1);
+    /* reset_umac (Circle sequence) */
+    gw(SYS_RBUF_FLUSH, 0);
+    delay_cycles(10000);
+    gw(UMAC_CMD, 0);
+    gw(UMAC_CMD, CMD_SW_RESET | (1 << 15));  /* SW_RESET | LCL_LOOP_EN */
+    delay_cycles(2000);
+    gw(UMAC_CMD, 0);
+
+    /* umac_reset2 (Circle sequence) */
+    gw(SYS_RBUF_FLUSH, 0);
+    delay_cycles(10000);
+    gw(SYS_RBUF_FLUSH, (1 << 1));  /* toggle bit 1 */
     delay_cycles(10000);
     gw(SYS_RBUF_FLUSH, 0);
 
-    gw(UMAC_CMD, CMD_SW_RESET);
-    delay_cycles(10000);
-    gw(UMAC_CMD, 0);
-    delay_cycles(10000);
-
-    /* RGMII mode for external GPHY (required for Pi 5) */
+    /* RGMII mode for external GPHY (Circle: PORT_MODE_EXT_GPHY) */
     gw(SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
     {
         u32 oob = gr(EXT_RGMII_OOB_CTRL);
         oob |= RGMII_MODE_EN | RGMII_ID_MODE_DIS;
         gw(EXT_RGMII_OOB_CTRL, oob);
     }
+
+    /* init_umac: MIB counter reset */
+    gw(0x0D80, (1 << 0) | (1 << 1) | (1 << 2));  /* MIB_CTRL: reset RX+RUNT+TX */
+    delay_cycles(1000);
+    gw(0x0D80, 0);
 
     /* Set MAC address */
     gw(UMAC_MAC0, (mac_addr[0] << 24) | (mac_addr[1] << 16) |
@@ -355,11 +366,16 @@ bool genet_init(void) {
     /* Max frame size */
     gw(UMAC_MAX_FRAME, ETH_FRAME_MAX);
 
-    /* Enable 64-byte receive status metadata block for per-packet offload trust. */
-    gw(RBUF_CTRL, gr(RBUF_CTRL) | (1 << 0));
+    /* RBUF config (Circle init_umac) */
+    gw(RBUF_TBUF_SIZE_CTRL, 1);
+    gw(RBUF_CTRL, gr(RBUF_CTRL) | (1 << 1));  /* RBUF_ALIGN_2B */
     gw(RBUF_64B_EN, 1);
-    gw(TBUF_CTRL, gr(TBUF_CTRL) | TBUF_64B_EN);
-    genet_apply_offloads();
+
+    /* Disable all interrupts (polling mode) */
+    gw(0x0200 + 0x10, 0xFFFFFFFF);  /* INTRL2_0 MASK_SET = mask all */
+    gw(0x0200 + 0x08, 0xFFFFFFFF);  /* INTRL2_0 CLEAR = clear all */
+    gw(0x0240 + 0x10, 0xFFFFFFFF);  /* INTRL2_1 MASK_SET */
+    gw(0x0240 + 0x08, 0xFFFFFFFF);  /* INTRL2_1 CLEAR */
 
     /* Init PHY */
     if (!phy_init())
