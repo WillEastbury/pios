@@ -25,26 +25,44 @@ static bool use_rp1;
 #define FR_RXFE     (1 << 4)    /* RX FIFO empty */
 
 void uart_init(void) {
-    /* Enable RX on RP1 UART0. Don't touch GPIO mux — just enable
-     * the RXE bit and set pad15 input enable + pull-up directly. */
-
-    /* PAD15: input enable + pull-up (raw register, no gpio driver) */
-    volatile u32 *pad15 = (volatile u32 *)(0x1F000F0000UL + 0x04 + 15 * 4);
-    u32 pad = *pad15;
-    pad |= (1 << 6);   /* IE  — input enable */
-    pad |= (1 << 3);   /* PUE — pull-up */
-    pad &= ~(1 << 2);  /* PDE — clear pull-down */
-    *pad15 = pad;
-
-    /* GPIO15 CTRL: set funcsel to 4 (ALT4 = UART0 RX) directly */
+    /* Debug: dump GPIO14/15 config to serial to see firmware state */
+    volatile u32 *gpio14_ctrl = (volatile u32 *)(0x1F000D0000UL + 14 * 8 + 0x04);
     volatile u32 *gpio15_ctrl = (volatile u32 *)(0x1F000D0000UL + 15 * 8 + 0x04);
-    u32 ctrl = *gpio15_ctrl;
-    ctrl = (ctrl & ~0x1F) | 4;  /* funcsel = 4 */
-    *gpio15_ctrl = ctrl;
+    volatile u32 *pad14 = (volatile u32 *)(0x1F000F0000UL + 0x04 + 14 * 4);
+    volatile u32 *pad15 = (volatile u32 *)(0x1F000F0000UL + 0x04 + 15 * 4);
+    volatile u32 *uart_cr = (volatile u32 *)(0x1F00030000UL + 0x30);
 
-    /* Enable RXE in UART CR */
-    volatile u32 *cr = (volatile u32 *)(0x1F00030000UL + 0x30);
-    *cr = *cr | (1 << 9);
+    /* Print firmware state before we touch anything */
+    uart_puts("[uart] FW: G14 ctrl=");
+    uart_hex(*gpio14_ctrl);
+    uart_puts(" pad=");
+    uart_hex(*pad14);
+    uart_puts("\r\n[uart] FW: G15 ctrl=");
+    uart_hex(*gpio15_ctrl);
+    uart_puts(" pad=");
+    uart_hex(*pad15);
+    uart_puts(" CR=");
+    uart_hex(*uart_cr);
+    uart_puts("\r\n");
+
+    /* Strategy: copy GPIO14's exact config to GPIO15 + enable IE */
+    u32 g14_fsel = *gpio14_ctrl & 0x1F;
+    *gpio15_ctrl = (*gpio15_ctrl & ~0x1F) | g14_fsel;
+
+    /* Copy pad14 config to pad15 + force IE (input enable) */
+    *pad15 = *pad14 | (1 << 6);
+
+    /* Enable RXE in UART control register */
+    *uart_cr = *uart_cr | (1 << 9);
+
+    /* Print state after config */
+    uart_puts("[uart] SET: G15 ctrl=");
+    uart_hex(*gpio15_ctrl);
+    uart_puts(" pad=");
+    uart_hex(*pad15);
+    uart_puts(" CR=");
+    uart_hex(*uart_cr);
+    uart_puts("\r\n");
 
     use_rp1 = true;
 }

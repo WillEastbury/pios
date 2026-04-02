@@ -4229,9 +4229,14 @@ NORETURN void core0_main(void) {
         ui_handle_keys();
 
         /* Update spinner frequently */
-        if ((spin_counter & 0xFFF) == 0)
+        if ((spin_counter & 0x3FFFF) == 0)
             spin_update();
         spin_counter++;
+
+        /* Periodic serial heartbeat every ~10M iterations */
+        if ((env->poll_count & 0xFFFFFF) == 0 && env->poll_count > 0) {
+            uart_putc('.');
+        }
 
         env->poll_count++;
     }
