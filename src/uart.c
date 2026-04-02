@@ -1,12 +1,17 @@
 /*
  * uart.c - PL011 UART driver (TX + RX)
- * Pi 5 firmware pre-configures UART0 on GPIO14/15.
- * BCM2712-native UART — no PCIe / RP1 required.
+ * On Pi 5, GPIO14/15 serial is on RP1 UART0, not the BCM2712 SoC UART.
+ * After RP1 init, we redirect all I/O to the RP1 UART.
  */
 
 #include "uart.h"
+#include "rp1_uart.h"
+#include "rp1_gpio.h"
 #include "mmio.h"
 #include "fb.h"
+
+/* Use RP1 UART0 for GPIO14/15 serial header */
+static bool use_rp1;
 
 #define UART_DR     (UART0_BASE + 0x00)
 #define UART_FR     (UART0_BASE + 0x18)
@@ -20,25 +25,33 @@
 #define FR_RXFE     (1 << 4)    /* RX FIFO empty */
 
 void uart_init(void) {
-    mmio_write(UART_CR, 0);
-    mmio_write(UART_ICR, 0x7FF);
+    /* Configure GPIO14 (TX) and GPIO15 (RX) for RP1 UART0 (ALT0) */
+    rp1_gpio_set_function(14, RP1_FSEL_ALT0);
+    rp1_gpio_set_function(15, RP1_FSEL_ALT0);
 
-    /* 115200 baud @ 48MHz UART clock
-     * IBRD = 26, FBRD = 3 */
-    mmio_write(UART_IBRD, 26);
-    mmio_write(UART_FBRD, 3);
+    /* Read the firmware's baud rate divisors from RP1 UART0 */
+    u64 base = RP1_BAR_BASE + 0x030000;
+    u32 fw_ibrd = mmio_read(base + 0x24);
+    u32 fw_fbrd = mmio_read(base + 0x28);
 
-    /* 8N1, enable FIFO */
-    mmio_write(UART_LCRH, (3 << 5) | (1 << 4));
+    /* Full PL011 init with RX enabled, preserving firmware baud rate */
+    mmio_write(base + 0x30, 0);            /* CR = 0 (disable) */
+    mmio_write(base + 0x44, 0x7FF);        /* ICR = clear all */
+    mmio_write(base + 0x24, fw_ibrd);      /* restore IBRD */
+    mmio_write(base + 0x28, fw_fbrd);      /* restore FBRD */
+    mmio_write(base + 0x2C, (3 << 5) | (1 << 4));  /* LCRH: 8N1 + FIFO */
+    mmio_write(base + 0x30, (1 << 0) | (1 << 8) | (1 << 9));  /* UARTEN+TXE+RXE */
 
-    /* Enable UART + TX + RX */
-    mmio_write(UART_CR, (1 << 0) | (1 << 8) | (1 << 9));
+    use_rp1 = true;
 }
 
 void uart_putc(char c) {
-    while (mmio_read(UART_FR) & FR_TXFF)
-        ;
-    mmio_write(UART_DR, (u32)c);
+    if (use_rp1) {
+        rp1_uart_putc(0, c);
+    } else {
+        while (mmio_read(UART_FR) & FR_TXFF) ;
+        mmio_write(UART_DR, (u32)c);
+    }
 }
 
 void uart_puts(const char *s) {
@@ -59,16 +72,23 @@ void uart_hex(u64 val) {
 /* ---- RX ---- */
 
 bool uart_rx_ready(void) {
+    if (use_rp1) {
+        /* Check RP1 UART0 flag register directly — don't consume data */
+        return !(mmio_read(RP1_BAR_BASE + 0x030000 + 0x18) & (1 << 4));
+    }
     return !(mmio_read(UART_FR) & FR_RXFE);
 }
 
 char uart_getc(void) {
-    while (mmio_read(UART_FR) & FR_RXFE)
-        ;
+    if (use_rp1)
+        return rp1_uart_getc(0);
+    while (mmio_read(UART_FR) & FR_RXFE) ;
     return (char)(mmio_read(UART_DR) & 0xFF);
 }
 
 i32 uart_try_getc(void) {
+    if (use_rp1)
+        return rp1_uart_try_getc(0);
     if (mmio_read(UART_FR) & FR_RXFE)
         return -1;
     return (i32)(mmio_read(UART_DR) & 0xFF);

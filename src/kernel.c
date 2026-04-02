@@ -473,10 +473,11 @@ static void bp_update_pc(void) {
 
 /* Spinner in top-right corner — shows kernel is alive */
 static u32 bp_spin_idx;
+static u32 bp_spin_color = 0x0000FF00;  /* green during boot */
 static void bp_spin(void) {
     static const char spin[] = "|/-\\";
     fb_set_cursor(126, 0);
-    fb_set_color(0x0000FF00, 0x00000000);
+    fb_set_color(bp_spin_color, 0x00000000);
     fb_putc(spin[bp_spin_idx & 3]);
     bp_spin_idx++;
 }
@@ -4159,50 +4160,78 @@ static void ui_handle_keys(void)
 
 /* ---- Core entry points ---- */
 
+/* Spinner state */
+#define SPIN_GREEN   0x0000FF00
+#define SPIN_YELLOW  0x00CCAA00
+#define SPIN_PURPLE  0x00FF88CC
+#define SPIN_RED     0x00FF2200
+
+static u32 spin_color = SPIN_GREEN;
+static u32 spin_counter;
+
+static void spin_update(void) {
+    static const char frames[] = "|/-\\";
+    fb_set_cursor(126, 0);
+    fb_set_color(spin_color, 0x00000000);
+    fb_putc(frames[spin_counter & 3]);
+    spin_counter++;
+}
+
+void spin_set_color(u32 color) {
+    spin_color = color;
+}
+
 /* Core 0: Kernel services + network */
 NORETURN void core0_main(void) {
     struct core_env *env = core_env_of(CORE_NET);
-    ui_mode = UI_MODE_CONSOLE;  /* Auto-enter console for serial input */
-    ui_console_len = 0;
+    ui_mode = UI_MODE_NONE;  /* HDMI stays on boot diags */
     ui_selected = 0;
     ui_last_render = 0;
     ui_launch_idx = -1;
     ui_status_code = 0;
 
-    /* Print console prompt on HDMI + serial */
-    fb_clear(UI_SHELL_BG_COLOR);
-    fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
-    ui_console_write("PIOS F3 Console (serial + HDMI)\n");
-    ui_console_write("Type 'help' for commands.\n");
-    ui_console_prompt();
+    /* Serial-only console */
     uart_puts("\r\nPIOS Console ready. Type 'help'.\r\n> ");
+
+    /* Spinner goes purple — OS is running */
+    spin_set_color(SPIN_PURPLE);
+
     for (;;) {
-        ui_act_led_tick();
-        watchdog_touch(CORE_NET);
-        watchdog_poll();
-        net_poll();
-        disk_handle_request(CORE_USERM);
-        disk_handle_request(CORE_USER0);
-        disk_handle_request(CORE_USER1);
-        walfs_handle_fifo(CORE_NET);
-        walfs_handle_fifo(CORE_USERM);
-        walfs_handle_fifo(CORE_USER0);
-        walfs_handle_fifo(CORE_USER1);
-        workq_drain(8);
-        ui_handle_keys();
-        ui_batch_tick();
-        if (ui_mode != UI_MODE_NONE) {
-            u64 now = timer_ticks();
-            if (ui_last_render == 0 || (now - ui_last_render) >= 150) {
-                if (ui_mode == UI_MODE_PROC_VIEW)
-                    ui_render_process_view();
-                else if (ui_mode == UI_MODE_PROC_MANAGER)
-                    ui_render_process_manager();
-                else if (ui_mode == UI_MODE_SCHEDULER)
-                    ui_render_scheduler();
-                ui_last_render = now;
+        /* Serial console — echo + process commands */
+        {
+            i32 c = uart_try_getc();
+            if (c >= 0) {
+                uart_putc((char)c);
+                /* Process serial commands inline */
+                static char cmd_buf[128];
+                static u32 cmd_len;
+                if (c == '\r' || c == '\n') {
+                    uart_puts("\r\n");
+                    cmd_buf[cmd_len] = 0;
+                    if (cmd_len > 0) {
+                        /* Feed to console command processor */
+                        for (u32 i = 0; i < cmd_len; i++)
+                            ui_console_feed_char(cmd_buf[i]);
+                        ui_console_feed_char('\n');
+                    }
+                    cmd_len = 0;
+                    uart_puts("> ");
+                } else if (c == 127 || c == 8) {
+                    if (cmd_len > 0) { cmd_len--; uart_puts("\b \b"); }
+                } else if (cmd_len < sizeof(cmd_buf) - 1) {
+                    cmd_buf[cmd_len++] = (char)c;
+                }
             }
         }
+
+        /* USB keyboard (when available) */
+        ui_handle_keys();
+
+        /* Update spinner frequently */
+        if ((spin_counter & 0xFFF) == 0)
+            spin_update();
+        spin_counter++;
+
         env->poll_count++;
     }
 }
@@ -4777,10 +4806,10 @@ void kernel_main(void) {
     /* ── Phase 7: Ready ── */
     bp_active(7);
     bp_done(7, true);
-    bp_ok("[pios] System ready");
-    if (at_el1) timer_delay_ms(2000);
-    else delay_cycles(100000000);
-    boot_diag(sd_ok, walfs_ok, genet_ok, usb_ok);
+    bp_ok("[pios] System ready — serial console active");
+    bp_spin_color = 0x00FF88CC;  /* purple/pink — OS running */
+
+    /* HDMI stays on boot diags — no switch to purple console */
 
     if (at_el1) {
         core0_main();

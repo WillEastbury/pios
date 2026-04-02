@@ -235,7 +235,7 @@ static bool phy_init(void) {
         /* Spinner */
         static const char spin[] = "|/-\\";
         fb_set_cursor(126, 0);
-        fb_set_color(0x0000FF00, 0x00000000);
+        fb_set_color(0x00CCAA00, 0x00000000);  /* yellow during wait */
         fb_putc(spin[s & 3]);
     }
 
