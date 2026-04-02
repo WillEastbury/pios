@@ -20,8 +20,9 @@
 /* VideoCore Mailbox (confirmed from bcm2712.dtsi: mailbox@7c013880) */
 #define MBOX_BASE           (PERIPH_BASE + 0x013880)
 
-/* EMMC2 / SD Host Controller */
-#define EMMC2_BASE          (PERIPH_BASE + 0x300000)
+/* EMMC2 / SD Host Controller
+ * Pi 5 uses 0x1000FFF000 (not PERIPH_BASE + 0x300000 like Pi 4) */
+#define EMMC2_BASE          0x1000FFF000UL
 
 /* GENET v5 Ethernet MAC */
 #define GENET_BASE          0x107D580000UL

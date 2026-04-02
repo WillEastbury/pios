@@ -19,6 +19,15 @@
 #define SYS_RBUF_FLUSH      0x0008
 #define SYS_TBUF_FLUSH      0x000C
 
+/* SYS_PORT_CTRL modes */
+#define PORT_MODE_EXT_GPHY  3
+
+/* EXT block (external PHY control) */
+#define EXT_RGMII_OOB_CTRL  0x078C
+#define RGMII_MODE_EN       (1 << 0)
+#define RGMII_LINK          (1 << 4)
+#define RGMII_ID_MODE_DIS   (1 << 16)
+
 /* RBUF control */
 #define RBUF_CTRL           0x0300
 #define RBUF_64B_EN         0x0308
@@ -329,6 +338,14 @@ bool genet_init(void) {
     delay_cycles(10000);
     gw(UMAC_CMD, 0);
     delay_cycles(10000);
+
+    /* RGMII mode for external GPHY (required for Pi 5) */
+    gw(SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
+    {
+        u32 oob = gr(EXT_RGMII_OOB_CTRL);
+        oob |= RGMII_MODE_EN | RGMII_ID_MODE_DIS;
+        gw(EXT_RGMII_OOB_CTRL, oob);
+    }
 
     /* Set MAC address */
     gw(UMAC_MAC0, (mac_addr[0] << 24) | (mac_addr[1] << 16) |

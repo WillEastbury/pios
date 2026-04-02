@@ -26,8 +26,9 @@ static i64 psci_cpu_on(u64 target_mpidr, u64 entry, u64 context) {
 }
 
 void core_start_secondary(u32 id, void (*entry)(void)) {
-    (void)entry; /* we use secondary_entry for all cores */
-    i64 ret = psci_cpu_on((u64)id, (u64)(usize)secondary_entry, (u64)id);
+    /* Pi 5 (Cortex-A76): core ID is in MPIDR Aff1, not Aff0.
+     * PSCI target_affinity must be (core << 8). */
+    i64 ret = psci_cpu_on((u64)id << 8, (u64)(usize)secondary_entry, (u64)id);
     if (ret == 0) {
         uart_puts("[core] Started core ");
         uart_putc('0' + (char)id);
