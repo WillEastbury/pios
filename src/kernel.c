@@ -4196,31 +4196,32 @@ NORETURN void core0_main(void) {
     /* Spinner goes purple — OS is running */
     spin_set_color(SPIN_PURPLE);
 
+    /* RP1 UART0 direct register addresses for RX polling */
+    u64 rp1_fr = 0x1F00030000UL + 0x18;  /* FR register */
+    u64 rp1_dr = 0x1F00030000UL + 0x00;  /* DR register */
+
+    static char cmd_buf[128];
+    static u32 cmd_len;
+
     for (;;) {
-        /* Serial console — echo + process commands */
-        {
-            i32 c = uart_try_getc();
-            if (c >= 0) {
-                uart_putc((char)c);
-                /* Process serial commands inline */
-                static char cmd_buf[128];
-                static u32 cmd_len;
-                if (c == '\r' || c == '\n') {
-                    uart_puts("\r\n");
-                    cmd_buf[cmd_len] = 0;
-                    if (cmd_len > 0) {
-                        /* Feed to console command processor */
-                        for (u32 i = 0; i < cmd_len; i++)
-                            ui_console_feed_char(cmd_buf[i]);
-                        ui_console_feed_char('\n');
-                    }
-                    cmd_len = 0;
-                    uart_puts("> ");
-                } else if (c == 127 || c == 8) {
-                    if (cmd_len > 0) { cmd_len--; uart_puts("\b \b"); }
-                } else if (cmd_len < sizeof(cmd_buf) - 1) {
-                    cmd_buf[cmd_len++] = (char)c;
+        /* Direct RP1 UART0 RX poll */
+        if (!(*(volatile u32 *)rp1_fr & (1 << 4))) {  /* RXFE = 0 */
+            char c = (char)(*(volatile u32 *)rp1_dr & 0xFF);
+            uart_putc(c);  /* echo */
+            if (c == '\r' || c == '\n') {
+                uart_puts("\r\n");
+                cmd_buf[cmd_len] = 0;
+                if (cmd_len > 0) {
+                    for (u32 i = 0; i < cmd_len; i++)
+                        ui_console_feed_char(cmd_buf[i]);
+                    ui_console_feed_char('\n');
                 }
+                cmd_len = 0;
+                uart_puts("> ");
+            } else if (c == 127 || c == 8) {
+                if (cmd_len > 0) { cmd_len--; uart_puts("\b \b"); }
+            } else if (cmd_len < sizeof(cmd_buf) - 1) {
+                cmd_buf[cmd_len++] = c;
             }
         }
 
@@ -4803,13 +4804,54 @@ void kernel_main(void) {
         bp_done(6, false);
     }
 
-    /* ── Phase 7: Ready ── */
+    /* ── Phase 7: Ready — show system info on HDMI ── */
     bp_active(7);
     bp_done(7, true);
     bp_ok("[pios] System ready — serial console active");
     bp_spin_color = 0x00FF88CC;  /* purple/pink — OS running */
 
-    /* HDMI stays on boot diags — no switch to purple console */
+    /* System summary in the log area */
+    {
+        u32 max_rows = 768 / 8;
+        if (bp_log_y + 6 < max_rows) {
+            fb_set_cursor(1, bp_log_y++);
+            fb_set_color(0x00444444, BOOT_BLACK);
+            fb_puts("---------------------------------------------");
+
+            u8 mac[6];
+            genet_get_mac(mac);
+            fb_set_cursor(1, bp_log_y++);
+            fb_set_color(0x0000CCFF, BOOT_BLACK);
+            fb_printf("MAC  %x:%x:%x:%x:%x:%x",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+            fb_set_cursor(1, bp_log_y++);
+            fb_printf("IP   %d.%d.%d.%d / %d.%d.%d.%d",
+                (ui_cfg_ip >> 24) & 0xFF, (ui_cfg_ip >> 16) & 0xFF,
+                (ui_cfg_ip >> 8) & 0xFF, ui_cfg_ip & 0xFF,
+                (ui_cfg_mask >> 24) & 0xFF, (ui_cfg_mask >> 16) & 0xFF,
+                (ui_cfg_mask >> 8) & 0xFF, ui_cfg_mask & 0xFF);
+
+            fb_set_cursor(1, bp_log_y++);
+            fb_printf("GW   %d.%d.%d.%d  DNS %d.%d.%d.%d",
+                (ui_cfg_gw >> 24) & 0xFF, (ui_cfg_gw >> 16) & 0xFF,
+                (ui_cfg_gw >> 8) & 0xFF, ui_cfg_gw & 0xFF,
+                (ui_cfg_dns >> 24) & 0xFF, (ui_cfg_dns >> 16) & 0xFF,
+                (ui_cfg_dns >> 8) & 0xFF, ui_cfg_dns & 0xFF);
+
+            fb_set_cursor(1, bp_log_y++);
+            fb_printf("PHY  %s  USB %s  SD %s",
+                genet_ok ? (genet_link_up() ? "UP" : "DOWN") : "FAIL",
+                usb_ok ? "OK" : "FAIL",
+                sd_ok ? "OK" : "FAIL");
+
+            fb_set_cursor(1, bp_log_y++);
+            fb_set_color(BOOT_FG_PINK, BOOT_BLACK);
+            fb_puts("Serial console active on RP1 UART0");
+        }
+    }
+
+    /* HDMI stays on boot diags */
 
     if (at_el1) {
         core0_main();

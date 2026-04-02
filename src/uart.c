@@ -25,22 +25,15 @@ static bool use_rp1;
 #define FR_RXFE     (1 << 4)    /* RX FIFO empty */
 
 void uart_init(void) {
-    /* Configure GPIO14 (TX) and GPIO15 (RX) for RP1 UART0 (ALT0) */
-    rp1_gpio_set_function(14, RP1_FSEL_ALT0);
+    /* Configure GPIO15 for UART RX (ALT0) — GPIO14 TX already set by firmware */
     rp1_gpio_set_function(15, RP1_FSEL_ALT0);
 
-    /* Read the firmware's baud rate divisors from RP1 UART0 */
-    u64 base = RP1_BAR_BASE + 0x030000;
-    u32 fw_ibrd = mmio_read(base + 0x24);
-    u32 fw_fbrd = mmio_read(base + 0x28);
-
-    /* Full PL011 init with RX enabled, preserving firmware baud rate */
-    mmio_write(base + 0x30, 0);            /* CR = 0 (disable) */
-    mmio_write(base + 0x44, 0x7FF);        /* ICR = clear all */
-    mmio_write(base + 0x24, fw_ibrd);      /* restore IBRD */
-    mmio_write(base + 0x28, fw_fbrd);      /* restore FBRD */
-    mmio_write(base + 0x2C, (3 << 5) | (1 << 4));  /* LCRH: 8N1 + FIFO */
-    mmio_write(base + 0x30, (1 << 0) | (1 << 8) | (1 << 9));  /* UARTEN+TXE+RXE */
+    /* Just enable RXE — don't touch baud rate or disable/re-enable.
+     * The PL011 spec says you can set RXE while UARTEN is active. */
+    u64 cr_addr = RP1_BAR_BASE + 0x030000 + 0x30;
+    u32 cr = mmio_read(cr_addr);
+    cr |= (1 << 9);  /* RXE */
+    mmio_write(cr_addr, cr);
 
     use_rp1 = true;
 }
