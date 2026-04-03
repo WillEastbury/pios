@@ -19,6 +19,16 @@
 #define WALFS_NAME_MAX      127
 #define WALFS_DATA_MAX      4096
 
+/*
+ * WALFS base LBA offset — all WALFS block addresses are relative to this.
+ * This protects the FAT32 boot partition on partition 1.
+ * Set at runtime from MBR partition 2, or falls back to WALFS_BASE_LBA.
+ */
+#define WALFS_BASE_LBA      2048
+
+/* Runtime partition 2 base, set by walfs_discover_partition() */
+u32 walfs_part2_lba(void);
+
 /* Record magic and types */
 #define WALFS_REC_MAGIC     0x5245434F  /* 'RECO' */
 #define RECORD_INODE        1

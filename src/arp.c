@@ -20,7 +20,7 @@
 
 #include "arp.h"
 #include "net.h"
-#include "genet.h"
+#include "nic.h"
 #include "simd.h"
 #include "uart.h"
 #include "timer.h"
@@ -205,7 +205,7 @@ static void send_arp(u16 opcode, const u8 *target_mac, u32 target_ip) {
     for (u32 i = sizeof(struct eth_hdr) + ARP_FRAME_LEN; i < 60; i++)
         arp_tx[i] = 0;
 
-    genet_send(arp_tx, 60);
+    nic_send(arp_tx, 60);
 }
 
 /* ---- Public API ---- */

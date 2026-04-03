@@ -12,7 +12,7 @@
 
 #include "tcp.h"
 #include "net.h"
-#include "genet.h"
+#include "nic.h"
 #include "arp.h"
 #include "dma.h"
 #include "simd.h"
@@ -472,7 +472,7 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     tcp->checksum  = 0;
     tcp->urgent    = 0;
 
-    bool tx_offload_window = genet_tx_checksum_offload_enabled() && data_len > 0;
+    bool tx_offload_window = nic_tx_checksum_offload_enabled() && data_len > 0;
     bool need_pad = frame_len < MIN_FRAME;
     if (need_pad) frame_len = MIN_FRAME;
 
@@ -485,15 +485,15 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     }
 
     if (data_len == 0) {
-        genet_send(tx_frame, frame_len);
+        nic_send(tx_frame, frame_len);
         return;
     }
     if (need_pad) {
         tcp_memcpy_accel(tx_frame + TCP_OVERHEAD, data, data_len);
-        genet_send(tx_frame, frame_len);
+        nic_send(tx_frame, frame_len);
         return;
     }
-    genet_send_parts(tx_frame, TCP_OVERHEAD, data, data_len);
+    nic_send_parts(tx_frame, TCP_OVERHEAD, data, data_len);
 }
 
 static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
@@ -535,14 +535,14 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
     tcp->checksum  = 0;
     tcp->urgent    = 0;
 
-    bool tx_offload_window = genet_tx_checksum_offload_enabled() && data_len > 0;
+    bool tx_offload_window = nic_tx_checksum_offload_enabled() && data_len > 0;
     bool need_pad = frame_len < MIN_FRAME;
     if (need_pad) frame_len = MIN_FRAME;
 
     if (data_len == 0) {
         if (!tx_offload_window)
             tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
-        genet_send(tx_frame, frame_len);
+        nic_send(tx_frame, frame_len);
         return;
     }
 
@@ -552,14 +552,14 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
         if (!tx_offload_window)
             tcp->checksum = tcp_checksum_split(t->local_ip, t->remote_ip,
                                                tcp, TCP_HDR_SIZE, lin, data_len);
-        genet_send_parts(tx_frame, TCP_OVERHEAD, lin, data_len);
+        nic_send_parts(tx_frame, TCP_OVERHEAD, lin, data_len);
         return;
     }
 
     ring_copy_from_offset(&t->tx_buf, tx_off, tx_frame + TCP_OVERHEAD, data_len);
     if (!tx_offload_window)
         tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
-    genet_send(tx_frame, frame_len);
+    nic_send(tx_frame, frame_len);
 }
 
 /* Send a raw RST/ACK without a TCB (for rejecting unexpected segments) */
@@ -603,7 +603,7 @@ static void tcp_send_rst(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port,
     tcp->checksum = tcp_checksum(src_ip, dst_ip, tcp, TCP_HDR_SIZE);
 
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
-    genet_send(tx_frame, frame_len);
+    nic_send(tx_frame, frame_len);
 }
 
 /* Send a SYN-ACK with SYN cookie ISN (no TCB needed) */
@@ -648,7 +648,7 @@ static void tcp_send_synack_cookie(u32 remote_ip, u16 remote_port,
     tcp->checksum = tcp_checksum(tcp_local_ip, remote_ip, tcp, TCP_HDR_SIZE);
 
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
-    genet_send(tx_frame, frame_len);
+    nic_send(tx_frame, frame_len);
 }
 
 /* ================================================================== */
@@ -1248,7 +1248,7 @@ void tcp_init(void) {
     for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++)
         tcb_reset(&tcbs[i]);
 
-    genet_get_mac(tcp_local_mac);
+    nic_get_mac(tcp_local_mac);
     tcp_local_ip = net_get_our_ip();
 
     /* Generate SYN cookie secret from timer jitter */

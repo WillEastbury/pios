@@ -38,6 +38,13 @@
 #define MISC_RC_CFG_RETRY_TIMEOUT   0x40AC
 #define MISC_AXI_READ_ERROR_DATA    0x4170
 #define HARD_DEBUG                  0x4304
+
+/* Inbound (RC BAR) registers for RP1 DMA to reach system RAM */
+#define MISC_RC_BAR2_CONFIG_LO      0x4034
+#define MISC_RC_BAR2_CONFIG_HI      0x4038
+#define MISC_RC_BAR3_CONFIG_LO      0x403C
+#define MISC_UBUS_BAR2_CONFIG_REMAP 0x40B4
+
 #define EXT_CFG_DATA                0x8000
 #define EXT_CFG_INDEX               0x9000
 #define RGR1_SW_INIT_1              0x9210
@@ -202,6 +209,17 @@ bool pcie_init(void) {
 
     /* 7. Outbound ATU window 0: CPU 0x1F00000000 → PCIe 0x80000000 */
     set_outbound_win(PCIE_CPU_WIN_BASE, PCIE_TARGET_ADDR, PCIE_CPU_WIN_SIZE);
+
+    /* 7b. Read back inbound (RC BAR) config left by firmware.
+     * The GPU firmware configures inbound DMA windows during boot.
+     * We log them but do NOT reconfigure — changing these can break RP1. */
+    uart_puts("[pcie] Inbound BAR2_LO=");
+    uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
+    uart_puts(" BAR2_HI=");
+    uart_hex(pr(MISC_RC_BAR2_CONFIG_HI));
+    uart_puts(" REMAP=");
+    uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP));
+    uart_puts("\n");
 
     /* 8. UBUS/AXI bridge: suppress error responses, set timeouts */
     tmp = pr(MISC_UBUS_CTRL);

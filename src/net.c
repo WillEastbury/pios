@@ -10,7 +10,7 @@
 #include "tcp.h"
 #include "socket.h"
 #include "tls.h"
-#include "genet.h"
+#include "nic.h"
 #include "simd.h"
 #include "core_env.h"
 #include "fifo.h"
@@ -165,7 +165,7 @@ static void handle_icmp(const u8 *frame, u32 len,
     icmp_out->checksum = simd_checksum(icmp_out, icmp_len);
 
     u32 frame_len = sizeof(struct eth_hdr) + ip_total;
-    genet_send(tx_frame, frame_len);
+    nic_send(tx_frame, frame_len);
     stats.icmp_echo_replies++;
     stats.tx_packets++;
     stats.tx_bytes += frame_len;
@@ -384,16 +384,16 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
     stats.udp_sent++;
 
     if (len == 0)
-        return genet_send(tx_frame, frame_len);
+        return nic_send(tx_frame, frame_len);
 
     if (need_pad) {
         simd_memcpy(tx_frame + sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr),
                     data, len);
-        return genet_send(tx_frame, frame_len);
+        return nic_send(tx_frame, frame_len);
     }
 
     u32 head_len = sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr);
-    return genet_send_parts(tx_frame, head_len, data, len);
+    return nic_send_parts(tx_frame, head_len, data, len);
 }
 
 /* ================================================================== */
@@ -453,7 +453,7 @@ void net_poll(void) {
 
     for (u32 burst = 0; burst < NET_RX_BURST_MAX; burst++) {
         checksum_trusted = false;
-        if (!likely(genet_recv(rx_frame, &len, &checksum_trusted)))
+        if (!likely(nic_recv(rx_frame, &len, &checksum_trusted)))
             break;
 
         stats.rx_packets++;
@@ -487,7 +487,7 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     our_ip   = ip;
     our_gw   = gateway;
     our_mask = netmask;
-    genet_get_mac(our_mac);
+    nic_get_mac(our_mac);
 
     if (gateway_mac) {
         simd_memcpy(gw_mac, gateway_mac, 6);
@@ -516,9 +516,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     socket_init();
 
     /* Enable safe NIC checksum assist paths by default. */
-    genet_set_rx_checksum_offload(true);
-    genet_set_tx_checksum_offload(true);
-    genet_set_tso(true);
+    nic_set_rx_checksum_offload(true);
+    nic_set_tx_checksum_offload(true);
+    nic_set_tso(true);
 
     net_maint_queued = false;
     timer_set_tick_hook(net_tick_hook);

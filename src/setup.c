@@ -10,7 +10,7 @@
 #include "setup.h"
 #include "uart.h"
 #include "fb.h"
-#include "genet.h"
+#include "nic.h"
 #include "usb_kbd.h"
 #include "walfs.h"
 #include "principal.h"
@@ -114,7 +114,7 @@ bool setup_run(bool fb_available, bool net_ready, bool usb_ready)
 
     setup_log("[setup] First boot detected (missing deck0/record2 marker)\n");
     setup_log_bool("[setup] Network stack: ", net_ready);
-    setup_log_bool("[setup] Network link: ", genet_link_up());
+    setup_log_bool("[setup] Network link: ", nic_link_up());
     setup_log_bool("[setup] HDMI/framebuffer: ", fb_available);
     setup_log_bool("[setup] USB subsystem: ", usb_ready);
     setup_log_bool("[setup] USB keyboard: ", usb_kbd_available());

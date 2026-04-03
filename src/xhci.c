@@ -15,6 +15,10 @@
 #include "uart.h"
 #include "timer.h"
 #include "mmu.h"
+#include "rp1_gpio.h"
+
+/* USB VBUS power is controlled by RP1 GPIO 38 */
+#define USB_VBUS_GPIO   38
 
 /* ---- DWC3 Global Registers ---- */
 
@@ -157,6 +161,17 @@ static u32 hci_max_ports, hci_max_slots, ctx_size;
 static u32 cmd_enq, cmd_cycle;
 static u32 evt_deq, evt_cycle;
 
+/*
+ * RP1 DMA address translation: the xHCI controller lives inside RP1
+ * which accesses system RAM via PCIe inbound translation.
+ *
+ * The firmware may have configured inbound windows. Try identity mapping
+ * first (offset=0) since the firmware may map PCIe 0x00 → AXI 0x00.
+ * If that fails, try 0x10_00000000 offset per rp1.dtsi dma-ranges.
+ */
+#define RP1_DMA_OFFSET  0x0ULL
+static inline u64 dma_addr(const void *p) { return (u64)(usize)p + RP1_DMA_OFFSET; }
+
 /* DCI → ep_rings index. 0xFF = unmapped. DCI 1 = EP0 always ring 0. */
 static u8 dci_map[32];
 
@@ -175,7 +190,7 @@ static void ring_init(struct xhci_trb *ring, u32 *enq, u32 *cycle) {
     for (u32 i = 0; i < RING_SIZE; i++) {
         ring[i].param = 0; ring[i].status = 0; ring[i].control = 0;
     }
-    ring[RING_SIZE - 1].param = (u64)(usize)ring;
+    ring[RING_SIZE - 1].param = dma_addr(ring);
     ring[RING_SIZE - 1].control = TRB_TYPE(TRB_LINK) | (1U << 1) | TRB_CYCLE;
     *enq = 0; *cycle = 1;
 }
@@ -211,13 +226,14 @@ static i32 alloc_ep_ring(void) {
 
 static bool evt_poll(struct xhci_trb *out, u32 timeout_ms) {
     for (u32 i = 0; i < timeout_ms * 100; i++) {
+        dcache_invalidate_range((u64)(usize)&evt_ring[evt_deq], sizeof(struct xhci_trb));
         struct xhci_trb *trb = &evt_ring[evt_deq];
         dmb();
         if ((trb->control & TRB_CYCLE) == (evt_cycle ? 1U : 0U)) {
             *out = *trb;
             evt_deq++;
             if (evt_deq >= RING_SIZE) { evt_deq = 0; evt_cycle ^= 1; }
-            u64 erdp = (u64)(usize)&evt_ring[evt_deq];
+            u64 erdp = dma_addr(&evt_ring[evt_deq]);
             rtw(IR0_ERDP_LO, (u32)erdp | (1U << 3));
             rtw(IR0_ERDP_HI, (u32)(erdp >> 32));
             return true;
@@ -231,6 +247,7 @@ static bool evt_poll(struct xhci_trb *out, u32 timeout_ms) {
 
 static bool cmd_submit(u64 param, u32 status, u32 control, struct xhci_trb *evt) {
     ring_enqueue(cmd_ring, &cmd_enq, &cmd_cycle, param, status, control);
+    dcache_clean_range((u64)(usize)cmd_ring, sizeof(cmd_ring));
     dmb();
     ring_db(0, 0);
     if (!evt_poll(evt, 500)) {
@@ -246,26 +263,42 @@ static bool cmd_submit(u64 param, u32 status, u32 control, struct xhci_trb *evt)
 /* ---- DWC3 Init ---- */
 
 static bool dwc3_init(u64 base) {
-    uart_puts("[xhci] DWC3 ID: ");
-    uart_hex(mmio_read(base + DWC3_GSNPSID));
+    u32 snpsid = mmio_read(base + DWC3_GSNPSID);
+    uart_puts("[xhci] DWC3 GSNPSID=");
+    uart_hex(snpsid);
     uart_puts("\n");
 
+    if (snpsid == 0 || snpsid == 0xFFFFFFFF) {
+        uart_puts("[xhci] DWC3 not responding\n");
+        return false;
+    }
+
+    /* Core soft reset */
     u32 gctl = mmio_read(base + DWC3_GCTL);
+    uart_puts("[xhci] DWC3 GCTL before=");
+    uart_hex(gctl);
+    uart_puts("\n");
     gctl |= GCTL_CORESOFTRESET;
     mmio_write(base + DWC3_GCTL, gctl);
     timer_delay_us(100);
 
+    /* PHY soft reset */
     u32 phycfg = mmio_read(base + DWC3_GUSB2PHYCFG);
     mmio_write(base + DWC3_GUSB2PHYCFG, phycfg | GUSB2_PHYSOFTRST);
     timer_delay_us(100);
     mmio_write(base + DWC3_GUSB2PHYCFG, phycfg & ~GUSB2_PHYSOFTRST);
     timer_delay_ms(10);
 
+    /* Clear core reset, set host mode */
     gctl = mmio_read(base + DWC3_GCTL);
     gctl &= ~(GCTL_CORESOFTRESET | GCTL_PRTCAP_MASK | GCTL_DSBLCLKGTNG);
     gctl |= GCTL_PRTCAP_HOST;
     mmio_write(base + DWC3_GCTL, gctl);
     timer_delay_ms(10);
+
+    uart_puts("[xhci] DWC3 GCTL after=");
+    uart_hex(mmio_read(base + DWC3_GCTL));
+    uart_puts("\n");
     return true;
 }
 
@@ -273,6 +306,14 @@ static bool dwc3_init(u64 base) {
 
 bool xhci_init(void) {
     uart_puts("[xhci] Init USB0 (DWC3)...\n");
+
+    /* Enable USB VBUS power via GPIO 38 */
+    uart_puts("[xhci] Enabling VBUS (GPIO38)...\n");
+    rp1_gpio_set_function(USB_VBUS_GPIO, 5);
+    rp1_gpio_set_dir_output(USB_VBUS_GPIO);
+    rp1_gpio_write(USB_VBUS_GPIO, true);
+    timer_delay_ms(100);  /* let VBUS stabilise and devices power up */
+
     xhci_base = RP1_BAR_BASE + XHCI_USB0_OFFSET;
 
     if (!dwc3_init(xhci_base)) return false;
@@ -290,8 +331,12 @@ bool xhci_init(void) {
     rt_base = xhci_base + xr(CAP_RTSOFF);
     db_base = xhci_base + xr(CAP_DBOFF);
 
-    uart_puts("[xhci] Ports=");
+    uart_puts("[xhci] CapLen=");
+    uart_hex(caplength);
+    uart_puts(" Ports=");
     uart_hex(hci_max_ports);
+    uart_puts(" Slots=");
+    uart_hex(hci_max_slots);
     uart_puts(" CtxSize=");
     uart_hex(ctx_size);
     uart_puts("\n");
@@ -302,6 +347,9 @@ bool xhci_init(void) {
         if (opr(OP_USBSTS) & STS_HCH) break;
         timer_delay_us(100);
     }
+    uart_puts("[xhci] Halted STS=");
+    uart_hex(opr(OP_USBSTS));
+    uart_puts("\n");
 
     /* Reset */
     opw(OP_USBCMD, CMD_HCRST);
@@ -310,9 +358,14 @@ bool xhci_init(void) {
         timer_delay_us(100);
     }
     if (opr(OP_USBCMD) & CMD_HCRST) {
-        uart_puts("[xhci] Reset timeout\n");
+        uart_puts("[xhci] Reset timeout CMD=");
+        uart_hex(opr(OP_USBCMD));
+        uart_puts(" STS=");
+        uart_hex(opr(OP_USBSTS));
+        uart_puts("\n");
         return false;
     }
+    uart_puts("[xhci] Reset OK\n");
 
     opw(OP_CONFIG, 1); /* MaxSlotsEn = 1 */
 
@@ -324,15 +377,16 @@ bool xhci_init(void) {
     if (num_sp > 0) {
         if (num_sp > 4) num_sp = 4;
         for (u32 i = 0; i < num_sp; i++)
-            scratchpad_array[i] = (u64)(usize)&scratchpad_bufs[i][0];
-        dcbaa[0] = (u64)(usize)scratchpad_array;
+            scratchpad_array[i] = dma_addr(&scratchpad_bufs[i][0]);
+        dcbaa[0] = dma_addr(scratchpad_array);
     }
-    opw(OP_DCBAAP_LO, (u32)(usize)dcbaa);
-    opw(OP_DCBAAP_HI, (u32)((u64)(usize)dcbaa >> 32));
+    u64 dcbaa_dma = dma_addr(dcbaa);
+    opw(OP_DCBAAP_LO, (u32)dcbaa_dma);
+    opw(OP_DCBAAP_HI, (u32)(dcbaa_dma >> 32));
 
     /* Command ring */
     ring_init(cmd_ring, &cmd_enq, &cmd_cycle);
-    u64 cp = (u64)(usize)cmd_ring;
+    u64 cp = dma_addr(cmd_ring);
     opw(OP_CRCR_LO, (u32)cp | cmd_cycle);
     opw(OP_CRCR_HI, (u32)(cp >> 32));
 
@@ -341,20 +395,29 @@ bool xhci_init(void) {
         evt_ring[i].param = 0; evt_ring[i].status = 0; evt_ring[i].control = 0;
     }
     evt_deq = 0; evt_cycle = 1;
-    erst[0].base = (u64)(usize)evt_ring;
+    erst[0].base = dma_addr(evt_ring);
     erst[0].size = RING_SIZE;
     erst[0].rsvd = 0;
     rtw(IR0_ERSTSZ, 1);
-    u64 ep = (u64)(usize)evt_ring;
+    u64 ep = dma_addr(evt_ring);
     rtw(IR0_ERDP_LO, (u32)ep);
     rtw(IR0_ERDP_HI, (u32)(ep >> 32));
-    u64 eb = (u64)(usize)erst;
+    u64 eb = dma_addr(erst);
     rtw(IR0_ERSTBA_LO, (u32)eb);
     rtw(IR0_ERSTBA_HI, (u32)(eb >> 32));
 
     /* EP ring pool */
     for (u32 i = 0; i < NUM_EP_RINGS; i++) ep_used[i] = false;
     for (u32 i = 0; i < 32; i++) dci_map[i] = 0xFF;
+
+    /* Flush all xHCI data structures to RAM before starting the controller */
+    dcache_clean_range((u64)(usize)dcbaa, sizeof(dcbaa));
+    dcache_clean_range((u64)(usize)cmd_ring, sizeof(cmd_ring));
+    dcache_clean_range((u64)(usize)evt_ring, sizeof(evt_ring));
+    dcache_clean_range((u64)(usize)erst, sizeof(erst));
+    dcache_clean_range((u64)(usize)scratchpad_array, sizeof(scratchpad_array));
+    for (u32 i = 0; i < 4; i++)
+        dcache_clean_range((u64)(usize)scratchpad_bufs[i], sizeof(scratchpad_bufs[i]));
 
     /* Start */
     opw(OP_USBCMD, CMD_RUN | CMD_INTE);
@@ -364,7 +427,15 @@ bool xhci_init(void) {
         return false;
     }
 
-    uart_puts("[xhci] Controller running\n");
+    uart_puts("[xhci] Controller running");
+    /* Dump PCIe inbound BAR config (set by firmware) */
+    uart_puts(" BAR2_LO=");
+    uart_hex(mmio_read(PCIE_RC_BASE + 0x4034));
+    uart_puts(" BAR2_HI=");
+    uart_hex(mmio_read(PCIE_RC_BASE + 0x4038));
+    uart_puts(" REMAP=");
+    uart_hex(mmio_read(PCIE_RC_BASE + 0x40B4));
+    uart_puts("\n");
     return true;
 }
 
@@ -426,19 +497,19 @@ bool xhci_address_device(u32 slot, u32 port, u32 speed, u32 max_packet) {
 
     struct xhci_ep_ctx *ep0 = (struct xhci_ep_ctx *)(input + ctx_size * 2);
     ep0->f1 = (3U << 1) | (4U << 3) | (max_packet << 16);
-    ep0->deq = (u64)(usize)ep_rings[ri] | ep_cyc[ri];
+    ep0->deq = dma_addr(ep_rings[ri]) | ep_cyc[ri];
     ep0->f3 = 8;
 
     /* Set DCBAA[slot] before Address Device */
     for (u32 i = 0; i < sizeof(dev_ctx_buf); i++) dev_ctx_buf[i] = 0;
-    dcbaa[slot] = (u64)(usize)dev_ctx_buf;
+    dcbaa[slot] = dma_addr(dev_ctx_buf);
     dcache_clean_range((u64)(usize)dcbaa, sizeof(dcbaa));
     dcache_clean_range((u64)(usize)dev_ctx_buf, sizeof(dev_ctx_buf));
     dcache_clean_range((u64)(usize)input, sizeof(input_ctx_buf));
     dcache_clean_range((u64)(usize)ep_rings[ri], sizeof(ep_rings[ri]));
 
     struct xhci_trb evt;
-    return cmd_submit((u64)(usize)input, 0,
+    return cmd_submit(dma_addr(input), 0,
                       TRB_TYPE(TRB_ADDRESS_DEV) | (slot << 24), &evt);
 }
 
@@ -475,7 +546,7 @@ bool xhci_configure_endpoints(u32 slot, u32 port, u32 speed,
         struct xhci_ep_ctx *epc = (struct xhci_ep_ctx *)(input + ctx_size * (dci + 1));
         epc->f0 = ((u32)eps[i].interval << 16);
         epc->f1 = (3U << 1) | (ep_type << 3) | ((u32)eps[i].max_packet << 16);
-        epc->deq = (u64)(usize)ep_rings[ri] | ep_cyc[ri];
+        epc->deq = dma_addr(ep_rings[ri]) | ep_cyc[ri];
         epc->f3 = eps[i].max_packet;
     }
 
@@ -486,7 +557,7 @@ bool xhci_configure_endpoints(u32 slot, u32 port, u32 speed,
     dcache_clean_range((u64)(usize)input, sizeof(input_ctx_buf));
 
     struct xhci_trb evt;
-    return cmd_submit((u64)(usize)input, 0,
+    return cmd_submit(dma_addr(input), 0,
                       TRB_TYPE(TRB_CONFIG_EP) | (slot << 24), &evt);
 }
 
@@ -512,7 +583,7 @@ bool xhci_control_transfer(u32 slot, u8 bmReq, u8 bReq, u16 wVal,
         u32 dc = TRB_TYPE(TRB_DATA);
         if (bmReq & 0x80) dc |= TRB_DIR_IN;
         dcache_clean_range((u64)(usize)data, wLen);
-        ring_enqueue(ring, enq, cyc, (u64)(usize)data, wLen, dc);
+        ring_enqueue(ring, enq, cyc, dma_addr(data), wLen, dc);
     }
 
     /* Status Stage */
@@ -520,6 +591,7 @@ bool xhci_control_transfer(u32 slot, u8 bmReq, u8 bReq, u16 wVal,
     if (wLen > 0 && !(bmReq & 0x80)) stc |= TRB_DIR_IN;
     ring_enqueue(ring, enq, cyc, 0, 0, stc);
 
+    dcache_clean_range((u64)(usize)ring, sizeof(struct xhci_trb) * RING_SIZE);
     dmb();
     ring_db(slot, 1);
 
@@ -551,8 +623,9 @@ bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual) 
         dcache_invalidate_range((u64)(usize)data, len);
 
     ring_enqueue(ring, enq, cyc,
-                 (u64)(usize)data, len,
+                 dma_addr(data), len,
                  TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+    dcache_clean_range((u64)(usize)ring, sizeof(struct xhci_trb) * RING_SIZE);
     dmb();
     ring_db(slot, dci);
 

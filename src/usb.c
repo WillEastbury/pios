@@ -239,13 +239,16 @@ bool usb_init(void) {
 
     /* Scan ports */
     u32 nports = xhci_port_count();
+    uart_puts("[usb] Scanning ");
+    uart_hex(nports);
+    uart_puts(" ports\n");
     for (u32 p = 0; p < nports; p++) {
-        if (!xhci_port_connected(p))
-            continue;
-
-        uart_puts("[usb] Device on port ");
+        bool conn = xhci_port_connected(p);
+        uart_puts("[usb] Port ");
         uart_hex(p);
-        uart_puts("\n");
+        uart_puts(conn ? " connected\n" : " empty\n");
+        if (!conn)
+            continue;
 
         u32 speed = 0;
         if (!xhci_port_reset(p, &speed)) {

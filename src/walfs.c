@@ -25,6 +25,66 @@
 #define WAL_REC_MIN  sizeof(struct wal_record)
 #define WAL_REC_MAX  (WALFS_DATA_MAX + 256)
 
+/* ---- Partition offset ---- */
+
+static u32 base_lba = WALFS_BASE_LBA;
+
+static u32 read_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static bool discover_partition(void)
+{
+    static u8 ALIGNED(64) mbr[SD_BLOCK_SIZE];
+    if (!sd_read_block(0, mbr)) {
+        uart_puts("[walfs] Cannot read MBR\n");
+        return false;
+    }
+
+    /* Check MBR signature */
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) {
+        uart_puts("[walfs] No MBR signature, using default base LBA ");
+        uart_hex(WALFS_BASE_LBA);
+        uart_puts("\n");
+        base_lba = WALFS_BASE_LBA;
+        return true;
+    }
+
+    /* MBR partition table starts at offset 0x1BE, each entry is 16 bytes.
+     * Entry fields: [0]=status, [4]=type, [8..11]=start LBA, [12..15]=size */
+    u32 p2_start = read_le32(&mbr[0x1CE + 8]);
+    u32 p2_size  = read_le32(&mbr[0x1CE + 12]);
+    u8  p2_type  = mbr[0x1CE + 4];
+
+    uart_puts("[walfs] MBR partition 2: type=");
+    uart_hex(p2_type);
+    uart_puts(" start=");
+    uart_hex(p2_start);
+    uart_puts(" size=");
+    uart_hex(p2_size);
+    uart_puts("\n");
+
+    if (p2_start == 0 || p2_size == 0) {
+        uart_puts("[walfs] Partition 2 not found, using default base LBA ");
+        uart_hex(WALFS_BASE_LBA);
+        uart_puts("\n");
+        base_lba = WALFS_BASE_LBA;
+        return true;
+    }
+
+    base_lba = p2_start;
+    uart_puts("[walfs] Using partition 2 at LBA ");
+    uart_hex(base_lba);
+    uart_puts("\n");
+    return true;
+}
+
+u32 walfs_part2_lba(void) { return base_lba; }
+
+/* Translate a WALFS-relative LBA to an absolute SD LBA */
+static inline u32 abs_lba(u32 rel) { return base_lba + rel; }
+
 struct readdir_entry_wire {
     u64 inode_id;
     u8 name[128];
@@ -240,7 +300,7 @@ static bool wal_read(u64 off, void *buf, u32 len)
 {
     u8 *d = (u8 *)buf;
     while (len > 0) {
-        u32 lba = (u32)(off / SD_BLOCK_SIZE);
+        u32 lba = abs_lba((u32)(off / SD_BLOCK_SIZE));
         u32 blk_off = (u32)(off % SD_BLOCK_SIZE);
         u32 n = SD_BLOCK_SIZE - blk_off;
         if (n > len) n = len;
@@ -260,7 +320,7 @@ static bool wal_write(u64 off, const void *buf, u32 len)
 {
     const u8 *s = (const u8 *)buf;
     while (len > 0) {
-        u32 lba = (u32)(off / SD_BLOCK_SIZE);
+        u32 lba = abs_lba((u32)(off / SD_BLOCK_SIZE));
         u32 blk_off = (u32)(off % SD_BLOCK_SIZE);
         u32 n = SD_BLOCK_SIZE - blk_off;
         if (n > len) n = len;
@@ -295,8 +355,8 @@ static void write_super(void)
 
     /* Write superblock directly to SD, bypassing cache, to ensure
      * it hits disk AFTER all WAL data blocks are persisted. */
-    sd_write_block(0, (const u8 *)&super);
-    bcache_invalidate(0); /* keep cache consistent */
+    sd_write_block(abs_lba(0), (const u8 *)&super);
+    bcache_invalidate(abs_lba(0)); /* keep cache consistent */
 }
 
 /* ---- WAL append (two-part payload to avoid large stack buffers) ---- */
@@ -515,7 +575,10 @@ bool walfs_init(void)
     lru_init(&inode_cache, NULL, 0);  /* no TTL — invalidated on write */
     lru_init(&path_cache, NULL, 30000); /* 30s TTL for path lookups */
 
-    if (!bcache_read(0, (u8 *)&super)) return false;
+    /* Discover partition 2 from MBR before any WALFS I/O */
+    if (!discover_partition()) return false;
+
+    if (!bcache_read(abs_lba(0), (u8 *)&super)) return false;
 
     if (super.magic == WALFS_MAGIC && super.version == WALFS_VERSION) {
         u32 saved = super.crc32;

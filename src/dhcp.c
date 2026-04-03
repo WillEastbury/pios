@@ -13,7 +13,7 @@
 #include "dhcp.h"
 #include "net.h"
 #include "arp.h"
-#include "genet.h"
+#include "nic.h"
 #include "simd.h"
 #include "uart.h"
 #include "timer.h"
@@ -142,7 +142,7 @@ static void dhcp_send_raw(const struct dhcp_msg *msg, u32 msg_len, u32 src_ip) {
     u32 frame_len = pay_off + msg_len;
     if (frame_len < 60) frame_len = 60;
 
-    genet_send(f, frame_len);
+    nic_send(f, frame_len);
 }
 
 /* ---- DHCP message construction ---- */
@@ -388,7 +388,7 @@ static void dhcp_udp_handler(u32 src_ip, u16 src_port, u16 dst_port,
 /* ---- Public API ---- */
 
 bool dhcp_start(u32 timeout_ms) {
-    genet_get_mac(our_mac);
+    nic_get_mac(our_mac);
     xid = gen_xid();
     dhcp_state = DHCP_INIT;
     retries = 0;

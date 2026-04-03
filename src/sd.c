@@ -34,6 +34,8 @@
 
 /* Control1 bits */
 #define C1_SRST_HC          (1 << 24)
+#define C1_SRST_CMD         (1 << 25)
+#define C1_SRST_DATA        (1 << 26)
 #define C1_CLK_EN           (1 << 2)
 #define C1_CLK_STABLE       (1 << 1)
 #define C1_CLK_INTLEN       (1 << 0)
@@ -82,10 +84,29 @@ static sd_card_t card;
 static inline void sd_write(u32 off, u32 val) { mmio_write(EMMC2_BASE + off, val); }
 static inline u32  sd_read(u32 off)           { return mmio_read(EMMC2_BASE + off); }
 
+static void sd_dump_regs(const char *tag)
+{
+    uart_puts(tag);
+    uart_puts(" STATUS="); uart_hex(sd_read(REG_STATUS));
+    uart_puts(" C0="); uart_hex(sd_read(REG_CONTROL0));
+    uart_puts(" C1="); uart_hex(sd_read(REG_CONTROL1));
+    uart_puts(" C2="); uart_hex(sd_read(REG_CONTROL2));
+    uart_puts(" IRPT="); uart_hex(sd_read(REG_INTERRUPT));
+    uart_puts(" MASK="); uart_hex(sd_read(REG_IRPT_MASK));
+    uart_puts(" ARG1="); uart_hex(sd_read(REG_ARG1));
+    uart_puts(" CMDTM="); uart_hex(sd_read(REG_CMDTM));
+    uart_puts("\n");
+}
+
 static bool sd_wait_cmd(void) {
     u32 timeout = 1000000;
     while ((sd_read(REG_STATUS) & SR_CMD_INHIBIT) && timeout--)
         delay_cycles(10);
+    if (!timeout) {
+        uart_puts("[sd] wait_cmd timeout STATUS=");
+        uart_hex(sd_read(REG_STATUS));
+        uart_puts("\n");
+    }
     return timeout > 0;
 }
 
@@ -93,6 +114,11 @@ static bool sd_wait_data(void) {
     u32 timeout = 1000000;
     while ((sd_read(REG_STATUS) & SR_DAT_INHIBIT) && timeout--)
         delay_cycles(10);
+    if (!timeout) {
+        uart_puts("[sd] wait_data timeout STATUS=");
+        uart_hex(sd_read(REG_STATUS));
+        uart_puts("\n");
+    }
     return timeout > 0;
 }
 
@@ -112,14 +138,23 @@ static bool sd_send_cmd(u32 cmd, u32 arg, u32 *resp) {
     do {
         intr = sd_read(REG_INTERRUPT);
         if (intr & INT_ERROR) {
+            uart_puts("[sd] CMD error intr=");
+            uart_hex(intr);
+            uart_puts(" status=");
+            uart_hex(sd_read(REG_STATUS));
+            uart_puts("\n");
             sd_write(REG_INTERRUPT, INT_ERROR);
             return false;
         }
         delay_cycles(10);
     } while (!(intr & INT_CMD_DONE) && timeout--);
 
-    if (!timeout)
+    if (!timeout) {
+        uart_puts("[sd] CMD timeout intr=");
+        uart_hex(intr);
+        uart_puts("\n");
         return false;
+    }
 
     sd_write(REG_INTERRUPT, INT_CMD_DONE);
 
@@ -173,33 +208,63 @@ static void sd_set_clock(u32 freq_khz) {
 
 bool sd_init(void) {
     fb_puts("  [sd] reset SDHCI...\n");
+    uart_puts("[sd] init\n");
 
     card.type = 0;
     card.rca  = 0;
 
-    /* Reset controller */
-    sd_write(REG_CONTROL1, sd_read(REG_CONTROL1) | C1_SRST_HC);
+    /* Full HC reset */
+    sd_write(REG_CONTROL1, C1_SRST_HC);
     u32 timeout = 100000;
     while ((sd_read(REG_CONTROL1) & C1_SRST_HC) && timeout--)
         delay_cycles(10);
     if (!timeout) {
         fb_puts("  [sd] reset timeout\n");
+        uart_puts("[sd] reset timeout\n");
         return false;
     }
     fb_puts("  [sd] reset OK\n");
 
+    /* Power on: SD Bus Power = 1, voltage = 3.3V */
+    sd_write(REG_CONTROL0, 0x0F00);
+    delay_cycles(10000);
+
     /* Enable interrupts we care about */
     sd_write(REG_IRPT_MASK, INT_ALL);
-    sd_write(REG_IRPT_EN, 0);
+    sd_write(REG_IRPT_EN, INT_ALL);
 
     /* Set slow clock for identification (400 KHz) */
     fb_puts("  [sd] clock 400kHz...\n");
     sd_set_clock(400);
 
+    /* Extra settle time — let card see 74+ clocks */
+    delay_cycles(500000);
+
     /* CMD0: GO_IDLE */
     fb_puts("  [sd] CMD0...\n");
-    if (!sd_send_cmd(SD_CMD0, 0, NULL)) {
-        fb_puts("  [sd] CMD0 FAIL\n");
+    {
+        sd_send_cmd(SD_CMD0, 0, NULL);
+        /* CMD0 may leave inhibit — always reset CMD line after */
+        sd_write(REG_CONTROL1, sd_read(REG_CONTROL1) | C1_SRST_CMD);
+        timeout = 100000;
+        while ((sd_read(REG_CONTROL1) & C1_SRST_CMD) && timeout--)
+            delay_cycles(10);
+        sd_write(REG_INTERRUPT, INT_ALL);
+        delay_cycles(100000);
+    }
+
+    /* Ensure CMD inhibit is clear */
+    if (sd_read(REG_STATUS) & SR_CMD_INHIBIT) {
+        sd_write(REG_CONTROL1, sd_read(REG_CONTROL1) | C1_SRST_CMD | C1_SRST_DATA);
+        u32 rst2 = 100000;
+        while ((sd_read(REG_CONTROL1) & (C1_SRST_CMD | C1_SRST_DATA)) && rst2--)
+            delay_cycles(10);
+        sd_write(REG_INTERRUPT, INT_ALL);
+        delay_cycles(100000);
+    }
+
+    if (!sd_wait_cmd()) {
+        uart_puts("[sd] CMD inhibit stuck\n");
         return false;
     }
 
