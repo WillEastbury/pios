@@ -123,10 +123,12 @@
 #define BUF_SIZE 2048
 
 /* ── Descriptors and buffers (64-byte aligned for DMA coherency) ── */
-/* 32-bit descriptors: addr + ctrl. No ADDR64 — use direct PCIe addressing. */
+/* ADDR64 mode: 16-byte descriptors with addr_hi for PCIe DMA offset */
 struct macb_desc {
-    u32 addr;
-    u32 ctrl;
+    u32 addr;       /* buffer address low + OWN/WRAP bits */
+    u32 ctrl;       /* control/status */
+    u32 addr_hi;    /* buffer address high (0x10 for PCIe) */
+    u32 rsvd;
 } PACKED;
 
 static struct macb_desc rx_ring[NUM_RX] ALIGNED(64);
@@ -399,10 +401,11 @@ bool macb_init(void) {
     mw(NCFGR, NCFGR_GBE | NCFGR_FD | NCFGR_BIG |
               NCFGR_CLK_DIV64 | NCFGR_CAF | NCFGR_RXCOEN);
 
-    /* DMA config: store-and-forward TX, set RX buffer size. No ADDR64. */
-    mw(DMACFG, (1 << 10) |                       /* TXPBMS: full packet buffer */
-               (16 << DMACFG_FBLDO_SHIFT) |       /* burst length 16 */
-               ((BUF_SIZE / 64) << DMACFG_RXBS_SHIFT)); /* RX buf = 2048 */
+    /* DMA config: ADDR64 for 64-bit DMA, store-and-forward TX, set RX buffer size */
+    mw(DMACFG, DMACFG_ADDR64 |
+               (1 << 10) |
+               (16 << DMACFG_FBLDO_SHIFT) |
+               ((BUF_SIZE / 64) << DMACFG_RXBS_SHIFT));
 
     /* USRIO: RGMII mode + clock enable */
     mw(USRIO, USRIO_RGMII | USRIO_CLKEN);
@@ -416,53 +419,54 @@ bool macb_init(void) {
              ((u32)mac_addr[2] << 16) | ((u32)mac_addr[3] << 24));
     mw(SA1T, (u32)mac_addr[4] | ((u32)mac_addr[5] << 8));
 
-    /* ── Setup RX ring (32-bit descriptors) ── */
-    /* Use volatile to prevent compiler reordering descriptor writes */
+    /* ── Setup RX ring (64-bit descriptors with 0x10 high addr) ── */
     for (u32 i = 0; i < NUM_RX; i++) {
-        volatile u32 *a = &rx_ring[i].addr;
-        volatile u32 *c = &rx_ring[i].ctrl;
-        *a = (u32)(usize)&rx_bufs[i][0];
+        volatile struct macb_desc *d = &rx_ring[i];
+        d->addr = (u32)(usize)&rx_bufs[i][0];
+        d->ctrl = 0;
+        d->addr_hi = 0x10;
+        d->rsvd = 0;
         if (i == NUM_RX - 1)
-            *a = *a | RX_ADDR_WRAP;
-        *c = 0;
+            d->addr |= RX_ADDR_WRAP;
     }
     rx_idx = 0;
 
-    /* DSB to ensure all stores complete, then clean entire descriptor+buffer region */
     __asm__ volatile("dsb sy" ::: "memory");
     dcache_clean_range((u64)(usize)rx_ring, sizeof(rx_ring));
     dcache_clean_range((u64)(usize)rx_bufs, sizeof(rx_bufs));
     __asm__ volatile("dsb sy" ::: "memory");
 
-    /* Verify: invalidate and read back to confirm RAM has correct data */
+    /* Verify */
     dcache_invalidate_range((u64)(usize)&rx_ring[0], sizeof(struct macb_desc));
     uart_puts("[macb] RX verify: desc[0].addr=");
     uart_hex(rx_ring[0].addr);
+    uart_puts(" hi=");
+    uart_hex(rx_ring[0].addr_hi);
     uart_puts(" expected=");
     uart_hex((u32)(usize)&rx_bufs[0][0]);
     uart_puts("\n");
 
     mw(RBQP, (u32)(usize)&rx_ring[0]);
-    mw(RBQPH, 0);
+    mw(RBQPH, 0x10);
 
-    /* ── Setup TX ring (32-bit descriptors) ── */
+    /* ── Setup TX ring (64-bit descriptors with 0x10 high addr) ── */
     for (u32 i = 0; i < NUM_TX; i++) {
-        volatile u32 *a = &tx_ring[i].addr;
-        volatile u32 *c = &tx_ring[i].ctrl;
-        *a = (u32)(usize)&tx_bufs[i][0];
-        *c = TX_STAT_USED;
+        volatile struct macb_desc *d = &tx_ring[i];
+        d->addr = (u32)(usize)&tx_bufs[i][0];
+        d->ctrl = TX_STAT_USED;
+        d->addr_hi = 0x10;
+        d->rsvd = 0;
         if (i == NUM_TX - 1)
-            *c = *c | TX_STAT_WRAP;
+            d->ctrl |= TX_STAT_WRAP;
     }
     tx_idx = 0;
 
-    /* Flush TX descriptors to RAM */
     __asm__ volatile("dsb sy" ::: "memory");
     dcache_clean_range((u64)(usize)tx_ring, sizeof(tx_ring));
     __asm__ volatile("dsb sy" ::: "memory");
 
     mw(TBQP, (u32)(usize)&tx_ring[0]);
-    mw(TBQPH, 0);
+    mw(TBQPH, 0x10);
 
     /* Enable MDIO + RX + TX */
     mw(NCR, NCR_MPE | NCR_RE | NCR_TE);
