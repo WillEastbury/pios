@@ -260,7 +260,7 @@ bool usb_init(void) {
         uart_hex(speed);
         uart_puts("\n");
 
-        timer_delay_ms(50);
+        timer_delay_ms(200);  /* USB spec: 200ms after port reset */
 
         if (enumerate_device(p, speed)) {
             probe_drivers();

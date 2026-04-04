@@ -467,6 +467,37 @@ bool macb_init(void) {
 
     mac_log("[macb] Active MAC ", mac_addr);
 
+    /* ── Verbose MACB DMA state dump ── */
+    uart_puts("[macb] === MACB Register Dump ===\n");
+    uart_puts("[macb] NCR="); uart_hex(mr(NCR)); uart_puts("\n");
+    uart_puts("[macb] NCFGR="); uart_hex(mr(NCFGR)); uart_puts("\n");
+    uart_puts("[macb] NSR="); uart_hex(mr(NSR)); uart_puts("\n");
+    uart_puts("[macb] DMACFG="); uart_hex(mr(DMACFG)); uart_puts("\n");
+    uart_puts("[macb] USRIO="); uart_hex(mr(USRIO)); uart_puts("\n");
+    uart_puts("[macb] RBQP="); uart_hex(mr(RBQP));
+    uart_puts(" RBQPH="); uart_hex(mr(RBQPH)); uart_puts("\n");
+    uart_puts("[macb] TBQP="); uart_hex(mr(TBQP));
+    uart_puts(" TBQPH="); uart_hex(mr(TBQPH)); uart_puts("\n");
+    uart_puts("[macb] ISR="); uart_hex(mr(ISR)); uart_puts("\n");
+    uart_puts("[macb] TSR="); uart_hex(mr(TSR)); uart_puts("\n");
+    uart_puts("[macb] RSR="); uart_hex(mr(RSR)); uart_puts("\n");
+    uart_puts("[macb] RX desc[0] addr="); uart_hex(rx_ring[0].addr);
+    uart_puts(" ctrl="); uart_hex(rx_ring[0].ctrl); uart_puts("\n");
+    uart_puts("[macb] TX desc[0] addr="); uart_hex(tx_ring[0].addr);
+    uart_puts(" ctrl="); uart_hex(tx_ring[0].ctrl); uart_puts("\n");
+    uart_puts("[macb] rx_bufs[0] phys="); uart_hex((u64)(usize)&rx_bufs[0][0]); uart_puts("\n");
+    uart_puts("[macb] tx_bufs[0] phys="); uart_hex((u64)(usize)&tx_bufs[0][0]); uart_puts("\n");
+
+    /* HDMI dump */
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_printf("MACB NCR=%X NCFGR=%X NSR=%X\n", mr(NCR), mr(NCFGR), mr(NSR));
+    fb_printf("MACB RBQP=%X TBQP=%X\n", mr(RBQP), mr(TBQP));
+    fb_printf("MACB ISR=%X TSR=%X RSR=%X\n", mr(ISR), mr(TSR), mr(RSR));
+    fb_printf("MACB rxdesc0=%X txdesc0=%X\n", rx_ring[0].addr, tx_ring[0].addr);
+    fb_printf("MACB rxbuf0=%X txbuf0=%X\n",
+              (u32)(usize)&rx_bufs[0][0], (u32)(usize)&tx_bufs[0][0]);
+    uart_puts("[macb] === End Dump ===\n");
+
     return true;
 }
 

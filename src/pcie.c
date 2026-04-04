@@ -196,7 +196,7 @@ bool pcie_init(void) {
     tmp = pr(MISC_MISC_CTRL);
     tmp |= MCTRL_SCB_ACCESS_EN | MCTRL_CFG_READ_UR | MCTRL_RCB_MPS | MCTRL_RCB_64B;
     tmp = (tmp & ~MCTRL_MAX_BURST_MASK) | (0x1U << 20);
-    tmp = (tmp & ~0xF8000000U) | (17U << 27);  /* SCB0_SIZE = 17 for 4GB */
+    tmp = (tmp & ~0xF8000000U) | (21U << 27);  /* SCB0_SIZE = 21 for 64GB window */
     pw(MISC_MISC_CTRL, tmp);
 
     tmp = pr(RC_CFG_PRIV1_ID_VAL3);
@@ -210,12 +210,11 @@ bool pcie_init(void) {
 
     /*
      * Program inbound DMA window (BAR2) from scratch.
-     * Pi 5: 4GB RAM, identity mapped (PCIe addr 0 = CPU addr 0).
-     * encode_ibar_size(4GB) = ilog2(4GB)-15 = 17 = 0x11
-     * BAR2_CONFIG_LO = lower32(pcie_offset) | encoded_size
-     * BAR2_CONFIG_HI = upper32(pcie_offset)
+     * RP1 peripherals translate DMA addr 0x00_xxxxxxxx to PCIe 0x10_xxxxxxxx,
+     * so we need a 64GB window to cover the 0x10_00000000 range.
+     * encode_ibar_size(64GB) = ilog2(64GB)-15 = 36-15 = 21 = 0x15
      */
-    pw(MISC_RC_BAR2_CONFIG_LO, 0x00000000 | 0x11);  /* offset=0, size=4GB */
+    pw(MISC_RC_BAR2_CONFIG_LO, 0x00000000 | 0x15);  /* offset=0, size=64GB */
     pw(MISC_RC_BAR2_CONFIG_HI, 0x00000000);          /* high bits of offset */
     pw(MISC_UBUS_BAR2_CONFIG_REMAP, 0x00000001);     /* access enable */
 
@@ -249,12 +248,36 @@ bool pcie_init(void) {
     pw(PCI_REG_CMD, tmp);
     dmb();
 
-    uart_puts("[pcie] Link UP, MISC_CTRL=");
-    uart_hex(pr(MISC_MISC_CTRL));
-    uart_puts(" BAR2=");
-    uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
-    uart_puts("/");
-    uart_hex(pr(MISC_RC_BAR2_CONFIG_HI));
-    uart_puts("\n");
+    /* ── Verbose PCIe register dump for DMA debugging ── */
+    uart_puts("[pcie] === PCIe RC Register Dump ===\n");
+    uart_puts("[pcie] MISC_CTRL="); uart_hex(pr(MISC_MISC_CTRL)); uart_puts("\n");
+    uart_puts("[pcie] BAR2_LO="); uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
+    uart_puts(" BAR2_HI="); uart_hex(pr(MISC_RC_BAR2_CONFIG_HI)); uart_puts("\n");
+    uart_puts("[pcie] UBUS_BAR2_REMAP="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP)); uart_puts("\n");
+    uart_puts("[pcie] VENDOR_REG1="); uart_hex(pr(RC_CFG_VENDOR_SPECIFIC_REG1)); uart_puts("\n");
+    uart_puts("[pcie] UBUS_CTRL="); uart_hex(pr(MISC_UBUS_CTRL)); uart_puts("\n");
+    uart_puts("[pcie] STATUS="); uart_hex(pr(MISC_PCIE_STATUS)); uart_puts("\n");
+    uart_puts("[pcie] RC_CMD="); uart_hex(pr(PCI_REG_CMD)); uart_puts("\n");
+    uart_puts("[pcie] HARD_DEBUG="); uart_hex(pr(HARD_DEBUG)); uart_puts("\n");
+    uart_puts("[pcie] OB_WIN0_LO="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_LO));
+    uart_puts(" HI="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_HI)); uart_puts("\n");
+    uart_puts("[pcie] OB_WIN0_BL="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_BL)); uart_puts("\n");
+    uart_puts("[pcie] OB_WIN0_BH="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_BH));
+    uart_puts(" LH="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_LH)); uart_puts("\n");
+
+    /* RP1 endpoint config */
+    uart_puts("[pcie] RP1 BAR1="); uart_hex(pcie_cfg_read(1,0,0,0x14)); uart_puts("\n");
+    uart_puts("[pcie] RP1 CMD="); uart_hex(pcie_cfg_read(1,0,0,0x04)); uart_puts("\n");
+    uart_puts("[pcie] RP1 ID="); uart_hex(pcie_cfg_read(1,0,0,0x00)); uart_puts("\n");
+
+    /* Also dump to HDMI via fb so user can read it on screen */
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_printf("PCIe MISC_CTRL=%X\n", pr(MISC_MISC_CTRL));
+    fb_printf("BAR2=%X/%X REMAP=%X\n", pr(MISC_RC_BAR2_CONFIG_LO),
+              pr(MISC_RC_BAR2_CONFIG_HI), pr(MISC_UBUS_BAR2_CONFIG_REMAP));
+    fb_printf("VENDOR=%X UBUS=%X\n", pr(RC_CFG_VENDOR_SPECIFIC_REG1), pr(MISC_UBUS_CTRL));
+    fb_printf("RP1 BAR1=%X CMD=%X\n", pcie_cfg_read(1,0,0,0x14), pcie_cfg_read(1,0,0,0x04));
+
+    uart_puts("[pcie] === End Dump ===\n");
     return true;
 }

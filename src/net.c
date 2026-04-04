@@ -539,6 +539,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
 
     /* Announce our presence on the network */
     arp_announce();
+
+    uart_puts("[net] Post-announce NIC state:\n");
+    uart_puts("[net] nic_link="); uart_hex(nic_link_up() ? 1 : 0); uart_puts("\n");
 }
 
 void net_set_udp_callback(udp_recv_cb cb) {

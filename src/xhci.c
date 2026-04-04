@@ -255,14 +255,35 @@ static bool cmd_submit(u64 param, u32 status, u32 control, struct xhci_trb *evt)
     dcache_clean_range((u64)(usize)cmd_ring, sizeof(cmd_ring));
     dmb();
     ring_db(0, 0);
-    if (!evt_poll(evt, 500)) {
-        uart_puts("[xhci] Cmd timeout\n");
-        return false;
+
+    /* Poll for Command Complete event, skipping non-command events
+     * (e.g. Port Status Change events from recent port resets) */
+    for (u32 attempts = 0; attempts < 10; attempts++) {
+        if (!evt_poll(evt, 500)) {
+            uart_puts("[xhci] Cmd timeout after ");
+            uart_hex(attempts);
+            uart_puts(" events\n");
+            return false;
+        }
+        u32 evt_type = TRB_GET_TYPE(evt->control);
+        u32 cc = TRB_COMP_CODE(evt->status);
+
+        uart_puts("[xhci] Event: type=");
+        uart_hex(evt_type);
+        uart_puts(" cc=");
+        uart_hex(cc);
+        uart_puts("\n");
+
+        if (evt_type == TRB_CMD_COMPLETE) {
+            fb_set_color(0x00FFAA00, 0x00000000);
+            fb_printf("xHCI slot cc=%X\n", cc);
+            return (cc == CC_SUCCESS);
+        }
+        /* Not our event — skip and try again */
+        uart_puts("[xhci] Skipping non-command event, retrying...\n");
     }
-    if (TRB_GET_TYPE(evt->control) != TRB_CMD_COMPLETE)
-        return false;
-    u32 cc = TRB_COMP_CODE(evt->status);
-    return (cc == CC_SUCCESS);
+    uart_puts("[xhci] Too many non-command events\n");
+    return false;
 }
 
 /* ---- DWC3 Init ---- */
