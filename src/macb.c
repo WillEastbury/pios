@@ -17,6 +17,8 @@
 #include "timer.h"
 #include "rp1_gpio.h"
 #include "rp1_clk.h"
+#include "mmu.h"
+#include "rp1_clk.h"
 
 /* PHY reset is on RP1 GPIO 32, funcsel 5, active LOW */
 #define PHY_RESET_GPIO  32
@@ -38,7 +40,7 @@
 #define MAN         0x0034  /* PHY Maintenance (MDIO) */
 #define SA1B        0x0088  /* Specific Address 1 Bottom (GEM) */
 #define SA1T        0x008C  /* Specific Address 1 Top (GEM) */
-#define USRIO       0x000C  /* User I/O (GEM) */
+#define USRIO       0x00C0  /* User I/O (GEM — not 0x0C which is MACB) */
 #define DCFG1       0x0280  /* Design Config 1 */
 #define DCFG2       0x0284  /* Design Config 2 */
 #define RBQPH       0x04D4  /* RX Queue Base Addr High */
@@ -419,6 +421,11 @@ bool macb_init(void) {
         rx_ring[i].ctrl = 0;
     }
     rx_idx = 0;
+
+    /* Flush RX descriptors and buffers to RAM before MAC reads them via DMA */
+    dcache_clean_range((u64)(usize)rx_ring, sizeof(rx_ring));
+    dcache_clean_range((u64)(usize)rx_bufs, sizeof(rx_bufs));
+
     mw(RBQP, (u32)(usize)&rx_ring[0]);
     mw(RBQPH, 0);  /* upper 32 bits — our buffers are in low 4GB */
 
@@ -430,6 +437,10 @@ bool macb_init(void) {
             tx_ring[i].ctrl |= TX_STAT_WRAP;
     }
     tx_idx = 0;
+
+    /* Flush TX descriptors to RAM */
+    dcache_clean_range((u64)(usize)tx_ring, sizeof(tx_ring));
+
     mw(TBQP, (u32)(usize)&tx_ring[0]);
     mw(TBQPH, 0);
 
@@ -505,6 +516,9 @@ bool macb_init(void) {
 bool macb_send(const u8 *frame, u32 len) {
     if (len > BUF_SIZE || len == 0) return false;
 
+    /* Invalidate TX descriptor to see MAC's latest USED bit */
+    dcache_invalidate_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
+
     /* Wait for TX descriptor to be available */
     if (!(tx_ring[tx_idx].ctrl & TX_STAT_USED))
         return false;  /* busy */
@@ -520,6 +534,9 @@ bool macb_send(const u8 *frame, u32 len) {
     /* Clear USED bit — give to MAC */
     tx_ring[tx_idx].ctrl = ctrl;
 
+    /* Flush TX buffer + descriptor to RAM so MAC can read them via DMA */
+    dcache_clean_range((u64)(usize)dst, len);
+    dcache_clean_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
     dsb();
 
     /* Trigger TX */
@@ -531,6 +548,9 @@ bool macb_send(const u8 *frame, u32 len) {
 
 /* ── Receive ── */
 bool macb_recv(u8 *frame, u32 *len) {
+    /* Invalidate RX descriptor to see MAC's latest write via DMA */
+    dcache_invalidate_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
+
     /* Check if current RX descriptor has been filled by MAC */
     if (!(rx_ring[rx_idx].addr & RX_ADDR_OWN))
         return false;
@@ -541,17 +561,22 @@ bool macb_recv(u8 *frame, u32 *len) {
     if (flen == 0 || flen > BUF_SIZE) {
         /* Reclaim descriptor */
         rx_ring[rx_idx].addr &= ~RX_ADDR_OWN;
+        dcache_clean_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
         rx_idx = (rx_idx + 1) % NUM_RX;
         return false;
     }
+
+    /* Invalidate RX buffer to see data written by MAC via DMA */
+    dcache_invalidate_range((u64)(usize)rx_bufs[rx_idx], BUF_SIZE);
 
     /* Copy frame out */
     u8 *src = rx_bufs[rx_idx];
     for (u32 i = 0; i < flen; i++) frame[i] = src[i];
     *len = flen;
 
-    /* Reclaim: clear ownership bit */
+    /* Reclaim: clear ownership bit and flush back to RAM */
     rx_ring[rx_idx].addr &= ~RX_ADDR_OWN;
+    dcache_clean_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
     dsb();
 
     rx_idx = (rx_idx + 1) % NUM_RX;
