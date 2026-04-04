@@ -19,6 +19,7 @@
 #include "timer.h"
 #include "workq.h"
 #include "fb.h"
+#include "pcie.h"
 
 /* ---- Network state ---- */
 
@@ -538,7 +539,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     uart_puts(" (ARP hardened, TCP/UDP, NO DHCP)\n");
 
     /* Announce our presence on the network */
+    pcie_aer_dump("pre-ARP");
     arp_announce();
+    pcie_aer_dump("post-ARP");
 
     uart_puts("[net] Post-announce NIC state:\n");
     uart_puts("[net] nic_link="); uart_hex(nic_link_up() ? 1 : 0); uart_puts("\n");

@@ -26,3 +26,7 @@ bool pcie_link_up(void);
 /* Config space access (bus/dev/func addressing) */
 u32  pcie_cfg_read(u32 bus, u32 dev, u32 func, u32 reg);
 void pcie_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val);
+
+/* AER diagnostics */
+void pcie_aer_init(void);
+void pcie_aer_dump(const char *tag);

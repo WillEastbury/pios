@@ -18,6 +18,7 @@
 #include "rp1_gpio.h"
 #include "rp1_clk.h"
 #include "mmu.h"
+#include "pcie.h"
 #include "rp1_clk.h"
 
 /* PHY reset is on RP1 GPIO 32, funcsel 5, active LOW */
@@ -604,8 +605,8 @@ bool macb_send(const u8 *frame, u32 len) {
         uart_puts(" addr=");
         uart_hex(tx_ring[tx_idx].addr);
         uart_puts("\n");
-        /* Wait a moment then check if MAC consumed it */
-        delay_cycles(10000);
+        /* Wait a moment then check if MAC consumed it + AER errors */
+        delay_cycles(100000);
         dcache_invalidate_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
         uart_puts("[macb] TX post: ctrl=");
         uart_hex(tx_ring[tx_idx].ctrl);
@@ -616,6 +617,7 @@ bool macb_send(const u8 *frame, u32 len) {
         uart_puts(" NSR=");
         uart_hex(mr(NSR));
         uart_puts("\n");
+        pcie_aer_dump("post-TX");
     }
     tx_send_count++;
 

@@ -279,5 +279,90 @@ bool pcie_init(void) {
     fb_printf("RP1 BAR1=%X CMD=%X\n", pcie_cfg_read(1,0,0,0x14), pcie_cfg_read(1,0,0,0x04));
 
     uart_puts("[pcie] === End Dump ===\n");
+
+    /* Init AER early so we catch any DMA errors */
+    pcie_aer_init();
+
     return true;
+}
+
+/* ---- PCIe Advanced Error Reporting (AER) ---- */
+
+/*
+ * AER is an Extended Capability (ID=0x0001) in PCIe config space.
+ * Walk the extended capability list starting at offset 0x100 to find it.
+ * Works on both the RC (bus 0) and the RP1 endpoint (bus 1).
+ */
+
+static u32 aer_offset_rc;   /* AER base in RC config space */
+
+/* AER register offsets from AER base */
+#define AER_UNCORR_ERR      0x04
+#define AER_UNCORR_MASK     0x08
+#define AER_UNCORR_SEV      0x0C
+#define AER_CORR_ERR        0x10
+#define AER_CORR_MASK       0x14
+#define AER_HDR_LOG0        0x1C
+#define AER_HDR_LOG1        0x20
+#define AER_HDR_LOG2        0x24
+#define AER_HDR_LOG3        0x28
+
+static u32 find_aer_cap(u32 bus, u32 dev, u32 fn) {
+    u32 off = 0x100;
+    for (u32 i = 0; i < 48 && off >= 0x100; i++) {
+        u32 hdr = pcie_cfg_read(bus, dev, fn, off);
+        u16 cap_id = hdr & 0xFFFF;
+        if (cap_id == 0x0001)
+            return off;  /* found AER */
+        off = (hdr >> 20) & 0xFFC;
+        if (off == 0) break;
+    }
+    return 0;
+}
+
+void pcie_aer_init(void) {
+    /* Find AER on the RC (bus 0) */
+    aer_offset_rc = find_aer_cap(0, 0, 0);
+    if (aer_offset_rc) {
+        uart_puts("[pcie] AER found at RC offset ");
+        uart_hex(aer_offset_rc);
+        uart_puts("\n");
+        /* Clear all errors */
+        pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_UNCORR_ERR, 0xFFFFFFFF);
+        pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_CORR_ERR, 0xFFFFFFFF);
+        /* Unmask all errors */
+        pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_UNCORR_MASK, 0);
+        pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_CORR_MASK, 0);
+    } else {
+        uart_puts("[pcie] AER not found on RC\n");
+    }
+}
+
+void pcie_aer_dump(const char *tag) {
+    if (!aer_offset_rc) return;
+    u32 uncorr = pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_UNCORR_ERR);
+    u32 corr   = pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_CORR_ERR);
+
+    uart_puts("[aer] ");
+    uart_puts(tag);
+    uart_puts(" uncorr=");
+    uart_hex(uncorr);
+    uart_puts(" corr=");
+    uart_hex(corr);
+
+    if (uncorr || corr) {
+        uart_puts("\n[aer] HDR: ");
+        uart_hex(pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_HDR_LOG0));
+        uart_puts(" ");
+        uart_hex(pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_HDR_LOG1));
+        uart_puts(" ");
+        uart_hex(pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_HDR_LOG2));
+        uart_puts(" ");
+        uart_hex(pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_HDR_LOG3));
+
+        /* Clear for next check */
+        pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_UNCORR_ERR, 0xFFFFFFFF);
+        pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_CORR_ERR, 0xFFFFFFFF);
+    }
+    uart_puts("\n");
 }
