@@ -478,6 +478,50 @@ bool macb_init(void) {
 
     mac_log("[macb] Active MAC ", mac_addr);
 
+    /* Read negotiated speed from PHY and configure MAC to match */
+    {
+        u16 gbsr = mdio_read(phy_addr, 0x0A);  /* 1000BASE-T Status */
+        u16 anlpar = mdio_read(phy_addr, 0x05); /* AN Link Partner Ability */
+        u16 bmcr = mdio_read(phy_addr, 0x00);   /* Basic Mode Control */
+        bool gig = false, fd = true, spd100 = false;
+
+        uart_puts("[macb] PHY GBSR="); uart_hex(gbsr);
+        uart_puts(" ANLPAR="); uart_hex(anlpar);
+        uart_puts(" BMCR="); uart_hex(bmcr);
+        uart_puts("\n");
+
+        /* Check 1000BASE-T first */
+        if ((gbsr & (1 << 11)) || (gbsr & (1 << 10))) {
+            gig = true;
+            fd = !!(gbsr & (1 << 11)); /* 1000BASE-T FD */
+        } else if (anlpar & (1 << 8)) {
+            spd100 = true; fd = true;  /* 100BASE-TX FD */
+        } else if (anlpar & (1 << 7)) {
+            spd100 = true; fd = false; /* 100BASE-TX HD */
+        } else if (anlpar & (1 << 6)) {
+            fd = true;  /* 10BASE-T FD */
+        }
+
+        /* Reconfigure NCFGR with correct speed */
+        u32 ncfgr = NCFGR_BIG | NCFGR_CLK_DIV64 | NCFGR_CAF | NCFGR_RXCOEN;
+        if (gig)    ncfgr |= NCFGR_GBE;
+        if (spd100) ncfgr |= NCFGR_SPD;
+        if (fd)     ncfgr |= NCFGR_FD;
+        mw(NCFGR, ncfgr);
+
+        uart_puts("[macb] Negotiated: ");
+        uart_puts(gig ? "1000" : (spd100 ? "100" : "10"));
+        uart_puts(fd ? "Mbps FD" : "Mbps HD");
+        uart_puts(" NCFGR=");
+        uart_hex(ncfgr);
+        uart_puts("\n");
+
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_printf("MACB %s%s NCFGR=%X\n",
+                  gig ? "1000" : (spd100 ? "100" : "10"),
+                  fd ? "FD" : "HD", ncfgr);
+    }
+
     /* ── Verbose MACB DMA state dump ── */
     uart_puts("[macb] === MACB Register Dump ===\n");
     uart_puts("[macb] NCR="); uart_hex(mr(NCR)); uart_puts("\n");
