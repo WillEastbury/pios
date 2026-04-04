@@ -417,32 +417,49 @@ bool macb_init(void) {
     mw(SA1T, (u32)mac_addr[4] | ((u32)mac_addr[5] << 8));
 
     /* ── Setup RX ring (32-bit descriptors) ── */
+    /* Use volatile to prevent compiler reordering descriptor writes */
     for (u32 i = 0; i < NUM_RX; i++) {
-        rx_ring[i].addr = (u32)(usize)&rx_bufs[i][0];
+        volatile u32 *a = &rx_ring[i].addr;
+        volatile u32 *c = &rx_ring[i].ctrl;
+        *a = (u32)(usize)&rx_bufs[i][0];
         if (i == NUM_RX - 1)
-            rx_ring[i].addr |= RX_ADDR_WRAP;
-        rx_ring[i].ctrl = 0;
+            *a = *a | RX_ADDR_WRAP;
+        *c = 0;
     }
     rx_idx = 0;
 
-    /* Flush RX descriptors and buffers to RAM before MAC reads them via DMA */
+    /* DSB to ensure all stores complete, then clean entire descriptor+buffer region */
+    __asm__ volatile("dsb sy" ::: "memory");
     dcache_clean_range((u64)(usize)rx_ring, sizeof(rx_ring));
     dcache_clean_range((u64)(usize)rx_bufs, sizeof(rx_bufs));
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    /* Verify: invalidate and read back to confirm RAM has correct data */
+    dcache_invalidate_range((u64)(usize)&rx_ring[0], sizeof(struct macb_desc));
+    uart_puts("[macb] RX verify: desc[0].addr=");
+    uart_hex(rx_ring[0].addr);
+    uart_puts(" expected=");
+    uart_hex((u32)(usize)&rx_bufs[0][0]);
+    uart_puts("\n");
 
     mw(RBQP, (u32)(usize)&rx_ring[0]);
     mw(RBQPH, 0);
 
     /* ── Setup TX ring (32-bit descriptors) ── */
     for (u32 i = 0; i < NUM_TX; i++) {
-        tx_ring[i].addr = (u32)(usize)&tx_bufs[i][0];
-        tx_ring[i].ctrl = TX_STAT_USED;  /* SW owns initially */
+        volatile u32 *a = &tx_ring[i].addr;
+        volatile u32 *c = &tx_ring[i].ctrl;
+        *a = (u32)(usize)&tx_bufs[i][0];
+        *c = TX_STAT_USED;
         if (i == NUM_TX - 1)
-            tx_ring[i].ctrl |= TX_STAT_WRAP;
+            *c = *c | TX_STAT_WRAP;
     }
     tx_idx = 0;
 
     /* Flush TX descriptors to RAM */
+    __asm__ volatile("dsb sy" ::: "memory");
     dcache_clean_range((u64)(usize)tx_ring, sizeof(tx_ring));
+    __asm__ volatile("dsb sy" ::: "memory");
 
     mw(TBQP, (u32)(usize)&tx_ring[0]);
     mw(TBQPH, 0);
