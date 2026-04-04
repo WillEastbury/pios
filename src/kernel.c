@@ -4258,6 +4258,9 @@ NORETURN void core0_main(void) {
     static u32 cmd_len;
 
     for (;;) {
+        /* Network poll — process incoming packets */
+        net_poll();
+
         /* Direct RP1 UART0 RX poll */
         if (!(*(volatile u32 *)rp1_fr & (1 << 4))) {  /* RXFE = 0 */
             char c = (char)(*(volatile u32 *)rp1_dr & 0xFF);

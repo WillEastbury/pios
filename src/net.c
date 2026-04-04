@@ -449,6 +449,18 @@ void net_handle_fifo_request(void) {
 void net_poll(void) {
     u32 len;
     bool checksum_trusted;
+    static u32 poll_count;
+    static u32 rx_count;
+
+    /* Log occasionally to prove polling is running */
+    if ((poll_count & 0xFFFFF) == 0 && poll_count > 0) {
+        uart_puts("[net] poll=");
+        uart_hex(poll_count);
+        uart_puts(" rx=");
+        uart_hex(rx_count);
+        uart_puts("\n");
+    }
+    poll_count++;
 
     prefetch_r(rx_frame);
 
@@ -457,8 +469,24 @@ void net_poll(void) {
         if (!likely(nic_recv(rx_frame, &len, &checksum_trusted)))
             break;
 
+        rx_count++;
         stats.rx_packets++;
         stats.rx_bytes += len;
+
+        /* Log first few received frames */
+        if (rx_count <= 5) {
+            uart_puts("[net] RX#");
+            uart_hex(rx_count);
+            uart_puts(" len=");
+            uart_hex(len);
+            uart_puts(" eth=");
+            for (u32 i = 0; i < 14 && i < len; i++) {
+                static const char hex[] = "0123456789ABCDEF";
+                uart_putc(hex[rx_frame[i] >> 4]);
+                uart_putc(hex[rx_frame[i] & 0xF]);
+            }
+            uart_puts("\n");
+        }
 
         if (unlikely(len < sizeof(struct eth_hdr))) {
             stats.drop_runt++;
