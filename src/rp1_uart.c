@@ -91,8 +91,9 @@ bool rp1_uart_init(u32 index, u32 baud) {
 
 void rp1_uart_putc(u32 index, char c) {
     if (index > 5) return;
-    /* Wait for TX FIFO not full */
-    while (ur(index, UART_FR) & FR_TXFF)
+    /* Wait for TX FIFO not full — with timeout to prevent hang */
+    u32 timeout = 100000;
+    while ((ur(index, UART_FR) & FR_TXFF) && timeout--)
         ;
     uw(index, UART_DR, (u32)c);
 }
