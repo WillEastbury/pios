@@ -127,10 +127,10 @@ struct macb_desc {
     u32 ctrl;
 } PACKED;
 
-static struct macb_desc rx_ring[NUM_RX] ALIGNED(16);
-static struct macb_desc tx_ring[NUM_TX] ALIGNED(16);
-static u8 rx_bufs[NUM_RX][BUF_SIZE] ALIGNED(8);
-static u8 tx_bufs[NUM_TX][BUF_SIZE] ALIGNED(8);
+static struct macb_desc rx_ring[NUM_RX] ALIGNED(64);
+static struct macb_desc tx_ring[NUM_TX] ALIGNED(64);
+static u8 rx_bufs[NUM_RX][BUF_SIZE] ALIGNED(64);
+static u8 tx_bufs[NUM_TX][BUF_SIZE] ALIGNED(64);
 static u32 rx_idx;
 static u32 tx_idx;
 static u8 mac_addr[6];
@@ -397,9 +397,10 @@ bool macb_init(void) {
     mw(NCFGR, NCFGR_GBE | NCFGR_FD | NCFGR_BIG |
               NCFGR_CLK_DIV64 | NCFGR_CAF | NCFGR_RXCOEN);
 
-    /* DMA config: fixed burst len 16, RX buffer size = BUF_SIZE/64 */
-    mw(DMACFG, (16 << DMACFG_FBLDO_SHIFT) |
-               ((BUF_SIZE / 64) << DMACFG_RXBS_SHIFT));
+    /* DMA config: enable full store-and-forward for TX, set RX buffer size */
+    mw(DMACFG, (1 << 10) |                       /* TXPBMS: full packet buffer */
+               (16 << DMACFG_FBLDO_SHIFT) |       /* burst length 16 */
+               ((BUF_SIZE / 64) << DMACFG_RXBS_SHIFT)); /* RX buf = 2048 */
 
     /* USRIO: RGMII mode + clock enable */
     mw(USRIO, USRIO_RGMII | USRIO_CLKEN);
@@ -557,6 +558,8 @@ bool macb_init(void) {
 }
 
 /* ── Send ── */
+static u32 tx_send_count;
+
 bool macb_send(const u8 *frame, u32 len) {
     if (len > BUF_SIZE || len == 0) return false;
 
@@ -585,6 +588,34 @@ bool macb_send(const u8 *frame, u32 len) {
 
     /* Trigger TX */
     mw(NCR, mr(NCR) | NCR_TSTART);
+
+    /* Log first few TX attempts */
+    if (tx_send_count < 5) {
+        uart_puts("[macb] TX#");
+        uart_hex(tx_send_count);
+        uart_puts(" idx=");
+        uart_hex(tx_idx);
+        uart_puts(" len=");
+        uart_hex(len);
+        uart_puts(" ctrl=");
+        uart_hex(ctrl);
+        uart_puts(" addr=");
+        uart_hex(tx_ring[tx_idx].addr);
+        uart_puts("\n");
+        /* Wait a moment then check if MAC consumed it */
+        delay_cycles(10000);
+        dcache_invalidate_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
+        uart_puts("[macb] TX post: ctrl=");
+        uart_hex(tx_ring[tx_idx].ctrl);
+        uart_puts(" TSR=");
+        uart_hex(mr(TSR));
+        uart_puts(" ISR=");
+        uart_hex(mr(ISR));
+        uart_puts(" NSR=");
+        uart_hex(mr(NSR));
+        uart_puts("\n");
+    }
+    tx_send_count++;
 
     tx_idx = (tx_idx + 1) % NUM_TX;
     return true;
@@ -634,5 +665,8 @@ void macb_get_mac(u8 *mac) {
 
 /* ── Link status ── */
 bool macb_link_up(void) {
+    /* BMSR link status (bit 2) is latching-low: read twice to get current state.
+     * First read clears any latched-low condition, second gives live status. */
+    (void)mdio_read(phy_addr, 0x01);
     return (mdio_read(phy_addr, 0x01) & (1 << 2)) != 0;
 }
