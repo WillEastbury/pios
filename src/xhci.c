@@ -73,11 +73,16 @@
 
 /* ---- Runtime Registers (Interrupter 0) ---- */
 
+#define IR0_IMAN            0x20
+#define IR0_IMOD            0x24
 #define IR0_ERSTSZ          0x28
 #define IR0_ERSTBA_LO       0x30
 #define IR0_ERSTBA_HI       0x34
 #define IR0_ERDP_LO         0x38
 #define IR0_ERDP_HI         0x3C
+
+#define IMAN_IE             (1U << 1)
+#define IMAN_IP             (1U << 0)
 
 /* ---- TRB Definitions ---- */
 
@@ -406,6 +411,10 @@ bool xhci_init(void) {
     rtw(IR0_ERSTBA_LO, (u32)eb);
     rtw(IR0_ERSTBA_HI, (u32)(eb >> 32));
 
+    /* Enable interrupter 0 — required for the controller to write events */
+    rtw(IR0_IMOD, 0);          /* no interrupt moderation */
+    rtw(IR0_IMAN, IMAN_IE);    /* enable event delivery */
+
     /* EP ring pool */
     for (u32 i = 0; i < NUM_EP_RINGS; i++) ep_used[i] = false;
     for (u32 i = 0; i < 32; i++) dci_map[i] = 0xFF;
@@ -433,8 +442,8 @@ bool xhci_init(void) {
     uart_hex(mmio_read(PCIE_RC_BASE + 0x4034));
     uart_puts(" BAR2_HI=");
     uart_hex(mmio_read(PCIE_RC_BASE + 0x4038));
-    uart_puts(" REMAP=");
-    uart_hex(mmio_read(PCIE_RC_BASE + 0x40B4));
+    uart_puts(" IMAN=");
+    uart_hex(mmio_read(rt_base + IR0_IMAN));
     uart_puts("\n");
     return true;
 }

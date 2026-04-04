@@ -173,87 +173,61 @@ void pcie_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val) {
 bool pcie_init(void) {
     u32 tmp;
 
-    uart_puts("[pcie] Init BCM2712 PCIe2 RC...\n");
+    /*
+     * The GPU firmware fully configures PCIe before handing off:
+     *  - SerDes powered, link trained, PERST# deasserted
+     *  - Outbound ATU: CPU 0x1F00000000 → PCIe target
+     *  - Inbound BAR2: RP1 DMA → system RAM
+     *  - RP1 BAR1 programmed, memory + bus master enabled
+     *
+     * We do NOT reset or reprogram — just verify and use.
+     */
 
-    /* 1. Assert bridge + endpoint reset */
-    bridge_reset(true);
-    perst_set(true);
-    timer_delay_us(200);
-
-    /* 2. Deassert bridge reset (controller out of reset) */
-    bridge_reset(false);
-
-    /* 3. Power up SerDes (clear IDDQ power-down bit) */
-    tmp = pr(HARD_DEBUG);
-    tmp &= ~SERDES_IDDQ;
-    pw(HARD_DEBUG, tmp);
-    timer_delay_us(200);
-
-    /* 4. Configure MISC_CTRL */
-    tmp = pr(MISC_MISC_CTRL);
-    tmp |= MCTRL_SCB_ACCESS_EN;    /* SCB access enable */
-    tmp |= MCTRL_CFG_READ_UR;      /* return UR on bad config reads */
-    tmp |= MCTRL_RCB_MPS;          /* MPS mode */
-    tmp |= MCTRL_RCB_64B;          /* 64-byte read completion boundary */
-    tmp = (tmp & ~MCTRL_MAX_BURST_MASK) | MCTRL_MAX_BURST_512;
-    pw(MISC_MISC_CTRL, tmp);
-
-    /* 5. Set RC class code to PCI-PCI Bridge (0x060400) */
-    tmp = pr(RC_CFG_PRIV1_ID_VAL3);
-    tmp = (tmp & ~0xFFFFFFU) | 0x060400U;
-    pw(RC_CFG_PRIV1_ID_VAL3, tmp);
-
-    /* 6. Bus numbers: primary=0, secondary=1, subordinate=1 */
-    pw(PCI_REG_BUS_NUM, 0x00010100);
-    dmb();
-
-    /* 7. Outbound ATU window 0: CPU 0x1F00000000 → PCIe 0x80000000 */
-    set_outbound_win(PCIE_CPU_WIN_BASE, PCIE_TARGET_ADDR, PCIE_CPU_WIN_SIZE);
-
-    /* 7b. Read back inbound (RC BAR) config left by firmware.
-     * The GPU firmware configures inbound DMA windows during boot.
-     * We log them but do NOT reconfigure — changing these can break RP1. */
-    uart_puts("[pcie] Inbound BAR2_LO=");
-    uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
-    uart_puts(" BAR2_HI=");
-    uart_hex(pr(MISC_RC_BAR2_CONFIG_HI));
-    uart_puts(" REMAP=");
-    uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP));
-    uart_puts("\n");
-
-    /* 8. UBUS/AXI bridge: suppress error responses, set timeouts */
-    tmp = pr(MISC_UBUS_CTRL);
-    tmp |= UBUS_REPLY_ERR_DIS;
-    tmp |= UBUS_REPLY_DECERR_DIS;
-    pw(MISC_UBUS_CTRL, tmp);
-    pw(MISC_AXI_READ_ERROR_DATA, 0xFFFFFFFF);
-    pw(MISC_UBUS_TIMEOUT, 0x0B2D0000);           /* ~250ms */
-    pw(MISC_RC_CFG_RETRY_TIMEOUT, 0x0ABA0000);   /* ~240ms */
-
-    /* 9. Deassert PERST# — endpoint begins link training */
-    perst_set(false);
-    timer_delay_ms(100);  /* PCIe spec: min 100ms after PERST# deassert */
-
-    /* 10. Poll for link up (up to 100ms more) */
-    for (u32 i = 0; i < 20; i++) {
-        if (pcie_link_up())
-            break;
-        timer_delay_ms(5);
-    }
-
+    /* Verify link is up */
     if (!pcie_link_up()) {
-        uart_puts("[pcie] Link FAILED (status=");
+        uart_puts("[pcie] Link DOWN — firmware did not init?\n");
+        uart_puts("[pcie] status=");
         uart_hex(pr(MISC_PCIE_STATUS));
-        uart_puts(")\n");
+        uart_puts("\n");
         return false;
     }
 
-    /* 11. Enable Memory Space + Bus Master on RC */
+    /* Verify RP1 is on bus 1 */
+    u32 id = pcie_cfg_read(1, 0, 0, 0x00);
+    if (id == 0xFFFFFFFF || id == 0x00000000) {
+        uart_puts("[pcie] No device on bus 1\n");
+        return false;
+    }
+    u16 vendor = (u16)(id & 0xFFFF);
+    u16 device = (u16)((id >> 16) & 0xFFFF);
+    if (vendor != RP1_VENDOR_ID || device != RP1_DEVICE_ID) {
+        uart_puts("[pcie] Unexpected device: ");
+        uart_hex(id);
+        uart_puts("\n");
+        return false;
+    }
+
+    /* Ensure bus mastering is on (firmware should have set it) */
+    tmp = pcie_cfg_read(1, 0, 0, 0x04);
+    if (!(tmp & (PCI_CMD_MEM | PCI_CMD_MASTER))) {
+        tmp |= PCI_CMD_MEM | PCI_CMD_MASTER;
+        pcie_cfg_write(1, 0, 0, 0x04, tmp);
+    }
     tmp = pr(PCI_REG_CMD);
-    tmp |= PCI_CMD_MEM | PCI_CMD_MASTER;
-    pw(PCI_REG_CMD, tmp);
+    if (!(tmp & (PCI_CMD_MEM | PCI_CMD_MASTER))) {
+        tmp |= PCI_CMD_MEM | PCI_CMD_MASTER;
+        pw(PCI_REG_CMD, tmp);
+    }
     dmb();
 
-    uart_puts("[pcie] Link UP\n");
+    /*
+     * Do NOT touch outbound ATU, BAR1, or any config registers.
+     * Firmware already configured everything. Just use it.
+     */
+
+    uart_puts("[pcie] Link UP (firmware), RP1 ");
+    uart_hex(id);
+    uart_puts("\n");
+
     return true;
 }
