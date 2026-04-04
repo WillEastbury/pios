@@ -45,6 +45,11 @@
 #define MISC_RC_BAR3_CONFIG_LO      0x403C
 #define MISC_UBUS_BAR2_CONFIG_REMAP 0x40B4
 
+/* Vendor-specific config: BAR2 endian mode */
+#define RC_CFG_VENDOR_SPECIFIC_REG1 0x0188
+#define  VENDOR_SPECIFIC_REG1_ENDIAN_MODE_BAR2_MASK 0xC
+#define  VENDOR_SPECIFIC_REG1_LITTLE_ENDIAN         0x0
+
 #define EXT_CFG_DATA                0x8000
 #define EXT_CFG_INDEX               0x9000
 #define RGR1_SW_INIT_1              0x9210
@@ -173,11 +178,6 @@ void pcie_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val) {
 bool pcie_init(void) {
     u32 tmp;
 
-    /* Save firmware inbound DMA config before bridge reset */
-    u32 fw_bar2_lo = pr(MISC_RC_BAR2_CONFIG_LO);
-    u32 fw_bar2_hi = pr(MISC_RC_BAR2_CONFIG_HI);
-    u32 fw_remap   = pr(MISC_UBUS_BAR2_CONFIG_REMAP);
-
     bridge_reset(true);
     perst_set(true);
     timer_delay_us(200);
@@ -188,9 +188,15 @@ bool pcie_init(void) {
     pw(HARD_DEBUG, tmp);
     timer_delay_us(200);
 
+    /*
+     * MISC_CTRL: SCB_ACCESS_EN, CFG_READ_UR, burst=128B (BCM2712),
+     * RCB_MPS, RCB_64B, and SCB0_SIZE for 4GB RAM.
+     * SCB0_SIZE bits [31:27] = ilog2(4GB) - 15 = 17
+     */
     tmp = pr(MISC_MISC_CTRL);
     tmp |= MCTRL_SCB_ACCESS_EN | MCTRL_CFG_READ_UR | MCTRL_RCB_MPS | MCTRL_RCB_64B;
-    tmp = (tmp & ~MCTRL_MAX_BURST_MASK) | MCTRL_MAX_BURST_512;
+    tmp = (tmp & ~MCTRL_MAX_BURST_MASK) | (0x1U << 20);
+    tmp = (tmp & ~0xF8000000U) | (17U << 27);  /* SCB0_SIZE = 17 for 4GB */
     pw(MISC_MISC_CTRL, tmp);
 
     tmp = pr(RC_CFG_PRIV1_ID_VAL3);
@@ -202,11 +208,23 @@ bool pcie_init(void) {
 
     set_outbound_win(PCIE_CPU_WIN_BASE, PCIE_TARGET_ADDR, PCIE_CPU_WIN_SIZE);
 
-    /* Restore firmware inbound DMA window */
-    pw(MISC_RC_BAR2_CONFIG_LO, fw_bar2_lo);
-    pw(MISC_RC_BAR2_CONFIG_HI, fw_bar2_hi);
-    pw(MISC_UBUS_BAR2_CONFIG_REMAP, fw_remap);
+    /*
+     * Program inbound DMA window (BAR2) from scratch.
+     * Pi 5: 4GB RAM, identity mapped (PCIe addr 0 = CPU addr 0).
+     * encode_ibar_size(4GB) = ilog2(4GB)-15 = 17 = 0x11
+     * BAR2_CONFIG_LO = lower32(pcie_offset) | encoded_size
+     * BAR2_CONFIG_HI = upper32(pcie_offset)
+     */
+    pw(MISC_RC_BAR2_CONFIG_LO, 0x00000000 | 0x11);  /* offset=0, size=4GB */
+    pw(MISC_RC_BAR2_CONFIG_HI, 0x00000000);          /* high bits of offset */
+    pw(MISC_UBUS_BAR2_CONFIG_REMAP, 0x00000001);     /* access enable */
 
+    /* Set BAR2 to little-endian mode (required for DMA) */
+    tmp = pr(RC_CFG_VENDOR_SPECIFIC_REG1);
+    tmp &= ~VENDOR_SPECIFIC_REG1_ENDIAN_MODE_BAR2_MASK;
+    pw(RC_CFG_VENDOR_SPECIFIC_REG1, tmp);
+
+    /* Suppress AXI error responses (BCM2712) */
     tmp = pr(MISC_UBUS_CTRL);
     tmp |= UBUS_REPLY_ERR_DIS | UBUS_REPLY_DECERR_DIS;
     pw(MISC_UBUS_CTRL, tmp);
@@ -231,8 +249,12 @@ bool pcie_init(void) {
     pw(PCI_REG_CMD, tmp);
     dmb();
 
-    uart_puts("[pcie] Link UP, BAR2=");
+    uart_puts("[pcie] Link UP, MISC_CTRL=");
+    uart_hex(pr(MISC_MISC_CTRL));
+    uart_puts(" BAR2=");
     uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
+    uart_puts("/");
+    uart_hex(pr(MISC_RC_BAR2_CONFIG_HI));
     uart_puts("\n");
     return true;
 }
