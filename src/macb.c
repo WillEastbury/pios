@@ -428,7 +428,7 @@ bool macb_init(void) {
     dcache_clean_range((u64)(usize)rx_bufs, sizeof(rx_bufs));
 
     mw(RBQP, (u32)(usize)&rx_ring[0]);
-    mw(RBQPH, 0);  /* upper 32 bits — our buffers are in low 4GB */
+    mw(RBQPH, 0);  /* upper 32 bits — keep at 0, RP1 bus adds 0x10 prefix */
 
     /* ── Setup TX ring ── */
     for (u32 i = 0; i < NUM_TX; i++) {
@@ -443,7 +443,7 @@ bool macb_init(void) {
     dcache_clean_range((u64)(usize)tx_ring, sizeof(tx_ring));
 
     mw(TBQP, (u32)(usize)&tx_ring[0]);
-    mw(TBQPH, 0);
+    mw(TBQPH, 0);  /* upper 32 bits — keep at 0, RP1 bus adds 0x10 prefix */
 
     /* Enable MDIO + RX + TX */
     mw(NCR, NCR_MPE | NCR_RE | NCR_TE);
