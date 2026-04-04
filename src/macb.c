@@ -122,12 +122,10 @@
 #define BUF_SIZE 2048
 
 /* ── Descriptors and buffers (64-byte aligned for DMA coherency) ── */
-/* With ADDR64, GEM uses 16-byte descriptors: addr_lo, ctrl, addr_hi, rsvd */
+/* 32-bit descriptors: addr + ctrl. No ADDR64 — use direct PCIe addressing. */
 struct macb_desc {
     u32 addr;
     u32 ctrl;
-    u32 addr_hi;
-    u32 rsvd;
 } PACKED;
 
 static struct macb_desc rx_ring[NUM_RX] ALIGNED(64);
@@ -400,9 +398,8 @@ bool macb_init(void) {
     mw(NCFGR, NCFGR_GBE | NCFGR_FD | NCFGR_BIG |
               NCFGR_CLK_DIV64 | NCFGR_CAF | NCFGR_RXCOEN);
 
-    /* DMA config: enable 64-bit addressing, store-and-forward TX, set RX buffer size */
-    mw(DMACFG, DMACFG_ADDR64 |                    /* 64-bit DMA addressing */
-               (1 << 10) |                        /* TXPBMS: full packet buffer */
+    /* DMA config: store-and-forward TX, set RX buffer size. No ADDR64. */
+    mw(DMACFG, (1 << 10) |                       /* TXPBMS: full packet buffer */
                (16 << DMACFG_FBLDO_SHIFT) |       /* burst length 16 */
                ((BUF_SIZE / 64) << DMACFG_RXBS_SHIFT)); /* RX buf = 2048 */
 
@@ -418,11 +415,9 @@ bool macb_init(void) {
              ((u32)mac_addr[2] << 16) | ((u32)mac_addr[3] << 24));
     mw(SA1T, (u32)mac_addr[4] | ((u32)mac_addr[5] << 8));
 
-    /* ── Setup RX ring (64-bit descriptors) ── */
+    /* ── Setup RX ring (32-bit descriptors) ── */
     for (u32 i = 0; i < NUM_RX; i++) {
         rx_ring[i].addr = (u32)(usize)&rx_bufs[i][0];
-        rx_ring[i].addr_hi = 0x10;  /* DMA high bits for PCIe translation */
-        rx_ring[i].rsvd = 0;
         if (i == NUM_RX - 1)
             rx_ring[i].addr |= RX_ADDR_WRAP;
         rx_ring[i].ctrl = 0;
@@ -434,13 +429,11 @@ bool macb_init(void) {
     dcache_clean_range((u64)(usize)rx_bufs, sizeof(rx_bufs));
 
     mw(RBQP, (u32)(usize)&rx_ring[0]);
-    mw(RBQPH, 0x10);  /* Queue base high bits */
+    mw(RBQPH, 0);
 
-    /* ── Setup TX ring (64-bit descriptors) ── */
+    /* ── Setup TX ring (32-bit descriptors) ── */
     for (u32 i = 0; i < NUM_TX; i++) {
         tx_ring[i].addr = (u32)(usize)&tx_bufs[i][0];
-        tx_ring[i].addr_hi = 0x10;  /* DMA high bits for PCIe translation */
-        tx_ring[i].rsvd = 0;
         tx_ring[i].ctrl = TX_STAT_USED;  /* SW owns initially */
         if (i == NUM_TX - 1)
             tx_ring[i].ctrl |= TX_STAT_WRAP;
@@ -451,7 +444,7 @@ bool macb_init(void) {
     dcache_clean_range((u64)(usize)tx_ring, sizeof(tx_ring));
 
     mw(TBQP, (u32)(usize)&tx_ring[0]);
-    mw(TBQPH, 0x10);  /* Queue base high bits */
+    mw(TBQPH, 0);
 
     /* Enable MDIO + RX + TX */
     mw(NCR, NCR_MPE | NCR_RE | NCR_TE);
@@ -589,10 +582,11 @@ bool macb_send(const u8 *frame, u32 len) {
     /* Clear USED bit — give to MAC */
     tx_ring[tx_idx].ctrl = ctrl;
 
-    /* Flush TX buffer + descriptor to RAM so MAC can read them via DMA */
-    dcache_clean_range((u64)(usize)dst, len);
-    dcache_clean_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
-    dsb();
+    /* Flush TX buffer + entire TX ring to RAM so MAC can read them via DMA.
+     * Use aggressive flush: clean whole ring + whole buffer pool + DSB. */
+    dcache_clean_range((u64)(usize)tx_bufs, sizeof(tx_bufs));
+    dcache_clean_range((u64)(usize)tx_ring, sizeof(tx_ring));
+    __asm__ volatile("dsb sy" ::: "memory");
 
     /* Trigger TX */
     mw(NCR, mr(NCR) | NCR_TSTART);
