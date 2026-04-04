@@ -121,10 +121,13 @@
 #define NUM_TX  16
 #define BUF_SIZE 2048
 
-/* ── Descriptors and buffers (8-byte aligned) ── */
+/* ── Descriptors and buffers (64-byte aligned for DMA coherency) ── */
+/* With ADDR64, GEM uses 16-byte descriptors: addr_lo, ctrl, addr_hi, rsvd */
 struct macb_desc {
     u32 addr;
     u32 ctrl;
+    u32 addr_hi;
+    u32 rsvd;
 } PACKED;
 
 static struct macb_desc rx_ring[NUM_RX] ALIGNED(64);
@@ -397,8 +400,9 @@ bool macb_init(void) {
     mw(NCFGR, NCFGR_GBE | NCFGR_FD | NCFGR_BIG |
               NCFGR_CLK_DIV64 | NCFGR_CAF | NCFGR_RXCOEN);
 
-    /* DMA config: enable full store-and-forward for TX, set RX buffer size */
-    mw(DMACFG, (1 << 10) |                       /* TXPBMS: full packet buffer */
+    /* DMA config: enable 64-bit addressing, store-and-forward TX, set RX buffer size */
+    mw(DMACFG, DMACFG_ADDR64 |                    /* 64-bit DMA addressing */
+               (1 << 10) |                        /* TXPBMS: full packet buffer */
                (16 << DMACFG_FBLDO_SHIFT) |       /* burst length 16 */
                ((BUF_SIZE / 64) << DMACFG_RXBS_SHIFT)); /* RX buf = 2048 */
 
@@ -414,9 +418,11 @@ bool macb_init(void) {
              ((u32)mac_addr[2] << 16) | ((u32)mac_addr[3] << 24));
     mw(SA1T, (u32)mac_addr[4] | ((u32)mac_addr[5] << 8));
 
-    /* ── Setup RX ring ── */
+    /* ── Setup RX ring (64-bit descriptors) ── */
     for (u32 i = 0; i < NUM_RX; i++) {
         rx_ring[i].addr = (u32)(usize)&rx_bufs[i][0];
+        rx_ring[i].addr_hi = 0x10;  /* DMA high bits for PCIe translation */
+        rx_ring[i].rsvd = 0;
         if (i == NUM_RX - 1)
             rx_ring[i].addr |= RX_ADDR_WRAP;
         rx_ring[i].ctrl = 0;
@@ -428,11 +434,13 @@ bool macb_init(void) {
     dcache_clean_range((u64)(usize)rx_bufs, sizeof(rx_bufs));
 
     mw(RBQP, (u32)(usize)&rx_ring[0]);
-    mw(RBQPH, 0);  /* upper 32 bits — keep at 0, RP1 bus adds 0x10 prefix */
+    mw(RBQPH, 0x10);  /* Queue base high bits */
 
-    /* ── Setup TX ring ── */
+    /* ── Setup TX ring (64-bit descriptors) ── */
     for (u32 i = 0; i < NUM_TX; i++) {
         tx_ring[i].addr = (u32)(usize)&tx_bufs[i][0];
+        tx_ring[i].addr_hi = 0x10;  /* DMA high bits for PCIe translation */
+        tx_ring[i].rsvd = 0;
         tx_ring[i].ctrl = TX_STAT_USED;  /* SW owns initially */
         if (i == NUM_TX - 1)
             tx_ring[i].ctrl |= TX_STAT_WRAP;
@@ -443,7 +451,7 @@ bool macb_init(void) {
     dcache_clean_range((u64)(usize)tx_ring, sizeof(tx_ring));
 
     mw(TBQP, (u32)(usize)&tx_ring[0]);
-    mw(TBQPH, 0);  /* upper 32 bits — keep at 0, RP1 bus adds 0x10 prefix */
+    mw(TBQPH, 0x10);  /* Queue base high bits */
 
     /* Enable MDIO + RX + TX */
     mw(NCR, NCR_MPE | NCR_RE | NCR_TE);
