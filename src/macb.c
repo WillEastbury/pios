@@ -468,7 +468,37 @@ bool macb_init(void) {
     mw(TBQP, (u32)(usize)&tx_ring[0]);
     mw(TBQPH, 0x10);
 
-    /* Enable MDIO + RX + TX */
+    /* ── Initialize extra hardware queues with dummy descriptors ──
+     * The GEM has multiple queues. Uninitialized queues can prevent
+     * queue 0 from working. Set all extra queues to a single USED desc. */
+    {
+        static struct macb_desc dummy_desc ALIGNED(64);
+        dummy_desc.addr = 0;
+        dummy_desc.ctrl = TX_STAT_USED;
+        dummy_desc.addr_hi = 0;
+        dummy_desc.rsvd = 0;
+        __asm__ volatile("dsb sy" ::: "memory");
+        dcache_clean_range((u64)(usize)&dummy_desc, sizeof(dummy_desc));
+        __asm__ volatile("dsb sy" ::: "memory");
+
+        u32 dcfg6 = mr(0x0294);  /* DCFG6: queue mask in bits [7:0] */
+        u32 queue_mask = (dcfg6 & 0xFF) | 0x01;
+        u32 dummy_lo = (u32)(usize)&dummy_desc;
+        u32 dummy_hi = 0x10;
+        for (u32 q = 1; q < 8; q++) {
+            if (queue_mask & (1 << q)) {
+                mw(0x0440 + ((q-1) << 2), dummy_lo);  /* GEM_TBQP(q) */
+                mw(0x0480 + ((q-1) << 2), dummy_lo);  /* GEM_RBQP(q) */
+                mw(0x04C8, dummy_hi);                  /* GEM_TBQPH */
+                mw(0x04D4, dummy_hi);                  /* GEM_RBQPH */
+            }
+        }
+        uart_puts("[macb] Multi-queue init: mask=");
+        uart_hex(queue_mask);
+        uart_puts("\n");
+    }
+
+    /* Enable RX + TX (no MPE — enable for MDIO ops only) */
     mw(NCR, NCR_MPE | NCR_RE | NCR_TE);
 
     if (!phy_select())
