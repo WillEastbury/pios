@@ -43,14 +43,14 @@ struct fifo {
 
 ## Message Types
 
-### Disk I/O (User → Core 1 → User)
+### Disk I/O (User → Core 0 → User)
 
 | Type | Direction | Fields |
 |------|-----------|--------|
-| `MSG_DISK_READ` (1) | User → Core 1 | param=LBA, buffer=dest ptr, length=block count |
-| `MSG_DISK_WRITE` (2) | User → Core 1 | param=LBA, buffer=src ptr, length=block count |
-| `MSG_DISK_DONE` (3) | Core 1 → User | status=0, buffer=data ptr |
-| `MSG_DISK_ERROR` (4) | Core 1 → User | status=error code |
+| `MSG_DISK_READ` (1) | User → Core 0 | param=LBA, buffer=dest ptr, length=block count |
+| `MSG_DISK_WRITE` (2) | User → Core 0 | param=LBA, buffer=src ptr, length=block count |
+| `MSG_DISK_DONE` (3) | Core 0 → User | status=0, buffer=data ptr |
+| `MSG_DISK_ERROR` (4) | Core 0 → User | status=error code |
 
 ### Network I/O (User → Core 0 → User)
 

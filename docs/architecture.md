@@ -12,51 +12,53 @@ PIOS targets the **Raspberry Pi 5** exclusively:
 
 ## Core Assignment
 
-PIOS uses a **static partitioning** model. Each core runs a single dedicated role. There is no scheduler on cores 0-1; they are infinite polling loops.
+PIOS uses a **static partitioning** model. Each core runs a single dedicated role. Core 0 is an infinite polling loop; cores 1-3 run preemptive user schedulers.
 
 ```
 ┌────────────────────────────────────────────────┐
 │              PIOS Microkernel                  │
 ├──────────┬──────────┬──────────┬──────────────┤
 │  Core 0  │  Core 1  │  Core 2  │   Core 3    │
-│ NETWORK  │ DISK I/O │  USER 0  │   USER 1    │
-│          │          │          │              │
-│ net_poll │ FIFO→SD  │ wfe/app  │  wfe/app    │
-│ FIFO svc │ FIFO rpy │ FIFO req │  FIFO req   │
+│KERNEL+NET│  USER M  │  USER 0  │   USER 1    │
+│ +DISK svc│          │          │              │
+│ net_poll │ preempt  │ preempt  │  preempt    │
+│ FIFO svc │ sched    │ sched    │  sched      │
 ├──────────┴──────────┴──────────┴──────────────┤
 │         Lock-free SPSC FIFO Layer             │
 ├──────────┬──────────┬─────────────────────────┤
-│  GENET   │  SDHCI   │ VideoCore / DMA / GIC   │
-│  MAC/PHY │  SD Card │ Framebuffer / Timer     │
+│  MACB/   │  EMMC2   │ VideoCore / DMA / GIC   │
+│  GEM NIC │  SD Card │ Framebuffer / Timer     │
+│ (RP1 PCIe│          │ USB/xHCI (RP1 PCIe)     │
 ├──────────┴──────────┴─────────────────────────┤
 │           BCM2712 + RP1 Hardware              │
 └───────────────────────────────────────────────┘
 ```
 
-### Core 0 — Network
-- Owns the GENET v5 Ethernet MAC exclusively
-- Tight polling loop: `genet_recv()` → validate → dispatch → `genet_send()`
-- Services UDP send requests from user cores via FIFO
+### Core 0 — Kernel + Network + Disk
+- Owns the Cadence GEM/MACB Ethernet MAC (on RP1 southbridge) exclusively
+- Tight polling loop: `nic_recv()` → validate → dispatch → `nic_send()`
+- Services UDP/TCP send requests from user cores via FIFO
 - Handles ICMP echo reply (rate-limited)
+- Handles disk I/O FIFO requests (`MSG_DISK_READ`/`MSG_DISK_WRITE`) — `CORE_DISK = CORE_NET = 0`
+- Runs serial console REPL on RP1 UART0
 - Never sleeps, never blocks
 
-### Core 1 — Disk I/O
-- Owns the SDHCI SD card controller exclusively
-- Waits for FIFO messages from user cores (MSG_DISK_READ/WRITE)
-- Performs SD block I/O, replies with MSG_DISK_DONE/ERROR
-- Sleeps via `wfe()` when FIFO is empty
+### Core 1 — User (USERM)
+- 16MB private RAM, initialised environment
+- Runs a preemptive process scheduler (timer quanta @ 1kHz, default 5ms)
+- Communicates with Core 0 Net/Disk through FIFO messages
 
-### Cores 2-3 — User
+### Cores 2-3 — User (USER0 / USER1)
 - 16MB private RAM each, initialised environment
-- Communicate with Net/Disk through FIFO messages
-- Currently idle (`wfe()`), designed for application code
+- Run preemptive process schedulers (same as Core 1)
+- Communicate with Core 0 Net/Disk through FIFO messages
 
 ## Memory Map
 
 ```
 Physical Address        Size    Region              Cacheability
 ────────────────────────────────────────────────────────────────
-0x0000_0000_0008_0000   ~15KB   Kernel .text+.rodata Normal WB
+0x0000_0000_0008_0000   ~240KB  Kernel .text+.rodata Normal WB
 0x0000_0000_001x_xxxx   ~1MB    BSS (stacks, bufs)   Normal WB
 0x0000_0000_0020_0000   16MB    Core 0 private        Normal WB
 0x0000_0000_0120_0000   16MB    Core 1 private        Normal WB
@@ -133,23 +135,41 @@ _start (start.S)
 
 ```
 kernel_main (kernel.c)
-  1.  uart_init()           PL011 serial TX+RX
-  2.  exception_init()      Install VBAR_EL1
-  3.  gic_init()            GIC-400 distributor + CPU interface
-  4.  mmu_init()            Page tables → SCTLR M+C+I = ON
-  5.  timer_init(1000)      1kHz virtual timer via GIC
-  6.  daifclr #2            Unmask IRQs
-  7.  dma_init()            6 DMA channels
-  8.  fb_init(1280,720)     HDMI framebuffer via mailbox
-  9.  fifo_init_all()       Zero shared FIFO region
-  10. sd_init()             SDHCI card detection + setup
-  11. genet_init()          Ethernet MAC + PHY autoneg
-  12. net_init()            IP/UDP/ICMP stack (static config)
-  13. tensor_init()         QPU enable + NEON tensor ops
-  14. core_env_init()       Core 0 environment
-  15. boot_diag()           HDMI diagnostic screen
-  16. core_start_all()      PSCI CPU_ON for cores 1-3
-  17. core0_main()          Enter network poll loop (never returns)
+  [EL1 only]
+  1.  exception_init()      Install VBAR_EL1
+  2.  gic_init()            GIC-400 distributor + CPU interface
+  3.  timer_init(1000)      1kHz virtual timer via GIC
+  4.  watchdog_init(5000)   5s per-core heartbeat watchdog
+  5.  daifclr #2            Unmask IRQs
+  [All ELs]
+  6.  dma_init()            6 DMA channels
+  7.  pcie_init()           PCIe root complex (RC)
+  8.  rp1_init()            RP1 southbridge BAR map
+  9.  rp1_clk_init()        RP1 clock tree
+  10. rp1_gpio_init()       RP1 GPIO controller
+  11. uart_init()           RP1 PL011 UART0 (serial console)
+  12. usb_init()            xHCI USB host on RP1
+  13. fifo_init_all()       Zero shared FIFO region
+  14. ipc_queue_init()      In-memory queue/stack IPC
+  15. ipc_stream_init()     Event stream IPC
+  16. ipc_proc_init()       Kernel-enforced FIFO + SHM
+  17. pipe_init()           Unified virtual pipe layer
+  18. sd_init()             EMMC2 SDHCI card detection + setup
+  19. bcache_init()         SD block cache
+  20. walfs_init()          WAL filesystem + integrity verify
+  21. principal_init()      Principal / capability store
+  22. picowal_db_init()     Picowal KV store
+  23. nic_init()            Cadence GEM/MACB Ethernet (RP1)
+  24. net_init()            IP/UDP/TCP/ICMP stack (static config)
+  25. dns_init()            DNS resolver
+  26. tensor_init()         QPU enable + NEON tensor ops
+  27. core_env_init()       Core 0 environment
+  28. ksem_init_core()      Kernel semaphores for Core 0
+  29. workq_init_core()     Deferred work queue for Core 0
+  30. module_init()         Loadable module table
+  31. setup_run()           First-boot setup (if WALFS online)
+  32. core_start_all()      PSCI CPU_ON for cores 1-3
+  33. core0_main()          Enter network poll + serial console (never returns)
 ```
 
 ### Secondary Core Boot (Cores 1-3)
@@ -164,12 +184,12 @@ SECONDARY_SETUP (start.S)
   ├── SP = __stack_top_coreN
   ├── SP_EL1 = SP - 16KB
   ├── VBAR_EL1 = vector_table (shared)
-  ├── TTBR0_EL1 = shared_ttbr0 (from core 0's mmu_init)
+  ├── TTBR0_EL1 = shared_ttbr0 (from core 0's MMU init in start.S)
   ├── MAIR_EL1, TCR_EL1 = shared values
   ├── tlbi vmalle1 + DSB + ISB
   ├── SCTLR_EL1: MMU + caches ON
   ├── daifclr #2 (unmask IRQs)
-  └── bl coreN_main
+  └── bl coreN_main → core_env_init → proc_init → timer_init → proc_schedule
 ```
 
 ## Exception Handling

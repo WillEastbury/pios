@@ -20,7 +20,7 @@
 git clone https://github.com/WillEastbury/pios.git
 cd pios
 make CROSS=aarch64-none-elf-
-# Output: kernel8.img (~27KB)
+# Output: kernel8.img (~240KB)
 ```
 
 ## Prepare SD Card
@@ -53,7 +53,7 @@ cp config.txt   /mnt/sdcard/
 ├── start4.elf              GPU firmware (loads our kernel)
 ├── fixup4.dat              Memory fixup
 ├── bcm2712-rpi-5-b.dtb     Device tree
-├── kernel8.img             PIOS kernel (~27KB)
+├── kernel8.img             PIOS kernel (~240KB)
 └── config.txt              Boot config
 ```
 
@@ -103,19 +103,31 @@ To find your gateway's MAC, run `arp -a` on another machine on the same network.
 
 ### Expected UART Output
 ```
-PIOS v0.3 booting...
-[kernel] Exceptions + GIC ready
-[mmu] SCTLR_EL1=0x... TTBR0_EL1=0x...
-[mmu] Identity map: low mem + periph, caches ON
-[timer] 0x3E8 Hz tick
-[dma] 6 channels initialised
-[fb] Framebuffer OK
-[fifo] Init OK
-[sd] Card ready: SDHC/SDXC RCA=0x...
-[genet] Link UP
-[net] Hardened stack: IP=0x0A000002 (NO ARP/TCP/DHCP)
-[tensor] NEON float: add/mul/scale/dot/matmul/relu/softmax
-[kernel] All cores running. Entering net loop.
+[uart] RP1 UART online
+
+PIOS Console ready. Type 'help'.
+> 
+```
+
+The HDMI screen shows a colour-coded boot progress panel. Each phase lights up as it completes:
+
+```
+[exc]   vectors installed
+[gic]   distributor + CPU iface ready
+[timer] 1kHz tick running
+[wdog]  armed
+[dma]   6-channel engine ready
+[pcie]  RP1 BAR mapped OK
+[uart]  RP1 UART online
+[usb]   xHCI online
+[fifo]  all channels ready
+[sd]    card detected OK
+[walfs] WALFS online
+[nic]   MACB online
+[net]   IP stack ready
+[gpu]   tensor compute ready
+[smp]   cores 0-3 active
+[pios]  System ready — serial console active
 ```
 
 ### Expected HDMI Output
@@ -134,6 +146,6 @@ ping 10.0.0.2     # Should get ICMP echo replies (rate-limited to 10/sec)
 |---------|-------|-----|
 | No UART output | Wrong pins or baud rate | Check wiring, ensure 115200/8N1 |
 | `[sd] SD init FAILED` | Card not detected | Try a different SD card, ensure FAT32 |
-| `[genet] Link timeout` | No Ethernet connection | Check cable, wait for switch to negotiate |
+| `[nic] MACB init FAILED` | No Ethernet connection or RP1 not up | Check cable; ensure PCIe/RP1 init succeeded |
 | No ICMP replies | Wrong IP or gateway MAC | Verify MY_IP/MY_GW_MAC in kernel.c |
 | Kernel doesn't load | Missing firmware files | Ensure start4.elf + fixup4.dat + DTB on SD |

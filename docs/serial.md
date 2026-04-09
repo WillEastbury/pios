@@ -1,7 +1,6 @@
 # Serial Console Setup
 
-PIOS uses the Pi 5's PL011 UART (GPIO14/15) for serial console I/O. This guide
-covers adapter wiring, terminal configuration, and troubleshooting.
+PIOS uses the RP1 southbridge PL011 UART0 (GPIO14/15) for serial console I/O after PCIe and RP1 initialisation. This guide covers adapter wiring, terminal configuration, and troubleshooting.
 
 ## Serial Port Settings
 
@@ -13,8 +12,7 @@ covers adapter wiring, terminal configuration, and troubleshooting.
 | Parity        | None     |
 | Flow control  | None     |
 
-These are set by `uart_init()` in `src/uart.c` (48 MHz clock, IBRD = 26,
-FBRD = 3, LCRH = 8N1 with FIFO enabled).
+These are set by `uart_init()` in `src/uart.c` / `src/rp1_uart.c` (48 MHz RP1 UART clock, 115200 baud, 8N1, FIFO enabled).
 
 ## Supported Adapters
 
@@ -158,18 +156,13 @@ mode COM3 BAUD=115200 PARITY=n DATA=8 STOP=1
 3. You should see:
 
 ```
-PIOS v0.3 booting...
-[kernel] Exceptions + GIC ready
-[mmu] SCTLR_EL1=0x... TTBR0_EL1=0x...
-[timer] 0x3E8 Hz tick
-[dma] 6 channels initialised
-[fb] Framebuffer OK
-[fifo] Init OK
-[sd] Card ready: SDHC/SDXC RCA=0x...
-[genet] Link UP
-[net] Hardened stack: IP=0x0A000002 (NO ARP/TCP/DHCP)
-[kernel] All cores running. Entering net loop.
+[uart] RP1 UART online
+
+PIOS Console ready. Type 'help'.
+> 
 ```
+
+The full boot progress is shown on the HDMI screen (colour-coded phases). Once the serial console prompt appears, PIOS is fully operational.
 
 ## Troubleshooting
 
