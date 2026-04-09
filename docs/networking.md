@@ -5,7 +5,7 @@
 Minimal, hardened, polling-based. Runs exclusively on Core 0.
 
 ```
-Ethernet Frame (genet.c)
+Ethernet Frame (nic.c / macb.c)
     │
     ▼
 Frame Validation (min size, max size)
@@ -74,7 +74,7 @@ net_send_udp(dst_ip, src_port, dst_port, data, len)
     │   └── UDP checksum = 0 (optional in IPv4)
     │
     ├── Build Ethernet + IP + UDP headers in local TX header buffer
-    └── genet_send_parts(header, payload) for single-pass NIC DMA copy
+    └── nic_send_parts(header, payload) for single-pass NIC DMA copy
 ```
 
 ## TCP Send Fast Path (toe-enable-window)
@@ -83,10 +83,10 @@ Core 0 TCP TX now uses a burst send path that segments directly from the per-con
 
 - Sends up to 4 MSS segments per output pass when window/cwnd permit.
 - Uses direct ring-offset copy into wire frame payload.
-- Uses header/payload split TX (`genet_send_parts`) when payload is contiguous.
+- Uses header/payload split TX (`nic_send_parts`) when payload is contiguous.
 - Keeps retransmit path on the same direct-copy routine.
 - Uses DMA-assisted copies for larger ring/frame moves (`DMA_CHAN_MEMCPY`) with SIMD fallback.
-- Enables a TX checksum offload window for data segments when GENET checksum assist is enabled.
+- Enables a TX checksum offload window for data segments when NIC checksum assist is enabled.
 
 ## RX Fast Path (toe-enable-window)
 
@@ -94,7 +94,7 @@ Core 0 receive polling drains frames in small bursts per `net_poll()` pass (`NET
 
 - Burst receive loop processes up to 4 frames per poll tick.
 - TCP in-order payload ingest uses direct ring writes (`tcp_rx_ingest_in_order`) without extra staging buffers.
-- TCP checksum verification can be skipped only when the per-packet GENET RX status metadata marks checksum-complete for a TCP packet (not just global offload enablement).
+- TCP checksum verification can be skipped only when the per-packet NIC RX status metadata marks checksum-complete for a TCP packet (not just global offload enablement).
 - Existing validation posture remains unchanged: malformed/unsafe packets are still dropped early.
 
 ## FIFO Integration
