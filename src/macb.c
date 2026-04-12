@@ -126,7 +126,7 @@
 /* DAW64 hardware requires 16-byte descriptors.
  * addr_hi = 0x10 because MACB DMA goes RP1→PCIe RC→BAR2 inbound at 0x10_00000000.
  * Circle: PTR_TO_DMA(p) = (uintptr)(p) | GetDMAAddress(PCIE_BUS_MACB) */
-#define MACB_DMA_HI  0x00  /* RP1 DMA via PCIe BAR2 at offset 0 */
+#define MACB_DMA_HI  0x00  /* BAR2 at PCIe 0x00, descriptors use low 32-bit addresses */
 struct macb_desc {
     u32 addr;       /* buffer address + OWN/WRAP bits (RX) */
     u32 ctrl;       /* control/status */
@@ -623,6 +623,32 @@ bool macb_init(void) {
     fb_printf("MACB rxdesc0=%X txdesc0=%X\n", rx_ring[0].addr, tx_ring[0].addr);
     fb_printf("MACB rxbuf0=%X txbuf0=%X\n",
               (u32)(usize)&rx_bufs[0][0], (u32)(usize)&tx_bufs[0][0]);
+    /* ── PCIe BAR2 state (visible here since UART is active) ── */
+    uart_puts("[macb] PCIe BAR2_LO="); uart_hex(mmio_read(0x1000120000ULL + 0x4034));
+    uart_puts(" BAR2_HI="); uart_hex(mmio_read(0x1000120000ULL + 0x4038));
+    uart_puts("\n");
+    uart_puts("[macb] UBUS_REMAP="); uart_hex(mmio_read(0x1000120000ULL + 0x40B4));
+    uart_puts(" REMAP_HI="); uart_hex(mmio_read(0x1000120000ULL + 0x40B0));
+    uart_puts("\n");
+    uart_puts("[macb] MISC_CTRL="); uart_hex(mmio_read(0x1000120000ULL + 0x4008));
+    uart_puts("\n");
+
+    /* ── DMA write-back test: check if MAC can modify descriptor memory ──
+     * Write a canary to rx_ring[NUM_RX-1].ctrl, clear it, wait, read back.
+     * If MAC touched it (e.g. BNA sets descriptor state), we'll see it. */
+    {
+        volatile u32 *test_word = (volatile u32 *)(usize)&rx_ring[0].ctrl;
+        u32 before = *test_word;
+        /* Wait a moment for any pending DMA */
+        __asm__ volatile("dsb sy; isb" ::: "memory");
+        delay_cycles(1000000);
+        __asm__ volatile("dsb sy; isb" ::: "memory");
+        u32 after = *test_word;
+        uart_puts("[macb] DMA test: desc[0].ctrl before="); uart_hex(before);
+        uart_puts(" after="); uart_hex(after);
+        uart_puts(before != after ? " CHANGED!\n" : " unchanged\n");
+    }
+
     uart_puts("[macb] === End Dump ===\n");
 
     return true;

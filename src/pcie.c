@@ -43,7 +43,8 @@
 #define MISC_RC_BAR2_CONFIG_LO      0x4034
 #define MISC_RC_BAR2_CONFIG_HI      0x4038
 #define MISC_RC_BAR3_CONFIG_LO      0x403C
-#define MISC_UBUS_BAR2_CONFIG_REMAP 0x40B4
+#define MISC_UBUS_BAR2_CONFIG_REMAP    0x40B4
+#define MISC_UBUS_BAR2_CONFIG_REMAP_HI 0x40B0
 
 /* Vendor-specific config: BAR2 endian mode */
 #define RC_CFG_VENDOR_SPECIFIC_REG1 0x0188
@@ -178,82 +179,25 @@ void pcie_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val) {
 bool pcie_init(void) {
     u32 tmp;
 
-    bridge_reset(true);
-    perst_set(true);
-    timer_delay_us(200);
-    bridge_reset(false);
-
-    tmp = pr(HARD_DEBUG);
-    tmp &= ~SERDES_IDDQ;
-    pw(HARD_DEBUG, tmp);
-    timer_delay_us(200);
-
-    /*
-     * MISC_CTRL: SCB_ACCESS_EN, CFG_READ_UR, burst=128B (BCM2712),
-     * RCB_MPS, RCB_64B, and SCB0_SIZE for 4GB RAM.
-     * SCB0_SIZE bits [31:27] = ilog2(4GB) - 15 = 17
+    /* ── Don't reset the bridge! ──
+     * Firmware (start4.elf) already configured:
+     * - BAR2 inbound DMA window (covers both 0x00 and 0x10 PCIe ranges)
+     * - UBUS remap for RP1→host RAM translation
+     * - SCB_SIZE, burst, endian mode
+     * - Link training completed
+     * Resetting would wipe all of this and we can't properly recreate
+     * the dual-path config (xHCI at 0x00, MACB at 0x10 via RP1 EP).
      */
-    tmp = pr(MISC_MISC_CTRL);
-    tmp |= MCTRL_SCB_ACCESS_EN | MCTRL_CFG_READ_UR | MCTRL_RCB_MPS | MCTRL_RCB_64B;
-    tmp = (tmp & ~MCTRL_MAX_BURST_MASK) | (0x1U << 20);
-    tmp = (tmp & ~0xF8000000U) | (21U << 27);  /* SCB0_SIZE = 21 for 64GB window */
-    pw(MISC_MISC_CTRL, tmp);
 
-    tmp = pr(RC_CFG_PRIV1_ID_VAL3);
-    tmp = (tmp & ~0xFFFFFFU) | 0x060400U;
-    pw(RC_CFG_PRIV1_ID_VAL3, tmp);
-
-    pw(PCI_REG_BUS_NUM, 0x00010100);
-    dmb();
-
-    set_outbound_win(PCIE_CPU_WIN_BASE, PCIE_TARGET_ADDR, PCIE_CPU_WIN_SIZE);
-
-    /*
-     * Inbound DMA window (BAR2): let firmware's config stand.
-     * Print what firmware set, then only ensure UBUS remap + access are enabled.
-     * Firmware knows the correct dma-ranges translation.
-     */
-    uart_puts("[pcie] FW BAR2_LO="); uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
-    uart_puts(" BAR2_HI="); uart_hex(pr(MISC_RC_BAR2_CONFIG_HI));
-    uart_puts(" REMAP="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP));
-    uart_puts("\n");
-
-    /* Only touch BAR2 if firmware left it unconfigured (size=0) */
-    if ((pr(MISC_RC_BAR2_CONFIG_LO) & 0x1F) == 0) {
-        uart_puts("[pcie] BAR2 unconfigured, programming from scratch\n");
-        pw(MISC_RC_BAR2_CONFIG_LO, 0x00000000 | 0x15);  /* size=64GB */
-        pw(MISC_RC_BAR2_CONFIG_HI, 0x00000010);          /* PCIe addr 0x10 per dma-ranges */
-    }
-    /* Always ensure UBUS remap access is enabled */
-    tmp = pr(MISC_UBUS_BAR2_CONFIG_REMAP);
-    tmp |= 0x01;  /* ACCESS_ENABLE */
-    pw(MISC_UBUS_BAR2_CONFIG_REMAP, tmp);
-
-    /* Set BAR2 to little-endian mode (required for DMA) */
-    tmp = pr(RC_CFG_VENDOR_SPECIFIC_REG1);
-    tmp &= ~VENDOR_SPECIFIC_REG1_ENDIAN_MODE_BAR2_MASK;
-    pw(RC_CFG_VENDOR_SPECIFIC_REG1, tmp);
-
-    /* Suppress AXI error responses (BCM2712) */
-    tmp = pr(MISC_UBUS_CTRL);
-    tmp |= UBUS_REPLY_ERR_DIS | UBUS_REPLY_DECERR_DIS;
-    pw(MISC_UBUS_CTRL, tmp);
-    pw(MISC_AXI_READ_ERROR_DATA, 0xFFFFFFFF);
-    pw(MISC_UBUS_TIMEOUT, 0x0B2D0000);
-    pw(MISC_RC_CFG_RETRY_TIMEOUT, 0x0ABA0000);
-
-    perst_set(false);
-    timer_delay_ms(100);
-
-    for (u32 i = 0; i < 20; i++) {
-        if (pcie_link_up()) break;
-        timer_delay_ms(5);
-    }
     if (!pcie_link_up()) {
-        uart_puts("[pcie] Link FAILED\n");
+        uart_puts("[pcie] Link not up at entry, firmware may not have initialized\n");
         return false;
     }
 
+    /* Just set up our outbound ATU window for RP1 MMIO access */
+    set_outbound_win(PCIE_CPU_WIN_BASE, PCIE_TARGET_ADDR, PCIE_CPU_WIN_SIZE);
+
+    /* Enable memory + bus master on the bridge */
     tmp = pr(PCI_REG_CMD);
     tmp |= PCI_CMD_MEM | PCI_CMD_MASTER;
     pw(PCI_REG_CMD, tmp);
@@ -264,7 +208,8 @@ bool pcie_init(void) {
     uart_puts("[pcie] MISC_CTRL="); uart_hex(pr(MISC_MISC_CTRL)); uart_puts("\n");
     uart_puts("[pcie] BAR2_LO="); uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
     uart_puts(" BAR2_HI="); uart_hex(pr(MISC_RC_BAR2_CONFIG_HI)); uart_puts("\n");
-    uart_puts("[pcie] UBUS_BAR2_REMAP="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP)); uart_puts("\n");
+    uart_puts("[pcie] UBUS_BAR2_REMAP="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP));
+    uart_puts(" REMAP_HI="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP_HI)); uart_puts("\n");
     uart_puts("[pcie] VENDOR_REG1="); uart_hex(pr(RC_CFG_VENDOR_SPECIFIC_REG1)); uart_puts("\n");
     uart_puts("[pcie] UBUS_CTRL="); uart_hex(pr(MISC_UBUS_CTRL)); uart_puts("\n");
     uart_puts("[pcie] STATUS="); uart_hex(pr(MISC_PCIE_STATUS)); uart_puts("\n");
