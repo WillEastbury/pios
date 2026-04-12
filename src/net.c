@@ -20,6 +20,7 @@
 #include "workq.h"
 #include "fb.h"
 #include "pcie.h"
+#include "mmio.h"
 
 /* ---- Network state ---- */
 
@@ -452,12 +453,22 @@ void net_poll(void) {
     static u32 poll_count;
     static u32 rx_count;
 
-    /* Log occasionally to prove polling is running */
-    if ((poll_count & 0xFFFFF) == 0 && poll_count > 0) {
+    /* Log occasionally with MACB state */
+    if ((poll_count & 0x3FFFFF) == 0 && poll_count > 0) {
         uart_puts("[net] poll=");
         uart_hex(poll_count);
         uart_puts(" rx=");
         uart_hex(rx_count);
+        uart_puts("\n");
+    }
+    /* Every ~16M polls, dump MACB state */
+    if ((poll_count & 0xFFFFFF) == 0 && poll_count > 0) {
+        #define MACB_BASE_NET 0x1F00100000UL
+        uart_puts("[net] MACB ISR="); uart_hex(mmio_read(MACB_BASE_NET + 0x0024));
+        uart_puts(" RSR="); uart_hex(mmio_read(MACB_BASE_NET + 0x0020));
+        uart_puts(" TSR="); uart_hex(mmio_read(MACB_BASE_NET + 0x0014));
+        uart_puts(" RXCNT="); uart_hex(mmio_read(MACB_BASE_NET + 0x0158));
+        uart_puts(" TXCNT="); uart_hex(mmio_read(MACB_BASE_NET + 0x0108));
         uart_puts("\n");
     }
     poll_count++;

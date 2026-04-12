@@ -209,14 +209,25 @@ bool pcie_init(void) {
     set_outbound_win(PCIE_CPU_WIN_BASE, PCIE_TARGET_ADDR, PCIE_CPU_WIN_SIZE);
 
     /*
-     * Program inbound DMA window (BAR2) from scratch.
-     * RP1 peripherals translate DMA addr 0x00_xxxxxxxx to PCIe 0x10_xxxxxxxx,
-     * so we need a 64GB window to cover the 0x10_00000000 range.
-     * encode_ibar_size(64GB) = ilog2(64GB)-15 = 36-15 = 21 = 0x15
+     * Inbound DMA window (BAR2): let firmware's config stand.
+     * Print what firmware set, then only ensure UBUS remap + access are enabled.
+     * Firmware knows the correct dma-ranges translation.
      */
-    pw(MISC_RC_BAR2_CONFIG_LO, 0x00000000 | 0x15);  /* offset=0, size=64GB */
-    pw(MISC_RC_BAR2_CONFIG_HI, 0x00000000);          /* high bits of offset */
-    pw(MISC_UBUS_BAR2_CONFIG_REMAP, 0x00000001);     /* access enable */
+    uart_puts("[pcie] FW BAR2_LO="); uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
+    uart_puts(" BAR2_HI="); uart_hex(pr(MISC_RC_BAR2_CONFIG_HI));
+    uart_puts(" REMAP="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP));
+    uart_puts("\n");
+
+    /* Only touch BAR2 if firmware left it unconfigured (size=0) */
+    if ((pr(MISC_RC_BAR2_CONFIG_LO) & 0x1F) == 0) {
+        uart_puts("[pcie] BAR2 unconfigured, programming from scratch\n");
+        pw(MISC_RC_BAR2_CONFIG_LO, 0x00000000 | 0x15);  /* size=64GB */
+        pw(MISC_RC_BAR2_CONFIG_HI, 0x00000010);          /* PCIe addr 0x10 per dma-ranges */
+    }
+    /* Always ensure UBUS remap access is enabled */
+    tmp = pr(MISC_UBUS_BAR2_CONFIG_REMAP);
+    tmp |= 0x01;  /* ACCESS_ENABLE */
+    pw(MISC_UBUS_BAR2_CONFIG_REMAP, tmp);
 
     /* Set BAR2 to little-endian mode (required for DMA) */
     tmp = pr(RC_CFG_VENDOR_SPECIFIC_REG1);
