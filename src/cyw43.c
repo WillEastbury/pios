@@ -303,13 +303,25 @@ static bool sdpcm_send(u8 channel, const u8 *data, u32 len)
     /* Pad to 64-byte boundary for SDIO */
     u32 padded = (total + 63) & ~63U;
 
+    /* Zero padding to avoid leaking stale buffer contents */
+    if (padded > total)
+        memset(cyw_tx_buf + total, 0, padded - total);
+
+    /* Use block mode for transfers >512 bytes */
+    if (padded > 512) {
+        u32 nblks = (padded + SDIO_FUNC2_BLKSZ - 1) / SDIO_FUNC2_BLKSZ;
+        return sdio_cmd53_write_blocks(SDIO_FUNC_WLAN, 0, cyw_tx_buf,
+                                       SDIO_FUNC2_BLKSZ, nblks, true);
+    }
     return sdio_cmd53_write(SDIO_FUNC_WLAN, 0, cyw_tx_buf, padded, true);
 }
 
 static bool sdpcm_recv(u8 *channel, u8 *data, u32 *len)
 {
-    /* Read the SDPCM header first */
-    if (!sdio_cmd53_read(SDIO_FUNC_WLAN, 0, cyw_rx_buf, CYW_MAX_FRAME, true))
+    /* Read via block mode — frames can exceed 512 bytes */
+    u32 nblks = (CYW_MAX_FRAME + SDIO_FUNC2_BLKSZ - 1) / SDIO_FUNC2_BLKSZ;
+    if (!sdio_cmd53_read_blocks(SDIO_FUNC_WLAN, 0, cyw_rx_buf,
+                                SDIO_FUNC2_BLKSZ, nblks, true))
         return false;
 
     /* Parse frame tag */
@@ -526,10 +538,12 @@ static void handle_event(const u8 *data, u32 len)
                 r->rssi = (i16)((u16)data[54] | ((u16)data[55] << 8));
                 /* Channel at offset 58 */
                 r->channel = data[58];
-                /* SSID length at offset 70 */
+                /* SSID length at offset 70, bounded by buffer */
                 r->ssid_len = data[70];
                 if (r->ssid_len > CYW_SSID_MAX)
                     r->ssid_len = CYW_SSID_MAX;
+                if (71 + r->ssid_len > len)
+                    r->ssid_len = (len > 71) ? (u8)(len - 71) : 0;
                 memcpy(r->ssid, data + 71, r->ssid_len);
                 scan_count++;
             }
