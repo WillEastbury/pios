@@ -131,12 +131,18 @@ void mmu_init(void) {
     for (u32 i = 0; i < 512; i++)
         l1[i] = 0;
 
-    /* RAM: L1[0] non-cacheable (FB at 0x3F400000), L1[1-3] WB cacheable */
-    u64 ram_nc = PTE_VALID | PTE_BLOCK | PTE_AF |
-                 PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1;
+    /* RAM: L1[0] split into 2MB blocks via l2_table_low, L1[1-3] WB cacheable */
     u64 ram_attr = PTE_VALID | PTE_BLOCK | PTE_AF |
                    PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
-    l1[0] = 0x00000000UL | ram_nc;
+
+    /* L1[0] = table descriptor → l2_table_low (first 1GB in 2MB blocks) */
+    volatile u64 *l2 = l2_table_low;
+    for (u32 i = 0; i < 512; i++) {
+        u64 addr = (u64)i * L2_BLOCK_SIZE;
+        l2[i] = addr | ram_attr;  /* Normal WB Cacheable */
+    }
+    l1[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
+
     l1[1] = 0x40000000UL | ram_attr;
     l1[2] = 0x80000000UL | ram_attr;
     l1[3] = 0xC0000000UL | ram_attr;
