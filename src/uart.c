@@ -67,12 +67,23 @@ void uart_init(void) {
     use_rp1 = true;
 }
 
+/* Mirror all uart output to HDMI framebuffer when enabled */
+static bool hdmi_mirror;
+static bool hdmi_scrolling;  /* guard against DMA scroll re-entry */
+
+void uart_enable_hdmi_mirror(void) { hdmi_mirror = true; }
+
 void uart_putc(char c) {
     if (use_rp1) {
         rp1_uart_putc(0, c);
     } else {
         while (mmio_read(UART_FR) & FR_TXFF) ;
         mmio_write(UART_DR, (u32)c);
+    }
+    if (hdmi_mirror && c != '\r' && !hdmi_scrolling) {
+        hdmi_scrolling = true;
+        fb_putc(c);
+        hdmi_scrolling = false;
     }
 }
 

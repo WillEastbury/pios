@@ -42,10 +42,21 @@
 #define SA1B        0x0088  /* Specific Address 1 Bottom (GEM) */
 #define SA1T        0x008C  /* Specific Address 1 Top (GEM) */
 #define USRIO       0x00C0  /* User I/O (GEM — not 0x0C which is MACB) */
+#define GEM_AMP     0x0054  /* AXI Max Pipeline (RP1-specific) */
+#define GEM_INTMOD  0x005C  /* Interrupt Moderation */
 #define DCFG1       0x0280  /* Design Config 1 */
 #define DCFG2       0x0284  /* Design Config 2 */
 #define RBQPH       0x04D4  /* RX Queue Base Addr High */
 #define TBQPH       0x04C8  /* TX Queue Base Addr High */
+
+/* RP1 ETH_CFG block — separate from GEM registers */
+#define ETH_CFG_BASE    0x1F00104000UL
+#define ETH_CFG_CTRL    0x00  /* bit 3 = BUSERR_EN, bit 4 = MEM_PD */
+#define ETH_CFG_STAT    0x04  /* bit 4 = ARLEN_ILLEGAL, bit 5 = AWLEN_ILLEGAL */
+#define ETH_CFG_CLKGEN  0x14  /* bit 7 = ENABLE */
+
+static inline u32 ecr(u32 off) { return mmio_read(ETH_CFG_BASE + off); }
+static inline void ecw(u32 off, u32 val) { mmio_write(ETH_CFG_BASE + off, val); }
 
 /* NCR bits */
 #define NCR_LLB     (1 << 1)   /* Loopback local */
@@ -123,16 +134,24 @@
 #define BUF_SIZE 2048
 
 /* ── Descriptors and buffers (64-byte aligned for DMA coherency) ── */
-/* DAW64 hardware requires 16-byte descriptors.
- * addr_hi = 0x10 because MACB DMA goes RP1→PCIe RC→BAR2 inbound at 0x10_00000000.
- * Circle: PTR_TO_DMA(p) = (uintptr)(p) | GetDMAAddress(PCIE_BUS_MACB) */
-#define MACB_DMA_HI  0x00  /* BAR2 at PCIe 0x00, descriptors use low 32-bit addresses */
+/* Firmware BAR2 at PCIe 0x00 (64GB window covers 0x00-0x40).
+ * But RP1 DT dma-ranges says child DMA is at 0x10. Use 0x10. */
+#define MACB_DMA_HI       0x10
+#define USE_8BYTE_DESC     0
+
+#if USE_8BYTE_DESC
 struct macb_desc {
     u32 addr;       /* buffer address + OWN/WRAP bits (RX) */
     u32 ctrl;       /* control/status */
-    u32 addr_hi;    /* buffer address high (0x10 for PCIe BAR2) */
-    u32 rsvd;       /* reserved, must be 0 */
 } PACKED;
+#else
+struct macb_desc {
+    u32 addr;       /* buffer address + OWN/WRAP bits (RX) */
+    u32 ctrl;       /* control/status */
+    u32 addr_hi;    /* buffer address high */
+    u32 rsvd;       /* reserved */
+} PACKED;
+#endif
 
 static struct macb_desc rx_ring[NUM_RX] ALIGNED(64);
 static struct macb_desc tx_ring[NUM_TX] ALIGNED(64);
@@ -399,6 +418,57 @@ bool macb_init(void) {
         delay_cycles(100);
     mw(NCR, NCR_CLRSTAT);
 
+    /* ── DMA config: set ADDR64 FIRST so MAC uses 16-byte descriptors ──
+     * CRITICAL: firmware leaves ADDR64=0 (8-byte descriptors).
+     * We MUST set ADDR64 before writing ring pointers, otherwise the MAC
+     * will stride at 8 bytes through our 16-byte descriptor ring. */
+    {
+        u32 dmacfg = mr(DMACFG);
+        uart_puts("[macb] DMACFG firmware="); uart_hex(dmacfg); uart_puts("\n");
+        dmacfg &= ~(0xFF << DMACFG_RXBS_SHIFT);
+        dmacfg &= ~(0x1F << DMACFG_FBLDO_SHIFT);
+        dmacfg |= ((BUF_SIZE / 64) << DMACFG_RXBS_SHIFT);
+        /* FBLDO=16 — RPi rp1-gem config uses 16 */
+        dmacfg |= (16 << DMACFG_FBLDO_SHIFT);
+        dmacfg |= (1 << 10);   /* TXPBMS */
+        dmacfg |= (3 << 8);    /* RXBMS = 3 (max) */
+        dmacfg &= ~(1 << 7);   /* no endian swap pkt */
+        dmacfg &= ~(1 << 6);   /* no endian swap desc */
+#if USE_8BYTE_DESC
+        dmacfg &= ~DMACFG_ADDR64;  /* 8-byte descriptors */
+#else
+        dmacfg |= DMACFG_ADDR64;   /* 16-byte descriptors */
+#endif
+        mw(DMACFG, dmacfg);
+        uart_puts("[macb] DMACFG final="); uart_hex(dmacfg); uart_puts("\n");
+    }
+
+    /* ── RP1 ETH_CFG: check status and enable bus errors ── */
+    {
+        u32 cfg_stat = ecr(ETH_CFG_STAT);
+        u32 cfg_ctrl = ecr(ETH_CFG_CTRL);
+        uart_puts("[macb] ETH_CFG CTRL="); uart_hex(cfg_ctrl);
+        uart_puts(" STAT="); uart_hex(cfg_stat);
+        uart_puts("\n");
+        if (cfg_stat & (1 << 5)) uart_puts("[macb] WARNING: AWLEN_ILLEGAL set!\n");
+        if (cfg_stat & (1 << 4)) uart_puts("[macb] WARNING: ARLEN_ILLEGAL set!\n");
+        /* Enable bus error passthrough for debugging */
+        ecw(ETH_CFG_CTRL, cfg_ctrl | (1 << 3));
+    }
+
+    /* ── GEM AXI pipeline config (RP1-specific, from Linux patch) ── */
+    {
+        u32 amp = mr(GEM_AMP);
+        uart_puts("[macb] GEM_AMP before="); uart_hex(amp); uart_puts("\n");
+        /* Set reasonable pipeline depths — RP1 Linux uses DT properties */
+        amp &= ~0xFFFF;  /* clear AR2R and AW2W fields */
+        amp |= (8 << 0);   /* AR2R_MAX_PIPE = 8 */
+        amp |= (4 << 8);   /* AW2W_MAX_PIPE = 4 */
+        amp |= (1 << 16);  /* AW2B_FILL = 1 (AW to B channel) */
+        mw(GEM_AMP, amp);
+        uart_puts("[macb] GEM_AMP after="); uart_hex(mr(GEM_AMP)); uart_puts("\n");
+    }
+
     if (!mac_load_from_sa1(mac_addr) && !mac_load_from_mailbox(mac_addr)) {
         uart_puts("[macb] No valid MAC\n");
         return false;
@@ -427,9 +497,11 @@ bool macb_init(void) {
     /* ── Setup RX descriptors ── */
     for (u32 i = 0; i < NUM_RX; i++) {
         volatile struct macb_desc *d = &rx_ring[i];
+#if !USE_8BYTE_DESC
         d->addr_hi = MACB_DMA_HI;
-        d->rsvd = 0;
-        d->ctrl = 0;
+        d->rsvd = 0xCAFE0000;  /* canary w3 */
+#endif
+        d->ctrl = 0xDEAD0000;  /* canary w1 */
         __asm__ volatile("dsb sy" ::: "memory");
         u32 a = (u32)(usize)&rx_bufs[i][0];
         if (i == NUM_RX - 1) a |= RX_ADDR_WRAP;
@@ -440,9 +512,11 @@ bool macb_init(void) {
     /* ── Setup TX descriptors ── */
     for (u32 i = 0; i < NUM_TX; i++) {
         volatile struct macb_desc *d = &tx_ring[i];
+#if !USE_8BYTE_DESC
         d->addr_hi = MACB_DMA_HI;
         d->rsvd = 0;
-        d->addr = 0;/* Circle: addr=0 during init, set during send */
+#endif
+        d->addr = 0;
         d->ctrl = TX_STAT_USED;
         if (i == NUM_TX - 1)
             d->ctrl |= TX_STAT_WRAP;
@@ -461,39 +535,28 @@ bool macb_init(void) {
     uart_hex((u32)(usize)&rx_bufs[0][0]);
     uart_puts("\n");
 
-    /* ── Ring base pointers (Circle order: RBQP, TBQP, RBQPH, TBQPH) ── */
+    /* ── Ring base pointers ── */
     mw(RBQP, (u32)(usize)&rx_ring[0]);
     mw(TBQP, (u32)(usize)&tx_ring[0]);
-    mw(RBQPH, 0x00);
-    mw(TBQPH, 0x00);
+#if !USE_8BYTE_DESC
+    mw(RBQPH, MACB_DMA_HI);
+    mw(TBQPH, MACB_DMA_HI);
+#else
+    mw(RBQPH, 0);
+    mw(TBQPH, 0);
+#endif
 
-    /* ── DMA config: read-modify-write to preserve firmware defaults ──
-     * (Circle: gmac_configure_dma — called AFTER ring pointers) */
-    {
-        u32 dmacfg = mr(DMACFG);
-        uart_puts("[macb] DMACFG firmware="); uart_hex(dmacfg); uart_puts("\n");
-        /* Clear fields we'll set */
-        dmacfg &= ~(0xFF << DMACFG_RXBS_SHIFT);  /* clear RXBS */
-        dmacfg &= ~(0x1F << DMACFG_FBLDO_SHIFT);  /* clear FBLDO */
-        /* Set our values */
-        dmacfg |= ((BUF_SIZE / 64) << DMACFG_RXBS_SHIFT); /* RXBS = 32 */
-        dmacfg |= (16 << DMACFG_FBLDO_SHIFT);              /* FBLDO = 16 */
-        dmacfg |= (1 << 10);                                /* TXPBMS */
-        dmacfg |= (3 << 8);                                 /* RXBMS = 3 (max) */
-        dmacfg &= ~(1 << 7);                                /* no endian swap pkt */
-        dmacfg &= ~(1 << 6);                                /* no endian swap desc */
-        dmacfg |= DMACFG_ADDR64;                            /* 16-byte descriptors */
-        mw(DMACFG, dmacfg);
-        uart_puts("[macb] DMACFG final="); uart_hex(dmacfg); uart_puts("\n");
-    }
+    /* (DMACFG already set above before ring pointers) */
 
     /* ── Multi-queue init (Circle: gmac_init_multi_queues) ── */
     {
         static struct macb_desc dummy_desc ALIGNED(64);
         dummy_desc.ctrl = TX_STAT_USED;
         dummy_desc.addr = 0;
+#if !USE_8BYTE_DESC
         dummy_desc.addr_hi = MACB_DMA_HI;
         dummy_desc.rsvd = 0;
+#endif
         __asm__ volatile("dsb sy" ::: "memory");
         dcache_clean_range((u64)(usize)&dummy_desc, sizeof(dummy_desc));
 
@@ -504,8 +567,10 @@ bool macb_init(void) {
             if (queue_mask & (1 << q)) {
                 mw(0x0440 + ((q-1) << 2), dummy_lo);
                 mw(0x0480 + ((q-1) << 2), dummy_lo);
+#if !USE_8BYTE_DESC
                 mw(0x04C8, MACB_DMA_HI);
                 mw(0x04D4, MACB_DMA_HI);
+#endif
             }
         }
         uart_puts("[macb] Multi-queue init: mask=");
@@ -574,8 +639,14 @@ bool macb_init(void) {
             fd = true;  /* 10BASE-T FD */
         }
 
-        /* Reconfigure NCFGR with correct speed */
-        u32 ncfgr = NCFGR_BIG | NCFGR_CLK_DIV64 | NCFGR_CAF | NCFGR_RXCOEN;
+        /* Reconfigure NCFGR with correct speed — PRESERVE DBW! */
+        u32 dbwdef2 = (mr(DCFG1) >> 25) & 0x7;
+        u32 dbw2;
+        if (dbwdef2 >= 4) dbw2 = 2;       /* 128-bit */
+        else if (dbwdef2 >= 2) dbw2 = 1;   /* 64-bit */
+        else dbw2 = 0;                     /* 32-bit */
+        u32 ncfgr = NCFGR_BIG | NCFGR_CLK_DIV64 | NCFGR_CAF | NCFGR_RXCOEN
+                   | (dbw2 << 21) | (1 << 17) /* DRFCS */;
         if (gig)    ncfgr |= NCFGR_GBE;
         if (spd100) ncfgr |= NCFGR_SPD;
         if (fd)     ncfgr |= NCFGR_FD;
@@ -672,7 +743,9 @@ bool macb_send(const u8 *frame, u32 len) {
     for (u32 i = 0; i < len; i++) dst[i] = frame[i];
 
     /* Setup descriptor (Circle: set addr during send, then barrier, then ctrl) */
+#if !USE_8BYTE_DESC
     tx_ring[tx_idx].addr_hi = MACB_DMA_HI;
+#endif
     __asm__ volatile("dsb sy" ::: "memory");
     tx_ring[tx_idx].addr = (u32)(usize)&tx_bufs[tx_idx][0];
     __asm__ volatile("dsb sy" ::: "memory");
@@ -747,8 +820,39 @@ bool macb_recv(u8 *frame, u32 *len) {
     if (!(addr_val & RX_ADDR_OWN))
         return false;
 
-    u32 status = rx_ring[rx_idx].ctrl;
+    u32 status = raw[1];
     u32 flen = status & RX_STAT_LEN_MASK;
+
+    /* Dump first few OWN-set descriptors to see all words */
+    static u32 own_dump_count;
+    if (own_dump_count < 3) {
+        uart_puts("[macb] RX OWN set! idx="); uart_hex(rx_idx);
+        uart_puts(" w0="); uart_hex(addr_val);
+        uart_puts(" w1="); uart_hex(status);
+#if !USE_8BYTE_DESC
+        uart_puts(" w2="); uart_hex(raw[2]);
+        uart_puts(" w3="); uart_hex(raw[3]);
+#endif
+        uart_puts(" flen="); uart_hex(flen);
+        uart_puts("\n");
+        /* Scan 64 bytes around descriptor for misplaced writes */
+        volatile u32 *scan = (volatile u32 *)((usize)raw - 16);
+        uart_puts("[macb] memscan: ");
+        for (u32 s = 0; s < 16; s++) {
+            uart_hex(scan[s]);
+            uart_puts(" ");
+        }
+        uart_puts("\n");
+        /* Also dump first 32 bytes of RX buffer to check for frame data */
+        volatile u32 *bufp = (volatile u32 *)(usize)rx_bufs[rx_idx];
+        uart_puts("[macb] buf: ");
+        for (u32 s = 0; s < 8; s++) {
+            uart_hex(bufp[s]);
+            uart_puts(" ");
+        }
+        uart_puts("\n");
+        own_dump_count++;
+    }
 
     if (flen == 0 || flen > BUF_SIZE) {
         /* Reclaim descriptor */

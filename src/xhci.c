@@ -174,7 +174,7 @@ static u32 evt_deq, evt_cycle;
  * first (offset=0) since the firmware may map PCIe 0x00 → AXI 0x00.
  * If that fails, try 0x10_00000000 offset per rp1.dtsi dma-ranges.
  */
-#define RP1_DMA_OFFSET  0x0ULL
+#define RP1_DMA_OFFSET  0x1000000000ULL  /* BAR2 at PCIe 0x10 after full reset */
 static inline u64 dma_addr(const void *p) { return (u64)(usize)p + RP1_DMA_OFFSET; }
 
 /* DCI → ep_rings index. 0xFF = unmapped. DCI 1 = EP0 always ring 0. */

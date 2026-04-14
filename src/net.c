@@ -460,6 +460,8 @@ void net_poll(void) {
         uart_puts(" rx=");
         uart_hex(rx_count);
         uart_puts("\n");
+        fb_set_color(0x00AAAAAA, 0x00000000);
+        fb_printf("poll=%X rx=%X\n", poll_count, rx_count);
     }
     /* Every ~16M polls, dump MACB state */
     if ((poll_count & 0xFFFFFF) == 0 && poll_count > 0) {
@@ -470,6 +472,13 @@ void net_poll(void) {
         uart_puts(" RXCNT="); uart_hex(mmio_read(MACB_BASE_NET + 0x0158));
         uart_puts(" TXCNT="); uart_hex(mmio_read(MACB_BASE_NET + 0x0108));
         uart_puts("\n");
+        fb_set_color(0x00FFAA00, 0x00000000);
+        fb_printf("ISR=%X RSR=%X TSR=%X RXCNT=%X TXCNT=%X\n",
+            mmio_read(MACB_BASE_NET + 0x0024),
+            mmio_read(MACB_BASE_NET + 0x0020),
+            mmio_read(MACB_BASE_NET + 0x0014),
+            mmio_read(MACB_BASE_NET + 0x0158),
+            mmio_read(MACB_BASE_NET + 0x0108));
     }
     poll_count++;
 
