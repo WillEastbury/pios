@@ -222,17 +222,7 @@ static void bcm2712_gpio_set_fsel(u32 pin, u32 fsel)
 
 static void sdio_gpio_init(void)
 {
-    /* Trust firmware to have configured both WL_ON (GPIO28) and
-     * SDIO2 pins (GPIO 30-35) via DTB. Just log the current state. */
-    u32 data = mmio_read(BCM2712_GPIO1_DATA0);
-    u32 iodir = mmio_read(BCM2712_GPIO1_IODIR0);
-    uart_puts("[sdio] pre-init DATA=");
-    uart_hex(data);
-    uart_puts(" IODIR=");
-    uart_hex(iodir);
-    uart_puts("\n");
-    
-    /* Read pinctrl FSEL for GPIO 28-35 (reg offset for GPIO 24-31 = 0x0C) */
+    /* Read and verify SDIO2 pin configuration from firmware */
     u32 fsel3 = mmio_read(BCM2712_PINCTRL_BASE + 0x0C); /* GPIO 24-31 */
     u32 fsel4 = mmio_read(BCM2712_PINCTRL_BASE + 0x10); /* GPIO 32-39 */
     uart_puts("[sdio] FSEL[24-31]=");
@@ -240,6 +230,24 @@ static void sdio_gpio_init(void)
     uart_puts(" FSEL[32-39]=");
     uart_hex(fsel4);
     uart_puts("\n");
+
+    /* GPIO 28 should be func 0 (GPIO) for WL_REG_ON */
+    /* GPIO 30-35 should be configured for SDIO2 by firmware */
+    /* If FSEL for GPIO 30-31 (bits [27:24] and [31:28] of fsel3) are 0,
+       firmware didn't configure them — set them ourselves */
+    u32 gpio30_fsel = (fsel3 >> 24) & 0xF;
+    u32 gpio31_fsel = (fsel3 >> 28) & 0xF;
+    if (gpio30_fsel == 0 && gpio31_fsel == 0) {
+        uart_puts("[sdio] WARN: SDIO2 pins not muxed, configuring...\n");
+        bcm2712_gpio_set_fsel(30, 1);
+        bcm2712_gpio_set_fsel(31, 1);
+        bcm2712_gpio_set_fsel(32, 1);
+        bcm2712_gpio_set_fsel(33, 1);
+        bcm2712_gpio_set_fsel(34, 1);
+        bcm2712_gpio_set_fsel(35, 1);
+    } else {
+        uart_puts("[sdio] SDIO2 pins OK (firmware configured)\n");
+    }
 }
 
 void sdio_power_on(void)
