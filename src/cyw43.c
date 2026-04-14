@@ -667,23 +667,50 @@ static bool upload_nvram(const u8 *nvram, u32 nvram_len)
     uart_puts(" B)...\n");
 
     /* NVRAM goes at the end of RAM, with a length token */
-    u32 ram_size = 0x80000;  /* 512KB for CYW43455 */
-    u32 nvram_offset = ram_size - 4 - nvram_len;
+    u32 ram_size = 0x80000; /* TODO: read from SOCSRAM sizing regs */
+
+    /* Condense NVRAM: strip comments/blanks, NUL-separate key=value pairs */
+    static u8 nvram_condensed[4096];
+    u32 clen = 0;
+    for (u32 i = 0; i < nvram_len; ) {
+        /* Skip comment lines */
+        if (nvram[i] == '#') {
+            while (i < nvram_len && nvram[i] != '\n') i++;
+            if (i < nvram_len) i++;
+            continue;
+        }
+        /* Skip blank lines */
+        if (nvram[i] == '\n' || nvram[i] == '\r') { i++; continue; }
+        /* Copy key=value until newline, terminate with NUL */
+        while (i < nvram_len && nvram[i] != '\n' && nvram[i] != '\r'
+               && clen < sizeof(nvram_condensed) - 2)
+            nvram_condensed[clen++] = nvram[i++];
+        nvram_condensed[clen++] = '\0';
+        while (i < nvram_len && (nvram[i] == '\n' || nvram[i] == '\r')) i++;
+    }
+    nvram_condensed[clen++] = '\0'; /* double-NUL terminator */
+
+    /* Pad to 4-byte boundary */
+    while (clen & 3) nvram_condensed[clen++] = '\0';
+
+    u32 nvram_offset = ram_size - 4 - clen;
     nvram_offset &= ~0x3U;  /* word-align */
 
-    if (!bp_write_buf(CYW_RAM_BASE + nvram_offset, nvram, nvram_len)) {
+    if (!bp_write_buf(CYW_RAM_BASE + nvram_offset, nvram_condensed, clen)) {
         uart_puts("[cyw] NVRAM write fail\n");
         return false;
     }
 
-    /* Write length token (complement of size in words) */
-    u32 token = (~(nvram_len / 4)) << 16 | (nvram_len / 4);
+    /* Write length token: complement of size-in-words in upper 16 bits */
+    u32 token = (~(clen / 4) << 16) | (clen / 4);
     if (!bp_write32(CYW_RAM_BASE + ram_size - 4, token)) {
         uart_puts("[cyw] NVRAM token fail\n");
         return false;
     }
 
-    uart_puts("[cyw] NVRAM ok\n");
+    uart_puts("[cyw] NVRAM ok (condensed ");
+    uart_hex(clen);
+    uart_puts(" B)\n");
     return true;
 }
 
@@ -1166,7 +1193,19 @@ bool cyw43_send_frame(const u8 *frame, u32 len)
     if (!cyw43_is_connected())
         return false;
 
-    return sdpcm_send(SDPCM_DATA_CHANNEL, frame, len);
+    /* Prepend 4-byte BDC data header before the Ethernet frame */
+    u32 bdc_len = 4 + len;
+    if (bdc_len > sizeof(cyw_tx_buf) - SDPCM_HEADER_LEN)
+        return false;
+
+    static u8 bdc_buf[CYW_MAX_FRAME] ALIGNED(64);
+    bdc_buf[0] = 0x20;  /* BDC version 2 */
+    bdc_buf[1] = 0x00;  /* flags */
+    bdc_buf[2] = 0x00;  /* header2 */
+    bdc_buf[3] = 0x00;  /* pad */
+    memcpy(bdc_buf + 4, frame, len);
+
+    return sdpcm_send(SDPCM_DATA_CHANNEL, bdc_buf, bdc_len);
 }
 
 bool cyw43_recv_frame(u8 *frame, u32 *len)
@@ -1185,10 +1224,18 @@ bool cyw43_recv_frame(u8 *frame, u32 *len)
     if (channel != SDPCM_DATA_CHANNEL)
         return false;
 
+    /* Strip BDC data header: 4 bytes + (data[3] * 4) bytes of padding */
+    if (rlen < 4)
+        return false;
+    u32 bdc_offset = 4 + ((u32)cyw_rx_buf[3] << 2);
+    if (bdc_offset >= rlen)
+        return false;
+    rlen -= bdc_offset;
+
     if (rlen > *len)
         rlen = *len;
 
-    memcpy(frame, cyw_rx_buf, rlen);
+    memcpy(frame, cyw_rx_buf + bdc_offset, rlen);
     *len = rlen;
     return true;
 }

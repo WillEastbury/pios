@@ -50,7 +50,7 @@
 #define SDPCM_MAXSEQ_OFFSET     9
 
 /* ── BCDC protocol ── */
-#define BCDC_HEADER_LEN         4
+#define BCDC_HEADER_LEN         16
 #define BCDC_FLAG_SET           0x02
 #define BCDC_FLAG_IF_MASK       0xF000
 #define BCDC_FLAG_ID_SHIFT      16
