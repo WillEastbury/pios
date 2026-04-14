@@ -22,6 +22,7 @@ void fifo_init_all(void) {
 }
 
 bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {
+    if (src >= 4 || dst >= 4) return false;
     struct fifo *f = get_fifo(src, dst);
     u32 head = f->head;
     u32 next = (head + 1) & (FIFO_CAPACITY - 1); /* power-of-2 mask */
@@ -38,6 +39,7 @@ bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {
 }
 
 bool fifo_pop(u32 dst, u32 src, struct fifo_msg *msg) {
+    if (src >= 4 || dst >= 4) return false;
     struct fifo *f = get_fifo(src, dst);
     u32 tail = f->tail;
 

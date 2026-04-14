@@ -178,6 +178,10 @@ static bool scsi_read_capacity(void) {
                    ((u32)scsi_buf[6] << 8)  | (u32)scsi_buf[7];
     num_blocks = (u64)last_lba + 1;
 
+    /* Block size must be a power-of-2 between 512 and 4096 */
+    if (blk_size == 0 || blk_size > 4096 || (blk_size & (blk_size - 1)) != 0)
+        return false;
+
     uart_puts("[usb_stor] Capacity: ");
     uart_hex((u32)num_blocks);
     uart_puts(" blocks x ");

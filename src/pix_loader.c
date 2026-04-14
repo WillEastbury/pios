@@ -86,7 +86,7 @@ static bool apply_relocations(u8 *base, const u8 *file,
         u32 off = r->offset;
 
         /* Bounds check */
-        if (off > image_span - 8U)
+        if (image_span < 8 || off > image_span - 8U)
             return false;
 
         switch (r->type) {
@@ -146,7 +146,7 @@ static bool resolve_imports(u8 *base, const u8 *file,
         }
 
         u32 off = imports[i].patch_offset;
-        if (off > image_span - 8U)
+        if (image_span < 8 || off > image_span - 8U)
             return false;
 
         /* Patch with absolute function pointer (64-bit) */

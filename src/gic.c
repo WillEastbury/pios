@@ -50,18 +50,21 @@ void gic_init(void) {
 }
 
 void gic_enable_irq(u32 intid) {
+    if (intid >= 1020) return;
     u32 reg = intid / 32;
     u32 bit = intid % 32;
-    mmio_write(GICD_ISENABLER(reg), 1 << bit);
+    mmio_write(GICD_ISENABLER(reg), 1U << bit);
 }
 
 void gic_disable_irq(u32 intid) {
+    if (intid >= 1020) return;
     u32 reg = intid / 32;
     u32 bit = intid % 32;
-    mmio_write(GICD_ICENABLER(reg), 1 << bit);
+    mmio_write(GICD_ICENABLER(reg), 1U << bit);
 }
 
 void gic_set_priority(u32 intid, u8 priority) {
+    if (intid >= 1020) return;
     u32 reg = intid / 4;
     u32 shift = (intid % 4) * 8;
     u32 val = mmio_read(GICD_IPRIORITYR(reg));
@@ -71,6 +74,7 @@ void gic_set_priority(u32 intid, u8 priority) {
 }
 
 void gic_set_target(u32 intid, u8 cpu_mask) {
+    if (intid >= 1020) return;
     u32 reg = intid / 4;
     u32 shift = (intid % 4) * 8;
     u32 val = mmio_read(GICD_ITARGETSR(reg));

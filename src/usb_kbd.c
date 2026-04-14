@@ -174,8 +174,9 @@ static void queue_poll(void) {
     if (!kbd_ready || poll_pending) return;
     dcache_invalidate_range((u64)(usize)report_buf, sizeof(report_buf));
     u32 actual;
+    u32 xfer_len = (int_ep_maxpkt > 8) ? 8 : int_ep_maxpkt;
     if (xhci_bulk_transfer(kbd_dev->slot, int_ep_addr, report_buf,
-                            int_ep_maxpkt < 8 ? 8 : int_ep_maxpkt, &actual)) {
+                            xfer_len, &actual)) {
         dcache_invalidate_range((u64)(usize)report_buf, sizeof(report_buf));
         process_report(report_buf);
     }
