@@ -108,6 +108,7 @@
 #define TRB_PORT_STATUS     34
 
 #define TRB_CYCLE           (1U << 0)
+#define TRB_CHAIN           (1U << 4)
 #define TRB_IOC             (1U << 5)
 #define TRB_IDT             (1U << 6)
 #define TRB_DIR_IN          (1U << 16)
@@ -256,8 +257,8 @@ static i32 alloc_ep_ring(void) {
     return -1;
 }
 
-static void free_ep_ring(u32 ri) UNUSED;
-static void free_ep_ring(u32 ri) {
+/* Release an EP ring back to the pool (used during device teardown). */
+static void UNUSED free_ep_ring(u32 ri) {
     if (ri < NUM_EP_RINGS)
         ep_used[ri] = false;
 }
@@ -388,7 +389,7 @@ bool xhci_init(void) {
     uart_puts("[xhci] Init USB0 (DWC3)...\n");
 
     /* Reset instrumentation counters */
-    for (u32 i = 0; i < sizeof(stats); i++) ((u8 *)&stats)[i] = 0;
+    memset(&stats, 0, sizeof(stats));
 
     /* Enable USB VBUS power via GPIO 38 */
     uart_puts("[xhci] Enabling VBUS (GPIO38)...\n");
@@ -780,7 +781,7 @@ bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual) 
 
         u32 flags = TRB_TYPE(TRB_NORMAL);
         if (remaining > 0)
-            flags |= (1U << 4); /* TRB_CHAIN */
+            flags |= TRB_CHAIN;
         else
             flags |= TRB_IOC;
 
