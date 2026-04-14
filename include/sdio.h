@@ -18,10 +18,30 @@
 #pragma once
 #include "types.h"
 
-/* RP1 SDIO1 controller offset from RP1_BAR_BASE */
+/* RP1 SDIO1 controller offset from RP1_BAR_BASE — NOT used for WiFi */
 #define RP1_SDIO1_BASE      0x104000
 
-/* SDIO GPIO pins — DTB: rp1_sdio1_28_33 (RP1 GPIOs 28-33) */
+/* BCM2712 SDIO2 controller — the actual WiFi SDIO host
+ * DTB: /axi/mmc@1100000 compatible "brcm,bcm2712-sdhci"
+ * AXI base 0x1000000000 + 0x1100000 = 0x1001100000 */
+#define BCM2712_SDIO2_BASE  0x1001100000UL
+
+/* BCM2712 SoC pinctrl for SDIO2 pins (sdio2_30_pins)
+ * SoC GPIO controller at 0x107d504100 */
+#define BCM2712_PINCTRL_BASE 0x107D504100UL
+
+/* BCM2712 SoC GPIO controller (brcmstb-gpio at 0x107d517c00) */
+#define BCM2712_GPIO_BASE    0x107D517C00UL
+
+/* SDIO2 uses BCM2712 SoC GPIOs 30-35 (sdio2_30_pins in DTB) */
+#define SDIO2_GPIO_CLK       30
+#define SDIO2_GPIO_CMD       31
+#define SDIO2_GPIO_DAT0      32
+#define SDIO2_GPIO_DAT1      33
+#define SDIO2_GPIO_DAT2      34
+#define SDIO2_GPIO_DAT3      35
+
+/* SDIO GPIO pins — kept for reference but NOT used for WiFi on Pi 5 */
 #define SDIO_GPIO_CLK       28
 #define SDIO_GPIO_CMD       29
 #define SDIO_GPIO_DAT0      30
@@ -29,9 +49,9 @@
 #define SDIO_GPIO_DAT2      32
 #define SDIO_GPIO_DAT3      33
 
-/* WL_REG_ON: WiFi chip power/reset — BCM2712 SoC GPIO (not RP1)
- * On Pi 5, this is typically handled by the firmware/regulator.
- * RP1 GPIO used as fallback. Check DTB 'wl-on-reg' for actual pin. */
+/* WL_REG_ON: WiFi chip power/reset — firmware-managed regulator
+ * On Pi 5 the VideoCore firmware handles this via 'wl-on-reg'.
+ * We may need to use mailbox property tags to toggle it. */
 #define SDIO_WL_REG_ON_GPIO 35
 
 /* SDIO function numbers */

@@ -108,14 +108,9 @@
 static u32 sdio_rca;
 static bool sdio_initialized;
 
-/* ── Register helpers ── */
-static u64 sdio_base(void)
-{
-    return RP1_BAR_BASE + RP1_SDIO1_BASE;
-}
-
-static inline u32 sr(u32 off)           { return mmio_read(sdio_base() + off); }
-static inline void sw(u32 off, u32 val) { mmio_write(sdio_base() + off, val); }
+/* ── Register helpers — target BCM2712 SDIO2 ── */
+static inline u32 sr(u32 off)           { return mmio_read(BCM2712_SDIO2_BASE + off); }
+static inline void sw(u32 off, u32 val) { mmio_write(BCM2712_SDIO2_BASE + off, val); }
 
 /* ── Low-level helpers ── */
 
@@ -208,34 +203,70 @@ static void sdio_set_clock(u32 freq_khz)
 
 /* ── GPIO and power setup ── */
 
+/* ── BCM2712 SoC GPIO/pinctrl helpers ── */
+
+/* BCM2712 pinctrl: set pin function via FSEL registers
+ * Each GPIO has 4 bits in FSEL registers, 8 GPIOs per 32-bit register.
+ * SDIO2 function is typically ALT0 or the default mux. */
+static void bcm2712_gpio_set_fsel(u32 pin, u32 fsel)
+{
+    u32 reg_off = (pin / 8) * 4;
+    u32 shift = (pin % 8) * 4;
+    u32 val = mmio_read(BCM2712_PINCTRL_BASE + reg_off);
+    val &= ~(0xF << shift);
+    val |= (fsel & 0xF) << shift;
+    mmio_write(BCM2712_PINCTRL_BASE + reg_off, val);
+}
+
 static void sdio_gpio_init(void)
 {
-    /* Configure SDIO pins for ALT0 (SD1 function) */
-    u32 pins[] = { SDIO_GPIO_CLK, SDIO_GPIO_CMD,
-                   SDIO_GPIO_DAT0, SDIO_GPIO_DAT1,
-                   SDIO_GPIO_DAT2, SDIO_GPIO_DAT3 };
+    /* SDIO2 pins are on BCM2712 SoC GPIO 30-35.
+     * The VideoCore firmware likely already configures these via
+     * sdio2_30_pins in the DTB. We re-assert to be safe.
+     * Function 1 = SDIO2 for these pins. */
+    u32 pins[] = { SDIO2_GPIO_CLK, SDIO2_GPIO_CMD,
+                   SDIO2_GPIO_DAT0, SDIO2_GPIO_DAT1,
+                   SDIO2_GPIO_DAT2, SDIO2_GPIO_DAT3 };
 
     for (u32 i = 0; i < 6; i++) {
-        rp1_gpio_set_function(pins[i], RP1_FSEL_ALT0);
-        rp1_gpio_set_pull(pins[i], RP1_PULL_UP);
-        rp1_gpio_set_drive(pins[i], RP1_DRIVE_8MA);
+        bcm2712_gpio_set_fsel(pins[i], 1);  /* ALT1 = SDIO2 */
     }
+    uart_puts("[sdio] BCM2712 SDIO2 GPIO 30-35 configured\n");
 }
 
 void sdio_power_on(void)
 {
-    /* Assert WL_REG_ON (active HIGH) to power up CYW43455 */
-    rp1_gpio_set_function(SDIO_WL_REG_ON_GPIO, RP1_FSEL_GPIO);
-    rp1_gpio_set_dir_output(SDIO_WL_REG_ON_GPIO);
-    rp1_gpio_write(SDIO_WL_REG_ON_GPIO, false);
-    delay_cycles(200000);  /* hold low for reset */
-    rp1_gpio_write(SDIO_WL_REG_ON_GPIO, true);
-    delay_cycles(500000);  /* CYW43455 needs ~150ms after power-on */
+    /* Assert WL_REG_ON to power up CYW43455.
+     * On Pi 5, the firmware may have already enabled this via
+     * the 'wl-on-reg' regulator. We toggle it via BCM2712 SoC GPIO
+     * as a belt-and-braces approach. The exact GPIO is TBD —
+     * try GPIO 35 (common on Pi 5 designs). */
+    u32 wl_gpio = SDIO_WL_REG_ON_GPIO;
+
+    /* Set as output via BCM2712 GPIO controller */
+    /* GPIO direction: base + 0x08 per bank, bit per GPIO */
+    u32 bank = wl_gpio / 32;
+    u32 bit = 1U << (wl_gpio % 32);
+    u64 gpio_base = BCM2712_GPIO_BASE + (bank * 0x24);
+
+    /* Drive low (reset) */
+    mmio_write(gpio_base + 0x08, mmio_read(gpio_base + 0x08) | bit);  /* output enable */
+    mmio_write(gpio_base + 0x04, bit);  /* clear */
+    delay_cycles(200000);
+
+    /* Drive high (power on) */
+    mmio_write(gpio_base + 0x00, bit);  /* set */
+    delay_cycles(1000000);  /* CYW43455 needs ~150ms, give extra margin */
+    uart_puts("[sdio] WL_REG_ON asserted\n");
 }
 
 void sdio_power_off(void)
 {
-    rp1_gpio_write(SDIO_WL_REG_ON_GPIO, false);
+    u32 wl_gpio = SDIO_WL_REG_ON_GPIO;
+    u32 bank = wl_gpio / 32;
+    u32 bit = 1U << (wl_gpio % 32);
+    u64 gpio_base = BCM2712_GPIO_BASE + (bank * 0x24);
+    mmio_write(gpio_base + 0x04, bit);  /* clear */
     delay_cycles(200000);
 }
 
@@ -246,7 +277,7 @@ bool sdio_init(void)
     sdio_initialized = false;
     sdio_rca = 0;
 
-    uart_puts("[sdio] init RP1 SDIO1\n");
+    uart_puts("[sdio] init BCM2712 SDIO2\n");
 
     /* Configure GPIOs for SDIO */
     sdio_gpio_init();
