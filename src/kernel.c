@@ -4858,12 +4858,21 @@ void kernel_main(void) {
         bp_done(4, sd_ok);
     }
 
-    /* ── Phase 5: NIC (Cadence MACB/GEM on RP1) ── */
+    /* ── Phase 5: NIC (Cadence MACB/GEM on RP1, with WiFi fallback) ── */
     bp_active(5);
     bp_log("[nic] nic_init (Cadence GEM)...");
     nic_ok = nic_init();
     if (!nic_ok) {
-        bp_err("[nic] MACB init FAILED"); bp_done(5, false);
+        bp_warn("[nic] MACB init failed, trying WiFi...");
+        nic_ok = nic_init_wifi();
+        if (!nic_ok) {
+            bp_err("[nic] WiFi init FAILED"); bp_done(5, false);
+        } else {
+            bp_ok("[nic] CYW43455 WiFi online");
+            if (nic_link_up()) bp_ok("[nic] WiFi link UP");
+            else bp_warn("[nic] WiFi link DOWN (not associated)");
+            bp_done(5, true);
+        }
     } else {
         bp_ok("[nic] MACB online");
         if (nic_link_up()) bp_ok("[nic] PHY link UP");
