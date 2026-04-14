@@ -725,6 +725,24 @@ bool cyw43_load_firmware(void)
         return false;
     }
 
+    /* Halt ARM core before firmware upload */
+    uart_puts("[cyw] halting ARM core...\n");
+    if (!bp_write32(CYW_ARM_CORE_BASE + CORE_IOCTRL, SICF_CPUHALT | SICF_CLOCK_EN)) {
+        uart_puts("[cyw] ARM halt fail\n");
+        return false;
+    }
+    delay_cycles(100000);
+
+    /* Reset and enable SOCSRAM */
+    if (!core_reset(CYW_SOCSRAM_BASE, 0)) {
+        uart_puts("[cyw] SOCSRAM reset fail\n");
+        return false;
+    }
+    /* Disable remap — ensure all RAM banks are accessible */
+    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_IDX, 0x03);
+    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
+    uart_puts("[cyw] SOCSRAM ready\n");
+
     /* Upload firmware binary */
     {
         fat32_file_t fw;
@@ -794,6 +812,25 @@ bool cyw43_load_firmware(void)
     /* Reset ARM core to start firmware */
     if (!core_reset(CYW_ARM_CORE_BASE, 0)) {
         uart_puts("[cyw] ARM reset fail\n");
+        return false;
+    }
+
+    /* Wait for firmware to boot — poll HT_AVAIL via func 1 register */
+    uart_puts("[cyw] waiting for firmware...\n");
+    bool fw_ready = false;
+    for (u32 i = 0; i < 500; i++) {
+        u8 status_val;
+        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, 0x1000E, &status_val)) {
+            if (status_val & 0x80) {  /* HT_AVAIL */
+                fw_ready = true;
+                uart_puts("[cyw] firmware ready (HT_AVAIL)\n");
+                break;
+            }
+        }
+        delay_cycles(500000);  /* ~5ms per iteration, up to ~2.5s total */
+    }
+    if (!fw_ready) {
+        uart_puts("[cyw] firmware boot timeout\n");
         return false;
     }
 
