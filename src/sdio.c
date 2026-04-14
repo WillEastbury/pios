@@ -279,6 +279,15 @@ bool sdio_init(void)
 
     uart_puts("[sdio] init BCM2712 SDIO2\n");
 
+    /* Probe: read SDHCI capability register to verify controller is alive */
+    uart_puts("[sdio] base=");
+    uart_hex(BCM2712_SDIO2_BASE);
+    uart_puts(" CAP0=");
+    uart_hex(sr(REG_CAP0));
+    uart_puts(" CAP1=");
+    uart_hex(sr(REG_CAP1));
+    uart_puts("\n");
+
     /* Configure GPIOs for SDIO */
     sdio_gpio_init();
 
@@ -286,6 +295,7 @@ bool sdio_init(void)
     sdio_power_on();
 
     /* Reset the host controller */
+    uart_puts("[sdio] HC reset...\n");
     sw(REG_CONTROL1, C1_SRST_HC);
     u32 timeout = 100000;
     while ((sr(REG_CONTROL1) & C1_SRST_HC) && timeout--)
@@ -294,18 +304,28 @@ bool sdio_init(void)
         uart_puts("[sdio] HC rst timeout\n");
         return false;
     }
+    uart_puts("[sdio] HC reset ok\n");
 
     /* Power on: 3.3V */
     sw(REG_CONTROL0, 0x0F00);
     delay_cycles(10000);
+    uart_puts("[sdio] power on, CTRL0=");
+    uart_hex(sr(REG_CONTROL0));
+    uart_puts("\n");
 
     /* Enable all interrupts */
     sw(REG_IRPT_MASK, INT_ALL);
     sw(REG_IRPT_EN, INT_ALL);
 
     /* Slow clock for identification (400 kHz) */
+    uart_puts("[sdio] setting 400kHz clock...\n");
     sdio_set_clock(400);
     delay_cycles(500000);
+    uart_puts("[sdio] CTRL1=");
+    uart_hex(sr(REG_CONTROL1));
+    uart_puts(" STATUS=");
+    uart_hex(sr(REG_STATUS));
+    uart_puts("\n");
 
     /* CMD0: GO_IDLE_STATE */
     sdio_send_cmd(SDIO_CMD0, 0, NULL);
