@@ -8,6 +8,7 @@
 
 #include "dma.h"
 #include "mmio.h"
+#include "mmu.h"
 #include "simd.h"
 #include "uart.h"
 #include "fb.h"
@@ -92,6 +93,15 @@ bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len) {
     if (channel >= DMA_NUM_CHANNELS || len == 0) return false;
     if (dma_busy(channel)) return false;
 
+    /* CB addresses are 32-bit — reject anything above 4GB */
+    if ((u64)(usize)src > 0xFFFFFFFF || (u64)(usize)dst > 0xFFFFFFFF) {
+        uart_puts("[dma] addr >4GB\n");
+        return false;
+    }
+
+    /* Flush source to RAM so DMA engine sees current data */
+    dcache_clean_range((u64)(usize)src, len);
+
     struct dma_cb *cb = &cb_pool[channel][0];
 
     cb->ti       = DMA_TI_SRC_INC | DMA_TI_DEST_INC |
@@ -110,6 +120,9 @@ bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len) {
 
     dma_wait(channel);
 
+    /* Invalidate destination so CPU sees DMA-written data */
+    dcache_invalidate_range((u64)(usize)dst, len);
+
     /* Check for errors */
     u32 cs = mmio_read(dma_reg(channel, DMA_CH_CS));
     if (cs & DMA_CS_ERROR) {
@@ -123,6 +136,12 @@ bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len) {
 bool dma_zero(u32 channel, void *dst, u32 len) {
     if (channel >= DMA_NUM_CHANNELS || len == 0) return false;
     if (dma_busy(channel)) return false;
+
+    /* CB addresses are 32-bit — reject anything above 4GB */
+    if ((u64)(usize)dst > 0xFFFFFFFF) {
+        uart_puts("[dma] addr >4GB\n");
+        return false;
+    }
 
     struct dma_cb *cb = &cb_pool[channel][0];
 
@@ -142,6 +161,9 @@ bool dma_zero(u32 channel, void *dst, u32 len) {
         return false;
 
     dma_wait(channel);
+
+    /* Invalidate destination so CPU sees DMA-zeroed data */
+    dcache_invalidate_range((u64)(usize)dst, len);
 
     u32 cs = mmio_read(dma_reg(channel, DMA_CH_CS));
     return !(cs & DMA_CS_ERROR);
