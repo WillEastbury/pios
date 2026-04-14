@@ -724,8 +724,8 @@ bool cyw43_load_firmware(void)
     /* Upload firmware binary */
     {
         fat32_file_t fw;
-        if (!fat32_open("/firmware.bin", &fw)) {
-            uart_puts("[cyw43] firmware.bin not found on boot partition\n");
+        if (!fat32_open("/wifi/firmware.bin", &fw)) {
+            uart_puts("[cyw43] wifi/firmware.bin not found on boot partition\n");
             return false;
         }
         uart_puts("[cyw43] loading firmware.bin (");
@@ -761,7 +761,7 @@ bool cyw43_load_firmware(void)
     /* Upload NVRAM */
     {
         fat32_file_t nv;
-        if (!fat32_open("/nvram.txt", &nv)) {
+        if (!fat32_open("/wifi/nvram.txt", &nv)) {
             uart_puts("[cyw43] nvram.txt not found — using minimal defaults\n");
             static const u8 default_nvram[] =
                 "boardtype=0x0646\0"
