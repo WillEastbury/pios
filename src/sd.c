@@ -116,12 +116,15 @@ static sd_stats_t stats;
 static inline void sd_write(u32 off, u32 val) { mmio_write(EMMC2_BASE + off, val); }
 static inline u32  sd_read(u32 off)           { return mmio_read(EMMC2_BASE + off); }
 
-/* Timer-based microsecond timestamp (reads ARM generic counter directly). */
+/* Timer-based microsecond timestamp (reads ARM generic counter directly).
+ * Returns ~UINT64_MAX when CNTFRQ_EL0 == 0 so deadlines never expire
+ * spuriously — callers will block until the condition is met or another
+ * exit path fires (error interrupt, etc.). */
 static inline u64 sd_now_us(void) {
     u64 freq, cnt;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
     __asm__ volatile("mrs %0, cntvct_el0" : "=r"(cnt));
-    if (unlikely(freq == 0)) return 0;
+    if (unlikely(freq == 0)) return ~(u64)0;
     return cnt / (freq / 1000000ULL);
 }
 
@@ -292,7 +295,9 @@ static void sd_set_clock(u32 freq_khz) {
 static u32 csd_extract(const u32 *resp, u32 start, u32 width) {
     u32 val = 0;
     for (u32 i = 0; i < width; i++) {
-        u32 bit = start + i - 8;          /* adjust for CRC strip */
+        u32 csd_bit = start + i;
+        if (csd_bit < 8) continue;        /* CRC zone — stripped by SDHCI */
+        u32 bit = csd_bit - 8;            /* adjust for CRC strip */
         u32 word = bit / 32;
         u32 pos  = bit % 32;
         if (word < 4 && (resp[word] & (1u << pos)))
@@ -316,8 +321,8 @@ static bool sd_read_csd(void) {
         u32 c_size      = csd_extract(csd, 62, 12);
         u32 c_size_mult = csd_extract(csd, 47, 3);
         card.capacity   = (u64)(c_size + 1)
-                          * (1u << (c_size_mult + 2))
-                          * (1u << read_bl_len);
+                          * (1ULL << (c_size_mult + 2))
+                          * (1ULL << read_bl_len);
     } else if (csd_ver == 1) {
         /* CSD v2 — SDHC / SDXC */
         u32 c_size    = csd_extract(csd, 48, 22);
@@ -438,7 +443,8 @@ bool sd_init(void) {
     card.rca = resp[0] >> 16;
 
     /* CMD9: SEND_CSD — parse capacity (must be before CMD7 selects card) */
-    sd_read_csd();
+    if (!sd_read_csd())
+        uart_puts("[sd] WARNING: CSD parse failed, capacity unknown\n");
 
     /* CMD7: SELECT_CARD */
     if (!sd_send_cmd(SD_CMD7, card.rca << 16, resp)) {
@@ -662,8 +668,8 @@ static bool sd_read_blocks_multi(u32 lba, u32 count, u8 *buf) {
             return false;
         }
 
-        sd_write(REG_INTERRUPT, INT_READ_RDY);
         pio_read_block(buf + b * SD_BLOCK_SIZE);
+        sd_write(REG_INTERRUPT, INT_READ_RDY);
     }
 
     /* Wait for transfer complete (auto-CMD12 sent by controller) */
@@ -724,8 +730,8 @@ static bool sd_write_blocks_multi(u32 lba, u32 count, const u8 *buf) {
             return false;
         }
 
-        sd_write(REG_INTERRUPT, INT_WRITE_RDY);
         pio_write_block(buf + b * SD_BLOCK_SIZE);
+        sd_write(REG_INTERRUPT, INT_WRITE_RDY);
     }
 
     /* Wait for transfer complete (auto-CMD12 sent by controller) */
