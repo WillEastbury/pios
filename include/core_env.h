@@ -57,6 +57,13 @@ struct core_env {
     u64  bytes_processed;
 } ALIGNED(64);
 
+/* Validate a pointer+length falls entirely within a core's private RAM */
+static inline bool ptr_in_core_ram(u32 core, u64 ptr, u32 len) {
+    u64 base = core_ram_bases[core & 3];
+    u64 end  = base + CORE_PRIV_SIZE;
+    return ptr >= base && ptr + len <= end && ptr + len >= ptr;
+}
+
 /* One env per core, stored at start of each core's private RAM */
 static inline struct core_env *core_env_of(u32 id) {
     return (struct core_env *)(usize)core_ram_bases[id & 3];

@@ -17,6 +17,7 @@
 #include "net.h"
 #include "fifo.h"
 #include "core.h"
+#include "core_env.h"
 #include "uart.h"
 #include "simd.h"
 #include "timer.h"
@@ -422,6 +423,11 @@ void socket_handle_fifo(u32 from_core) {
     }
 
     case MSG_SOCK_SEND: {
+        if (!ptr_in_core_ram(from_core, msg.buffer, msg.length)) {
+            reply.status = 1;
+            fifo_push(CORE_NET, from_core, &reply);
+            break;
+        }
         tcp_conn_t conn = (tcp_conn_t)msg.param;
         u32 written = tcp_write(conn, (void *)(usize)msg.buffer, msg.length);
         reply.param = written;
@@ -431,6 +437,11 @@ void socket_handle_fifo(u32 from_core) {
     }
 
     case MSG_SOCK_RECV: {
+        if (!ptr_in_core_ram(from_core, msg.buffer, msg.length)) {
+            reply.status = 1;
+            fifo_push(CORE_NET, from_core, &reply);
+            break;
+        }
         tcp_conn_t conn = (tcp_conn_t)msg.param;
         /* Poll until data available or timeout */
         for (u32 i = 0; i < 5000; i++) {

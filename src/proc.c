@@ -3170,21 +3170,31 @@ static void sys_tensor_download(const void *t, void *data)
 
 static i32 sys_tensor_matmul(void *c, const void *a, const void *b)
 {
+    if (!ptr_valid(c, sizeof(tensor_t))) return -1;
+    if (!ptr_valid(a, sizeof(tensor_t))) return -1;
+    if (!ptr_valid(b, sizeof(tensor_t))) return -1;
     return tensor_matmul((tensor_t *)c, (const tensor_t *)a, (const tensor_t *)b) ? 0 : -1;
 }
 
 static i32 sys_tensor_relu(void *b, const void *a)
 {
+    if (!ptr_valid(b, sizeof(tensor_t))) return -1;
+    if (!ptr_valid(a, sizeof(tensor_t))) return -1;
     return tensor_relu((tensor_t *)b, (const tensor_t *)a) ? 0 : -1;
 }
 
 static i32 sys_tensor_softmax(void *b, const void *a)
 {
+    if (!ptr_valid(b, sizeof(tensor_t))) return -1;
+    if (!ptr_valid(a, sizeof(tensor_t))) return -1;
     return tensor_softmax((tensor_t *)b, (const tensor_t *)a) ? 0 : -1;
 }
 
 static i32 sys_tensor_add(void *c, const void *a, const void *b)
 {
+    if (!ptr_valid(c, sizeof(tensor_t))) return -1;
+    if (!ptr_valid(a, sizeof(tensor_t))) return -1;
+    if (!ptr_valid(b, sizeof(tensor_t))) return -1;
     return tensor_add((tensor_t *)c, (const tensor_t *)a, (const tensor_t *)b) ? 0 : -1;
 }
 
@@ -3196,11 +3206,16 @@ static i32 sys_tensor_dot(void *result, const void *a, const void *b)
 
 static i32 sys_tensor_mul(void *c, const void *a, const void *b)
 {
+    if (!ptr_valid(c, sizeof(tensor_t))) return -1;
+    if (!ptr_valid(a, sizeof(tensor_t))) return -1;
+    if (!ptr_valid(b, sizeof(tensor_t))) return -1;
     return tensor_mul((tensor_t *)c, (const tensor_t *)a, (const tensor_t *)b) ? 0 : -1;
 }
 
 static i32 sys_tensor_scale(void *b, const void *a, float scalar)
 {
+    if (!ptr_valid(b, sizeof(tensor_t))) return -1;
+    if (!ptr_valid(a, sizeof(tensor_t))) return -1;
     return tensor_scale((tensor_t *)b, (const tensor_t *)a, scalar) ? 0 : -1;
 }
 
