@@ -19,7 +19,7 @@
 #include "rp1_clk.h"
 #include "mmu.h"
 #include "pcie.h"
-#include "rp1_clk.h"
+#include "simd.h"
 
 /* PHY reset is on RP1 GPIO 32, funcsel 5, active LOW */
 #define PHY_RESET_GPIO  32
@@ -672,7 +672,7 @@ bool macb_init(void) {
 static u32 tx_send_count;
 
 bool macb_send(const u8 *frame, u32 len) {
-    if (len > BUF_SIZE || len == 0) return false;
+    if (len > BUF_SIZE || len < 14) return false;
 
     /* Invalidate TX descriptor to see MAC's latest USED bit */
     dcache_invalidate_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
@@ -681,9 +681,12 @@ bool macb_send(const u8 *frame, u32 len) {
     if (!(tx_ring[tx_idx].ctrl & TX_STAT_USED))
         return false;  /* busy */
 
-    /* Copy frame to TX buffer */
+    /* Copy frame to TX buffer (NEON for throughput) */
     u8 *dst = tx_bufs[tx_idx];
-    for (u32 i = 0; i < len; i++) dst[i] = frame[i];
+    simd_memcpy(dst, frame, len);
+
+    /* Flush TX buffer to RAM for non-coherent PCIe DMA */
+    dcache_clean_range((u64)(usize)dst, len);
 
     /* Setup descriptor (Circle: set addr during send, then barrier, then ctrl) */
 #if !USE_8BYTE_DESC
@@ -697,6 +700,9 @@ bool macb_send(const u8 *frame, u32 len) {
     ctrl |= TX_STAT_LAST;
     if (tx_idx == NUM_TX - 1) ctrl |= TX_STAT_WRAP;
     tx_ring[tx_idx].ctrl = ctrl;
+
+    /* Flush descriptor to RAM before triggering DMA */
+    dcache_clean_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
     __asm__ volatile("dsb sy" ::: "memory");
 
     /* Trigger TX */
@@ -737,18 +743,18 @@ bool macb_send(const u8 *frame, u32 len) {
 
 /* ── Receive ── */
 bool macb_recv(u8 *frame, u32 *len) {
-    /* Force visibility of DMA writes */
-    __asm__ volatile("dsb sy; isb" ::: "memory");
+    /* Invalidate RX descriptor to see MAC's DMA writes (non-coherent PCIe) */
+    dcache_invalidate_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
+    __asm__ volatile("dsb sy" ::: "memory");
 
-    /* Read descriptor via volatile pointer */
-    volatile u32 *raw = (volatile u32 *)(usize)&rx_ring[rx_idx];
-    u32 addr_val = raw[0];
+    /* Read descriptor */
+    u32 addr_val = rx_ring[rx_idx].addr;
 
     /* Check if current RX descriptor has been filled by MAC */
     if (!(addr_val & RX_ADDR_OWN))
         return false;
 
-    u32 status = raw[1];
+    u32 status = rx_ring[rx_idx].ctrl;
     u32 flen = status & RX_STAT_LEN_MASK;
 
     if (flen == 0 || flen > BUF_SIZE) {
@@ -762,9 +768,9 @@ bool macb_recv(u8 *frame, u32 *len) {
     /* Invalidate RX buffer to see data written by MAC via DMA */
     dcache_invalidate_range((u64)(usize)rx_bufs[rx_idx], BUF_SIZE);
 
-    /* Copy frame out */
+    /* Copy frame out (NEON for throughput) */
     u8 *src = rx_bufs[rx_idx];
-    for (u32 i = 0; i < flen; i++) frame[i] = src[i];
+    simd_memcpy(frame, src, flen);
     *len = flen;
 
     /* Reclaim: clear ownership bit and flush back to RAM */
