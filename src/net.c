@@ -501,11 +501,11 @@ void net_poll(void) {
 
         if (unlikely(len < sizeof(struct eth_hdr))) {
             stats.drop_runt++;
-            return;
+            continue;
         }
         if (unlikely(len > 1518)) {
             stats.drop_oversized++;
-            return;
+            continue;
         }
 
         struct eth_hdr *eth = (struct eth_hdr *)rx_frame;
