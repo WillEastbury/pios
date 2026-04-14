@@ -205,68 +205,66 @@ static void sdio_set_clock(u32 freq_khz)
 
 /* ── BCM2712 SoC GPIO/pinctrl helpers ── */
 
-/* BCM2712 pinctrl: set pin function via FSEL registers
- * Each GPIO has 4 bits in FSEL registers, 8 GPIOs per 32-bit register.
- * SDIO2 function is typically ALT0 or the default mux. */
+/* BCM2712 pinctrl: set pin function via FSEL registers at 0x107D504100.
+ * Each GPIO has 4 bits in FSEL registers, 8 GPIOs per 32-bit register. */
 static void bcm2712_gpio_set_fsel(u32 pin, u32 fsel)
 {
     u32 reg_off = (pin / 8) * 4;
     u32 shift = (pin % 8) * 4;
     u32 val = mmio_read(BCM2712_PINCTRL_BASE + reg_off);
-    val &= ~(0xF << shift);
+    val &= ~(0xFU << shift);
     val |= (fsel & 0xF) << shift;
     mmio_write(BCM2712_PINCTRL_BASE + reg_off, val);
 }
 
 static void sdio_gpio_init(void)
 {
-    /* SDIO2 pins are on BCM2712 SoC GPIO 30-35.
-     * The VideoCore firmware likely already configures these via
-     * sdio2_30_pins in the DTB. We re-assert to be safe.
-     * Function 1 = SDIO2 for these pins. */
+    /* WL_ON pin (GPIO 28) — set as plain GPIO for WL_REG_ON */
+    bcm2712_gpio_set_fsel(SDIO_WL_REG_ON_GPIO, 0);  /* func 0 = GPIO */
+
+    /* SDIO2 pins (GPIO 30-35) — set to SDIO2 function.
+     * The firmware likely already configured these via sdio2_30_pins.
+     * We re-assert to be safe. */
     u32 pins[] = { SDIO2_GPIO_CLK, SDIO2_GPIO_CMD,
                    SDIO2_GPIO_DAT0, SDIO2_GPIO_DAT1,
                    SDIO2_GPIO_DAT2, SDIO2_GPIO_DAT3 };
 
     for (u32 i = 0; i < 6; i++) {
-        bcm2712_gpio_set_fsel(pins[i], 1);  /* ALT1 = SDIO2 */
+        bcm2712_gpio_set_fsel(pins[i], 1);  /* func 1 = SDIO2 */
     }
-    uart_puts("[sdio] BCM2712 SDIO2 GPIO 30-35 configured\n");
+    uart_puts("[sdio] GPIO 28=WL_ON, 30-35=SDIO2\n");
 }
 
 void sdio_power_on(void)
 {
-    /* Assert WL_REG_ON to power up CYW43455.
-     * On Pi 5, the firmware may have already enabled this via
-     * the 'wl-on-reg' regulator. We toggle it via BCM2712 SoC GPIO
-     * as a belt-and-braces approach. The exact GPIO is TBD —
-     * try GPIO 35 (common on Pi 5 designs). */
-    u32 wl_gpio = SDIO_WL_REG_ON_GPIO;
+    /* Assert WL_REG_ON (GPIO 28) to power up CYW43455.
+     * Circle: GPIO28 output HIGH + 150ms delay.
+     * Uses BCM2712 SoC GPIO registers (not brcmstb-gpio base):
+     *   IODIR0 at 0x107D508508 — bit clear = output
+     *   DATA0  at 0x107D508504 — bit set = high */
+    u32 bit = 1U << SDIO_WL_REG_ON_GPIO;  /* bit 28 */
 
-    /* Set as output via BCM2712 GPIO controller */
-    /* GPIO direction: base + 0x08 per bank, bit per GPIO */
-    u32 bank = wl_gpio / 32;
-    u32 bit = 1U << (wl_gpio % 32);
-    u64 gpio_base = BCM2712_GPIO_BASE + (bank * 0x24);
+    /* Set as output (clear IODIR bit) */
+    u32 iodir = mmio_read(BCM2712_GPIO1_IODIR0);
+    mmio_write(BCM2712_GPIO1_IODIR0, iodir & ~bit);
 
     /* Drive low (reset) */
-    mmio_write(gpio_base + 0x08, mmio_read(gpio_base + 0x08) | bit);  /* output enable */
-    mmio_write(gpio_base + 0x04, bit);  /* clear */
+    u32 data = mmio_read(BCM2712_GPIO1_DATA0);
+    mmio_write(BCM2712_GPIO1_DATA0, data & ~bit);
     delay_cycles(200000);
 
     /* Drive high (power on) */
-    mmio_write(gpio_base + 0x00, bit);  /* set */
-    delay_cycles(1000000);  /* CYW43455 needs ~150ms, give extra margin */
-    uart_puts("[sdio] WL_REG_ON asserted\n");
+    data = mmio_read(BCM2712_GPIO1_DATA0);
+    mmio_write(BCM2712_GPIO1_DATA0, data | bit);
+    delay_cycles(2000000);  /* 150ms+ startup delay */
+    uart_puts("[sdio] WL_REG_ON GPIO28 HIGH\n");
 }
 
 void sdio_power_off(void)
 {
-    u32 wl_gpio = SDIO_WL_REG_ON_GPIO;
-    u32 bank = wl_gpio / 32;
-    u32 bit = 1U << (wl_gpio % 32);
-    u64 gpio_base = BCM2712_GPIO_BASE + (bank * 0x24);
-    mmio_write(gpio_base + 0x04, bit);  /* clear */
+    u32 bit = 1U << SDIO_WL_REG_ON_GPIO;
+    u32 data = mmio_read(BCM2712_GPIO1_DATA0);
+    mmio_write(BCM2712_GPIO1_DATA0, data & ~bit);
     delay_cycles(200000);
 }
 
@@ -338,8 +336,29 @@ bool sdio_init(void)
 
     /* CMD5: IO_SEND_OP_COND — probe for SDIO card */
     u32 resp[4];
-    if (!sdio_send_cmd(SDIO_CMD5, 0, resp)) {
-        uart_puts("[sdio] CMD5 fail\n");
+    uart_puts("[sdio] CMD5 probe...\n");
+    
+    /* First CMD5 may fail with timeout if chip not ready — retry a few times */
+    bool cmd5_ok = false;
+    for (u32 retry = 0; retry < 5; retry++) {
+        sw(REG_INTERRUPT, INT_ALL);  /* clear all pending */
+        if (sdio_send_cmd(SDIO_CMD5, 0, resp)) {
+            cmd5_ok = true;
+            break;
+        }
+        /* Log the error bits */
+        u32 err = sr(REG_INTERRUPT);
+        uart_puts("[sdio] CMD5 err=");
+        uart_hex(err);
+        uart_puts(" retry ");
+        uart_hex(retry);
+        uart_puts("\n");
+        sw(REG_INTERRUPT, INT_ALL);
+        delay_cycles(2000000);  /* wait ~200ms between retries */
+    }
+    
+    if (!cmd5_ok) {
+        uart_puts("[sdio] CMD5 fail after retries\n");
         return false;
     }
 

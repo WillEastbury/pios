@@ -30,8 +30,13 @@
  * SoC GPIO controller at 0x107d504100 */
 #define BCM2712_PINCTRL_BASE 0x107D504100UL
 
-/* BCM2712 SoC GPIO controller (brcmstb-gpio at 0x107d517c00) */
+/* BCM2712 SoC GPIO — brcmstb-gpio register layout
+ * Per bank: ODEN(+0x00), DATA(+0x04), IODIR(+0x08), ..., stride=0x20
+ * Bank 0 = GPIO 0-31, Bank 1 = GPIO 32-35
+ * Circle uses dedicated offsets: DATA0=0x107D508504, IODIR0=0x107D508508 */
 #define BCM2712_GPIO_BASE    0x107D517C00UL
+#define BCM2712_GPIO1_DATA0  0x107D508504UL
+#define BCM2712_GPIO1_IODIR0 0x107D508508UL
 
 /* SDIO2 uses BCM2712 SoC GPIOs 30-35 (sdio2_30_pins in DTB) */
 #define SDIO2_GPIO_CLK       30
@@ -41,18 +46,10 @@
 #define SDIO2_GPIO_DAT2      34
 #define SDIO2_GPIO_DAT3      35
 
-/* SDIO GPIO pins — kept for reference but NOT used for WiFi on Pi 5 */
-#define SDIO_GPIO_CLK       28
-#define SDIO_GPIO_CMD       29
-#define SDIO_GPIO_DAT0      30
-#define SDIO_GPIO_DAT1      31
-#define SDIO_GPIO_DAT2      32
-#define SDIO_GPIO_DAT3      33
-
-/* WL_REG_ON: WiFi chip power/reset — firmware-managed regulator
- * On Pi 5 the VideoCore firmware handles this via 'wl-on-reg'.
- * We may need to use mailbox property tags to toggle it. */
-#define SDIO_WL_REG_ON_GPIO 35
+/* WL_REG_ON: BCM2712 SoC GPIO 28 (active HIGH, 150ms startup delay)
+ * DTS: gpio = <&gio 28 GPIO_ACTIVE_HIGH> in wl_on_reg
+ * Circle: GPIO28 set output high + 150ms delay */
+#define SDIO_WL_REG_ON_GPIO 28
 
 /* SDIO function numbers */
 #define SDIO_FUNC_CIA       0   /* Common I/O Area (CCCR/FBR) */
