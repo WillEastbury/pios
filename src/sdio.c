@@ -121,18 +121,22 @@ static inline void sw(u32 off, u32 val) { mmio_write(sdio_base() + off, val); }
 
 static bool sdio_wait_cmd(void)
 {
-    u32 timeout = 1000000;
-    while ((sr(REG_STATUS) & SR_CMD_INHIBIT) && timeout--)
+    for (u32 i = 0; i < 1000000; i++) {
+        if (!(sr(REG_STATUS) & SR_CMD_INHIBIT))
+            return true;
         delay_cycles(10);
-    return timeout > 0;
+    }
+    return false;
 }
 
 static bool sdio_wait_data(void)
 {
-    u32 timeout = 1000000;
-    while ((sr(REG_STATUS) & SR_DAT_INHIBIT) && timeout--)
+    for (u32 i = 0; i < 1000000; i++) {
+        if (!(sr(REG_STATUS) & SR_DAT_INHIBIT))
+            return true;
         delay_cycles(10);
-    return timeout > 0;
+    }
+    return false;
 }
 
 static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
@@ -424,11 +428,16 @@ bool sdio_cmd53_read(u32 func, u32 addr, u8 *buf, u32 len, bool incr)
     if (!timeout)
         return false;
 
-    /* Read data — 32-bit words */
+    /* Read data — 32-bit words, use byte writes for alignment safety */
     u32 words = (len + 3) / 4;
-    u32 *buf32 = (u32 *)buf;
-    for (u32 i = 0; i < words; i++)
-        buf32[i] = sr(REG_DATA);
+    for (u32 i = 0; i < words; i++) {
+        u32 val = sr(REG_DATA);
+        u32 off = i * 4;
+        buf[off]     = (u8)(val & 0xFF);
+        if (off + 1 < len) buf[off + 1] = (u8)((val >> 8) & 0xFF);
+        if (off + 2 < len) buf[off + 2] = (u8)((val >> 16) & 0xFF);
+        if (off + 3 < len) buf[off + 3] = (u8)((val >> 24) & 0xFF);
+    }
 
     /* Wait for transfer complete */
     timeout = 1000000;
@@ -475,11 +484,16 @@ bool sdio_cmd53_write(u32 func, u32 addr, const u8 *buf, u32 len, bool incr)
     if (!timeout)
         return false;
 
-    /* Write data — 32-bit words */
+    /* Write data — 32-bit words, use byte reads for alignment safety */
     u32 words = (len + 3) / 4;
-    const u32 *buf32 = (const u32 *)buf;
-    for (u32 i = 0; i < words; i++)
-        sw(REG_DATA, buf32[i]);
+    for (u32 i = 0; i < words; i++) {
+        u32 off = i * 4;
+        u32 val = (u32)buf[off];
+        if (off + 1 < len) val |= (u32)buf[off + 1] << 8;
+        if (off + 2 < len) val |= (u32)buf[off + 2] << 16;
+        if (off + 3 < len) val |= (u32)buf[off + 3] << 24;
+        sw(REG_DATA, val);
+    }
 
     /* Wait for transfer complete */
     timeout = 1000000;
@@ -519,8 +533,8 @@ bool sdio_cmd53_read_blocks(u32 func, u32 addr, u8 *buf,
     if (!sdio_send_cmd(cmd_flags, arg, resp))
         return false;
 
-    u32 total_words = (blksz * nblks + 3) / 4;
-    u32 *buf32 = (u32 *)buf;
+    u32 total_bytes = blksz * nblks;
+    u32 total_words = (total_bytes + 3) / 4;
 
     for (u32 w = 0; w < total_words; w++) {
         u32 timeout = 1000000;
@@ -528,7 +542,12 @@ bool sdio_cmd53_read_blocks(u32 func, u32 addr, u8 *buf,
             delay_cycles(10);
         if (!timeout)
             return false;
-        buf32[w] = sr(REG_DATA);
+        u32 val = sr(REG_DATA);
+        u32 off = w * 4;
+        buf[off]     = (u8)(val & 0xFF);
+        if (off + 1 < total_bytes) buf[off + 1] = (u8)((val >> 8) & 0xFF);
+        if (off + 2 < total_bytes) buf[off + 2] = (u8)((val >> 16) & 0xFF);
+        if (off + 3 < total_bytes) buf[off + 3] = (u8)((val >> 24) & 0xFF);
     }
 
     u32 timeout = 1000000;
@@ -567,8 +586,8 @@ bool sdio_cmd53_write_blocks(u32 func, u32 addr, const u8 *buf,
     if (!sdio_send_cmd(cmd_flags, arg, resp))
         return false;
 
-    u32 total_words = (blksz * nblks + 3) / 4;
-    const u32 *buf32 = (const u32 *)buf;
+    u32 total_bytes = blksz * nblks;
+    u32 total_words = (total_bytes + 3) / 4;
 
     for (u32 w = 0; w < total_words; w++) {
         u32 timeout = 1000000;
@@ -576,7 +595,12 @@ bool sdio_cmd53_write_blocks(u32 func, u32 addr, const u8 *buf,
             delay_cycles(10);
         if (!timeout)
             return false;
-        sw(REG_DATA, buf32[w]);
+        u32 off = w * 4;
+        u32 val = (u32)buf[off];
+        if (off + 1 < total_bytes) val |= (u32)buf[off + 1] << 8;
+        if (off + 2 < total_bytes) val |= (u32)buf[off + 2] << 16;
+        if (off + 3 < total_bytes) val |= (u32)buf[off + 3] << 24;
+        sw(REG_DATA, val);
     }
 
     u32 timeout = 1000000;

@@ -914,7 +914,12 @@ i32 cyw43_get_rssi(void)
 
 void cyw43_get_mac(u8 *mac)
 {
-    if (cyw_mac[0] == 0 && cyw_mac[1] == 0 && cyw_mac[2] == 0) {
+    /* Check if MAC has been retrieved (all zeros = not yet) */
+    bool all_zero = true;
+    for (u32 i = 0; i < CYW_MAC_LEN; i++) {
+        if (cyw_mac[i] != 0) { all_zero = false; break; }
+    }
+    if (all_zero) {
         /* Try reading from chip */
         u8 resp[8];
         u32 resp_len = sizeof(resp);
