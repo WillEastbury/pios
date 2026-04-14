@@ -25,15 +25,26 @@ Each driver is a single `.c` / `.h` pair. All talk directly to MMIO registers vi
 **Hardware**: BCM2712 EMMC2 SDHCI controller at `0x1000FFF000`. Supports SDSC and SDHC/SDXC.
 
 ### Init Sequence
-`CMD0` (GO_IDLE) → `CMD8` (IF_COND, SD v2 check) → `ACMD41` (poll until ready, HCS for SDHC) → `CMD2` (ALL_SEND_CID) → `CMD3` (SEND_RELATIVE_ADDR) → `CMD7` (SELECT_CARD) → clock to 25MHz → `ACMD6` (4-bit bus) → `CMD16` (block length 512)
+`CMD0` (GO_IDLE) → `CMD8` (IF_COND, SD v2 check) → `ACMD41` (poll until ready, HCS for SDHC) → `CMD2` (ALL_SEND_CID) → `CMD3` (SEND_RELATIVE_ADDR) → `CMD9` (SEND_CSD, parse capacity) → `CMD7` (SELECT_CARD) → clock to 25MHz → `ACMD6` (4-bit bus) → `CMD16` (block length 512, SDSC only)
 
 | Function | Description |
 |----------|-------------|
-| `sd_init()` | Full card init sequence, returns true if card detected |
-| `sd_read_block(lba, buf)` | Read one 512-byte block via CMD17 |
-| `sd_write_block(lba, buf)` | Write one 512-byte block via CMD24 |
-| `sd_read_blocks(lba, count, buf)` | Multi-block read (sequential CMD17) |
-| `sd_write_blocks(lba, count, buf)` | Multi-block write (sequential CMD24) |
+| `sd_init()` | Full card init sequence; parses CSD for capacity; returns true if card detected |
+| `sd_read_block(lba, buf)` | Read one 512-byte block via CMD17 (retries on transient error) |
+| `sd_write_block(lba, buf)` | Write one 512-byte block via CMD24 (retries, post-write busy wait) |
+| `sd_read_blocks(lba, count, buf)` | Multi-block read via CMD18 with auto-CMD12 |
+| `sd_write_blocks(lba, count, buf)` | Multi-block write via CMD25 with auto-CMD12, post-write busy wait |
+| `sd_get_card_info()` | Return card type, RCA, and capacity (bytes) |
+| `sd_get_stats()` | Return lightweight I/O statistics (reads, writes, errors, retries, timeouts) |
+
+### Timeout Model
+All waits use the ARM generic timer counter (`CNTVCT_EL0` / `CNTFRQ_EL0`) for deterministic, CPU-speed-independent deadlines. Per-operation policy: command 100 ms, data transfer 500 ms, init/reset 1 s, post-write busy 1 s, clock stabilise 100 ms.
+
+### Error Recovery
+On CMD/DATA errors the driver resets the relevant SDHCI line(s) (`C1_SRST_CMD` / `C1_SRST_DATA`), clears all interrupt bits, and retries up to 3 times before reporting failure.
+
+### Buffer Contract
+4-byte-aligned buffers use the fast 32-bit PIO path. Unaligned buffers are handled safely via a byte-copy fallback. No DMA is used; cache maintenance is not required.
 
 **Registers**: `EMMC2_BASE` = `0x1000FFF000`
 
