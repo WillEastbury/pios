@@ -118,4 +118,48 @@ Inter-core communication uses `struct fifo_msg` (64 bytes). When adding new mess
 
 ### Code Size Discipline
 
-The entire kernel is ~27KB. Every byte matters. No printf-debugging left in (use `uart_puts` sparingly). No unused code. `-O2` optimization. If a function is only called once, the compiler will inline it — don't fight this.
+The entire kernel is ~259KB. Keep strings short (prefixes: `[mac]`, `[wal]`, `[bt]`, `[cyw]`, `[fat]`, `[sdio]`, etc). No unused code. `-O2` optimization. If a function is only called once, the compiler will inline it — don't fight this.
+
+### WiFi — CYW43455 via BCM2712 SDIO2 (WIP)
+
+**Status:** SDIO2 controller confirmed alive, CMD5 fails (chip not responding).
+
+**Critical hardware finding (2026-04-14):** The Pi 5's CYW43455 WiFi chip is connected to the **BCM2712 SoC's SDIO2** controller, NOT RP1. This was discovered by parsing the DTB (`bcm2712-rpi-5-b.dtb`).
+
+**Address map:**
+| What | Address | Notes |
+|------|---------|-------|
+| BCM2712 SDIO2 (WiFi) | `0x1001100000` | DTB: `/axi/mmc@1100000`, compat: `brcm,bcm2712-sdhci` |
+| BCM2712 EMMC2 (SD card) | `0x1000FFF000` | DTB: `/soc@107c000000/mmc@fff000` |
+| RP1 MMC0 | `RP1_BAR + 0x180000` | NOT WiFi — separate RP1 controller |
+| RP1 MMC1 | `RP1_BAR + 0x184000` | NOT WiFi — separate RP1 controller |
+| BCM2712 SoC pinctrl | `0x107D504100` | DTB: `sdio2_30_pins` for SDIO2 GPIO 30-35 |
+| BCM2712 SoC GPIO | `0x107D517C00` | `brcmstb-gpio` — different register layout from RP1 |
+| WL_REG_ON | firmware regulator | DTB: `wl-on-reg` / `ywl-on-regulator` — may need mailbox |
+
+**What works:**
+- SDIO2 controller responds: CAP0=`0x55EEC832`, CAP1=`0x8000A527`
+- HC reset, 3.3V power, 400kHz clock all succeed
+- STATUS=`0x000F0000` (CMD/DAT lines idle — correct)
+
+**What doesn't work yet:**
+- CMD5 (IO_SEND_OP_COND) fails — CYW43455 not responding
+- Likely cause: WL_REG_ON not toggling correctly. The `brcmstb-gpio` controller at `0x107D517C00` has a different register layout than standard ARM GPIO. May need to use VideoCore mailbox to toggle the `wl-on-reg` regulator instead.
+- SoC pinctrl at `0x107D504100` — FSEL register layout for `bcm2712c0-pinctrl` needs verification. The firmware may already configure SDIO2 pins via DTB `sdio2_30_pins`.
+
+**Next steps:**
+1. Investigate `brcmstb-gpio` register layout (Linux `drivers/gpio/gpio-brcmstb.c`)
+2. Try VideoCore mailbox to control `wl-on-reg` (SET_GPIO_STATE or equivalent)
+3. Verify SDIO2 pin muxing is correct (firmware may handle this)
+4. Add CMD5 error detail logging (read interrupt status register for specific error bits)
+5. If CMD5 returns CRC error, that's actually normal for first probe — retry with error masking
+
+**Architecture (FullMAC):** CYW43455 firmware handles 802.11/WPA2. Host speaks SDPCM/BCDC protocol. Files: `sdio.c` (SDHCI host), `cyw43.c` (chip driver + protocol), `wifi_nic.c` (NIC backend), `fat32.c` (reads firmware from boot partition).
+
+**Firmware blobs** (on SD `/wifi/` folder):
+- `firmware.bin` — cyfmac43455-sdio-standard.bin (595KB)
+- `nvram.txt` — brcmfmac43455-sdio.txt (2KB)
+- `clm.bin` — cyfmac43455-sdio.clm_blob (2.6KB)
+Source: `RPi-Distro/firmware-nonfree` GitHub repo.
+
+**DO NOT** modify `pcie.c`, `macb.c`, `uart.c`, `fb.c`, `net.c` for WiFi work — these are stable boot-critical drivers. The cloud agent previously broke boot by "cleaning up" RESCAL calibration, DMA scroll, and HDMI mirror code. WiFi code is additive only.
