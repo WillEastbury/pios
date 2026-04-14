@@ -38,13 +38,13 @@ static bool discover_partition(void)
 {
     static u8 ALIGNED(64) mbr[SD_BLOCK_SIZE];
     if (!sd_read_block(0, mbr)) {
-        uart_puts("[walfs] Cannot read MBR\n");
+        uart_puts("[wal] MBR read fail\n");
         return false;
     }
 
     /* Check MBR signature */
     if (mbr[510] != 0x55 || mbr[511] != 0xAA) {
-        uart_puts("[walfs] No MBR signature, using default base LBA ");
+        uart_puts("[wal] no MBR sig, default LBA=");
         uart_hex(WALFS_BASE_LBA);
         uart_puts("\n");
         base_lba = WALFS_BASE_LBA;
@@ -57,16 +57,16 @@ static bool discover_partition(void)
     u32 p2_size  = read_le32(&mbr[0x1CE + 12]);
     u8  p2_type  = mbr[0x1CE + 4];
 
-    uart_puts("[walfs] MBR partition 2: type=");
+    uart_puts("[wal] MBR p2: t=");
     uart_hex(p2_type);
-    uart_puts(" start=");
+    uart_puts(" s=");
     uart_hex(p2_start);
-    uart_puts(" size=");
+    uart_puts(" sz=");
     uart_hex(p2_size);
     uart_puts("\n");
 
     if (p2_start == 0 || p2_size == 0) {
-        uart_puts("[walfs] Partition 2 not found, using default base LBA ");
+        uart_puts("[wal] p2 missing, default LBA=");
         uart_hex(WALFS_BASE_LBA);
         uart_puts("\n");
         base_lba = WALFS_BASE_LBA;
@@ -74,7 +74,7 @@ static bool discover_partition(void)
     }
 
     base_lba = p2_start;
-    uart_puts("[walfs] Using partition 2 at LBA ");
+    uart_puts("[wal] p2 LBA=");
     uart_hex(base_lba);
     uart_puts("\n");
     return true;
@@ -519,7 +519,7 @@ static void scan_recovery(void)
 
     /* Repair wal_head if it's inconsistent with actual data */
     if (last_valid_pos != super.wal_head) {
-        uart_puts("[walfs] Repaired wal_head: ");
+        uart_puts("[wal] fix head: ");
         uart_hex((u32)(super.wal_head >> 32));
         uart_hex((u32)super.wal_head);
         uart_puts(" -> ");
@@ -563,7 +563,7 @@ static bool format_disk(void)
     super.tree_root = rp;
 
     write_super();
-    uart_puts("[walfs] formatted\n");
+    uart_puts("[wal] formatted\n");
     return true;
 }
 
@@ -586,19 +586,19 @@ bool walfs_init(void)
         u32 crc = hw_crc32c(&super, SD_BLOCK_SIZE);
         super.crc32 = saved;
         if (crc != saved) {
-            uart_puts("[walfs] bad superblock crc\n");
+            uart_puts("[wal] bad super crc\n");
             return false;
         }
         /* Validate wal_head is within sane bounds */
         if (super.wal_head < WAL_START ||
             (super.total_blocks > 0 &&
              super.wal_head > (u64)super.total_blocks * SD_BLOCK_SIZE)) {
-            uart_puts("[walfs] wal_head out of bounds\n");
+            uart_puts("[wal] head OOB\n");
             return false;
         }
         scan_recovery();
         mounted = true;
-        uart_puts("[walfs] mounted, records=");
+        uart_puts("[wal] mounted rec=");
         uart_hex(super.record_count);
         uart_puts("\n");
         return true;
@@ -960,7 +960,7 @@ bool walfs_mmap(u64 inode_id, u64 offset, u32 length, void *dest)
 bool walfs_compact(void)
 {
     if (!mounted) return false;
-    uart_puts("[walfs] Compacting WAL...\n");
+    uart_puts("[wal] compacting...\n");
 
     /* Phase 1: Scan WAL, determine live inodes + latest RECORD_INODE pos */
     #define COMPACT_MAX 256
@@ -1087,9 +1087,9 @@ bool walfs_compact(void)
     lru_flush(&path_cache);
     write_super();
 
-    uart_puts("[walfs] Compacted: ");
+    uart_puts("[wal] compact: ");
     uart_hex(super.record_count);
-    uart_puts(" records, head=");
+    uart_puts(" rec head=");
     uart_hex((u32)super.wal_head);
     uart_puts("\n");
     return true;

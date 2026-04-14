@@ -320,27 +320,27 @@ bool pcie_init(void) {
     dmb();
 
     /* ── Verbose PCIe register dump for DMA debugging ── */
-    uart_puts("[pcie] === PCIe RC Register Dump ===\n");
-    uart_puts("[pcie] MISC_CTRL="); uart_hex(pr(MISC_MISC_CTRL)); uart_puts("\n");
-    uart_puts("[pcie] BAR2_LO="); uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
-    uart_puts(" BAR2_HI="); uart_hex(pr(MISC_RC_BAR2_CONFIG_HI)); uart_puts("\n");
-    uart_puts("[pcie] UBUS_BAR2_REMAP="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP));
-    uart_puts(" REMAP_HI="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP_HI)); uart_puts("\n");
-    uart_puts("[pcie] VENDOR_REG1="); uart_hex(pr(RC_CFG_VENDOR_SPECIFIC_REG1)); uart_puts("\n");
-    uart_puts("[pcie] UBUS_CTRL="); uart_hex(pr(MISC_UBUS_CTRL)); uart_puts("\n");
-    uart_puts("[pcie] STATUS="); uart_hex(pr(MISC_PCIE_STATUS)); uart_puts("\n");
-    uart_puts("[pcie] RC_CMD="); uart_hex(pr(PCI_REG_CMD)); uart_puts("\n");
-    uart_puts("[pcie] HARD_DEBUG="); uart_hex(pr(HARD_DEBUG)); uart_puts("\n");
-    uart_puts("[pcie] OB_WIN0_LO="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_LO));
-    uart_puts(" HI="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_HI)); uart_puts("\n");
-    uart_puts("[pcie] OB_WIN0_BL="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_BL)); uart_puts("\n");
-    uart_puts("[pcie] OB_WIN0_BH="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_BH));
+    uart_puts("[pci] RC regs:\n");
+    uart_puts("[pci] MCTRL="); uart_hex(pr(MISC_MISC_CTRL)); uart_puts("\n");
+    uart_puts("[pci] B2L="); uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
+    uart_puts(" B2H="); uart_hex(pr(MISC_RC_BAR2_CONFIG_HI)); uart_puts("\n");
+    uart_puts("[pci] UBRM="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP));
+    uart_puts(" RMH="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP_HI)); uart_puts("\n");
+    uart_puts("[pci] VREG="); uart_hex(pr(RC_CFG_VENDOR_SPECIFIC_REG1)); uart_puts("\n");
+    uart_puts("[pci] UBUS="); uart_hex(pr(MISC_UBUS_CTRL)); uart_puts("\n");
+    uart_puts("[pci] STS="); uart_hex(pr(MISC_PCIE_STATUS)); uart_puts("\n");
+    uart_puts("[pci] CMD="); uart_hex(pr(PCI_REG_CMD)); uart_puts("\n");
+    uart_puts("[pci] HDBG="); uart_hex(pr(HARD_DEBUG)); uart_puts("\n");
+    uart_puts("[pci] OB0L="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_LO));
+    uart_puts(" H="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_HI)); uart_puts("\n");
+    uart_puts("[pci] OB0BL="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_BL)); uart_puts("\n");
+    uart_puts("[pci] OB0BH="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_BH));
     uart_puts(" LH="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_LH)); uart_puts("\n");
 
     /* RP1 endpoint config */
-    uart_puts("[pcie] RP1 BAR1="); uart_hex(pcie_cfg_read(1,0,0,0x14)); uart_puts("\n");
-    uart_puts("[pcie] RP1 CMD="); uart_hex(pcie_cfg_read(1,0,0,0x04)); uart_puts("\n");
-    uart_puts("[pcie] RP1 ID="); uart_hex(pcie_cfg_read(1,0,0,0x00)); uart_puts("\n");
+    uart_puts("[pci] RP1 B1="); uart_hex(pcie_cfg_read(1,0,0,0x14)); uart_puts("\n");
+    uart_puts("[pci] RP1 CMD="); uart_hex(pcie_cfg_read(1,0,0,0x04)); uart_puts("\n");
+    uart_puts("[pci] RP1 ID="); uart_hex(pcie_cfg_read(1,0,0,0x00)); uart_puts("\n");
 
     /* Also dump to HDMI via fb so user can read it on screen */
     fb_set_color(0x0000CCFF, 0x00000000);
@@ -350,7 +350,7 @@ bool pcie_init(void) {
     fb_printf("VENDOR=%X UBUS=%X\n", pr(RC_CFG_VENDOR_SPECIFIC_REG1), pr(MISC_UBUS_CTRL));
     fb_printf("RP1 BAR1=%X CMD=%X\n", pcie_cfg_read(1,0,0,0x14), pcie_cfg_read(1,0,0,0x04));
 
-    uart_puts("[pcie] === End Dump ===\n");
+    uart_puts("[pci] end dump\n");
 
     /* Init AER early so we catch any DMA errors */
     pcie_aer_init();
@@ -396,7 +396,7 @@ void pcie_aer_init(void) {
     /* Find AER on the RC (bus 0) */
     aer_offset_rc = find_aer_cap(0, 0, 0);
     if (aer_offset_rc) {
-        uart_puts("[pcie] AER found at RC offset ");
+        uart_puts("[pci] AER @RC=");
         uart_hex(aer_offset_rc);
         uart_puts("\n");
         /* Clear all errors */
@@ -406,7 +406,7 @@ void pcie_aer_init(void) {
         pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_UNCORR_MASK, 0);
         pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_CORR_MASK, 0);
     } else {
-        uart_puts("[pcie] AER not found on RC\n");
+        uart_puts("[pci] no AER\n");
     }
 }
 

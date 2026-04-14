@@ -455,22 +455,22 @@ void net_poll(void) {
 
     /* Log occasionally with MACB state */
     if ((poll_count & 0x3FFFFF) == 0 && poll_count > 0) {
-        uart_puts("[net] poll=");
+        uart_puts("[net] p=");
         uart_hex(poll_count);
-        uart_puts(" rx=");
+        uart_puts(" r=");
         uart_hex(rx_count);
         uart_puts("\n");
         fb_set_color(0x00AAAAAA, 0x00000000);
-        fb_printf("poll=%X rx=%X\n", poll_count, rx_count);
+        fb_printf("p=%X r=%X\n", poll_count, rx_count);
     }
     /* Every ~16M polls, dump MACB state */
     if ((poll_count & 0xFFFFFF) == 0 && poll_count > 0) {
         #define MACB_BASE_NET 0x1F00100000UL
-        uart_puts("[net] MACB ISR="); uart_hex(mmio_read(MACB_BASE_NET + 0x0024));
+        uart_puts("[net] ISR="); uart_hex(mmio_read(MACB_BASE_NET + 0x0024));
         uart_puts(" RSR="); uart_hex(mmio_read(MACB_BASE_NET + 0x0020));
         uart_puts(" TSR="); uart_hex(mmio_read(MACB_BASE_NET + 0x0014));
-        uart_puts(" RXCNT="); uart_hex(mmio_read(MACB_BASE_NET + 0x0158));
-        uart_puts(" TXCNT="); uart_hex(mmio_read(MACB_BASE_NET + 0x0108));
+        uart_puts(" RXC="); uart_hex(mmio_read(MACB_BASE_NET + 0x0158));
+        uart_puts(" TXC="); uart_hex(mmio_read(MACB_BASE_NET + 0x0108));
         uart_puts("\n");
         fb_set_color(0x00FFAA00, 0x00000000);
         fb_printf("ISR=%X RSR=%X TSR=%X RXCNT=%X TXCNT=%X\n",
@@ -580,19 +580,19 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
         arp_add_static(gateway, gateway_mac);
     }
 
-    uart_puts("[net] Hardened stack: IP=");
+    uart_puts("[net] IP=");
     uart_hex(ip);
     uart_puts(" GW=");
     uart_hex(gateway);
-    uart_puts(" (ARP hardened, TCP/UDP, NO DHCP)\n");
+    uart_puts(" (ARP+TCP/UDP)\n");
 
     /* Announce our presence on the network */
     pcie_aer_dump("pre-ARP");
     arp_announce();
     pcie_aer_dump("post-ARP");
 
-    uart_puts("[net] Post-announce NIC state:\n");
-    uart_puts("[net] nic_link="); uart_hex(nic_link_up() ? 1 : 0); uart_puts("\n");
+    uart_puts("[net] post-announce:\n");
+    uart_puts("[net] link="); uart_hex(nic_link_up() ? 1 : 0); uart_puts("\n");
 }
 
 void net_set_udp_callback(udp_recv_cb cb) {

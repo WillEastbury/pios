@@ -17,20 +17,20 @@ bool wifi_nic_init(void)
 {
     wifi_nic_initialized = false;
 
-    uart_puts("[wifi_nic] initializing CYW43455...\n");
+    uart_puts("[wnic] init CYW43455...\n");
 
     if (!cyw43_init()) {
-        uart_puts("[wifi_nic] cyw43 init failed\n");
+        uart_puts("[wnic] cyw init fail\n");
         return false;
     }
 
     if (!cyw43_load_firmware()) {
-        uart_puts("[wifi_nic] firmware load failed\n");
+        uart_puts("[wnic] fw load fail\n");
         return false;
     }
 
     wifi_nic_initialized = true;
-    uart_puts("[wifi_nic] CYW43455 ready\n");
+    uart_puts("[wnic] ready\n");
     return true;
 }
 

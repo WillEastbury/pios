@@ -246,7 +246,7 @@ bool sdio_init(void)
     sdio_initialized = false;
     sdio_rca = 0;
 
-    uart_puts("[sdio] init RP1 SDIO1 controller\n");
+    uart_puts("[sdio] init RP1 SDIO1\n");
 
     /* Configure GPIOs for SDIO */
     sdio_gpio_init();
@@ -260,7 +260,7 @@ bool sdio_init(void)
     while ((sr(REG_CONTROL1) & C1_SRST_HC) && timeout--)
         delay_cycles(10);
     if (!timeout) {
-        uart_puts("[sdio] HC reset timeout\n");
+        uart_puts("[sdio] HC rst timeout\n");
         return false;
     }
 
@@ -288,17 +288,17 @@ bool sdio_init(void)
     /* CMD5: IO_SEND_OP_COND — probe for SDIO card */
     u32 resp[4];
     if (!sdio_send_cmd(SDIO_CMD5, 0, resp)) {
-        uart_puts("[sdio] CMD5 failed — no SDIO card\n");
+        uart_puts("[sdio] CMD5 fail\n");
         return false;
     }
 
     u32 ocr = resp[0];
-    uart_puts("[sdio] CMD5 OCR=");
+    uart_puts("[sdio] OCR=");
     uart_hex(ocr);
     uart_puts("\n");
 
     u32 num_funcs = (ocr >> 28) & 0x7;
-    uart_puts("[sdio] functions=");
+    uart_puts("[sdio] funcs=");
     uart_hex(num_funcs);
     uart_puts("\n");
 
@@ -307,20 +307,20 @@ bool sdio_init(void)
     timeout = 100;
     do {
         if (!sdio_send_cmd(SDIO_CMD5, cmd5_arg, resp)) {
-            uart_puts("[sdio] CMD5 retry failed\n");
+            uart_puts("[sdio] CMD5 retry fail\n");
             return false;
         }
         delay_cycles(100000);
     } while (!(resp[0] & (1U << 31)) && timeout--);
 
     if (!timeout) {
-        uart_puts("[sdio] CMD5 ready timeout\n");
+        uart_puts("[sdio] CMD5 rdy timeout\n");
         return false;
     }
 
     /* CMD3: SEND_RELATIVE_ADDR */
     if (!sdio_send_cmd(SDIO_CMD3, 0, resp)) {
-        uart_puts("[sdio] CMD3 failed\n");
+        uart_puts("[sdio] CMD3 fail\n");
         return false;
     }
     sdio_rca = resp[0] >> 16;
@@ -330,7 +330,7 @@ bool sdio_init(void)
 
     /* CMD7: SELECT_CARD */
     if (!sdio_send_cmd(SDIO_CMD7, sdio_rca << 16, resp)) {
-        uart_puts("[sdio] CMD7 failed\n");
+        uart_puts("[sdio] CMD7 fail\n");
         return false;
     }
 
@@ -340,10 +340,10 @@ bool sdio_init(void)
     /* Verify CCCR access */
     u8 cccr_rev;
     if (!sdio_cmd52_read(SDIO_FUNC_CIA, CCCR_SDIO_REV, &cccr_rev)) {
-        uart_puts("[sdio] CCCR read failed\n");
+        uart_puts("[sdio] CCCR fail\n");
         return false;
     }
-    uart_puts("[sdio] CCCR rev=");
+    uart_puts("[sdio] CCCR=");
     uart_hex(cccr_rev);
     uart_puts("\n");
 
@@ -655,7 +655,7 @@ bool sdio_enable_func(u32 func)
         delay_cycles(1000);
     } while (timeout--);
 
-    uart_puts("[sdio] func enable timeout func=");
+    uart_puts("[sdio] func en timeout f=");
     uart_hex(func);
     uart_puts("\n");
     return false;

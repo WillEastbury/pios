@@ -255,7 +255,7 @@ static bool mac_load_from_sa1(u8 *out)
     u32 sa1t = mr(SA1T);
     u8 candidate[6];
 
-    uart_puts("[macb] SA1B="); uart_hex(sa1b);
+    uart_puts("[mac] SA1B="); uart_hex(sa1b);
     uart_puts(" SA1T="); uart_hex(sa1t);
     uart_puts("\n");
 
@@ -289,9 +289,9 @@ static bool mac_load_from_mailbox(u8 *out)
     mb[0] = 8 * 4; mb[1] = 0;
     mb[2] = 0x00010003; mb[3] = 6; mb[4] = 6;
     mb[5] = 0; mb[6] = 0; mb[7] = 0;
-    uart_puts("[macb] Mailbox GET_MAC_ADDRESS call...\n");
+    uart_puts("[mac] mbox GET_MAC...\n");
     bool ok = mbox_call(8, mb);
-    uart_puts("[macb] Mailbox result=");
+    uart_puts("[mac] mbox res=");
     uart_hex(ok ? 1 : 0);
     uart_puts(" mb[1]=");
     uart_hex(mb[1]);
@@ -304,24 +304,24 @@ static bool mac_load_from_mailbox(u8 *out)
         for (u32 i = 0; i < 6; i++)
             candidate[i] = raw[i];
 
-        mac_log("[macb] Mailbox MAC raw ", candidate);
+        mac_log("[mac] mbox raw ", candidate);
 
         if (mac_is_valid(candidate)) {
             mac_copy(out, candidate);
-            mac_log("[macb] MAC from mailbox ", out);
+            mac_log("[mac] MAC from mbox ", out);
             return true;
         }
-        mac_log("[macb] Rejecting invalid mailbox MAC ", candidate);
-        mac_log_invalid_reason("[macb] Mailbox reject reason: ", candidate);
+        mac_log("[mac] reject mbox MAC ", candidate);
+        mac_log_invalid_reason("[mac] reject: ", candidate);
     }
 
     /* Try tag 0x00010004 — GET_BOARD_SERIAL and derive MAC */
-    uart_puts("[macb] Trying GET_BOARD_SERIAL for MAC...\n");
+    uart_puts("[mac] try BOARD_SERIAL...\n");
     mb[0] = 8 * 4; mb[1] = 0;
     mb[2] = 0x00010004; mb[3] = 8; mb[4] = 8;
     mb[5] = 0; mb[6] = 0; mb[7] = 0;
     ok = mbox_call(8, mb);
-    uart_puts("[macb] Serial result=");
+    uart_puts("[mac] serial res=");
     uart_hex(ok ? 1 : 0);
     uart_puts(" mb[5]=");
     uart_hex(mb[5]);
@@ -338,12 +338,12 @@ static bool mac_load_from_mailbox(u8 *out)
         candidate[3] = (u8)(serial >> 16);
         candidate[4] = (u8)(serial >> 8);
         candidate[5] = (u8)(serial);
-        mac_log("[macb] MAC derived from serial ", candidate);
+        mac_log("[mac] MAC from serial ", candidate);
         mac_copy(out, candidate);
         return true;
     }
 
-    uart_puts("[macb] All mailbox MAC sources exhausted\n");
+    uart_puts("[mac] mbox MAC exhausted\n");
     return false;
 }
 
@@ -364,26 +364,26 @@ static bool phy_select(void)
 {
     for (u32 addr = 0; addr < 32; addr++) {
         u16 bmsr = mdio_read((u8)addr, 0x01);
-        uart_puts("[macb] MDIO scan addr=");
+        uart_puts("[mac] MDIO addr=");
         uart_hex(addr);
         uart_puts(" BMSR=");
         uart_hex(bmsr);
         uart_puts("\n");
         if (bmsr != 0x0000 && bmsr != 0xFFFF) {
             phy_addr = (u8)addr;
-            uart_puts("[macb] PHY addr ");
+            uart_puts("[mac] PHY=");
             uart_hex(addr);
-            uart_puts(" detected\n");
+            uart_puts(" found\n");
             return true;
         }
     }
-    uart_puts("[macb] No PHY responded on MDIO\n");
+    uart_puts("[mac] no PHY on MDIO\n");
     return false;
 }
 
 /* ── Init ── */
 bool macb_init(void) {
-    uart_puts("[macb] Init Cadence GEM\n");
+    uart_puts("[mac] init GEM\n");
 
     /* ── Step 0: Enable ETH clock on RP1 ── */
     rp1_clk_enable(RP1_CLK_ETH);
@@ -400,14 +400,14 @@ bool macb_init(void) {
     /* Read design config to verify it's alive */
     u32 dcfg1 = mr(DCFG1);
     u32 dcfg2 = mr(DCFG2);
-    uart_puts("[macb] DCFG1=");
+    uart_puts("[mac] DCFG1=");
     uart_hex(dcfg1);
     uart_puts(" DCFG2=");
     uart_hex(dcfg2);
     uart_puts("\n");
 
     if (dcfg1 == 0 && dcfg2 == 0) {
-        uart_puts("[macb] GEM not responding (all zeros)\n");
+        uart_puts("[mac] GEM no resp\n");
         return false;
     }
 
@@ -424,7 +424,7 @@ bool macb_init(void) {
      * will stride at 8 bytes through our 16-byte descriptor ring. */
     {
         u32 dmacfg = mr(DMACFG);
-        uart_puts("[macb] DMACFG firmware="); uart_hex(dmacfg); uart_puts("\n");
+        uart_puts("[mac] DMACFG fw="); uart_hex(dmacfg); uart_puts("\n");
         dmacfg &= ~(0xFF << DMACFG_RXBS_SHIFT);
         dmacfg &= ~(0x1F << DMACFG_FBLDO_SHIFT);
         dmacfg |= ((BUF_SIZE / 64) << DMACFG_RXBS_SHIFT);
@@ -440,18 +440,18 @@ bool macb_init(void) {
         dmacfg |= DMACFG_ADDR64;   /* 16-byte descriptors */
 #endif
         mw(DMACFG, dmacfg);
-        uart_puts("[macb] DMACFG final="); uart_hex(dmacfg); uart_puts("\n");
+        uart_puts("[mac] DMACFG="); uart_hex(dmacfg); uart_puts("\n");
     }
 
     /* ── RP1 ETH_CFG: check status and enable bus errors ── */
     {
         u32 cfg_stat = ecr(ETH_CFG_STAT);
         u32 cfg_ctrl = ecr(ETH_CFG_CTRL);
-        uart_puts("[macb] ETH_CFG CTRL="); uart_hex(cfg_ctrl);
-        uart_puts(" STAT="); uart_hex(cfg_stat);
+        uart_puts("[mac] ETH_CFG C="); uart_hex(cfg_ctrl);
+        uart_puts(" S="); uart_hex(cfg_stat);
         uart_puts("\n");
-        if (cfg_stat & (1 << 5)) uart_puts("[macb] WARNING: AWLEN_ILLEGAL set!\n");
-        if (cfg_stat & (1 << 4)) uart_puts("[macb] WARNING: ARLEN_ILLEGAL set!\n");
+        if (cfg_stat & (1 << 5)) uart_puts("[mac] WARN: AWLEN_ILLEGAL\n");
+        if (cfg_stat & (1 << 4)) uart_puts("[mac] WARN: ARLEN_ILLEGAL\n");
         /* Enable bus error passthrough for debugging */
         ecw(ETH_CFG_CTRL, cfg_ctrl | (1 << 3));
     }
@@ -459,18 +459,18 @@ bool macb_init(void) {
     /* ── GEM AXI pipeline config (RP1-specific, from Linux patch) ── */
     {
         u32 amp = mr(GEM_AMP);
-        uart_puts("[macb] GEM_AMP before="); uart_hex(amp); uart_puts("\n");
+        uart_puts("[mac] AMP pre="); uart_hex(amp); uart_puts("\n");
         /* Set reasonable pipeline depths — RP1 Linux uses DT properties */
         amp &= ~0xFFFF;  /* clear AR2R and AW2W fields */
         amp |= (8 << 0);   /* AR2R_MAX_PIPE = 8 */
         amp |= (4 << 8);   /* AW2W_MAX_PIPE = 4 */
         amp |= (1 << 16);  /* AW2B_FILL = 1 (AW to B channel) */
         mw(GEM_AMP, amp);
-        uart_puts("[macb] GEM_AMP after="); uart_hex(mr(GEM_AMP)); uart_puts("\n");
+        uart_puts("[mac] AMP post="); uart_hex(mr(GEM_AMP)); uart_puts("\n");
     }
 
     if (!mac_load_from_sa1(mac_addr) && !mac_load_from_mailbox(mac_addr)) {
-        uart_puts("[macb] No valid MAC\n");
+        uart_puts("[mac] no valid MAC\n");
         return false;
     }
 
@@ -529,9 +529,9 @@ bool macb_init(void) {
     dcache_clean_range((u64)(usize)tx_ring, sizeof(tx_ring));
     __asm__ volatile("dsb sy" ::: "memory");
 
-    uart_puts("[macb] RX verify: desc[0].addr=");
+    uart_puts("[mac] RX desc[0]=");
     uart_hex(rx_ring[0].addr);
-    uart_puts(" expected=");
+    uart_puts(" exp=");
     uart_hex((u32)(usize)&rx_bufs[0][0]);
     uart_puts("\n");
 
@@ -573,7 +573,7 @@ bool macb_init(void) {
 #endif
             }
         }
-        uart_puts("[macb] Multi-queue init: mask=");
+        uart_puts("[mac] MQ mask=");
         uart_hex(queue_mask);
         uart_puts("\n");
     }
@@ -588,17 +588,17 @@ bool macb_init(void) {
         return false;
 
     /* PHY: inspect link partner on detected address */
-    uart_puts("[macb] PHY BMSR=");
+    uart_puts("[mac] BMSR=");
     u16 bmsr = mdio_read(phy_addr, 0x01);
     uart_hex(bmsr);
     uart_puts("\n");
 
     /* Wait for link (5 seconds) */
-    uart_puts("[macb] Waiting for link (5s)...\n");
+    uart_puts("[mac] link wait 5s...\n");
     for (u32 s = 0; s < 50; s++) {
         bmsr = mdio_read(phy_addr, 0x01);
         if (bmsr & (1 << 2)) {  /* BMSR link status */
-            uart_puts("[macb] Link UP at poll ");
+            uart_puts("[mac] link UP @");
             uart_hex(s);
             uart_puts(" BMSR=");
             uart_hex(bmsr);
@@ -613,7 +613,7 @@ bool macb_init(void) {
         fb_putc(spin[s & 3]);
     }
 
-    mac_log("[macb] Active MAC ", mac_addr);
+    mac_log("[mac] active ", mac_addr);
 
     /* Read negotiated speed from PHY and configure MAC to match */
     {
@@ -622,8 +622,8 @@ bool macb_init(void) {
         u16 bmcr = mdio_read(phy_addr, 0x00);   /* Basic Mode Control */
         bool gig = false, fd = true, spd100 = false;
 
-        uart_puts("[macb] PHY GBSR="); uart_hex(gbsr);
-        uart_puts(" ANLPAR="); uart_hex(anlpar);
+        uart_puts("[mac] GBSR="); uart_hex(gbsr);
+        uart_puts(" ANLP="); uart_hex(anlpar);
         uart_puts(" BMCR="); uart_hex(bmcr);
         uart_puts("\n");
 
@@ -652,9 +652,9 @@ bool macb_init(void) {
         if (fd)     ncfgr |= NCFGR_FD;
         mw(NCFGR, ncfgr);
 
-        uart_puts("[macb] Negotiated: ");
+        uart_puts("[mac] neg: ");
         uart_puts(gig ? "1000" : (spd100 ? "100" : "10"));
-        uart_puts(fd ? "Mbps FD" : "Mbps HD");
+        uart_puts(fd ? " FD" : " HD");
         uart_puts(" NCFGR=");
         uart_hex(ncfgr);
         uart_puts("\n");
@@ -704,7 +704,7 @@ bool macb_send(const u8 *frame, u32 len) {
 
     /* Log first few TX attempts */
     if (tx_send_count < 5) {
-        uart_puts("[macb] TX#");
+        uart_puts("[mac] TX#");
         uart_hex(tx_send_count);
         uart_puts(" idx=");
         uart_hex(tx_idx);
@@ -718,7 +718,7 @@ bool macb_send(const u8 *frame, u32 len) {
         /* Wait a moment then check if MAC consumed it + AER errors */
         delay_cycles(100000);
         dcache_invalidate_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
-        uart_puts("[macb] TX post: ctrl=");
+        uart_puts("[mac] TX post: c=");
         uart_hex(tx_ring[tx_idx].ctrl);
         uart_puts(" TSR=");
         uart_hex(mr(TSR));

@@ -411,7 +411,7 @@ static void boot_measurements(u32 *el1_hash, u32 *el2_hash, u64 *el1_start, u32 
     u64 el2_s = (u64)(usize)&__el2_integrity_start;
     u64 el2_e = (u64)(usize)&__el2_integrity_end;
     if (el1_e <= el1_s) {
-        uart_puts("[boot] WARNING: EL1 text section empty/invalid, skipping measurements\n");
+        uart_puts("[bt] EL1 text empty, skip\n");
         if (el1_hash) *el1_hash = 0;
         if (el2_hash) *el2_hash = 0;
         if (el1_start) *el1_start = 0;
@@ -422,7 +422,7 @@ static void boot_measurements(u32 *el1_hash, u32 *el2_hash, u64 *el1_start, u32 
     if (el2_s < el2_e) {
         if (el2_hash) *el2_hash = hw_crc32c((const void *)(usize)el2_s, (u32)(el2_e - el2_s));
     } else {
-        uart_puts("[boot] EL2 integrity section empty, skipping EL2 hash\n");
+        uart_puts("[bt] EL2 integ empty, skip\n");
         if (el2_hash) *el2_hash = 0;
     }
     if (el1_start) *el1_start = el1_s;
@@ -491,7 +491,7 @@ static u32 bp_log_y;  /* next row for boot log messages */
 static void bp_uart_phase(u32 phase, const char *state)
 {
     if (phase >= BP_COUNT) return;
-    uart_puts("[boot] ");
+    uart_puts("[bt] ");
     uart_puts(bp_names[phase]);
     uart_puts(" ");
     uart_puts(state);
@@ -533,7 +533,7 @@ static void bp_init(void) {
     fb_puts("---------------------------------------------");
     bp_log_y = BP_LIST_ROW + BP_COUNT + 2;
 
-    uart_puts("\n[boot] PIOS v0.3 Boot Sequence\n");
+    uart_puts("\n[bt] PIOS v0.3 Boot\n");
     for (u32 i = 0; i < BP_COUNT; i++)
         bp_uart_phase(i, "pending");
 }
@@ -760,7 +760,7 @@ static void boot_policy_verify_or_seed(void)
     } else {
         if (rec.magic != BOOT_POLICY_MAGIC || !boot_policy_mac_ok(&rec)) {
             /* Corrupted policy record — re-seed */
-            uart_puts("[boot] Policy record corrupt, re-seeding\n");
+            uart_puts("[bt] policy corrupt, reseed\n");
             rec.magic = BOOT_POLICY_MAGIC;
             rec.version = BOOT_POLICY_VERSION;
             rec.el1_hash = cur_el1;
@@ -770,7 +770,7 @@ static void boot_policy_verify_or_seed(void)
                 exception_pisod("Boot policy reseed failed", 5, 0x38, 0, 0, 0);
         } else if (rec.el1_hash != cur_el1 || rec.el2_hash != cur_el2) {
             /* Kernel changed — re-seed during development */
-            uart_puts("[boot] Kernel hash changed, updating policy\n");
+            uart_puts("[bt] hash changed, update policy\n");
             rec.el1_hash = cur_el1;
             rec.el2_hash = cur_el2;
             rec.version++;
@@ -4720,8 +4720,8 @@ static void reg_panel(u32 at_el1) {
     u32 row = 1;
     u64 val;
 
-    uart_puts("[regs] CPU Registers\n");
-    uart_puts("[regs] EL=");
+    uart_puts("[reg] CPU Regs\n");
+    uart_puts("[reg] EL=");
     uart_hex(at_el1 ? 1 : 2);
     uart_puts(at_el1 ? " (kernel)\n" : " (hypervisor)\n");
 
@@ -4742,9 +4742,9 @@ static void reg_panel(u32 at_el1) {
     fb_printf("PC     %X", val);
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts(" Program ctr");
-    uart_puts("[regs] PC=");
+    uart_puts("[reg] PC=");
     uart_hex(val);
-    uart_puts(" Program ctr\n");
+    uart_puts("\n");
 
     /* SP */
     __asm__ volatile("mov %0, sp" : "=r"(val));
@@ -4753,9 +4753,9 @@ static void reg_panel(u32 at_el1) {
     fb_printf("SP     %X", val);
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts(" Stack ptr");
-    uart_puts("[regs] SP=");
+    uart_puts("[reg] SP=");
     uart_hex(val);
-    uart_puts(" Stack ptr\n");
+    uart_puts("\n");
 
     /* MPIDR */
     __asm__ volatile("mrs %0, MPIDR_EL1" : "=r"(val));
@@ -4766,11 +4766,11 @@ static void reg_panel(u32 at_el1) {
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_printf(" Core %u / Cluster %u",
         (u32)(val & 0xFF), (u32)((val >> 8) & 0xFF));
-    uart_puts("[regs] MPIDR=");
+    uart_puts("[reg] MPIDR=");
     uart_hex(val);
-    uart_puts(" Core=");
+    uart_puts(" c=");
     uart_hex((u32)(val & 0xFF));
-    uart_puts(" Cluster=");
+    uart_puts(" cl=");
     uart_hex((u32)((val >> 8) & 0xFF));
     uart_puts("\n");
 
@@ -4784,7 +4784,7 @@ static void reg_panel(u32 at_el1) {
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_printf(" MMU=%u DC=%u IC=%u",
             (u32)(val & 1), (u32)((val >> 2) & 1), (u32)((val >> 12) & 1));
-        uart_puts("[regs] SCTLR_EL1=");
+        uart_puts("[reg] SCTLR1=");
         uart_hex(val);
         uart_puts(" MMU=");
         uart_hex((u32)(val & 1));
@@ -4801,7 +4801,7 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_printf(" NEON=%s", ((val >> 20) & 3) == 3 ? "enabled" : "TRAPPED");
-        uart_puts("[regs] CPACR_EL1=");
+        uart_puts("[reg] CPACR1=");
         uart_hex(val);
         uart_puts(" NEON=");
         uart_puts(((val >> 20) & 3) == 3 ? "enabled\n" : "TRAPPED\n");
@@ -4813,9 +4813,9 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_puts(val ? " Page table base" : " (none)");
-        uart_puts("[regs] TTBR0_EL1=");
+        uart_puts("[reg] TTBR0=");
         uart_hex(val);
-        uart_puts(val ? " Page table base\n" : " (none)\n");
+        uart_puts(val ? " pgtbl\n" : " none\n");
 
         __asm__ volatile("mrs %0, VBAR_EL1" : "=r"(val));
         fb_set_cursor(col, row++);
@@ -4824,9 +4824,9 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_puts(val ? " Exception vectors" : " (none!)");
-        uart_puts("[regs] VBAR_EL1=");
+        uart_puts("[reg] VBAR1=");
         uart_hex(val);
-        uart_puts(val ? " Exception vectors\n" : " (none!)\n");
+        uart_puts(val ? " vec\n" : " none!\n");
     } else {
         /* ── EL2 registers ── */
         __asm__ volatile("mrs %0, SCTLR_EL2" : "=r"(val));
@@ -4837,7 +4837,7 @@ static void reg_panel(u32 at_el1) {
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_printf(" MMU=%u DC=%u IC=%u",
             (u32)(val & 1), (u32)((val >> 2) & 1), (u32)((val >> 12) & 1));
-        uart_puts("[regs] SCTLR_EL2=");
+        uart_puts("[reg] SCTLR2=");
         uart_hex(val);
         uart_puts(" MMU=");
         uart_hex((u32)(val & 1));
@@ -4854,7 +4854,7 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_printf(" RW=%u VM=%u", (u32)((val >> 31) & 1), (u32)(val & 1));
-        uart_puts("[regs] HCR_EL2=");
+        uart_puts("[reg] HCR2=");
         uart_hex(val);
         uart_puts(" RW=");
         uart_hex((u32)((val >> 31) & 1));
@@ -4869,7 +4869,7 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_printf(" NEON=%s", ((val >> 10) & 1) ? "TRAPPED" : "enabled");
-        uart_puts("[regs] CPTR_EL2=");
+        uart_puts("[reg] CPTR2=");
         uart_hex(val);
         uart_puts(" NEON=");
         uart_puts(((val >> 10) & 1) ? "TRAPPED\n" : "enabled\n");
@@ -4881,15 +4881,15 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_puts(val ? " EL2 vectors" : " (none)");
-        uart_puts("[regs] VBAR_EL2=");
+        uart_puts("[reg] VBAR2=");
         uart_hex(val);
-        uart_puts(val ? " EL2 vectors\n" : " (none)\n");
+        uart_puts(val ? " EL2 vec\n" : " none\n");
     }
 
     fb_set_cursor(col, row++);
     fb_set_color(0x00444444, 0x00000000);
     fb_puts("---------------------");
-    uart_puts("[regs] ---------------------\n");
+    uart_puts("[reg] ---\n");
 }
 
 void kernel_main(void) {
@@ -5043,7 +5043,7 @@ void kernel_main(void) {
             /* Skip boot integrity arming during development —
              * the EL2 HVC call fails when kernel image changes
              * because the stored hash no longer matches. */
-            uart_puts("[boot] Skipping EL2 boot integrity arm (dev mode)\n");
+            uart_puts("[bt] skip EL2 integ arm (dev)\n");
             bp_warn("[walfs] integrity check skipped (dev)");
         } else {
             bp_err("[walfs] WALFS init FAILED");
@@ -5079,7 +5079,7 @@ void kernel_main(void) {
     net_udp_subscribe(echo_udp_cb);
     echo_listen_conn = tcp_listen(ECHO_TCP_PORT);
     http_listen_conn = tcp_listen(HTTP_TCP_PORT);
-    uart_puts("[net] Echo UDP:7 TCP:7 HTTP:80 active\n");
+    uart_puts("[net] echo UDP:7 TCP:7 HTTP:80\n");
     bp_ok("[net] IP stack ready");
 
     /* GPU + Tensor */

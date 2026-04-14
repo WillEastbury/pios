@@ -124,13 +124,13 @@ void v3d_init(void)
     g_v3d_caps.dispatch_supported = g_v3d_caps.mailbox_qpu || g_v3d_caps.mmio_csd;
     v3d_kernel_blobs_init();
 
-    uart_puts("[v3d] mailbox_qpu=");
+    uart_puts("[v3d] mbox=");
     uart_hex(g_v3d_caps.mailbox_qpu ? 1 : 0);
-    uart_puts(" mmio_probe=");
+    uart_puts(" mmio=");
     uart_hex(g_v3d_caps.mmio_probe_ok ? 1 : 0);
-    uart_puts(" mmio_csd=");
+    uart_puts(" csd=");
     uart_hex(g_v3d_caps.mmio_csd ? 1 : 0);
-    uart_puts(" ident0=");
+    uart_puts(" id0=");
     uart_hex(g_v3d_caps.ident0);
     uart_puts("\n");
 }
@@ -252,7 +252,7 @@ v3d_status_t v3d_dispatch_compute(const struct v3d_dispatch_cfg *cfg)
             g_v3d_caps.mailbox_qpu) {
             g_mmio_auto_quarantined = true;
             if (!g_mmio_auto_warned) {
-                uart_puts("[v3d] auto: quarantining MMIO CSD, using mailbox fallback\n");
+                uart_puts("[v3d] auto: MMIO->mbox fallback\n");
                 g_mmio_auto_warned = true;
             }
         }
@@ -374,9 +374,9 @@ v3d_status_t v3d_kernel_bind_blob(v3d_kernel_id_t id,
     g_kernel_uniform_bus[id] = uniform_bus;
     g_kernel_shader_handle[id] = shader_handle;
     g_kernel_shader_bus[id] = shader_bus;
-    uart_puts("[v3d] kernel bound: ");
+    uart_puts("[v3d] bind: ");
     uart_puts(g_kernels[id].name);
-    uart_puts(" qpu=");
+    uart_puts(" q=");
     uart_hex(g_kernels[id].qpu_count);
     uart_puts("\n");
     return V3D_STATUS_OK;

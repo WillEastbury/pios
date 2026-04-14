@@ -162,12 +162,12 @@ bool fat32_init(void)
 
     /* Read MBR */
     if (!read_sector(0, fat32_buf)) {
-        uart_puts("[fat32] cannot read MBR\n");
+        uart_puts("[fat] MBR read fail\n");
         return false;
     }
 
     if (fat32_buf[510] != 0x55 || fat32_buf[511] != 0xAA) {
-        uart_puts("[fat32] no MBR signature\n");
+        uart_puts("[fat] no MBR sig\n");
         return false;
     }
 
@@ -177,28 +177,28 @@ bool fat32_init(void)
     u32 p1_size = read_le32(&fat32_buf[0x1BE + 12]);
 
     if (part1_lba == 0 || p1_size == 0) {
-        uart_puts("[fat32] partition 1 not found\n");
+        uart_puts("[fat] p1 not found\n");
         return false;
     }
 
     /* Accept FAT32 types: 0x0B (FAT32), 0x0C (FAT32 LBA) */
     if (p1_type != 0x0B && p1_type != 0x0C) {
-        uart_puts("[fat32] partition 1 type=");
+        uart_puts("[fat] p1 type=");
         uart_hex(p1_type);
-        uart_puts(" (not FAT32)\n");
+        uart_puts(" !FAT32\n");
         return false;
     }
 
     /* Read BPB (first sector of partition) */
     if (!read_sector(part1_lba, fat32_buf)) {
-        uart_puts("[fat32] cannot read BPB\n");
+        uart_puts("[fat] BPB read fail\n");
         return false;
     }
 
     /* Validate BPB */
     u32 bps = read_le16(&fat32_buf[11]);
     if (bps != 512) {
-        uart_puts("[fat32] unsupported sector size: ");
+        uart_puts("[fat] bad sectsz=");
         uart_hex(bps);
         uart_puts("\n");
         return false;
@@ -207,7 +207,7 @@ bool fat32_init(void)
     sectors_per_cluster = fat32_buf[13];
     if (sectors_per_cluster == 0 ||
         (sectors_per_cluster & (sectors_per_cluster - 1)) != 0) {
-        uart_puts("[fat32] bad sectors/cluster: ");
+        uart_puts("[fat] bad spc=");
         uart_hex(sectors_per_cluster);
         uart_puts("\n");
         return false;
@@ -219,14 +219,14 @@ bool fat32_init(void)
     root_cluster     = read_le32(&fat32_buf[44]);
 
     if (reserved_sectors == 0 || num_fats == 0 || fat_size_sectors == 0) {
-        uart_puts("[fat32] invalid BPB fields\n");
+        uart_puts("[fat] bad BPB\n");
         return false;
     }
 
     /* Root entry count must be 0 for FAT32 */
     u32 root_entry_count = read_le16(&fat32_buf[17]);
     if (root_entry_count != 0) {
-        uart_puts("[fat32] not FAT32 (root entries != 0)\n");
+        uart_puts("[fat] !FAT32 rootent!=0\n");
         return false;
     }
 
@@ -242,7 +242,7 @@ bool fat32_init(void)
 
     /* Sanity: FAT32 requires >= 65525 clusters */
     if (total_clusters < 65525) {
-        uart_puts("[fat32] too few clusters for FAT32: ");
+        uart_puts("[fat] too few cl=");
         uart_hex(total_clusters);
         uart_puts("\n");
         return false;
@@ -250,13 +250,13 @@ bool fat32_init(void)
 
     fat32_ready = true;
 
-    uart_puts("[fat32] partition 1 at LBA ");
+    uart_puts("[fat] p1 LBA=");
     uart_hex(part1_lba);
-    uart_puts(" clusters=");
+    uart_puts(" cl=");
     uart_hex(total_clusters);
     uart_puts(" spc=");
     uart_hex(sectors_per_cluster);
-    uart_puts(" root=");
+    uart_puts(" rt=");
     uart_hex(root_cluster);
     uart_puts("\n");
 

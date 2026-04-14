@@ -252,14 +252,14 @@ static bool chip_identify(void)
     u16 id = (u16)(chip_id & 0xFFFF);
     u16 rev = (u16)((chip_id >> 16) & 0xF);
 
-    uart_puts("[cyw43] chip_id=");
+    uart_puts("[cyw] chip=");
     uart_hex(id);
-    uart_puts(" rev=");
+    uart_puts(" r=");
     uart_hex(rev);
     uart_puts("\n");
 
     if (id != CYW43455_CHIP_ID) {
-        uart_puts("[cyw43] unexpected chip ID\n");
+        uart_puts("[cyw] bad chip ID\n");
         return false;
     }
     return true;
@@ -497,10 +497,10 @@ static void handle_event(const u8 *data, u32 len)
     case CYW_E_SET_SSID:
         if (status == CYW_E_STATUS_SUCCESS) {
             cyw_link = CYW_LINK_UP;
-            uart_puts("[cyw43] connected\n");
+            uart_puts("[cyw] connected\n");
         } else {
             cyw_link = CYW_LINK_AUTH_FAIL;
-            uart_puts("[cyw43] connect failed status=");
+            uart_puts("[cyw] conn fail st=");
             uart_hex(status);
             uart_puts("\n");
         }
@@ -512,10 +512,10 @@ static void handle_event(const u8 *data, u32 len)
             u16 flags = ((u16)data[44] << 8) | (u16)data[45];
             if (flags & 1) {
                 cyw_link = CYW_LINK_UP;
-                uart_puts("[cyw43] link up\n");
+                uart_puts("[cyw] link up\n");
             } else {
                 cyw_link = CYW_LINK_DOWN;
-                uart_puts("[cyw43] link down\n");
+                uart_puts("[cyw] link down\n");
             }
         }
         break;
@@ -523,7 +523,7 @@ static void handle_event(const u8 *data, u32 len)
     case CYW_E_DISASSOC_IND:
     case CYW_E_DEAUTH_IND:
         cyw_link = CYW_LINK_DOWN;
-        uart_puts("[cyw43] disconnected (event=");
+        uart_puts("[cyw] discon ev=");
         uart_hex(event_type);
         uart_puts(")\n");
         break;
@@ -550,7 +550,7 @@ static void handle_event(const u8 *data, u32 len)
             }
         } else if (status == CYW_E_STATUS_SUCCESS) {
             scan_in_progress = false;
-            uart_puts("[cyw43] scan complete, results=");
+            uart_puts("[cyw] scan done n=");
             uart_hex(scan_count);
             uart_puts("\n");
         }
@@ -571,19 +571,19 @@ static void handle_event(const u8 *data, u32 len)
  */
 UNUSED static bool upload_firmware(const u8 *fw, u32 fw_len)
 {
-    uart_puts("[cyw43] uploading firmware (");
+    uart_puts("[cyw] uploading fw (");
     uart_hex(fw_len);
-    uart_puts(" bytes)...\n");
+    uart_puts(" B)...\n");
 
     /* Halt the ARM core */
     if (!core_disable(CYW_ARM_CORE_BASE)) {
-        uart_puts("[cyw43] failed to halt ARM core\n");
+        uart_puts("[cyw] ARM halt fail\n");
         return false;
     }
 
     /* Enable SOCSRAM */
     if (!core_reset(CYW_SOCSRAM_BASE, 0)) {
-        uart_puts("[cyw43] SOCSRAM reset failed\n");
+        uart_puts("[cyw] SOCSRAM fail\n");
         return false;
     }
 
@@ -593,19 +593,19 @@ UNUSED static bool upload_firmware(const u8 *fw, u32 fw_len)
 
     /* Write firmware to chip RAM */
     if (!bp_write_buf(CYW_RAM_BASE, fw, fw_len)) {
-        uart_puts("[cyw43] firmware write failed\n");
+        uart_puts("[cyw] fw write fail\n");
         return false;
     }
 
-    uart_puts("[cyw43] firmware uploaded\n");
+    uart_puts("[cyw] fw uploaded\n");
     return true;
 }
 
 static bool upload_nvram(const u8 *nvram, u32 nvram_len)
 {
-    uart_puts("[cyw43] uploading NVRAM (");
+    uart_puts("[cyw] uploading NVRAM (");
     uart_hex(nvram_len);
-    uart_puts(" bytes)...\n");
+    uart_puts(" B)...\n");
 
     /* NVRAM goes at the end of RAM, with a length token */
     u32 ram_size = 0x80000;  /* 512KB for CYW43455 */
@@ -613,18 +613,18 @@ static bool upload_nvram(const u8 *nvram, u32 nvram_len)
     nvram_offset &= ~0x3U;  /* word-align */
 
     if (!bp_write_buf(CYW_RAM_BASE + nvram_offset, nvram, nvram_len)) {
-        uart_puts("[cyw43] NVRAM write failed\n");
+        uart_puts("[cyw] NVRAM write fail\n");
         return false;
     }
 
     /* Write length token (complement of size in words) */
     u32 token = (~(nvram_len / 4)) << 16 | (nvram_len / 4);
     if (!bp_write32(CYW_RAM_BASE + ram_size - 4, token)) {
-        uart_puts("[cyw43] NVRAM token write failed\n");
+        uart_puts("[cyw] NVRAM token fail\n");
         return false;
     }
 
-    uart_puts("[cyw43] NVRAM uploaded\n");
+    uart_puts("[cyw] NVRAM ok\n");
     return true;
 }
 
@@ -632,25 +632,25 @@ UNUSED static bool boot_firmware(void)
 {
     /* Release ARM core from reset */
     if (!core_reset(CYW_ARM_CORE_BASE, 0)) {
-        uart_puts("[cyw43] ARM core reset failed\n");
+        uart_puts("[cyw] ARM reset fail\n");
         return false;
     }
 
     /* Wait for firmware to signal ready via HT clock */
-    uart_puts("[cyw43] waiting for firmware ready...\n");
+    uart_puts("[cyw] wait fw ready...\n");
     u32 timeout = 500;
     while (timeout--) {
         u8 status;
         if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SB_INT_STATUS, &status)) {
             if (status & 0x80) {  /* HT available */
-                uart_puts("[cyw43] firmware running (HT avail)\n");
+                uart_puts("[cyw] fw running\n");
                 return true;
             }
         }
         delay_cycles(100000);
     }
 
-    uart_puts("[cyw43] firmware boot timeout\n");
+    uart_puts("[cyw] fw boot timeout\n");
     return false;
 }
 
@@ -666,24 +666,24 @@ bool cyw43_init(void)
     scan_in_progress = false;
     memset(cyw_mac, 0, CYW_MAC_LEN);
 
-    uart_puts("[cyw43] init CYW43455...\n");
+    uart_puts("[cyw] init...\n");
 
     /* Initialize SDIO controller and enumerate card */
     if (!sdio_init()) {
-        uart_puts("[cyw43] SDIO init failed\n");
+        uart_puts("[cyw] SDIO fail\n");
         return false;
     }
 
     /* Enable backplane function (func 1) */
     if (!sdio_enable_func(SDIO_FUNC_BACKPLANE)) {
-        uart_puts("[cyw43] func 1 enable failed\n");
+        uart_puts("[cyw] f1 enable fail\n");
         return false;
     }
     sdio_set_block_size(SDIO_FUNC_BACKPLANE, SDIO_FUNC1_BLKSZ);
 
     /* Enable WLAN data function (func 2) */
     if (!sdio_enable_func(SDIO_FUNC_WLAN)) {
-        uart_puts("[cyw43] func 2 enable failed\n");
+        uart_puts("[cyw] f2 enable fail\n");
         return false;
     }
     sdio_set_block_size(SDIO_FUNC_WLAN, SDIO_FUNC2_BLKSZ);
@@ -693,7 +693,7 @@ bool cyw43_init(void)
 
     /* Identify chip via backplane */
     if (!chip_identify()) {
-        uart_puts("[cyw43] chip identify failed\n");
+        uart_puts("[cyw] chip ID fail\n");
         return false;
     }
 
@@ -701,7 +701,7 @@ bool cyw43_init(void)
     sdio_enable_func_irq(SDIO_FUNC_BACKPLANE);
     sdio_enable_func_irq(SDIO_FUNC_WLAN);
 
-    uart_puts("[cyw43] init OK\n");
+    uart_puts("[cyw] init OK\n");
     return true;
 }
 
@@ -717,7 +717,7 @@ bool cyw43_load_firmware(void)
 
     /* Initialize FAT32 if not already done */
     if (!fat32_init()) {
-        uart_puts("[cyw43] FAT32 init failed — cannot load firmware\n");
+        uart_puts("[cyw] FAT32 fail\n");
         return false;
     }
 
@@ -725,10 +725,10 @@ bool cyw43_load_firmware(void)
     {
         fat32_file_t fw;
         if (!fat32_open("/wifi/firmware.bin", &fw)) {
-            uart_puts("[cyw43] wifi/firmware.bin not found on boot partition\n");
+            uart_puts("[cyw] no wifi/firmware.bin\n");
             return false;
         }
-        uart_puts("[cyw43] loading firmware.bin (");
+        uart_puts("[cyw] loading fw (");
         uart_hex(fw.file_size);
         uart_puts(" bytes)...\n");
 
@@ -739,14 +739,14 @@ bool cyw43_load_firmware(void)
             if (chunk > FW_UPLOAD_BLKSZ) chunk = FW_UPLOAD_BLKSZ;
             u32 got = fat32_read(&fw, fw_chunk, chunk);
             if (got == 0) {
-                uart_puts("[cyw43] firmware read error at offset ");
+                uart_puts("[cyw] fw read err @");
                 uart_hex(offset);
                 uart_puts("\n");
                 fat32_close(&fw);
                 return false;
             }
             if (!bp_write_buf(CYW_RAM_BASE + offset, fw_chunk, got)) {
-                uart_puts("[cyw43] firmware write error at offset ");
+                uart_puts("[cyw] fw write err @");
                 uart_hex(offset);
                 uart_puts("\n");
                 fat32_close(&fw);
@@ -755,14 +755,14 @@ bool cyw43_load_firmware(void)
             offset += got;
         }
         fat32_close(&fw);
-        uart_puts("[cyw43] firmware uploaded\n");
+        uart_puts("[cyw] fw uploaded\n");
     }
 
     /* Upload NVRAM */
     {
         fat32_file_t nv;
         if (!fat32_open("/wifi/nvram.txt", &nv)) {
-            uart_puts("[cyw43] nvram.txt not found — using minimal defaults\n");
+            uart_puts("[cyw] no nvram.txt, defaults\n");
             static const u8 default_nvram[] =
                 "boardtype=0x0646\0"
                 "boardrev=0x1101\0"
@@ -777,11 +777,11 @@ bool cyw43_load_firmware(void)
             static u8 ALIGNED(4) nvram_data[4096];
             u32 nvram_len = fat32_read(&nv, nvram_data, sizeof(nvram_data));
             fat32_close(&nv);
-            uart_puts("[cyw43] nvram loaded (");
+            uart_puts("[cyw] nvram (");
             uart_hex(nvram_len);
-            uart_puts(" bytes)\n");
+            uart_puts(" B)\n");
             if (!upload_nvram(nvram_data, nvram_len)) {
-                uart_puts("[cyw43] NVRAM upload failed\n");
+                uart_puts("[cyw] NVRAM upload fail\n");
                 return false;
             }
         }
@@ -789,11 +789,11 @@ bool cyw43_load_firmware(void)
 
     /* Reset ARM core to start firmware */
     if (!core_reset(CYW_ARM_CORE_BASE, 0)) {
-        uart_puts("[cyw43] ARM core reset failed\n");
+        uart_puts("[cyw] ARM reset fail\n");
         return false;
     }
 
-    uart_puts("[cyw43] firmware loaded OK\n");
+    uart_puts("[cyw] fw loaded OK\n");
     return true;
 }
 
@@ -944,7 +944,7 @@ bool cyw43_join(const char *ssid, u32 ssid_len,
     ssid_params.ssid_len = ssid_len;
     memcpy(ssid_params.ssid, ssid, ssid_len);
 
-    uart_puts("[cyw43] joining SSID: ");
+    uart_puts("[cyw] join SSID: ");
     for (u32 i = 0; i < ssid_len; i++)
         uart_putc(ssid[i]);
     uart_puts("\n");
