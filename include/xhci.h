@@ -27,6 +27,21 @@ struct xhci_ep_info {
 #define USB_SPEED_HIGH      3
 #define USB_SPEED_SUPER     4
 
+/* Lightweight instrumentation counters */
+struct xhci_stats {
+    u32 cmd_submitted;
+    u32 cmd_completed;
+    u32 cmd_timeout;
+    u32 xfer_ok;
+    u32 xfer_fail;
+    u32 evt_polled;
+    u32 evt_stale_drained;
+    u32 port_resets;
+    u32 ep_stalls;
+    u32 ep_resets;
+    u32 ring_full;
+};
+
 /* Controller lifecycle */
 bool xhci_init(void);
 
@@ -41,7 +56,14 @@ bool xhci_address_device(u32 slot, u32 port, u32 speed, u32 max_packet);
 bool xhci_configure_endpoints(u32 slot, u32 port, u32 speed,
                                const struct xhci_ep_info *eps, u32 count);
 
+/* Error recovery */
+bool xhci_reset_endpoint(u32 slot, u32 dci);
+bool xhci_stop_endpoint(u32 slot, u32 dci);
+
 /* Transfer operations */
 bool xhci_control_transfer(u32 slot, u8 bmReq, u8 bReq, u16 wVal,
                             u16 wIdx, u16 wLen, void *data, u32 *actual);
 bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual);
+
+/* Instrumentation */
+const struct xhci_stats *xhci_get_stats(void);
