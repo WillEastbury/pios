@@ -59,6 +59,8 @@
 #include "el2.h"
 #include "crypto.h"
 #include "watchdog.h"
+#include "cyw43.h"
+#include "sdio.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -137,6 +139,7 @@ static const char *ui_proc_state_str(u32 s);
 static void ui_dump_sector(u32 lba);
 static void ui_cmd_fsinspect(const char *path);
 static void ui_cmd_netcfg(u32 argc, char **argv);
+static void ui_cmd_wifi(u32 argc, char **argv);
 static void ui_cmd_disk(u32 argc, char **argv);
 static void ui_cmd_db(u32 argc, char **argv);
 static void ui_cmd_lsdir(const char *path);
@@ -1165,6 +1168,126 @@ static void ui_cmd_fsinspect(const char *path)
         uart_hex(fs_ctx.count);
         uart_puts("\n");
     }
+}
+
+/* ── WiFi defaults ── */
+#define WIFI_DEFAULT_SSID       "Bussy_5G"
+#define WIFI_DEFAULT_PASS       "Whatever1"
+
+static bool wifi_active;
+
+static void ui_cmd_wifi(u32 argc, char **argv)
+{
+    if (argc < 2) {
+        ui_console_write("usage: wifi <init|scan|connect|status|disconnect>\n");
+        ui_console_write("  wifi init              - power on CYW43455\n");
+        ui_console_write("  wifi scan              - scan for networks\n");
+        ui_console_write("  wifi connect [ssid] [pass] - join network\n");
+        ui_console_write("  wifi status            - show link state\n");
+        ui_console_write("  wifi disconnect        - leave network\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "init")) {
+        ui_console_write("WiFi: initializing CYW43455...\n");
+        if (!nic_init_wifi()) {
+            ui_console_write("ERR: WiFi init failed\n");
+            return;
+        }
+        wifi_active = true;
+        ui_console_write("OK: CYW43455 ready\n");
+        return;
+    }
+
+    if (!wifi_active) {
+        ui_console_write("ERR: run 'wifi init' first\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "scan")) {
+        ui_console_write("WiFi: scanning...\n");
+        if (!cyw43_scan_start()) {
+            ui_console_write("ERR: scan start failed\n");
+            return;
+        }
+        /* Poll for a few seconds to collect results */
+        for (u32 i = 0; i < 50; i++) {
+            cyw43_poll();
+            for (volatile u32 d = 0; d < 500000; d++) {}
+        }
+        struct cyw_scan_result results[CYW_MAX_SCAN_RESULTS];
+        u32 count = CYW_MAX_SCAN_RESULTS;
+        cyw43_scan_get_results(results, &count);
+        fb_printf("Found %d networks:\n", count);
+        for (u32 i = 0; i < count; i++) {
+            fb_printf("  %d: ", i);
+            for (u32 j = 0; j < results[i].ssid_len; j++)
+                fb_printf("%c", results[i].ssid[j]);
+            fb_printf(" (ch%d rssi=%d)\n", results[i].channel, results[i].rssi);
+        }
+        return;
+    }
+
+    if (ui_streq(argv[1], "connect")) {
+        const char *ssid = WIFI_DEFAULT_SSID;
+        const char *pass = WIFI_DEFAULT_PASS;
+        u32 ssid_len, pass_len;
+
+        if (argc >= 4) {
+            ssid = argv[2];
+            pass = argv[3];
+        } else if (argc >= 3) {
+            ssid = argv[2];
+        }
+
+        ssid_len = 0; while (ssid[ssid_len]) ssid_len++;
+        pass_len = 0; while (pass[pass_len]) pass_len++;
+
+        fb_printf("WiFi: connecting to '%s'...\n", ssid);
+        if (!cyw43_join(ssid, ssid_len, pass, pass_len, WPA2_AUTH_PSK | WSEC_AES)) {
+            ui_console_write("ERR: join failed\n");
+            return;
+        }
+        /* Poll for association */
+        for (u32 i = 0; i < 100; i++) {
+            cyw43_poll();
+            if (cyw43_is_connected()) break;
+            for (volatile u32 d = 0; d < 500000; d++) {}
+        }
+        if (cyw43_is_connected()) {
+            ui_console_write("OK: connected!\n");
+            net_init(MY_IP, MY_GW, MY_MASK, NULL);
+            ui_cfg_dhcp = false;
+        } else {
+            ui_console_write("WARN: join sent, not yet associated\n");
+        }
+        return;
+    }
+
+    if (ui_streq(argv[1], "status")) {
+        u32 state = cyw43_link_state();
+        fb_printf("WiFi: link=%s",
+            state == CYW_LINK_UP ? "UP" :
+            state == CYW_LINK_JOINING ? "JOINING" :
+            state == CYW_LINK_AUTH_FAIL ? "AUTH_FAIL" : "DOWN");
+        if (state == CYW_LINK_UP) {
+            i32 rssi = cyw43_get_rssi();
+            fb_printf(" rssi=%d", rssi);
+        }
+        u8 mac[6];
+        cyw43_get_mac(mac);
+        fb_printf(" mac=%x:%x:%x:%x:%x:%x\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        return;
+    }
+
+    if (ui_streq(argv[1], "disconnect")) {
+        cyw43_disconnect();
+        ui_console_write("OK: disconnected\n");
+        return;
+    }
+
+    ui_console_write("ERR: unknown wifi subcommand\n");
 }
 
 static void ui_cmd_netcfg(u32 argc, char **argv)
@@ -3737,9 +3860,10 @@ static void ui_console_exec(char *line)
         ui_console_write("help echo clear time ps kill launch run pwd cd lsdir mkdir touch\n");
         ui_console_write("copy cp cpdir mv cat stat rm find hexdump df mount umount\n");
         ui_console_write("stream if for foreach source env batch svc update watchdog edit\n");
-        ui_console_write("hexsec fsinspect netcfg disk db capsule obs\n");
+        ui_console_write("hexsec fsinspect netcfg wifi disk db capsule obs\n");
         ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d> | netcfg apply\n");
         ui_console_write("netcfg dhcp <on|off> [timeout_ms] | netcfg addnbr <ip> <mac>\n");
+        ui_console_write("wifi init|scan|connect [ssid] [pass]|status|disconnect\n");
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
         ui_console_write("batch add|at|every supports [core] [priority] [principal] [retries]\n");
         ui_console_write("batch run [parallel] | batch stop | batch status | batch list\n");
@@ -3990,6 +4114,8 @@ static void ui_console_exec(char *line)
         ui_cmd_batch(argc, argv);
     } else if (ui_streq(argv[0], "svc")) {
         ui_cmd_svc(argc, argv);
+    } else if (ui_streq(argv[0], "wifi")) {
+        ui_cmd_wifi(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "disk")) {
@@ -4868,6 +4994,7 @@ void kernel_main(void) {
         if (!nic_ok) {
             bp_err("[nic] WiFi init FAILED"); bp_done(5, false);
         } else {
+            wifi_active = true;
             bp_ok("[nic] CYW43455 WiFi online");
             if (nic_link_up()) bp_ok("[nic] WiFi link UP");
             else bp_warn("[nic] WiFi link DOWN (not associated)");
@@ -4876,7 +5003,16 @@ void kernel_main(void) {
     } else {
         bp_ok("[nic] MACB online");
         if (nic_link_up()) bp_ok("[nic] PHY link UP");
-        else bp_warn("[nic] PHY link DOWN");
+        else {
+            bp_warn("[nic] PHY link DOWN — trying WiFi...");
+            nic_ok = nic_init_wifi();
+            if (nic_ok) {
+                wifi_active = true;
+                bp_ok("[nic] CYW43455 WiFi online (ETH down)");
+            } else {
+                bp_warn("[nic] WiFi also failed");
+            }
+        }
         bp_done(5, true);
     }
 
@@ -4890,6 +5026,28 @@ void kernel_main(void) {
     ui_cfg_dhcp = false;
     dns_init(ui_cfg_dns);
     bp_ok("[net] IP stack ready");
+
+    /* Auto-connect WiFi if active */
+    if (wifi_active) {
+        bp_log("[wifi] auto-connecting to " WIFI_DEFAULT_SSID "...");
+        u32 ssid_len = 0; { const char *s = WIFI_DEFAULT_SSID; while (s[ssid_len]) ssid_len++; }
+        u32 pass_len = 0; { const char *s = WIFI_DEFAULT_PASS; while (s[pass_len]) pass_len++; }
+        if (cyw43_join(WIFI_DEFAULT_SSID, ssid_len,
+                       WIFI_DEFAULT_PASS, pass_len,
+                       WPA2_AUTH_PSK | WSEC_AES)) {
+            for (u32 i = 0; i < 100; i++) {
+                cyw43_poll();
+                if (cyw43_is_connected()) break;
+                for (volatile u32 d = 0; d < 500000; d++) {}
+            }
+            if (cyw43_is_connected())
+                bp_ok("[wifi] connected to " WIFI_DEFAULT_SSID);
+            else
+                bp_warn("[wifi] join sent, waiting for association");
+        } else {
+            bp_warn("[wifi] auto-connect failed");
+        }
+    }
 
     /* GPU + Tensor */
     bp_log("[gpu] tensor_init...");
