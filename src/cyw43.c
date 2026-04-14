@@ -352,9 +352,9 @@ static bool sdpcm_recv(u8 *channel, u8 *data, u32 *len)
 
 static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len)
 {
-    /* BCDC header (4 bytes) + iovar name + '\0' + data */
     u32 name_len = pios_strlen(name) + 1;
-    u32 payload_len = BCDC_HEADER_LEN + name_len + data_len;
+    u32 body_len = name_len + data_len;
+    u32 payload_len = BCDC_HEADER_LEN + body_len;
 
     if (payload_len > CYW_MAX_FRAME - SDPCM_HEADER_LEN)
         return false;
@@ -364,11 +364,22 @@ static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len)
         return false;
     u16 id = bcdc_reqid++;
 
-    /* BCDC header */
-    buf[0] = (u8)(WLC_SET_VAR & 0xFF);
-    buf[1] = (u8)((WLC_SET_VAR >> 8) & 0xFF) | BCDC_FLAG_SET;
-    buf[2] = (u8)(id & 0xFF);
-    buf[3] = (u8)((id >> 8) & 0xFF);
+    /* BCDC 16-byte header (little-endian) */
+    u32 cmd = WLC_SET_VAR;
+    buf[0]  = (u8)(cmd & 0xFF);
+    buf[1]  = (u8)((cmd >> 8) & 0xFF);
+    buf[2]  = (u8)((cmd >> 16) & 0xFF);
+    buf[3]  = (u8)((cmd >> 24) & 0xFF);
+    buf[4]  = (u8)(body_len & 0xFF);
+    buf[5]  = (u8)((body_len >> 8) & 0xFF);
+    buf[6]  = (u8)((body_len >> 16) & 0xFF);
+    buf[7]  = (u8)((body_len >> 24) & 0xFF);
+    u16 flags = BCDC_FLAG_SET;
+    buf[8]  = (u8)(flags & 0xFF);
+    buf[9]  = (u8)((flags >> 8) & 0xFF);
+    buf[10] = (u8)(id & 0xFF);
+    buf[11] = (u8)((id >> 8) & 0xFF);
+    buf[12] = 0; buf[13] = 0; buf[14] = 0; buf[15] = 0; /* status = 0 */
 
     /* iovar name */
     memcpy(buf + BCDC_HEADER_LEN, name, name_len);
@@ -388,11 +399,20 @@ static bool bcdc_get_iovar(const char *name, u8 *resp, u32 *resp_len)
     u8 buf[512];
     u16 id = bcdc_reqid++;
 
-    /* BCDC header */
-    buf[0] = (u8)(WLC_GET_VAR & 0xFF);
-    buf[1] = (u8)((WLC_GET_VAR >> 8) & 0xFF);
-    buf[2] = (u8)(id & 0xFF);
-    buf[3] = (u8)((id >> 8) & 0xFF);
+    /* BCDC 16-byte header (little-endian) */
+    u32 cmd = WLC_GET_VAR;
+    buf[0]  = (u8)(cmd & 0xFF);
+    buf[1]  = (u8)((cmd >> 8) & 0xFF);
+    buf[2]  = (u8)((cmd >> 16) & 0xFF);
+    buf[3]  = (u8)((cmd >> 24) & 0xFF);
+    buf[4]  = (u8)(name_len & 0xFF);
+    buf[5]  = (u8)((name_len >> 8) & 0xFF);
+    buf[6]  = (u8)((name_len >> 16) & 0xFF);
+    buf[7]  = (u8)((name_len >> 24) & 0xFF);
+    buf[8]  = 0; buf[9] = 0;   /* flags = 0 (GET) */
+    buf[10] = (u8)(id & 0xFF);
+    buf[11] = (u8)((id >> 8) & 0xFF);
+    buf[12] = 0; buf[13] = 0; buf[14] = 0; buf[15] = 0; /* status = 0 */
 
     /* iovar name */
     memcpy(buf + BCDC_HEADER_LEN, name, name_len);
@@ -407,6 +427,15 @@ static bool bcdc_get_iovar(const char *name, u8 *resp, u32 *resp_len)
         u32 rlen;
         if (sdpcm_recv(&channel, cyw_rx_buf, &rlen)) {
             if (channel == SDPCM_CTL_CHANNEL && rlen >= BCDC_HEADER_LEN) {
+                /* Check status field at offset 12 */
+                u32 status = (u32)cyw_rx_buf[12] | ((u32)cyw_rx_buf[13] << 8) |
+                             ((u32)cyw_rx_buf[14] << 16) | ((u32)cyw_rx_buf[15] << 24);
+                if (status != 0) {
+                    uart_puts("[cyw] bcdc get err st=");
+                    uart_hex(status);
+                    uart_puts("\n");
+                    return false;
+                }
                 u32 data_off = BCDC_HEADER_LEN;
                 u32 data_len = rlen - data_off;
                 if (resp && data_len > 0) {
@@ -434,10 +463,21 @@ static bool bcdc_set_cmd(u32 cmd, const void *data, u32 data_len)
         return false;
     u16 id = bcdc_reqid++;
 
-    buf[0] = (u8)(cmd & 0xFF);
-    buf[1] = (u8)((cmd >> 8) & 0xFF) | BCDC_FLAG_SET;
-    buf[2] = (u8)(id & 0xFF);
-    buf[3] = (u8)((id >> 8) & 0xFF);
+    /* BCDC 16-byte header (little-endian) */
+    buf[0]  = (u8)(cmd & 0xFF);
+    buf[1]  = (u8)((cmd >> 8) & 0xFF);
+    buf[2]  = (u8)((cmd >> 16) & 0xFF);
+    buf[3]  = (u8)((cmd >> 24) & 0xFF);
+    buf[4]  = (u8)(data_len & 0xFF);
+    buf[5]  = (u8)((data_len >> 8) & 0xFF);
+    buf[6]  = (u8)((data_len >> 16) & 0xFF);
+    buf[7]  = (u8)((data_len >> 24) & 0xFF);
+    u16 flags = BCDC_FLAG_SET;
+    buf[8]  = (u8)(flags & 0xFF);
+    buf[9]  = (u8)((flags >> 8) & 0xFF);
+    buf[10] = (u8)(id & 0xFF);
+    buf[11] = (u8)((id >> 8) & 0xFF);
+    buf[12] = 0; buf[13] = 0; buf[14] = 0; buf[15] = 0; /* status = 0 */
 
     if (data && data_len > 0)
         memcpy(buf + BCDC_HEADER_LEN, data, data_len);
@@ -452,10 +492,16 @@ UNUSED static bool bcdc_get_cmd(u32 cmd, u8 *resp, u32 *resp_len)
     u8 buf[512];
     u16 id = bcdc_reqid++;
 
-    buf[0] = (u8)(cmd & 0xFF);
-    buf[1] = (u8)((cmd >> 8) & 0xFF);
-    buf[2] = (u8)(id & 0xFF);
-    buf[3] = (u8)((id >> 8) & 0xFF);
+    /* BCDC 16-byte header (little-endian) */
+    buf[0]  = (u8)(cmd & 0xFF);
+    buf[1]  = (u8)((cmd >> 8) & 0xFF);
+    buf[2]  = (u8)((cmd >> 16) & 0xFF);
+    buf[3]  = (u8)((cmd >> 24) & 0xFF);
+    buf[4]  = 0; buf[5] = 0; buf[6] = 0; buf[7] = 0; /* len = 0 */
+    buf[8]  = 0; buf[9] = 0;   /* flags = 0 (GET) */
+    buf[10] = (u8)(id & 0xFF);
+    buf[11] = (u8)((id >> 8) & 0xFF);
+    buf[12] = 0; buf[13] = 0; buf[14] = 0; buf[15] = 0; /* status = 0 */
 
     if (!sdpcm_send(SDPCM_CTL_CHANNEL, buf, payload_len))
         return false;
@@ -466,6 +512,15 @@ UNUSED static bool bcdc_get_cmd(u32 cmd, u8 *resp, u32 *resp_len)
         u32 rlen;
         if (sdpcm_recv(&channel, cyw_rx_buf, &rlen)) {
             if (channel == SDPCM_CTL_CHANNEL && rlen >= BCDC_HEADER_LEN) {
+                /* Check status field at offset 12 */
+                u32 status = (u32)cyw_rx_buf[12] | ((u32)cyw_rx_buf[13] << 8) |
+                             ((u32)cyw_rx_buf[14] << 16) | ((u32)cyw_rx_buf[15] << 24);
+                if (status != 0) {
+                    uart_puts("[cyw] bcdc get err st=");
+                    uart_hex(status);
+                    uart_puts("\n");
+                    return false;
+                }
                 u32 data_off = BCDC_HEADER_LEN;
                 u32 data_len = rlen - data_off;
                 if (resp && data_len > 0) {
@@ -834,6 +889,54 @@ bool cyw43_load_firmware(void)
         return false;
     }
 
+    /* Load CLM blob via 'clmload' iovar */
+    {
+        fat32_file_t clm;
+        if (fat32_open("/wifi/clm.bin", &clm)) {
+            uart_puts("[cyw] loading CLM (");
+            uart_hex(clm.file_size);
+            uart_puts(" bytes)...\n");
+
+            static u8 ALIGNED(4) clm_chunk[1024 + 16]; /* data + download header */
+            u32 offset = 0;
+            bool clm_ok = true;
+
+            while (offset < clm.file_size && clm_ok) {
+                u32 chunk = clm.file_size - offset;
+                if (chunk > 1024) chunk = 1024;
+
+                /* Build download header: flag(2) + type(2) + len(4) + crc(4) = 12 bytes */
+                u16 flag = 0x0004; /* DL_CONT */
+                if (offset == 0) flag |= 0x0002; /* DL_BEGIN */
+                if (offset + chunk >= clm.file_size) flag |= 0x0008; /* DL_END */
+
+                clm_chunk[0] = flag & 0xFF;
+                clm_chunk[1] = (flag >> 8) & 0xFF;
+                clm_chunk[2] = 0x02; /* type = CLM */
+                clm_chunk[3] = 0x00;
+                clm_chunk[4] = chunk & 0xFF;
+                clm_chunk[5] = (chunk >> 8) & 0xFF;
+                clm_chunk[6] = (chunk >> 16) & 0xFF;
+                clm_chunk[7] = (chunk >> 24) & 0xFF;
+                clm_chunk[8] = 0; clm_chunk[9] = 0; /* crc = 0 */
+                clm_chunk[10] = 0; clm_chunk[11] = 0;
+
+                u32 got = fat32_read(&clm, clm_chunk + 12, chunk);
+                if (got != chunk) { clm_ok = false; break; }
+
+                if (!bcdc_set_iovar("clmload", clm_chunk, 12 + chunk))
+                    clm_ok = false;
+
+                offset += chunk;
+            }
+            fat32_close(&clm);
+            if (clm_ok) uart_puts("[cyw] CLM loaded\n");
+            else uart_puts("[cyw] CLM load failed (non-fatal)\n");
+        } else {
+            uart_puts("[cyw] no CLM blob (non-fatal)\n");
+        }
+    }
+
     uart_puts("[cyw] fw loaded OK\n");
     return true;
 }
@@ -990,7 +1093,26 @@ bool cyw43_join(const char *ssid, u32 ssid_len,
         uart_putc(ssid[i]);
     uart_puts("\n");
 
-    return bcdc_set_cmd(WLC_SET_SSID, &ssid_params, sizeof(ssid_params));
+    if (!bcdc_set_cmd(WLC_SET_SSID, &ssid_params, sizeof(ssid_params)))
+        return false;
+
+    /* Poll for association result */
+    uart_puts("[cyw] joining...\n");
+    for (u32 i = 0; i < 200; i++) {  /* up to ~10s */
+        cyw43_poll();
+        u32 state = cyw43_link_state();
+        if (state == CYW_LINK_UP) {
+            uart_puts("[cyw] associated!\n");
+            return true;
+        }
+        if (state == CYW_LINK_AUTH_FAIL) {
+            uart_puts("[cyw] auth failed\n");
+            return false;
+        }
+        for (volatile u32 d = 0; d < 500000; d++) {} /* ~50ms */
+    }
+    uart_puts("[cyw] join timeout\n");
+    return false;
 }
 
 bool cyw43_disconnect(void)
