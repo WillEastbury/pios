@@ -34,7 +34,9 @@ static bcache_stats_t stats;
 /* Hash index: LBA → cache entry index for O(1) lookup.
  * 128 buckets, open addressing with linear probe. */
 #define HASH_BUCKETS 128
-static i32 hash_index[HASH_BUCKETS]; /* -1 = empty */
+#define HASH_EMPTY     (-1)  /* slot never used — stop search */
+#define HASH_TOMBSTONE (-2)  /* deleted — continue search */
+static i32 hash_index[HASH_BUCKETS];
 
 static inline u32 lba_hash(u32 lba) { return (lba * 2654435761U) >> 25; } /* Knuth mult hash → 7 bits */
 
@@ -42,7 +44,8 @@ static void hash_insert(u32 lba, u32 idx) {
     u32 bucket = lba_hash(lba);
     for (u32 i = 0; i < HASH_BUCKETS; i++) {
         u32 b = (bucket + i) & (HASH_BUCKETS - 1);
-        if (hash_index[b] < 0 || ((u32)hash_index[b] < BCACHE_ENTRIES &&
+        if (hash_index[b] == HASH_EMPTY || hash_index[b] == HASH_TOMBSTONE ||
+            ((u32)hash_index[b] < BCACHE_ENTRIES &&
             cache[hash_index[b]].lba == lba)) {
             hash_index[b] = (i32)idx;
             return;
@@ -54,9 +57,10 @@ static void hash_remove(u32 lba) {
     u32 bucket = lba_hash(lba);
     for (u32 i = 0; i < HASH_BUCKETS; i++) {
         u32 b = (bucket + i) & (HASH_BUCKETS - 1);
-        if (hash_index[b] < 0) return;
-        if ((u32)hash_index[b] < BCACHE_ENTRIES && cache[hash_index[b]].lba == lba) {
-            hash_index[b] = -1;
+        if (hash_index[b] == HASH_EMPTY) return;
+        if (hash_index[b] != HASH_TOMBSTONE &&
+            (u32)hash_index[b] < BCACHE_ENTRIES && cache[hash_index[b]].lba == lba) {
+            hash_index[b] = HASH_TOMBSTONE;
             return;
         }
     }
@@ -74,7 +78,8 @@ static bcache_entry_t *find_entry(u32 lba)
     u32 bucket = lba_hash(lba);
     for (u32 i = 0; i < HASH_BUCKETS; i++) {
         u32 b = (bucket + i) & (HASH_BUCKETS - 1);
-        if (hash_index[b] < 0) break;
+        if (hash_index[b] == HASH_EMPTY) break;       /* never used — stop */
+        if (hash_index[b] == HASH_TOMBSTONE) continue; /* deleted — skip */
         u32 idx = (u32)hash_index[b];
         if (idx < BCACHE_ENTRIES && (cache[idx].flags & FLAG_VALID) && cache[idx].lba == lba)
             return &cache[idx];
@@ -256,7 +261,7 @@ void bcache_init(void)
     simd_zero(cache, sizeof(cache));
     simd_zero(&stats, sizeof(stats));
     for (u32 i = 0; i < HASH_BUCKETS; i++)
-        hash_index[i] = -1;
+        hash_index[i] = HASH_EMPTY;
     for (u32 i = 0; i < PREFETCH_WINDOW; i++)
         history[i] = 0xFFFFFFFF;
     history_idx = 0;
