@@ -176,8 +176,11 @@ static void sdio_set_clock(u32 freq_khz)
     sw(REG_CONTROL1, c1);
     delay_cycles(1000);
 
-    /* Base clock ~50MHz from RP1 PLL */
-    u32 base_khz = 50000;
+    /* Derive base clock from SDHCI capabilities register */
+    u32 cap = sr(REG_CAP0);
+    u32 base_mhz = (cap >> 8) & 0xFF;
+    if (base_mhz == 0) base_mhz = 50;  /* fallback */
+    u32 base_khz = base_mhz * 1000;
     u32 div = base_khz / freq_khz;
     if (base_khz / div > freq_khz) div++;
     div = div >> 1;
@@ -305,6 +308,20 @@ bool sdio_init(void)
 
     /* Power-cycle the WiFi chip */
     sdio_power_on();
+
+    /* Probe PRESENT_STATE for card */
+    u32 pstate = sr(REG_STATUS);
+    uart_puts("[sdio] PRESENT=");
+    uart_hex(pstate);
+    uart_puts("\n");
+
+    /* Try CFG block presence override */
+    u64 cfg = BCM2712_SDIO2_BASE + BCM2712_SDIO2_CFG_OFFSET;
+    uart_puts("[sdio] CFG[0]=");
+    uart_hex(mmio_read(cfg + 0x00));
+    uart_puts(" CFG[4]=");
+    uart_hex(mmio_read(cfg + 0x04));
+    uart_puts("\n");
 
     /* Reset the host controller */
     uart_puts("[sdio] HC reset...\n");

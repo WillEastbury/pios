@@ -26,6 +26,9 @@
  * AXI base 0x1000000000 + 0x1100000 = 0x1001100000 */
 #define BCM2712_SDIO2_BASE  0x1001100000UL
 
+/* BCM2712 SDHCI CFG block — offset from SDIO2 base (exploratory) */
+#define BCM2712_SDIO2_CFG_OFFSET  0x200
+
 /* BCM2712 SoC pinctrl for SDIO2 pins (sdio2_30_pins)
  * SoC GPIO controller at 0x107d504100 */
 #define BCM2712_PINCTRL_BASE 0x107D504100UL
