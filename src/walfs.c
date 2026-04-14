@@ -73,6 +73,10 @@ static bool discover_partition(void)
         return true;
     }
 
+    if ((u64)p2_start + (u64)p2_size > 0xFFFFFFFF) {
+        uart_puts("[wal] partition exceeds u32 LBA\n");
+    }
+
     base_lba = p2_start;
     uart_puts("[wal] p2 LBA=");
     uart_hex(base_lba);
@@ -82,8 +86,8 @@ static bool discover_partition(void)
 
 u32 walfs_part2_lba(void) { return base_lba; }
 
-/* Translate a WALFS-relative LBA to an absolute SD LBA */
-static inline u32 abs_lba(u32 rel) { return base_lba + rel; }
+/* Translate a WALFS-relative LBA to an absolute SD LBA (u64 to catch overflow) */
+static inline u64 abs_lba64(u32 rel) { return (u64)base_lba + (u64)rel; }
 
 struct readdir_entry_wire {
     u64 inode_id;
@@ -300,7 +304,9 @@ static bool wal_read(u64 off, void *buf, u32 len)
 {
     u8 *d = (u8 *)buf;
     while (len > 0) {
-        u32 lba = abs_lba((u32)(off / SD_BLOCK_SIZE));
+        u64 abs_lba = abs_lba64((u32)(off / SD_BLOCK_SIZE));
+        if (abs_lba > 0xFFFFFFFF) return false;
+        u32 lba = (u32)abs_lba;
         u32 blk_off = (u32)(off % SD_BLOCK_SIZE);
         u32 n = SD_BLOCK_SIZE - blk_off;
         if (n > len) n = len;
@@ -320,7 +326,9 @@ static bool wal_write(u64 off, const void *buf, u32 len)
 {
     const u8 *s = (const u8 *)buf;
     while (len > 0) {
-        u32 lba = abs_lba((u32)(off / SD_BLOCK_SIZE));
+        u64 abs_lba = abs_lba64((u32)(off / SD_BLOCK_SIZE));
+        if (abs_lba > 0xFFFFFFFF) return false;
+        u32 lba = (u32)abs_lba;
         u32 blk_off = (u32)(off % SD_BLOCK_SIZE);
         u32 n = SD_BLOCK_SIZE - blk_off;
         if (n > len) n = len;
@@ -355,8 +363,8 @@ static void write_super(void)
 
     /* Write superblock directly to SD, bypassing cache, to ensure
      * it hits disk AFTER all WAL data blocks are persisted. */
-    sd_write_block(abs_lba(0), (const u8 *)&super);
-    bcache_invalidate(abs_lba(0)); /* keep cache consistent */
+    sd_write_block((u32)abs_lba64(0), (const u8 *)&super);
+    bcache_invalidate((u32)abs_lba64(0)); /* keep cache consistent */
 }
 
 /* ---- WAL append (two-part payload to avoid large stack buffers) ---- */
@@ -364,7 +372,8 @@ static void write_super(void)
 static u64 wal_append(u32 type, const void *meta, u32 meta_len,
                       const void *data, u32 data_len)
 {
-    /* Bounds check: prevent rec_buf overflow */
+    /* Bounds check: prevent u32 overflow and rec_buf overflow */
+    if (meta_len > 0xFFFFFFFF - data_len) return 0;
     if (meta_len + data_len > sizeof(rec_buf) - sizeof(struct wal_record))
         return 0;
 
@@ -578,7 +587,7 @@ bool walfs_init(void)
     /* Discover partition 2 from MBR before any WALFS I/O */
     if (!discover_partition()) return false;
 
-    if (!bcache_read(abs_lba(0), (u8 *)&super)) return false;
+    if (!bcache_read((u32)abs_lba64(0), (u8 *)&super)) return false;
 
     if (super.magic == WALFS_MAGIC && super.version == WALFS_VERSION) {
         u32 saved = super.crc32;
@@ -652,8 +661,8 @@ u64 walfs_create(u64 parent_id, const char *name, u32 flags, u32 mode)
     de.child_id  = id;
     name_copy(de.name, name);
 
-    wal_append(RECORD_DIRENT, &de, sizeof(de), NULL, 0);
-    wal_append(RECORD_TX_COMMIT, &tx_id, sizeof(tx_id), NULL, 0);
+    if (!wal_append(RECORD_DIRENT, &de, sizeof(de), NULL, 0)) return 0;
+    if (!wal_append(RECORD_TX_COMMIT, &tx_id, sizeof(tx_id), NULL, 0)) return 0;
     lru_flush(&path_cache);
     write_super();
     return id;
@@ -694,7 +703,8 @@ bool walfs_write(u64 inode_id, u64 offset, const void *data, u32 len)
     icache_put(inode_id, ino_pos);
 
     /* Commit transaction */
-    wal_append(RECORD_TX_COMMIT, &tx_id, sizeof(tx_id), NULL, 0);
+    if (!wal_append(RECORD_TX_COMMIT, &tx_id, sizeof(tx_id), NULL, 0))
+        return false;
     write_super();
     return true;
 }
