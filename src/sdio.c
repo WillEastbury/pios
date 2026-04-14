@@ -334,31 +334,63 @@ bool sdio_init(void)
     sw(REG_INTERRUPT, INT_ALL);
     delay_cycles(100000);
 
-    /* CMD5: IO_SEND_OP_COND — probe for SDIO card */
+    /* CMD5: IO_SEND_OP_COND — probe for SDIO card.
+     * First CMD5 may return CRC/index errors which are normal for SDIO. */
     u32 resp[4];
     uart_puts("[sdio] CMD5 probe...\n");
     
-    /* First CMD5 may fail with timeout if chip not ready — retry a few times */
     bool cmd5_ok = false;
-    for (u32 retry = 0; retry < 5; retry++) {
+    for (u32 retry = 0; retry < 10; retry++) {
         sw(REG_INTERRUPT, INT_ALL);  /* clear all pending */
-        if (sdio_send_cmd(SDIO_CMD5, 0, resp)) {
-            cmd5_ok = true;
-            break;
+        
+        /* Send CMD5 directly — tolerate errors on first attempts */
+        if (!sdio_wait_cmd()) {
+            uart_puts("[sdio] CMD5 wait_cmd fail\n");
+            sw(REG_CONTROL1, sr(REG_CONTROL1) | C1_SRST_CMD);
+            delay_cycles(100000);
+            continue;
         }
-        /* Log the error bits */
-        u32 err = sr(REG_INTERRUPT);
-        uart_puts("[sdio] CMD5 err=");
-        uart_hex(err);
-        uart_puts(" retry ");
-        uart_hex(retry);
-        uart_puts("\n");
+        
         sw(REG_INTERRUPT, INT_ALL);
-        delay_cycles(2000000);  /* wait ~200ms between retries */
+        sw(REG_ARG1, 0);
+        sw(REG_CMDTM, SDIO_CMD5);
+        
+        u32 tout = 1000000;
+        u32 intr;
+        do {
+            intr = sr(REG_INTERRUPT);
+            delay_cycles(10);
+        } while (!(intr & (INT_CMD_DONE | INT_ERROR)) && tout--);
+        
+        uart_puts("[sdio] CMD5 intr=");
+        uart_hex(intr);
+        
+        if (intr & INT_CMD_DONE) {
+            /* Read response even if error bits are set */
+            resp[0] = sr(REG_RESP0);
+            uart_puts(" R=");
+            uart_hex(resp[0]);
+            uart_puts("\n");
+            sw(REG_INTERRUPT, INT_ALL);
+            
+            if (resp[0] != 0) {
+                cmd5_ok = true;
+                break;
+            }
+        } else {
+            uart_puts(" (no CMD_DONE)\n");
+        }
+        
+        sw(REG_INTERRUPT, INT_ALL);
+        /* Reset CMD line on error */
+        sw(REG_CONTROL1, sr(REG_CONTROL1) | C1_SRST_CMD);
+        delay_cycles(100000);
+        while (sr(REG_CONTROL1) & C1_SRST_CMD) delay_cycles(10);
+        delay_cycles(2000000);
     }
     
     if (!cmd5_ok) {
-        uart_puts("[sdio] CMD5 fail after retries\n");
+        uart_puts("[sdio] CMD5 no response\n");
         return false;
     }
 
