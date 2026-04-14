@@ -159,14 +159,16 @@ static u32 build_base_msg(struct dhcp_msg *msg) {
     return 0; /* options offset */
 }
 
-static u32 add_opt_byte(u8 *opts, u32 off, u8 code, u8 val) {
+static u32 add_opt_byte(u8 *opts, u32 opts_size, u32 off, u8 code, u8 val) {
+    if (off + 3 > opts_size) return off;
     opts[off++] = code;
     opts[off++] = 1;
     opts[off++] = val;
     return off;
 }
 
-static u32 add_opt_u32(u8 *opts, u32 off, u8 code, u32 val) {
+static u32 add_opt_u32(u8 *opts, u32 opts_size, u32 off, u8 code, u32 val) {
+    if (off + 6 > opts_size) return off;
     opts[off++] = code;
     opts[off++] = 4;
     opts[off++] = (u8)(val >> 24);
@@ -180,17 +182,21 @@ static void send_discover(void) {
     struct dhcp_msg msg;
     build_base_msg(&msg);
 
+    u32 cap = sizeof(msg.options);
     u32 off = 0;
-    off = add_opt_byte(msg.options, off, OPT_MSG_TYPE, DHCPDISCOVER);
+    off = add_opt_byte(msg.options, cap, off, OPT_MSG_TYPE, DHCPDISCOVER);
 
     /* Parameter request list */
-    msg.options[off++] = OPT_PARAM_LIST;
-    msg.options[off++] = 3;
-    msg.options[off++] = OPT_SUBNET;
-    msg.options[off++] = OPT_ROUTER;
-    msg.options[off++] = OPT_DNS;
+    if (off + 5 <= cap) {
+        msg.options[off++] = OPT_PARAM_LIST;
+        msg.options[off++] = 3;
+        msg.options[off++] = OPT_SUBNET;
+        msg.options[off++] = OPT_ROUTER;
+        msg.options[off++] = OPT_DNS;
+    }
 
-    msg.options[off++] = OPT_END;
+    if (off + 1 <= cap)
+        msg.options[off++] = OPT_END;
 
     /* Message size: fixed header (236) + cookie (4) + options */
     u32 msg_len = 240 + off;
@@ -202,19 +208,23 @@ static void send_request(u32 requested_ip, u32 server_id) {
     struct dhcp_msg msg;
     build_base_msg(&msg);
 
+    u32 cap = sizeof(msg.options);
     u32 off = 0;
-    off = add_opt_byte(msg.options, off, OPT_MSG_TYPE, DHCPREQUEST);
-    off = add_opt_u32(msg.options, off, OPT_SERVER_ID, server_id);
+    off = add_opt_byte(msg.options, cap, off, OPT_MSG_TYPE, DHCPREQUEST);
+    off = add_opt_u32(msg.options, cap, off, OPT_SERVER_ID, server_id);
 
-    /* Requested IP */
-    msg.options[off++] = 50; /* option 50: requested IP */
-    msg.options[off++] = 4;
-    msg.options[off++] = (u8)(requested_ip >> 24);
-    msg.options[off++] = (u8)(requested_ip >> 16);
-    msg.options[off++] = (u8)(requested_ip >> 8);
-    msg.options[off++] = (u8)requested_ip;
+    /* Requested IP (option 50) */
+    if (off + 6 <= cap) {
+        msg.options[off++] = 50;
+        msg.options[off++] = 4;
+        msg.options[off++] = (u8)(requested_ip >> 24);
+        msg.options[off++] = (u8)(requested_ip >> 16);
+        msg.options[off++] = (u8)(requested_ip >> 8);
+        msg.options[off++] = (u8)requested_ip;
+    }
 
-    msg.options[off++] = OPT_END;
+    if (off + 1 <= cap)
+        msg.options[off++] = OPT_END;
 
     u32 msg_len = 240 + off;
     dhcp_send_raw(&msg, msg_len, 0);

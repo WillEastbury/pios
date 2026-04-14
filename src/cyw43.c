@@ -359,7 +359,9 @@ static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len)
     if (payload_len > CYW_MAX_FRAME - SDPCM_HEADER_LEN)
         return false;
 
-    u8 buf[512];
+    static u8 buf[CYW_MAX_FRAME] ALIGNED(64);
+    if (payload_len > sizeof(buf))
+        return false;
     u16 id = bcdc_reqid++;
 
     /* BCDC header */
@@ -427,7 +429,9 @@ static bool bcdc_set_cmd(u32 cmd, const void *data, u32 data_len)
     if (payload_len > sizeof(cyw_tx_buf) - SDPCM_HEADER_LEN)
         return false;
 
-    u8 buf[512];
+    static u8 buf[CYW_MAX_FRAME] ALIGNED(64);
+    if (payload_len > sizeof(buf))
+        return false;
     u16 id = bcdc_reqid++;
 
     buf[0] = (u8)(cmd & 0xFF);

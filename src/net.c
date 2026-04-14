@@ -343,6 +343,10 @@ static bool resolve_mac(u32 dst_ip, const u8 **mac_out) {
 
 bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
                   const u8 *data, u16 len) {
+    /* Guard against u16 overflow: max frame 2048 minus IP+UDP headers */
+    if (len > 2048 - 42)
+        return false;
+
     const u8 *dst_mac;
     if (unlikely(!resolve_mac(dst_ip, &dst_mac)))
         return false;
@@ -410,6 +414,8 @@ void net_handle_fifo_request(void) {
         if (!fifo_pop(CORE_NET, CORE_USER0, &msg))
             break;
         if (msg.type == MSG_NET_UDP_SEND && msg.buffer && msg.length <= 1472) {
+            if (!ptr_in_core_ram(CORE_USER0, msg.buffer, msg.length))
+                continue;
             u16 sp = (u16)(msg.tag >> 16);
             u16 dp = (u16)(msg.tag & 0xFFFF);
             bool ok = net_send_udp(msg.param, sp, dp,
@@ -425,6 +431,8 @@ void net_handle_fifo_request(void) {
         if (!fifo_pop(CORE_NET, CORE_USER1, &msg))
             break;
         if (msg.type == MSG_NET_UDP_SEND && msg.buffer && msg.length <= 1472) {
+            if (!ptr_in_core_ram(CORE_USER1, msg.buffer, msg.length))
+                continue;
             u16 sp = (u16)(msg.tag >> 16);
             u16 dp = (u16)(msg.tag & 0xFFFF);
             bool ok = net_send_udp(msg.param, sp, dp,

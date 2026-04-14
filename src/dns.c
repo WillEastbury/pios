@@ -71,7 +71,7 @@ static u16 gen_src_port(void) {
 
 /* ---- QNAME encoding ---- */
 
-static u32 encode_qname(u8 *buf, const char *hostname) {
+static u32 encode_qname(u8 *buf, u32 max_len, const char *hostname) {
     u32 off = 0;
     const char *p = hostname;
 
@@ -81,6 +81,8 @@ static u32 encode_qname(u8 *buf, const char *hostname) {
         u32 label_len = (u32)(dot - p);
         if (label_len == 0 || label_len > 63) return 0;
         if (p[0] == '-' || p[label_len - 1] == '-') return 0;
+        /* 1 byte length prefix + label + 1 byte root terminator must fit */
+        if (off + 1 + label_len + 1 > max_len) return 0;
         buf[off++] = (u8)label_len;
         for (u32 i = 0; i < label_len; i++) {
             u8 c = (u8)p[i];
@@ -93,6 +95,7 @@ static u32 encode_qname(u8 *buf, const char *hostname) {
         }
         p = (*dot == '.') ? dot + 1 : dot;
     }
+    if (off + 1 > max_len) return 0;
     buf[off++] = 0; /* root label */
     return off;
 }
@@ -102,6 +105,11 @@ static u32 encode_qname(u8 *buf, const char *hostname) {
 static u8 query_buf[256] ALIGNED(64);
 
 static u32 build_query(u16 txid, const char *hostname) {
+    /* Hostname length check per RFC 1035 */
+    u32 hostname_len = 0;
+    while (hostname[hostname_len]) hostname_len++;
+    if (hostname_len > 253) return 0;
+
     u8 *p = query_buf;
 
     /* Header */
@@ -113,11 +121,13 @@ static u32 build_query(u16 txid, const char *hostname) {
     p[8] = 0; p[9] = 0;   /* NSCOUNT = 0 */
     p[10] = 0; p[11] = 0; /* ARCOUNT = 0 */
 
-    /* Question */
-    u32 qname_len = encode_qname(p + DNS_HDR_SIZE, hostname);
+    /* Question - encode_qname must fit within remaining query_buf space */
+    u32 qname_max = sizeof(query_buf) - DNS_HDR_SIZE - 4; /* 4 = QTYPE+QCLASS */
+    u32 qname_len = encode_qname(p + DNS_HDR_SIZE, qname_max, hostname);
     if (qname_len == 0) return 0;
 
     u32 off = DNS_HDR_SIZE + qname_len;
+    if (off + 4 > sizeof(query_buf)) return 0;
     p[off++] = 0; p[off++] = DNS_TYPE_A;   /* QTYPE = A */
     p[off++] = 0; p[off++] = DNS_CLASS_IN; /* QCLASS = IN */
 
@@ -274,9 +284,8 @@ bool dns_resolve(const char *hostname, u32 *ip_out) {
     u32 qlen = build_query(txid, hostname);
     if (qlen == 0) return false;
 
-    /* Install our UDP handler temporarily */
-    /* Note: we chain to existing callback for non-DNS traffic */
-    net_set_udp_callback(dns_udp_handler);
+    /* Install our UDP handler temporarily, saving previous callback */
+    prev_callback = net_swap_udp_callback(dns_udp_handler);
 
     for (u32 retry = 0; retry < MAX_RETRIES; retry++) {
         net_send_udp(dns_server, src_port, DNS_PORT, query_buf, (u16)qlen);
@@ -288,11 +297,15 @@ bool dns_resolve(const char *hostname, u32 *ip_out) {
             if (got_response) {
                 *ip_out = resp_ip;
                 cache_insert(hash, resp_ip, resp_ttl);
+                net_set_udp_callback(prev_callback);
                 return true;
             }
             timer_delay_us(100);
         }
     }
+
+    /* Restore previous UDP callback on failure */
+    net_set_udp_callback(prev_callback);
 
     uart_puts("[dns] Resolve failed: ");
     uart_puts(hostname);

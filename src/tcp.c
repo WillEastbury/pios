@@ -431,6 +431,9 @@ static u16 tcp_checksum_split(u32 src_ip, u32 dst_ip,
 
 static void tcp_send_segment(struct tcb *t, u8 flags,
                              const void *data, u32 data_len) {
+    /* Guard against u16 overflow: max frame 2048 minus IP+TCP headers */
+    if (data_len > 2048 - 54) return;
+
     /* Resolve destination MAC */
     const u8 *dst_mac = arp_resolve(t->remote_ip);
     if (unlikely(!dst_mac)) return;
@@ -498,6 +501,9 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
 
 static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
                                         u32 tx_off, u32 data_len) {
+    /* Guard against u16 overflow: max frame 2048 minus IP+TCP headers */
+    if (data_len > 2048 - 54) return;
+
     const u8 *dst_mac = arp_resolve(t->remote_ip);
     if (unlikely(!dst_mac)) return;
 
