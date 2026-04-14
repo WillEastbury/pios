@@ -665,63 +665,6 @@ bool macb_init(void) {
                   fd ? "FD" : "HD", ncfgr);
     }
 
-    /* ── Verbose MACB DMA state dump ── */
-    uart_puts("[macb] === MACB Register Dump ===\n");
-    uart_puts("[macb] NCR="); uart_hex(mr(NCR)); uart_puts("\n");
-    uart_puts("[macb] NCFGR="); uart_hex(mr(NCFGR)); uart_puts("\n");
-    uart_puts("[macb] NSR="); uart_hex(mr(NSR)); uart_puts("\n");
-    uart_puts("[macb] DMACFG="); uart_hex(mr(DMACFG)); uart_puts("\n");
-    uart_puts("[macb] USRIO="); uart_hex(mr(USRIO)); uart_puts("\n");
-    uart_puts("[macb] RBQP="); uart_hex(mr(RBQP));
-    uart_puts(" RBQPH="); uart_hex(mr(RBQPH)); uart_puts("\n");
-    uart_puts("[macb] TBQP="); uart_hex(mr(TBQP));
-    uart_puts(" TBQPH="); uart_hex(mr(TBQPH)); uart_puts("\n");
-    uart_puts("[macb] ISR="); uart_hex(mr(ISR)); uart_puts("\n");
-    uart_puts("[macb] TSR="); uart_hex(mr(TSR)); uart_puts("\n");
-    uart_puts("[macb] RSR="); uart_hex(mr(RSR)); uart_puts("\n");
-    uart_puts("[macb] RX desc[0] addr="); uart_hex(rx_ring[0].addr);
-    uart_puts(" ctrl="); uart_hex(rx_ring[0].ctrl); uart_puts("\n");
-    uart_puts("[macb] TX desc[0] addr="); uart_hex(tx_ring[0].addr);
-    uart_puts(" ctrl="); uart_hex(tx_ring[0].ctrl); uart_puts("\n");
-    uart_puts("[macb] rx_bufs[0] phys="); uart_hex((u64)(usize)&rx_bufs[0][0]); uart_puts("\n");
-    uart_puts("[macb] tx_bufs[0] phys="); uart_hex((u64)(usize)&tx_bufs[0][0]); uart_puts("\n");
-
-    /* HDMI dump */
-    fb_set_color(0x0000CCFF, 0x00000000);
-    fb_printf("MACB NCR=%X NCFGR=%X NSR=%X\n", mr(NCR), mr(NCFGR), mr(NSR));
-    fb_printf("MACB RBQP=%X TBQP=%X\n", mr(RBQP), mr(TBQP));
-    fb_printf("MACB ISR=%X TSR=%X RSR=%X\n", mr(ISR), mr(TSR), mr(RSR));
-    fb_printf("MACB rxdesc0=%X txdesc0=%X\n", rx_ring[0].addr, tx_ring[0].addr);
-    fb_printf("MACB rxbuf0=%X txbuf0=%X\n",
-              (u32)(usize)&rx_bufs[0][0], (u32)(usize)&tx_bufs[0][0]);
-    /* ── PCIe BAR2 state (visible here since UART is active) ── */
-    uart_puts("[macb] PCIe BAR2_LO="); uart_hex(mmio_read(0x1000120000ULL + 0x4034));
-    uart_puts(" BAR2_HI="); uart_hex(mmio_read(0x1000120000ULL + 0x4038));
-    uart_puts("\n");
-    uart_puts("[macb] UBUS_REMAP="); uart_hex(mmio_read(0x1000120000ULL + 0x40B4));
-    uart_puts(" REMAP_HI="); uart_hex(mmio_read(0x1000120000ULL + 0x40B0));
-    uart_puts("\n");
-    uart_puts("[macb] MISC_CTRL="); uart_hex(mmio_read(0x1000120000ULL + 0x4008));
-    uart_puts("\n");
-
-    /* ── DMA write-back test: check if MAC can modify descriptor memory ──
-     * Write a canary to rx_ring[NUM_RX-1].ctrl, clear it, wait, read back.
-     * If MAC touched it (e.g. BNA sets descriptor state), we'll see it. */
-    {
-        volatile u32 *test_word = (volatile u32 *)(usize)&rx_ring[0].ctrl;
-        u32 before = *test_word;
-        /* Wait a moment for any pending DMA */
-        __asm__ volatile("dsb sy; isb" ::: "memory");
-        delay_cycles(1000000);
-        __asm__ volatile("dsb sy; isb" ::: "memory");
-        u32 after = *test_word;
-        uart_puts("[macb] DMA test: desc[0].ctrl before="); uart_hex(before);
-        uart_puts(" after="); uart_hex(after);
-        uart_puts(before != after ? " CHANGED!\n" : " unchanged\n");
-    }
-
-    uart_puts("[macb] === End Dump ===\n");
-
     return true;
 }
 
@@ -793,7 +736,6 @@ bool macb_send(const u8 *frame, u32 len) {
 }
 
 /* ── Receive ── */
-static u32 rx_diag_count;
 bool macb_recv(u8 *frame, u32 *len) {
     /* Force visibility of DMA writes */
     __asm__ volatile("dsb sy; isb" ::: "memory");
@@ -801,20 +743,6 @@ bool macb_recv(u8 *frame, u32 *len) {
     /* Read descriptor via volatile pointer */
     volatile u32 *raw = (volatile u32 *)(usize)&rx_ring[rx_idx];
     u32 addr_val = raw[0];
-    u32 ctrl_val = raw[1];
-
-    /* Periodic diagnostic: dump first descriptor + RSR */
-    if ((rx_diag_count & 0xFFFFF) == 0 && rx_diag_count > 0 && rx_diag_count < 0x500000) {
-        uart_puts("[macb] RX diag idx="); uart_hex(rx_idx);
-        uart_puts(" raw[0]="); uart_hex(addr_val);
-        uart_puts(" raw[1]="); uart_hex(ctrl_val);
-        uart_puts(" RSR="); uart_hex(mr(RSR));
-        uart_puts(" RBQP="); uart_hex(mr(RBQP));
-        uart_puts("\n");
-        /* Clear RSR to see if new events occur */
-        mw(RSR, mr(RSR));
-    }
-    rx_diag_count++;
 
     /* Check if current RX descriptor has been filled by MAC */
     if (!(addr_val & RX_ADDR_OWN))
@@ -822,37 +750,6 @@ bool macb_recv(u8 *frame, u32 *len) {
 
     u32 status = raw[1];
     u32 flen = status & RX_STAT_LEN_MASK;
-
-    /* Dump first few OWN-set descriptors to see all words */
-    static u32 own_dump_count;
-    if (own_dump_count < 3) {
-        uart_puts("[macb] RX OWN set! idx="); uart_hex(rx_idx);
-        uart_puts(" w0="); uart_hex(addr_val);
-        uart_puts(" w1="); uart_hex(status);
-#if !USE_8BYTE_DESC
-        uart_puts(" w2="); uart_hex(raw[2]);
-        uart_puts(" w3="); uart_hex(raw[3]);
-#endif
-        uart_puts(" flen="); uart_hex(flen);
-        uart_puts("\n");
-        /* Scan 64 bytes around descriptor for misplaced writes */
-        volatile u32 *scan = (volatile u32 *)((usize)raw - 16);
-        uart_puts("[macb] memscan: ");
-        for (u32 s = 0; s < 16; s++) {
-            uart_hex(scan[s]);
-            uart_puts(" ");
-        }
-        uart_puts("\n");
-        /* Also dump first 32 bytes of RX buffer to check for frame data */
-        volatile u32 *bufp = (volatile u32 *)(usize)rx_bufs[rx_idx];
-        uart_puts("[macb] buf: ");
-        for (u32 s = 0; s < 8; s++) {
-            uart_hex(bufp[s]);
-            uart_puts(" ");
-        }
-        uart_puts("\n");
-        own_dump_count++;
-    }
 
     if (flen == 0 || flen > BUF_SIZE) {
         /* Reclaim descriptor */
