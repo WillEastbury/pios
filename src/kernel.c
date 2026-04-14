@@ -61,6 +61,7 @@
 #include "watchdog.h"
 #include "cyw43.h"
 #include "sdio.h"
+#include "fat32.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -101,6 +102,71 @@ u32 pios_strlen(const char *s) {
 
 /* Gateway MAC - MUST be configured (no ARP to discover it) */
 static const u8 MY_GW_MAC[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+/* ---- Echo servers ---- */
+#define ECHO_UDP_PORT  7
+#define ECHO_TCP_PORT  7
+#define HTTP_TCP_PORT  80
+
+static tcp_conn_t echo_listen_conn = -1;
+static tcp_conn_t echo_client_conn = -1;
+static tcp_conn_t http_listen_conn = -1;
+static tcp_conn_t http_client_conn = -1;
+
+/* UDP echo: reflect any packet back to sender */
+static void echo_udp_cb(u32 src_ip, u16 src_port, u16 dst_port,
+                         const u8 *data, u16 len) {
+    if (dst_port == ECHO_UDP_PORT) {
+        net_send_udp(src_ip, ECHO_UDP_PORT, src_port, data, len);
+    }
+}
+
+/* TCP echo + HTTP poll — called from core0 main loop */
+static void echo_tcp_poll(void) {
+    /* TCP echo server on port 7 */
+    if (echo_client_conn < 0 && echo_listen_conn >= 0) {
+        echo_client_conn = tcp_accept(echo_listen_conn);
+    }
+    if (echo_client_conn >= 0) {
+        u32 st = tcp_state(echo_client_conn);
+        if (st == 4 /* ESTABLISHED */) {
+            static u8 echo_buf[1024];
+            u32 n = tcp_read(echo_client_conn, echo_buf, sizeof(echo_buf));
+            if (n > 0)
+                tcp_write(echo_client_conn, echo_buf, n);
+        } else if (st == 0 || st >= 8 /* CLOSED or closing */) {
+            tcp_close(echo_client_conn);
+            echo_client_conn = -1;
+        }
+    }
+
+    /* HTTP server on port 80 — returns simple status page */
+    if (http_client_conn < 0 && http_listen_conn >= 0) {
+        http_client_conn = tcp_accept(http_listen_conn);
+    }
+    if (http_client_conn >= 0) {
+        u32 st = tcp_state(http_client_conn);
+        if (st == 4 /* ESTABLISHED */) {
+            static u8 http_buf[512];
+            u32 n = tcp_read(http_client_conn, http_buf, sizeof(http_buf));
+            if (n > 0) {
+                static const char http_resp[] =
+                    "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Connection: close\r\n\r\n"
+                    "PIOS bare-metal Pi 5\n"
+                    "Ethernet: 1000Mbps FD\n"
+                    "Status: operational\n";
+                tcp_write(http_client_conn, http_resp, pios_strlen(http_resp));
+                tcp_close(http_client_conn);
+                http_client_conn = -1;
+            }
+        } else if (st == 0 || st >= 8) {
+            tcp_close(http_client_conn);
+            http_client_conn = -1;
+        }
+    }
+}
 
 #define UI_MODE_NONE          0
 #define UI_MODE_PROC_VIEW     1
@@ -4387,6 +4453,9 @@ NORETURN void core0_main(void) {
         /* Network poll — process incoming packets */
         net_poll();
 
+        /* Service TCP echo + HTTP servers */
+        echo_tcp_poll();
+
         /* Direct RP1 UART0 RX poll */
         if (!(*(volatile u32 *)rp1_fr & (1 << 4))) {  /* RXFE = 0 */
             char c = (char)(*(volatile u32 *)rp1_dr & 0xFF);
@@ -4984,35 +5053,16 @@ void kernel_main(void) {
         bp_done(4, sd_ok);
     }
 
-    /* ── Phase 5: NIC (Cadence MACB/GEM on RP1, with WiFi fallback) ── */
+    /* ── Phase 5: NIC (Cadence MACB/GEM on RP1) ── */
     bp_active(5);
     bp_log("[nic] nic_init (Cadence GEM)...");
     nic_ok = nic_init();
     if (!nic_ok) {
-        bp_warn("[nic] MACB init failed, trying WiFi...");
-        nic_ok = nic_init_wifi();
-        if (!nic_ok) {
-            bp_err("[nic] WiFi init FAILED"); bp_done(5, false);
-        } else {
-            wifi_active = true;
-            bp_ok("[nic] CYW43455 WiFi online");
-            if (nic_link_up()) bp_ok("[nic] WiFi link UP");
-            else bp_warn("[nic] WiFi link DOWN (not associated)");
-            bp_done(5, true);
-        }
+        bp_err("[nic] MACB init FAILED"); bp_done(5, false);
     } else {
         bp_ok("[nic] MACB online");
         if (nic_link_up()) bp_ok("[nic] PHY link UP");
-        else {
-            bp_warn("[nic] PHY link DOWN — trying WiFi...");
-            nic_ok = nic_init_wifi();
-            if (nic_ok) {
-                wifi_active = true;
-                bp_ok("[nic] CYW43455 WiFi online (ETH down)");
-            } else {
-                bp_warn("[nic] WiFi also failed");
-            }
-        }
+        else bp_warn("[nic] PHY link DOWN (use 'wifi init' for wireless)");
         bp_done(5, true);
     }
 
@@ -5025,29 +5075,12 @@ void kernel_main(void) {
     ui_cfg_dns = MY_GW;
     ui_cfg_dhcp = false;
     dns_init(ui_cfg_dns);
+    /* Echo servers */
+    net_udp_subscribe(echo_udp_cb);
+    echo_listen_conn = tcp_listen(ECHO_TCP_PORT);
+    http_listen_conn = tcp_listen(HTTP_TCP_PORT);
+    uart_puts("[net] Echo UDP:7 TCP:7 HTTP:80 active\n");
     bp_ok("[net] IP stack ready");
-
-    /* Auto-connect WiFi if active */
-    if (wifi_active) {
-        bp_log("[wifi] auto-connecting to " WIFI_DEFAULT_SSID "...");
-        u32 ssid_len = 0; { const char *s = WIFI_DEFAULT_SSID; while (s[ssid_len]) ssid_len++; }
-        u32 pass_len = 0; { const char *s = WIFI_DEFAULT_PASS; while (s[pass_len]) pass_len++; }
-        if (cyw43_join(WIFI_DEFAULT_SSID, ssid_len,
-                       WIFI_DEFAULT_PASS, pass_len,
-                       WPA2_AUTH_PSK | WSEC_AES)) {
-            for (u32 i = 0; i < 100; i++) {
-                cyw43_poll();
-                if (cyw43_is_connected()) break;
-                for (volatile u32 d = 0; d < 500000; d++) {}
-            }
-            if (cyw43_is_connected())
-                bp_ok("[wifi] connected to " WIFI_DEFAULT_SSID);
-            else
-                bp_warn("[wifi] join sent, waiting for association");
-        } else {
-            bp_warn("[wifi] auto-connect failed");
-        }
-    }
 
     /* GPU + Tensor */
     bp_log("[gpu] tensor_init...");

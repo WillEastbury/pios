@@ -19,6 +19,7 @@
 
 #include "cyw43.h"
 #include "sdio.h"
+#include "fat32.h"
 #include "uart.h"
 #include "timer.h"
 #include "fb.h"
@@ -707,38 +708,92 @@ bool cyw43_init(void)
 bool cyw43_load_firmware(void)
 {
     /*
-     * Firmware loading from walfs.
-     * The firmware, NVRAM, and CLM blobs must be stored on the SD card
-     * at walfs paths:
-     *   /sys/wifi/firmware.bin
-     *   /sys/wifi/nvram.txt
-     *   /sys/wifi/clm.bin
-     *
-     * For now, we use a minimal stub that verifies the upload path works.
-     * Full firmware loading requires reading from walfs, which uses
-     * the SD card (different controller than SDIO WiFi).
+     * Load firmware, NVRAM, and CLM blobs from the FAT32 boot partition.
+     * Expected files (long filenames supported):
+     *   /firmware.bin     (CYW43455 WiFi firmware)
+     *   /nvram.txt        (board NVRAM configuration)
+     *   /clm.bin          (regulatory/CLM blob)
      */
 
-    /* Placeholder: in production, load from walfs */
-    static const u8 dummy_nvram[] =
-        "boardtype=0x0646\0"
-        "boardrev=0x1101\0"
-        "boardflags=0x00404001\0"
-        "sromrev=11\0"
-        "boardflags3=0x08000188\0"
-        "macaddr=00:11:22:33:44:55\0"
-        "\0";
-
-    u32 nvram_len = sizeof(dummy_nvram);
-
-    /* Skip actual firmware upload in stub mode —
-     * just attempt NVRAM upload to verify backplane access */
-    if (!upload_nvram(dummy_nvram, nvram_len)) {
-        uart_puts("[cyw43] NVRAM upload failed\n");
+    /* Initialize FAT32 if not already done */
+    if (!fat32_init()) {
+        uart_puts("[cyw43] FAT32 init failed — cannot load firmware\n");
         return false;
     }
 
-    uart_puts("[cyw43] firmware load (stub) OK\n");
+    /* Upload firmware binary */
+    {
+        fat32_file_t fw;
+        if (!fat32_open("/firmware.bin", &fw)) {
+            uart_puts("[cyw43] firmware.bin not found on boot partition\n");
+            return false;
+        }
+        uart_puts("[cyw43] loading firmware.bin (");
+        uart_hex(fw.file_size);
+        uart_puts(" bytes)...\n");
+
+        u32 offset = 0;
+        static u8 ALIGNED(64) fw_chunk[FW_UPLOAD_BLKSZ];
+        while (offset < fw.file_size) {
+            u32 chunk = fw.file_size - offset;
+            if (chunk > FW_UPLOAD_BLKSZ) chunk = FW_UPLOAD_BLKSZ;
+            u32 got = fat32_read(&fw, fw_chunk, chunk);
+            if (got == 0) {
+                uart_puts("[cyw43] firmware read error at offset ");
+                uart_hex(offset);
+                uart_puts("\n");
+                fat32_close(&fw);
+                return false;
+            }
+            if (!bp_write_buf(CYW_RAM_BASE + offset, fw_chunk, got)) {
+                uart_puts("[cyw43] firmware write error at offset ");
+                uart_hex(offset);
+                uart_puts("\n");
+                fat32_close(&fw);
+                return false;
+            }
+            offset += got;
+        }
+        fat32_close(&fw);
+        uart_puts("[cyw43] firmware uploaded\n");
+    }
+
+    /* Upload NVRAM */
+    {
+        fat32_file_t nv;
+        if (!fat32_open("/nvram.txt", &nv)) {
+            uart_puts("[cyw43] nvram.txt not found — using minimal defaults\n");
+            static const u8 default_nvram[] =
+                "boardtype=0x0646\0"
+                "boardrev=0x1101\0"
+                "boardflags=0x00404001\0"
+                "sromrev=11\0"
+                "boardflags3=0x08000188\0"
+                "macaddr=00:11:22:33:44:55\0"
+                "\0";
+            if (!upload_nvram(default_nvram, sizeof(default_nvram)))
+                return false;
+        } else {
+            static u8 ALIGNED(4) nvram_data[4096];
+            u32 nvram_len = fat32_read(&nv, nvram_data, sizeof(nvram_data));
+            fat32_close(&nv);
+            uart_puts("[cyw43] nvram loaded (");
+            uart_hex(nvram_len);
+            uart_puts(" bytes)\n");
+            if (!upload_nvram(nvram_data, nvram_len)) {
+                uart_puts("[cyw43] NVRAM upload failed\n");
+                return false;
+            }
+        }
+    }
+
+    /* Reset ARM core to start firmware */
+    if (!core_reset(CYW_ARM_CORE_BASE, 0)) {
+        uart_puts("[cyw43] ARM core reset failed\n");
+        return false;
+    }
+
+    uart_puts("[cyw43] firmware loaded OK\n");
     return true;
 }
 
