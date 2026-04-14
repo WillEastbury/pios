@@ -93,9 +93,9 @@ u32 pios_strlen(const char *s) {
 
 /* ---- Network configuration (static - no ARP/DHCP) ---- */
 
-#define MY_IP       IP4(192, 168, 222, 222)
+#define MY_IP       IP4(192, 168, 0, 101)
 #define MY_GW       IP4(192, 168, 0, 1)
-#define MY_MASK     IP4(255, 255, 0, 0)
+#define MY_MASK     IP4(255, 255, 255, 0)
 
 /* Gateway MAC - MUST be configured (no ARP to discover it) */
 static const u8 MY_GW_MAC[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
