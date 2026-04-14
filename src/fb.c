@@ -283,9 +283,9 @@ static void fb_scroll(void) {
     u32 total_bytes = fb_pitch * fb_height;
     u8 *base = (u8 *)fb_ptr;
 
-    /* Use DMA for the bulk copy (~2.7MB at 1280x720x32bpp) */
-    dma_memcpy(3, base, base + row_bytes, total_bytes - row_bytes);
-    dma_zero(3, base + total_bytes - row_bytes, row_bytes);
+    /* Simple memcpy scroll — DMA scroll can crash when called from hot loop */
+    memcpy(base, base + row_bytes, total_bytes - row_bytes);
+    memset(base + total_bytes - row_bytes, 0, row_bytes);
 }
 
 /* Draw one 8x8 character at text position (cx, cy) */

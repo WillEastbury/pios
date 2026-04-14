@@ -99,9 +99,9 @@ static bool tensor_try_v3d(v3d_kernel_id_t id, u64 work_hint)
      */
     v3d_kernel_disabled[id] = true;
     if (!v3d_kernel_warned[id]) {
-        uart_puts("[tensor] disable V3D kernel: ");
+        uart_puts("[ten] dis V3D: ");
         uart_puts(k->name);
-        uart_puts(" status=");
+        uart_puts(" st=");
         uart_hex((u32)r);
         uart_puts("\n");
         v3d_kernel_warned[id] = true;
@@ -394,7 +394,7 @@ bool tensor_add(tensor_t *c, const tensor_t *a, const tensor_t *b) {
 
         v3d_kernel_disabled[V3D_KERNEL_ADD] = true;
         if (!v3d_kernel_warned[V3D_KERNEL_ADD]) {
-            uart_puts("[tensor] disable V3D add kernel: verification mismatch\n");
+            uart_puts("[ten] dis V3D add: verify fail\n");
             v3d_kernel_warned[V3D_KERNEL_ADD] = true;
         }
     }
@@ -633,12 +633,12 @@ void tensor_init(void) {
     }
     use_qpu_fallback = !v3d_dispatch_supported();
     if (qpu_enable(true)) {
-        uart_puts("[tensor] QPU enabled (12 QPUs)\n");
+        uart_puts("[ten] QPU on (12)\n");
     } else {
-        uart_puts("[tensor] QPU enable failed, using NEON fallback\n");
+        uart_puts("[ten] QPU fail, NEON fallback\n");
         use_qpu_fallback = true;
     }
     if (!tensor_any_bound_v3d_kernel())
         use_qpu_fallback = true;
-    uart_puts("[tensor] NEON float: add/mul/scale/dot/matmul/relu/softmax\n");
+    uart_puts("[ten] NEON: add/mul/scale/dot/mm/relu/sm\n");
 }

@@ -174,7 +174,7 @@ static u32 evt_deq, evt_cycle;
  * first (offset=0) since the firmware may map PCIe 0x00 → AXI 0x00.
  * If that fails, try 0x10_00000000 offset per rp1.dtsi dma-ranges.
  */
-#define RP1_DMA_OFFSET  0x0ULL
+#define RP1_DMA_OFFSET  0x1000000000ULL  /* BAR2 at PCIe 0x10 after full reset */
 static inline u64 dma_addr(const void *p) { return (u64)(usize)p + RP1_DMA_OFFSET; }
 
 /* DCI → ep_rings index. 0xFF = unmapped. DCI 1 = EP0 always ring 0. */
@@ -260,7 +260,7 @@ static bool cmd_submit(u64 param, u32 status, u32 control, struct xhci_trb *evt)
      * (e.g. Port Status Change events from recent port resets) */
     for (u32 attempts = 0; attempts < 10; attempts++) {
         if (!evt_poll(evt, 500)) {
-            uart_puts("[xhci] Cmd timeout after ");
+            uart_puts("[xhc] cmd timeout after ");
             uart_hex(attempts);
             uart_puts(" events\n");
             return false;
@@ -268,7 +268,7 @@ static bool cmd_submit(u64 param, u32 status, u32 control, struct xhci_trb *evt)
         u32 evt_type = TRB_GET_TYPE(evt->control);
         u32 cc = TRB_COMP_CODE(evt->status);
 
-        uart_puts("[xhci] Event: type=");
+        uart_puts("[xhc] evt: t=");
         uart_hex(evt_type);
         uart_puts(" cc=");
         uart_hex(cc);
@@ -280,9 +280,9 @@ static bool cmd_submit(u64 param, u32 status, u32 control, struct xhci_trb *evt)
             return (cc == CC_SUCCESS);
         }
         /* Not our event — skip and try again */
-        uart_puts("[xhci] Skipping non-command event, retrying...\n");
+        uart_puts("[xhc] skip non-cmd evt\n");
     }
-    uart_puts("[xhci] Too many non-command events\n");
+    uart_puts("[xhc] too many non-cmd evts\n");
     return false;
 }
 
@@ -290,18 +290,18 @@ static bool cmd_submit(u64 param, u32 status, u32 control, struct xhci_trb *evt)
 
 static bool dwc3_init(u64 base) {
     u32 snpsid = mmio_read(base + DWC3_GSNPSID);
-    uart_puts("[xhci] DWC3 GSNPSID=");
+    uart_puts("[xhc] DWC3 SNPSID=");
     uart_hex(snpsid);
     uart_puts("\n");
 
     if (snpsid == 0 || snpsid == 0xFFFFFFFF) {
-        uart_puts("[xhci] DWC3 not responding\n");
+        uart_puts("[xhc] DWC3 no resp\n");
         return false;
     }
 
     /* Core soft reset */
     u32 gctl = mmio_read(base + DWC3_GCTL);
-    uart_puts("[xhci] DWC3 GCTL before=");
+    uart_puts("[xhc] GCTL pre=");
     uart_hex(gctl);
     uart_puts("\n");
     gctl |= GCTL_CORESOFTRESET;
@@ -322,7 +322,7 @@ static bool dwc3_init(u64 base) {
     mmio_write(base + DWC3_GCTL, gctl);
     timer_delay_ms(10);
 
-    uart_puts("[xhci] DWC3 GCTL after=");
+    uart_puts("[xhc] GCTL post=");
     uart_hex(mmio_read(base + DWC3_GCTL));
     uart_puts("\n");
     return true;
@@ -331,10 +331,10 @@ static bool dwc3_init(u64 base) {
 /* ---- Public: Init ---- */
 
 bool xhci_init(void) {
-    uart_puts("[xhci] Init USB0 (DWC3)...\n");
+    uart_puts("[xhc] init USB0...\n");
 
     /* Enable USB VBUS power via GPIO 38 */
-    uart_puts("[xhci] Enabling VBUS (GPIO38)...\n");
+    uart_puts("[xhc] VBUS on...\n");
     rp1_gpio_set_function(USB_VBUS_GPIO, 5);
     rp1_gpio_set_dir_output(USB_VBUS_GPIO);
     rp1_gpio_write(USB_VBUS_GPIO, true);
@@ -357,13 +357,13 @@ bool xhci_init(void) {
     rt_base = xhci_base + xr(CAP_RTSOFF);
     db_base = xhci_base + xr(CAP_DBOFF);
 
-    uart_puts("[xhci] CapLen=");
+    uart_puts("[xhc] cap=");
     uart_hex(caplength);
-    uart_puts(" Ports=");
+    uart_puts(" ports=");
     uart_hex(hci_max_ports);
-    uart_puts(" Slots=");
+    uart_puts(" slots=");
     uart_hex(hci_max_slots);
-    uart_puts(" CtxSize=");
+    uart_puts(" ctx=");
     uart_hex(ctx_size);
     uart_puts("\n");
 
@@ -373,7 +373,7 @@ bool xhci_init(void) {
         if (opr(OP_USBSTS) & STS_HCH) break;
         timer_delay_us(100);
     }
-    uart_puts("[xhci] Halted STS=");
+    uart_puts("[xhc] halted STS=");
     uart_hex(opr(OP_USBSTS));
     uart_puts("\n");
 
@@ -384,14 +384,14 @@ bool xhci_init(void) {
         timer_delay_us(100);
     }
     if (opr(OP_USBCMD) & CMD_HCRST) {
-        uart_puts("[xhci] Reset timeout CMD=");
+        uart_puts("[xhc] rst timeout CMD=");
         uart_hex(opr(OP_USBCMD));
-        uart_puts(" STS=");
+        uart_puts(" S=");
         uart_hex(opr(OP_USBSTS));
         uart_puts("\n");
         return false;
     }
-    uart_puts("[xhci] Reset OK\n");
+    uart_puts("[xhc] rst OK\n");
 
     opw(OP_CONFIG, 1); /* MaxSlotsEn = 1 */
 
@@ -453,15 +453,14 @@ bool xhci_init(void) {
     opw(OP_USBCMD, CMD_RUN | CMD_INTE);
     timer_delay_ms(10);
     if (opr(OP_USBSTS) & STS_HCH) {
-        uart_puts("[xhci] Failed to start\n");
+        uart_puts("[xhc] start fail\n");
         return false;
     }
 
-    uart_puts("[xhci] Controller running");
-    /* Dump PCIe inbound BAR config (set by firmware) */
-    uart_puts(" BAR2_LO=");
+    uart_puts("[xhc] running");
+    uart_puts(" B2L=");
     uart_hex(mmio_read(PCIE_RC_BASE + 0x4034));
-    uart_puts(" BAR2_HI=");
+    uart_puts(" B2H=");
     uart_hex(mmio_read(PCIE_RC_BASE + 0x4038));
     uart_puts(" IMAN=");
     uart_hex(mmio_read(rt_base + IR0_IMAN));

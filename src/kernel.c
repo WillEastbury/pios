@@ -59,6 +59,9 @@
 #include "el2.h"
 #include "crypto.h"
 #include "watchdog.h"
+#include "cyw43.h"
+#include "sdio.h"
+#include "fat32.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -93,12 +96,77 @@ u32 pios_strlen(const char *s) {
 
 /* ---- Network configuration (static - no ARP/DHCP) ---- */
 
-#define MY_IP       IP4(192, 168, 222, 222)
+#define MY_IP       IP4(192, 168, 0, 101)
 #define MY_GW       IP4(192, 168, 0, 1)
-#define MY_MASK     IP4(255, 255, 0, 0)
+#define MY_MASK     IP4(255, 255, 255, 0)
 
 /* Gateway MAC - MUST be configured (no ARP to discover it) */
 static const u8 MY_GW_MAC[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+/* ---- Echo servers ---- */
+#define ECHO_UDP_PORT  7
+#define ECHO_TCP_PORT  7
+#define HTTP_TCP_PORT  80
+
+static tcp_conn_t echo_listen_conn = -1;
+static tcp_conn_t echo_client_conn = -1;
+static tcp_conn_t http_listen_conn = -1;
+static tcp_conn_t http_client_conn = -1;
+
+/* UDP echo: reflect any packet back to sender */
+static void echo_udp_cb(u32 src_ip, u16 src_port, u16 dst_port,
+                         const u8 *data, u16 len) {
+    if (dst_port == ECHO_UDP_PORT) {
+        net_send_udp(src_ip, ECHO_UDP_PORT, src_port, data, len);
+    }
+}
+
+/* TCP echo + HTTP poll — called from core0 main loop */
+static void echo_tcp_poll(void) {
+    /* TCP echo server on port 7 */
+    if (echo_client_conn < 0 && echo_listen_conn >= 0) {
+        echo_client_conn = tcp_accept(echo_listen_conn);
+    }
+    if (echo_client_conn >= 0) {
+        u32 st = tcp_state(echo_client_conn);
+        if (st == 4 /* ESTABLISHED */) {
+            static u8 echo_buf[1024];
+            u32 n = tcp_read(echo_client_conn, echo_buf, sizeof(echo_buf));
+            if (n > 0)
+                tcp_write(echo_client_conn, echo_buf, n);
+        } else if (st == 0 || st >= 8 /* CLOSED or closing */) {
+            tcp_close(echo_client_conn);
+            echo_client_conn = -1;
+        }
+    }
+
+    /* HTTP server on port 80 — returns simple status page */
+    if (http_client_conn < 0 && http_listen_conn >= 0) {
+        http_client_conn = tcp_accept(http_listen_conn);
+    }
+    if (http_client_conn >= 0) {
+        u32 st = tcp_state(http_client_conn);
+        if (st == 4 /* ESTABLISHED */) {
+            static u8 http_buf[512];
+            u32 n = tcp_read(http_client_conn, http_buf, sizeof(http_buf));
+            if (n > 0) {
+                static const char http_resp[] =
+                    "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Connection: close\r\n\r\n"
+                    "PIOS bare-metal Pi 5\n"
+                    "Ethernet: 1000Mbps FD\n"
+                    "Status: operational\n";
+                tcp_write(http_client_conn, http_resp, pios_strlen(http_resp));
+                tcp_close(http_client_conn);
+                http_client_conn = -1;
+            }
+        } else if (st == 0 || st >= 8) {
+            tcp_close(http_client_conn);
+            http_client_conn = -1;
+        }
+    }
+}
 
 #define UI_MODE_NONE          0
 #define UI_MODE_PROC_VIEW     1
@@ -137,6 +205,7 @@ static const char *ui_proc_state_str(u32 s);
 static void ui_dump_sector(u32 lba);
 static void ui_cmd_fsinspect(const char *path);
 static void ui_cmd_netcfg(u32 argc, char **argv);
+static void ui_cmd_wifi(u32 argc, char **argv);
 static void ui_cmd_disk(u32 argc, char **argv);
 static void ui_cmd_db(u32 argc, char **argv);
 static void ui_cmd_lsdir(const char *path);
@@ -342,7 +411,7 @@ static void boot_measurements(u32 *el1_hash, u32 *el2_hash, u64 *el1_start, u32 
     u64 el2_s = (u64)(usize)&__el2_integrity_start;
     u64 el2_e = (u64)(usize)&__el2_integrity_end;
     if (el1_e <= el1_s) {
-        uart_puts("[boot] WARNING: EL1 text section empty/invalid, skipping measurements\n");
+        uart_puts("[bt] EL1 text empty, skip\n");
         if (el1_hash) *el1_hash = 0;
         if (el2_hash) *el2_hash = 0;
         if (el1_start) *el1_start = 0;
@@ -353,7 +422,7 @@ static void boot_measurements(u32 *el1_hash, u32 *el2_hash, u64 *el1_start, u32 
     if (el2_s < el2_e) {
         if (el2_hash) *el2_hash = hw_crc32c((const void *)(usize)el2_s, (u32)(el2_e - el2_s));
     } else {
-        uart_puts("[boot] EL2 integrity section empty, skipping EL2 hash\n");
+        uart_puts("[bt] EL2 integ empty, skip\n");
         if (el2_hash) *el2_hash = 0;
     }
     if (el1_start) *el1_start = el1_s;
@@ -422,7 +491,7 @@ static u32 bp_log_y;  /* next row for boot log messages */
 static void bp_uart_phase(u32 phase, const char *state)
 {
     if (phase >= BP_COUNT) return;
-    uart_puts("[boot] ");
+    uart_puts("[bt] ");
     uart_puts(bp_names[phase]);
     uart_puts(" ");
     uart_puts(state);
@@ -464,7 +533,7 @@ static void bp_init(void) {
     fb_puts("---------------------------------------------");
     bp_log_y = BP_LIST_ROW + BP_COUNT + 2;
 
-    uart_puts("\n[boot] PIOS v0.3 Boot Sequence\n");
+    uart_puts("\n[bt] PIOS v0.3 Boot\n");
     for (u32 i = 0; i < BP_COUNT; i++)
         bp_uart_phase(i, "pending");
 }
@@ -691,7 +760,7 @@ static void boot_policy_verify_or_seed(void)
     } else {
         if (rec.magic != BOOT_POLICY_MAGIC || !boot_policy_mac_ok(&rec)) {
             /* Corrupted policy record — re-seed */
-            uart_puts("[boot] Policy record corrupt, re-seeding\n");
+            uart_puts("[bt] policy corrupt, reseed\n");
             rec.magic = BOOT_POLICY_MAGIC;
             rec.version = BOOT_POLICY_VERSION;
             rec.el1_hash = cur_el1;
@@ -701,7 +770,7 @@ static void boot_policy_verify_or_seed(void)
                 exception_pisod("Boot policy reseed failed", 5, 0x38, 0, 0, 0);
         } else if (rec.el1_hash != cur_el1 || rec.el2_hash != cur_el2) {
             /* Kernel changed — re-seed during development */
-            uart_puts("[boot] Kernel hash changed, updating policy\n");
+            uart_puts("[bt] hash changed, update policy\n");
             rec.el1_hash = cur_el1;
             rec.el2_hash = cur_el2;
             rec.version++;
@@ -1165,6 +1234,126 @@ static void ui_cmd_fsinspect(const char *path)
         uart_hex(fs_ctx.count);
         uart_puts("\n");
     }
+}
+
+/* ── WiFi defaults ── */
+#define WIFI_DEFAULT_SSID       "Bussy_5G"
+#define WIFI_DEFAULT_PASS       "Whatever1"
+
+static bool wifi_active;
+
+static void ui_cmd_wifi(u32 argc, char **argv)
+{
+    if (argc < 2) {
+        ui_console_write("usage: wifi <init|scan|connect|status|disconnect>\n");
+        ui_console_write("  wifi init              - power on CYW43455\n");
+        ui_console_write("  wifi scan              - scan for networks\n");
+        ui_console_write("  wifi connect [ssid] [pass] - join network\n");
+        ui_console_write("  wifi status            - show link state\n");
+        ui_console_write("  wifi disconnect        - leave network\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "init")) {
+        ui_console_write("WiFi: initializing CYW43455...\n");
+        if (!nic_init_wifi()) {
+            ui_console_write("ERR: WiFi init failed\n");
+            return;
+        }
+        wifi_active = true;
+        ui_console_write("OK: CYW43455 ready\n");
+        return;
+    }
+
+    if (!wifi_active) {
+        ui_console_write("ERR: run 'wifi init' first\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "scan")) {
+        ui_console_write("WiFi: scanning...\n");
+        if (!cyw43_scan_start()) {
+            ui_console_write("ERR: scan start failed\n");
+            return;
+        }
+        /* Poll for a few seconds to collect results */
+        for (u32 i = 0; i < 50; i++) {
+            cyw43_poll();
+            for (volatile u32 d = 0; d < 500000; d++) {}
+        }
+        struct cyw_scan_result results[CYW_MAX_SCAN_RESULTS];
+        u32 count = CYW_MAX_SCAN_RESULTS;
+        cyw43_scan_get_results(results, &count);
+        fb_printf("Found %d networks:\n", count);
+        for (u32 i = 0; i < count; i++) {
+            fb_printf("  %d: ", i);
+            for (u32 j = 0; j < results[i].ssid_len; j++)
+                fb_printf("%c", results[i].ssid[j]);
+            fb_printf(" (ch%d rssi=%d)\n", results[i].channel, results[i].rssi);
+        }
+        return;
+    }
+
+    if (ui_streq(argv[1], "connect")) {
+        const char *ssid = WIFI_DEFAULT_SSID;
+        const char *pass = WIFI_DEFAULT_PASS;
+        u32 ssid_len, pass_len;
+
+        if (argc >= 4) {
+            ssid = argv[2];
+            pass = argv[3];
+        } else if (argc >= 3) {
+            ssid = argv[2];
+        }
+
+        ssid_len = 0; while (ssid[ssid_len]) ssid_len++;
+        pass_len = 0; while (pass[pass_len]) pass_len++;
+
+        fb_printf("WiFi: connecting to '%s'...\n", ssid);
+        if (!cyw43_join(ssid, ssid_len, pass, pass_len, WPA2_AUTH_PSK | WSEC_AES)) {
+            ui_console_write("ERR: join failed\n");
+            return;
+        }
+        /* Poll for association */
+        for (u32 i = 0; i < 100; i++) {
+            cyw43_poll();
+            if (cyw43_is_connected()) break;
+            for (volatile u32 d = 0; d < 500000; d++) {}
+        }
+        if (cyw43_is_connected()) {
+            ui_console_write("OK: connected!\n");
+            net_init(MY_IP, MY_GW, MY_MASK, NULL);
+            ui_cfg_dhcp = false;
+        } else {
+            ui_console_write("WARN: join sent, not yet associated\n");
+        }
+        return;
+    }
+
+    if (ui_streq(argv[1], "status")) {
+        u32 state = cyw43_link_state();
+        fb_printf("WiFi: link=%s",
+            state == CYW_LINK_UP ? "UP" :
+            state == CYW_LINK_JOINING ? "JOINING" :
+            state == CYW_LINK_AUTH_FAIL ? "AUTH_FAIL" : "DOWN");
+        if (state == CYW_LINK_UP) {
+            i32 rssi = cyw43_get_rssi();
+            fb_printf(" rssi=%d", rssi);
+        }
+        u8 mac[6];
+        cyw43_get_mac(mac);
+        fb_printf(" mac=%x:%x:%x:%x:%x:%x\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        return;
+    }
+
+    if (ui_streq(argv[1], "disconnect")) {
+        cyw43_disconnect();
+        ui_console_write("OK: disconnected\n");
+        return;
+    }
+
+    ui_console_write("ERR: unknown wifi subcommand\n");
 }
 
 static void ui_cmd_netcfg(u32 argc, char **argv)
@@ -3737,9 +3926,10 @@ static void ui_console_exec(char *line)
         ui_console_write("help echo clear time ps kill launch run pwd cd lsdir mkdir touch\n");
         ui_console_write("copy cp cpdir mv cat stat rm find hexdump df mount umount\n");
         ui_console_write("stream if for foreach source env batch svc update watchdog edit\n");
-        ui_console_write("hexsec fsinspect netcfg disk db capsule obs\n");
+        ui_console_write("hexsec fsinspect netcfg wifi disk db capsule obs\n");
         ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d> | netcfg apply\n");
         ui_console_write("netcfg dhcp <on|off> [timeout_ms] | netcfg addnbr <ip> <mac>\n");
+        ui_console_write("wifi init|scan|connect [ssid] [pass]|status|disconnect\n");
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
         ui_console_write("batch add|at|every supports [core] [priority] [principal] [retries]\n");
         ui_console_write("batch run [parallel] | batch stop | batch status | batch list\n");
@@ -3990,6 +4180,8 @@ static void ui_console_exec(char *line)
         ui_cmd_batch(argc, argv);
     } else if (ui_streq(argv[0], "svc")) {
         ui_cmd_svc(argc, argv);
+    } else if (ui_streq(argv[0], "wifi")) {
+        ui_cmd_wifi(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "disk")) {
@@ -4261,6 +4453,9 @@ NORETURN void core0_main(void) {
         /* Network poll — process incoming packets */
         net_poll();
 
+        /* Service TCP echo + HTTP servers */
+        echo_tcp_poll();
+
         /* Direct RP1 UART0 RX poll */
         if (!(*(volatile u32 *)rp1_fr & (1 << 4))) {  /* RXFE = 0 */
             char c = (char)(*(volatile u32 *)rp1_dr & 0xFF);
@@ -4525,8 +4720,8 @@ static void reg_panel(u32 at_el1) {
     u32 row = 1;
     u64 val;
 
-    uart_puts("[regs] CPU Registers\n");
-    uart_puts("[regs] EL=");
+    uart_puts("[reg] CPU Regs\n");
+    uart_puts("[reg] EL=");
     uart_hex(at_el1 ? 1 : 2);
     uart_puts(at_el1 ? " (kernel)\n" : " (hypervisor)\n");
 
@@ -4547,9 +4742,9 @@ static void reg_panel(u32 at_el1) {
     fb_printf("PC     %X", val);
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts(" Program ctr");
-    uart_puts("[regs] PC=");
+    uart_puts("[reg] PC=");
     uart_hex(val);
-    uart_puts(" Program ctr\n");
+    uart_puts("\n");
 
     /* SP */
     __asm__ volatile("mov %0, sp" : "=r"(val));
@@ -4558,9 +4753,9 @@ static void reg_panel(u32 at_el1) {
     fb_printf("SP     %X", val);
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts(" Stack ptr");
-    uart_puts("[regs] SP=");
+    uart_puts("[reg] SP=");
     uart_hex(val);
-    uart_puts(" Stack ptr\n");
+    uart_puts("\n");
 
     /* MPIDR */
     __asm__ volatile("mrs %0, MPIDR_EL1" : "=r"(val));
@@ -4571,11 +4766,11 @@ static void reg_panel(u32 at_el1) {
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_printf(" Core %u / Cluster %u",
         (u32)(val & 0xFF), (u32)((val >> 8) & 0xFF));
-    uart_puts("[regs] MPIDR=");
+    uart_puts("[reg] MPIDR=");
     uart_hex(val);
-    uart_puts(" Core=");
+    uart_puts(" c=");
     uart_hex((u32)(val & 0xFF));
-    uart_puts(" Cluster=");
+    uart_puts(" cl=");
     uart_hex((u32)((val >> 8) & 0xFF));
     uart_puts("\n");
 
@@ -4589,7 +4784,7 @@ static void reg_panel(u32 at_el1) {
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_printf(" MMU=%u DC=%u IC=%u",
             (u32)(val & 1), (u32)((val >> 2) & 1), (u32)((val >> 12) & 1));
-        uart_puts("[regs] SCTLR_EL1=");
+        uart_puts("[reg] SCTLR1=");
         uart_hex(val);
         uart_puts(" MMU=");
         uart_hex((u32)(val & 1));
@@ -4606,7 +4801,7 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_printf(" NEON=%s", ((val >> 20) & 3) == 3 ? "enabled" : "TRAPPED");
-        uart_puts("[regs] CPACR_EL1=");
+        uart_puts("[reg] CPACR1=");
         uart_hex(val);
         uart_puts(" NEON=");
         uart_puts(((val >> 20) & 3) == 3 ? "enabled\n" : "TRAPPED\n");
@@ -4618,9 +4813,9 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_puts(val ? " Page table base" : " (none)");
-        uart_puts("[regs] TTBR0_EL1=");
+        uart_puts("[reg] TTBR0=");
         uart_hex(val);
-        uart_puts(val ? " Page table base\n" : " (none)\n");
+        uart_puts(val ? " pgtbl\n" : " none\n");
 
         __asm__ volatile("mrs %0, VBAR_EL1" : "=r"(val));
         fb_set_cursor(col, row++);
@@ -4629,9 +4824,9 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_puts(val ? " Exception vectors" : " (none!)");
-        uart_puts("[regs] VBAR_EL1=");
+        uart_puts("[reg] VBAR1=");
         uart_hex(val);
-        uart_puts(val ? " Exception vectors\n" : " (none!)\n");
+        uart_puts(val ? " vec\n" : " none!\n");
     } else {
         /* ── EL2 registers ── */
         __asm__ volatile("mrs %0, SCTLR_EL2" : "=r"(val));
@@ -4642,7 +4837,7 @@ static void reg_panel(u32 at_el1) {
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_printf(" MMU=%u DC=%u IC=%u",
             (u32)(val & 1), (u32)((val >> 2) & 1), (u32)((val >> 12) & 1));
-        uart_puts("[regs] SCTLR_EL2=");
+        uart_puts("[reg] SCTLR2=");
         uart_hex(val);
         uart_puts(" MMU=");
         uart_hex((u32)(val & 1));
@@ -4659,7 +4854,7 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_printf(" RW=%u VM=%u", (u32)((val >> 31) & 1), (u32)(val & 1));
-        uart_puts("[regs] HCR_EL2=");
+        uart_puts("[reg] HCR2=");
         uart_hex(val);
         uart_puts(" RW=");
         uart_hex((u32)((val >> 31) & 1));
@@ -4674,7 +4869,7 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_printf(" NEON=%s", ((val >> 10) & 1) ? "TRAPPED" : "enabled");
-        uart_puts("[regs] CPTR_EL2=");
+        uart_puts("[reg] CPTR2=");
         uart_hex(val);
         uart_puts(" NEON=");
         uart_puts(((val >> 10) & 1) ? "TRAPPED\n" : "enabled\n");
@@ -4686,15 +4881,15 @@ static void reg_panel(u32 at_el1) {
         fb_set_cursor(col, row++);
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_puts(val ? " EL2 vectors" : " (none)");
-        uart_puts("[regs] VBAR_EL2=");
+        uart_puts("[reg] VBAR2=");
         uart_hex(val);
-        uart_puts(val ? " EL2 vectors\n" : " (none)\n");
+        uart_puts(val ? " EL2 vec\n" : " none\n");
     }
 
     fb_set_cursor(col, row++);
     fb_set_color(0x00444444, 0x00000000);
     fb_puts("---------------------");
-    uart_puts("[regs] ---------------------\n");
+    uart_puts("[reg] ---\n");
 }
 
 void kernel_main(void) {
@@ -4848,7 +5043,7 @@ void kernel_main(void) {
             /* Skip boot integrity arming during development —
              * the EL2 HVC call fails when kernel image changes
              * because the stored hash no longer matches. */
-            uart_puts("[boot] Skipping EL2 boot integrity arm (dev mode)\n");
+            uart_puts("[bt] skip EL2 integ arm (dev)\n");
             bp_warn("[walfs] integrity check skipped (dev)");
         } else {
             bp_err("[walfs] WALFS init FAILED");
@@ -4867,7 +5062,7 @@ void kernel_main(void) {
     } else {
         bp_ok("[nic] MACB online");
         if (nic_link_up()) bp_ok("[nic] PHY link UP");
-        else bp_warn("[nic] PHY link DOWN");
+        else bp_warn("[nic] PHY link DOWN (use 'wifi init' for wireless)");
         bp_done(5, true);
     }
 
@@ -4880,6 +5075,11 @@ void kernel_main(void) {
     ui_cfg_dns = MY_GW;
     ui_cfg_dhcp = false;
     dns_init(ui_cfg_dns);
+    /* Echo servers */
+    net_udp_subscribe(echo_udp_cb);
+    echo_listen_conn = tcp_listen(ECHO_TCP_PORT);
+    http_listen_conn = tcp_listen(HTTP_TCP_PORT);
+    uart_puts("[net] echo UDP:7 TCP:7 HTTP:80\n");
     bp_ok("[net] IP stack ready");
 
     /* GPU + Tensor */

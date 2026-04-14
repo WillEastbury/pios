@@ -96,7 +96,45 @@ static inline u32  pr(u32 off)          { return mmio_read(PCIE_RC_BASE + off); 
 
 /* ---- Internal helpers ---- */
 
-/* PERST# control — active low, so clear bit to assert, set to deassert */
+/* RESCAL (PCIe resistor calibration) — BCM2712 SoC register */
+#define RESCAL_BASE             0x1000119500UL
+#define RESCAL_START            0x00
+#define RESCAL_STATUS           0x08
+#define RESCAL_START_BIT        (1U << 0)
+#define RESCAL_STATUS_BIT       (1U << 0)
+
+/* BCM2712 reset controller for bridge reset */
+#define BCM_RESET_BASE          0x1001504318UL
+#define SW_INIT_SET             0x00
+#define SW_INIT_CLEAR           0x04
+#define SW_INIT_STATUS          0x08
+#define SW_INIT_BANK_SIZE       0x18
+
+static void rescal_deassert(void) {
+    u32 reg = mmio_read(RESCAL_BASE + RESCAL_START);
+    mmio_write(RESCAL_BASE + RESCAL_START, reg | RESCAL_START_BIT);
+    delay_cycles(100000);
+    /* Wait for calibration complete */
+    for (u32 i = 0; i < 10000; i++) {
+        if (mmio_read(RESCAL_BASE + RESCAL_STATUS) & RESCAL_STATUS_BIT)
+            break;
+        delay_cycles(10000);
+    }
+    reg = mmio_read(RESCAL_BASE + RESCAL_START);
+    mmio_write(RESCAL_BASE + RESCAL_START, reg & ~RESCAL_START_BIT);
+}
+
+/* BCM7712-style bridge reset via reset controller (not RGR1) */
+static void bridge_reset_brcm(bool assert) {
+    /* Reset ID 44 for pcie2 (RP1 bridge) */
+    u32 bit = 1U << (44 & 0x1F);
+    u32 bank_off = (44 >> 5) * SW_INIT_BANK_SIZE;
+    if (assert)
+        mmio_write(BCM_RESET_BASE + bank_off + SW_INIT_SET, bit);
+    else
+        mmio_write(BCM_RESET_BASE + bank_off + SW_INIT_CLEAR, bit);
+    delay_cycles(100000);
+}
 static void perst_set(bool assert) {
     u32 tmp = pr(MISC_PCIE_CTRL);
     if (assert)
@@ -178,53 +216,131 @@ void pcie_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val) {
 
 bool pcie_init(void) {
     u32 tmp;
+    u32 i;
 
-    /* ── Don't reset the bridge! ──
-     * Firmware (start4.elf) already configured:
-     * - BAR2 inbound DMA window (covers both 0x00 and 0x10 PCIe ranges)
-     * - UBUS remap for RP1→host RAM translation
-     * - SCB_SIZE, burst, endian mode
-     * - Link training completed
-     * Resetting would wipe all of this and we can't properly recreate
-     * the dual-path config (xHCI at 0x00, MACB at 0x10 via RP1 EP).
-     */
+    /* ══════════════════════════════════════════════════════════════════
+     * Full RC init — Circle/Linux sequence for BCM2712 Pi 5.
+     * Includes rescal (missing from all previous attempts).
+     * ══════════════════════════════════════════════════════════════════ */
 
+    /* 0. RESCAL — PCIe SerDes resistor calibration (CRITICAL) */
+    rescal_deassert();
+
+    /* 1. Assert bridge reset (BCM7712 reset controller, ID 44) */
+    bridge_reset_brcm(true);
+    delay_cycles(100000);
+
+    /* 2. Deassert bridge reset */
+    bridge_reset_brcm(false);
+
+    /* 3. Power up SerDes */
+    tmp = pr(HARD_DEBUG);
+    tmp &= ~SERDES_IDDQ;
+    pw(HARD_DEBUG, tmp);
+    delay_cycles(200000);
+
+    /* 4. MISC_CTRL */
+    tmp = pr(MISC_MISC_CTRL);
+    tmp |= MCTRL_SCB_ACCESS_EN;
+    tmp |= MCTRL_CFG_READ_UR;
+    tmp &= ~MCTRL_MAX_BURST_MASK;
+    tmp |= (1U << 20);  /* BURST_SIZE_256 */
+    tmp |= MCTRL_RCB_MPS;
+    tmp |= MCTRL_RCB_64B;
+    pw(MISC_MISC_CTRL, tmp);
+    dmb();
+
+    /* 5. BAR2 inbound: 64GB at PCIe 0x10 → CPU 0x00 */
+    pw(MISC_RC_BAR2_CONFIG_LO, 0x15);  /* size=21, offset_lo=0 */
+    pw(MISC_RC_BAR2_CONFIG_HI, 0x10);
+    dmb();
+
+    /* 6. UBUS BAR2 remap */
+    tmp = pr(MISC_UBUS_BAR2_CONFIG_REMAP);
+    tmp |= 1;  /* ACCESS_ENABLE */
+    pw(MISC_UBUS_BAR2_CONFIG_REMAP, tmp);
+    pw(MISC_UBUS_BAR2_CONFIG_REMAP_HI, 0x00);
+    dmb();
+
+    /* 7. SCB0_SIZE = 21 */
+    tmp = pr(MISC_MISC_CTRL);
+    tmp &= ~(0x1FU << 27);
+    tmp |= (21U << 27);
+    pw(MISC_MISC_CTRL, tmp);
+    dmb();
+
+    /* 8. UBUS error suppression + timeouts */
+    tmp = pr(MISC_UBUS_CTRL);
+    tmp |= UBUS_REPLY_ERR_DIS | UBUS_REPLY_DECERR_DIS;
+    pw(MISC_UBUS_CTRL, tmp);
+    pw(MISC_AXI_READ_ERROR_DATA, 0xFFFFFFFF);
+    pw(MISC_UBUS_TIMEOUT, 0x0B2D0000);
+    pw(MISC_RC_CFG_RETRY_TIMEOUT, 0x0ABA0000);
+
+    /* 9. Disable BAR1, BAR3 */
+    pw(0x402C, 0);
+    pw(MISC_RC_BAR3_CONFIG_LO, 0);
+
+    /* 10. Class code */
+    tmp = pr(RC_CFG_PRIV1_ID_VAL3);
+    tmp &= ~0xFFFFFF;
+    tmp |= 0x060400;
+    pw(RC_CFG_PRIV1_ID_VAL3, tmp);
+
+    /* 11. Outbound ATU */
+    set_outbound_win(PCIE_CPU_WIN_BASE, PCIE_TARGET_ADDR, PCIE_CPU_WIN_SIZE);
+
+    /* 12. Endian: little */
+    tmp = pr(RC_CFG_VENDOR_SPECIFIC_REG1);
+    tmp &= ~VENDOR_SPECIFIC_REG1_ENDIAN_MODE_BAR2_MASK;
+    pw(RC_CFG_VENDOR_SPECIFIC_REG1, tmp);
+    dmb();
+
+    /* 13. PERST# deassert → link training */
+    perst_set(false);
+    delay_cycles(100000000);  /* ~200ms */
+
+    /* 14. Wait for link */
+    for (i = 0; i < 200; i++) {
+        if (pcie_link_up()) break;
+        delay_cycles(5000000);
+    }
     if (!pcie_link_up()) {
-        uart_puts("[pcie] Link not up at entry, firmware may not have initialized\n");
         return false;
     }
 
-    /* Just set up our outbound ATU window for RP1 MMIO access */
-    set_outbound_win(PCIE_CPU_WIN_BASE, PCIE_TARGET_ADDR, PCIE_CPU_WIN_SIZE);
+    /* 15. Bus numbers */
+    pw(PCI_REG_BUS_NUM, 0x00010100);
+    dmb();
 
-    /* Enable memory + bus master on the bridge */
+    /* 16. Bridge command */
     tmp = pr(PCI_REG_CMD);
     tmp |= PCI_CMD_MEM | PCI_CMD_MASTER;
     pw(PCI_REG_CMD, tmp);
     dmb();
 
     /* ── Verbose PCIe register dump for DMA debugging ── */
-    uart_puts("[pcie] === PCIe RC Register Dump ===\n");
-    uart_puts("[pcie] MISC_CTRL="); uart_hex(pr(MISC_MISC_CTRL)); uart_puts("\n");
-    uart_puts("[pcie] BAR2_LO="); uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
-    uart_puts(" BAR2_HI="); uart_hex(pr(MISC_RC_BAR2_CONFIG_HI)); uart_puts("\n");
-    uart_puts("[pcie] UBUS_BAR2_REMAP="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP));
-    uart_puts(" REMAP_HI="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP_HI)); uart_puts("\n");
-    uart_puts("[pcie] VENDOR_REG1="); uart_hex(pr(RC_CFG_VENDOR_SPECIFIC_REG1)); uart_puts("\n");
-    uart_puts("[pcie] UBUS_CTRL="); uart_hex(pr(MISC_UBUS_CTRL)); uart_puts("\n");
-    uart_puts("[pcie] STATUS="); uart_hex(pr(MISC_PCIE_STATUS)); uart_puts("\n");
-    uart_puts("[pcie] RC_CMD="); uart_hex(pr(PCI_REG_CMD)); uart_puts("\n");
-    uart_puts("[pcie] HARD_DEBUG="); uart_hex(pr(HARD_DEBUG)); uart_puts("\n");
-    uart_puts("[pcie] OB_WIN0_LO="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_LO));
-    uart_puts(" HI="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_HI)); uart_puts("\n");
-    uart_puts("[pcie] OB_WIN0_BL="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_BL)); uart_puts("\n");
-    uart_puts("[pcie] OB_WIN0_BH="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_BH));
+    uart_puts("[pci] RC regs:\n");
+    uart_puts("[pci] MCTRL="); uart_hex(pr(MISC_MISC_CTRL)); uart_puts("\n");
+    uart_puts("[pci] B2L="); uart_hex(pr(MISC_RC_BAR2_CONFIG_LO));
+    uart_puts(" B2H="); uart_hex(pr(MISC_RC_BAR2_CONFIG_HI)); uart_puts("\n");
+    uart_puts("[pci] UBRM="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP));
+    uart_puts(" RMH="); uart_hex(pr(MISC_UBUS_BAR2_CONFIG_REMAP_HI)); uart_puts("\n");
+    uart_puts("[pci] VREG="); uart_hex(pr(RC_CFG_VENDOR_SPECIFIC_REG1)); uart_puts("\n");
+    uart_puts("[pci] UBUS="); uart_hex(pr(MISC_UBUS_CTRL)); uart_puts("\n");
+    uart_puts("[pci] STS="); uart_hex(pr(MISC_PCIE_STATUS)); uart_puts("\n");
+    uart_puts("[pci] CMD="); uart_hex(pr(PCI_REG_CMD)); uart_puts("\n");
+    uart_puts("[pci] HDBG="); uart_hex(pr(HARD_DEBUG)); uart_puts("\n");
+    uart_puts("[pci] OB0L="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_LO));
+    uart_puts(" H="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_HI)); uart_puts("\n");
+    uart_puts("[pci] OB0BL="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_BL)); uart_puts("\n");
+    uart_puts("[pci] OB0BH="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_BH));
     uart_puts(" LH="); uart_hex(pr(MISC_CPU_2_PCIE_WIN0_LH)); uart_puts("\n");
 
     /* RP1 endpoint config */
-    uart_puts("[pcie] RP1 BAR1="); uart_hex(pcie_cfg_read(1,0,0,0x14)); uart_puts("\n");
-    uart_puts("[pcie] RP1 CMD="); uart_hex(pcie_cfg_read(1,0,0,0x04)); uart_puts("\n");
-    uart_puts("[pcie] RP1 ID="); uart_hex(pcie_cfg_read(1,0,0,0x00)); uart_puts("\n");
+    uart_puts("[pci] RP1 B1="); uart_hex(pcie_cfg_read(1,0,0,0x14)); uart_puts("\n");
+    uart_puts("[pci] RP1 CMD="); uart_hex(pcie_cfg_read(1,0,0,0x04)); uart_puts("\n");
+    uart_puts("[pci] RP1 ID="); uart_hex(pcie_cfg_read(1,0,0,0x00)); uart_puts("\n");
 
     /* Also dump to HDMI via fb so user can read it on screen */
     fb_set_color(0x0000CCFF, 0x00000000);
@@ -234,7 +350,7 @@ bool pcie_init(void) {
     fb_printf("VENDOR=%X UBUS=%X\n", pr(RC_CFG_VENDOR_SPECIFIC_REG1), pr(MISC_UBUS_CTRL));
     fb_printf("RP1 BAR1=%X CMD=%X\n", pcie_cfg_read(1,0,0,0x14), pcie_cfg_read(1,0,0,0x04));
 
-    uart_puts("[pcie] === End Dump ===\n");
+    uart_puts("[pci] end dump\n");
 
     /* Init AER early so we catch any DMA errors */
     pcie_aer_init();
@@ -280,7 +396,7 @@ void pcie_aer_init(void) {
     /* Find AER on the RC (bus 0) */
     aer_offset_rc = find_aer_cap(0, 0, 0);
     if (aer_offset_rc) {
-        uart_puts("[pcie] AER found at RC offset ");
+        uart_puts("[pci] AER @RC=");
         uart_hex(aer_offset_rc);
         uart_puts("\n");
         /* Clear all errors */
@@ -290,7 +406,7 @@ void pcie_aer_init(void) {
         pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_UNCORR_MASK, 0);
         pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_CORR_MASK, 0);
     } else {
-        uart_puts("[pcie] AER not found on RC\n");
+        uart_puts("[pci] no AER\n");
     }
 }
 

@@ -5,6 +5,8 @@
 #define ETH_ALEN        6
 
 bool nic_init(void);
+bool nic_init_wifi(void);
+bool nic_is_wifi(void);
 bool nic_send(const u8 *frame, u32 len);
 bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_len);
 bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted);
