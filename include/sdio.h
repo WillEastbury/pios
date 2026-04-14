@@ -21,16 +21,18 @@
 /* RP1 SDIO1 controller offset from RP1_BAR_BASE */
 #define RP1_SDIO1_BASE      0x104000
 
-/* SDIO GPIO pins (bank 2: GPIOs 34-53) */
-#define SDIO_GPIO_CLK       34
-#define SDIO_GPIO_CMD       35
-#define SDIO_GPIO_DAT0      36
-#define SDIO_GPIO_DAT1      37
-#define SDIO_GPIO_DAT2      38
-#define SDIO_GPIO_DAT3      39
+/* SDIO GPIO pins — DTB: rp1_sdio1_28_33 (RP1 GPIOs 28-33) */
+#define SDIO_GPIO_CLK       28
+#define SDIO_GPIO_CMD       29
+#define SDIO_GPIO_DAT0      30
+#define SDIO_GPIO_DAT1      31
+#define SDIO_GPIO_DAT2      32
+#define SDIO_GPIO_DAT3      33
 
-/* WL_REG_ON: WiFi chip power/reset (active HIGH) */
-#define SDIO_WL_REG_ON_GPIO 40
+/* WL_REG_ON: WiFi chip power/reset — BCM2712 SoC GPIO (not RP1)
+ * On Pi 5, this is typically handled by the firmware/regulator.
+ * RP1 GPIO used as fallback. Check DTB 'wl-on-reg' for actual pin. */
+#define SDIO_WL_REG_ON_GPIO 35
 
 /* SDIO function numbers */
 #define SDIO_FUNC_CIA       0   /* Common I/O Area (CCCR/FBR) */
