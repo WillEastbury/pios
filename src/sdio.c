@@ -219,20 +219,24 @@ static void bcm2712_gpio_set_fsel(u32 pin, u32 fsel)
 
 static void sdio_gpio_init(void)
 {
-    /* WL_ON pin (GPIO 28) — set as plain GPIO for WL_REG_ON */
-    bcm2712_gpio_set_fsel(SDIO_WL_REG_ON_GPIO, 0);  /* func 0 = GPIO */
-
-    /* SDIO2 pins (GPIO 30-35) — set to SDIO2 function.
-     * The firmware likely already configured these via sdio2_30_pins.
-     * We re-assert to be safe. */
-    u32 pins[] = { SDIO2_GPIO_CLK, SDIO2_GPIO_CMD,
-                   SDIO2_GPIO_DAT0, SDIO2_GPIO_DAT1,
-                   SDIO2_GPIO_DAT2, SDIO2_GPIO_DAT3 };
-
-    for (u32 i = 0; i < 6; i++) {
-        bcm2712_gpio_set_fsel(pins[i], 1);  /* func 1 = SDIO2 */
-    }
-    uart_puts("[sdio] GPIO 28=WL_ON, 30-35=SDIO2\n");
+    /* Trust firmware to have configured both WL_ON (GPIO28) and
+     * SDIO2 pins (GPIO 30-35) via DTB. Just log the current state. */
+    u32 data = mmio_read(BCM2712_GPIO1_DATA0);
+    u32 iodir = mmio_read(BCM2712_GPIO1_IODIR0);
+    uart_puts("[sdio] pre-init DATA=");
+    uart_hex(data);
+    uart_puts(" IODIR=");
+    uart_hex(iodir);
+    uart_puts("\n");
+    
+    /* Read pinctrl FSEL for GPIO 28-35 (reg offset for GPIO 24-31 = 0x0C) */
+    u32 fsel3 = mmio_read(BCM2712_PINCTRL_BASE + 0x0C); /* GPIO 24-31 */
+    u32 fsel4 = mmio_read(BCM2712_PINCTRL_BASE + 0x10); /* GPIO 32-39 */
+    uart_puts("[sdio] FSEL[24-31]=");
+    uart_hex(fsel3);
+    uart_puts(" FSEL[32-39]=");
+    uart_hex(fsel4);
+    uart_puts("\n");
 }
 
 void sdio_power_on(void)
@@ -257,7 +261,17 @@ void sdio_power_on(void)
     data = mmio_read(BCM2712_GPIO1_DATA0);
     mmio_write(BCM2712_GPIO1_DATA0, data | bit);
     delay_cycles(2000000);  /* 150ms+ startup delay */
-    uart_puts("[sdio] WL_REG_ON GPIO28 HIGH\n");
+    
+    /* Verify GPIO state */
+    u32 data_readback = mmio_read(BCM2712_GPIO1_DATA0);
+    u32 iodir_readback = mmio_read(BCM2712_GPIO1_IODIR0);
+    uart_puts("[sdio] WL_REG_ON GPIO28: DATA=");
+    uart_hex(data_readback);
+    uart_puts(" IODIR=");
+    uart_hex(iodir_readback);
+    uart_puts(" bit28=");
+    uart_hex((data_readback >> 28) & 1);
+    uart_puts("\n");
 }
 
 void sdio_power_off(void)
