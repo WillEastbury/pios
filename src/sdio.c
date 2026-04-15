@@ -63,8 +63,9 @@
 #define INT_DATA_DONE       (1 << 1)
 #define INT_WRITE_RDY       (1 << 4)
 #define INT_READ_RDY        (1 << 5)
-#define INT_ERROR           0xFFFF0000U
-#define INT_ALL             0xFFFF00FFU
+#define INT_ERROR_SUMMARY   (1U << 15)
+#define INT_ERROR           0xFFFF8000U  /* summary + all error bits */
+#define INT_ALL             0xFFFFFFFFU  /* clear everything */
 
 /* Command encoding */
 #define CMD(n)              ((n) << 24)
@@ -109,8 +110,34 @@ static u32 sdio_rca;
 static bool sdio_initialized;
 
 /* ── Register helpers — target BCM2712 SDIO2 ── */
+/* 32-bit access (responses, data, present state, interrupts, caps) */
 static inline u32 sr(u32 off)           { return mmio_read(BCM2712_SDIO2_BASE + off); }
 static inline void sw(u32 off, u32 val) { mmio_write(BCM2712_SDIO2_BASE + off, val); }
+/* 16-bit access (clock control, block size/count, host control 2, transfer mode) */
+static inline u16 sr16(u32 off)           { return mmio_read16(BCM2712_SDIO2_BASE + off); }
+static inline void sw16(u32 off, u16 val) { mmio_write16(BCM2712_SDIO2_BASE + off, val); }
+/* 8-bit access (host control, power control, timeout, software reset) */
+static inline u8 sr8(u32 off)           { return mmio_read8(BCM2712_SDIO2_BASE + off); }
+static inline void sw8(u32 off, u8 val) { mmio_write8(BCM2712_SDIO2_BASE + off, val); }
+
+/* SDHCI spec-accurate sub-register offsets */
+#define SDHCI_HOST_CONTROL    0x28  /* 8-bit */
+#define SDHCI_POWER_CONTROL   0x29  /* 8-bit */
+#define SDHCI_BLOCK_GAP       0x2A  /* 8-bit */
+#define SDHCI_WAKEUP          0x2B  /* 8-bit */
+#define SDHCI_CLOCK_CONTROL   0x2C  /* 16-bit */
+#define SDHCI_TIMEOUT_CONTROL 0x2E  /* 8-bit */
+#define SDHCI_SOFTWARE_RESET  0x2F  /* 8-bit */
+#define SDHCI_HOST_CONTROL2   0x3E  /* 16-bit */
+
+/* Software reset bits (8-bit register at 0x2F) */
+#define SDHCI_RESET_ALL       0x01
+#define SDHCI_RESET_CMD       0x02
+#define SDHCI_RESET_DATA      0x04
+
+/* Power control bits */
+#define SDHCI_POWER_ON        0x01
+#define SDHCI_POWER_330       0x0E  /* 3.3V */
 
 /* ── Low-level helpers ── */
 
@@ -170,37 +197,41 @@ static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
 
 static void sdio_set_clock(u32 freq_khz)
 {
-    /* Disable clock */
-    u32 c1 = sr(REG_CONTROL1);
-    c1 &= ~C1_CLK_EN;
-    sw(REG_CONTROL1, c1);
+    /* Disable SD clock via 16-bit CLOCK_CONTROL */
+    sw16(SDHCI_CLOCK_CONTROL, 0);
     delay_cycles(1000);
+
+    /* Set timeout via 8-bit register */
+    sw8(SDHCI_TIMEOUT_CONTROL, 0x0E);
 
     /* Derive base clock from SDHCI capabilities register */
     u32 cap = sr(REG_CAP0);
     u32 base_mhz = (cap >> 8) & 0xFF;
     if (base_mhz == 0) base_mhz = 50;  /* fallback */
     u32 base_khz = base_mhz * 1000;
-    u32 div = base_khz / freq_khz;
-    if (base_khz / div > freq_khz) div++;
-    div = div >> 1;
-    if (div > 0x3FF) div = 0x3FF;
 
-    u32 divider = ((div & 0xFF) << 8) | ((div >> 8) << 6);
+    /* Calculate divider — must produce even real divisor per SDHCI v3 spec */
+    u32 real_div = (base_khz + freq_khz - 1) / freq_khz;
+    if (real_div & 1) real_div++;  /* round up to even */
+    if (real_div < 2) real_div = 2;
+    u32 encoded = real_div >> 1;
+    if (encoded > 0x3FF) encoded = 0x3FF;
 
-    c1 = (c1 & 0xFFFF001FU) | divider | C1_CLK_INTLEN | C1_TOUNIT(0xE);
-    sw(REG_CONTROL1, c1);
+    /* CLOCK_CONTROL: [15:8]=SDCLK Freq Select, [7:6]=upper divider bits,
+     * [2]=SD Clock Enable, [1]=Clock Stable (RO), [0]=Internal Clock Enable */
+    u16 clk = ((encoded & 0xFF) << 8) | (((encoded >> 8) & 0x3) << 6) | 0x01;
+    sw16(SDHCI_CLOCK_CONTROL, clk);
     delay_cycles(1000);
 
-    /* Wait for clock stable */
+    /* Wait for internal clock stable (bit 1) */
     u32 timeout = 100000;
-    while (!(sr(REG_CONTROL1) & C1_CLK_STABLE) && timeout--)
+    while (!(sr16(SDHCI_CLOCK_CONTROL) & 0x02) && timeout--)
         delay_cycles(10);
 
-    /* Enable clock */
-    c1 = sr(REG_CONTROL1);
-    c1 |= C1_CLK_EN;
-    sw(REG_CONTROL1, c1);
+    /* Enable SD clock (bit 2) */
+    clk = sr16(SDHCI_CLOCK_CONTROL);
+    clk |= 0x04;
+    sw16(SDHCI_CLOCK_CONTROL, clk);
     delay_cycles(1000);
 }
 
@@ -346,6 +377,12 @@ bool sdio_init(void)
     max50 &= ~SDIO_CFG_MAX_50MHZ_ENABLE;
     mmio_write(cfg + SDIO_CFG_MAX_50MHZ_MODE, max50);
 
+    /* Set SD_PIN_SEL to SD mode (not eMMC) — BCM2712-specific */
+    u32 pinsel = mmio_read(cfg + SDIO_CFG_SD_PIN_SEL);
+    pinsel &= ~0x3U;
+    pinsel |= 0x2;  /* SD mode */
+    mmio_write(cfg + SDIO_CFG_SD_PIN_SEL, pinsel);
+
     /* Re-check PRESENT_STATE after CFG */
     pstate = sr(REG_STATUS);
     uart_puts("[sdio] post-CFG PRESENT=");
@@ -354,30 +391,24 @@ bool sdio_init(void)
     uart_hex((pstate >> 16) & 1);
     uart_puts("\n");
 
-    /* Reset the host controller — Circle: Srsthc + Srstdata */
+    /* Reset the host controller using proper 8-bit software reset register */
     uart_puts("[sdio] HC reset...\n");
-    sw(REG_CONTROL1, C1_SRST_HC);
+    sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_ALL);
     u32 timeout = 100000;
-    while ((sr(REG_CONTROL1) & C1_SRST_HC) && timeout--)
+    while ((sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_ALL) && timeout--)
         delay_cycles(100);
     if (!timeout) {
         uart_puts("[sdio] HC rst timeout\n");
         return false;
     }
-    /* Also reset data line (Circle does this separately) */
-    sw(REG_CONTROL1, sr(REG_CONTROL1) | C1_SRST_DATA);
-    delay_cycles(100000);
-    sw(REG_CONTROL1, 0);  /* Clear all control1 bits */
     uart_puts("[sdio] HC reset ok\n");
 
-    /* Power on: 3.3V — OR into existing CONTROL0 (Circle pattern) */
-    u32 c0 = sr(REG_CONTROL0);
-    c0 |= 0x0F00;  /* SD Bus Power + 3.3V voltage */
-    sw(REG_CONTROL0, c0);
-    delay_cycles(20000);  /* Circle: 2ms */
+    /* Power on: 3.3V via 8-bit power control register */
+    sw8(SDHCI_POWER_CONTROL, SDHCI_POWER_330 | SDHCI_POWER_ON);
+    delay_cycles(20000);
 
-    /* Clear CONTROL2 (Circle does this) */
-    sw(REG_CONTROL2, 0);
+    /* Clear Host Control 2 via 16-bit register (not 32-bit at 0x3C!) */
+    sw16(SDHCI_HOST_CONTROL2, 0);
 
     /* Set up clock for 400 kHz identification mode.
      * Circle: single write with divider + timeout + internal clock enable */
@@ -385,10 +416,10 @@ bool sdio_init(void)
     sdio_set_clock(400);
     delay_cycles(500000);
 
-    /* Set up interrupts — Circle pattern */
-    sw(REG_IRPT_EN, 0);
-    sw(REG_INTERRUPT, 0xFFFFFFFF);  /* clear all pending */
-    sw(REG_IRPT_MASK, 0xFFFFFFFF & ~(1 << 8));  /* all except card interrupt */
+    /* Set up interrupts per SDHCI spec */
+    sw(REG_IRPT_EN, 0);                   /* disable signal enable */
+    sw(REG_INTERRUPT, 0xFFFFFFFF);         /* clear ALL pending (was INT_ALL which missed bit 15) */
+    sw(REG_IRPT_MASK, 0xFFFFFFFF);        /* enable all status bits */
 
     uart_puts("[sdio] CTRL1=");
     uart_hex(sr(REG_CONTROL1));
@@ -402,11 +433,12 @@ bool sdio_init(void)
 
     /* CMD0: GO_IDLE_STATE */
     sdio_send_cmd(SDIO_CMD0, 0, NULL);
-    sw(REG_CONTROL1, sr(REG_CONTROL1) | C1_SRST_CMD);
+    /* Reset CMD line and wait for auto-clear */
+    sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD);
     timeout = 100000;
-    while ((sr(REG_CONTROL1) & C1_SRST_CMD) && timeout--)
+    while ((sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_CMD) && timeout--)
         delay_cycles(10);
-    sw(REG_INTERRUPT, INT_ALL);
+    sw(REG_INTERRUPT, 0xFFFFFFFF);
     delay_cycles(100000);
 
     /* Re-check PRESENT_STATE after CMD0 + clock */
@@ -429,7 +461,8 @@ bool sdio_init(void)
         /* Send CMD5 directly — tolerate errors on first attempts */
         if (!sdio_wait_cmd()) {
             uart_puts("[sdio] CMD5 wait_cmd fail\n");
-            sw(REG_CONTROL1, sr(REG_CONTROL1) | C1_SRST_CMD);
+            sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD);
+            while (sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_CMD) delay_cycles(10);
             delay_cycles(100000);
             continue;
         }
@@ -464,11 +497,10 @@ bool sdio_init(void)
             uart_puts(" (no CMD_DONE)\n");
         }
         
-        sw(REG_INTERRUPT, INT_ALL);
-        /* Reset CMD line on error */
-        sw(REG_CONTROL1, sr(REG_CONTROL1) | C1_SRST_CMD);
-        delay_cycles(100000);
-        while (sr(REG_CONTROL1) & C1_SRST_CMD) delay_cycles(10);
+        sw(REG_INTERRUPT, 0xFFFFFFFF);
+        /* Reset CMD line on error — proper 8-bit write + poll */
+        sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD);
+        while (sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_CMD) delay_cycles(10);
         delay_cycles(2000000);
     }
     

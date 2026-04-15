@@ -48,3 +48,11 @@ static inline void mmio_write16(u64 addr, u16 val) {
 static inline u16 mmio_read16(u64 addr) {
     return *(volatile u16 *)addr;
 }
+
+static inline void mmio_write8(u64 addr, u8 val) {
+    *(volatile u8 *)addr = val;
+}
+
+static inline u8 mmio_read8(u64 addr) {
+    return *(volatile u8 *)addr;
+}
