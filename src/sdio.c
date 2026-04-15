@@ -354,38 +354,51 @@ bool sdio_init(void)
     uart_hex((pstate >> 16) & 1);
     uart_puts("\n");
 
-    /* Reset the host controller */
+    /* Reset the host controller — Circle: Srsthc + Srstdata */
     uart_puts("[sdio] HC reset...\n");
     sw(REG_CONTROL1, C1_SRST_HC);
     u32 timeout = 100000;
     while ((sr(REG_CONTROL1) & C1_SRST_HC) && timeout--)
-        delay_cycles(10);
+        delay_cycles(100);
     if (!timeout) {
         uart_puts("[sdio] HC rst timeout\n");
         return false;
     }
+    /* Also reset data line (Circle does this separately) */
+    sw(REG_CONTROL1, sr(REG_CONTROL1) | C1_SRST_DATA);
+    delay_cycles(100000);
+    sw(REG_CONTROL1, 0);  /* Clear all control1 bits */
     uart_puts("[sdio] HC reset ok\n");
 
-    /* Power on: 3.3V */
-    sw(REG_CONTROL0, 0x0F00);
-    delay_cycles(10000);
-    uart_puts("[sdio] power on, CTRL0=");
-    uart_hex(sr(REG_CONTROL0));
-    uart_puts("\n");
+    /* Power on: 3.3V — OR into existing CONTROL0 (Circle pattern) */
+    u32 c0 = sr(REG_CONTROL0);
+    c0 |= 0x0F00;  /* SD Bus Power + 3.3V voltage */
+    sw(REG_CONTROL0, c0);
+    delay_cycles(20000);  /* Circle: 2ms */
 
-    /* Enable all interrupts */
-    sw(REG_IRPT_MASK, INT_ALL);
-    sw(REG_IRPT_EN, INT_ALL);
+    /* Clear CONTROL2 (Circle does this) */
+    sw(REG_CONTROL2, 0);
 
-    /* Slow clock for identification (400 kHz) */
+    /* Set up clock for 400 kHz identification mode.
+     * Circle: single write with divider + timeout + internal clock enable */
     uart_puts("[sdio] setting 400kHz clock...\n");
     sdio_set_clock(400);
     delay_cycles(500000);
+
+    /* Set up interrupts — Circle pattern */
+    sw(REG_IRPT_EN, 0);
+    sw(REG_INTERRUPT, 0xFFFFFFFF);  /* clear all pending */
+    sw(REG_IRPT_MASK, 0xFFFFFFFF & ~(1 << 8));  /* all except card interrupt */
+
     uart_puts("[sdio] CTRL1=");
     uart_hex(sr(REG_CONTROL1));
     uart_puts(" STATUS=");
     uart_hex(sr(REG_STATUS));
+    uart_puts(" card=");
+    uart_hex((sr(REG_STATUS) >> 16) & 1);
     uart_puts("\n");
+
+    delay_cycles(200000);  /* 20ms settle */
 
     /* CMD0: GO_IDLE_STATE */
     sdio_send_cmd(SDIO_CMD0, 0, NULL);
