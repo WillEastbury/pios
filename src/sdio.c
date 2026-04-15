@@ -251,46 +251,133 @@ static void sdio_set_clock(u32 freq_khz)
 
 /* ── BCM2712 SoC GPIO/pinctrl helpers ── */
 
-/* BCM2712 pinctrl: set pin function via FSEL registers at 0x107D504100.
- * Each GPIO has 4 bits in FSEL registers, 8 GPIOs per 32-bit register. */
+static u32 soc_stepping;
+
+static void detect_soc_stepping(void)
+{
+    u32 val = mmio_read(BCM2712_SOC_STEPPING);
+    uart_puts("[sdio] SOC_STEPPING=");
+    uart_hex(val);
+    if ((val >> 16) == 0x2712) {
+        soc_stepping = val & 0xFF;
+        uart_puts(" rev=");
+        uart_hex(soc_stepping);
+    } else {
+        soc_stepping = 0xFF;  /* unknown — assume pre-D0 */
+        uart_puts(" (unknown SoC)");
+    }
+    uart_puts("\n");
+}
+
+static bool is_d0_stepping(void)
+{
+    return soc_stepping >= SOC_STEPPING_D0;
+}
+
+/* BCM2712 pinctrl: set pin function via FSEL registers at BCM2712_PINCTRL_BASE.
+ * Register layout depends on SoC stepping:
+ *   Pre-D0: 8 GPIOs per 32-bit reg, 4 bits each: reg = (pin/8)*4, shift = (pin%8)*4
+ *   D0+:    Pins 28-31 in reg 2, pins 32-35 in reg 3, shift = ((pin-24)%8)*4 */
 static void bcm2712_gpio_set_fsel(u32 pin, u32 fsel)
 {
-    u32 reg_off = (pin / 8) * 4;
-    u32 shift = (pin % 8) * 4;
+    u32 reg_off, shift;
+    if (is_d0_stepping()) {
+        reg_off = (pin < 32 ? 2 : 3) * 4;
+        shift = ((pin - 24) % 8) * 4;
+    } else {
+        reg_off = (pin / 8) * 4;
+        shift = (pin % 8) * 4;
+    }
     u32 val = mmio_read(BCM2712_PINCTRL_BASE + reg_off);
     val &= ~(0xFU << shift);
     val |= (fsel & 0xF) << shift;
     mmio_write(BCM2712_PINCTRL_BASE + reg_off, val);
 }
 
+static u32 bcm2712_gpio_get_fsel(u32 pin)
+{
+    u32 reg_off, shift;
+    if (is_d0_stepping()) {
+        reg_off = (pin < 32 ? 2 : 3) * 4;
+        shift = ((pin - 24) % 8) * 4;
+    } else {
+        reg_off = (pin / 8) * 4;
+        shift = (pin % 8) * 4;
+    }
+    return (mmio_read(BCM2712_PINCTRL_BASE + reg_off) >> shift) & 0xF;
+}
+
+/* BCM2712 GPIO pad pull-up/down control.
+ * Layout depends on stepping:
+ *   Pre-D0: offset = (pin+112)/15, bit = ((pin+112)%15)*2
+ *   D0+:    pins 28-32 in reg 5, pins 33-35 in reg 6, bit = ((pin-18)%15)*2 */
+static void bcm2712_gpio_set_pull(u32 pin, u32 mode)
+{
+    u32 pad_off, pad_bit;
+    if (is_d0_stepping()) {
+        pad_off = (pin < 33 ? 5 : 6) * 4;
+        pad_bit = ((pin - 18) % 15) * 2;
+    } else {
+        u32 offset = pin + 112;
+        pad_off = (offset / 15) * 4;
+        pad_bit = (offset % 15) * 2;
+    }
+    u32 val = mmio_read(BCM2712_PINCTRL_BASE + pad_off);
+    val &= ~(3U << pad_bit);
+    val |= (mode << pad_bit);
+    mmio_write(BCM2712_PINCTRL_BASE + pad_off, val);
+}
+
+#define PULL_NONE 0
+#define PULL_UP   2
+
 static void sdio_gpio_init(void)
 {
-    /* Read and verify SDIO2 pin configuration from firmware */
-    u32 fsel3 = mmio_read(BCM2712_PINCTRL_BASE + 0x0C); /* GPIO 24-31 */
-    u32 fsel4 = mmio_read(BCM2712_PINCTRL_BASE + 0x10); /* GPIO 32-39 */
-    uart_puts("[sdio] FSEL[24-31]=");
-    uart_hex(fsel3);
-    uart_puts(" FSEL[32-39]=");
-    uart_hex(fsel4);
+    detect_soc_stepping();
+
+    /* Read current FSEL for SDIO2 pins */
+    uart_puts("[sdio] FSEL: ");
+    for (u32 p = 30; p <= 35; p++) {
+        uart_puts("g");
+        uart_hex(p);
+        uart_puts("=");
+        uart_hex(bcm2712_gpio_get_fsel(p));
+        uart_puts(" ");
+    }
     uart_puts("\n");
 
-    /* GPIO 28 should be func 0 (GPIO) for WL_REG_ON */
-    /* GPIO 30-35 should be configured for SDIO2 by firmware */
-    /* If FSEL for GPIO 30-31 (bits [27:24] and [31:28] of fsel3) are 0,
-       firmware didn't configure them — set them ourselves */
-    u32 gpio30_fsel = (fsel3 >> 24) & 0xF;
-    u32 gpio31_fsel = (fsel3 >> 28) & 0xF;
-    if (gpio30_fsel == 0 && gpio31_fsel == 0) {
-        uart_puts("[sdio] WARN: SDIO2 pins not muxed, configuring...\n");
-        bcm2712_gpio_set_fsel(30, 1);
-        bcm2712_gpio_set_fsel(31, 1);
-        bcm2712_gpio_set_fsel(32, 1);
-        bcm2712_gpio_set_fsel(33, 1);
-        bcm2712_gpio_set_fsel(34, 1);
-        bcm2712_gpio_set_fsel(35, 1);
+    /* Pin function select per SoC stepping (from Circle ether4330.c):
+     *   D0+:    All pins = Func1
+     *   Pre-D0: Most = Func4, pins 33/35 = Func3 */
+    u32 clk_func, cmd_func, d0_func, d1_func, d2_func, d3_func;
+    if (is_d0_stepping()) {
+        clk_func = cmd_func = d0_func = d1_func = d2_func = d3_func = 1;
     } else {
-        uart_puts("[sdio] SDIO2 pins OK (firmware configured)\n");
+        clk_func = 4; cmd_func = 4; d0_func = 4;
+        d1_func = 3;  d2_func = 4;  d3_func = 3;
     }
+
+    uart_puts("[sdio] Configuring SDIO2 pins (");
+    uart_puts(is_d0_stepping() ? "D0+" : "pre-D0");
+    uart_puts(")...\n");
+
+    bcm2712_gpio_set_fsel(30, clk_func);  bcm2712_gpio_set_pull(30, PULL_NONE);
+    bcm2712_gpio_set_fsel(31, cmd_func);  bcm2712_gpio_set_pull(31, PULL_UP);
+    bcm2712_gpio_set_fsel(32, d0_func);   bcm2712_gpio_set_pull(32, PULL_UP);
+    bcm2712_gpio_set_fsel(33, d1_func);   bcm2712_gpio_set_pull(33, PULL_UP);
+    bcm2712_gpio_set_fsel(34, d2_func);   bcm2712_gpio_set_pull(34, PULL_UP);
+    bcm2712_gpio_set_fsel(35, d3_func);   bcm2712_gpio_set_pull(35, PULL_UP);
+
+    /* Verify */
+    uart_puts("[sdio] post-mux FSEL: ");
+    for (u32 p = 30; p <= 35; p++) {
+        uart_puts("g");
+        uart_hex(p);
+        uart_puts("=");
+        uart_hex(bcm2712_gpio_get_fsel(p));
+        uart_puts(" ");
+    }
+    uart_puts("\n");
 }
 
 void sdio_power_on(void)

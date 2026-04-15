@@ -44,6 +44,10 @@
 #define SDIO_CFG_MAX_50MHZ_STRAP_OVERRIDE  (1U << 31)
 #define SDIO_CFG_MAX_50MHZ_ENABLE          (1U << 0)
 
+/* BCM2712 SoC stepping register — upper 16 bits = 0x2712, lower 8 = stepping */
+#define BCM2712_SOC_STEPPING  0x1001504004UL
+#define SOC_STEPPING_D0       0x30
+
 /* BCM2712 SoC pinctrl for SDIO2 pins (sdio2_30_pins)
  * SoC GPIO controller at 0x107d504100 */
 #define BCM2712_PINCTRL_BASE 0x107D504100UL
