@@ -192,6 +192,18 @@ static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
         resp[2] = sr(REG_RESP2);
         resp[3] = sr(REG_RESP3);
     }
+
+    /* For R1b (busy) responses, wait for DAT line to release */
+    if (cmd & RSP_48_BUSY) {
+        u32 busy_timeout = 1000000;
+        while ((sr(REG_STATUS) & SR_DAT_INHIBIT) && busy_timeout--)
+            delay_cycles(10);
+        if (!busy_timeout) {
+            uart_puts("[sdio] busy timeout\n");
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -371,11 +383,8 @@ bool sdio_init(void)
     uart_hex(mmio_read(cfg + SDIO_CFG_CTRL));
     uart_puts("\n");
 
-    /* Override max-50MHz strap */
-    u32 max50 = mmio_read(cfg + SDIO_CFG_MAX_50MHZ_MODE);
-    max50 |= SDIO_CFG_MAX_50MHZ_STRAP_OVERRIDE;
-    max50 &= ~SDIO_CFG_MAX_50MHZ_ENABLE;
-    mmio_write(cfg + SDIO_CFG_MAX_50MHZ_MODE, max50);
+    /* MAX_50MHZ strap — leave as-is for basic 25MHz bring-up.
+     * Only override if implementing UHS/tuning modes (>50MHz). */
 
     /* Set SD_PIN_SEL to SD mode (not eMMC) — BCM2712-specific */
     u32 pinsel = mmio_read(cfg + SDIO_CFG_SD_PIN_SEL);
@@ -519,15 +528,16 @@ bool sdio_init(void)
     uart_hex(num_funcs);
     uart_puts("\n");
 
-    /* Send CMD5 with voltage window until card ready */
-    u32 cmd5_arg = ocr & 0x00FFFFFFU;  /* echo back supported voltages */
+    /* Send CMD5 with 3.3V voltage window until card ready (bit 31 = ready) */
+    #define SDIO_OCR_V3_3  0x00300000  /* 3.2-3.4V window */
+    u32 cmd5_arg = SDIO_OCR_V3_3;
     timeout = 100;
     do {
         if (!sdio_send_cmd(SDIO_CMD5, cmd5_arg, resp)) {
             uart_puts("[sdio] CMD5 retry fail\n");
             return false;
         }
-        delay_cycles(100000);
+        delay_cycles(1000000);  /* 100ms between retries (Circle: tsleep 100) */
     } while (!(resp[0] & (1U << 31)) && timeout--);
 
     if (!timeout) {
