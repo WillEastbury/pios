@@ -1237,7 +1237,7 @@ static void ui_cmd_fsinspect(const char *path)
 }
 
 /* ── WiFi defaults ── */
-#define WIFI_DEFAULT_SSID       "Bussy_5G"
+#define WIFI_DEFAULT_SSID       "Will's S24 Ultra"
 #define WIFI_DEFAULT_PASS       "Whatever1"
 
 static bool wifi_active;
@@ -1322,8 +1322,29 @@ static void ui_cmd_wifi(u32 argc, char **argv)
         }
         if (cyw43_is_connected()) {
             ui_console_write("OK: connected!\n");
-            net_init(MY_IP, MY_GW, MY_MASK, NULL);
-            ui_cfg_dhcp = false;
+            /* Use DHCP to get IP from hotspot */
+            ui_console_write("WiFi: requesting DHCP lease...\n");
+            if (dhcp_start(10000)) {
+                const dhcp_lease_t *lease = dhcp_get_lease();
+                if (lease) {
+                    ui_cfg_ip   = lease->ip;
+                    ui_cfg_mask = lease->mask;
+                    ui_cfg_gw   = lease->gateway;
+                    ui_cfg_dns  = lease->dns;
+                    dns_init(ui_cfg_dns);
+                    fb_printf("DHCP: ip=%d.%d.%d.%d gw=%d.%d.%d.%d\n",
+                        (lease->ip >> 24) & 0xFF, (lease->ip >> 16) & 0xFF,
+                        (lease->ip >> 8) & 0xFF, lease->ip & 0xFF,
+                        (lease->gateway >> 24) & 0xFF, (lease->gateway >> 16) & 0xFF,
+                        (lease->gateway >> 8) & 0xFF, lease->gateway & 0xFF);
+                }
+                ui_cfg_dhcp = true;
+                ui_console_write("OK: dhcp lease applied\n");
+            } else {
+                ui_console_write("WARN: DHCP failed, using static IP\n");
+                net_init(MY_IP, MY_GW, MY_MASK, NULL);
+                ui_cfg_dhcp = false;
+            }
         } else {
             ui_console_write("WARN: join sent, not yet associated\n");
         }
