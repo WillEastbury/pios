@@ -26,8 +26,23 @@
  * AXI base 0x1000000000 + 0x1100000 = 0x1001100000 */
 #define BCM2712_SDIO2_BASE  0x1001100000UL
 
-/* BCM2712 SDHCI CFG block — offset from SDIO2 base (exploratory) */
-#define BCM2712_SDIO2_CFG_OFFSET  0x200
+/* BCM2712 SDHCI CFG block — at SDIO2 base + 0x400 (second reg range in DTB)
+ * DTB: reg = <0x10 0x01100000 0x0 0x260>, <0x10 0x01100400 0x0 0x200>
+ * Key registers: CTRL(+0x00), SD_PIN_SEL(+0x44), MAX_50MHZ(+0x1AC) */
+#define BCM2712_SDIO2_CFG_OFFSET  0x400
+
+/* CFG register offsets */
+#define SDIO_CFG_CTRL             0x00
+#define SDIO_CFG_SD_PIN_SEL       0x44
+#define SDIO_CFG_MAX_50MHZ_MODE   0x1AC
+
+/* CFG_CTRL bits */
+#define SDIO_CFG_CTRL_SDCD_N_TEST_EN   (1U << 31)  /* force card detect */
+#define SDIO_CFG_CTRL_SDCD_N_TEST_LEV  (1U << 30)  /* card detect level */
+
+/* CFG_MAX_50MHZ bits */
+#define SDIO_CFG_MAX_50MHZ_STRAP_OVERRIDE  (1U << 31)
+#define SDIO_CFG_MAX_50MHZ_ENABLE          (1U << 0)
 
 /* BCM2712 SoC pinctrl for SDIO2 pins (sdio2_30_pins)
  * SoC GPIO controller at 0x107d504100 */

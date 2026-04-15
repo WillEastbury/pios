@@ -321,14 +321,37 @@ bool sdio_init(void)
     u32 pstate = sr(REG_STATUS);
     uart_puts("[sdio] PRESENT=");
     uart_hex(pstate);
+    uart_puts(" card=");
+    uart_hex((pstate >> 16) & 1);
     uart_puts("\n");
 
-    /* Try CFG block presence override */
+    /* Program BCM2712 CFG block (MUST happen before SDHCI init)
+     * Linux sdhci-brcmstb.c: sdhci_brcmstb_cfginit_2712() */
     u64 cfg = BCM2712_SDIO2_BASE + BCM2712_SDIO2_CFG_OFFSET;
-    uart_puts("[sdio] CFG[0]=");
-    uart_hex(mmio_read(cfg + 0x00));
-    uart_puts(" CFG[4]=");
-    uart_hex(mmio_read(cfg + 0x04));
+
+    /* Force card present for non-removable WiFi chip */
+    u32 ctrl = mmio_read(cfg + SDIO_CFG_CTRL);
+    uart_puts("[sdio] CFG_CTRL before=");
+    uart_hex(ctrl);
+    ctrl |= SDIO_CFG_CTRL_SDCD_N_TEST_EN;   /* enable card-detect override */
+    ctrl &= ~SDIO_CFG_CTRL_SDCD_N_TEST_LEV;  /* level=0 = card present */
+    mmio_write(cfg + SDIO_CFG_CTRL, ctrl);
+    uart_puts(" after=");
+    uart_hex(mmio_read(cfg + SDIO_CFG_CTRL));
+    uart_puts("\n");
+
+    /* Override max-50MHz strap */
+    u32 max50 = mmio_read(cfg + SDIO_CFG_MAX_50MHZ_MODE);
+    max50 |= SDIO_CFG_MAX_50MHZ_STRAP_OVERRIDE;
+    max50 &= ~SDIO_CFG_MAX_50MHZ_ENABLE;
+    mmio_write(cfg + SDIO_CFG_MAX_50MHZ_MODE, max50);
+
+    /* Re-check PRESENT_STATE after CFG */
+    pstate = sr(REG_STATUS);
+    uart_puts("[sdio] post-CFG PRESENT=");
+    uart_hex(pstate);
+    uart_puts(" card=");
+    uart_hex((pstate >> 16) & 1);
     uart_puts("\n");
 
     /* Reset the host controller */
@@ -372,6 +395,14 @@ bool sdio_init(void)
         delay_cycles(10);
     sw(REG_INTERRUPT, INT_ALL);
     delay_cycles(100000);
+
+    /* Re-check PRESENT_STATE after CMD0 + clock */
+    pstate = sr(REG_STATUS);
+    uart_puts("[sdio] post-CMD0 PRESENT=");
+    uart_hex(pstate);
+    uart_puts(" card_inserted=");
+    uart_hex((pstate >> 16) & 1);
+    uart_puts("\n");
 
     /* CMD5: IO_SEND_OP_COND — probe for SDIO card.
      * First CMD5 may return CRC/index errors which are normal for SDIO. */
