@@ -113,13 +113,23 @@ static bool bp_set_window(u32 addr)
 
 static bool bp_read32(u32 addr, u32 *val)
 {
-    if (!bp_set_window(addr))
+    if (!bp_set_window(addr)) {
+        uart_puts("[bp] set_win fail @");
+        uart_hex(addr);
+        uart_puts("\n");
         return false;
+    }
 
     u32 off = addr & BACKPLANE_WIN_MASK;
     u8 buf[4];
-    if (!sdio_cmd53_read(SDIO_FUNC_BACKPLANE, off | 0x8000, buf, 4, true))
+    if (!sdio_cmd53_read(SDIO_FUNC_BACKPLANE, off | 0x8000, buf, 4, true)) {
+        uart_puts("[bp] cmd53 rd fail off=");
+        uart_hex(off | 0x8000);
+        uart_puts(" addr=");
+        uart_hex(addr);
+        uart_puts("\n");
         return false;
+    }
 
     *val = (u32)buf[0] | ((u32)buf[1] << 8) |
            ((u32)buf[2] << 16) | ((u32)buf[3] << 24);
@@ -190,9 +200,16 @@ static bool core_disable(u32 core_base)
 {
     u32 val;
 
-    /* Check if already in reset */
-    if (!bp_read32(core_base + CORE_RESETCTRL, &val))
-        return false;
+    /* Check if already in reset — if read fails, assume not in reset and proceed */
+    if (!bp_read32(core_base + CORE_RESETCTRL, &val)) {
+        uart_puts("[cyw] core_dis: RSTCTRL read fail, forcing reset\n");
+        /* Can't read reset state — just try to force disable */
+        bp_write32(core_base + CORE_IOCTRL, 0);
+        delay_cycles(1000);
+        bp_write32(core_base + CORE_RESETCTRL, AIRC_RESET);
+        delay_cycles(1000);
+        return true;
+    }
     if (val & AIRC_RESET)
         return true;
 
@@ -214,8 +231,12 @@ static bool core_disable(u32 core_base)
 static bool core_reset(u32 core_base, u32 ioctrl_flags)
 {
     /* Disable first */
-    if (!core_disable(core_base))
+    if (!core_disable(core_base)) {
+        uart_puts("[cyw] core_rst: disable fail @");
+        uart_hex(core_base);
+        uart_puts("\n");
         return false;
+    }
 
     /* Pull out of reset with clocks + flags */
     if (!bp_write32(core_base + CORE_IOCTRL,
