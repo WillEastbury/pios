@@ -65,6 +65,9 @@
 #define PORTSC_CCS          (1U << 0)
 #define PORTSC_PED          (1U << 1)
 #define PORTSC_PR           (1U << 4)
+#define PORTSC_PLS_SHIFT    5
+#define PORTSC_PLS_MASK     (0xFU << 5)
+#define PORTSC_PLS_U0       (0U << 5)
 #define PORTSC_PP           (1U << 9)
 #define PORTSC_SPEED_SHIFT  10
 #define PORTSC_SPEED_MASK   (0xFU << 10)
@@ -72,6 +75,9 @@
 #define PORTSC_PRC          (1U << 21)
 #define PORTSC_RW1C_MASK    (PORTSC_CSC | PORTSC_PRC | (1U<<18) | (1U<<19) | \
                              (1U<<20) | (1U<<22) | (1U<<23))
+
+/* Pi 5 xHCI port layout: ports 0-1 = USB2, port 2 = USB3 (1-indexed: 1-2=USB2, 3=USB3) */
+#define XHCI_IS_USB3_PORT(p)  ((p) >= 2)  /* 0-indexed */
 
 /* ---- Runtime Registers (Interrupter 0) ---- */
 
@@ -195,9 +201,11 @@ static struct xhci_stats stats;
  *
  * The firmware may have configured inbound windows. Try identity mapping
  * first (offset=0) since the firmware may map PCIe 0x00 → AXI 0x00.
- * If that fails, try 0x10_00000000 offset per rp1.dtsi dma-ranges.
+ * The PCIe BAR2 inbound maps PCIe 0x10_00000000 → CPU 0x00_00000000.
+ * So the xHCI controller (inside RP1, on PCIe) needs DMA addresses
+ * with this offset added to access system RAM.
  */
-#define RP1_DMA_OFFSET  0x0ULL
+#define RP1_DMA_OFFSET  0x1000000000ULL
 static inline u64 dma_addr(const void *p) { return (u64)(usize)p + RP1_DMA_OFFSET; }
 
 /* DCI → ep_rings index. 0xFF = unmapped. DCI 1 = EP0 always ring 0. */
@@ -582,6 +590,21 @@ bool xhci_port_connected(u32 port) {
 bool xhci_port_reset(u32 port, u32 *speed) {
     u64 pa = op_base + 0x400 + (u64)port * 0x10;
     u32 sc = mmio_read(pa);
+
+    if (XHCI_IS_USB3_PORT(port)) {
+        /* USB3: wait for link state U0 instead of port reset */
+        for (u32 i = 0; i < 200; i++) {
+            sc = mmio_read(pa);
+            if ((sc & PORTSC_PLS_MASK) == PORTSC_PLS_U0 && (sc & PORTSC_PED)) {
+                *speed = (sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
+                return true;
+            }
+            timer_delay_ms(5);
+        }
+        return false;
+    }
+
+    /* USB2: standard port reset */
     sc &= ~PORTSC_RW1C_MASK;
     sc |= PORTSC_PR;
     mmio_write(pa, sc);
