@@ -1237,7 +1237,7 @@ static void ui_cmd_fsinspect(const char *path)
 }
 
 /* ── WiFi defaults ── */
-#define WIFI_DEFAULT_SSID       "Will's S24 Ultra"
+#define WIFI_DEFAULT_SSID       "Bussy_5G"
 #define WIFI_DEFAULT_PASS       "Whatever1"
 
 static bool wifi_active;
