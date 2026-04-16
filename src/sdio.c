@@ -73,7 +73,6 @@
 #define RSP_136             (1 << 16)
 #define RSP_48              (2 << 16)
 #define RSP_48_BUSY         (3 << 16)
-#define CMD_RSP_MASK        (3 << 16)
 #define CMD_ISDATA          (1 << 21)
 #define CMD_IXCHK           (1 << 20)
 #define CMD_CRCCHK          (1 << 19)
@@ -167,21 +166,6 @@ static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
     if (!sdio_wait_cmd())
         return false;
 
-    /* Circle pattern (emmc.c:394-403): if DAT_INHIBIT is set and this
-     * command needs DAT lines (data transfer or busy response), reset
-     * the DATA line before proceeding. */
-    if ((sr(REG_STATUS) & SR_DAT_INHIBIT) &&
-        ((cmd & CMD_ISDATA) || (cmd & CMD_RSP_MASK) == RSP_48_BUSY)) {
-        sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
-        u32 rst_t = 100000;
-        while ((sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA) && rst_t--)
-            delay_cycles(10);
-        u32 dat_t = 100000;
-        while ((sr(REG_STATUS) & SR_DAT_INHIBIT) && dat_t--)
-            delay_cycles(10);
-        sw(REG_INTERRUPT, 0xFFFFFFFF);
-    }
-
     sw(REG_INTERRUPT, INT_ALL);
     sw(REG_ARG1, arg);
     sw(REG_CMDTM, cmd);
@@ -210,7 +194,7 @@ static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
     }
 
     /* For R1b (busy) responses, wait for DAT line to release */
-    if ((cmd & CMD_RSP_MASK) == RSP_48_BUSY) {
+    if (cmd & RSP_48_BUSY) {
         u32 busy_timeout = 1000000;
         while ((sr(REG_STATUS) & SR_DAT_INHIBIT) && busy_timeout--)
             delay_cycles(10);
@@ -682,6 +666,15 @@ bool sdio_init(void)
     return true;
 }
 
+void sdio_reset_data_line(void)
+{
+    sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
+    u32 t = 100000;
+    while ((sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA) && t--)
+        delay_cycles(10);
+    sw(REG_INTERRUPT, 0xFFFFFFFF);
+}
+
 bool sdio_card_present(void)
 {
     return sdio_initialized;
@@ -729,7 +722,8 @@ bool sdio_cmd53_read(u32 func, u32 addr, u8 *buf, u32 len, bool incr)
     if (len == 0 || len > 512)
         return false;
 
-    /* DAT recovery is now handled inside sdio_send_cmd() */
+    if (!sdio_wait_data())
+        return false;
 
     sw(REG_BLKSIZECNT, (1 << 16) | len);
     sw(REG_INTERRUPT, INT_ALL);
@@ -739,12 +733,8 @@ bool sdio_cmd53_read(u32 func, u32 addr, u8 *buf, u32 len, bool incr)
         arg |= CMD53_INCR_ADDR;
 
     u32 resp[4];
-    if (!sdio_send_cmd(SDIO_CMD53_R, arg, resp)) {
-        uart_puts("[cmd53r] cmd fail a=");
-        uart_hex(addr);
-        uart_puts("\n");
+    if (!sdio_send_cmd(SDIO_CMD53_R, arg, resp))
         return false;
-    }
 
     /* Wait for read ready */
     u32 timeout = 1000000;
@@ -752,23 +742,14 @@ bool sdio_cmd53_read(u32 func, u32 addr, u8 *buf, u32 len, bool incr)
     do {
         intr = sr(REG_INTERRUPT);
         if (intr & INT_ERROR) {
-            uart_puts("[cmd53r] data err i=");
-            uart_hex(intr);
-            uart_puts(" a=");
-            uart_hex(addr);
-            uart_puts("\n");
             sw(REG_INTERRUPT, INT_ERROR);
             return false;
         }
         delay_cycles(10);
     } while (!(intr & INT_READ_RDY) && timeout--);
 
-    if (!timeout) {
-        uart_puts("[cmd53r] rd_rdy timeout a=");
-        uart_hex(addr);
-        uart_puts("\n");
+    if (!timeout)
         return false;
-    }
 
     /* Read data — 32-bit words, use byte writes for alignment safety */
     u32 words = (len + 3) / 4;
@@ -785,20 +766,8 @@ bool sdio_cmd53_read(u32 func, u32 addr, u8 *buf, u32 len, bool incr)
     timeout = 1000000;
     do {
         intr = sr(REG_INTERRUPT);
-        if (intr & INT_ERROR) {
-            sw(REG_INTERRUPT, INT_ERROR | INT_DATA_DONE);
-            sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
-            while (sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA) delay_cycles(10);
-            return false;
-        }
         delay_cycles(10);
     } while (!(intr & INT_DATA_DONE) && timeout--);
-
-    if (!timeout) {
-        sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
-        while (sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA) delay_cycles(10);
-        return false;
-    }
 
     sw(REG_INTERRUPT, INT_DATA_DONE);
     return true;
@@ -809,7 +778,8 @@ bool sdio_cmd53_write(u32 func, u32 addr, const u8 *buf, u32 len, bool incr)
     if (len == 0 || len > 512)
         return false;
 
-    /* DAT recovery is now handled inside sdio_send_cmd() */
+    if (!sdio_wait_data())
+        return false;
 
     sw(REG_BLKSIZECNT, (1 << 16) | len);
     sw(REG_INTERRUPT, INT_ALL);
@@ -852,20 +822,8 @@ bool sdio_cmd53_write(u32 func, u32 addr, const u8 *buf, u32 len, bool incr)
     timeout = 1000000;
     do {
         intr = sr(REG_INTERRUPT);
-        if (intr & INT_ERROR) {
-            sw(REG_INTERRUPT, INT_ERROR | INT_DATA_DONE);
-            sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
-            while (sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA) delay_cycles(10);
-            return false;
-        }
         delay_cycles(10);
     } while (!(intr & INT_DATA_DONE) && timeout--);
-
-    if (!timeout) {
-        sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
-        while (sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA) delay_cycles(10);
-        return false;
-    }
 
     sw(REG_INTERRUPT, INT_DATA_DONE);
     return true;
@@ -877,6 +835,9 @@ bool sdio_cmd53_read_blocks(u32 func, u32 addr, u8 *buf,
                             u32 blksz, u32 nblks, bool incr)
 {
     if (nblks == 0 || blksz == 0)
+        return false;
+
+    if (!sdio_wait_data())
         return false;
 
     sw(REG_BLKSIZECNT, (nblks << 16) | blksz);
@@ -927,6 +888,9 @@ bool sdio_cmd53_write_blocks(u32 func, u32 addr, const u8 *buf,
                              u32 blksz, u32 nblks, bool incr)
 {
     if (nblks == 0 || blksz == 0)
+        return false;
+
+    if (!sdio_wait_data())
         return false;
 
     sw(REG_BLKSIZECNT, (nblks << 16) | blksz);

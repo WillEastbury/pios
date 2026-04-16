@@ -113,23 +113,13 @@ static bool bp_set_window(u32 addr)
 
 static bool bp_read32(u32 addr, u32 *val)
 {
-    if (!bp_set_window(addr)) {
-        uart_puts("[bp] set_win fail @");
-        uart_hex(addr);
-        uart_puts("\n");
+    if (!bp_set_window(addr))
         return false;
-    }
 
     u32 off = addr & BACKPLANE_WIN_MASK;
     u8 buf[4];
-    if (!sdio_cmd53_read(SDIO_FUNC_BACKPLANE, off | 0x8000, buf, 4, true)) {
-        uart_puts("[bp] cmd53 rd fail off=");
-        uart_hex(off | 0x8000);
-        uart_puts(" addr=");
-        uart_hex(addr);
-        uart_puts("\n");
+    if (!sdio_cmd53_read(SDIO_FUNC_BACKPLANE, off | 0x8000, buf, 4, true))
         return false;
-    }
 
     *val = (u32)buf[0] | ((u32)buf[1] << 8) |
            ((u32)buf[2] << 16) | ((u32)buf[3] << 24);
@@ -200,16 +190,9 @@ static bool core_disable(u32 core_base)
 {
     u32 val;
 
-    /* Check if already in reset — if read fails, assume not in reset and proceed */
-    if (!bp_read32(core_base + CORE_RESETCTRL, &val)) {
-        uart_puts("[cyw] core_dis: RSTCTRL read fail, forcing reset\n");
-        /* Can't read reset state — just try to force disable */
-        bp_write32(core_base + CORE_IOCTRL, 0);
-        delay_cycles(1000);
-        bp_write32(core_base + CORE_RESETCTRL, AIRC_RESET);
-        delay_cycles(1000);
-        return true;
-    }
+    /* Check if already in reset */
+    if (!bp_read32(core_base + CORE_RESETCTRL, &val))
+        return false;
     if (val & AIRC_RESET)
         return true;
 
@@ -231,12 +214,8 @@ static bool core_disable(u32 core_base)
 static bool core_reset(u32 core_base, u32 ioctrl_flags)
 {
     /* Disable first */
-    if (!core_disable(core_base)) {
-        uart_puts("[cyw] core_rst: disable fail @");
-        uart_hex(core_base);
-        uart_puts("\n");
+    if (!core_disable(core_base))
         return false;
-    }
 
     /* Pull out of reset with clocks + flags */
     if (!bp_write32(core_base + CORE_IOCTRL,
@@ -823,6 +802,18 @@ bool cyw43_load_firmware(void)
         return false;
     }
 
+    /* Request ALP clock before backplane access (Circle: cfgw(Clkcsr, ReqALP)) */
+    #define SDIO_CLKCSR  0x1000E
+    #define CLKCSR_ReqALP   0x08
+    #define CLKCSR_ALPavail 0x40
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqALP);
+    for (u32 i = 0; i < 1000; i++) {
+        u8 clk;
+        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk) && (clk & CLKCSR_ALPavail))
+            break;
+        delay_cycles(100000);
+    }
+
     /* Halt ARM core before firmware upload */
     uart_puts("[cyw] halting ARM core...\n");
     if (!bp_write32(CYW_ARM_CORE_BASE + CORE_IOCTRL, SICF_CPUHALT | SICF_CLOCK_EN)) {
@@ -830,6 +821,9 @@ bool cyw43_load_firmware(void)
         return false;
     }
     delay_cycles(100000);
+
+    /* Clear stuck DAT_INHIBIT from ARM halt write */
+    sdio_reset_data_line();
 
     /* Reset and enable SOCSRAM */
     if (!core_reset(CYW_SOCSRAM_BASE, 0)) {

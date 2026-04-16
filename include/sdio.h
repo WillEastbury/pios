@@ -145,3 +145,6 @@ bool sdio_set_bus_width_4bit(void);
 /* Power control */
 void sdio_power_on(void);
 void sdio_power_off(void);
+
+/* Reset DATA line (clears DAT_INHIBIT after stuck transfers) */
+void sdio_reset_data_line(void);
