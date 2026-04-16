@@ -31,3 +31,6 @@ arm-toolchain/
 # Debug
 *.log
 core.*
+
+# WiFi credentials (add manually, never commit)
+wifi_config.h

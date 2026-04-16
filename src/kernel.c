@@ -1236,9 +1236,8 @@ static void ui_cmd_fsinspect(const char *path)
     }
 }
 
-/* ── WiFi defaults ── */
-#define WIFI_DEFAULT_SSID       "Bussy_5G"
-#define WIFI_DEFAULT_PASS       "Whatever1"
+/* ── WiFi defaults (from gitignored wifi_config.h) ── */
+#include "../wifi_config.h"
 
 static bool wifi_active;
 
