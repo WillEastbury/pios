@@ -767,13 +767,6 @@ bool cyw43_init(void)
     }
     sdio_set_block_size(SDIO_FUNC_BACKPLANE, SDIO_FUNC1_BLKSZ);
 
-    /* Enable WLAN data function (func 2) */
-    if (!sdio_enable_func(SDIO_FUNC_WLAN)) {
-        uart_puts("[cyw] f2 enable fail\n");
-        return false;
-    }
-    sdio_set_block_size(SDIO_FUNC_WLAN, SDIO_FUNC2_BLKSZ);
-
     /* Enable 4-bit SDIO bus */
     sdio_set_bus_width_4bit();
 
@@ -783,9 +776,11 @@ bool cyw43_init(void)
         return false;
     }
 
-    /* Enable function interrupts */
+    /* Enable function interrupts for backplane */
     sdio_enable_func_irq(SDIO_FUNC_BACKPLANE);
-    sdio_enable_func_irq(SDIO_FUNC_WLAN);
+
+    /* NOTE: func 2 (WLAN) is enabled AFTER firmware load in cyw43_load_firmware(),
+     * because the WLAN function won't be ready until firmware boots. */
 
     uart_puts("[cyw] init OK\n");
     return true;
@@ -915,6 +910,14 @@ bool cyw43_load_firmware(void)
         uart_puts("[cyw] firmware boot timeout\n");
         return false;
     }
+
+    /* Enable WLAN data function (func 2) — now that firmware is running */
+    if (!sdio_enable_func(SDIO_FUNC_WLAN)) {
+        uart_puts("[cyw] f2 enable fail (post-fw)\n");
+        return false;
+    }
+    sdio_set_block_size(SDIO_FUNC_WLAN, SDIO_FUNC2_BLKSZ);
+    sdio_enable_func_irq(SDIO_FUNC_WLAN);
 
     /* Load CLM blob via 'clmload' iovar */
     {
