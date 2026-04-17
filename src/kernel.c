@@ -590,6 +590,7 @@ static void bp_timestamp(void) {
     u64 ms = timer_monotonic_ms();
     u32 sec = (u32)(ms / 1000);
     u32 frac = (u32)(ms % 1000);
+    fb_set_cursor(0, bp_log_y);
     fb_printf("[%3d.%03d] ", sec, frac);
 }
 
@@ -598,7 +599,7 @@ static void bp_log(const char *msg) {
     fb_set_color(BOOT_FG_LOG, BOOT_BLACK);
     bp_timestamp();
     fb_puts(msg);
-    fb_putc('\n');
+    bp_log_y++;
     bp_uart_line("[diag] ", msg);
 }
 
@@ -607,7 +608,7 @@ static void bp_ok(const char *msg) {
     fb_set_color(BOOT_FG_OK, BOOT_BLACK);
     bp_timestamp();
     fb_puts(msg);
-    fb_putc('\n');
+    bp_log_y++;
     bp_uart_line("[ok] ", msg);
 }
 
@@ -616,7 +617,7 @@ static void bp_err(const char *msg) {
     fb_set_color(BOOT_FG_FAIL, BOOT_BLACK);
     bp_timestamp();
     fb_puts(msg);
-    fb_putc('\n');
+    bp_log_y++;
     bp_uart_line("[err] ", msg);
 }
 
@@ -625,7 +626,7 @@ static void bp_warn(const char *msg) {
     fb_set_color(BOOT_YELLOW, BOOT_BLACK);
     bp_timestamp();
     fb_puts(msg);
-    fb_putc('\n');
+    bp_log_y++;
     bp_uart_line("[warn] ", msg);
 }
 

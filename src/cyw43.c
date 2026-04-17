@@ -209,6 +209,8 @@ UNUSED static bool bp_read_buf(u32 addr, u8 *buf, u32 len)
 
 static bool bp_write_buf(u32 addr, const u8 *buf, u32 len)
 {
+    /* Use CMD52 byte-at-a-time — CMD53 DAT transfers hang on this controller.
+     * Slower but reliable. ~30-60s for 600KB firmware at 25MHz. */
     while (len > 0) {
         if (!bp_set_window(addr))
             return false;
@@ -216,11 +218,11 @@ static bool bp_write_buf(u32 addr, const u8 *buf, u32 len)
         u32 off = addr & BACKPLANE_WIN_MASK;
         u32 chunk = BACKPLANE_WIN_SIZE - off;
         if (chunk > len) chunk = len;
-        if (chunk > 512) chunk = 512;
 
-        if (!sdio_cmd53_write(SDIO_FUNC_BACKPLANE, off | 0x8000,
-                              buf, chunk, true))
-            return false;
+        for (u32 i = 0; i < chunk; i++) {
+            if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + i, buf[i]))
+                return false;
+        }
 
         addr += chunk;
         buf += chunk;
