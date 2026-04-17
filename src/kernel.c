@@ -585,55 +585,47 @@ static void bp_spin(void) {
     bp_spin_idx++;
 }
 
-/* Append a line to the scrolling boot log below the phase list */
+/* Print uptime prefix: [  0.123] */
+static void bp_timestamp(void) {
+    u64 ms = timer_monotonic_ms();
+    u32 sec = (u32)(ms / 1000);
+    u32 frac = (u32)(ms % 1000);
+    fb_printf("[%3d.%03d] ", sec, frac);
+}
+
+/* Append a line to the scrolling boot log */
 static void bp_log(const char *msg) {
-    bp_update_pc();
-    bp_spin();
-    u32 max_rows = 768 / 8;
-    if (bp_log_y >= max_rows) return;
-    fb_set_cursor(1, bp_log_y);
     fb_set_color(BOOT_FG_LOG, BOOT_BLACK);
+    bp_timestamp();
     fb_puts(msg);
-    bp_log_y++;
+    fb_putc('\n');
     bp_uart_line("[diag] ", msg);
 }
 
 /* Green log — success */
 static void bp_ok(const char *msg) {
-    bp_update_pc();
-    bp_spin();
-    u32 max_rows = 768 / 8;
-    if (bp_log_y >= max_rows) return;
-    fb_set_cursor(1, bp_log_y);
     fb_set_color(BOOT_FG_OK, BOOT_BLACK);
+    bp_timestamp();
     fb_puts(msg);
-    bp_log_y++;
+    fb_putc('\n');
     bp_uart_line("[ok] ", msg);
 }
 
 /* Red log — error */
 static void bp_err(const char *msg) {
-    bp_update_pc();
-    bp_spin();
-    u32 max_rows = 768 / 8;
-    if (bp_log_y >= max_rows) return;
-    fb_set_cursor(1, bp_log_y);
     fb_set_color(BOOT_FG_FAIL, BOOT_BLACK);
+    bp_timestamp();
     fb_puts(msg);
-    bp_log_y++;
+    fb_putc('\n');
     bp_uart_line("[err] ", msg);
 }
 
 /* Yellow log — warning */
 static void bp_warn(const char *msg) {
-    bp_update_pc();
-    bp_spin();
-    u32 max_rows = 768 / 8;
-    if (bp_log_y >= max_rows) return;
-    fb_set_cursor(1, bp_log_y);
     fb_set_color(BOOT_YELLOW, BOOT_BLACK);
+    bp_timestamp();
     fb_puts(msg);
-    bp_log_y++;
+    fb_putc('\n');
     bp_uart_line("[warn] ", msg);
 }
 
@@ -4459,9 +4451,6 @@ NORETURN void core0_main(void) {
     /* Serial-only console */
     uart_puts("\r\nPIOS Console ready. Type 'help'.\r\n> ");
 
-    /* Spinner goes purple — OS is running */
-    spin_set_color(SPIN_PURPLE);
-
     /* RP1 UART0 direct register addresses for RX polling */
     u64 rp1_fr = 0x1F00030000UL + 0x18;  /* FR register */
     u64 rp1_dr = 0x1F00030000UL + 0x00;  /* DR register */
@@ -4499,11 +4488,6 @@ NORETURN void core0_main(void) {
 
         /* USB keyboard (when available) */
         ui_handle_keys();
-
-        /* Update spinner frequently */
-        if ((spin_counter & 0x3FFFF) == 0)
-            spin_update();
-        spin_counter++;
 
         /* Periodic serial heartbeat every ~10M iterations */
         if ((env->poll_count & 0xFFFFFF) == 0 && env->poll_count > 0) {
