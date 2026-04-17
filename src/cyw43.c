@@ -108,6 +108,12 @@ static struct cyw_scan_result scan_results[CYW_MAX_SCAN_RESULTS];
 static u32 scan_count;
 static bool scan_in_progress;
 
+/* Discovered core addresses (from EROM scan) */
+static u32 cyw_arm_ctl;
+static u32 cyw_d11_ctl;
+static u32 cyw_sram_ctl;
+static u32 cyw_sdio_regs;
+
 /* ── Backplane access ── */
 
 static bool bp_set_window(u32 addr)
@@ -738,25 +744,93 @@ static bool cyw43_backplane_init(void)
     delay_cycles(30000);
     uart_puts("[cyw] ALP ok\n");
 
+    /* Core scan: read EROM to discover actual core addresses */
+    u32 eromptr;
+    if (!bp_read32(CYW_CHIPCOMMON_BASE + 0xFC, &eromptr)) {
+        uart_puts("[cyw] EROMPTR fail\n");
+        return false;
+    }
+    uart_puts("[cyw] EROM=");
+    uart_hex(eromptr);
+    uart_puts("\n");
+
+    /* Parse EROM entries to find ARM, D11, SOCSRAM, SDIOD cores */
+    u32 arm_ctl = 0, d11_ctl = 0, sram_ctl = 0, sdio_regs = 0;
+    u32 coreid = 0;
+    for (u32 i = 0; i < 512; i += 4) {
+        u32 entry;
+        if (!bp_read32(eromptr + i, &entry))
+            break;
+        u32 tag = entry & 0xF;
+        if (tag == 0xF) break;  /* end marker */
+        if (tag == 0x1) {  /* component info */
+            u32 next;
+            if (!bp_read32(eromptr + i + 4, &next)) break;
+            if ((next & 0xF) == 0x1) {
+                coreid = ((entry >> 4) | ((entry >> 8) & 0xFF00)) & 0xFFF;
+                i += 4;
+            }
+        } else if (tag == 0x5) {  /* address descriptor */
+            u32 addr = ((entry >> 8) & 0xFFFFF0) << 8;
+            addr &= ~0xFFFU;
+            bool is_ctl = (entry & 0xC0) != 0;
+            switch (coreid) {
+            case 0x83C: case 0x83E:  /* ARM CR4 / CA7 */
+                if (is_ctl && !arm_ctl) arm_ctl = addr;
+                break;
+            case 0x80E:  /* SOCSRAM */
+                if (is_ctl && !sram_ctl) sram_ctl = addr;
+                break;
+            case 0x812:  /* D11 */
+                if (is_ctl && !d11_ctl) d11_ctl = addr;
+                break;
+            case 0x829:  /* SDIOD */
+                if (!is_ctl && !sdio_regs) sdio_regs = addr;
+                break;
+            }
+        }
+    }
+
+    uart_puts("[cyw] ARM=");
+    uart_hex(arm_ctl);
+    uart_puts(" D11=");
+    uart_hex(d11_ctl);
+    uart_puts(" SRAM=");
+    uart_hex(sram_ctl);
+    uart_puts(" SDIO=");
+    uart_hex(sdio_regs);
+    uart_puts("\n");
+
+    if (!arm_ctl || !sram_ctl) {
+        uart_puts("[cyw] core scan fail\n");
+        return false;
+    }
+
+    /* Store discovered addresses for firmware load */
+    cyw_arm_ctl = arm_ctl;
+    cyw_d11_ctl = d11_ctl;
+    cyw_sram_ctl = sram_ctl;
+    cyw_sdio_regs = sdio_regs;
+
     /* Halt ARM CR4 core */
-    if (!core_reset(CYW_ARM_CORE_BASE, SICF_CPUHALT)) {
+    if (!core_reset(cyw_arm_ctl, SICF_CPUHALT)) {
         uart_puts("[cyw] ARM!\n");
         return false;
     }
 
     /* Reset D11 802.11 MAC core */
-    if (!core_reset(CYW_D11_CORE_BASE, 4)) {
+    if (cyw_d11_ctl && !core_reset(cyw_d11_ctl, 4)) {
         uart_puts("[cyw] D11!\n");
         return false;
     }
 
     /* Reset SOCSRAM, disable remap */
-    if (!core_reset(CYW_SOCSRAM_BASE, 0)) {
+    if (!core_reset(cyw_sram_ctl, 0)) {
         uart_puts("[cyw] SRAM!\n");
         return false;
     }
-    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_IDX, 0x03);
-    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
+    bp_write32(cyw_sram_ctl + SOCSRAM_BANKX_IDX, 0x03);
+    bp_write32(cyw_sram_ctl + SOCSRAM_BANKX_PDA, 0);
 
     /* Clear pull-ups/pull-downs */
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_PULLUPS, 0);
@@ -914,10 +988,10 @@ bool cyw43_load_firmware(void)
     }
 
     /* Clear SDIOD interrupt status before ARM reset */
-    bp_write32(CYW_SDIOD_CORE_BASE + SDIOD_INTSTATUS, 0xFFFFFFFF);
+    bp_write32(cyw_sdio_regs + SDIOD_INTSTATUS, 0xFFFFFFFF);
 
     /* Reset ARM core to start firmware */
-    if (!core_reset(CYW_ARM_CORE_BASE, 0)) {
+    if (!core_reset(cyw_arm_ctl, 0)) {
         uart_puts("[cyw] ARM reset fail\n");
         return false;
     }
@@ -949,10 +1023,10 @@ bool cyw43_load_firmware(void)
     uart_puts("[cyw] HT ok\n");
 
     /* Set protocol version */
-    bp_write32(CYW_SDIOD_CORE_BASE + SDIOD_SBMBOXDATA, 4 << 16);
+    bp_write32(cyw_sdio_regs + SDIOD_SBMBOXDATA, 4 << 16);
 
     /* Set interrupt mask: Fcchange|FrameInt|MailboxInt */
-    bp_write32(CYW_SDIOD_CORE_BASE + SDIOD_INTMASK, 0xE0);
+    bp_write32(cyw_sdio_regs + SDIOD_INTMASK, 0xE0);
 
     /* Enable WLAN data function (func 2) — now that firmware is running */
     if (!sdio_enable_func(SDIO_FUNC_WLAN)) {
