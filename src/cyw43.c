@@ -947,6 +947,7 @@ bool cyw43_load_firmware(void)
         while (offset < fw.file_size) {
             u32 chunk = fw.file_size - offset;
             if (chunk > FW_UPLOAD_BLKSZ) chunk = FW_UPLOAD_BLKSZ;
+            if (offset == 0) uart_puts("[cyw] reading...\n");
             u32 got = fat32_read(&fw, fw_chunk, chunk);
             if (got == 0) {
                 uart_puts("[cyw] fw read err @");
