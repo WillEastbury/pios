@@ -134,15 +134,24 @@ static bool bp_set_window(u32 addr)
 /* CMD52-based 4-byte backplane read — avoids DAT line entirely */
 static bool bp_read32(u32 addr, u32 *val)
 {
-    if (!bp_set_window(addr))
+    if (!bp_set_window(addr)) {
+        uart_puts("[bpr] win fail @");
+        uart_hex(addr);
+        uart_puts("\n");
         return false;
+    }
 
     u32 off = addr & BACKPLANE_WIN_MASK;
     u8 b0, b1, b2, b3;
-    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 0, &b0)) return false;
-    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 1, &b1)) return false;
-    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 2, &b2)) return false;
-    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 3, &b3)) return false;
+    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000), &b0)) {
+        uart_puts("[bpr] r52 fail off=");
+        uart_hex(off);
+        uart_puts("\n");
+        return false;
+    }
+    sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 1, &b1);
+    sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 2, &b2);
+    sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 3, &b3);
     *val = (u32)b0 | ((u32)b1 << 8) | ((u32)b2 << 16) | ((u32)b3 << 24);
     return true;
 }
@@ -150,11 +159,20 @@ static bool bp_read32(u32 addr, u32 *val)
 /* CMD52-based 4-byte backplane write — avoids DAT line entirely */
 static bool bp_write32(u32 addr, u32 val)
 {
-    if (!bp_set_window(addr))
+    if (!bp_set_window(addr)) {
+        uart_puts("[bpw] win fail @");
+        uart_hex(addr);
+        uart_puts("\n");
         return false;
+    }
 
     u32 off = addr & BACKPLANE_WIN_MASK;
-    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 0, (u8)(val & 0xFF))) return false;
+    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 0, (u8)(val & 0xFF))) {
+        uart_puts("[bpw] w52 fail off=");
+        uart_hex(off);
+        uart_puts("\n");
+        return false;
+    }
     if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 1, (u8)((val >> 8) & 0xFF))) return false;
     if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 2, (u8)((val >> 16) & 0xFF))) return false;
     if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 3, (u8)((val >> 24) & 0xFF))) return false;
@@ -703,21 +721,7 @@ static bool upload_nvram(const u8 *nvram, u32 nvram_len)
 
 static bool cyw43_backplane_init(void)
 {
-    /* Halt ARM CR4 core */
-    if (!core_reset(CYW_ARM_CORE_BASE, SICF_CPUHALT))
-        return false;
-
-    /* Reset D11 802.11 MAC core */
-    if (!core_reset(CYW_D11_CORE_BASE, 4))
-        return false;
-
-    /* Reset SOCSRAM, disable remap */
-    if (!core_reset(CYW_SOCSRAM_BASE, 0))
-        return false;
-    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_IDX, 0x03);
-    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
-
-    /* ALP clock setup (Circle sbinit) */
+    /* ALP clock MUST be active before accessing core wrappers */
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, 0);
     delay_cycles(5000);
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR,
@@ -733,6 +737,26 @@ static bool cyw43_backplane_init(void)
                      CLKCSR_Nohwreq | CLKCSR_ForceALP);
     delay_cycles(30000);
     uart_puts("[cyw] ALP ok\n");
+
+    /* Halt ARM CR4 core */
+    if (!core_reset(CYW_ARM_CORE_BASE, SICF_CPUHALT)) {
+        uart_puts("[cyw] ARM!\n");
+        return false;
+    }
+
+    /* Reset D11 802.11 MAC core */
+    if (!core_reset(CYW_D11_CORE_BASE, 4)) {
+        uart_puts("[cyw] D11!\n");
+        return false;
+    }
+
+    /* Reset SOCSRAM, disable remap */
+    if (!core_reset(CYW_SOCSRAM_BASE, 0)) {
+        uart_puts("[cyw] SRAM!\n");
+        return false;
+    }
+    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_IDX, 0x03);
+    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
 
     /* Clear pull-ups/pull-downs */
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_PULLUPS, 0);
