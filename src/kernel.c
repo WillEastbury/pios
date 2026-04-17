@@ -96,8 +96,8 @@ u32 pios_strlen(const char *s) {
 
 /* ---- Network configuration (static - no ARP/DHCP) ---- */
 
-#define MY_IP       IP4(192, 168, 0, 101)
-#define MY_GW       IP4(192, 168, 0, 1)
+#define MY_IP       IP4(192, 168, 3, 1)
+#define MY_GW       IP4(192, 168, 3, 1)
 #define MY_MASK     IP4(255, 255, 255, 0)
 
 /* Gateway MAC - MUST be configured (no ARP to discover it) */
@@ -1341,7 +1341,7 @@ static void ui_cmd_wifi(u32 argc, char **argv)
                 ui_console_write("OK: dhcp lease applied\n");
             } else {
                 ui_console_write("WARN: DHCP failed, using static IP\n");
-                net_init(MY_IP, MY_GW, MY_MASK, NULL);
+                net_init(IP4(192,168,4,1), IP4(192,168,4,1), MY_MASK, NULL);
                 ui_cfg_dhcp = false;
             }
         } else {
