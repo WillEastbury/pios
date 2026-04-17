@@ -113,6 +113,7 @@ static u32 cyw_arm_ctl;
 static u32 cyw_d11_ctl;
 static u32 cyw_sram_ctl;
 static u32 cyw_sdio_regs;
+static u32 cyw_ram_base = CYW_RAM_BASE;  /* default, updated from EROM */
 
 /* ── Backplane access ── */
 
@@ -707,14 +708,14 @@ static bool upload_nvram(const u8 *nvram, u32 nvram_len)
     u32 nvram_offset = ram_size - 4 - clen;
     nvram_offset &= ~0x3U;  /* word-align */
 
-    if (!bp_write_buf(CYW_RAM_BASE + nvram_offset, nvram_condensed, clen)) {
+    if (!bp_write_buf(cyw_ram_base + nvram_offset, nvram_condensed, clen)) {
         uart_puts("[cyw] NVRAM write fail\n");
         return false;
     }
 
     /* Write length token: complement of size-in-words in upper 16 bits */
     u32 token = (~(clen / 4) << 16) | (clen / 4);
-    if (!bp_write32(CYW_RAM_BASE + ram_size - 4, token)) {
+    if (!bp_write32(cyw_ram_base + ram_size - 4, token)) {
         uart_puts("[cyw] NVRAM token fail\n");
         return false;
     }
@@ -757,7 +758,7 @@ static bool cyw43_backplane_init(void)
     uart_puts("\n");
 
     /* Parse EROM entries to find ARM, D11, SOCSRAM, SDIOD cores */
-    u32 arm_ctl = 0, d11_ctl = 0, sram_ctl = 0, sdio_regs = 0;
+    u32 arm_ctl = 0, arm_regs = 0, d11_ctl = 0, sram_ctl = 0, sdio_regs = 0;
     u32 coreid = 0;
     for (u32 i = 0; i < 512; i += 4) {
         u32 entry;
@@ -777,13 +778,12 @@ static bool cyw43_backplane_init(void)
         } else if (tag == 0x5) {  /* address descriptor */
             u32 addr = entry & 0xFFFFF000U;
             bool is_ctl = (entry & 0xC0) != 0;
-            if (is_ctl) {
-                uart_puts(" @");
-                uart_hex(addr);
-            }
+            uart_puts(is_ctl ? " W" : " M");
+            uart_hex(addr);
             switch (coreid) {
             case 0x83C: case 0x83E:  /* ARM CR4 / CA7 */
                 if (is_ctl && !arm_ctl) arm_ctl = addr;
+                if (!is_ctl && !arm_regs) arm_regs = addr;
                 break;
             case 0x80E: case 0x135:  /* SOCSRAM / SOCRAM-es */
                 if (is_ctl && !sram_ctl) sram_ctl = addr;
@@ -800,8 +800,8 @@ static bool cyw43_backplane_init(void)
 
     uart_puts("[cyw] ARM=");
     uart_hex(arm_ctl);
-    uart_puts(" D11=");
-    uart_hex(d11_ctl);
+    uart_puts(" r=");
+    uart_hex(arm_regs);
     uart_puts(" SRAM=");
     uart_hex(sram_ctl);
     uart_puts(" SDIO=");
@@ -818,6 +818,8 @@ static bool cyw43_backplane_init(void)
     cyw_d11_ctl = d11_ctl;
     cyw_sram_ctl = sram_ctl;
     cyw_sdio_regs = sdio_regs;
+    /* CR4: RAM base = ARM regs address (Circle: rambase = armregs) */
+    if (arm_regs) cyw_ram_base = arm_regs;
 
     /* Halt ARM CR4 core */
     if (!core_reset(cyw_arm_ctl, SICF_CPUHALT)) {
@@ -931,7 +933,7 @@ bool cyw43_load_firmware(void)
     }
 
     /* Clear end of RAM before upload */
-    bp_write32(CYW_RAM_BASE + CYW_RAM_SIZE - 4, 0);
+    bp_write32(cyw_ram_base + CYW_RAM_SIZE - 4, 0);
 
     /* Upload firmware binary */
     {
@@ -957,7 +959,7 @@ bool cyw43_load_firmware(void)
                 fat32_close(&fw);
                 return false;
             }
-            if (!bp_write_buf(CYW_RAM_BASE + offset, fw_chunk, got)) {
+            if (!bp_write_buf(cyw_ram_base + offset, fw_chunk, got)) {
                 uart_puts("[cyw] fw wr err @");
                 uart_hex(offset);
                 uart_puts("\n");
