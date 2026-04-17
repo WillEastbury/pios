@@ -705,14 +705,17 @@ static bool cyw43_backplane_init(void)
     /* Halt ARM CR4 core */
     if (!core_reset(CYW_ARM_CORE_BASE, SICF_CPUHALT))
         return false;
+    sdio_reset_data_line();
 
     /* Reset D11 802.11 MAC core */
     if (!core_reset(CYW_D11_CORE_BASE, 4))
         return false;
+    sdio_reset_data_line();
 
     /* Reset SOCSRAM, disable remap */
     if (!core_reset(CYW_SOCSRAM_BASE, 0))
         return false;
+    sdio_reset_data_line();
     bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_IDX, 0x03);
     bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
 
