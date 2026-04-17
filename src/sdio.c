@@ -153,12 +153,18 @@ static bool sdio_wait_cmd(void)
 
 static bool sdio_wait_data(void)
 {
-    for (u32 i = 0; i < 1000000; i++) {
+    for (u32 i = 0; i < 100000; i++) {
         if (!(sr(REG_STATUS) & SR_DAT_INHIBIT))
             return true;
         delay_cycles(10);
     }
-    return false;
+    /* Try DATA reset to recover */
+    sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
+    u32 t = 100000;
+    while ((sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA) && t--)
+        delay_cycles(10);
+    sw(REG_INTERRUPT, 0xFFFFFFFF);
+    return !(sr(REG_STATUS) & SR_DAT_INHIBIT);
 }
 
 static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
@@ -835,8 +841,21 @@ bool sdio_cmd53_write(u32 func, u32 addr, const u8 *buf, u32 len, bool incr)
     timeout = 1000000;
     do {
         intr = sr(REG_INTERRUPT);
+        if (intr & INT_ERROR) {
+            sw(REG_INTERRUPT, INT_ERROR | INT_DATA_DONE);
+            sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
+            while (sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA) delay_cycles(10);
+            return false;
+        }
         delay_cycles(10);
     } while (!(intr & INT_DATA_DONE) && timeout--);
+
+    if (!timeout) {
+        sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
+        while (sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA) delay_cycles(10);
+        sw(REG_INTERRUPT, 0xFFFFFFFF);
+        return false;
+    }
 
     sw(REG_INTERRUPT, INT_DATA_DONE);
     return true;
