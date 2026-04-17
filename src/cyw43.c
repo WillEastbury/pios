@@ -767,12 +767,11 @@ static bool cyw43_backplane_init(void)
             u32 next;
             if (!bp_read32(eromptr + i + 4, &next)) break;
             if ((next & 0xF) == 0x1) {
-                coreid = ((entry >> 4) | ((entry >> 8) & 0xFF00)) & 0xFFF;
+                coreid = (entry >> 8) & 0xFFF;
                 i += 4;
             }
         } else if (tag == 0x5) {  /* address descriptor */
-            u32 addr = ((entry >> 8) & 0xFFFFF0) << 8;
-            addr &= ~0xFFFU;
+            u32 addr = entry & 0xFFFFF000U;
             bool is_ctl = (entry & 0xC0) != 0;
             switch (coreid) {
             case 0x83C: case 0x83E:  /* ARM CR4 / CA7 */
