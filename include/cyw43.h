@@ -25,10 +25,13 @@
 
 /* ── Silicon Backplane (AXI) core addresses ── */
 #define CYW_CHIPCOMMON_BASE     0x18000000
+#define CYW_D11_CORE_BASE      0x18001000
 #define CYW_SDIO_DEV_BASE      0x18002000
+#define CYW_SDIOD_CORE_BASE    0x18002000
 #define CYW_ARM_CORE_BASE      0x18003000
 #define CYW_SOCSRAM_BASE       0x18004000
 #define CYW_RAM_BASE            0x00198000
+#define CYW_RAM_SIZE            0x80000
 
 /* Backplane window register (via SDIO func 1, CMD52) */
 #define CYW_BAK_WIN_ADDR        0x1000A

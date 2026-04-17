@@ -58,6 +58,26 @@
 #define SOCSRAM_BANKX_IDX       0x10
 #define SOCSRAM_BANKX_PDA       0x44
 
+/* Clock control status register (SDIO func 1) */
+#define SDIO_CLKCSR             0x1000E
+#define SDIO_PULLUPS            0x1000F
+#define CLKCSR_ForceALP         0x01
+#define CLKCSR_ForceHT          0x02
+#define CLKCSR_ReqALP           0x08
+#define CLKCSR_ReqHT            0x10
+#define CLKCSR_Nohwreq          0x20
+#define CLKCSR_ALPavail         0x40
+#define CLKCSR_HTavail          0x80
+
+/* Chipcommon GPIO pull registers */
+#define CC_GPIOPULLUP           0x58
+#define CC_GPIOPULLDOWN         0x5C
+
+/* SDIOD core register offsets */
+#define SDIOD_INTSTATUS         0x20
+#define SDIOD_INTMASK           0x24
+#define SDIOD_SBMBOXDATA        0x48
+
 /* Firmware upload block size */
 #define FW_UPLOAD_BLKSZ         64
 #define SDIO_FUNC1_BLKSZ        64
@@ -622,43 +642,7 @@ static void handle_event(const u8 *data, u32 len)
 
 /* ── Firmware upload ── */
 
-/*
- * Upload firmware blob to chip RAM via backplane writes.
- * Firmware is loaded from walfs at /sys/wifi/firmware.bin.
- * For initial bring-up we just verify the upload path works
- * and rely on the chip's ROM firmware for basic ops.
- */
-UNUSED static bool upload_firmware(const u8 *fw, u32 fw_len)
-{
-    uart_puts("[cyw] uploading fw (");
-    uart_hex(fw_len);
-    uart_puts(" B)...\n");
-
-    /* Halt the ARM core */
-    if (!core_disable(CYW_ARM_CORE_BASE)) {
-        uart_puts("[cyw] ARM halt fail\n");
-        return false;
-    }
-
-    /* Enable SOCSRAM */
-    if (!core_reset(CYW_SOCSRAM_BASE, 0)) {
-        uart_puts("[cyw] SOCSRAM fail\n");
-        return false;
-    }
-
-    /* Disable remap (if any) */
-    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_IDX, 0x03);
-    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
-
-    /* Write firmware to chip RAM */
-    if (!bp_write_buf(CYW_RAM_BASE, fw, fw_len)) {
-        uart_puts("[cyw] fw write fail\n");
-        return false;
-    }
-
-    uart_puts("[cyw] fw uploaded\n");
-    return true;
-}
+/* upload_nvram is called from cyw43_load_firmware below */
 
 static bool upload_nvram(const u8 *nvram, u32 nvram_len)
 {
@@ -708,36 +692,53 @@ static bool upload_nvram(const u8 *nvram, u32 nvram_len)
         return false;
     }
 
-    uart_puts("[cyw] NVRAM ok (condensed ");
+    uart_puts("[cyw] nvram ");
     uart_hex(clen);
-    uart_puts(" B)\n");
+    uart_puts("B\n");
     return true;
 }
 
-UNUSED static bool boot_firmware(void)
+/* ── Backplane init (Issue #65) ── */
+
+static bool cyw43_backplane_init(void)
 {
-    /* Release ARM core from reset */
-    if (!core_reset(CYW_ARM_CORE_BASE, 0)) {
-        uart_puts("[cyw] ARM reset fail\n");
+    /* Halt ARM CR4 core */
+    if (!core_reset(CYW_ARM_CORE_BASE, SICF_CPUHALT))
         return false;
-    }
 
-    /* Wait for firmware to signal ready via HT clock */
-    uart_puts("[cyw] wait fw ready...\n");
-    u32 timeout = 500;
-    while (timeout--) {
-        u8 status;
-        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SB_INT_STATUS, &status)) {
-            if (status & 0x80) {  /* HT available */
-                uart_puts("[cyw] fw running\n");
-                return true;
-            }
-        }
-        delay_cycles(100000);
-    }
+    /* Reset D11 802.11 MAC core */
+    if (!core_reset(CYW_D11_CORE_BASE, 4))
+        return false;
 
-    uart_puts("[cyw] fw boot timeout\n");
-    return false;
+    /* Reset SOCSRAM, disable remap */
+    if (!core_reset(CYW_SOCSRAM_BASE, 0))
+        return false;
+    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_IDX, 0x03);
+    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
+
+    /* ALP clock setup (Circle sbinit) */
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, 0);
+    delay_cycles(5000);
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR,
+                     CLKCSR_Nohwreq | CLKCSR_ReqALP);
+    for (u32 i = 0; i < 1000; i++) {
+        u8 clk;
+        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk) &&
+            (clk & (CLKCSR_ALPavail | CLKCSR_HTavail)))
+            break;
+        delay_cycles(5000);
+    }
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR,
+                     CLKCSR_Nohwreq | CLKCSR_ForceALP);
+    delay_cycles(30000);
+    uart_puts("[cyw] ALP ok\n");
+
+    /* Clear pull-ups/pull-downs */
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_PULLUPS, 0);
+    bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLUP, 0);
+    bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLDOWN, 0);
+
+    return true;
 }
 
 /* ── Public API ── */
@@ -776,6 +777,12 @@ bool cyw43_init(void)
         return false;
     }
 
+    /* Backplane init: halt ARM, reset cores, setup clocks */
+    if (!cyw43_backplane_init()) {
+        uart_puts("[cyw] bp fail\n");
+        return false;
+    }
+
     /* Enable function interrupts for backplane */
     sdio_enable_func_irq(SDIO_FUNC_BACKPLANE);
 
@@ -802,47 +809,27 @@ bool cyw43_load_firmware(void)
         return false;
     }
 
-    /* Request ALP clock before backplane access (Circle: cfgw(Clkcsr, ReqALP)) */
-    #define SDIO_CLKCSR  0x1000E
-    #define CLKCSR_ReqALP   0x08
-    #define CLKCSR_ALPavail 0x40
+    /* Request ALP clock for backplane memory access */
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqALP);
     for (u32 i = 0; i < 1000; i++) {
         u8 clk;
-        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk) && (clk & CLKCSR_ALPavail))
+        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk) &&
+            (clk & CLKCSR_ALPavail))
             break;
-        delay_cycles(100000);
+        delay_cycles(5000);
     }
 
-    /* Halt ARM core before firmware upload */
-    uart_puts("[cyw] halting ARM core...\n");
-    if (!bp_write32(CYW_ARM_CORE_BASE + CORE_IOCTRL, SICF_CPUHALT | SICF_CLOCK_EN)) {
-        uart_puts("[cyw] ARM halt fail\n");
-        return false;
-    }
-    delay_cycles(100000);
-
-    /* Clear stuck DAT_INHIBIT from ARM halt write */
-    sdio_reset_data_line();
-
-    /* Reset and enable SOCSRAM */
-    if (!core_reset(CYW_SOCSRAM_BASE, 0)) {
-        uart_puts("[cyw] SOCSRAM reset fail\n");
-        return false;
-    }
-    /* Disable remap — ensure all RAM banks are accessible */
-    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_IDX, 0x03);
-    bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
-    uart_puts("[cyw] SOCSRAM ready\n");
+    /* Clear end of RAM before upload */
+    bp_write32(CYW_RAM_BASE + CYW_RAM_SIZE - 4, 0);
 
     /* Upload firmware binary */
     {
         fat32_file_t fw;
         if (!fat32_open("/wifi/firmware.bin", &fw)) {
-            uart_puts("[cyw] no wifi/firmware.bin\n");
+            uart_puts("[cyw] no fw\n");
             return false;
         }
-        uart_puts("[cyw] loading fw (");
+        uart_puts("[cyw] fw (");
         uart_hex(fw.file_size);
         uart_puts(" bytes)...\n");
 
@@ -876,7 +863,7 @@ bool cyw43_load_firmware(void)
     {
         fat32_file_t nv;
         if (!fat32_open("/wifi/nvram.txt", &nv)) {
-            uart_puts("[cyw] no nvram.txt, defaults\n");
+            uart_puts("[cyw] nvram def\n");
             static const u8 default_nvram[] =
                 "boardtype=0x0646\0"
                 "boardrev=0x1101\0"
@@ -895,11 +882,14 @@ bool cyw43_load_firmware(void)
             uart_hex(nvram_len);
             uart_puts(" B)\n");
             if (!upload_nvram(nvram_data, nvram_len)) {
-                uart_puts("[cyw] NVRAM upload fail\n");
+                uart_puts("[cyw] nvram fail\n");
                 return false;
             }
         }
     }
+
+    /* Clear SDIOD interrupt status before ARM reset */
+    bp_write32(CYW_SDIOD_CORE_BASE + SDIOD_INTSTATUS, 0xFFFFFFFF);
 
     /* Reset ARM core to start firmware */
     if (!core_reset(CYW_ARM_CORE_BASE, 0)) {
@@ -907,28 +897,41 @@ bool cyw43_load_firmware(void)
         return false;
     }
 
-    /* Wait for firmware to boot — poll HT_AVAIL via func 1 register */
-    uart_puts("[cyw] waiting for firmware...\n");
-    bool fw_ready = false;
-    for (u32 i = 0; i < 500; i++) {
-        u8 status_val;
-        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, 0x1000E, &status_val)) {
-            if (status_val & 0x80) {  /* HT_AVAIL */
-                fw_ready = true;
-                uart_puts("[cyw] firmware ready (HT_AVAIL)\n");
-                break;
-            }
+    /* sbenable: request HT clock and wait (Issue #67) */
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, 0);
+    delay_cycles(500000);
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqHT);
+    bool ht_ok = false;
+    for (u32 i = 0; i < 50; i++) {
+        u8 clk;
+        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk) &&
+            (clk & CLKCSR_HTavail)) {
+            ht_ok = true;
+            break;
         }
-        delay_cycles(500000);  /* ~5ms per iteration, up to ~2.5s total */
+        delay_cycles(5000000);
     }
-    if (!fw_ready) {
-        uart_puts("[cyw] firmware boot timeout\n");
+    if (!ht_ok) {
+        uart_puts("[cyw] HT timeout\n");
         return false;
     }
+    {
+        u8 clk;
+        sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk);
+        sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR,
+                         clk | CLKCSR_ForceHT);
+    }
+    uart_puts("[cyw] HT ok\n");
+
+    /* Set protocol version */
+    bp_write32(CYW_SDIOD_CORE_BASE + SDIOD_SBMBOXDATA, 4 << 16);
+
+    /* Set interrupt mask: Fcchange|FrameInt|MailboxInt */
+    bp_write32(CYW_SDIOD_CORE_BASE + SDIOD_INTMASK, 0xE0);
 
     /* Enable WLAN data function (func 2) — now that firmware is running */
     if (!sdio_enable_func(SDIO_FUNC_WLAN)) {
-        uart_puts("[cyw] f2 enable fail (post-fw)\n");
+        uart_puts("[cyw] f2 fail\n");
         return false;
     }
     sdio_set_block_size(SDIO_FUNC_WLAN, SDIO_FUNC2_BLKSZ);
@@ -975,14 +978,14 @@ bool cyw43_load_firmware(void)
                 offset += chunk;
             }
             fat32_close(&clm);
-            if (clm_ok) uart_puts("[cyw] CLM loaded\n");
-            else uart_puts("[cyw] CLM load failed (non-fatal)\n");
+            if (clm_ok) uart_puts("[cyw] CLM ok\n");
+            else uart_puts("[cyw] CLM fail\n");
         } else {
-            uart_puts("[cyw] no CLM blob (non-fatal)\n");
+            uart_puts("[cyw] no CLM\n");
         }
     }
 
-    uart_puts("[cyw] fw loaded OK\n");
+    uart_puts("[cyw] fw ok\n");
     return true;
 }
 
