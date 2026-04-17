@@ -131,33 +131,34 @@ static bool bp_set_window(u32 addr)
     return true;
 }
 
+/* CMD52-based 4-byte backplane read — avoids DAT line entirely */
 static bool bp_read32(u32 addr, u32 *val)
 {
     if (!bp_set_window(addr))
         return false;
 
     u32 off = addr & BACKPLANE_WIN_MASK;
-    u8 buf[4];
-    if (!sdio_cmd53_read(SDIO_FUNC_BACKPLANE, off | 0x8000, buf, 4, true))
-        return false;
-
-    *val = (u32)buf[0] | ((u32)buf[1] << 8) |
-           ((u32)buf[2] << 16) | ((u32)buf[3] << 24);
+    u8 b0, b1, b2, b3;
+    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 0, &b0)) return false;
+    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 1, &b1)) return false;
+    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 2, &b2)) return false;
+    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 3, &b3)) return false;
+    *val = (u32)b0 | ((u32)b1 << 8) | ((u32)b2 << 16) | ((u32)b3 << 24);
     return true;
 }
 
+/* CMD52-based 4-byte backplane write — avoids DAT line entirely */
 static bool bp_write32(u32 addr, u32 val)
 {
     if (!bp_set_window(addr))
         return false;
 
     u32 off = addr & BACKPLANE_WIN_MASK;
-    u8 buf[4];
-    buf[0] = (u8)(val & 0xFF);
-    buf[1] = (u8)((val >> 8) & 0xFF);
-    buf[2] = (u8)((val >> 16) & 0xFF);
-    buf[3] = (u8)((val >> 24) & 0xFF);
-    return sdio_cmd53_write(SDIO_FUNC_BACKPLANE, off | 0x8000, buf, 4, true);
+    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 0, (u8)(val & 0xFF))) return false;
+    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 1, (u8)((val >> 8) & 0xFF))) return false;
+    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 2, (u8)((val >> 16) & 0xFF))) return false;
+    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 3, (u8)((val >> 24) & 0xFF))) return false;
+    return true;
 }
 
 UNUSED static bool bp_read_buf(u32 addr, u8 *buf, u32 len)
@@ -705,17 +706,14 @@ static bool cyw43_backplane_init(void)
     /* Halt ARM CR4 core */
     if (!core_reset(CYW_ARM_CORE_BASE, SICF_CPUHALT))
         return false;
-    sdio_reset_data_line();
 
     /* Reset D11 802.11 MAC core */
     if (!core_reset(CYW_D11_CORE_BASE, 4))
         return false;
-    sdio_reset_data_line();
 
     /* Reset SOCSRAM, disable remap */
     if (!core_reset(CYW_SOCSRAM_BASE, 0))
         return false;
-    sdio_reset_data_line();
     bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_IDX, 0x03);
     bp_write32(CYW_SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
 
