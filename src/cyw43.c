@@ -768,16 +768,22 @@ static bool cyw43_backplane_init(void)
             if (!bp_read32(eromptr + i + 4, &next)) break;
             if ((next & 0xF) == 0x1) {
                 coreid = (entry >> 8) & 0xFFF;
+                uart_puts("[e] c=");
+                uart_hex(coreid);
                 i += 4;
             }
         } else if (tag == 0x5) {  /* address descriptor */
             u32 addr = entry & 0xFFFFF000U;
             bool is_ctl = (entry & 0xC0) != 0;
+            if (is_ctl) {
+                uart_puts(" @");
+                uart_hex(addr);
+            }
             switch (coreid) {
             case 0x83C: case 0x83E:  /* ARM CR4 / CA7 */
                 if (is_ctl && !arm_ctl) arm_ctl = addr;
                 break;
-            case 0x80E:  /* SOCSRAM */
+            case 0x80E: case 0x135:  /* SOCSRAM / SOCRAM-es */
                 if (is_ctl && !sram_ctl) sram_ctl = addr;
                 break;
             case 0x812:  /* D11 */
@@ -800,8 +806,8 @@ static bool cyw43_backplane_init(void)
     uart_hex(sdio_regs);
     uart_puts("\n");
 
-    if (!arm_ctl || !sram_ctl) {
-        uart_puts("[cyw] core scan fail\n");
+    if (!arm_ctl) {
+        uart_puts("[cyw] no ARM core\n");
         return false;
     }
 
@@ -823,13 +829,15 @@ static bool cyw43_backplane_init(void)
         return false;
     }
 
-    /* Reset SOCSRAM, disable remap */
-    if (!core_reset(cyw_sram_ctl, 0)) {
-        uart_puts("[cyw] SRAM!\n");
-        return false;
+    /* Reset SOCSRAM if present, disable remap */
+    if (cyw_sram_ctl) {
+        if (!core_reset(cyw_sram_ctl, 0)) {
+            uart_puts("[cyw] SRAM!\n");
+            return false;
+        }
+        bp_write32(cyw_sram_ctl + SOCSRAM_BANKX_IDX, 0x03);
+        bp_write32(cyw_sram_ctl + SOCSRAM_BANKX_PDA, 0);
     }
-    bp_write32(cyw_sram_ctl + SOCSRAM_BANKX_IDX, 0x03);
-    bp_write32(cyw_sram_ctl + SOCSRAM_BANKX_PDA, 0);
 
     /* Clear pull-ups/pull-downs */
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_PULLUPS, 0);
