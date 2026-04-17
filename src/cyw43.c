@@ -909,6 +909,9 @@ bool cyw43_load_firmware(void)
      *   /clm.bin          (regulatory/CLM blob)
      */
 
+    /* Re-init SD card — EMMC2 state may be stale after long SDIO2 init */
+    sd_init();
+
     /* Initialize FAT32 if not already done */
     if (!fat32_init()) {
         uart_puts("[cyw] FAT32 fail\n");
