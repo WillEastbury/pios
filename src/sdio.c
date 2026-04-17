@@ -808,8 +808,10 @@ bool sdio_cmd53_write(u32 func, u32 addr, const u8 *buf, u32 len, bool incr)
         arg |= CMD53_INCR_ADDR;
 
     u32 resp[4];
-    if (!sdio_send_cmd(SDIO_CMD53_W, arg, resp))
+    if (!sdio_send_cmd(SDIO_CMD53_W, arg, resp)) {
+        uart_puts("[w53] cmd fail\n");
         return false;
+    }
 
     /* Wait for write ready */
     u32 timeout = 1000000;
@@ -817,11 +819,19 @@ bool sdio_cmd53_write(u32 func, u32 addr, const u8 *buf, u32 len, bool incr)
     do {
         intr = sr(REG_INTERRUPT);
         if (intr & INT_ERROR) {
+            uart_puts("[w53] err i=");
+            uart_hex(intr);
+            uart_puts("\n");
             sw(REG_INTERRUPT, INT_ERROR);
             return false;
         }
         delay_cycles(10);
     } while (!(intr & INT_WRITE_RDY) && timeout--);
+
+    if (!timeout) {
+        uart_puts("[w53] wrdy timeout\n");
+        return false;
+    }
 
     if (!timeout)
         return false;
