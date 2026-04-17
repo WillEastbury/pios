@@ -166,6 +166,19 @@ static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
     if (!sdio_wait_cmd())
         return false;
 
+    /* Circle pattern: clear DAT_INHIBIT before data/busy commands */
+    if ((sr(REG_STATUS) & SR_DAT_INHIBIT) &&
+        (cmd & CMD_ISDATA)) {
+        sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_DATA);
+        u32 t = 100000;
+        while ((sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_DATA) && t--)
+            delay_cycles(10);
+        t = 100000;
+        while ((sr(REG_STATUS) & SR_DAT_INHIBIT) && t--)
+            delay_cycles(10);
+        sw(REG_INTERRUPT, 0xFFFFFFFF);
+    }
+
     sw(REG_INTERRUPT, INT_ALL);
     sw(REG_ARG1, arg);
     sw(REG_CMDTM, cmd);
