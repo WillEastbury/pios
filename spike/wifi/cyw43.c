@@ -115,6 +115,18 @@ static u32 cyw_sram_ctl;
 static u32 cyw_sdio_regs;
 static u32 cyw_ram_base = CYW_RAM_BASE;  /* default, updated from EROM */
 
+/* Pre-loaded blobs (loaded before cyw43_init disturbs SD) */
+#define CYW_FW_MAX_SIZE   (700 * 1024)
+#define CYW_NVRAM_MAX     4096
+#define CYW_CLM_MAX       8192
+static u8 fw_buf[CYW_FW_MAX_SIZE] ALIGNED(64);
+static u32 fw_buf_len;
+static u8 nvram_buf[CYW_NVRAM_MAX];
+static u32 nvram_buf_len;
+static u8 clm_buf[CYW_CLM_MAX];
+static u32 clm_buf_len;
+static bool blobs_loaded;
+
 /* ── Backplane access ── */
 
 static bool bp_set_window(u32 addr)
@@ -163,7 +175,8 @@ static bool bp_read32(u32 addr, u32 *val)
     return true;
 }
 
-/* CMD52-based 4-byte backplane write — avoids DAT line entirely */
+/* CMD53 word-mode 4-byte backplane write — required for TCM RAM (CMD52 byte
+ * writes only work for register space; RAM enforces 4-byte atomic access). */
 static bool bp_write32(u32 addr, u32 val)
 {
     if (!bp_set_window(addr)) {
@@ -174,15 +187,18 @@ static bool bp_write32(u32 addr, u32 val)
     }
 
     u32 off = addr & BACKPLANE_WIN_MASK;
-    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 0, (u8)(val & 0xFF))) {
-        uart_puts("[bpw] w52 fail off=");
-        uart_hex(off);
+    u8 buf[4] = {
+        (u8)(val & 0xFF),
+        (u8)((val >> 8) & 0xFF),
+        (u8)((val >> 16) & 0xFF),
+        (u8)((val >> 24) & 0xFF),
+    };
+    if (!sdio_cmd53_write(SDIO_FUNC_BACKPLANE, off | 0x8000, buf, 4, true)) {
+        uart_puts("[bpw] c53w4 fail addr=");
+        uart_hex(addr);
         uart_puts("\n");
         return false;
     }
-    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 1, (u8)((val >> 8) & 0xFF))) return false;
-    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 2, (u8)((val >> 16) & 0xFF))) return false;
-    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 3, (u8)((val >> 24) & 0xFF))) return false;
     return true;
 }
 
@@ -210,24 +226,34 @@ UNUSED static bool bp_read_buf(u32 addr, u8 *buf, u32 len)
 
 static bool bp_write_buf(u32 addr, const u8 *buf, u32 len)
 {
-    /* Use CMD52 byte-at-a-time — CMD53 DAT transfers hang on this controller.
-     * Slower but reliable. ~30-60s for 600KB firmware at 25MHz. */
-    while (len > 0) {
-        if (!bp_set_window(addr))
+    /* Use single 4-byte CMD53 transactions — same pattern as bp_write32,
+     * proven reliable. Larger chunks (e.g. 64-byte) intermittently hang
+     * the SDIO controller after several hundred transactions. */
+    if (addr & 3) {
+        uart_puts("[bpwb] unaligned addr=");
+        uart_hex(addr);
+        uart_puts("\n");
+        return false;
+    }
+
+    u32 nwords = (len + 3) / 4;
+    for (u32 i = 0; i < nwords; i++) {
+        u32 b0 = buf[i*4 + 0];
+        u32 b1 = (i*4 + 1 < len) ? buf[i*4 + 1] : 0;
+        u32 b2 = (i*4 + 2 < len) ? buf[i*4 + 2] : 0;
+        u32 b3 = (i*4 + 3 < len) ? buf[i*4 + 3] : 0;
+        u32 word = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        if (!bp_write32(addr + i*4, word)) {
+            uart_puts("[bpwb] w32 fail addr=");
+            uart_hex(addr + i*4);
+            uart_puts("\n");
             return false;
-
-        u32 off = addr & BACKPLANE_WIN_MASK;
-        u32 chunk = BACKPLANE_WIN_SIZE - off;
-        if (chunk > len) chunk = len;
-
-        for (u32 i = 0; i < chunk; i++) {
-            if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, (off | 0x8000) + i, buf[i]))
-                return false;
         }
-
-        addr += chunk;
-        buf += chunk;
-        len -= chunk;
+        if ((i & 0x3FF) == 0) {
+            uart_puts("[bpwb] @");
+            uart_hex(addr + i*4);
+            uart_puts("\n");
+        }
     }
     return true;
 }
@@ -818,8 +844,9 @@ static bool cyw43_backplane_init(void)
     cyw_d11_ctl = d11_ctl;
     cyw_sram_ctl = sram_ctl;
     cyw_sdio_regs = sdio_regs;
-    /* CR4: RAM base = ARM regs address (Circle: rambase = armregs) */
-    if (arm_regs) cyw_ram_base = arm_regs;
+    /* CYW43455 TCM RAM base is chip-specific, not from EROM.
+     * Linux brcmf_chip_tcm_rambase: 0x4345 → 0x198000.
+     * Keep the #define CYW_RAM_BASE default. */
 
     /* Halt ARM CR4 core */
     if (!core_reset(cyw_arm_ctl, SICF_CPUHALT)) {
@@ -903,24 +930,100 @@ bool cyw43_init(void)
     return true;
 }
 
+bool cyw43_preload_blobs(void)
+{
+    blobs_loaded = false;
+    fw_buf_len = nvram_buf_len = clm_buf_len = 0;
+
+    if (!fat32_init()) {
+        uart_puts("[cyw-pre] FAT32 fail\n");
+        return false;
+    }
+
+    /* Firmware */
+    {
+        fat32_file_t fw;
+        if (!fat32_open("/wifi/firmware.bin", &fw)) {
+            uart_puts("[cyw-pre] no fw\n");
+            return false;
+        }
+        if (fw.file_size > CYW_FW_MAX_SIZE) {
+            uart_puts("[cyw-pre] fw too big\n");
+            fat32_close(&fw);
+            return false;
+        }
+        u32 off = 0;
+        while (off < fw.file_size) {
+            u32 chunk = fw.file_size - off;
+            if (chunk > 4096) chunk = 4096;
+            u32 got = fat32_read(&fw, fw_buf + off, chunk);
+            if (got == 0) {
+                uart_puts("[cyw-pre] fw read err @");
+                uart_hex(off);
+                uart_puts("\n");
+                fat32_close(&fw);
+                return false;
+            }
+            off += got;
+        }
+        fat32_close(&fw);
+        fw_buf_len = off;
+        uart_puts("[cyw-pre] fw loaded ");
+        uart_hex(fw_buf_len);
+        uart_puts("\n");
+    }
+
+    /* NVRAM (optional) */
+    {
+        fat32_file_t nv;
+        if (fat32_open("/wifi/nvram.txt", &nv)) {
+            if (nv.file_size <= CYW_NVRAM_MAX) {
+                nvram_buf_len = fat32_read(&nv, nvram_buf, nv.file_size);
+                uart_puts("[cyw-pre] nvram loaded ");
+                uart_hex(nvram_buf_len);
+                uart_puts("\n");
+            }
+            fat32_close(&nv);
+        }
+    }
+
+    /* CLM (optional) */
+    {
+        fat32_file_t clm;
+        if (fat32_open("/wifi/clm.bin", &clm)) {
+            if (clm.file_size <= CYW_CLM_MAX) {
+                clm_buf_len = fat32_read(&clm, clm_buf, clm.file_size);
+                uart_puts("[cyw-pre] clm loaded ");
+                uart_hex(clm_buf_len);
+                uart_puts("\n");
+            }
+            fat32_close(&clm);
+        }
+    }
+
+    blobs_loaded = true;
+    return true;
+}
+
 bool cyw43_load_firmware(void)
 {
     /*
-     * Load firmware, NVRAM, and CLM blobs from the FAT32 boot partition.
-     * Expected files (long filenames supported):
-     *   /firmware.bin     (CYW43455 WiFi firmware)
-     *   /nvram.txt        (board NVRAM configuration)
-     *   /clm.bin          (regulatory/CLM blob)
+     * Load firmware, NVRAM, and CLM blobs from preloaded RAM buffers
+     * (cyw43_preload_blobs() must be called BEFORE cyw43_init since
+     *  SDIO2 init disturbs the EMMC2 SD controller).
      */
 
-    /* Re-init SD card — EMMC2 state may be stale after long SDIO2 init */
-    sd_init();
-
-    /* Initialize FAT32 if not already done */
-    if (!fat32_init()) {
-        uart_puts("[cyw] FAT32 fail\n");
+    if (!blobs_loaded) {
+        uart_puts("[cyw] blobs not preloaded\n");
         return false;
     }
+    uart_puts("[cyw] using preloaded blobs fw=");
+    uart_hex(fw_buf_len);
+    uart_puts(" nv=");
+    uart_hex(nvram_buf_len);
+    uart_puts(" clm=");
+    uart_hex(clm_buf_len);
+    uart_puts("\n");
 
     /* Request ALP clock for backplane memory access */
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqALP);
@@ -932,94 +1035,149 @@ bool cyw43_load_firmware(void)
         delay_cycles(5000);
     }
 
-    /* Clear end of RAM before upload */
-    bp_write32(cyw_ram_base + CYW_RAM_SIZE - 4, 0);
-
-    /* Upload firmware binary */
+    /* Quick sanity: try writing 4 bytes at RAM base via bp_write32 */
+    uart_puts("[cyw] sanity bp_write32 @ rambase ");
+    uart_hex(cyw_ram_base);
+    uart_puts("...\n");
+    if (!bp_write32(cyw_ram_base, 0xDEADBEEF)) {
+        uart_puts("[cyw] sanity bp_write32 @ rambase FAILED\n");
+        return false;
+    }
+    uart_puts("[cyw] sanity bp_write32 @ rambase OK\n");
     {
-        fat32_file_t fw;
-        if (!fat32_open("/wifi/firmware.bin", &fw)) {
-            uart_puts("[cyw] no fw\n");
-            return false;
+        u32 rb = 0;
+        if (bp_read32(cyw_ram_base, &rb)) {
+            uart_puts("[cyw] readback rambase=");
+            uart_hex(rb);
+            uart_puts("\n");
+        } else {
+            uart_puts("[cyw] readback FAIL\n");
         }
+    }
+
+    /* Clear end of RAM before upload */
+    uart_puts("[cyw] clear EOR @");
+    uart_hex(cyw_ram_base + CYW_RAM_SIZE - 4);
+    uart_puts("\n");
+    if (!bp_write32(cyw_ram_base + CYW_RAM_SIZE - 4, 0)) {
+        uart_puts("[cyw] EOR clear FAIL\n");
+        return false;
+    }
+    uart_puts("[cyw] EOR clear OK\n");
+
+    /* Capture reset vector (first 4 bytes of FW) for CR4 */
+    u32 resetvec = (u32)fw_buf[0] | ((u32)fw_buf[1] << 8) |
+                   ((u32)fw_buf[2] << 16) | ((u32)fw_buf[3] << 24);
+
+    /* Upload firmware binary from preloaded buffer */
+    {
         uart_puts("[cyw] fw (");
-        uart_hex(fw.file_size);
+        uart_hex(fw_buf_len);
         uart_puts(" bytes)...\n");
 
         u32 offset = 0;
-        static u8 ALIGNED(64) fw_chunk[FW_UPLOAD_BLKSZ];
-        while (offset < fw.file_size) {
-            u32 chunk = fw.file_size - offset;
+        while (offset < fw_buf_len) {
+            u32 chunk = fw_buf_len - offset;
             if (chunk > FW_UPLOAD_BLKSZ) chunk = FW_UPLOAD_BLKSZ;
-            u32 got = fat32_read(&fw, fw_chunk, chunk);
-            if (got == 0) {
-                uart_puts("[cyw] fw read err @");
-                uart_hex(offset);
-                uart_puts("\n");
-                fat32_close(&fw);
-                return false;
-            }
-            if (!bp_write_buf(cyw_ram_base + offset, fw_chunk, got)) {
+            if (!bp_write_buf(cyw_ram_base + offset, fw_buf + offset, chunk)) {
                 uart_puts("[cyw] fw wr err @");
                 uart_hex(offset);
                 uart_puts("\n");
-                fat32_close(&fw);
                 return false;
             }
-            offset += got;
+            offset += chunk;
             if ((offset & 0xFFFF) == 0) { uart_putc('.'); }
         }
-        fat32_close(&fw);
         uart_puts("[cyw] fw uploaded\n");
     }
 
-    /* Upload NVRAM */
-    {
-        fat32_file_t nv;
-        if (!fat32_open("/wifi/nvram.txt", &nv)) {
-            uart_puts("[cyw] nvram def\n");
-            static const u8 default_nvram[] =
-                "boardtype=0x0646\0"
-                "boardrev=0x1101\0"
-                "boardflags=0x00404001\0"
-                "sromrev=11\0"
-                "boardflags3=0x08000188\0"
-                "macaddr=00:11:22:33:44:55\0"
-                "\0";
-            if (!upload_nvram(default_nvram, sizeof(default_nvram)))
-                return false;
-        } else {
-            static u8 ALIGNED(4) nvram_data[4096];
-            u32 nvram_len = fat32_read(&nv, nvram_data, sizeof(nvram_data));
-            fat32_close(&nv);
-            uart_puts("[cyw] nvram (");
-            uart_hex(nvram_len);
-            uart_puts(" B)\n");
-            if (!upload_nvram(nvram_data, nvram_len)) {
-                uart_puts("[cyw] nvram fail\n");
-                return false;
-            }
+    /* Upload NVRAM from preloaded buffer */
+    if (nvram_buf_len > 0) {
+        uart_puts("[cyw] nvram (");
+        uart_hex(nvram_buf_len);
+        uart_puts(" B)\n");
+        if (!upload_nvram(nvram_buf, nvram_buf_len)) {
+            uart_puts("[cyw] nvram fail\n");
+            return false;
         }
+    } else {
+        uart_puts("[cyw] nvram def\n");
+        static const u8 default_nvram[] =
+            "boardtype=0x0646\0"
+            "boardrev=0x1101\0"
+            "boardflags=0x00404001\0"
+            "sromrev=11\0"
+            "boardflags3=0x08000188\0"
+            "macaddr=00:11:22:33:44:55\0"
+            "\0";
+        if (!upload_nvram(default_nvram, sizeof(default_nvram)))
+            return false;
+    }
+
+    /* Verify FW landed in TCM (read first 8 bytes back) */
+    {
+        u32 v0=0xDEADDEAD, v1=0xDEADDEAD;
+        bp_read32(cyw_ram_base, &v0);
+        bp_read32(cyw_ram_base + 4, &v1);
+        uart_puts("[cyw] fw[0]="); uart_hex(v0);
+        uart_puts(" fw[4]="); uart_hex(v1); uart_puts("\n");
     }
 
     /* Clear SDIOD interrupt status before ARM reset */
+    uart_puts("[cyw] post-nvram: clearing SDIOD INTSTATUS\n");
     bp_write32(cyw_sdio_regs + SDIOD_INTSTATUS, 0xFFFFFFFF);
 
+    /* CR4 reset vector: write first 4 bytes of FW to backplane addr 0
+     * (ARM CR4 fetches PC=0 on release; this is the trampoline). */
+    if (resetvec != 0) {
+        uart_puts("[cyw] writing resetvec ");
+        uart_hex(resetvec);
+        uart_puts(" -> 0\n");
+        if (!bp_write32(0, resetvec)) {
+            uart_puts("[cyw] resetvec write fail\n");
+            return false;
+        }
+    }
+
     /* Reset ARM core to start firmware */
+    uart_puts("[cyw] ARM reset out-of-halt...\n");
     if (!core_reset(cyw_arm_ctl, 0)) {
         uart_puts("[cyw] ARM reset fail\n");
         return false;
     }
+    uart_puts("[cyw] ARM reset OK\n");
+
+    /* Read CR4 state post-release */
+    {
+        u32 rc=0xDEADDEAD, ic=0xDEADDEAD;
+        bp_read32(cyw_arm_ctl + CORE_RESETCTRL, &rc);
+        bp_read32(cyw_arm_ctl + CORE_IOCTRL, &ic);
+        uart_puts("[cyw] CR4 RESETCTRL="); uart_hex(rc);
+        uart_puts(" IOCTRL="); uart_hex(ic); uart_puts("\n");
+    }
 
     /* sbenable: request HT clock and wait (Issue #67) */
+    uart_puts("[cyw] CLKCSR=0...\n");
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, 0);
+    uart_puts("[cyw] CLKCSR=0 done\n");
     delay_cycles(500000);
+    uart_puts("[cyw] CLKCSR=ReqHT...\n");
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqHT);
+    uart_puts("[cyw] CLKCSR=ReqHT done; polling HT...\n");
     bool ht_ok = false;
     for (u32 i = 0; i < 50; i++) {
-        u8 clk;
-        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk) &&
-            (clk & CLKCSR_HTavail)) {
+        u8 clk = 0;
+        bool rd = sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk);
+        if (i < 3 || (i & 7) == 0) {
+            uart_puts("[cyw] HT poll i=");
+            uart_hex(i);
+            uart_puts(" rd=");
+            uart_hex(rd ? 1 : 0);
+            uart_puts(" clk=");
+            uart_hex(clk);
+            uart_puts("\n");
+        }
+        if (rd && (clk & CLKCSR_HTavail)) {
             ht_ok = true;
             break;
         }
@@ -1051,52 +1209,47 @@ bool cyw43_load_firmware(void)
     sdio_set_block_size(SDIO_FUNC_WLAN, SDIO_FUNC2_BLKSZ);
     sdio_enable_func_irq(SDIO_FUNC_WLAN);
 
-    /* Load CLM blob via 'clmload' iovar */
-    {
-        fat32_file_t clm;
-        if (fat32_open("/wifi/clm.bin", &clm)) {
-            uart_puts("[cyw] loading CLM (");
-            uart_hex(clm.file_size);
-            uart_puts(" bytes)...\n");
+    /* Load CLM blob via 'clmload' iovar from preloaded buffer */
+    if (clm_buf_len > 0) {
+        uart_puts("[cyw] loading CLM (");
+        uart_hex(clm_buf_len);
+        uart_puts(" bytes)...\n");
 
-            static u8 ALIGNED(4) clm_chunk[1024 + 16]; /* data + download header */
-            u32 offset = 0;
-            bool clm_ok = true;
+        static u8 ALIGNED(4) clm_chunk[1024 + 16];
+        u32 offset = 0;
+        bool clm_ok = true;
 
-            while (offset < clm.file_size && clm_ok) {
-                u32 chunk = clm.file_size - offset;
-                if (chunk > 1024) chunk = 1024;
+        while (offset < clm_buf_len && clm_ok) {
+            u32 chunk = clm_buf_len - offset;
+            if (chunk > 1024) chunk = 1024;
 
-                /* Build download header: flag(2) + type(2) + len(4) + crc(4) = 12 bytes */
-                u16 flag = 0x0004; /* DL_CONT */
-                if (offset == 0) flag |= 0x0002; /* DL_BEGIN */
-                if (offset + chunk >= clm.file_size) flag |= 0x0008; /* DL_END */
+            u16 flag = 0x0004;
+            if (offset == 0) flag |= 0x0002;
+            if (offset + chunk >= clm_buf_len) flag |= 0x0008;
 
-                clm_chunk[0] = flag & 0xFF;
-                clm_chunk[1] = (flag >> 8) & 0xFF;
-                clm_chunk[2] = 0x02; /* type = CLM */
-                clm_chunk[3] = 0x00;
-                clm_chunk[4] = chunk & 0xFF;
-                clm_chunk[5] = (chunk >> 8) & 0xFF;
-                clm_chunk[6] = (chunk >> 16) & 0xFF;
-                clm_chunk[7] = (chunk >> 24) & 0xFF;
-                clm_chunk[8] = 0; clm_chunk[9] = 0; /* crc = 0 */
-                clm_chunk[10] = 0; clm_chunk[11] = 0;
+            clm_chunk[0] = flag & 0xFF;
+            clm_chunk[1] = (flag >> 8) & 0xFF;
+            clm_chunk[2] = 0x02;
+            clm_chunk[3] = 0x00;
+            clm_chunk[4] = chunk & 0xFF;
+            clm_chunk[5] = (chunk >> 8) & 0xFF;
+            clm_chunk[6] = (chunk >> 16) & 0xFF;
+            clm_chunk[7] = (chunk >> 24) & 0xFF;
+            clm_chunk[8] = 0; clm_chunk[9] = 0;
+            clm_chunk[10] = 0; clm_chunk[11] = 0;
 
-                u32 got = fat32_read(&clm, clm_chunk + 12, chunk);
-                if (got != chunk) { clm_ok = false; break; }
+            for (u32 i = 0; i < chunk; i++)
+                clm_chunk[12 + i] = clm_buf[offset + i];
 
-                if (!bcdc_set_iovar("clmload", clm_chunk, 12 + chunk))
-                    clm_ok = false;
+            if (!bcdc_set_iovar("clmload", clm_chunk, 12 + chunk))
+                clm_ok = false;
 
-                offset += chunk;
-            }
-            fat32_close(&clm);
-            if (clm_ok) uart_puts("[cyw] CLM ok\n");
-            else uart_puts("[cyw] CLM fail\n");
-        } else {
-            uart_puts("[cyw] no CLM\n");
+            offset += chunk;
         }
+        if (clm_ok) uart_puts("[cyw] CLM ok\n");
+        else uart_puts("[cyw] CLM fail\n");
+    } else {
+        uart_puts("[cyw] no CLM\n");
     }
 
     uart_puts("[cyw] fw ok\n");

@@ -724,12 +724,28 @@ bool sdio_cmd52_write(u32 func, u32 addr, u8 val)
     u32 arg = CMD52_WRITE | CMD52_FUNC(func) | CMD52_ADDR(addr) | CMD52_DATA(val);
     u32 resp[4];
 
-    if (!sdio_send_cmd(SDIO_CMD52, arg, resp))
+    if (!sdio_send_cmd(SDIO_CMD52, arg, resp)) {
+        uart_puts("[c52w] CMD fail f=");
+        uart_hex(func);
+        uart_puts(" a=");
+        uart_hex(addr);
+        uart_puts("\n");
         return false;
+    }
 
     u32 flags = (resp[0] >> 8) & 0xFF;
-    if (flags & 0xCB)
+    if (flags & 0xCB) {
+        uart_puts("[c52w] R5 err f=");
+        uart_hex(func);
+        uart_puts(" a=");
+        uart_hex(addr);
+        uart_puts(" v=");
+        uart_hex(val);
+        uart_puts(" R5=");
+        uart_hex(resp[0]);
+        uart_puts("\n");
         return false;
+    }
 
     return true;
 }
@@ -741,8 +757,10 @@ bool sdio_cmd53_read(u32 func, u32 addr, u8 *buf, u32 len, bool incr)
     if (len == 0 || len > 512)
         return false;
 
-    if (!sdio_wait_data())
+    if (!sdio_wait_data()) {
+        uart_puts("[c53r] wait_data timeout\n");
         return false;
+    }
 
     sw(REG_BLKSIZECNT, (1 << 16) | len);
     sw(REG_INTERRUPT, INT_ALL);
@@ -752,8 +770,16 @@ bool sdio_cmd53_read(u32 func, u32 addr, u8 *buf, u32 len, bool incr)
         arg |= CMD53_INCR_ADDR;
 
     u32 resp[4];
-    if (!sdio_send_cmd(SDIO_CMD53_R, arg, resp))
+    if (!sdio_send_cmd(SDIO_CMD53_R, arg, resp)) {
+        uart_puts("[c53r] CMD fail f=");
+        uart_hex(func);
+        uart_puts(" a=");
+        uart_hex(addr);
+        uart_puts(" len=");
+        uart_hex(len);
+        uart_puts("\n");
         return false;
+    }
 
     /* Wait for read ready */
     u32 timeout = 1000000;
@@ -761,14 +787,21 @@ bool sdio_cmd53_read(u32 func, u32 addr, u8 *buf, u32 len, bool incr)
     do {
         intr = sr(REG_INTERRUPT);
         if (intr & INT_ERROR) {
+            uart_puts("[c53r] INT_ERROR=");
+            uart_hex(intr);
+            uart_puts("\n");
             sw(REG_INTERRUPT, INT_ERROR);
             return false;
         }
         delay_cycles(10);
     } while (!(intr & INT_READ_RDY) && timeout--);
 
-    if (!timeout)
+    if (!timeout) {
+        uart_puts("[c53r] READ_RDY timeout intr=");
+        uart_hex(intr);
+        uart_puts("\n");
         return false;
+    }
 
     /* Read data — 32-bit words, use byte writes for alignment safety */
     u32 words = (len + 3) / 4;

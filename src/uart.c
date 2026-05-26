@@ -55,6 +55,10 @@ void uart_init(void) {
     /* Enable RXE in UART control register */
     *uart_cr = *uart_cr | (1 << 9);
 
+    /* Enable FIFO in LCRH (bit 4) — preserves firmware baud rate */
+    volatile u32 *uart_lcrh = (volatile u32 *)(0x1F00030000UL + 0x2C);
+    *uart_lcrh = *uart_lcrh | (1 << 4);
+
     /* Print state after config */
     uart_puts("[uart] SET: G15 ctrl=");
     uart_hex(*gpio15_ctrl);

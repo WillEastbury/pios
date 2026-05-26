@@ -569,6 +569,18 @@ bool sd_read_block(u32 lba, u8 *buf) {
         stats.retries++;
         sd_recover();
     }
+    /* Last-ditch: full controller + card re-init.
+     * Helps recover from DAT_INHIBIT-stuck state caused by abandoned
+     * transfers or external bus disturbances (e.g. SDIO2/WiFi init). */
+    uart_puts("[sd] read retries exhausted lba=");
+    uart_hex(lba);
+    uart_puts(" — full reinit\n");
+    if (sd_init()) {
+        if (sd_read_block_inner(lba, buf)) {
+            stats.reads++;
+            return true;
+        }
+    }
     return false;
 }
 

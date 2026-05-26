@@ -135,6 +135,10 @@ bool cyw43_init(void);
 /* Phase 2: Firmware boot */
 bool cyw43_load_firmware(void);
 
+/* Pre-load firmware/nvram/clm blobs from SD into RAM buffers.
+ * MUST be called before cyw43_init() — SDIO2 init disturbs EMMC2. */
+bool cyw43_preload_blobs(void);
+
 /* Phase 3: Runtime — called from poll loop */
 void cyw43_poll(void);
 

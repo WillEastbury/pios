@@ -19,6 +19,13 @@ bool wifi_nic_init(void)
 
     uart_puts("[wnic] init CYW43455...\n");
 
+    /* Pre-load firmware blobs from SD BEFORE SDIO2 init disturbs EMMC2 */
+    uart_puts("[wnic] preload blobs...\n");
+    if (!cyw43_preload_blobs()) {
+        uart_puts("[wnic] preload fail\n");
+        return false;
+    }
+
     if (!cyw43_init()) {
         uart_puts("[wnic] cyw init fail\n");
         return false;

@@ -59,8 +59,6 @@
 #include "el2.h"
 #include "crypto.h"
 #include "watchdog.h"
-#include "cyw43.h"
-#include "sdio.h"
 #include "fat32.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
@@ -205,7 +203,6 @@ static const char *ui_proc_state_str(u32 s);
 static void ui_dump_sector(u32 lba);
 static void ui_cmd_fsinspect(const char *path);
 static void ui_cmd_netcfg(u32 argc, char **argv);
-static void ui_cmd_wifi(u32 argc, char **argv);
 static void ui_cmd_disk(u32 argc, char **argv);
 static void ui_cmd_db(u32 argc, char **argv);
 static void ui_cmd_lsdir(const char *path);
@@ -1229,145 +1226,8 @@ static void ui_cmd_fsinspect(const char *path)
     }
 }
 
-/* ── WiFi defaults (from gitignored wifi_config.h) ── */
-#include "../wifi_config.h"
-
-static bool wifi_active;
-
-static void ui_cmd_wifi(u32 argc, char **argv)
-{
-    if (argc < 2) {
-        ui_console_write("usage: wifi <init|scan|connect|status|disconnect>\n");
-        ui_console_write("  wifi init              - power on CYW43455\n");
-        ui_console_write("  wifi scan              - scan for networks\n");
-        ui_console_write("  wifi connect [ssid] [pass] - join network\n");
-        ui_console_write("  wifi status            - show link state\n");
-        ui_console_write("  wifi disconnect        - leave network\n");
-        return;
-    }
-
-    if (ui_streq(argv[1], "init")) {
-        ui_console_write("WiFi: initializing CYW43455...\n");
-        if (!nic_init_wifi()) {
-            ui_console_write("ERR: WiFi init failed\n");
-            return;
-        }
-        wifi_active = true;
-        ui_console_write("OK: CYW43455 ready\n");
-        return;
-    }
-
-    if (!wifi_active) {
-        ui_console_write("ERR: run 'wifi init' first\n");
-        return;
-    }
-
-    if (ui_streq(argv[1], "scan")) {
-        ui_console_write("WiFi: scanning...\n");
-        if (!cyw43_scan_start()) {
-            ui_console_write("ERR: scan start failed\n");
-            return;
-        }
-        /* Poll for a few seconds to collect results */
-        for (u32 i = 0; i < 50; i++) {
-            cyw43_poll();
-            for (volatile u32 d = 0; d < 500000; d++) {}
-        }
-        struct cyw_scan_result results[CYW_MAX_SCAN_RESULTS];
-        u32 count = CYW_MAX_SCAN_RESULTS;
-        cyw43_scan_get_results(results, &count);
-        fb_printf("Found %d networks:\n", count);
-        for (u32 i = 0; i < count; i++) {
-            fb_printf("  %d: ", i);
-            for (u32 j = 0; j < results[i].ssid_len; j++)
-                fb_printf("%c", results[i].ssid[j]);
-            fb_printf(" (ch%d rssi=%d)\n", results[i].channel, results[i].rssi);
-        }
-        return;
-    }
-
-    if (ui_streq(argv[1], "connect")) {
-        const char *ssid = WIFI_DEFAULT_SSID;
-        const char *pass = WIFI_DEFAULT_PASS;
-        u32 ssid_len, pass_len;
-
-        if (argc >= 4) {
-            ssid = argv[2];
-            pass = argv[3];
-        } else if (argc >= 3) {
-            ssid = argv[2];
-        }
-
-        ssid_len = 0; while (ssid[ssid_len]) ssid_len++;
-        pass_len = 0; while (pass[pass_len]) pass_len++;
-
-        fb_printf("WiFi: connecting to '%s'...\n", ssid);
-        if (!cyw43_join(ssid, ssid_len, pass, pass_len, WPA2_AUTH_PSK | WSEC_AES)) {
-            ui_console_write("ERR: join failed\n");
-            return;
-        }
-        /* Poll for association */
-        for (u32 i = 0; i < 100; i++) {
-            cyw43_poll();
-            if (cyw43_is_connected()) break;
-            for (volatile u32 d = 0; d < 500000; d++) {}
-        }
-        if (cyw43_is_connected()) {
-            ui_console_write("OK: connected!\n");
-            /* Use DHCP to get IP from hotspot */
-            ui_console_write("WiFi: requesting DHCP lease...\n");
-            if (dhcp_start(10000)) {
-                const dhcp_lease_t *lease = dhcp_get_lease();
-                if (lease) {
-                    ui_cfg_ip   = lease->ip;
-                    ui_cfg_mask = lease->mask;
-                    ui_cfg_gw   = lease->gateway;
-                    ui_cfg_dns  = lease->dns;
-                    dns_init(ui_cfg_dns);
-                    fb_printf("DHCP: ip=%d.%d.%d.%d gw=%d.%d.%d.%d\n",
-                        (lease->ip >> 24) & 0xFF, (lease->ip >> 16) & 0xFF,
-                        (lease->ip >> 8) & 0xFF, lease->ip & 0xFF,
-                        (lease->gateway >> 24) & 0xFF, (lease->gateway >> 16) & 0xFF,
-                        (lease->gateway >> 8) & 0xFF, lease->gateway & 0xFF);
-                }
-                ui_cfg_dhcp = true;
-                ui_console_write("OK: dhcp lease applied\n");
-            } else {
-                ui_console_write("WARN: DHCP failed, using static IP\n");
-                net_init(IP4(192,168,4,1), IP4(192,168,4,1), MY_MASK, NULL);
-                ui_cfg_dhcp = false;
-            }
-        } else {
-            ui_console_write("WARN: join sent, not yet associated\n");
-        }
-        return;
-    }
-
-    if (ui_streq(argv[1], "status")) {
-        u32 state = cyw43_link_state();
-        fb_printf("WiFi: link=%s",
-            state == CYW_LINK_UP ? "UP" :
-            state == CYW_LINK_JOINING ? "JOINING" :
-            state == CYW_LINK_AUTH_FAIL ? "AUTH_FAIL" : "DOWN");
-        if (state == CYW_LINK_UP) {
-            i32 rssi = cyw43_get_rssi();
-            fb_printf(" rssi=%d", rssi);
-        }
-        u8 mac[6];
-        cyw43_get_mac(mac);
-        fb_printf(" mac=%x:%x:%x:%x:%x:%x\n",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        return;
-    }
-
-    if (ui_streq(argv[1], "disconnect")) {
-        cyw43_disconnect();
-        ui_console_write("OK: disconnected\n");
-        return;
-    }
-
-    ui_console_write("ERR: unknown wifi subcommand\n");
-}
+/* WiFi support has been parked in spike/wifi/ — see GitHub issue.
+ * The 'wifi' console command now returns an ERR stub. */
 
 static void ui_cmd_netcfg(u32 argc, char **argv)
 {
@@ -4194,7 +4054,7 @@ static void ui_console_exec(char *line)
     } else if (ui_streq(argv[0], "svc")) {
         ui_cmd_svc(argc, argv);
     } else if (ui_streq(argv[0], "wifi")) {
-        ui_cmd_wifi(argc, argv);
+        ui_console_write("ERR: wifi support removed (parked in spike/wifi/, see GitHub issue)\n");
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "disk")) {
@@ -4452,10 +4312,6 @@ NORETURN void core0_main(void) {
     /* Serial-only console */
     uart_puts("\r\nPIOS Console ready. Type 'help'.\r\n> ");
 
-    /* RP1 UART0 direct register addresses for RX polling */
-    u64 rp1_fr = 0x1F00030000UL + 0x18;  /* FR register */
-    u64 rp1_dr = 0x1F00030000UL + 0x00;  /* DR register */
-
     static char cmd_buf[128];
     static u32 cmd_len;
 
@@ -4466,9 +4322,10 @@ NORETURN void core0_main(void) {
         /* Service TCP echo + HTTP servers */
         echo_tcp_poll();
 
-        /* Direct RP1 UART0 RX poll */
-        if (!(*(volatile u32 *)rp1_fr & (1 << 4))) {  /* RXFE = 0 */
-            char c = (char)(*(volatile u32 *)rp1_dr & 0xFF);
+        /* UART RX poll via driver function */
+        i32 rx = uart_try_getc();
+        if (rx >= 0) {
+            char c = (char)(rx & 0xFF);
             uart_putc(c);  /* echo */
             if (c == '\r' || c == '\n') {
                 uart_puts("\r\n");

@@ -34,3 +34,8 @@ core.*
 
 # WiFi credentials (add manually, never commit)
 wifi_config.h
+
+# WiFi firmware blobs (binary, not for source repo)
+/wifi/
+sd_diff.txt
+fixup4.dat
