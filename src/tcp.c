@@ -48,6 +48,7 @@ extern u32 net_get_our_ip(void);
 
 #define LISTEN_BACKLOG      4
 #define TCP_DMA_COPY_THRESHOLD 256U
+#define TCP_UART_DIAG_VERBOSE 0
 
 /* ================================================================== */
 /*  TCP header (wire format)                                           */
@@ -308,6 +309,7 @@ static bool tcb_valid(tcp_conn_t c) {
     return c >= 0 && c < TCP_MAX_CONNECTIONS && tcbs[c].state != TCP_CLOSED;
 }
 
+#if TCP_UART_DIAG_VERBOSE
 static void tcp_log_ip(u32 ip)
 {
     uart_hex((ip >> 24) & 0xFF); uart_putc('.');
@@ -315,9 +317,11 @@ static void tcp_log_ip(u32 ip)
     uart_hex((ip >> 8) & 0xFF);  uart_putc('.');
     uart_hex(ip & 0xFF);
 }
+#endif
 
 static void tcp_log_established(const struct tcb *t, const char *kind)
 {
+#if TCP_UART_DIAG_VERBOSE
     uart_puts("[tcp] ESTABLISHED ");
     uart_puts(kind);
     uart_puts(" local=");
@@ -329,6 +333,10 @@ static void tcp_log_established(const struct tcb *t, const char *kind)
     uart_putc(':');
     uart_hex(t->remote_port);
     uart_putc('\n');
+#else
+    (void)t;
+    (void)kind;
+#endif
 }
 
 /* Ephemeral port allocator */
@@ -673,8 +681,11 @@ static void tcp_send_synack_cookie(u32 remote_ip, u16 remote_port,
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
     if (nic_send(tx_frame, frame_len))
         tcp_diag_counts.synack_sent++;
-    else
+    else {
+#if TCP_UART_DIAG_VERBOSE
         uart_puts("[tcp] SYNACK nic_send failed\n");
+#endif
+    }
 }
 
 /* ================================================================== */
@@ -960,8 +971,11 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
     if (!checksum_trusted &&
         unlikely(tcp_checksum(src_ip, dst_ip, payload, payload_len) != 0)) {
         tcp_diag_counts.bad_checksum++;
-        if ((tcp_diag_counts.bad_checksum & 0x0F) == 1)
+        if ((tcp_diag_counts.bad_checksum & 0x0F) == 1) {
+#if TCP_UART_DIAG_VERBOSE
             uart_puts("[tcp] drop bad checksum\n");
+#endif
+        }
         return;
     }
 
@@ -1265,7 +1279,9 @@ void tcp_tick(void) {
             t->retries++;
             if (t->retries > MAX_RETRIES) {
                 /* Connection failed */
+#if TCP_UART_DIAG_VERBOSE
                 uart_puts("[tcp] conn timeout\n");
+#endif
                 tcb_reset(t);
                 continue;
             }
@@ -1316,7 +1332,9 @@ void tcp_init(void) {
     tcp_ip_id = (u16)(syn_secret & 0xFFFF);
     next_ephemeral = 49152 + (u16)(syn_secret >> 16);
 
+#if TCP_UART_DIAG_VERBOSE
     uart_puts("[tcp] init ok\n");
+#endif
 }
 
 tcp_conn_t tcp_connect(u32 dst_ip, u16 dst_port) {
