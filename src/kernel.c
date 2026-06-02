@@ -64,6 +64,7 @@
 #include "watchdog.h"
 #include "fat32.h"
 #include "pios_addr.h"
+#include "picoscript.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -4143,12 +4144,13 @@ static bool ui_resolve_pis_path(const char *in, char *out, u32 out_max)
 {
     char abs[256];
     if (!ui_path_resolve(in, abs, sizeof(abs))) return false;
-    if (ui_has_suffix(abs, ".pis")) {
+    if (ui_has_suffix(abs, ".pis") || ui_has_suffix(abs, ".pbc")) {
         u32 n = pios_strlen(abs);
         if (n + 1 > out_max) return false;
         for (u32 i = 0; i <= n; i++) out[i] = abs[i];
         return true;
     }
+
     if (pios_strlen(abs) + 4 + 1 > out_max) return false;
     u32 p = 0;
     while (abs[p]) { out[p] = abs[p]; p++; }
@@ -5555,9 +5557,19 @@ static u16 ui_be16_read(const u8 *p)
     return (u16)(((u16)p[0] << 8) | (u16)p[1]);
 }
 
+static u16 ui_le16_read(const u8 *p)
+{
+    return (u16)((u16)p[0] | ((u16)p[1] << 8));
+}
+
 static u32 ui_be32_read(const u8 *p)
 {
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
+static u32 ui_le32_read(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
 }
 
 static void ui_be16_write(u8 *p, u16 v)
@@ -6591,6 +6603,46 @@ static void ui_cmd_source(const char *path)
     u32 n = (u32)((ino.size > sizeof(buf) - 1) ? (sizeof(buf) - 1) : ino.size);
     n = walfs_read(id, 0, buf, n);
     buf[n] = 0;
+
+    if (ui_has_suffix(abs, ".pbc")) {
+        if (n < sizeof(struct picoscript_header)) {
+            ui_console_write("ERR: bytecode too small\n");
+            return;
+        }
+        const u8 *p = (const u8 *)buf;
+        u32 magic = ui_le32_read(p);
+        u16 version = ui_le16_read(p + 4);
+        u16 count = ui_le16_read(p + 6);
+        u32 image_bytes = ui_le32_read(p + 8);
+        if (magic != PICOSCRIPT_MAGIC || version != PICOSCRIPT_VERSION ||
+            image_bytes > (u32)n || image_bytes < sizeof(struct picoscript_header)) {
+            ui_console_write("ERR: invalid PicoScript bytecode\n");
+            return;
+        }
+        u32 off = sizeof(struct picoscript_header);
+        char line[PICOSCRIPT_MAX_LINE + 1];
+        for (u32 ci = 0; ci < count; ci++) {
+            if (off + sizeof(struct picoscript_record) > image_bytes) {
+                ui_console_write("ERR: truncated bytecode record\n");
+                return;
+            }
+            u16 len = ui_le16_read(p + off);
+            u8 flags = p[off + 2];
+            off += sizeof(struct picoscript_record);
+            if (len > PICOSCRIPT_MAX_LINE || off + len > image_bytes) {
+                ui_console_write("ERR: invalid bytecode command\n");
+                return;
+            }
+            for (u32 j = 0; j < len; j++)
+                line[j] = (char)p[off + j];
+            line[len] = 0;
+            off += len;
+            if ((flags & 1U) == 0 && len != 0 && line[0] != '#')
+                ui_console_exec(line);
+        }
+        return;
+    }
+
     char line[256];
     u32 lp = 0;
     for (u32 i = 0; i <= n; i++) {

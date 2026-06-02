@@ -311,6 +311,20 @@ db list wal:0/0
 
 Network resource addresses reserve `pack` as a namespace and use `card` as the TCP/UDP port number. For example, `tcp:0/2323` names the debug console listener.
 
+## PicoScript compiler / assembler
+
+PicoScript source files (`.pis`) are newline-delimited console commands. The kernel `source` command can run `.pis` directly or compiled `.pbc` bytecode.
+
+Host compiler:
+
+```powershell
+python tools\picoscript.py compile script.pis script.pbc
+python tools\picoscript.py asm script.pasm script.pbc
+python tools\picoscript.py disasm script.pbc
+```
+
+The `.pbc` format stores validated command records and executes them through the existing console command dispatcher, so compiled scripts preserve current command behavior.
+
 ## Firewall command
 
 Defaults:
