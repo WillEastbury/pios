@@ -1525,6 +1525,31 @@ u32 tcp_active_count(void)
     return n;
 }
 
+u32 tcp_snapshot(tcp_snapshot_entry_t *out, u32 max)
+{
+    if (!out || max == 0)
+        return 0;
+    u32 n = 0;
+    for (u32 i = 0; i < TCP_MAX_CONNECTIONS && n < max; i++) {
+        struct tcb *t = &tcbs[i];
+        if (t->state == TCP_CLOSED)
+            continue;
+        dmb();
+        out[n].conn = (i32)i;
+        out[n].state = t->state;
+        out[n].local_ip = t->local_ip;
+        out[n].remote_ip = t->remote_ip;
+        out[n].local_port = t->local_port;
+        out[n].remote_port = t->remote_port;
+        out[n].pending_count = t->state == TCP_LISTEN ? t->pending_count : 0;
+        out[n].rx_used = ring_used(&t->rx_buf);
+        out[n].tx_used = ring_used(&t->tx_buf);
+        out[n].retries = t->retries;
+        n++;
+    }
+    return n;
+}
+
 const tcp_diag_t *tcp_diag(void)
 {
     return &tcp_diag_counts;

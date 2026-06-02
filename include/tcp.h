@@ -87,6 +87,22 @@ u32 tcp_writable(tcp_conn_t conn);
 u32 tcp_active_count(void);
 
 typedef struct {
+    i32 conn;
+    u32 state;
+    u32 local_ip;
+    u32 remote_ip;
+    u16 local_port;
+    u16 remote_port;
+    u32 pending_count;
+    u32 rx_used;
+    u32 tx_used;
+    u32 retries;
+} tcp_snapshot_entry_t;
+
+/* Snapshot TCP listeners and sessions. Returns number written. */
+u32 tcp_snapshot(tcp_snapshot_entry_t *out, u32 max);
+
+typedef struct {
     u64 in_short;
     u64 bad_checksum;
     u64 bad_header;

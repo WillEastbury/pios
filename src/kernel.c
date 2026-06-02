@@ -1005,6 +1005,35 @@ static bool http_query_cmd(const u8 *req, u32 len, char *out, u32 out_max)
     return http_query_value(req, len, "/api/terminal", "cmd", out, out_max) && out[0] != 0;
 }
 
+static const char *tcp_state_name(u32 state)
+{
+    switch (state) {
+    case TCP_CLOSED: return "CLOSED";
+    case TCP_LISTEN: return "LISTEN";
+    case TCP_SYN_SENT: return "SYN-SENT";
+    case TCP_SYN_RECEIVED: return "SYN-RECV";
+    case TCP_ESTABLISHED: return "ESTAB";
+    case TCP_FIN_WAIT_1: return "FIN-W1";
+    case TCP_FIN_WAIT_2: return "FIN-W2";
+    case TCP_CLOSE_WAIT: return "CLOSE-WAIT";
+    case TCP_CLOSING: return "CLOSING";
+    case TCP_LAST_ACK: return "LAST-ACK";
+    case TCP_TIME_WAIT: return "TIME-WAIT";
+    default: return "?";
+    }
+}
+
+static const char *tcp_owner_label(u16 port)
+{
+    if (port == ECHO_TCP_PORT) return "kernel/echo";
+    if (port == HTTP_TCP_PORT) return "kernel/http";
+    if (port == ADMIN_STATUS_TCP_PORT) return "admin/status";
+    if (port == ADMIN_REBOOT_TCP_PORT) return "admin/reboot";
+    if (port == ADMIN_UPDATE_TCP_PORT) return "admin/update";
+    if (port == DEBUG_TCP_PORT) return "kernel/debug";
+    return "-";
+}
+
 static bool http_streq(const char *a, const char *b)
 {
     if (!a || !b)
@@ -1067,16 +1096,50 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "netstat")) {
         const tcp_diag_t *td = tcp_diag();
-        http_append(out, &len, max, "Proto Port Owner        State\n");
-        http_append(out, &len, max, "tcp   7    kernel/echo  LISTEN\n");
-        http_append(out, &len, max, "tcp   80   kernel/http  LISTEN\n");
-        http_append(out, &len, max, "tcp   2323 kernel/debug LISTEN\n");
+        tcp_snapshot_entry_t snap[TCP_MAX_CONNECTIONS];
+        u32 n = tcp_snapshot(snap, TCP_MAX_CONNECTIONS);
+        u64 rx_drop = 0, tx_drop = 0;
+        nic_filter_stats(&rx_drop, &tx_drop);
+        http_append(out, &len, max, "CONN ST        LOCAL                  REMOTE                 OWNER          PEND RX TX RETRY\n");
+        for (u32 i = 0; i < n; i++) {
+            tcp_snapshot_entry_t *e = &snap[i];
+            http_append_u64(out, &len, max, (u32)e->conn);
+            http_append(out, &len, max, "    ");
+            http_append(out, &len, max, tcp_state_name(e->state));
+            http_append(out, &len, max, " ");
+            http_append_ip4(out, &len, max, e->local_ip);
+            http_append(out, &len, max, ":");
+            http_append_u64(out, &len, max, e->local_port);
+            http_append(out, &len, max, "    ");
+            if (e->remote_ip) {
+                http_append_ip4(out, &len, max, e->remote_ip);
+                http_append(out, &len, max, ":");
+                http_append_u64(out, &len, max, e->remote_port);
+            } else {
+                http_append(out, &len, max, "*:*");
+            }
+            http_append(out, &len, max, "    ");
+            http_append(out, &len, max, tcp_owner_label(e->local_port));
+            http_append(out, &len, max, "    ");
+            http_append_u64(out, &len, max, e->pending_count);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, e->rx_used);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, e->tx_used);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, e->retries);
+            http_append(out, &len, max, "\n");
+        }
         http_append(out, &len, max, "syn=");
         http_append_u64(out, &len, max, td->syn_seen);
         http_append(out, &len, max, " synack=");
         http_append_u64(out, &len, max, td->synack_sent);
         http_append(out, &len, max, " accepted=");
         http_append_u64(out, &len, max, td->accepted);
+        http_append(out, &len, max, " fw_rx_drop=");
+        http_append_u64(out, &len, max, rx_drop);
+        http_append(out, &len, max, " fw_tx_drop=");
+        http_append_u64(out, &len, max, tx_drop);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "processes")) {
         struct proc_ui_entry snap[MAX_PROCS_PER_CORE];
@@ -3953,6 +4016,56 @@ static void ui_console_ip4(u32 ip)
     ui_console_u32_dec((ip >> 8) & 0xFF);
     ui_console_write(".");
     ui_console_u32_dec(ip & 0xFF);
+}
+
+static void ui_console_print_netstat(void)
+{
+    tcp_snapshot_entry_t snap[TCP_MAX_CONNECTIONS];
+    const tcp_diag_t *td = tcp_diag();
+    u32 n = tcp_snapshot(snap, TCP_MAX_CONNECTIONS);
+    u64 rx_drop = 0, tx_drop = 0;
+    nic_filter_stats(&rx_drop, &tx_drop);
+    ui_console_write("CONN ST        LOCAL                  REMOTE                 OWNER          PEND RX TX RETRY\n");
+    for (u32 i = 0; i < n; i++) {
+        tcp_snapshot_entry_t *e = &snap[i];
+        ui_console_u32_dec((u32)e->conn);
+        ui_console_write("    ");
+        ui_console_write(tcp_state_name(e->state));
+        ui_console_write(" ");
+        ui_console_ip4(e->local_ip);
+        ui_console_write(":");
+        ui_console_u32_dec(e->local_port);
+        ui_console_write("    ");
+        if (e->remote_ip) {
+            ui_console_ip4(e->remote_ip);
+            ui_console_write(":");
+            ui_console_u32_dec(e->remote_port);
+        } else {
+            ui_console_write("*:*");
+        }
+        ui_console_write("    ");
+        ui_console_write(tcp_owner_label(e->local_port));
+        ui_console_write("    ");
+        ui_console_u32_dec(e->pending_count);
+        ui_console_write(" ");
+        ui_console_u32_dec(e->rx_used);
+        ui_console_write(" ");
+        ui_console_u32_dec(e->tx_used);
+        ui_console_write(" ");
+        ui_console_u32_dec(e->retries);
+        ui_console_write("\n");
+    }
+    ui_console_write("syn=");
+    ui_console_u32_dec((u32)td->syn_seen);
+    ui_console_write(" synack=");
+    ui_console_u32_dec((u32)td->synack_sent);
+    ui_console_write(" accepted=");
+    ui_console_u32_dec((u32)td->accepted);
+    ui_console_write(" fw_rx_drop=");
+    ui_console_u32_dec((u32)rx_drop);
+    ui_console_write(" fw_tx_drop=");
+    ui_console_u32_dec((u32)tx_drop);
+    ui_console_write("\n");
 }
 
 static void ui_firewall_print_ip_spec(u32 flags, bool src, const nic_filter_rule_t *r)
@@ -6873,6 +6986,8 @@ static void ui_console_exec(char *line)
         uart_puts("ticks=");
         uart_hex(t);
         uart_puts("\n");
+    } else if (ui_streq(argv[0], "netstat")) {
+        ui_console_print_netstat();
     } else if (ui_streq(argv[0], "ps")) {
         ui_console_print_ps();
     } else if (ui_streq(argv[0], "kill")) {
