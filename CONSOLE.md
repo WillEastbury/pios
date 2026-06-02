@@ -156,6 +156,8 @@ http://192.168.218.101/
 
 Tabs render as structured cards/tables and include a manual refresh button plus an auto-refresh checkbox with a millisecond interval control on live data tabs.
 
+HTTP admin sessions clean up normal peer-close states without treating `CLOSE_WAIT` as an operator error, so routine browser refreshes should not flood the hot log with repeated `http-error` entries.
+
 Tabs include:
 
 - **Overview**: `/api/status` JSON, including `version` and `build`.

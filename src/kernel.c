@@ -2704,7 +2704,11 @@ static void echo_tcp_poll(void) {
         http_last_state = st;
         http_last_readable = tcp_readable(http_client_conn);
         http_last_writable = tcp_writable(http_client_conn);
-        if (st == 4 /* ESTABLISHED */) {
+        if (st == TCP_CLOSED || st == TCP_CLOSE_WAIT || st >= TCP_CLOSING) {
+            http_diag.closes++;
+            http_trace(HTTP_EVT_CLOSE, http_diag.route, http_resp_len, http_resp_off);
+            http_reset_client(st != TCP_CLOSED);
+        } else if (st == TCP_ESTABLISHED) {
             if (http_resp_len == 0) {
                 u32 readable = tcp_readable(http_client_conn);
                 if (readable > 0 && http_req_len < sizeof(http_req_buf)) {
