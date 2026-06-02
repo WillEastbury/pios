@@ -1073,7 +1073,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
             "Examples: status | ps | netstat | firewall list | reboot confirm\n"
-            "Command help: help status | help netstat | help firewall | help reboot\n"
+            "Command help: help status | help netstat | help firewall | help reboot | help peek\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
     } else if (http_starts_with(cmd, "help ")) {
         const char *topic = cmd + 5;
@@ -1089,8 +1089,14 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "reboot confirm\n  Reboot via PSCI SYSTEM_RESET from UART/TCP console.\nHTTP reboot: /api/admin/reboot?confirm=1 or :8081/?confirm=1\n");
         } else if (http_streq(topic, "users")) {
             http_append(out, &len, max, "users\n  Show principal/user snapshot.\n");
+        } else if (http_streq(topic, "peek")) {
+            http_append(out, &len, max, "peek <addr> [1|2|4|8]\n  Read memory from UART/TCP console admin/debug context.\n");
+        } else if (http_streq(topic, "poke")) {
+            http_append(out, &len, max, "poke <addr> <value> [1|2|4|8]\n  Write live memory from UART/TCP console admin/debug context.\n");
+        } else if (http_streq(topic, "dumpmem")) {
+            http_append(out, &len, max, "dumpmem <addr> [bytes]\n  Dump memory from UART/TCP console admin/debug context.\n");
         } else {
-            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot\n");
+            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help peek\n");
         }
     }
     else if (http_streq(cmd, "status")) {
@@ -3469,6 +3475,30 @@ static bool ui_parse_u32(const char *s, u32 *out)
     return true;
 }
 
+static bool ui_parse_u64(const char *s, u64 *out)
+{
+    if (!s || !*s || !out) return false;
+    u32 base = 10;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        base = 16;
+        s += 2;
+        if (!*s) return false;
+    }
+    u64 v = 0;
+    while (*s) {
+        u32 d;
+        char c = *s++;
+        if (c >= '0' && c <= '9') d = (u32)(c - '0');
+        else if (base == 16 && c >= 'a' && c <= 'f') d = (u32)(c - 'a' + 10);
+        else if (base == 16 && c >= 'A' && c <= 'F') d = (u32)(c - 'A' + 10);
+        else return false;
+        if (d >= base) return false;
+        v = v * base + d;
+    }
+    *out = v;
+    return true;
+}
+
 static bool ui_parse_ip4(const char *s, u32 *out)
 {
     if (!s || !out) return false;
@@ -4020,6 +4050,110 @@ static void ui_console_u32_dec(u32 v)
     while (n) {
         char s[2] = { tmp[--n], 0 };
         ui_console_write(s);
+    }
+}
+
+static void ui_console_hex_fixed(u64 v, u32 digits)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    ui_console_write("0x");
+    for (i32 i = (i32)((digits - 1U) * 4U); i >= 0; i -= 4) {
+        char s[2] = { hx[(v >> (u32)i) & 0xFULL], 0 };
+        ui_console_write(s);
+    }
+}
+
+static bool ui_mem_width(const char *s, u32 *width)
+{
+    if (!width) return false;
+    if (!s) { *width = 4; return true; }
+    if (ui_streq(s, "1") || ui_streq(s, "u8") || ui_streq(s, "byte")) { *width = 1; return true; }
+    if (ui_streq(s, "2") || ui_streq(s, "16") || ui_streq(s, "half")) { *width = 2; return true; }
+    if (ui_streq(s, "4") || ui_streq(s, "32") || ui_streq(s, "word")) { *width = 4; return true; }
+    if (ui_streq(s, "8") || ui_streq(s, "64") || ui_streq(s, "qword")) { *width = 8; return true; }
+    return false;
+}
+
+static u64 ui_mem_read(u64 addr, u32 width)
+{
+    if (width == 1) return *(volatile u8 *)(usize)addr;
+    if (width == 2) return *(volatile u16 *)(usize)addr;
+    if (width == 8) return *(volatile u64 *)(usize)addr;
+    return *(volatile u32 *)(usize)addr;
+}
+
+static void ui_mem_write(u64 addr, u64 value, u32 width)
+{
+    if (width == 1) *(volatile u8 *)(usize)addr = (u8)value;
+    else if (width == 2) *(volatile u16 *)(usize)addr = (u16)value;
+    else if (width == 8) *(volatile u64 *)(usize)addr = value;
+    else *(volatile u32 *)(usize)addr = (u32)value;
+    dsb();
+    isb();
+}
+
+static void ui_cmd_peek(u32 argc, char **argv)
+{
+    u64 addr = 0;
+    u32 width = 4;
+    if (argc < 2 || !ui_parse_u64(argv[1], &addr) ||
+        (argc >= 3 && !ui_mem_width(argv[2], &width))) {
+        ui_console_write("ERR: usage peek <addr> [1|2|4|8]\n");
+        return;
+    }
+    u64 v = ui_mem_read(addr, width);
+    ui_console_hex_fixed(addr, 16);
+    ui_console_write(" = ");
+    ui_console_hex_fixed(v, width * 2U);
+    ui_console_write("\n");
+}
+
+static void ui_cmd_poke(u32 argc, char **argv)
+{
+    u64 addr = 0, value = 0;
+    u32 width = 4;
+    if (argc < 3 || !ui_parse_u64(argv[1], &addr) || !ui_parse_u64(argv[2], &value) ||
+        (argc >= 4 && !ui_mem_width(argv[3], &width))) {
+        ui_console_write("ERR: usage poke <addr> <value> [1|2|4|8]\n");
+        return;
+    }
+    ui_mem_write(addr, value, width);
+    ui_console_write("OK: ");
+    ui_console_hex_fixed(addr, 16);
+    ui_console_write(" <= ");
+    ui_console_hex_fixed(value, width * 2U);
+    ui_console_write("\n");
+}
+
+static void ui_cmd_dumpmem(u32 argc, char **argv)
+{
+    u64 addr = 0;
+    u32 len = 256;
+    if (argc < 2 || !ui_parse_u64(argv[1], &addr) ||
+        (argc >= 3 && !ui_parse_u32(argv[2], &len))) {
+        ui_console_write("ERR: usage dumpmem <addr> [bytes]\n");
+        return;
+    }
+    if (len > 4096) len = 4096;
+    for (u32 off = 0; off < len; off += 16) {
+        ui_console_hex_fixed(addr + off, 16);
+        ui_console_write(": ");
+        for (u32 i = 0; i < 16; i++) {
+            if (off + i < len) {
+                u8 b = *(volatile u8 *)(usize)(addr + off + i);
+                ui_console_hex_fixed(b, 2);
+                ui_console_write(" ");
+            } else {
+                ui_console_write("   ");
+            }
+        }
+        ui_console_write(" ");
+        for (u32 i = 0; i < 16 && off + i < len; i++) {
+            u8 b = *(volatile u8 *)(usize)(addr + off + i);
+            char s[2] = { (b >= 32 && b < 127) ? (char)b : '.', 0 };
+            ui_console_write(s);
+        }
+        ui_console_write("\n");
     }
 }
 
@@ -6923,6 +7057,13 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("usb status|reinit|poll\n");
     } else if (ui_streq(topic, "dev")) {
         ui_console_write("usb status|reinit|poll\ncapsule ...\nobs ...\nhexsec <lba>\n");
+        ui_console_write("peek <addr> [1|2|4|8]\npoke <addr> <value> [1|2|4|8]\ndumpmem <addr> [bytes]\n");
+    } else if (ui_streq(topic, "peek")) {
+        ui_console_write("peek <addr> [1|2|4|8]\n  Read memory width in bytes. Example: peek 0x1000FFF000 4\n");
+    } else if (ui_streq(topic, "poke")) {
+        ui_console_write("poke <addr> <value> [1|2|4|8]\n  Write memory width in bytes. Dangerous: live kernel memory/device access.\n");
+    } else if (ui_streq(topic, "dumpmem")) {
+        ui_console_write("dumpmem <addr> [bytes]\n  Dump up to 4096 bytes from a memory address.\n");
     } else {
         return false;
     }
@@ -7159,6 +7300,12 @@ static void ui_console_exec(char *line)
                 ui_dump_sector(lba);
             }
         }
+    } else if (ui_streq(argv[0], "peek")) {
+        ui_cmd_peek(argc, argv);
+    } else if (ui_streq(argv[0], "poke")) {
+        ui_cmd_poke(argc, argv);
+    } else if (ui_streq(argv[0], "dumpmem")) {
+        ui_cmd_dumpmem(argc, argv);
     } else if (ui_streq(argv[0], "fsinspect")) {
         if (argc < 2) ui_cmd_fsinspect(ui_cwd);
         else {

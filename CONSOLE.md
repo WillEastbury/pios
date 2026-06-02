@@ -88,9 +88,31 @@ users
 firewall list
 watchdog status
 reboot confirm
+peek 0x1000FFF000 4
+dumpmem 0x80000 128
 ```
 
 `help core`, `help fs`, `help net`, `help svc`, and `help dev` are documentation groups only. Do not prefix commands with the group name. For example, use `status` and `ps`, not `core status ps`.
+
+### Memory inspector commands
+
+The debug/admin console includes direct memory inspection commands:
+
+```text
+peek <addr> [1|2|4|8]
+poke <addr> <value> [1|2|4|8]
+dumpmem <addr> [bytes]
+```
+
+Examples:
+
+```text
+peek 0x1000FFF000 4
+poke 0x1000FFF000 0x1 4
+dumpmem 0x80000 256
+```
+
+These commands directly access live kernel/device memory and are intended for admin/debug use only.
 
 ## First-boot OOBE
 
