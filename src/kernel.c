@@ -1071,14 +1071,27 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     else if (http_streq(cmd, "help")) {
         http_append(out, &len, max,
             "PIOS terminal help\n"
-            "  status              system summary\n"
-            "  netstat             TCP/listener summary\n"
-            "  processes           process snapshot\n"
-            "  users               principal snapshot\n"
-            "  firewall list       firewall rules and defaults\n"
-            "  kill <pid>          kill process\n"
-            "  restart <pid>       restart process\n"
-            "For full console help use UART/TCP console: help core|fs|net|svc|dev\n");
+            "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
+            "Examples: status | ps | netstat | firewall list | reboot confirm\n"
+            "Command help: help status | help netstat | help firewall | help reboot\n"
+            "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
+    } else if (http_starts_with(cmd, "help ")) {
+        const char *topic = cmd + 5;
+        if (http_streq(topic, "status")) {
+            http_append(out, &len, max, "status\n  Show system/build/network summary.\n");
+        } else if (http_streq(topic, "ps") || http_streq(topic, "processes")) {
+            http_append(out, &len, max, "processes\n  Show process snapshot.\n");
+        } else if (http_streq(topic, "netstat")) {
+            http_append(out, &len, max, "netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
+        } else if (http_streq(topic, "firewall")) {
+            http_append(out, &len, max, "firewall list\n  List firewall rules.\nMutations are available from UART/TCP console.\n");
+        } else if (http_streq(topic, "reboot")) {
+            http_append(out, &len, max, "reboot confirm\n  Reboot via PSCI SYSTEM_RESET from UART/TCP console.\nHTTP reboot: /api/admin/reboot?confirm=1 or :8081/?confirm=1\n");
+        } else if (http_streq(topic, "users")) {
+            http_append(out, &len, max, "users\n  Show principal/user snapshot.\n");
+        } else {
+            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot\n");
+        }
     }
     else if (http_streq(cmd, "status")) {
         nic_packet_counters_t pc;
@@ -2027,7 +2040,7 @@ static u32 http_build_spa_response(char *out, u32 max)
         "<!doctype html><html><head><meta charset='utf-8'><title>PIOS Admin</title>"
         "<style>:root{--bs-font-sans:'Segoe UI',Aptos,Calibri,sans-serif;--bs-font-mono:Consolas,'Courier New',monospace;--bs-body-bg:#0f172a;--bs-body-color:#f1f5f9;--bs-secondary-color:#94a3b8;--bs-primary:#6366f1;--bs-light:#1e293b;--bs-dark:#020617;--bs-border-color:#334155;--bs-danger:#ef4444}body{margin:0;background:var(--bs-body-bg);color:var(--bs-body-color);font-family:var(--bs-font-sans)}.wrap{padding:24px}.tabs button,.bt{border:1px solid var(--bs-border-color);background:var(--bs-dark);color:var(--bs-body-color);border-radius:10px;padding:8px 12px;margin:4px}.tabs button.act{background:var(--bs-primary)}.danger{background:var(--bs-danger)}.cd{background:var(--bs-light);border:1px solid var(--bs-border-color);border-radius:16px;padding:16px;margin:12px 0}input{background:var(--bs-dark);color:var(--bs-body-color);border:1px solid var(--bs-border-color);border-radius:10px;padding:8px}pre,code{font-family:var(--bs-font-mono)}pre{white-space:pre-wrap}.nt{width:100%;border-collapse:collapse;font-family:var(--bs-font-mono);font-size:13px}.nt th,.nt td{border-bottom:1px solid var(--bs-border-color);padding:6px 8px;text-align:left}.nt th{color:var(--bs-secondary-color);background:var(--bs-dark)}.nt .st{color:#6dff6d}.ntstat{margin-top:12px;color:var(--bs-secondary-color);font-family:var(--bs-font-mono)}.term{background:#001600;color:#6dff6d;border:1px solid #24b524;border-radius:10px;box-shadow:0 0 24px #0a4 inset,0 0 10px #0f04;padding:0;overflow:hidden;font-family:var(--bs-font-mono)}.bar{background:#003000;color:#b8ffb8;padding:8px 12px;border-bottom:1px solid #147014;letter-spacing:.08em}.screen{height:420px;overflow:auto;padding:14px;white-space:pre-wrap;text-shadow:0 0 6px #3f3;font-size:14px;line-height:1.35}.prompt{display:flex;gap:8px;align-items:center;border-top:1px solid #147014;background:#001f00;padding:10px 12px}.prompt span{color:#b8ffb8}.prompt input{flex:1;background:#000;color:#8cff8c;border:0;outline:0;font-family:var(--bs-font-mono);font-size:15px}.fwex code{display:block;margin:4px 0;color:#b8ffb8}.cursor{animation:blink 1s steps(1) infinite}@keyframes blink{50%{opacity:0}}</style></head><body><div class='wrap'><h1>PIOS Admin Console</h1><p id='sub'>Lazy tabs; no polling.</p><div class='tabs'><button class='act' data-t='overview'>Overview</button><button data-t='processes'>Processes</button><button data-t='netstat'>Netstat</button><button data-t='system'>System</button><button data-t='users'>Users</button><button data-t='logs'>Logs</button><button data-t='walfs'>WALFS</button><button data-t='firewall'>Firewall</button><button data-t='terminal'>Terminal</button><button data-t='admin'>Admin</button></div><div id='app'></div></div>");
     http_append(out, &len, max,
-        "<script>let tab='overview',hist=['PIOS green-screen terminal ready. Type help.'];const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}async function txt(u){let r=await fetch(u);return await r.text()}async function js(u){let r=await fetch(u);return await r.json()}function pre(t,h){app.innerHTML=card(t,`<pre>${esc(h)}</pre>`)}function term(){app.innerHTML=card('Terminal',`<div class=term><div class=bar>PIOS // SECOND STAGE LOADER // REMOTE CONSOLE</div><div class=screen id=screen></div><div class=prompt><span>console&gt;</span><input id=cmd autocomplete=off spellcheck=false autofocus><span class=cursor>_</span></div></div>`);const sc=document.getElementById('screen'),cmd=document.getElementById('cmd');function paint(){sc.textContent=hist.join('\\n');sc.scrollTop=sc.scrollHeight}async function run(){let c=cmd.value.trim();cmd.value='';if(!c)return;if(c==='clear'){hist=[];paint();return}hist.push('console> '+c);try{hist.push(await txt('/api/terminal?cmd='+encodeURIComponent(c)))}catch(e){hist.push('ERR '+e)}while(hist.length>160)hist.shift();paint()}cmd.onkeydown=e=>{if(e.key==='Enter')run()};paint();cmd.focus()}async function firewall(){let r=await txt('/api/terminal?cmd=firewall%20list');app.innerHTML=card('Firewall',`<button class=bt id=fwrefresh>Refresh</button><pre>${esc(r)}</pre><div class=fwex><p>Use the UART/HDMI/TCP console for mutations:</p><code>firewall allow in tcp port 2323 src 192.168.218.9</code><code>firewall deny in tcp port 80 src 192.168.218.0/24</code><code>firewall allow out udp toport 53 dst 192.168.218.1</code><code>firewall reset</code></div>`);document.getElementById('fwrefresh').onclick=draw}async function netstat(){let r=await txt('/api/terminal?cmd=netstat'),lines=r.trim().split('\\n'),stats='';let rows=lines.filter(x=>x&&x[0]>='0'&&x[0]<='9').map(x=>x.trim().split(/\\s+/));let html='<button class=bt id=nsrefresh>Refresh</button><table class=nt><thead><tr><th>Conn</th><th>State</th><th>Local</th><th>Remote</th><th>Owner</th><th>Pending</th><th>RX</th><th>TX</th><th>Retry</th></tr></thead><tbody>';for(let p of rows){html+=`<tr><td>${esc(p[0]||'')}</td><td class=st>${esc(p[1]||'')}</td><td>${esc(p[2]||'')}</td><td>${esc(p[3]||'')}</td><td>${esc(p[4]||'')}</td><td>${esc(p[5]||'0')}</td><td>${esc(p[6]||'0')}</td><td>${esc(p[7]||'0')}</td><td>${esc(p[8]||'0')}</td></tr>`}for(let l of lines)if(l.startsWith('syn='))stats=l;html+='</tbody></table><div class=ntstat>'+esc(stats)+'</div>';app.innerHTML=card('Netstat',html);document.getElementById('nsrefresh').onclick=draw}async function draw(){sub.textContent='Loading '+tab+'...';try{if(tab==='overview'){let d=await js('/api/status');pre('Overview',JSON.stringify(d,null,2))}else if(tab==='system'){pre('System',await txt('/api/terminal?cmd=status'))}else if(tab==='netstat'){await netstat()}else if(tab==='processes'){pre('Processes',await txt('/api/terminal?cmd=processes'))}else if(tab==='users'){pre('Users',await txt('/api/terminal?cmd=users'))}else if(tab==='logs'){let a=await txt('/api/admin/log-stream?tail=24'),b=await txt('/api/logs');pre('Logs',a+'\\n--- proc logs ---\\n'+b)}else if(tab==='walfs'){pre('WALFS',await txt('/api/walfs?path=/'))}else if(tab==='firewall'){await firewall()}else if(tab==='terminal'){term()}else if(tab==='admin'){app.innerHTML=card('Admin',`<p>Operator endpoints.</p><p><a href='/api/admin/log-stream?tail=24'>tail log stream</a></p><p><a href='/api/admin/kernel-update?confirm=1'>kernel update</a></p><p><a href='/api/admin/reboot?confirm=1'>hot reboot</a></p>`)}else pre(tab,'unknown tab')}catch(e){pre('Error',e)}sub.textContent='Tab '+tab}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
+        "<script>let tab='overview',hist=['PIOS green-screen terminal ready. Type Help for assistance!'];const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}async function txt(u){let r=await fetch(u);return await r.text()}async function js(u){let r=await fetch(u);return await r.json()}function pre(t,h){app.innerHTML=card(t,`<pre>${esc(h)}</pre>`)}function term(){app.innerHTML=card('Terminal',`<div class=term><div class=bar>PIOS // SECOND STAGE LOADER // REMOTE CONSOLE</div><div class=screen id=screen></div><div class=prompt><span>ready&gt;</span><input id=cmd autocomplete=off spellcheck=false autofocus><span class=cursor>_</span></div></div>`);const sc=document.getElementById('screen'),cmd=document.getElementById('cmd');function paint(){sc.textContent=hist.join('\\n');sc.scrollTop=sc.scrollHeight}async function run(){let c=cmd.value.trim();cmd.value='';if(!c)return;if(c==='clear'){hist=[];paint();return}hist.push('ready> '+c);try{hist.push(await txt('/api/terminal?cmd='+encodeURIComponent(c)))}catch(e){hist.push('ERR '+e)}while(hist.length>160)hist.shift();paint()}cmd.onkeydown=e=>{if(e.key==='Enter')run()};paint();cmd.focus()}async function firewall(){let r=await txt('/api/terminal?cmd=firewall%20list');app.innerHTML=card('Firewall',`<button class=bt id=fwrefresh>Refresh</button><pre>${esc(r)}</pre><div class=fwex><p>Use the UART/HDMI/TCP console for mutations:</p><code>firewall allow in tcp port 2323 src 192.168.218.9</code><code>firewall deny in tcp port 80 src 192.168.218.0/24</code><code>firewall allow out udp toport 53 dst 192.168.218.1</code><code>firewall reset</code></div>`);document.getElementById('fwrefresh').onclick=draw}async function netstat(){let r=await txt('/api/terminal?cmd=netstat'),lines=r.trim().split('\\n'),stats='';let rows=lines.filter(x=>x&&x[0]>='0'&&x[0]<='9').map(x=>x.trim().split(/\\s+/));let html='<button class=bt id=nsrefresh>Refresh</button><table class=nt><thead><tr><th>Conn</th><th>State</th><th>Local</th><th>Remote</th><th>Owner</th><th>Pending</th><th>RX</th><th>TX</th><th>Retry</th></tr></thead><tbody>';for(let p of rows){html+=`<tr><td>${esc(p[0]||'')}</td><td class=st>${esc(p[1]||'')}</td><td>${esc(p[2]||'')}</td><td>${esc(p[3]||'')}</td><td>${esc(p[4]||'')}</td><td>${esc(p[5]||'0')}</td><td>${esc(p[6]||'0')}</td><td>${esc(p[7]||'0')}</td><td>${esc(p[8]||'0')}</td></tr>`}for(let l of lines)if(l.startsWith('syn='))stats=l;html+='</tbody></table><div class=ntstat>'+esc(stats)+'</div>';app.innerHTML=card('Netstat',html);document.getElementById('nsrefresh').onclick=draw}async function draw(){sub.textContent='Loading '+tab+'...';try{if(tab==='overview'){let d=await js('/api/status');pre('Overview',JSON.stringify(d,null,2))}else if(tab==='system'){pre('System',await txt('/api/terminal?cmd=status'))}else if(tab==='netstat'){await netstat()}else if(tab==='processes'){pre('Processes',await txt('/api/terminal?cmd=processes'))}else if(tab==='users'){pre('Users',await txt('/api/terminal?cmd=users'))}else if(tab==='logs'){let a=await txt('/api/admin/log-stream?tail=24'),b=await txt('/api/logs');pre('Logs',a+'\\n--- proc logs ---\\n'+b)}else if(tab==='walfs'){pre('WALFS',await txt('/api/walfs?path=/'))}else if(tab==='firewall'){await firewall()}else if(tab==='terminal'){term()}else if(tab==='admin'){app.innerHTML=card('Admin',`<p>Operator endpoints.</p><p><a href='/api/admin/log-stream?tail=24'>tail log stream</a></p><p><a href='/api/admin/kernel-update?confirm=1'>kernel update</a></p><p><a href='/api/admin/reboot?confirm=1'>hot reboot</a></p>`)}else pre(tab,'unknown tab')}catch(e){pre('Error',e)}sub.textContent='Tab '+tab}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
     return len;
 }
 
@@ -2526,6 +2539,9 @@ static void admin_services_poll(void)
 
 static void http_render_diag(void)
 {
+#if !HTTP_DIAG_VERBOSE
+    return;
+#endif
     u32 row = fb_reserved_rows();
     if (row < 5) row = 5;
     row -= 4;
@@ -3623,7 +3639,7 @@ static void ui_console_write(const char *s)
 static void ui_console_prompt(void)
 {
     uart_vt_color(UART_COLOR_GREEN, UART_COLOR_BLACK, true);
-    ui_console_write("console> ");
+    ui_console_write("ready> ");
     uart_vt_reset();
 }
 
@@ -6854,6 +6870,65 @@ static void ui_render_scheduler(void)
     fb_printf("sched> %s", ui_sched_line);
 }
 
+static bool ui_console_help_topic(const char *topic)
+{
+    if (!topic)
+        return false;
+    if (ui_streq(topic, "status")) {
+        ui_console_write("status\n  Show system/build/network summary.\n");
+    } else if (ui_streq(topic, "ps") || ui_streq(topic, "processes")) {
+        ui_console_write("ps\n  Show process list.\n");
+        ui_console_write("kill <pid>\n  Kill process by numeric/hex pid.\n");
+        ui_console_write("launch <path> [1|2|3] [lazy|low|normal|high|realtime]\n  Launch executable on a core.\n");
+    } else if (ui_streq(topic, "netstat")) {
+        ui_console_write("netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
+    } else if (ui_streq(topic, "firewall")) {
+        ui_console_write("firewall list\n  List rules.\n");
+        ui_console_write("firewall reset\n  Restore inbound deny/outbound allow defaults plus service allows.\n");
+        ui_console_write("firewall allow|deny <in|out|both> <tcp|udp|icmp|ip|arp> [port N|toport N|fromport N] [src SPEC] [dst SPEC]\n");
+        ui_console_write("SPEC: any | a.b.c.d | a.b.c.d/prefix | a.b.c.d/mask | a.b.c.d-a.b.c.d\n");
+    } else if (ui_streq(topic, "reboot")) {
+        ui_console_write("reboot confirm\n  Reboot via PSCI SYSTEM_RESET; confirmation word is required.\n");
+    } else if (ui_streq(topic, "watchdog")) {
+        ui_console_write("watchdog status\nwatchdog arm|disarm\nwatchdog timeout <ticks>\nwatchdog mode <halt|reboot>\nwatchdog trip\n");
+    } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
+        ui_console_write("pwd | cd <path> | lsdir [path]\n");
+        ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
+        ui_console_write("copy|cp <src> <dst> | cpdir <src_dir> <dst_dir> | mv <src> <dst>\n");
+        ui_console_write("hexdump <path> [max_bytes] | find <dir> <needle> | df\n");
+    } else if (ui_streq(topic, "disk")) {
+        ui_console_write("disk info|sync|compact|verify|read <lba>|writezero <lba> --force\n");
+    } else if (ui_streq(topic, "db")) {
+        ui_console_write("db key <card> <record>\n");
+        ui_console_write("db put|get|del <card> <record> ...\n");
+        ui_console_write("db putf|getf <card> <record> <path>\n");
+        ui_console_write("db list <card>\n");
+    } else if (ui_streq(topic, "netcfg")) {
+        ui_console_write("netcfg\n  Show current network config.\n");
+        ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d>\nnetcfg apply\nnetcfg dhcp <on|off> [timeout_ms]\nnetcfg addnbr <ip> <mac>\n");
+    } else if (ui_streq(topic, "stream")) {
+        ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
+    } else if (ui_streq(topic, "svc")) {
+        ui_console_write("svc add <name> <path> [dep|-] [target] [1|2|3] [priority] [principal] [restart] [max] [backoff]\n");
+        ui_console_write("svc start|stop|restart <name> | svc run|pause | svc target <default|rescue|all> | svc list | svc clear\n");
+    } else if (ui_streq(topic, "batch")) {
+        ui_console_write("batch add|at|every ...\nbatch run [parallel] | batch stop | batch status | batch list\n");
+    } else if (ui_streq(topic, "env")) {
+        ui_console_write("env list|get|set|pset|unset|save|load\n");
+    } else if (ui_streq(topic, "update")) {
+        ui_console_write("update status|stage <slot> [tries]|success\n");
+    } else if (ui_streq(topic, "edit")) {
+        ui_console_write("edit <path>\nedit.pix <path>\n  Ctrl+S save, Ctrl+Q exit.\n");
+    } else if (ui_streq(topic, "usb")) {
+        ui_console_write("usb status|reinit|poll\n");
+    } else if (ui_streq(topic, "dev")) {
+        ui_console_write("usb status|reinit|poll\ncapsule ...\nobs ...\nhexsec <lba>\n");
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static void ui_console_exec(char *line)
 {
     char *argv[UI_CONSOLE_ARGV_MAX];
@@ -6871,16 +6946,14 @@ static void ui_console_exec(char *line)
 
     if (ui_streq(argv[0], "help")) {
         if (argc < 2) {
-            ui_console_write("PIOS help categories:\n");
-            ui_console_write("  help core   - status, process, reboot, watchdog\n");
-            ui_console_write("  help fs     - WALFS files, dirs, database, disk\n");
-            ui_console_write("  help net    - network, firewall, stream, TCP debug\n");
-            ui_console_write("  help svc    - batch/service/scripting/env\n");
-            ui_console_write("  help dev    - USB, capsule, obs, debugger helpers\n");
-            ui_console_write("Common: status ps netstat firewall list logs reboot confirm\n");
+            ui_console_write("PIOS help\n");
+            ui_console_write("Run commands exactly as shown; category names are help topics, not prefixes.\n");
+            ui_console_write("Examples: status | ps | netstat | firewall list | reboot confirm\n");
+            ui_console_write("Command help: help <command>, e.g. help status, help firewall, help reboot\n");
+            ui_console_write("Category help: help core | help fs | help net | help svc | help dev\n");
         } else if (ui_streq(argv[1], "core")) {
             ui_console_write("Core/process commands:\n");
-            ui_console_write("  status time ps kill <pid>\n");
+            ui_console_write("  status\n  time\n  ps\n  kill <pid>\n");
             ui_console_write("  launch|run <path> [1|2|3] [priority]\n");
             ui_console_write("  prio <pid> <lazy|low|normal|high|realtime>\n");
             ui_console_write("  affinity <pid> <1|2|3>\n");
@@ -6888,7 +6961,9 @@ static void ui_console_exec(char *line)
             ui_console_write("  reboot confirm\n");
         } else if (ui_streq(argv[1], "fs")) {
             ui_console_write("Filesystem/storage commands:\n");
-            ui_console_write("  pwd cd lsdir mkdir touch copy cp cpdir mv cat stat rm find\n");
+            ui_console_write("  pwd\n  cd <path>\n  lsdir [path]\n  mkdir <path>\n  touch <path>\n");
+            ui_console_write("  copy|cp <src> <dst>\n  cpdir <src_dir> <dst_dir>\n  mv <src> <dst>\n");
+            ui_console_write("  cat <path>\n  stat <path>\n  rm <path>\n  find <dir> <needle>\n");
             ui_console_write("  hexdump <path> [max_bytes] fsinspect <path>\n");
             ui_console_write("  df mount umount disk [info|sync|compact|verify|read|writezero]\n");
             ui_console_write("  db key|put|putf|get|getf|del|list\n");
@@ -6910,8 +6985,8 @@ static void ui_console_exec(char *line)
             ui_console_write("  usb status|reinit|poll  wifi disabled\n");
             ui_console_write("  capsule ...  obs ...  hexsec <lba>\n");
             ui_console_write("  edit|edit.pix <path>  clear echo\n");
-        } else {
-            ui_console_write("ERR: usage help [core|fs|net|svc|dev]\n");
+        } else if (!ui_console_help_topic(argv[1])) {
+            ui_console_write("ERR: unknown help topic. Try: help, help core, help status, help firewall\n");
         }
     } else if (ui_streq(argv[0], "pwd")) {
         ui_console_write(ui_cwd);
@@ -7420,6 +7495,166 @@ void spin_set_color(u32 color) {
     spin_color = color;
 }
 
+static bool dash_contains(const char *s, const char *needle)
+{
+    if (!s || !needle || !*needle)
+        return false;
+    for (u32 i = 0; s[i]; i++) {
+        u32 j = 0;
+        while (needle[j] && s[i + j] == needle[j])
+            j++;
+        if (!needle[j])
+            return true;
+    }
+    return false;
+}
+
+static void dash_ip(u32 ip)
+{
+    fb_printf("%u.%u.%u.%u",
+              (ip >> 24) & 0xFF, (ip >> 16) & 0xFF,
+              (ip >> 8) & 0xFF, ip & 0xFF);
+}
+
+static void hdmi_dashboard_render(void)
+{
+    static u64 last_ms;
+    static u64 last_ticks[4];
+    static u64 last_poll[4];
+    static u32 last_cpu[4];
+    static u32 heartbeat;
+    u64 now_ms = timer_monotonic_ms();
+    if (now_ms < last_ms + 1000ULL)
+        return;
+
+    if (last_ms != 0) {
+        for (u32 i = 0; i < 4; i++) {
+            struct core_env *e = core_env_of(i);
+            u64 dt = timer_ticks_core(i) - last_ticks[i];
+            u64 dp = e->poll_count - last_poll[i];
+            last_cpu[i] = dp ? 100U : (dt ? 1U : 0U);
+            last_ticks[i] = timer_ticks_core(i);
+            last_poll[i] = e->poll_count;
+        }
+    } else {
+        for (u32 i = 0; i < 4; i++) {
+            struct core_env *e = core_env_of(i);
+            last_ticks[i] = timer_ticks_core(i);
+            last_poll[i] = e->poll_count;
+        }
+    }
+    last_ms = now_ms;
+    heartbeat++;
+
+    u64 used = 0;
+    for (u32 i = 0; i < 4; i++) {
+        struct core_env *e = core_env_of(i);
+        if (e->id == i && e->ram_base == (u8 *)(usize)core_ram_bases[i] &&
+            e->ram_end == e->ram_base + CORE_PRIV_SIZE &&
+            e->heap_ptr >= e->ram_base && e->heap_ptr <= e->ram_end)
+            used += (u64)(usize)(e->heap_ptr - e->ram_base);
+    }
+    u64 total = CORE_PRIV_SIZE * 4ULL;
+
+    nic_packet_counters_t pc;
+    nic_packet_counters(&pc);
+    tcp_snapshot_entry_t tcp[TCP_MAX_CONNECTIONS];
+    u32 tcp_n = tcp_snapshot(tcp, TCP_MAX_CONNECTIONS);
+    struct proc_ui_entry proc[UI_SNAPSHOT_MAX];
+    u32 proc_n = proc_snapshot(proc, UI_SNAPSHOT_MAX);
+    u32 ready = 0, running = 0, blocked = 0, dead = 0;
+    for (u32 i = 0; i < proc_n; i++) {
+        if (proc[i].state == PROC_READY) ready++;
+        else if (proc[i].state == PROC_RUNNING) running++;
+        else if (proc[i].state == PROC_BLOCKED) blocked++;
+        else if (proc[i].state == PROC_DEAD) dead++;
+    }
+
+    fb_clear(0x00000000);
+    fb_set_color(0x0000FF80, 0x00000000);
+    fb_set_cursor(0, 0);
+    fb_box(78, 4, "PIOS>");
+    fb_set_cursor(3, 1);
+    fb_set_color(0x00FF80FF, 0x00000000);
+    fb_puts(PIOS_BUILD_LABEL);
+    fb_set_cursor(3, 2);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts("uptime=");
+    fb_printf("%u", (u32)(now_ms / 1000ULL));
+    fb_puts("s hb=");
+    fb_printf("%u", heartbeat);
+    fb_puts(" ip=");
+    dash_ip(net_get_our_ip());
+
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_set_cursor(0, 5);
+    fb_box(78, 5, "SYSTEM");
+    fb_set_cursor(3, 6);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("CPU active: c0=%u%% c1=%u%% c2=%u%% c3=%u%%", last_cpu[0], last_cpu[1], last_cpu[2], last_cpu[3]);
+    fb_set_cursor(3, 7);
+    fb_printf("RAM used: %uK / %uK", (u32)(used / 1024ULL), (u32)(total / 1024ULL));
+    fb_set_cursor(3, 8);
+    fb_printf("Packets: rx=%u tx=%u drop=%u fw=%u", (u32)pc.rx_total, (u32)pc.tx_total,
+              (u32)pc.dropped, (u32)pc.firewalled);
+
+    fb_set_color(0x00FFAA00, 0x00000000);
+    fb_set_cursor(0, 11);
+    fb_box(78, 7, "LISTENING PORTS");
+    u32 row = 12;
+    for (u32 i = 0; i < tcp_n && row < 17; i++) {
+        if (tcp[i].state != TCP_LISTEN)
+            continue;
+        fb_set_cursor(3, row++);
+        fb_puts("tcp/");
+        fb_printf("%u", tcp[i].local_port);
+        fb_puts("  ");
+        fb_puts(tcp_owner_label(tcp[i].local_port));
+        fb_puts("  pending=");
+        fb_printf("%u", tcp[i].pending_count);
+    }
+
+    fb_set_color(0x0080FF80, 0x00000000);
+    fb_set_cursor(0, 19);
+    fb_box(78, 7, "PROCESSES");
+    fb_set_cursor(3, 20);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("total=%u ready=%u running=%u blocked=%u dead=%u", proc_n, ready, running, blocked, dead);
+    row = 21;
+    for (u32 i = 0; i < proc_n && row < 25; i++) {
+        fb_set_cursor(3, row++);
+        fb_printf("pid=0x%x core=%u cpu=%u%% mem=%uK %s %s",
+                  proc[i].pid, proc[i].affinity_core, proc[i].cpu_percent,
+                  proc[i].mem_kib, ui_proc_state_str(proc[i].state), proc[i].image_path);
+    }
+
+    u32 log_top = fb_rows() > 10 ? fb_rows() - 9 : 28;
+    fb_set_color(0x00FF4040, 0x00000000);
+    fb_set_cursor(0, log_top);
+    fb_box(78, 8, "WARNINGS / ERRORS");
+    row = log_top + 1;
+    u32 shown = 0;
+    u32 max_back = http_log_seq < HTTP_LOG_RING_SIZE ? http_log_seq : HTTP_LOG_RING_SIZE;
+    for (u32 back = 0; back < max_back && shown < 6; back++) {
+        u32 seq = http_log_seq - 1U - back;
+        struct http_log_entry *e = &http_log_ring[seq % HTTP_LOG_RING_SIZE];
+        if (e->seq != seq || !e->event)
+            continue;
+        if (!dash_contains(e->event, "error") &&
+            !dash_contains(e->event, "fail") &&
+            !dash_contains(e->event, "warn"))
+            continue;
+        fb_set_cursor(3, row++);
+        fb_printf("%u t=%u %s a=%u b=%u", e->seq, e->tick_ms, e->event, e->a, e->b);
+        shown++;
+    }
+    if (shown == 0) {
+        fb_set_cursor(3, row);
+        fb_set_color(0x0000FF80, 0x00000000);
+        fb_puts("No warnings or errors in the hot log ring.");
+    }
+}
+
 /* Core 0 I/O reactor: timer IRQ only marks work due and wakes the service
  * loop. Real I/O stays in thread context so IRQ latency remains bounded. */
 #define CORE0_IO_NET     (1U << 0)
@@ -7479,9 +7714,10 @@ NORETURN void core0_main(void) {
     uart_vt_clear();
     uart_vt_home();
     uart_vt_color(UART_COLOR_CYAN, UART_COLOR_BLACK, true);
-    uart_vt_box(58, 4, "PIOS SECOND STAGE LOADER");
+    ui_console_write("PIOS Serial Console is online\n");
+    uart_vt_color(UART_COLOR_GREEN, UART_COLOR_BLACK, true);
+    ui_console_write("Type Help for assistance!\n");
     uart_vt_reset();
-    ui_console_write("UART + HDMI console ready. Type 'help'.\n");
     ui_console_prompt();
 
     for (;;) {
@@ -7497,6 +7733,8 @@ NORETURN void core0_main(void) {
         }
 
         ui_handle_keys();
+        if (ui_mode == UI_MODE_NONE)
+            hdmi_dashboard_render();
 
         if ((env->poll_count & 0x3FFF) == 0) {
             arp_tick();

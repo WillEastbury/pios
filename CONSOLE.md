@@ -19,7 +19,9 @@ COM17 at 115200 8N1, no flow control
 The prompt is:
 
 ```text
-console>
+PIOS Serial Console is online
+Type Help for assistance!
+ready>
 ```
 
 Input typed on UART is echoed to both UART and HDMI. Command output is also mirrored to both surfaces.
@@ -75,7 +77,11 @@ Common commands:
 
 ```text
 help
+help status
+help firewall
+help core
 status
+ps
 netstat
 processes
 users
@@ -83,6 +89,8 @@ firewall list
 watchdog status
 reboot confirm
 ```
+
+`help core`, `help fs`, `help net`, `help svc`, and `help dev` are documentation groups only. Do not prefix commands with the group name. For example, use `status` and `ps`, not `core status ps`.
 
 ## TCP console
 
@@ -116,6 +124,22 @@ Tabs include:
 - **Firewall**: live firewall rule panel.
 - **Terminal**: green-screen HTTP terminal.
 - **Admin**: links to log stream, OTA update, and reboot endpoints.
+
+## HDMI post-boot dashboard
+
+After initialization, HDMI switches from verbose boot/diagnostic text to a clean status dashboard that updates once per second.
+
+It shows:
+
+- `PIOS>` banner and second-stage build label.
+- Uptime, heartbeat, and IP address.
+- Per-core activity estimate and RAM use.
+- Packet totals and firewall/drop counters.
+- Listening TCP ports and owner labels.
+- Process summary and a few active process rows.
+- Lower warning/error hot-log tail.
+
+Detailed logs and diagnostics should use the remote log endpoints rather than noisy HDMI/UART output.
 
 ## Logs
 

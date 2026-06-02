@@ -22,6 +22,8 @@ static bool packet_dump_enabled;
 static u32 local_ipv4;
 static nic_packet_counters_t pkt_counts;
 
+#define NIC_HDMI_TEXT_PANELS 0
+
 #define FLOW_PROTO_ARP 0xFEU
 #define NIC_FLOW_MAX 24U
 #define FLOW_SEC_BUCKETS 60U
@@ -289,6 +291,7 @@ static bool nic_filter_allows(u8 direction, const u8 *frame, u32 len) {
 }
 
 static void fb_filter_drop(char tag, u64 count) {
+#if NIC_HDMI_TEXT_PANELS
     if ((count & 0x3F) != 1)
         return;
     fb_set_color(0x00FF4040, 0x00000000);
@@ -296,6 +299,10 @@ static void fb_filter_drop(char tag, u64 count) {
     fb_puts(" FILTER_DROP count=0x");
     fb_hex8((u32)count);
     fb_putc('\n');
+#else
+    (void)tag;
+    (void)count;
+#endif
 }
 
 static void fb_count32(u64 v)
@@ -476,6 +483,7 @@ static u32 pct_u64(u64 part, u64 total)
 
 static void nic_render_system_panel(void)
 {
+#if NIC_HDMI_TEXT_PANELS
     static u64 last_ms;
     static u64 last_ticks[4];
     static u64 last_poll[4];
@@ -540,10 +548,12 @@ static void nic_render_system_panel(void)
     fb_puts("K ");
     fb_count32(pct_u64(used, total));
     fb_puts("%                              ");
+#endif
 }
 
 static void nic_render_counter_panel(void)
 {
+#if NIC_HDMI_TEXT_PANELS
     static u64 last_rendered;
     u64 total = pkt_counts.rx_total + pkt_counts.tx_total + pkt_counts.rx_filter_drop +
                 pkt_counts.tx_filter_drop + pkt_counts.rx_arp_not_us +
@@ -658,6 +668,7 @@ static void nic_render_counter_panel(void)
         fb_puts("                                                |");
     }
     nic_render_system_panel();
+#endif
 }
 
 static void nic_count_packet(bool tx, const u8 *frame, u32 len)
