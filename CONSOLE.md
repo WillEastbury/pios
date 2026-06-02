@@ -154,16 +154,18 @@ Open:
 http://192.168.218.101/
 ```
 
+Tabs render as structured cards/tables and include a manual refresh button plus an auto-refresh checkbox with a millisecond interval control on live data tabs.
+
 Tabs include:
 
 - **Overview**: `/api/status` JSON, including `version` and `build`.
-- **System**: terminal `status` output.
-- **Netstat**: TCP diagnostics.
-- **Processes**: process snapshot.
-- **Users**: user/principal snapshot.
-- **Logs**: operator log tail and process logs.
-- **WALFS**: root WALFS browser.
-- **Firewall**: live firewall rule panel.
+- **System**: terminal `status` output as summary cards/table plus raw text.
+- **Netstat**: TCP diagnostics as a connection/session table.
+- **Processes**: process snapshot table with PPID and graph section.
+- **Users**: user/principal table.
+- **Logs**: operator log tail and process logs in side-by-side cards.
+- **WALFS**: root WALFS browser/status table.
+- **Firewall**: live firewall rules table plus mutation examples.
 - **Terminal**: green-screen HTTP terminal.
 - **Admin**: links to log stream, OTA update, and reboot endpoints.
 
