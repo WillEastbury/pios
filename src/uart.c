@@ -153,6 +153,14 @@ void uart_vt_color(u8 fg, u8 bg, bool bright)
     uart_putc('m');
 }
 
+void uart_vt_title(const char *title)
+{
+    uart_puts("\x1b]0;");
+    if (title)
+        uart_puts(title);
+    uart_putc('\a');
+}
+
 void uart_vt_bell(void) { uart_putc('\a'); }
 
 #if UART_VT_UTF8_BOXES

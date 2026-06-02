@@ -6973,6 +6973,7 @@ static void ui_console_exec(char *line)
             ui_console_write("\n");
         }
     } else if (ui_streq(argv[0], "clear")) {
+        uart_vt_title("PIOS Admin Console");
         uart_vt_clear();
         uart_vt_home();
         if (ui_mode == UI_MODE_CONSOLE) {

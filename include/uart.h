@@ -22,6 +22,7 @@ void uart_vt_clear(void);
 void uart_vt_home(void);
 void uart_vt_move(u32 row, u32 col);
 void uart_vt_color(u8 fg, u8 bg, bool bright);
+void uart_vt_title(const char *title);
 void uart_vt_bell(void);
 void uart_vt_hline(u32 n);
 void uart_vt_box(u32 width, u32 height, const char *title);

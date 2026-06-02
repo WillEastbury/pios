@@ -38,6 +38,7 @@ ESC[{row};{col}H    cursor move, 1-based
 ESC[1;32;40m        bright green on black
 ESC[1;36;40m        bright cyan on black
 ESC[1;33;40m        bright yellow on black
+ESC]0;title BEL      xterm/OSC window title
 BEL / 0x07          bell
 UTF-8               box drawing characters
 ```
@@ -63,11 +64,12 @@ Suggested client-console behavior:
 1. Open COM17 at `115200 8N1`, no flow control.
 2. Set the terminal character set to UTF-8. In PuTTY: `Window -> Translation -> Remote character set -> UTF-8`.
 3. Interpret ANSI SGR colour and cursor-control sequences above.
-4. Render Unicode box drawing if available; fall back to ASCII if not.
-5. Treat `BEL` as an optional audible/visual alert.
-6. Preserve scrollback.
-7. Do not inject local echo unless the UART device echo is disabled; PIOS echoes input.
-8. Keep command prompt rendering exactly as sent by PIOS.
+4. Interpret OSC title sequence `ESC]0;PIOS Admin Console BEL` where supported.
+5. Render Unicode box drawing if available; fall back to ASCII if not.
+6. Treat `BEL` as an optional audible/visual alert unless it terminates an OSC sequence.
+7. Preserve scrollback.
+8. Do not inject local echo unless the UART device echo is disabled; PIOS echoes input.
+9. Keep command prompt rendering exactly as sent by PIOS.
 
 Common commands:
 
