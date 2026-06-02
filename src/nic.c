@@ -138,6 +138,20 @@ static bool mac_eq(const u8 *a, const u8 *b) {
            a[3] == b[3] && a[4] == b[4] && a[5] == b[5];
 }
 
+static bool ip_match_mask(u32 packet_ip, u32 rule_ip, u32 mask)
+{
+    if (mask == 0)
+        return packet_ip == rule_ip;
+    return (packet_ip & mask) == (rule_ip & mask);
+}
+
+static bool ip_match_range(u32 packet_ip, u32 start, u32 end)
+{
+    if (start <= end)
+        return packet_ip >= start && packet_ip <= end;
+    return packet_ip >= end && packet_ip <= start;
+}
+
 static bool mac_is_broadcast(const u8 *p) {
     return p[0] == 0xFF && p[1] == 0xFF && p[2] == 0xFF &&
            p[3] == 0xFF && p[4] == 0xFF && p[5] == 0xFF;
@@ -235,9 +249,17 @@ static bool filter_rule_matches(const nic_filter_rule_t *rule, const struct filt
         return false;
     if ((rule->flags & NIC_FILTER_IP_PROTO) && (!pkt->has_ip || pkt->ip_proto != rule->ip_proto))
         return false;
-    if ((rule->flags & NIC_FILTER_IP_TO) && (!pkt->has_ip || pkt->ip_to != rule->ip_to))
+    if ((rule->flags & NIC_FILTER_IP_TO) &&
+        (!pkt->has_ip || !ip_match_mask(pkt->ip_to, rule->ip_to, rule->ip_to_mask)))
         return false;
-    if ((rule->flags & NIC_FILTER_IP_FROM) && (!pkt->has_ip || pkt->ip_from != rule->ip_from))
+    if ((rule->flags & NIC_FILTER_IP_FROM) &&
+        (!pkt->has_ip || !ip_match_mask(pkt->ip_from, rule->ip_from, rule->ip_from_mask)))
+        return false;
+    if ((rule->flags & NIC_FILTER_IP_TO_RANGE) &&
+        (!pkt->has_ip || !ip_match_range(pkt->ip_to, rule->ip_to, rule->ip_to_end)))
+        return false;
+    if ((rule->flags & NIC_FILTER_IP_FROM_RANGE) &&
+        (!pkt->has_ip || !ip_match_range(pkt->ip_from, rule->ip_from, rule->ip_from_end)))
         return false;
     if ((rule->flags & NIC_FILTER_TCP_PORT_TO) && (!pkt->has_tcp || pkt->port_to != rule->tcp_port_to))
         return false;
@@ -1024,6 +1046,21 @@ bool nic_filter_add(const nic_filter_rule_t *rule)
     return true;
 }
 
+bool nic_filter_add_front(const nic_filter_rule_t *rule)
+{
+    if (!rule || filter_rule_count >= NIC_FILTER_MAX_RULES)
+        return false;
+    if ((rule->direction & NIC_FILTER_DIR_BOTH) == 0)
+        return false;
+    if (rule->action != NIC_FILTER_ALLOW && rule->action != NIC_FILTER_DROP)
+        return false;
+    for (u32 i = filter_rule_count; i > 0; i--)
+        filter_rules[i] = filter_rules[i - 1];
+    filter_rules[0] = *rule;
+    filter_rule_count++;
+    return true;
+}
+
 bool nic_filter_remove(u32 index)
 {
     if (index >= filter_rule_count)
@@ -1031,6 +1068,14 @@ bool nic_filter_remove(u32 index)
     filter_rule_count--;
     if (index != filter_rule_count)
         filter_rules[index] = filter_rules[filter_rule_count];
+    return true;
+}
+
+bool nic_filter_get(u32 index, nic_filter_rule_t *out)
+{
+    if (!out || index >= filter_rule_count)
+        return false;
+    *out = filter_rules[index];
     return true;
 }
 

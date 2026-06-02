@@ -9,15 +9,16 @@
 #include "types.h"
 #include "sd.h"
 #include "mmio.h"
+#include "walfs.h"
 
 #define BOOT_DST_ADDR       0x00080000ULL
 #define BOOT_STAGING_ADDR   0x08000000ULL
 #define BOOT_TRAMP_ADDR     0x07FFF000ULL
-#define BOOT_SLOT_BYTES     (2U * 1024U * 1024U)
-#define BOOT_SLOT_BLOCKS    (BOOT_SLOT_BYTES / SD_BLOCK_SIZE)
+#define BOOT_SLOT_BYTES     (PIOS_STAGE2_END_OFFSET + 1U)
+#define BOOT_SLOT_BLOCKS    ((PIOS_STAGE2_ZONE_BYTES + SD_BLOCK_SIZE - 1U) / SD_BLOCK_SIZE)
 #define BOOT_FALLBACK_LBA   2048U
 #define PROVISION_WRITE_SLOT 0
-#define BOOT_SLOT_MAGIC     0x50494F53U /* PIOS */
+#define BOOT_SLOT_MAGIC     PIOS_RESERVED_HEADER_MAGIC
 
 extern u8 bootstrap_trampoline[];
 extern u8 bootstrap_trampoline_end[];
@@ -70,6 +71,37 @@ static u32 read_le32(const u8 *p)
     return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
 }
 
+static void write_le32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+static void write_reserved_header(u8 *out, u32 magic, u32 payload_len)
+{
+    memset(out, 0, SD_BLOCK_SIZE);
+    write_le32(out + PIOS_HDR_MAGIC_OFF, magic);
+    write_le32(out + PIOS_HDR_STAGE2_LEN_OFF, payload_len);
+    write_le32(out + PIOS_HDR_LAYOUT_VERSION_OFF, PIOS_RESERVED_LAYOUT_VERSION);
+    write_le32(out + PIOS_HDR_RESERVED_BYTES_OFF, PIOS_RESERVED_BYTES);
+    write_le32(out + PIOS_HDR_STAGE2_OFFSET_OFF, PIOS_STAGE2_OFFSET);
+    write_le32(out + PIOS_HDR_STAGE2_BYTES_OFF, PIOS_STAGE2_ZONE_BYTES);
+    write_le32(out + PIOS_HDR_TCPIP_OFFSET_OFF, PIOS_TCPIP_STACK_OFFSET);
+    write_le32(out + PIOS_HDR_TCPIP_BYTES_OFF, PIOS_TCPIP_STACK_BYTES);
+    write_le32(out + PIOS_HDR_FIREWALL_OFFSET_OFF, PIOS_FIREWALL_CFG_OFFSET);
+    write_le32(out + PIOS_HDR_FIREWALL_BYTES_OFF, PIOS_FIREWALL_CFG_BYTES);
+    write_le32(out + PIOS_HDR_ADMIN_OFFSET_OFF, PIOS_ADMIN_HTTP_OFFSET);
+    write_le32(out + PIOS_HDR_DEBUG_OFFSET_OFF, PIOS_KERNEL_DEBUG_OFFSET);
+    write_le32(out + PIOS_HDR_USER_RECORDS_OFF, PIOS_USER_RECORDS_OFFSET);
+    write_le32(out + PIOS_HDR_HOT_LOGS_OFF, PIOS_HOT_LOGS_OFFSET);
+    write_le32(out + PIOS_HDR_HOT_LOGS_BYTES_OFF, PIOS_HOT_LOGS_BYTES);
+    write_le32(out + PIOS_HDR_CRASHDUMP_OFF, PIOS_CRASHDUMP_OFFSET);
+    write_le32(out + PIOS_HDR_FUTURE_OFF, PIOS_FUTURE_RESERVED_OFFSET);
+    write_le32(out + PIOS_HDR_WALFS_OFF, PIOS_WALFS_OFFSET);
+}
+
 void uart_putc(char c)
 {
     while (mmio_read(UART0_BASE + 0x18) & (1U << 5)) ;
@@ -118,18 +150,10 @@ static u32 discover_kernel_slot_lba(void)
 
 static bool write_slot(u32 slot_lba, const u8 *payload, u32 payload_len)
 {
-    if (!payload || payload_len == 0 || payload_len > BOOT_SLOT_BYTES - SD_BLOCK_SIZE)
+    if (!payload || payload_len == 0 || payload_len > PIOS_STAGE2_ZONE_BYTES)
         return false;
 
-    memset(block, 0, sizeof(block));
-    block[0] = (u8)(BOOT_SLOT_MAGIC & 0xFF);
-    block[1] = (u8)((BOOT_SLOT_MAGIC >> 8) & 0xFF);
-    block[2] = (u8)((BOOT_SLOT_MAGIC >> 16) & 0xFF);
-    block[3] = (u8)((BOOT_SLOT_MAGIC >> 24) & 0xFF);
-    block[4] = (u8)(payload_len & 0xFF);
-    block[5] = (u8)((payload_len >> 8) & 0xFF);
-    block[6] = (u8)((payload_len >> 16) & 0xFF);
-    block[7] = (u8)((payload_len >> 24) & 0xFF);
+    write_reserved_header(block, BOOT_SLOT_MAGIC, payload_len);
     if (!sd_write_block(slot_lba, block))
         return false;
 

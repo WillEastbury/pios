@@ -128,6 +128,42 @@ static const u8 font8x8[95][8] = {
     {0x00,0x00,0x4C,0x7E,0x32,0x00,0x00,0x00}, /*126 ~ */
 };
 
+enum {
+    FB_GLYPH_H = 95,
+    FB_GLYPH_V,
+    FB_GLYPH_TL,
+    FB_GLYPH_TR,
+    FB_GLYPH_BL,
+    FB_GLYPH_BR,
+    FB_GLYPH_LT,
+    FB_GLYPH_RT,
+    FB_GLYPH_TT,
+    FB_GLYPH_BT,
+    FB_GLYPH_CROSS,
+    FB_GLYPH_BLOCK,
+    FB_GLYPH_SHADE1,
+    FB_GLYPH_SHADE2,
+    FB_GLYPH_SHADE3,
+};
+
+static const u8 font8x8_box[][8] = {
+    {0x00,0x00,0x00,0xFF,0xFF,0x00,0x00,0x00}, /* horizontal */
+    {0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18}, /* vertical */
+    {0x00,0x00,0x00,0xF8,0xF8,0x18,0x18,0x18}, /* top-left */
+    {0x00,0x00,0x00,0x1F,0x1F,0x18,0x18,0x18}, /* top-right */
+    {0x18,0x18,0x18,0xF8,0xF8,0x00,0x00,0x00}, /* bottom-left */
+    {0x18,0x18,0x18,0x1F,0x1F,0x00,0x00,0x00}, /* bottom-right */
+    {0x18,0x18,0x18,0xF8,0xF8,0x18,0x18,0x18}, /* tee-left */
+    {0x18,0x18,0x18,0x1F,0x1F,0x18,0x18,0x18}, /* tee-right */
+    {0x00,0x00,0x00,0xFF,0xFF,0x18,0x18,0x18}, /* tee-top */
+    {0x18,0x18,0x18,0xFF,0xFF,0x00,0x00,0x00}, /* tee-bottom */
+    {0x18,0x18,0x18,0xFF,0xFF,0x18,0x18,0x18}, /* cross */
+    {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF}, /* full block */
+    {0x22,0x00,0x88,0x00,0x22,0x00,0x88,0x00}, /* light shade */
+    {0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA}, /* medium shade */
+    {0xDD,0x77,0xDD,0x77,0xDD,0x77,0xDD,0x77}, /* dark shade */
+};
+
 /* ---- Framebuffer init via mailbox ---- */
 
 /*
@@ -368,13 +404,33 @@ static void fb_advance_row(void) {
         fb_clear_text_row(cursor_y);
 }
 
-/* Draw one 8x8 character at text position (cx, cy) */
-static void fb_draw_char(u32 cx, u32 cy, char c) {
-    int idx = (int)c - 32;
-    if (idx < 0 || idx >= 95)
-        idx = 0; /* space for out-of-range */
+static const u8 *fb_glyph_for_code(u32 code)
+{
+    if (code >= 32 && code <= 126)
+        return font8x8[code - 32];
+    switch (code) {
+    case 0x2500: case 0x2550: return font8x8_box[FB_GLYPH_H - 95];
+    case 0x2502: case 0x2551: return font8x8_box[FB_GLYPH_V - 95];
+    case 0x250C: case 0x2554: return font8x8_box[FB_GLYPH_TL - 95];
+    case 0x2510: case 0x2557: return font8x8_box[FB_GLYPH_TR - 95];
+    case 0x2514: case 0x255A: return font8x8_box[FB_GLYPH_BL - 95];
+    case 0x2518: case 0x255D: return font8x8_box[FB_GLYPH_BR - 95];
+    case 0x251C: case 0x2560: return font8x8_box[FB_GLYPH_LT - 95];
+    case 0x2524: case 0x2563: return font8x8_box[FB_GLYPH_RT - 95];
+    case 0x252C: case 0x2566: return font8x8_box[FB_GLYPH_TT - 95];
+    case 0x2534: case 0x2569: return font8x8_box[FB_GLYPH_BT - 95];
+    case 0x253C: case 0x256C: return font8x8_box[FB_GLYPH_CROSS - 95];
+    case 0x2588: return font8x8_box[FB_GLYPH_BLOCK - 95];
+    case 0x2591: return font8x8_box[FB_GLYPH_SHADE1 - 95];
+    case 0x2592: return font8x8_box[FB_GLYPH_SHADE2 - 95];
+    case 0x2593: return font8x8_box[FB_GLYPH_SHADE3 - 95];
+    default: return font8x8[0];
+    }
+}
 
-    const u8 *glyph = font8x8[idx];
+/* Draw one 8x8 glyph at text position (cx, cy) */
+static void fb_draw_codepoint(u32 cx, u32 cy, u32 code) {
+    const u8 *glyph = fb_glyph_for_code(code);
     u32 px = cx * 8;
     u32 py = cy * 8;
 
@@ -387,17 +443,17 @@ static void fb_draw_char(u32 cx, u32 cy, char c) {
     }
 }
 
-void fb_putc(char c) {
-    if (c == '\n') {
+static void fb_put_codepoint(u32 code) {
+    if (code == '\n') {
         fb_advance_row();
-    } else if (c == '\r') {
+    } else if (code == '\r') {
         cursor_x = 0;
-    } else if (c == '\t') {
+    } else if (code == '\t') {
         cursor_x = (cursor_x + 4) & ~3;
     } else {
         if (console_wrapped && cursor_x == 0)
             fb_clear_text_row(cursor_y);
-        fb_draw_char(cursor_x, cursor_y, c);
+        fb_draw_codepoint(cursor_x, cursor_y, code);
         cursor_x++;
     }
 
@@ -406,9 +462,78 @@ void fb_putc(char c) {
     }
 }
 
+void fb_putc(char c) {
+    fb_put_codepoint((u8)c);
+}
+
+static u32 fb_utf8_next(const char **ps)
+{
+    const u8 *s = (const u8 *)*ps;
+    u8 c = *s++;
+    if (c < 0x80) {
+        *ps = (const char *)s;
+        return c;
+    }
+    if ((c & 0xE0) == 0xC0 && (s[0] & 0xC0) == 0x80) {
+        u32 cp = ((u32)(c & 0x1F) << 6) | (u32)(s[0] & 0x3F);
+        *ps = (const char *)(s + 1);
+        return cp;
+    }
+    if ((c & 0xF0) == 0xE0 && (s[0] & 0xC0) == 0x80 && (s[1] & 0xC0) == 0x80) {
+        u32 cp = ((u32)(c & 0x0F) << 12) |
+                 ((u32)(s[0] & 0x3F) << 6) |
+                 (u32)(s[1] & 0x3F);
+        *ps = (const char *)(s + 2);
+        return cp;
+    }
+    *ps = (const char *)s;
+    return '?';
+}
+
 void fb_puts(const char *s) {
-    while (*s)
-        fb_putc(*s++);
+    while (s && *s)
+        fb_put_codepoint(fb_utf8_next(&s));
+}
+
+void fb_hline(u32 n)
+{
+    for (u32 i = 0; i < n; i++)
+        fb_put_codepoint(0x2500);
+}
+
+void fb_box(u32 width, u32 height, const char *title)
+{
+    if (width < 4 || height < 2)
+        return;
+    fb_put_codepoint(0x250C);
+    fb_hline(width - 2);
+    fb_put_codepoint(0x2510);
+    fb_putc('\n');
+    for (u32 row = 1; row + 1 < height; row++) {
+        fb_put_codepoint(0x2502);
+        if (row == 1 && title) {
+            fb_putc(' ');
+            u32 t = 0;
+            while (title[t] && t + 3 < width) {
+                fb_putc(title[t]);
+                t++;
+            }
+            while (t + 3 < width) {
+                fb_putc(' ');
+                t++;
+            }
+            fb_putc(' ');
+        } else {
+            for (u32 col = 0; col < width - 2; col++)
+                fb_putc(' ');
+        }
+        fb_put_codepoint(0x2502);
+        fb_putc('\n');
+    }
+    fb_put_codepoint(0x2514);
+    fb_hline(width - 2);
+    fb_put_codepoint(0x2518);
+    fb_putc('\n');
 }
 
 /* Minimal printf: %d %u %x %s %c %% */

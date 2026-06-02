@@ -28,6 +28,8 @@
 #define HID_SET_PROTOCOL    0x0B
 #define HID_BOOT_PROTOCOL   0
 
+#define USB_KBD_DIAG_VERBOSE 0
+
 /* ---- HID Modifier Bits ---- */
 
 #define MOD_LCTRL   (1 << 0)
@@ -230,9 +232,11 @@ static bool kbd_probe(struct usb_device *dev) {
     poll_pending = false;
     kbd_ready = true;
 
+#if USB_KBD_DIAG_VERBOSE
     uart_puts("[usb_kbd] Keyboard ready (EP ");
     uart_hex(int_ep_addr);
     uart_puts(")\n");
+#endif
     return true;
 }
 

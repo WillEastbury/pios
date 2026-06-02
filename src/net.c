@@ -23,6 +23,8 @@
 #include "mmio.h"
 #include "macb.h"
 
+#define NET_ICMP_DIAG_VERBOSE 0
+
 /* ---- Network state ---- */
 
 static u32 our_ip;
@@ -111,7 +113,7 @@ static bool net_drop_arp_not_for_us(const u8 *frame, u32 len) {
     return net_read_be32(arp + 24) != our_ip;
 }
 
-static void net_install_ingress_firewall(void) {
+void net_firewall_install_defaults(void) {
     nic_filter_rule_t rule;
 
     nic_filter_clear();
@@ -141,6 +143,8 @@ static void net_install_ingress_firewall(void) {
     rule.tcp_port_to = 8081;
     (void)nic_filter_add(&rule);
     rule.tcp_port_to = 8082;
+    (void)nic_filter_add(&rule);
+    rule.tcp_port_to = 2323;
     (void)nic_filter_add(&rule);
 
     simd_zero(&rule, sizeof(rule));
@@ -247,12 +251,6 @@ static void handle_icmp(const u8 *frame, u32 len,
     simd_memcpy(eth_out->dst, eth_in->src, 6);
     simd_memcpy(eth_out->src, our_mac, 6);
     eth_out->ethertype = htons(ETH_P_IP);
-    
-    uart_puts("[icmp] dst_mac=");
-    for (u32 i = 0; i < 6; i++) { uart_hex(eth_out->dst[i]); }
-    uart_puts(" src_mac=");
-    for (u32 i = 0; i < 6; i++) { uart_hex(eth_out->src[i]); }
-    uart_puts("\n");
 
     u16 ip_total = ntohs(ip->total_len);
 
@@ -277,6 +275,7 @@ static void handle_icmp(const u8 *frame, u32 len,
     icmp_out->checksum = simd_checksum(icmp_out, icmp_len);
 
     u32 frame_len = sizeof(struct eth_hdr) + ip_total;
+#if NET_ICMP_DIAG_VERBOSE
     static u32 icmp_reply_count = 0;
     if (icmp_reply_count < 10) {
         uart_puts("[icmp] reply #");
@@ -287,13 +286,16 @@ static void handle_icmp(const u8 *frame, u32 len,
         for (u32 i = 0; i < 6; i++) { uart_hex(eth_out->src[i]); if (i<5) uart_puts(":"); }
         uart_puts("\n");
     }
+#endif
     if (!nic_send(tx_frame, frame_len)) {
+#if NET_ICMP_DIAG_VERBOSE
         static u32 send_fail_count = 0;
         if (send_fail_count++ < 5) {
             uart_puts("[icmp] TX FAILED #");
             uart_hex(send_fail_count);
             uart_puts("\n");
         }
+#endif
     }
     stats.icmp_echo_replies++;
     stats.tx_packets++;
@@ -635,7 +637,7 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     our_mask = netmask;
     nic_set_local_ipv4(ip);
     nic_get_mac(our_mac);
-    net_install_ingress_firewall();
+    net_firewall_install_defaults();
 
     if (gateway_mac) {
         simd_memcpy(gw_mac, gateway_mac, 6);

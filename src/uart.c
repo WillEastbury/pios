@@ -13,6 +13,9 @@
 /* Use RP1 UART0 for GPIO14/15 serial header */
 static bool use_rp1;
 
+#define UART_DIAG_VERBOSE 0
+#define UART_VT_UTF8_BOXES 1
+
 #define UART_DR     (UART0_BASE + 0x00)
 #define UART_FR     (UART0_BASE + 0x18)
 #define UART_IBRD   (UART0_BASE + 0x24)
@@ -32,6 +35,7 @@ void uart_init(void) {
     volatile u32 *pad15 = (volatile u32 *)(0x1F000F0000UL + 0x04 + 15 * 4);
     volatile u32 *uart_cr = (volatile u32 *)(0x1F00030000UL + 0x30);
 
+#if UART_DIAG_VERBOSE
     /* Print firmware state before we touch anything */
     uart_puts("[uart] FW: G14 ctrl=");
     uart_hex(*gpio14_ctrl);
@@ -44,6 +48,7 @@ void uart_init(void) {
     uart_puts(" CR=");
     uart_hex(*uart_cr);
     uart_puts("\r\n");
+#endif
 
     /* Strategy: copy GPIO14's exact config to GPIO15 + enable IE */
     u32 g14_fsel = *gpio14_ctrl & 0x1F;
@@ -59,6 +64,7 @@ void uart_init(void) {
     volatile u32 *uart_lcrh = (volatile u32 *)(0x1F00030000UL + 0x2C);
     *uart_lcrh = *uart_lcrh | (1 << 4);
 
+#if UART_DIAG_VERBOSE
     /* Print state after config */
     uart_puts("[uart] SET: G15 ctrl=");
     uart_hex(*gpio15_ctrl);
@@ -67,6 +73,7 @@ void uart_init(void) {
     uart_puts(" CR=");
     uart_hex(*uart_cr);
     uart_puts("\r\n");
+#endif
 
     use_rp1 = true;
 }
@@ -104,6 +111,105 @@ void uart_hex(u64 val) {
     uart_puts("0x");
     for (int i = 60; i >= 0; i -= 4)
         uart_putc(hex[(val >> i) & 0xF]);
+}
+
+static void uart_put_dec(u32 v)
+{
+    char tmp[10];
+    u32 n = 0;
+    if (v == 0) {
+        uart_putc('0');
+        return;
+    }
+    while (v && n < sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (v % 10U));
+        v /= 10U;
+    }
+    while (n)
+        uart_putc(tmp[--n]);
+}
+
+void uart_vt_reset(void) { uart_puts("\x1b[0m"); }
+void uart_vt_clear(void) { uart_puts("\x1b[2J"); }
+void uart_vt_home(void) { uart_puts("\x1b[H"); }
+
+void uart_vt_move(u32 row, u32 col)
+{
+    uart_puts("\x1b[");
+    uart_put_dec(row);
+    uart_putc(';');
+    uart_put_dec(col);
+    uart_putc('H');
+}
+
+void uart_vt_color(u8 fg, u8 bg, bool bright)
+{
+    uart_puts("\x1b[");
+    uart_putc(bright ? '1' : '0');
+    uart_putc(';');
+    uart_put_dec(30U + (fg & 7U));
+    uart_putc(';');
+    uart_put_dec(40U + (bg & 7U));
+    uart_putc('m');
+}
+
+void uart_vt_bell(void) { uart_putc('\a'); }
+
+#if UART_VT_UTF8_BOXES
+static const char *VT_TL = "\xE2\x94\x8C";
+static const char *VT_TR = "\xE2\x94\x90";
+static const char *VT_BL = "\xE2\x94\x94";
+static const char *VT_BR = "\xE2\x94\x98";
+static const char *VT_H  = "\xE2\x94\x80";
+static const char *VT_V  = "\xE2\x94\x82";
+#else
+static const char *VT_TL = "+";
+static const char *VT_TR = "+";
+static const char *VT_BL = "+";
+static const char *VT_BR = "+";
+static const char *VT_H  = "-";
+static const char *VT_V  = "|";
+#endif
+
+void uart_vt_hline(u32 n)
+{
+    for (u32 i = 0; i < n; i++)
+        uart_puts(VT_H);
+}
+
+void uart_vt_box(u32 width, u32 height, const char *title)
+{
+    if (width < 4 || height < 2)
+        return;
+    uart_puts(VT_TL);
+    uart_vt_hline(width - 2);
+    uart_puts(VT_TR);
+    uart_putc('\n');
+    for (u32 row = 1; row + 1 < height; row++) {
+        uart_puts(VT_V);
+        if (row == 1 && title) {
+            uart_putc(' ');
+            u32 t = 0;
+            while (title[t] && t + 3 < width) {
+                uart_putc(title[t]);
+                t++;
+            }
+            while (t + 3 < width) {
+                uart_putc(' ');
+                t++;
+            }
+            uart_putc(' ');
+        } else {
+            for (u32 col = 0; col < width - 2; col++)
+                uart_putc(' ');
+        }
+        uart_puts(VT_V);
+        uart_putc('\n');
+    }
+    uart_puts(VT_BL);
+    uart_vt_hline(width - 2);
+    uart_puts(VT_BR);
+    uart_putc('\n');
 }
 
 /* ---- RX ---- */

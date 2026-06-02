@@ -87,6 +87,9 @@ typedef void (*udp_recv_cb)(u32 src_ip, u16 src_port, u16 dst_port,
 /* Init with static IP, gateway IP, and gateway MAC */
 void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac);
 
+/* Restore default NIC firewall: inbound deny, outbound allow, and service allows. */
+void net_firewall_install_defaults(void);
+
 /* Add a static neighbor (IP → MAC mapping). No ARP. */
 void net_add_neighbor(u32 ip, const u8 *mac);
 

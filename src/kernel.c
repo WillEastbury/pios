@@ -123,8 +123,10 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HTTP_SIMPLE_MODE 0
 #define HTTP_DIAG_VERBOSE 0
 #define HTTP_ADMIN_EXPERIMENTAL 0
-#define HOTPATCH_SLOT_BYTES (2U * 1024U * 1024U)
-#define HOTPATCH_SLOT_MAGIC 0x50494F53U /* PIOS */
+#define HTTP_TRACE_RING_VERBOSE 0
+#define HTTP_TRACE_UART_VERBOSE 0
+#define HOTPATCH_SLOT_BYTES (PIOS_STAGE2_END_OFFSET + 1U)
+#define HOTPATCH_SLOT_MAGIC PIOS_RESERVED_HEADER_MAGIC
 #define HTTP_LOG_RING_SIZE 64
 #define ADMIN_HTTP_REQ_MAX 8192
 #define ADMIN_HTTP_RESP_MAX 4096
@@ -431,7 +433,13 @@ static void http_trace(u32 event, u32 route, u32 a, u32 b)
     http_diag.route = route;
     if (event != HTTP_EVT_ABORT && event != HTTP_EVT_BAD_STATE)
         http_diag.error = HTTP_ERR_NONE;
+#if HTTP_TRACE_RING_VERBOSE
     http_log_event("http-trace", (event << 24) | (route << 16) | (a & 0xFFFFU), b);
+#else
+    if (event == HTTP_EVT_ABORT || event == HTTP_EVT_BAD_STATE)
+        http_log_event("http-error", (event << 24) | (route << 16) | (a & 0xFFFFU), b);
+#endif
+#if HTTP_TRACE_UART_VERBOSE
     uart_puts("[http-trace] ev=");
     uart_hex(event);
     uart_puts(" route=");
@@ -441,6 +449,10 @@ static void http_trace(u32 event, u32 route, u32 a, u32 b)
     uart_puts(" b=");
     uart_hex(b);
     uart_puts("\n");
+#else
+    (void)a;
+    (void)b;
+#endif
 }
 
 static void http_append(char *out, u32 *len, u32 max, const char *s)
@@ -467,6 +479,93 @@ static void http_append_u64(char *out, u32 *len, u32 max, u64 v)
     while (n && *len < max - 1)
         out[(*len)++] = tmp[--n];
     out[*len] = 0;
+}
+
+static void http_append_ip4(char *out, u32 *len, u32 max, u32 ip)
+{
+    http_append_u64(out, len, max, (ip >> 24) & 0xFF);
+    http_append(out, len, max, ".");
+    http_append_u64(out, len, max, (ip >> 16) & 0xFF);
+    http_append(out, len, max, ".");
+    http_append_u64(out, len, max, (ip >> 8) & 0xFF);
+    http_append(out, len, max, ".");
+    http_append_u64(out, len, max, ip & 0xFF);
+}
+
+static void http_append_fw_ip_spec(char *out, u32 *len, u32 max,
+                                   u32 flags, bool src, const nic_filter_rule_t *r)
+{
+    u32 exact = src ? NIC_FILTER_IP_FROM : NIC_FILTER_IP_TO;
+    u32 range = src ? NIC_FILTER_IP_FROM_RANGE : NIC_FILTER_IP_TO_RANGE;
+    u32 ip = src ? r->ip_from : r->ip_to;
+    u32 mask = src ? r->ip_from_mask : r->ip_to_mask;
+    u32 end = src ? r->ip_from_end : r->ip_to_end;
+    if (flags & range) {
+        http_append_ip4(out, len, max, ip);
+        http_append(out, len, max, "-");
+        http_append_ip4(out, len, max, end);
+    } else if (flags & exact) {
+        http_append_ip4(out, len, max, ip);
+        if (mask != 0) {
+            http_append(out, len, max, "/");
+            http_append_ip4(out, len, max, mask);
+        }
+    } else {
+        http_append(out, len, max, "any");
+    }
+}
+
+static void http_append_firewall_list(char *out, u32 *len, u32 max)
+{
+    u32 n = nic_filter_count();
+    http_append(out, len, max, "Firewall rules=");
+    http_append_u64(out, len, max, n);
+    http_append(out, len, max, " (first match wins; inbound default deny, outbound default allow)\n");
+    for (u32 i = 0; i < n; i++) {
+        nic_filter_rule_t r;
+        if (!nic_filter_get(i, &r))
+            continue;
+        http_append_u64(out, len, max, i);
+        http_append(out, len, max, ": ");
+        http_append(out, len, max, r.action == NIC_FILTER_ALLOW ? "allow " : "deny ");
+        if (r.direction == NIC_FILTER_DIR_IN) http_append(out, len, max, "in ");
+        else if (r.direction == NIC_FILTER_DIR_OUT) http_append(out, len, max, "out ");
+        else http_append(out, len, max, "both ");
+        if ((r.flags & NIC_FILTER_ETHERTYPE) && r.ethertype == ETH_P_ARP) {
+            http_append(out, len, max, "arp ");
+        } else if ((r.flags & NIC_FILTER_IP_PROTO) && r.ip_proto == IP_PROTO_TCP) {
+            http_append(out, len, max, "tcp ");
+        } else if ((r.flags & NIC_FILTER_IP_PROTO) && r.ip_proto == IP_PROTO_UDP) {
+            http_append(out, len, max, "udp ");
+        } else if ((r.flags & NIC_FILTER_IP_PROTO) && r.ip_proto == IP_PROTO_ICMP) {
+            http_append(out, len, max, "icmp ");
+        } else if ((r.flags & NIC_FILTER_ETHERTYPE) && r.ethertype == ETH_P_IP) {
+            http_append(out, len, max, "ip ");
+        } else {
+            http_append(out, len, max, "any ");
+        }
+        http_append(out, len, max, "src=");
+        http_append_fw_ip_spec(out, len, max, r.flags, true, &r);
+        http_append(out, len, max, " dst=");
+        http_append_fw_ip_spec(out, len, max, r.flags, false, &r);
+        if (r.flags & NIC_FILTER_TCP_PORT_TO) {
+            http_append(out, len, max, " tcp_dport=");
+            http_append_u64(out, len, max, r.tcp_port_to);
+        }
+        if (r.flags & NIC_FILTER_TCP_PORT_FROM) {
+            http_append(out, len, max, " tcp_sport=");
+            http_append_u64(out, len, max, r.tcp_port_from);
+        }
+        if (r.flags & NIC_FILTER_UDP_PORT_TO) {
+            http_append(out, len, max, " udp_dport=");
+            http_append_u64(out, len, max, r.udp_port_to);
+        }
+        if (r.flags & NIC_FILTER_UDP_PORT_FROM) {
+            http_append(out, len, max, " udp_sport=");
+            http_append_u64(out, len, max, r.udp_port_from);
+        }
+        http_append(out, len, max, "\n");
+    }
 }
 
 static bool http_char_ieq(char a, char b)
@@ -939,9 +1038,19 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         "Connection: close\r\n\r\n");
 
     if (!http_query_cmd(req, req_len, cmd, sizeof(cmd)))
-        http_append(out, &len, max, "usage: /api/terminal?cmd=<help|status|netstat|processes|users|kill pid|restart pid>\n");
-    else if (http_streq(cmd, "help"))
-        http_append(out, &len, max, "commands: help status netstat processes users kill <pid> restart <pid>\nauth gates will be restored later\n");
+        http_append(out, &len, max, "usage: /api/terminal?cmd=<help|status|netstat|processes|users|firewall list|kill pid|restart pid>\n");
+    else if (http_streq(cmd, "help")) {
+        http_append(out, &len, max,
+            "PIOS terminal help\n"
+            "  status              system summary\n"
+            "  netstat             TCP/listener summary\n"
+            "  processes           process snapshot\n"
+            "  users               principal snapshot\n"
+            "  firewall list       firewall rules and defaults\n"
+            "  kill <pid>          kill process\n"
+            "  restart <pid>       restart process\n"
+            "For full console help use UART/TCP console: help core|fs|net|svc|dev\n");
+    }
     else if (http_streq(cmd, "status")) {
         nic_packet_counters_t pc;
         nic_packet_counters(&pc);
@@ -1001,6 +1110,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, users[i].name);
             http_append(out, &len, max, "\n");
         }
+    } else if (http_streq(cmd, "firewall") || http_streq(cmd, "firewall list")) {
+        http_append_firewall_list(out, &len, max);
     } else if (http_starts_with(cmd, "kill ")) {
         u32 pid = 0;
         if (http_parse_u32(cmd + 5, &pid) && proc_kill_pid(pid, 0xFFFF5002U))
@@ -1410,6 +1521,37 @@ static u32 http_running_kernel_image_len(void)
     return (u32)(end - start);
 }
 
+static void pios_write_le32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+static void pios_fill_reserved_header(u8 *out, u32 magic, u32 payload_len)
+{
+    simd_zero(out, SD_BLOCK_SIZE);
+    pios_write_le32(out + PIOS_HDR_MAGIC_OFF, magic);
+    pios_write_le32(out + PIOS_HDR_STAGE2_LEN_OFF, payload_len);
+    pios_write_le32(out + PIOS_HDR_LAYOUT_VERSION_OFF, PIOS_RESERVED_LAYOUT_VERSION);
+    pios_write_le32(out + PIOS_HDR_RESERVED_BYTES_OFF, PIOS_RESERVED_BYTES);
+    pios_write_le32(out + PIOS_HDR_STAGE2_OFFSET_OFF, PIOS_STAGE2_OFFSET);
+    pios_write_le32(out + PIOS_HDR_STAGE2_BYTES_OFF, PIOS_STAGE2_ZONE_BYTES);
+    pios_write_le32(out + PIOS_HDR_TCPIP_OFFSET_OFF, PIOS_TCPIP_STACK_OFFSET);
+    pios_write_le32(out + PIOS_HDR_TCPIP_BYTES_OFF, PIOS_TCPIP_STACK_BYTES);
+    pios_write_le32(out + PIOS_HDR_FIREWALL_OFFSET_OFF, PIOS_FIREWALL_CFG_OFFSET);
+    pios_write_le32(out + PIOS_HDR_FIREWALL_BYTES_OFF, PIOS_FIREWALL_CFG_BYTES);
+    pios_write_le32(out + PIOS_HDR_ADMIN_OFFSET_OFF, PIOS_ADMIN_HTTP_OFFSET);
+    pios_write_le32(out + PIOS_HDR_DEBUG_OFFSET_OFF, PIOS_KERNEL_DEBUG_OFFSET);
+    pios_write_le32(out + PIOS_HDR_USER_RECORDS_OFF, PIOS_USER_RECORDS_OFFSET);
+    pios_write_le32(out + PIOS_HDR_HOT_LOGS_OFF, PIOS_HOT_LOGS_OFFSET);
+    pios_write_le32(out + PIOS_HDR_HOT_LOGS_BYTES_OFF, PIOS_HOT_LOGS_BYTES);
+    pios_write_le32(out + PIOS_HDR_CRASHDUMP_OFF, PIOS_CRASHDUMP_OFFSET);
+    pios_write_le32(out + PIOS_HDR_FUTURE_OFF, PIOS_FUTURE_RESERVED_OFFSET);
+    pios_write_le32(out + PIOS_HDR_WALFS_OFF, PIOS_WALFS_OFFSET);
+}
+
 static bool http_write_kernel_slot_range(u32 offset, const u8 *data, u32 len,
                                          u32 *out_written)
 {
@@ -1451,15 +1593,7 @@ static bool http_write_kernel_slot_header(u32 payload_len, bool valid)
     static u8 header[SD_BLOCK_SIZE] ALIGNED(64);
     u32 written = 0;
     u32 magic = valid ? HOTPATCH_SLOT_MAGIC : 0U;
-    simd_zero(header, sizeof(header));
-    header[0] = (u8)(magic & 0xFF);
-    header[1] = (u8)((magic >> 8) & 0xFF);
-    header[2] = (u8)((magic >> 16) & 0xFF);
-    header[3] = (u8)((magic >> 24) & 0xFF);
-    header[4] = (u8)(payload_len & 0xFF);
-    header[5] = (u8)((payload_len >> 8) & 0xFF);
-    header[6] = (u8)((payload_len >> 16) & 0xFF);
-    header[7] = (u8)((payload_len >> 24) & 0xFF);
+    pios_fill_reserved_header(header, magic, payload_len);
     return http_write_kernel_slot_range(0, header, SD_BLOCK_SIZE, &written) &&
            written == SD_BLOCK_SIZE;
 }
@@ -1467,17 +1601,17 @@ static bool http_write_kernel_slot_header(u32 payload_len, bool valid)
 static bool http_write_kernel_payload_range(u32 offset, const u8 *data, u32 len,
                                             u32 *out_written)
 {
-    if (offset > HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE ||
-        len > (HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE) - offset)
+    if (offset > PIOS_STAGE2_ZONE_BYTES ||
+        len > PIOS_STAGE2_ZONE_BYTES - offset)
         return false;
-    return http_write_kernel_slot_range(SD_BLOCK_SIZE + offset, data, len,
+    return http_write_kernel_slot_range(PIOS_STAGE2_OFFSET + offset, data, len,
                                         out_written);
 }
 
 static bool http_write_kernel_slot_image(const u8 *data, u32 len, u32 *out_written)
 {
     if (out_written) *out_written = 0;
-    if (!data || len == 0 || len > HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE)
+    if (!data || len == 0 || len > PIOS_STAGE2_ZONE_BYTES)
         return false;
     u32 written = 0;
     if (!http_write_kernel_slot_header(len, false))
@@ -1517,8 +1651,13 @@ static u32 http_build_log_stream_response(char *out, u32 max, const u8 *req, u32
 {
     u32 len = 0;
     u32 since = http_query_u32_default(req, req_len, "/api/admin/log-stream", "since", 0);
+    u32 tail = http_query_u32_default(req, req_len, "/api/admin/log-stream", "tail", 0);
     if (since == 0)
         since = http_query_u32_default(req, req_len, "/logs", "since", 0);
+    if (tail == 0)
+        tail = http_query_u32_default(req, req_len, "/logs", "tail", 0);
+    if (tail > HTTP_LOG_RING_SIZE)
+        tail = HTTP_LOG_RING_SIZE;
     http_append(out, &len, max,
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: text/plain\r\n"
@@ -1528,6 +1667,10 @@ static u32 http_build_log_stream_response(char *out, u32 max, const u8 *req, u32
     http_append_u64(out, &len, max, http_log_seq);
     http_append(out, &len, max, "\n");
     u32 start = http_log_seq > HTTP_LOG_RING_SIZE ? http_log_seq - HTTP_LOG_RING_SIZE : 0;
+    if (tail != 0) {
+        u32 tail_start = http_log_seq > tail ? http_log_seq - tail : 0;
+        if (tail_start > start) start = tail_start;
+    }
     if (since > start) start = since;
     for (u32 seq = start; seq < http_log_seq; seq++) {
         struct http_log_entry *e = &http_log_ring[seq % HTTP_LOG_RING_SIZE];
@@ -1577,7 +1720,7 @@ static u32 http_build_hotpatch_kernel_response(char *out, u32 max, const u8 *req
 
     if (ui_streq(target, "slot")) {
         capacity = HOTPATCH_SLOT_BYTES;
-        if (image_len == 0 || image_len > HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE) {
+        if (image_len == 0 || image_len > PIOS_STAGE2_ZONE_BYTES) {
             error = "image does not fit raw bootstrap slot";
         } else {
             ok = http_write_kernel_slot_image((const u8 *)(usize)&_start,
@@ -1606,7 +1749,7 @@ static u32 http_build_hotpatch_kernel_response(char *out, u32 max, const u8 *req
         http_append(out, &len, max, ",\"error\":");
         http_append_json_string(out, &len, max, error);
     }
-    http_append(out, &len, max, ",\"bootstrapPlan\":\"kernel8.img becomes stable bootstrap; real kernel lives in partition-2 raw 2MiB slot; WALFS starts 10MiB after partition root\"");
+    http_append(out, &len, max, ",\"bootstrapPlan\":\"kernel8.img is stable stage0; partition-2 block0 is the PIOS reserved-area header; second-stage payload is 0x000200..0x1FFFFF; WALFS starts at 0xA00000\"");
     http_append(out, &len, max, "}\n");
     return len;
 }
@@ -1623,7 +1766,7 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
     u32 offset = http_update_query_u32_default(req, req_len, "offset", 0);
     u32 total = http_update_query_u32_default(req, req_len, "total", 0);
     u32 written = 0;
-    u32 capacity = HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE;
+    u32 capacity = PIOS_STAGE2_ZONE_BYTES;
     bool ok = false;
     const char *error = NULL;
 
@@ -1819,9 +1962,9 @@ static u32 http_build_spa_response(char *out, u32 max)
         "Cache-Control: no-store\r\n"
         "Connection: close\r\n\r\n"
         "<!doctype html><html><head><meta charset='utf-8'><title>PIOS Admin</title>"
-        "<style>:root{--bs-font-sans:'Segoe UI',Aptos,Calibri,sans-serif;--bs-font-mono:Consolas,'Courier New',monospace;--bs-body-bg:#0f172a;--bs-body-color:#f1f5f9;--bs-secondary-color:#94a3b8;--bs-primary:#6366f1;--bs-light:#1e293b;--bs-dark:#020617;--bs-border-color:#334155;--bs-danger:#ef4444}body{margin:0;background:var(--bs-body-bg);color:var(--bs-body-color);font-family:var(--bs-font-sans)}.wrap{padding:24px}.tabs button,.bt{border:1px solid var(--bs-border-color);background:var(--bs-dark);color:var(--bs-body-color);border-radius:10px;padding:8px 12px;margin:4px}.tabs button.act{background:var(--bs-primary)}.danger{background:var(--bs-danger)}.cd{background:var(--bs-light);border:1px solid var(--bs-border-color);border-radius:16px;padding:16px;margin:12px 0}input{background:var(--bs-dark);color:var(--bs-body-color);border:1px solid var(--bs-border-color);border-radius:10px;padding:8px}pre,code{font-family:var(--bs-font-mono)}pre{white-space:pre-wrap}</style></head><body><div class='wrap'><h1>PIOS Admin Console</h1><p id='sub'>Lazy tabs; no polling.</p><div class='tabs'><button class='act' data-t='overview'>Overview</button><button data-t='processes'>Processes</button><button data-t='netstat'>Netstat</button><button data-t='system'>System</button><button data-t='users'>Users</button><button data-t='logs'>Logs</button><button data-t='walfs'>WALFS</button><button data-t='terminal'>Terminal</button><button data-t='admin'>Admin</button></div><div id='app'></div></div>");
+        "<style>:root{--bs-font-sans:'Segoe UI',Aptos,Calibri,sans-serif;--bs-font-mono:Consolas,'Courier New',monospace;--bs-body-bg:#0f172a;--bs-body-color:#f1f5f9;--bs-secondary-color:#94a3b8;--bs-primary:#6366f1;--bs-light:#1e293b;--bs-dark:#020617;--bs-border-color:#334155;--bs-danger:#ef4444}body{margin:0;background:var(--bs-body-bg);color:var(--bs-body-color);font-family:var(--bs-font-sans)}.wrap{padding:24px}.tabs button,.bt{border:1px solid var(--bs-border-color);background:var(--bs-dark);color:var(--bs-body-color);border-radius:10px;padding:8px 12px;margin:4px}.tabs button.act{background:var(--bs-primary)}.danger{background:var(--bs-danger)}.cd{background:var(--bs-light);border:1px solid var(--bs-border-color);border-radius:16px;padding:16px;margin:12px 0}input{background:var(--bs-dark);color:var(--bs-body-color);border:1px solid var(--bs-border-color);border-radius:10px;padding:8px}pre,code{font-family:var(--bs-font-mono)}pre{white-space:pre-wrap}.term{background:#001600;color:#6dff6d;border:1px solid #24b524;border-radius:10px;box-shadow:0 0 24px #0a4 inset,0 0 10px #0f04;padding:0;overflow:hidden;font-family:var(--bs-font-mono)}.bar{background:#003000;color:#b8ffb8;padding:8px 12px;border-bottom:1px solid #147014;letter-spacing:.08em}.screen{height:420px;overflow:auto;padding:14px;white-space:pre-wrap;text-shadow:0 0 6px #3f3;font-size:14px;line-height:1.35}.prompt{display:flex;gap:8px;align-items:center;border-top:1px solid #147014;background:#001f00;padding:10px 12px}.prompt span{color:#b8ffb8}.prompt input{flex:1;background:#000;color:#8cff8c;border:0;outline:0;font-family:var(--bs-font-mono);font-size:15px}.fwex code{display:block;margin:4px 0;color:#b8ffb8}.cursor{animation:blink 1s steps(1) infinite}@keyframes blink{50%{opacity:0}}</style></head><body><div class='wrap'><h1>PIOS Admin Console</h1><p id='sub'>Lazy tabs; no polling.</p><div class='tabs'><button class='act' data-t='overview'>Overview</button><button data-t='processes'>Processes</button><button data-t='netstat'>Netstat</button><button data-t='system'>System</button><button data-t='users'>Users</button><button data-t='logs'>Logs</button><button data-t='walfs'>WALFS</button><button data-t='firewall'>Firewall</button><button data-t='terminal'>Terminal</button><button data-t='admin'>Admin</button></div><div id='app'></div></div>");
     http_append(out, &len, max,
-        "<script>let tab='overview';const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}async function txt(u){let r=await fetch(u);return await r.text()}async function js(u){let r=await fetch(u);return await r.json()}function pre(t,h){app.innerHTML=card(t,`<pre>${esc(h)}</pre>`)}async function draw(){sub.textContent='Loading '+tab+'...';try{if(tab==='overview'){let d=await js('/api/status');pre('Overview',JSON.stringify(d,null,2))}else if(tab==='system'){pre('System',await txt('/api/terminal?cmd=status'))}else if(tab==='netstat'){pre('Netstat',await txt('/api/terminal?cmd=netstat'))}else if(tab==='processes'){pre('Processes',await txt('/api/terminal?cmd=processes'))}else if(tab==='users'){pre('Users',await txt('/api/terminal?cmd=users'))}else if(tab==='logs'){let a=await txt('/api/admin/log-stream'),b=await txt('/api/logs');pre('Logs',a+'\\n--- proc logs ---\\n'+b)}else if(tab==='walfs'){pre('WALFS',await txt('/api/walfs?path=/'))}else if(tab==='terminal'){app.innerHTML=card('Terminal',`<input id=cmd value='help'><button class=bt id=run>Run</button><pre id=term></pre>`);document.getElementById('run').onclick=async()=>{document.getElementById('term').textContent=await txt('/api/terminal?cmd='+encodeURIComponent(document.getElementById('cmd').value))}}else if(tab==='admin'){app.innerHTML=card('Admin',`<p>Operator endpoints.</p><p><a href='/api/admin/log-stream'>log stream</a></p><p><a href='/api/admin/kernel-update?confirm=1'>kernel update</a></p><p><a href='/api/admin/reboot?confirm=1'>hot reboot</a></p>`)}else pre(tab,'unknown tab')}catch(e){pre('Error',e)}sub.textContent='Tab '+tab}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
+        "<script>let tab='overview',hist=['PIOS green-screen terminal ready. Type help.'];const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}async function txt(u){let r=await fetch(u);return await r.text()}async function js(u){let r=await fetch(u);return await r.json()}function pre(t,h){app.innerHTML=card(t,`<pre>${esc(h)}</pre>`)}function term(){app.innerHTML=card('Terminal',`<div class=term><div class=bar>PIOS // SECOND STAGE LOADER // REMOTE CONSOLE</div><div class=screen id=screen></div><div class=prompt><span>console&gt;</span><input id=cmd autocomplete=off spellcheck=false autofocus><span class=cursor>_</span></div></div>`);const sc=document.getElementById('screen'),cmd=document.getElementById('cmd');function paint(){sc.textContent=hist.join('\\n');sc.scrollTop=sc.scrollHeight}async function run(){let c=cmd.value.trim();cmd.value='';if(!c)return;if(c==='clear'){hist=[];paint();return}hist.push('console> '+c);try{hist.push(await txt('/api/terminal?cmd='+encodeURIComponent(c)))}catch(e){hist.push('ERR '+e)}while(hist.length>160)hist.shift();paint()}cmd.onkeydown=e=>{if(e.key==='Enter')run()};paint();cmd.focus()}async function firewall(){let r=await txt('/api/terminal?cmd=firewall%20list');app.innerHTML=card('Firewall',`<button class=bt id=fwrefresh>Refresh</button><pre>${esc(r)}</pre><div class=fwex><p>Use the UART/HDMI/TCP console for mutations:</p><code>firewall allow in tcp port 2323 src 192.168.218.9</code><code>firewall deny in tcp port 80 src 192.168.218.0/24</code><code>firewall allow out udp toport 53 dst 192.168.218.1</code><code>firewall reset</code></div>`);document.getElementById('fwrefresh').onclick=draw}async function draw(){sub.textContent='Loading '+tab+'...';try{if(tab==='overview'){let d=await js('/api/status');pre('Overview',JSON.stringify(d,null,2))}else if(tab==='system'){pre('System',await txt('/api/terminal?cmd=status'))}else if(tab==='netstat'){pre('Netstat',await txt('/api/terminal?cmd=netstat'))}else if(tab==='processes'){pre('Processes',await txt('/api/terminal?cmd=processes'))}else if(tab==='users'){pre('Users',await txt('/api/terminal?cmd=users'))}else if(tab==='logs'){let a=await txt('/api/admin/log-stream?tail=24'),b=await txt('/api/logs');pre('Logs',a+'\\n--- proc logs ---\\n'+b)}else if(tab==='walfs'){pre('WALFS',await txt('/api/walfs?path=/'))}else if(tab==='firewall'){await firewall()}else if(tab==='terminal'){term()}else if(tab==='admin'){app.innerHTML=card('Admin',`<p>Operator endpoints.</p><p><a href='/api/admin/log-stream?tail=24'>tail log stream</a></p><p><a href='/api/admin/kernel-update?confirm=1'>kernel update</a></p><p><a href='/api/admin/reboot?confirm=1'>hot reboot</a></p>`)}else pre(tab,'unknown tab')}catch(e){pre('Error',e)}sub.textContent='Tab '+tab}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
     return len;
 }
 
@@ -2609,6 +2752,7 @@ static const char *ui_proc_state_str(u32 s);
 static void ui_dump_sector(u32 lba);
 static void ui_cmd_fsinspect(const char *path);
 static void ui_cmd_netcfg(u32 argc, char **argv);
+static void ui_cmd_firewall(u32 argc, char **argv);
 static void ui_cmd_usb(u32 argc, char **argv);
 static void ui_cmd_disk(u32 argc, char **argv);
 static void ui_cmd_db(u32 argc, char **argv);
@@ -3274,6 +3418,92 @@ static bool ui_parse_ip4(const char *s, u32 *out)
     return true;
 }
 
+static bool ui_parse_cidr_prefix(const char *s, u32 *prefix_out)
+{
+    if (!s || !*s || !prefix_out)
+        return false;
+    u32 v = 0;
+    while (*s) {
+        if (*s < '0' || *s > '9')
+            return false;
+        v = v * 10U + (u32)(*s++ - '0');
+        if (v > 32U)
+            return false;
+    }
+    *prefix_out = v;
+    return true;
+}
+
+static u32 ui_prefix_mask(u32 prefix)
+{
+    if (prefix == 0)
+        return 0;
+    if (prefix >= 32)
+        return 0xFFFFFFFFU;
+    return 0xFFFFFFFFU << (32U - prefix);
+}
+
+static bool ui_parse_ip_spec(const char *s, u32 *flags, bool src, u32 *ip,
+                             u32 *mask, u32 *end)
+{
+    char left[32];
+    char right[32];
+    if (!s || !flags || !ip || !mask || !end)
+        return false;
+    if (ui_streq(s, "any")) {
+        *ip = 0;
+        *mask = 0;
+        *end = 0;
+        return true;
+    }
+
+    u32 i = 0;
+    while (s[i] && s[i] != '/' && s[i] != '-' && i + 1 < sizeof(left)) {
+        left[i] = s[i];
+        i++;
+    }
+    left[i] = 0;
+    if (!ui_parse_ip4(left, ip))
+        return false;
+
+    if (s[i] == '/') {
+        u32 j = 0;
+        i++;
+        while (s[i] && j + 1 < sizeof(right))
+            right[j++] = s[i++];
+        right[j] = 0;
+        u32 prefix = 0;
+        if (ui_parse_cidr_prefix(right, &prefix)) {
+            *mask = ui_prefix_mask(prefix);
+        } else if (!ui_parse_ip4(right, mask)) {
+            return false;
+        }
+        *end = 0;
+        *flags |= src ? NIC_FILTER_IP_FROM : NIC_FILTER_IP_TO;
+        return true;
+    }
+
+    if (s[i] == '-') {
+        u32 j = 0;
+        i++;
+        while (s[i] && j + 1 < sizeof(right))
+            right[j++] = s[i++];
+        right[j] = 0;
+        if (!ui_parse_ip4(right, end))
+            return false;
+        *mask = 0;
+        *flags |= src ? NIC_FILTER_IP_FROM_RANGE : NIC_FILTER_IP_TO_RANGE;
+        return true;
+    }
+
+    if (s[i] != 0)
+        return false;
+    *mask = 0;
+    *end = 0;
+    *flags |= src ? NIC_FILTER_IP_FROM : NIC_FILTER_IP_TO;
+    return true;
+}
+
 static bool ui_parse_priority(const char *s, u32 *out_prio)
 {
     if (!s || !out_prio) return false;
@@ -3322,13 +3552,16 @@ static bool ui_parse_mac6(const char *s, u8 out[6])
 static void ui_console_write(const char *s)
 {
     uart_puts(s);
-    fb_puts(s);
+    if (ui_mode == UI_MODE_CONSOLE)
+        fb_puts(s);
     debug_tcp_send(s);
 }
 
 static void ui_console_prompt(void)
 {
+    uart_vt_color(UART_COLOR_GREEN, UART_COLOR_BLACK, true);
     ui_console_write("console> ");
+    uart_vt_reset();
 }
 
 static void ui_print_ip(u32 ip)
@@ -3691,6 +3924,269 @@ static void ui_cmd_usb(u32 argc, char **argv)
     }
 
     ui_console_write("ERR: usage usb status|reinit|poll\n");
+}
+
+static void ui_console_u32_dec(u32 v)
+{
+    char tmp[11];
+    u32 n = 0;
+    if (v == 0) {
+        ui_console_write("0");
+        return;
+    }
+    while (v && n < sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (v % 10U));
+        v /= 10U;
+    }
+    while (n) {
+        char s[2] = { tmp[--n], 0 };
+        ui_console_write(s);
+    }
+}
+
+static void ui_console_ip4(u32 ip)
+{
+    ui_console_u32_dec((ip >> 24) & 0xFF);
+    ui_console_write(".");
+    ui_console_u32_dec((ip >> 16) & 0xFF);
+    ui_console_write(".");
+    ui_console_u32_dec((ip >> 8) & 0xFF);
+    ui_console_write(".");
+    ui_console_u32_dec(ip & 0xFF);
+}
+
+static void ui_firewall_print_ip_spec(u32 flags, bool src, const nic_filter_rule_t *r)
+{
+    u32 exact = src ? NIC_FILTER_IP_FROM : NIC_FILTER_IP_TO;
+    u32 range = src ? NIC_FILTER_IP_FROM_RANGE : NIC_FILTER_IP_TO_RANGE;
+    u32 ip = src ? r->ip_from : r->ip_to;
+    u32 mask = src ? r->ip_from_mask : r->ip_to_mask;
+    u32 end = src ? r->ip_from_end : r->ip_to_end;
+    if (flags & range) {
+        ui_console_ip4(ip);
+        ui_console_write("-");
+        ui_console_ip4(end);
+    } else if (flags & exact) {
+        ui_console_ip4(ip);
+        if (mask != 0) {
+            ui_console_write("/");
+            ui_console_ip4(mask);
+        }
+    } else {
+        ui_console_write("any");
+    }
+}
+
+static void ui_firewall_print_rule(u32 i, const nic_filter_rule_t *r)
+{
+    ui_console_u32_dec(i);
+    ui_console_write(": ");
+    ui_console_write(r->action == NIC_FILTER_ALLOW ? "allow " : "deny ");
+    if (r->direction == NIC_FILTER_DIR_IN) ui_console_write("in ");
+    else if (r->direction == NIC_FILTER_DIR_OUT) ui_console_write("out ");
+    else ui_console_write("both ");
+    if (r->flags & NIC_FILTER_ETHERTYPE) {
+        if (r->ethertype == ETH_P_ARP) ui_console_write("arp ");
+        else if (r->ethertype == ETH_P_IP) {
+            if (r->flags & NIC_FILTER_IP_PROTO) {
+                if (r->ip_proto == IP_PROTO_TCP) ui_console_write("tcp ");
+                else if (r->ip_proto == IP_PROTO_UDP) ui_console_write("udp ");
+                else if (r->ip_proto == IP_PROTO_ICMP) ui_console_write("icmp ");
+                else ui_console_write("ip ");
+            } else {
+                ui_console_write("ip ");
+            }
+        }
+    } else {
+        ui_console_write("any ");
+    }
+    ui_console_write("src=");
+    ui_firewall_print_ip_spec(r->flags, true, r);
+    ui_console_write(" dst=");
+    ui_firewall_print_ip_spec(r->flags, false, r);
+    if (r->flags & NIC_FILTER_TCP_PORT_TO) {
+        ui_console_write(" tcp_dport=");
+        ui_console_u32_dec(r->tcp_port_to);
+    }
+    if (r->flags & NIC_FILTER_TCP_PORT_FROM) {
+        ui_console_write(" tcp_sport=");
+        ui_console_u32_dec(r->tcp_port_from);
+    }
+    if (r->flags & NIC_FILTER_UDP_PORT_TO) {
+        ui_console_write(" udp_dport=");
+        ui_console_u32_dec(r->udp_port_to);
+    }
+    if (r->flags & NIC_FILTER_UDP_PORT_FROM) {
+        ui_console_write(" udp_sport=");
+        ui_console_u32_dec(r->udp_port_from);
+    }
+    ui_console_write("\n");
+}
+
+static void ui_cmd_firewall(u32 argc, char **argv)
+{
+    if (argc < 2 || ui_streq(argv[1], "help")) {
+        ui_console_write("firewall list|reset|clear|remove <idx>|default <in allow|deny> <out allow|deny>\n");
+        ui_console_write("firewall allow|deny <in|out|both> <tcp|udp|icmp|ip|arp> [port N|toport N|fromport N] [src SPEC] [dst SPEC]\n");
+        ui_console_write("SPEC: any | a.b.c.d | a.b.c.d/prefix | a.b.c.d/mask | a.b.c.d-a.b.c.d\n");
+        ui_console_write("Inbound default is deny; outbound default is allow. New rules insert first.\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "list")) {
+        u32 n = nic_filter_count();
+        ui_console_write("firewall rules=");
+        ui_console_u32_dec(n);
+        ui_console_write(" (first match wins)\n");
+        for (u32 i = 0; i < n; i++) {
+            nic_filter_rule_t r;
+            if (nic_filter_get(i, &r))
+                ui_firewall_print_rule(i, &r);
+        }
+        return;
+    }
+
+    if (ui_streq(argv[1], "reset")) {
+        net_firewall_install_defaults();
+        ui_console_write("OK: firewall reset to inbound deny/outbound allow defaults\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "clear")) {
+        nic_filter_clear();
+        nic_filter_set_default(false, true);
+        ui_console_write("OK: firewall cleared; inbound deny, outbound allow\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "remove")) {
+        u32 idx = 0;
+        if (argc < 3 || !ui_parse_u32(argv[2], &idx) || !nic_filter_remove(idx)) {
+            ui_console_write("ERR: usage firewall remove <idx>\n");
+            return;
+        }
+        ui_console_write("OK: firewall rule removed\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "default")) {
+        if (argc < 6 || !ui_streq(argv[2], "in") || !ui_streq(argv[4], "out")) {
+            ui_console_write("ERR: usage firewall default in <allow|deny> out <allow|deny>\n");
+            return;
+        }
+        bool in_allow = ui_streq(argv[3], "allow");
+        bool out_allow = ui_streq(argv[5], "allow");
+        if ((!in_allow && !ui_streq(argv[3], "deny")) ||
+            (!out_allow && !ui_streq(argv[5], "deny"))) {
+            ui_console_write("ERR: default policy must be allow|deny\n");
+            return;
+        }
+        nic_filter_set_default(in_allow, out_allow);
+        ui_console_write("OK: firewall defaults updated\n");
+        return;
+    }
+
+    if (!ui_streq(argv[1], "allow") && !ui_streq(argv[1], "deny")) {
+        ui_console_write("ERR: usage firewall help\n");
+        return;
+    }
+    if (argc < 4) {
+        ui_console_write("ERR: usage firewall allow|deny <in|out|both> <tcp|udp|icmp|ip|arp> ...\n");
+        return;
+    }
+
+    nic_filter_rule_t r;
+    simd_zero(&r, sizeof(r));
+    r.action = ui_streq(argv[1], "allow") ? NIC_FILTER_ALLOW : NIC_FILTER_DROP;
+    if (ui_streq(argv[2], "in")) r.direction = NIC_FILTER_DIR_IN;
+    else if (ui_streq(argv[2], "out")) r.direction = NIC_FILTER_DIR_OUT;
+    else if (ui_streq(argv[2], "both")) r.direction = NIC_FILTER_DIR_BOTH;
+    else {
+        ui_console_write("ERR: direction must be in|out|both\n");
+        return;
+    }
+
+    if (ui_streq(argv[3], "tcp")) {
+        r.flags |= NIC_FILTER_ETHERTYPE | NIC_FILTER_IP_PROTO;
+        r.ethertype = ETH_P_IP;
+        r.ip_proto = IP_PROTO_TCP;
+    } else if (ui_streq(argv[3], "udp")) {
+        r.flags |= NIC_FILTER_ETHERTYPE | NIC_FILTER_IP_PROTO;
+        r.ethertype = ETH_P_IP;
+        r.ip_proto = IP_PROTO_UDP;
+    } else if (ui_streq(argv[3], "icmp")) {
+        r.flags |= NIC_FILTER_ETHERTYPE | NIC_FILTER_IP_PROTO;
+        r.ethertype = ETH_P_IP;
+        r.ip_proto = IP_PROTO_ICMP;
+    } else if (ui_streq(argv[3], "ip")) {
+        r.flags |= NIC_FILTER_ETHERTYPE;
+        r.ethertype = ETH_P_IP;
+    } else if (ui_streq(argv[3], "arp")) {
+        r.flags |= NIC_FILTER_ETHERTYPE;
+        r.ethertype = ETH_P_ARP;
+    } else {
+        ui_console_write("ERR: protocol must be tcp|udp|icmp|ip|arp\n");
+        return;
+    }
+
+    for (u32 i = 4; i < argc; i++) {
+        if (ui_streq(argv[i], "port") || ui_streq(argv[i], "toport")) {
+            u32 p = 0;
+            if (++i >= argc || !ui_parse_u32(argv[i], &p) || p > 65535U) {
+                ui_console_write("ERR: invalid port\n");
+                return;
+            }
+            if (r.ip_proto == IP_PROTO_TCP) {
+                r.flags |= NIC_FILTER_TCP_PORT_TO;
+                r.tcp_port_to = (u16)p;
+            } else if (r.ip_proto == IP_PROTO_UDP) {
+                r.flags |= NIC_FILTER_UDP_PORT_TO;
+                r.udp_port_to = (u16)p;
+            } else {
+                ui_console_write("ERR: ports only valid for tcp/udp\n");
+                return;
+            }
+        } else if (ui_streq(argv[i], "fromport")) {
+            u32 p = 0;
+            if (++i >= argc || !ui_parse_u32(argv[i], &p) || p > 65535U) {
+                ui_console_write("ERR: invalid fromport\n");
+                return;
+            }
+            if (r.ip_proto == IP_PROTO_TCP) {
+                r.flags |= NIC_FILTER_TCP_PORT_FROM;
+                r.tcp_port_from = (u16)p;
+            } else if (r.ip_proto == IP_PROTO_UDP) {
+                r.flags |= NIC_FILTER_UDP_PORT_FROM;
+                r.udp_port_from = (u16)p;
+            } else {
+                ui_console_write("ERR: ports only valid for tcp/udp\n");
+                return;
+            }
+        } else if (ui_streq(argv[i], "src")) {
+            if (++i >= argc || !ui_parse_ip_spec(argv[i], &r.flags, true,
+                                                 &r.ip_from, &r.ip_from_mask,
+                                                 &r.ip_from_end)) {
+                ui_console_write("ERR: invalid src spec\n");
+                return;
+            }
+        } else if (ui_streq(argv[i], "dst")) {
+            if (++i >= argc || !ui_parse_ip_spec(argv[i], &r.flags, false,
+                                                 &r.ip_to, &r.ip_to_mask,
+                                                 &r.ip_to_end)) {
+                ui_console_write("ERR: invalid dst spec\n");
+                return;
+            }
+        } else {
+            ui_console_write("ERR: unknown firewall option\n");
+            return;
+        }
+    }
+
+    if (!nic_filter_add_front(&r)) {
+        ui_console_write("ERR: firewall rule table full/invalid\n");
+        return;
+    }
+    ui_console_write("OK: firewall rule inserted at index 0\n");
 }
 
 static void ui_cmd_netcfg(u32 argc, char **argv)
@@ -6261,25 +6757,49 @@ static void ui_console_exec(char *line)
     if (argc == 0) return;
 
     if (ui_streq(argv[0], "help")) {
-        ui_console_write("help echo clear time ps kill launch run pwd cd lsdir mkdir touch\n");
-        ui_console_write("copy cp cpdir mv cat stat rm find hexdump df mount umount\n");
-        ui_console_write("stream if for foreach source env batch svc update watchdog edit\n");
-        ui_console_write("hexsec fsinspect netcfg wifi usb disk db capsule obs\n");
-        ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d> | netcfg apply\n");
-        ui_console_write("netcfg dhcp <on|off> [timeout_ms] | netcfg addnbr <ip> <mac>\n");
-        ui_console_write("wifi disabled | usb status|reinit|poll | tcp debug :2323\n");
-        ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
-        ui_console_write("batch add|at|every supports [core] [priority] [principal] [retries]\n");
-        ui_console_write("batch run [parallel] | batch stop | batch status | batch list\n");
-        ui_console_write("svc add|start|stop|restart|run|pause|target|list|clear\n");
-        ui_console_write("update status|stage <slot> [tries]|success\n");
-        ui_console_write("watchdog status|arm|disarm|timeout <ticks>|mode <halt|reboot>|trip\n");
-        ui_console_write("launch <path> [1|2|3] [lazy|low|normal|high|realtime]\n");
-        ui_console_write("prio <pid> <lazy|low|normal|high|realtime> | affinity <pid> <1|2|3>\n");
-        ui_console_write("source <script[.pis]> (auto-adds .pis)\n");
-        ui_console_write("env [list|get|set|pset|unset|save|load]\n");
-        ui_console_write("edit|edit.pix <path> (Ctrl+S save, Ctrl+Q exit)\n");
-        ui_console_write("disk writezero requires --force\n");
+        if (argc < 2) {
+            ui_console_write("PIOS help categories:\n");
+            ui_console_write("  help core   - status, process, reboot, watchdog\n");
+            ui_console_write("  help fs     - WALFS files, dirs, database, disk\n");
+            ui_console_write("  help net    - network, firewall, stream, TCP debug\n");
+            ui_console_write("  help svc    - batch/service/scripting/env\n");
+            ui_console_write("  help dev    - USB, capsule, obs, debugger helpers\n");
+            ui_console_write("Common: status ps netstat firewall list logs reboot confirm\n");
+        } else if (ui_streq(argv[1], "core")) {
+            ui_console_write("Core/process commands:\n");
+            ui_console_write("  status time ps kill <pid>\n");
+            ui_console_write("  launch|run <path> [1|2|3] [priority]\n");
+            ui_console_write("  prio <pid> <lazy|low|normal|high|realtime>\n");
+            ui_console_write("  affinity <pid> <1|2|3>\n");
+            ui_console_write("  watchdog status|arm|disarm|timeout <ticks>|mode <halt|reboot>|trip\n");
+            ui_console_write("  reboot confirm\n");
+        } else if (ui_streq(argv[1], "fs")) {
+            ui_console_write("Filesystem/storage commands:\n");
+            ui_console_write("  pwd cd lsdir mkdir touch copy cp cpdir mv cat stat rm find\n");
+            ui_console_write("  hexdump <path> [max_bytes] fsinspect <path>\n");
+            ui_console_write("  df mount umount disk [info|sync|compact|verify|read|writezero]\n");
+            ui_console_write("  db key|put|putf|get|getf|del|list\n");
+        } else if (ui_streq(argv[1], "net")) {
+            ui_console_write("Network/firewall commands:\n");
+            ui_console_write("  netstat netcfg [set|apply|dhcp|addnbr]\n");
+            ui_console_write("  firewall list|reset|clear|remove <idx>|default in <allow|deny> out <allow|deny>\n");
+            ui_console_write("  firewall allow|deny <in|out|both> <tcp|udp|icmp|ip|arp> [port N] [src SPEC] [dst SPEC]\n");
+            ui_console_write("  stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
+            ui_console_write("  TCP debug console: port 2323, then 'unlock pios'\n");
+        } else if (ui_streq(argv[1], "svc")) {
+            ui_console_write("Service/script commands:\n");
+            ui_console_write("  batch add|at|every|run|stop|status|list\n");
+            ui_console_write("  svc add|start|stop|restart|run|pause|target|list|clear\n");
+            ui_console_write("  source <script[.pis]>  env [list|get|set|pset|unset|save|load]\n");
+            ui_console_write("  if for foreach update status|stage <slot> [tries]|success\n");
+        } else if (ui_streq(argv[1], "dev")) {
+            ui_console_write("Device/debug commands:\n");
+            ui_console_write("  usb status|reinit|poll  wifi disabled\n");
+            ui_console_write("  capsule ...  obs ...  hexsec <lba>\n");
+            ui_console_write("  edit|edit.pix <path>  clear echo\n");
+        } else {
+            ui_console_write("ERR: usage help [core|fs|net|svc|dev]\n");
+        }
     } else if (ui_streq(argv[0], "pwd")) {
         ui_console_write(ui_cwd);
         ui_console_write("\n");
@@ -6340,7 +6860,13 @@ static void ui_console_exec(char *line)
             ui_console_write("\n");
         }
     } else if (ui_streq(argv[0], "clear")) {
-        fb_clear(UI_SHELL_BG_COLOR);
+        uart_vt_clear();
+        uart_vt_home();
+        if (ui_mode == UI_MODE_CONSOLE) {
+            fb_clear(UI_SHELL_BG_COLOR);
+            fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
+            ui_console_write("PIOS F3 Console (serial + HDMI)\n");
+        }
     } else if (ui_streq(argv[0], "time")) {
         u64 t = timer_ticks();
         fb_printf("ticks=%X\n", t);
@@ -6524,6 +7050,8 @@ static void ui_console_exec(char *line)
         ui_cmd_usb(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
+    } else if (ui_streq(argv[0], "firewall")) {
+        ui_cmd_firewall(argc, argv);
     } else if (ui_streq(argv[0], "disk")) {
         ui_cmd_disk(argc, argv);
     } else if (ui_streq(argv[0], "db")) {
@@ -6536,6 +7064,15 @@ static void ui_console_exec(char *line)
         ui_cmd_update(argc, argv);
     } else if (ui_streq(argv[0], "watchdog")) {
         ui_cmd_watchdog(argc, argv);
+    } else if (ui_streq(argv[0], "reboot")) {
+        if (argc >= 2 && ui_streq(argv[1], "confirm")) {
+            ui_console_write("OK: rebooting via PSCI SYSTEM_RESET...\n");
+            http_log_event("console-reboot", 0, 0);
+            timer_delay_ms(100);
+            watchdog_reboot_now(0x434F4E52U);
+        } else {
+            ui_console_write("ERR: usage reboot confirm\n");
+        }
     } else {
         ui_console_write("ERR: unknown command\n");
     }
@@ -6810,7 +7347,6 @@ NORETURN void core0_main(void) {
     fb_set_color(0x0000FF80, 0x00000000);
     fb_puts("INIT COMPLETE\n");
 
-    /* Serial-only console */
     uart_puts("[sys] INIT COMPLETE\n");
 
     fb_set_color(0x00FFAA00, 0x00000000);
@@ -6824,37 +7360,24 @@ NORETURN void core0_main(void) {
         uart_puts("[dma] late memcpy selftest FAILED (using NEON fallback)\n");
     }
 
-    uart_puts("\r\nPIOS Console ready. Type 'help'.\r\n> ");
-
-    static char cmd_buf[128];
-    static u32 cmd_len;
+    uart_vt_clear();
+    uart_vt_home();
+    uart_vt_color(UART_COLOR_CYAN, UART_COLOR_BLACK, true);
+    uart_vt_box(58, 4, "PIOS SECOND STAGE LOADER");
+    uart_vt_reset();
+    ui_console_write("UART + HDMI console ready. Type 'help'.\n");
+    ui_console_prompt();
 
     for (;;) {
         net_poll();
         echo_tcp_poll();
         debug_tcp_poll();
 
-        for (u32 i = 0; i < 8; i++) {
+        for (u32 i = 0; i < 16; i++) {
             i32 rx = uart_try_getc();
             if (rx < 0)
                 break;
-            char c = (char)(rx & 0xFF);
-            uart_putc(c);  /* echo */
-            if (c == '\r' || c == '\n') {
-                uart_puts("\r\n");
-                cmd_buf[cmd_len] = 0;
-                if (cmd_len > 0) {
-                    for (u32 j = 0; j < cmd_len; j++)
-                        ui_console_feed_char(cmd_buf[j]);
-                    ui_console_feed_char('\n');
-                }
-                cmd_len = 0;
-                uart_puts("> ");
-            } else if (c == 127 || c == 8) {
-                if (cmd_len > 0) { cmd_len--; uart_puts("\b \b"); }
-            } else if (cmd_len < sizeof(cmd_buf) - 1) {
-                cmd_buf[cmd_len++] = c;
-            }
+            ui_console_feed_char(rx);
         }
 
         ui_handle_keys();
@@ -7289,7 +7812,7 @@ static u32 provision_slot_lba(void)
         return 2048;
     u32 p2_start = provision_read_le32(&mbr[0x1CE + 8]);
     u32 p2_size = provision_read_le32(&mbr[0x1CE + 12]);
-    if (p2_start == 0 || p2_size < (HOTPATCH_SLOT_BYTES / SD_BLOCK_SIZE))
+    if (p2_start == 0 || p2_size < PIOS_RESERVED_LBAS)
         return 2048;
     return p2_start;
 }
@@ -7299,7 +7822,7 @@ static bool provision_write_payload_to_slot(void)
     static u8 block[SD_BLOCK_SIZE] ALIGNED(64);
     const u8 *payload = provision_payload_start;
     u32 len = (u32)(provision_payload_end - provision_payload_start);
-    if (len == 0 || len > HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE)
+    if (len == 0 || len > PIOS_STAGE2_ZONE_BYTES)
         return false;
 
     u32 lba = provision_slot_lba();
@@ -7309,21 +7832,13 @@ static bool provision_write_payload_to_slot(void)
     uart_hex(len);
     uart_puts("\n");
 
-    simd_zero(block, sizeof(block));
-    block[0] = (u8)(HOTPATCH_SLOT_MAGIC & 0xFF);
-    block[1] = (u8)((HOTPATCH_SLOT_MAGIC >> 8) & 0xFF);
-    block[2] = (u8)((HOTPATCH_SLOT_MAGIC >> 16) & 0xFF);
-    block[3] = (u8)((HOTPATCH_SLOT_MAGIC >> 24) & 0xFF);
-    block[4] = (u8)(len & 0xFF);
-    block[5] = (u8)((len >> 8) & 0xFF);
-    block[6] = (u8)((len >> 16) & 0xFF);
-    block[7] = (u8)((len >> 24) & 0xFF);
+    pios_fill_reserved_header(block, HOTPATCH_SLOT_MAGIC, len);
     if (!sd_write_block(lba, block))
         return false;
 
-    for (u32 b = 0; b < (HOTPATCH_SLOT_BYTES / SD_BLOCK_SIZE); b++) {
+    for (u32 b = 0; b < (PIOS_STAGE2_ZONE_BYTES + SD_BLOCK_SIZE - 1U) / SD_BLOCK_SIZE; b++) {
         u32 off = b * SD_BLOCK_SIZE;
-        u32 dst_lba = lba + 1 + b;
+        u32 dst_lba = lba + (PIOS_STAGE2_OFFSET / SD_BLOCK_SIZE) + b;
         if (off + SD_BLOCK_SIZE <= len) {
             if (!sd_write_block(dst_lba, payload + off))
                 return false;

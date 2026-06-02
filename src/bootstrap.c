@@ -10,14 +10,15 @@
 #include "sd.h"
 #include "mmio.h"
 #include "fb.h"
+#include "walfs.h"
 
 #define BOOT_DST_ADDR       0x00080000ULL
 #define BOOT_STAGING_ADDR   0x08000000ULL
 #define BOOT_TRAMP_ADDR     0x07FFF000ULL
-#define BOOT_SLOT_BYTES     (2U * 1024U * 1024U)
+#define BOOT_SLOT_BYTES     (PIOS_STAGE2_END_OFFSET + 1U)
 #define BOOT_SLOT_BLOCKS    (BOOT_SLOT_BYTES / SD_BLOCK_SIZE)
 #define BOOT_FALLBACK_LBA   2048U
-#define BOOT_SLOT_MAGIC     0x50494F53U /* PIOS */
+#define BOOT_SLOT_MAGIC     PIOS_RESERVED_HEADER_MAGIC
 
 extern u8 bootstrap_trampoline[];
 extern u8 bootstrap_trampoline_end[];
@@ -165,9 +166,15 @@ NORETURN void kernel_main(void)
         uart_puts("[boot] header read failed\n");
         for (;;) wfi();
     }
-    u32 magic = read_le32(hdr);
-    u32 image_len = read_le32(hdr + 4);
-    if (magic != BOOT_SLOT_MAGIC || image_len == 0 || image_len > BOOT_SLOT_BYTES - SD_BLOCK_SIZE) {
+    u32 magic = read_le32(hdr + PIOS_HDR_MAGIC_OFF);
+    u32 image_len = read_le32(hdr + PIOS_HDR_STAGE2_LEN_OFF);
+    u32 layout_ver = read_le32(hdr + PIOS_HDR_LAYOUT_VERSION_OFF);
+    u32 stage2_off = read_le32(hdr + PIOS_HDR_STAGE2_OFFSET_OFF);
+    u32 stage2_bytes = read_le32(hdr + PIOS_HDR_STAGE2_BYTES_OFF);
+    if (magic != BOOT_SLOT_MAGIC || image_len == 0 || image_len > PIOS_STAGE2_ZONE_BYTES ||
+        (layout_ver != 0 && layout_ver != PIOS_RESERVED_LAYOUT_VERSION) ||
+        (stage2_off != 0 && stage2_off != PIOS_STAGE2_OFFSET) ||
+        (stage2_bytes != 0 && stage2_bytes != PIOS_STAGE2_ZONE_BYTES)) {
         fb_set_color(0x00FF0000, 0x00000000);
         fb_printf("[stage0] bad header magic=%x len=%u\n", magic, image_len);
         uart_puts("[boot] bad slot header magic=");
@@ -179,6 +186,8 @@ NORETURN void kernel_main(void)
     }
     fb_set_color(0x0000FF00, 0x00000000);
     fb_printf("[stage0] image bytes=%u\n", image_len);
+    if (layout_ver)
+        fb_printf("[stage0] layout v%u walfs=0x%x\n", layout_ver, PIOS_WALFS_OFFSET);
     uart_puts("[boot] image bytes=");
     uart_hex(image_len);
     uart_puts("\n");

@@ -20,12 +20,66 @@
 #define WALFS_DATA_MAX      4096
 
 /*
- * WALFS base LBA offset — all WALFS block addresses are relative to this.
- * This protects the FAT32 boot partition on partition 1.
- * Set at runtime from MBR partition 2, or falls back to WALFS_BASE_LBA.
+ * Partition-2 reserved layout. WALFS starts after this 10 MiB region; all
+ * WALFS block addresses are relative to that post-reserved base.
+ *
+ * Offsets are relative to the start of partition 2:
+ *   0x000000..0x0001FF  reserved-area header / PIOS signature
+ *   0x000200..0x1FFFFF  second-stage kernel image payload
+ *   0x200000..0x2C7FFF  TCP/IP stack area (800 KiB):
+ *                       MAC, ARP, DHCP, DNS, ICMP, UDP, TCP, streams clients
+ *   0x2C8000..0x2FFFFF  firewall rules + static IP config area (200 KiB)
+ *   0x300000..0x3FFFFF  Admin Console HTTP service area
+ *   0x400000..0x4FFFFF  kernel debugger / dump / inspector area
+ *   0x500000..0x5FFFFF  user records
+ *   0x600000..0x7FFFFF  circular hot log buffer
+ *   0x800000..0x8FFFFF  kernel state crashdump zone
+ *   0x900000..0x9FFFFF  future reserved system service area
+ *   0xA00000..end       WALFS packs/cards/storage
  */
-#define WALFS_BOOT_SLOT_BYTES  (10U * 1024U * 1024U)
-#define WALFS_BOOT_SLOT_LBAS   (WALFS_BOOT_SLOT_BYTES / 512U)
+#define PIOS_RESERVED_BYTES             (10U * 1024U * 1024U)
+#define PIOS_RESERVED_LBAS              (PIOS_RESERVED_BYTES / 512U)
+#define PIOS_RESERVED_HEADER_OFFSET     0x000000U
+#define PIOS_RESERVED_HEADER_BYTES      0x000200U
+#define PIOS_RESERVED_HEADER_MAGIC      0x50494F53U  /* 'PIOS' */
+#define PIOS_RESERVED_LAYOUT_VERSION    1U
+#define PIOS_HDR_MAGIC_OFF              0U
+#define PIOS_HDR_STAGE2_LEN_OFF         4U
+#define PIOS_HDR_LAYOUT_VERSION_OFF     8U
+#define PIOS_HDR_RESERVED_BYTES_OFF     12U
+#define PIOS_HDR_STAGE2_OFFSET_OFF      16U
+#define PIOS_HDR_STAGE2_BYTES_OFF       20U
+#define PIOS_HDR_TCPIP_OFFSET_OFF       24U
+#define PIOS_HDR_TCPIP_BYTES_OFF        28U
+#define PIOS_HDR_FIREWALL_OFFSET_OFF    32U
+#define PIOS_HDR_FIREWALL_BYTES_OFF     36U
+#define PIOS_HDR_ADMIN_OFFSET_OFF       40U
+#define PIOS_HDR_DEBUG_OFFSET_OFF       44U
+#define PIOS_HDR_USER_RECORDS_OFF       48U
+#define PIOS_HDR_HOT_LOGS_OFF           52U
+#define PIOS_HDR_HOT_LOGS_BYTES_OFF     56U
+#define PIOS_HDR_CRASHDUMP_OFF          60U
+#define PIOS_HDR_FUTURE_OFF             64U
+#define PIOS_HDR_WALFS_OFF              68U
+#define PIOS_STAGE2_OFFSET              0x000200U
+#define PIOS_STAGE2_END_OFFSET          0x1FFFFFU
+#define PIOS_STAGE2_ZONE_BYTES          (PIOS_STAGE2_END_OFFSET - PIOS_STAGE2_OFFSET + 1U)
+#define PIOS_TCPIP_STACK_OFFSET         0x200000U
+#define PIOS_TCPIP_STACK_BYTES          0x0C8000U
+#define PIOS_FIREWALL_CFG_OFFSET        0x2C8000U
+#define PIOS_FIREWALL_CFG_BYTES         0x038000U
+#define PIOS_TCPIP_FW_OFFSET            PIOS_TCPIP_STACK_OFFSET
+#define PIOS_ADMIN_HTTP_OFFSET          0x300000U
+#define PIOS_KERNEL_DEBUG_OFFSET        0x400000U
+#define PIOS_USER_RECORDS_OFFSET        0x500000U
+#define PIOS_HOT_LOGS_OFFSET            0x600000U
+#define PIOS_HOT_LOGS_BYTES             0x200000U
+#define PIOS_CRASHDUMP_OFFSET           0x800000U
+#define PIOS_FUTURE_RESERVED_OFFSET     0x900000U
+#define PIOS_WALFS_OFFSET               0xA00000U
+
+#define WALFS_BOOT_SLOT_BYTES  PIOS_RESERVED_BYTES
+#define WALFS_BOOT_SLOT_LBAS   PIOS_RESERVED_LBAS
 #define WALFS_BASE_LBA         (2048U + WALFS_BOOT_SLOT_LBAS)
 
 /* Runtime partition 2 base, set by walfs_discover_partition() */

@@ -38,8 +38,10 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 | **Hardened Network Stack** | IP/TCP/UDP/ICMP/ARP/DNS with strict ingress validation and no fragmentation. |
 | **Cadence GEM/MACB NIC** | Cadence GEM Ethernet MAC on RP1 southbridge via PCIe 2.0 x4. |
 | **Raw Block Storage** | SDHCI driver for SD/eMMC (EMMC2). WALFS WAL-based append-only filesystem. |
+| **Stage0 + Raw Slot Layout** | FAT `kernel8.img` is a stable stage0 loader; partition 2 reserves the first 10 MiB for second-stage and system areas before WALFS. See [DISKLAYOUT.md](DISKLAYOUT.md). |
 | **HDMI Boot Console** | 1024×768 framebuffer with 8×8 bitmap font, `fb_printf()`. |
 | **UART Serial I/O** | RP1 PL011 UART0 at 115200 baud. Line editing with backspace. |
+| **Operator Consoles** | UART+HDMI mirrored console, TCP debug console, Web Admin terminal, logs, OTA, reboot, and firewall operations. See [CONSOLE.md](CONSOLE.md). |
 | **Inter-Core FIFO** | 16 lock-free SPSC ring buffers (4×4 grid). 64-byte messages. |
 | **Unified Pipes** | `/ipc`, `/net`, `/fs`, `/hw` domains mapped through capability-gated pipe adapters. |
 | **NEON/SIMD** | Hardware-accelerated memcpy (64B/iter), IP checksum, CRC32C. |
@@ -52,6 +54,10 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 | **PCIe + RP1 Southbridge** | PCIe root complex init; RP1 GPIO, clock, UART, and USB xHCI. |
 | **USB xHCI + HID Keyboard** | USB host via xHCI on RP1; HID keyboard and mass storage class drivers. |
 | **EL2 Capsule + Stage-2 Groundwork** | Capsule descriptors plus HVC-managed stage-2 planning/enabling metadata (VMID/IPA policy scaffolding); user apps (including console apps) default to capsule binding, with optional shared capsule groups, virtual fs roots, and capsule-local shared memory via IPC SHM. |
+
+For operator workflows, serial/TCP/Web consoles, OTA hot-flashing, log tailing, remote reboot, and firewall commands, see [CONSOLE.md](CONSOLE.md).
+
+For the FAT/stage0/raw second-stage/WALFS disk map, see [DISKLAYOUT.md](DISKLAYOUT.md).
 
 ## Building
 

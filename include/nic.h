@@ -75,6 +75,8 @@ void nic_record_rate_limited(void);
 #define NIC_FILTER_TCP_PORT_FROM (1U << 7)
 #define NIC_FILTER_UDP_PORT_TO   (1U << 8)
 #define NIC_FILTER_UDP_PORT_FROM (1U << 9)
+#define NIC_FILTER_IP_TO_RANGE   (1U << 10)
+#define NIC_FILTER_IP_FROM_RANGE (1U << 11)
 
 typedef struct {
     u32 flags;
@@ -87,6 +89,10 @@ typedef struct {
     u8  _pad;
     u32 ip_to;
     u32 ip_from;
+    u32 ip_to_mask;      /* optional with IP_TO; 0 means exact match */
+    u32 ip_from_mask;    /* optional with IP_FROM; 0 means exact match */
+    u32 ip_to_end;       /* optional with IP_TO_RANGE */
+    u32 ip_from_end;     /* optional with IP_FROM_RANGE */
     u16 tcp_port_to;
     u16 tcp_port_from;
     u16 udp_port_to;
@@ -96,6 +102,8 @@ typedef struct {
 void nic_filter_clear(void);
 void nic_filter_set_default(bool allow_in, bool allow_out);
 bool nic_filter_add(const nic_filter_rule_t *rule);
+bool nic_filter_add_front(const nic_filter_rule_t *rule);
 bool nic_filter_remove(u32 index);
+bool nic_filter_get(u32 index, nic_filter_rule_t *out);
 u32  nic_filter_count(void);
 void nic_filter_stats(u64 *rx_dropped, u64 *tx_dropped);
