@@ -11,6 +11,25 @@ struct picowal_readdir_wire {
     u8 name[128];
 } PACKED;
 
+static struct {
+    struct picowal_readdir_wire *out;
+    u32 max;
+    u32 count;
+} direct_readdir;
+
+static void direct_readdir_cb(const struct walfs_dirent *entry)
+{
+    if (!entry || !direct_readdir.out) return;
+    if (direct_readdir.count >= direct_readdir.max) return;
+    struct picowal_readdir_wire *w = &direct_readdir.out[direct_readdir.count++];
+    w->inode_id = entry->child_id;
+    for (u32 i = 0; i < sizeof(w->name); i++) {
+        w->name[i] = entry->name[i];
+        if (entry->name[i] == 0) break;
+    }
+    w->name[sizeof(w->name) - 1] = 0;
+}
+
 static bool streq(const char *a, const char *b)
 {
     if (!a || !b) return false;
@@ -54,6 +73,10 @@ static bool fs_request(struct fifo_msg *msg, struct fifo_msg *reply)
 static bool fs_find(const char *path, u64 *id_out)
 {
     if (!path || !id_out) return false;
+    if (core_id() == CORE_NET) {
+        *id_out = walfs_find(path);
+        return *id_out != 0;
+    }
     struct fifo_msg msg = {0};
     struct fifo_msg reply = {0};
     msg.type = MSG_FS_FIND;
@@ -67,6 +90,23 @@ static bool fs_find(const char *path, u64 *id_out)
 
 static bool fs_mkdir(const char *path)
 {
+    if (core_id() == CORE_NET) {
+        char parent[96];
+        char name[64];
+        u32 len = pios_strlen(path);
+        if (!path || path[0] != '/' || len < 2) return false;
+        i32 slash = -1;
+        for (u32 i = 0; i < len; i++) if (path[i] == '/') slash = (i32)i;
+        if (slash < 0 || (u32)slash >= len - 1) return false;
+        u32 nl = len - (u32)slash - 1;
+        if (nl + 1 > sizeof(name) || (u32)slash + 1 > sizeof(parent)) return false;
+        for (u32 i = 0; i < nl; i++) name[i] = path[(u32)slash + 1 + i];
+        name[nl] = 0;
+        if (slash == 0) { parent[0] = '/'; parent[1] = 0; }
+        else { for (u32 i = 0; i < (u32)slash; i++) parent[i] = path[i]; parent[slash] = 0; }
+        u64 pid = walfs_find(parent);
+        return pid && walfs_create(pid, name, WALFS_DIR, 0755);
+    }
     struct fifo_msg msg = {0};
     struct fifo_msg reply = {0};
     msg.type = MSG_FS_MKDIR;
@@ -77,6 +117,25 @@ static bool fs_mkdir(const char *path)
 
 static bool fs_create(const char *path, u64 *id_out)
 {
+    if (core_id() == CORE_NET) {
+        char parent[96];
+        char name[64];
+        u32 len = pios_strlen(path);
+        if (!path || path[0] != '/' || len < 2) return false;
+        i32 slash = -1;
+        for (u32 i = 0; i < len; i++) if (path[i] == '/') slash = (i32)i;
+        if (slash < 0 || (u32)slash >= len - 1) return false;
+        u32 nl = len - (u32)slash - 1;
+        if (nl + 1 > sizeof(name) || (u32)slash + 1 > sizeof(parent)) return false;
+        for (u32 i = 0; i < nl; i++) name[i] = path[(u32)slash + 1 + i];
+        name[nl] = 0;
+        if (slash == 0) { parent[0] = '/'; parent[1] = 0; }
+        else { for (u32 i = 0; i < (u32)slash; i++) parent[i] = path[i]; parent[slash] = 0; }
+        u64 pid = walfs_find(parent);
+        u64 id = pid ? walfs_create(pid, name, WALFS_FILE, 0644) : 0;
+        if (id_out) *id_out = id;
+        return id != 0;
+    }
     struct fifo_msg msg = {0};
     struct fifo_msg reply = {0};
     msg.type = MSG_FS_CREATE;
@@ -92,6 +151,10 @@ static bool fs_create(const char *path, u64 *id_out)
 
 static bool fs_delete_path(const char *path)
 {
+    if (core_id() == CORE_NET) {
+        u64 id = walfs_find(path);
+        return id && walfs_delete(id);
+    }
     struct fifo_msg msg = {0};
     struct fifo_msg reply = {0};
     msg.type = MSG_FS_DELETE;
@@ -102,6 +165,8 @@ static bool fs_delete_path(const char *path)
 
 static i32 fs_read(u64 inode_id, void *out, u32 out_len)
 {
+    if (core_id() == CORE_NET)
+        return (i32)walfs_read(inode_id, 0, out, out_len);
     struct fifo_msg msg = {0};
     struct fifo_msg reply = {0};
     msg.type = MSG_FS_READ;
@@ -116,6 +181,8 @@ static i32 fs_read(u64 inode_id, void *out, u32 out_len)
 
 static i32 fs_write(u64 inode_id, const void *data, u32 len)
 {
+    if (core_id() == CORE_NET)
+        return walfs_write(inode_id, 0, data, len) ? (i32)len : -1;
     struct fifo_msg msg = {0};
     struct fifo_msg reply = {0};
     msg.type = MSG_FS_WRITE;
@@ -130,6 +197,13 @@ static i32 fs_write(u64 inode_id, const void *data, u32 len)
 
 static u32 fs_readdir(u64 inode_id, struct picowal_readdir_wire *out, u32 max_entries)
 {
+    if (core_id() == CORE_NET) {
+        direct_readdir.out = out;
+        direct_readdir.max = max_entries;
+        direct_readdir.count = 0;
+        walfs_readdir(inode_id, direct_readdir_cb);
+        return direct_readdir.count;
+    }
     struct fifo_msg msg = {0};
     struct fifo_msg reply = {0};
     msg.type = MSG_FS_READDIR;

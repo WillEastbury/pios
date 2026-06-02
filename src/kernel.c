@@ -63,6 +63,7 @@
 #include "crypto.h"
 #include "watchdog.h"
 #include "fat32.h"
+#include "pios_addr.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -1067,10 +1068,49 @@ static bool http_starts_with(const char *s, const char *prefix)
     return true;
 }
 
+static u32 http_split_args(char *line, char **argv, u32 max_args)
+{
+    u32 argc = 0;
+    char *p = line;
+    while (*p && argc < max_args) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        argv[argc++] = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) *p++ = 0;
+    }
+    return argc;
+}
+
+static bool http_parse_db_ref(u32 argc, char **argv, u32 start, u32 *card_out, u32 *rec_out, u32 *next_arg)
+{
+    if (!argv || !card_out || !rec_out || !next_arg || start >= argc)
+        return false;
+    u16 c16 = 0;
+    u32 rec = 0;
+    if (pios_addr_parse_picowal(argv[start], &c16, &rec)) {
+        *card_out = c16;
+        *rec_out = rec;
+        *next_arg = start + 1;
+        return true;
+    }
+    u32 card = 0;
+    if (start + 1 >= argc)
+        return false;
+    if (!http_parse_u32(argv[start], &card) || card > PICOWAL_CARD_MAX)
+        return false;
+    if (!http_parse_u32(argv[start + 1], &rec) || rec > PICOWAL_RECORD_MAX)
+        return false;
+    *card_out = card;
+    *rec_out = rec;
+    *next_arg = start + 2;
+    return true;
+}
+
 static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     u32 len = 0;
-    char cmd[32];
+    char cmd[128];
     http_append(out, &len, max,
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: text/plain\r\n"
@@ -1078,12 +1118,12 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         "Connection: close\r\n\r\n");
 
     if (!http_query_cmd(req, req_len, cmd, sizeof(cmd)))
-        http_append(out, &len, max, "usage: /api/terminal?cmd=<help|status|netstat|processes|users|firewall list|kill pid|restart pid>\n");
+        http_append(out, &len, max, "usage: /api/terminal?cmd=<help|status|netstat|processes|users|firewall list|addr spec|kill pid|restart pid>\n");
     else if (http_streq(cmd, "help")) {
         http_append(out, &len, max,
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
-            "Examples: status | ps | netstat | firewall list | reboot confirm\n"
+            "Examples: status | ps | netstat | firewall list | addr wal:0/3 | reboot confirm\n"
             "Command help: help status | help netstat | help firewall | help reboot | help peek\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
     } else if (http_starts_with(cmd, "help ")) {
@@ -1108,6 +1148,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "dumpmem <addr> [bytes]\n  Dump memory from UART/TCP console admin/debug context.\n");
         } else if (http_streq(topic, "dma")) {
             http_append(out, &len, max, "dma status | dma selftest\n  Show DMA channel registers, selftest result, selected CB address mode, and retry selftest.\n");
+        } else if (http_streq(topic, "addr")) {
+            http_append(out, &len, max, "addr <kind:pack/card[/tail]>\n  Parse and canonicalize PIOS resource addresses. Kinds: wal,tcp,udp,stream,dev,file.\n");
         } else {
             http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma\n");
         }
@@ -1225,6 +1267,129 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     } else if (http_streq(cmd, "dma selftest")) {
         bool ok = dma_selftest();
         http_append(out, &len, max, ok ? "DMA selftest OK\n" : "DMA selftest FAILED\n");
+    } else if (http_starts_with(cmd, "addr ")) {
+        struct pios_addr a;
+        char canon[160];
+        if (!pios_addr_parse(cmd + 5, &a) || !pios_addr_format(&a, canon, sizeof(canon))) {
+            http_append(out, &len, max, "ERR: usage addr <kind:pack/card[/tail]>\n");
+        } else {
+            http_append(out, &len, max, "canonical=");
+            http_append(out, &len, max, canon);
+            http_append(out, &len, max, "\nkind=");
+            http_append(out, &len, max, pios_addr_kind_name(a.kind));
+            http_append(out, &len, max, " pack=");
+            http_append_u64(out, &len, max, a.pack);
+            http_append(out, &len, max, " card=");
+            http_append_u64(out, &len, max, a.card);
+            if (a.kind == PIOS_ADDR_WAL) {
+                u32 key = 0;
+                if (picowal_db_pack_key((u16)a.pack, a.card, &key)) {
+                    http_append(out, &len, max, " dbkey=");
+                    http_append_u64(out, &len, max, key);
+                }
+            } else if (a.kind == PIOS_ADDR_TCP || a.kind == PIOS_ADDR_UDP) {
+                http_append(out, &len, max, " port=");
+                http_append_u64(out, &len, max, a.card);
+            }
+            if (a.tail[0]) {
+                http_append(out, &len, max, " tail=");
+                http_append(out, &len, max, a.tail);
+            }
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "db ")) {
+        char *argv[10];
+        u32 argc = http_split_args(cmd, argv, 10);
+        if (argc < 2) {
+            http_append(out, &len, max, "ERR: usage db key|get|put|del|list <addr>\n");
+        } else if (http_streq(argv[1], "list")) {
+            if (argc < 3) {
+                http_append(out, &len, max, "ERR: usage db list <card|wal:pack/card>\n");
+            } else {
+                u32 card = 0;
+                u32 ignored = 0;
+                u16 c16 = 0;
+                if (pios_addr_parse_picowal(argv[2], &c16, &ignored)) card = c16;
+                else if (!http_parse_u32(argv[2], &card) || card > PICOWAL_CARD_MAX) card = 0xFFFFFFFFU;
+                if (card == 0xFFFFFFFFU) {
+                    http_append(out, &len, max, "ERR: invalid card\n");
+                } else {
+                    u32 ids[64];
+                    u32 n = picowal_db_list((u16)card, ids, 64);
+                    http_append(out, &len, max, "db card=");
+                    http_append_u64(out, &len, max, card);
+                    http_append(out, &len, max, " count=");
+                    http_append_u64(out, &len, max, n);
+                    http_append(out, &len, max, "\n");
+                    for (u32 i = 0; i < n; i++) {
+                        http_append(out, &len, max, "rec=");
+                        http_append_u64(out, &len, max, ids[i]);
+                        http_append(out, &len, max, "\n");
+                    }
+                }
+            }
+        } else {
+            u32 card = 0, rec = 0, argi = 0;
+            if (!http_parse_db_ref(argc, argv, 2, &card, &rec, &argi)) {
+                http_append(out, &len, max, "ERR: invalid db address\n");
+            } else if (http_streq(argv[1], "key")) {
+                u32 key = 0;
+                if (picowal_db_pack_key((u16)card, rec, &key)) {
+                    http_append(out, &len, max, "key=");
+                    http_append_u64(out, &len, max, key);
+                    http_append(out, &len, max, " card=");
+                    http_append_u64(out, &len, max, card);
+                    http_append(out, &len, max, " record=");
+                    http_append_u64(out, &len, max, rec);
+                    http_append(out, &len, max, "\n");
+                } else {
+                    http_append(out, &len, max, "ERR: key pack failed\n");
+                }
+            } else if (http_streq(argv[1], "del")) {
+                http_append(out, &len, max, picowal_db_delete((u16)card, rec) ? "OK: deleted\n" : "ERR: delete failed\n");
+            } else if (http_streq(argv[1], "get")) {
+                static u8 data[PICOWAL_DATA_MAX];
+                i32 n = picowal_db_get((u16)card, rec, data, PICOWAL_DATA_MAX);
+                if (n < 0) {
+                    http_append(out, &len, max, "ERR: get failed\n");
+                } else {
+                    http_append(out, &len, max, "db card=");
+                    http_append_u64(out, &len, max, card);
+                    http_append(out, &len, max, " record=");
+                    http_append_u64(out, &len, max, rec);
+                    http_append(out, &len, max, " len=");
+                    http_append_u64(out, &len, max, (u32)n);
+                    http_append(out, &len, max, "\n");
+                    for (i32 i = 0; i < n && len + 1 < max; i++) {
+                        u8 c = data[i];
+                        out[len++] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
+                        out[len] = 0;
+                    }
+                    http_append(out, &len, max, "\n");
+                }
+            } else if (http_streq(argv[1], "put")) {
+                if (argc <= argi) {
+                    http_append(out, &len, max, "ERR: usage db put <addr> <text...>\n");
+                } else {
+                    static u8 data[PICOWAL_DATA_MAX];
+                    u32 p = 0;
+                    for (u32 i = argi; i < argc; i++) {
+                        const char *s = argv[i];
+                        while (*s && p < PICOWAL_DATA_MAX) data[p++] = (u8)*s++;
+                        if (i + 1 < argc && p < PICOWAL_DATA_MAX) data[p++] = ' ';
+                    }
+                    i32 n = picowal_db_put((u16)card, rec, data, p);
+                    if (n < 0) http_append(out, &len, max, "ERR: put failed\n");
+                    else {
+                        http_append(out, &len, max, "OK: wrote ");
+                        http_append_u64(out, &len, max, (u32)n);
+                        http_append(out, &len, max, " bytes\n");
+                    }
+                }
+            } else {
+                http_append(out, &len, max, "ERR: unknown db op\n");
+            }
+        }
     } else if (http_streq(cmd, "processes")) {
         struct proc_ui_entry snap[MAX_PROCS_PER_CORE];
         u32 n = proc_snapshot(snap, MAX_PROCS_PER_CORE);
@@ -2970,6 +3135,7 @@ static void ui_cmd_obs(u32 argc, char **argv);
 static void ui_cmd_update(u32 argc, char **argv);
 static void ui_cmd_watchdog(u32 argc, char **argv);
 static void ui_cmd_dma(u32 argc, char **argv);
+static void ui_cmd_addr(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -4846,16 +5012,78 @@ static void ui_cmd_disk(u32 argc, char **argv)
     ui_console_write("ERR: usage disk [info|sync|compact|verify|read <lba>|writezero <lba> --force]\n");
 }
 
+static bool ui_parse_db_ref(u32 argc, char **argv, u32 start, u32 *card_out, u32 *rec_out, u32 *next_arg)
+{
+    if (!argv || !card_out || !rec_out || !next_arg || start >= argc)
+        return false;
+    u16 c16 = 0;
+    u32 rec = 0;
+    if (pios_addr_parse_picowal(argv[start], &c16, &rec)) {
+        *card_out = c16;
+        *rec_out = rec;
+        *next_arg = start + 1;
+        return true;
+    }
+    u32 card = 0;
+    if (start + 1 >= argc)
+        return false;
+    if (!ui_parse_u32(argv[start], &card) || card > PICOWAL_CARD_MAX)
+        return false;
+    if (!ui_parse_u32(argv[start + 1], &rec) || rec > PICOWAL_RECORD_MAX)
+        return false;
+    *card_out = card;
+    *rec_out = rec;
+    *next_arg = start + 2;
+    return true;
+}
+
+static void ui_cmd_addr(u32 argc, char **argv)
+{
+    if (argc < 2) {
+        ui_console_write("addr <kind:pack/card[/tail]>\n");
+        ui_console_write("Kinds: wal tcp udp stream dev file. Bare pack/card means wal:pack/card.\n");
+        ui_console_write("Examples: wal:0/3 tcp:0/80 udp:0/7001 stream:1/42 dev:0/1/uart0 file:0/12/etc/init.pis\n");
+        return;
+    }
+    struct pios_addr a;
+    char canon[160];
+    if (!pios_addr_parse(argv[1], &a) || !pios_addr_format(&a, canon, sizeof(canon))) {
+        ui_console_write("ERR: invalid address\n");
+        return;
+    }
+    ui_console_write("canonical=");
+    ui_console_write(canon);
+    ui_console_write("\nkind=");
+    ui_console_write(pios_addr_kind_name(a.kind));
+    ui_console_write(" pack=");
+    ui_console_u32_dec(a.pack);
+    ui_console_write(" card=");
+    ui_console_u32_dec(a.card);
+    if (a.kind == PIOS_ADDR_WAL) {
+        u32 key = 0;
+        if (picowal_db_pack_key((u16)a.pack, a.card, &key)) {
+            ui_console_write(" dbkey=");
+            ui_console_hex_fixed(key, 8);
+        }
+    } else if (a.kind == PIOS_ADDR_TCP || a.kind == PIOS_ADDR_UDP) {
+        ui_console_write(" port=");
+        ui_console_u32_dec(a.card);
+    }
+    if (a.tail[0]) {
+        ui_console_write(" tail=");
+        ui_console_write(a.tail);
+    }
+    ui_console_write("\n");
+}
+
 static void ui_cmd_db(u32 argc, char **argv)
 {
     if (argc < 2 || ui_streq(argv[1], "help")) {
-        ui_console_write("db key <card> <record>\n");
-        ui_console_write("db put <card> <record> <text...>\n");
-        ui_console_write("db putf <card> <record> <path>\n");
-        ui_console_write("db get <card> <record>\n");
-        ui_console_write("db getf <card> <record> <path>\n");
-        ui_console_write("db del <card> <record>\n");
-        ui_console_write("db list <card>\n");
+        ui_console_write("db key <card> <record> | db key <wal:pack/card>\n");
+        ui_console_write("db put <card> <record> <text...> | db put <wal:pack/card> <text...>\n");
+        ui_console_write("db putf|getf <card> <record> <path> | db putf|getf <wal:pack/card> <path>\n");
+        ui_console_write("db get|del <card> <record> | db get|del <wal:pack/card>\n");
+        ui_console_write("db list <card|wal:pack/card>\n");
         ui_console_write("udp: port 7001 op={1:get,2:put,3:del,4:list} ver=1\n");
         return;
     }
@@ -4866,7 +5094,11 @@ static void ui_cmd_db(u32 argc, char **argv)
             return;
         }
         u32 card = 0;
-        if (!ui_parse_u32(argv[2], &card) || card > PICOWAL_CARD_MAX) {
+        u32 ignored = 0;
+        u16 c16 = 0;
+        if (pios_addr_parse_picowal(argv[2], &c16, &ignored)) {
+            card = c16;
+        } else if (!ui_parse_u32(argv[2], &card) || card > PICOWAL_CARD_MAX) {
             ui_console_write("ERR: card out of range (0..1023)\n");
             return;
         }
@@ -4878,18 +5110,15 @@ static void ui_cmd_db(u32 argc, char **argv)
         return;
     }
 
-    if (argc < 4) {
-        ui_console_write("ERR: usage db <op> <card> <record> ...\n");
+    if (argc < 3) {
+        ui_console_write("ERR: usage db <op> <card> <record> ... OR db <op> <wal:pack/card> ...\n");
         return;
     }
 
     u32 card = 0, rec = 0;
-    if (!ui_parse_u32(argv[2], &card) || card > PICOWAL_CARD_MAX) {
-        ui_console_write("ERR: card out of range (0..1023)\n");
-        return;
-    }
-    if (!ui_parse_u32(argv[3], &rec) || rec > PICOWAL_RECORD_MAX) {
-        ui_console_write("ERR: record out of range (0..4194303)\n");
+    u32 argi = 0;
+    if (!ui_parse_db_ref(argc, argv, 2, &card, &rec, &argi)) {
+        ui_console_write("ERR: invalid db address (use <card> <record> or wal:pack/card)\n");
         return;
     }
 
@@ -4912,13 +5141,13 @@ static void ui_cmd_db(u32 argc, char **argv)
     }
 
     if (ui_streq(argv[1], "put")) {
-        if (argc < 5) {
-            ui_console_write("ERR: usage db put <card> <record> <text...>\n");
+        if (argc <= argi) {
+            ui_console_write("ERR: usage db put <addr> <text...>\n");
             return;
         }
         static u8 data[PICOWAL_DATA_MAX];
         u32 p = 0;
-        for (u32 i = 4; i < argc; i++) {
+        for (u32 i = argi; i < argc; i++) {
             const char *s = argv[i];
             while (*s && p < PICOWAL_DATA_MAX) data[p++] = (u8)*s++;
             if (i + 1 < argc && p < PICOWAL_DATA_MAX) data[p++] = ' ';
@@ -4934,12 +5163,12 @@ static void ui_cmd_db(u32 argc, char **argv)
     }
 
     if (ui_streq(argv[1], "putf")) {
-        if (argc < 5) {
-            ui_console_write("ERR: usage db putf <card> <record> <path>\n");
+        if (argc <= argi) {
+            ui_console_write("ERR: usage db putf <addr> <path>\n");
             return;
         }
         char abs[256];
-        if (!ui_path_resolve(argv[4], abs, sizeof(abs))) {
+        if (!ui_path_resolve(argv[argi], abs, sizeof(abs))) {
             ui_console_write("ERR: bad path\n");
             return;
         }
@@ -4980,8 +5209,8 @@ static void ui_cmd_db(u32 argc, char **argv)
     }
 
     if (ui_streq(argv[1], "getf")) {
-        if (argc < 5) {
-            ui_console_write("ERR: usage db getf <card> <record> <path>\n");
+        if (argc <= argi) {
+            ui_console_write("ERR: usage db getf <addr> <path>\n");
             return;
         }
         static u8 data[PICOWAL_DATA_MAX];
@@ -4991,7 +5220,7 @@ static void ui_cmd_db(u32 argc, char **argv)
             return;
         }
         char abs[256];
-        if (!ui_path_resolve(argv[4], abs, sizeof(abs))) {
+        if (!ui_path_resolve(argv[argi], abs, sizeof(abs))) {
             ui_console_write("ERR: bad path\n");
             return;
         }
@@ -7296,7 +7525,7 @@ static void ui_console_exec(char *line)
         if (argc < 2) {
             ui_console_write("PIOS help\n");
             ui_console_write("Run commands exactly as shown; category names are help topics, not prefixes.\n");
-            ui_console_write("Examples: status | ps | netstat | firewall list | reboot confirm\n");
+            ui_console_write("Examples: status | ps | netstat | addr wal:0/3 | firewall list | reboot confirm\n");
             ui_console_write("Command help: help <command>, e.g. help status, help firewall, help reboot\n");
             ui_console_write("Category help: help core | help fs | help net | help svc | help dev\n");
         } else if (ui_streq(argv[1], "core")) {
@@ -7333,6 +7562,7 @@ static void ui_console_exec(char *line)
             ui_console_write("  dma status|selftest  usb status|reinit|poll  wifi disabled\n");
             ui_console_write("  capsule ...  obs ...  hexsec <lba>\n");
             ui_console_write("  edit|edit.pix <path>  clear echo\n");
+            ui_console_write("  addr <kind:pack/card[/tail]>\n");
         } else if (!ui_console_help_topic(argv[1])) {
             ui_console_write("ERR: unknown help topic. Try: help, help core, help status, help firewall\n");
         }
@@ -7410,6 +7640,8 @@ static void ui_console_exec(char *line)
         uart_puts("ticks=");
         uart_hex(t);
         uart_puts("\n");
+    } else if (ui_streq(argv[0], "addr")) {
+        ui_cmd_addr(argc, argv);
     } else if (ui_streq(argv[0], "netstat")) {
         ui_console_print_netstat();
     } else if (ui_streq(argv[0], "ps")) {

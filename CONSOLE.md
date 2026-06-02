@@ -279,6 +279,38 @@ dma selftest
 
 On BCM2712, PIOS uses the `dma32` controller with physical low-RAM DMA addresses, not the old `0xC0000000` legacy alias. The working memcpy path uses the 32-byte control-block format with shifted CB address mode; startup keeps the NEON fallback disabled only after the DMA selftest passes.
 
+## Pack/Card resource addresses
+
+PIOS accepts WAL-style resource addresses in the form:
+
+```text
+kind:pack/card[/tail]
+```
+
+`kind` is one of `wal`, `tcp`, `udp`, `stream`, `dev`, or `file`. Bare `pack/card` means `wal:pack/card`.
+
+Examples:
+
+```text
+addr wal:0/3
+addr tcp:0/80
+addr udp:0/7001
+addr stream:1/42
+addr dev:0/1/uart0
+addr file:0/12/etc/init.pis
+```
+
+For Picowal-backed storage, `wal:pack/card` maps to the existing database tuple `card=pack, record=card`, so old and new DB syntax both work:
+
+```text
+db get 0 3
+db get wal:0/3
+db put wal:0/3 hello
+db list wal:0/0
+```
+
+Network resource addresses reserve `pack` as a namespace and use `card` as the TCP/UDP port number. For example, `tcp:0/2323` names the debug console listener.
+
 ## Firewall command
 
 Defaults:
