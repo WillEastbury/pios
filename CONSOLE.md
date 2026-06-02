@@ -92,6 +92,26 @@ reboot confirm
 
 `help core`, `help fs`, `help net`, `help svc`, and `help dev` are documentation groups only. Do not prefix commands with the group name. For example, use `status` and `ps`, not `core status ps`.
 
+## First-boot OOBE
+
+When the first-boot marker is missing, PIOS runs a setup sequence before normal operation.
+
+It currently asks for:
+
+- Locale: `en-GB` or `en-US`
+- Keyboard layout: `uk` or `us`
+- Timezone offset: UK/GMT (`UTC+0`) or US/Eastern (`UTC-5`)
+
+The values are persisted in Picowal card `0`, record `3`:
+
+```text
+locale=en-GB
+keyboard=uk
+timezone_offset_minutes=0
+```
+
+The initial implementation intentionally supports only UK/US English options. More locales, keyboard maps, and daylight-saving rules are future work.
+
 ## TCP console
 
 The TCP debug console listens on port `2323`.

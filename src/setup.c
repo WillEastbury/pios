@@ -14,11 +14,14 @@
 #include "usb_kbd.h"
 #include "walfs.h"
 #include "principal.h"
+#include "picowal_db.h"
 #include "simd.h"
 #include "timer.h"
 
 #define SETUP_MARKER_DIR   "/var/picowal/c0"
 #define SETUP_MARKER_PATH  "/var/picowal/c0/r2.rec"
+#define SETUP_CONFIG_CARD  0U
+#define SETUP_CONFIG_REC   3U
 
 static bool setup_fb_console;
 
@@ -40,6 +43,131 @@ static void setup_log_bool(const char *label, bool ok)
 {
     setup_log(label);
     setup_log(ok ? "OK\n" : "NOT READY\n");
+}
+
+static bool setup_streq(const char *a, const char *b)
+{
+    if (!a || !b) return false;
+    while (*a && *b) {
+        char ca = *a++;
+        char cb = *b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + ('a' - 'A'));
+        if (ca != cb) return false;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static void setup_prompt_line(const char *prompt, const char *def, char *out, u32 out_max)
+{
+    if (!out || out_max == 0)
+        return;
+    setup_log(prompt);
+    if (def && *def) {
+        setup_log(" [");
+        setup_log(def);
+        setup_log("]");
+    }
+    setup_log(": ");
+    u32 n = uart_getline(out, out_max);
+    if (n == 0 && def) {
+        u32 i = 0;
+        while (def[i] && i + 1 < out_max) {
+            out[i] = def[i];
+            i++;
+        }
+        out[i] = 0;
+    }
+}
+
+static const char *setup_choose_locale(const char *s)
+{
+    if (setup_streq(s, "2") || setup_streq(s, "us") || setup_streq(s, "en-us") ||
+        setup_streq(s, "english-us") || setup_streq(s, "english (united states)"))
+        return "en-US";
+    return "en-GB";
+}
+
+static const char *setup_choose_keyboard(const char *s)
+{
+    if (setup_streq(s, "2") || setup_streq(s, "us") || setup_streq(s, "en-us"))
+        return "us";
+    return "uk";
+}
+
+static i32 setup_choose_timezone_min(const char *s)
+{
+    if (setup_streq(s, "2") || setup_streq(s, "us") || setup_streq(s, "america") ||
+        setup_streq(s, "american") || setup_streq(s, "et") || setup_streq(s, "est"))
+        return -300; /* US Eastern baseline; daylight rules are future work. */
+    return 0;       /* UK/GMT baseline. */
+}
+
+static u32 setup_append(char *out, u32 pos, u32 max, const char *s)
+{
+    while (s && *s && pos + 1 < max)
+        out[pos++] = *s++;
+    if (max) out[pos] = 0;
+    return pos;
+}
+
+static u32 setup_append_i32(char *out, u32 pos, u32 max, i32 v)
+{
+    char tmp[12];
+    u32 n = 0;
+    if (v < 0) {
+        if (pos + 1 < max) out[pos++] = '-';
+        v = -v;
+    }
+    if (v == 0) {
+        if (pos + 1 < max) out[pos++] = '0';
+        if (max) out[pos] = 0;
+        return pos;
+    }
+    while (v && n < sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (n && pos + 1 < max)
+        out[pos++] = tmp[--n];
+    if (max) out[pos] = 0;
+    return pos;
+}
+
+static bool setup_run_oobe(void)
+{
+    char line[40];
+    char config[256];
+    setup_log("\n[setup] First-boot locale setup\n");
+    setup_log("[setup] Locale options: 1=en-GB, 2=en-US\n");
+    setup_prompt_line("[setup] Select locale", "en-GB", line, sizeof(line));
+    const char *locale = setup_choose_locale(line);
+
+    setup_log("[setup] Keyboard options: 1=UK, 2=US\n");
+    setup_prompt_line("[setup] Select keyboard", locale[3] == 'U' && locale[4] == 'S' ? "us" : "uk",
+                      line, sizeof(line));
+    const char *keyboard = setup_choose_keyboard(line);
+
+    setup_log("[setup] Timezone options: 1=UK/GMT (UTC+0), 2=US/Eastern (UTC-5)\n");
+    setup_prompt_line("[setup] Select timezone", locale[3] == 'U' && locale[4] == 'S' ? "us" : "uk",
+                      line, sizeof(line));
+    i32 tz_min = setup_choose_timezone_min(line);
+
+    u32 p = 0;
+    p = setup_append(config, p, sizeof(config), "locale=");
+    p = setup_append(config, p, sizeof(config), locale);
+    p = setup_append(config, p, sizeof(config), "\nkeyboard=");
+    p = setup_append(config, p, sizeof(config), keyboard);
+    p = setup_append(config, p, sizeof(config), "\ntimezone_offset_minutes=");
+    p = setup_append_i32(config, p, sizeof(config), tz_min);
+    p = setup_append(config, p, sizeof(config), "\n");
+
+    if (picowal_db_put(SETUP_CONFIG_CARD, SETUP_CONFIG_REC, config, p) < 0) {
+        setup_log("[setup] OOBE config persist FAILED.\n");
+        return false;
+    }
+    setup_log("[setup] OOBE config persisted.\n");
+    return true;
 }
 
 static u64 setup_next_rand(u64 *state)
@@ -142,6 +270,11 @@ bool setup_run(bool fb_available, bool net_ready, bool usb_ready)
 
     if (!principal_ok) {
         setup_log("[setup] Setup incomplete: principal root not ready.\n");
+        return false;
+    }
+
+    if (!setup_run_oobe()) {
+        setup_log("[setup] Setup incomplete: OOBE config not ready.\n");
         return false;
     }
 
