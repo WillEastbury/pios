@@ -393,6 +393,10 @@ static void fb_clear_text_row(u32 cy) {
     }
 }
 
+void fb_clear_row(u32 row) {
+    fb_clear_text_row(row);
+}
+
 static void fb_advance_row(void) {
     cursor_x = 0;
     cursor_y++;

@@ -183,6 +183,8 @@ It shows:
 
 Detailed logs and diagnostics should use the remote log endpoints rather than noisy HDMI/UART output.
 
+The dashboard keeps the static frame on screen and refreshes only dynamic content rows to avoid full-screen flicker.
+
 ## Logs
 
 Operator log stream:

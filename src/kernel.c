@@ -7670,6 +7670,7 @@ static void hdmi_dashboard_render(void)
     static u64 last_poll[4];
     static u32 last_cpu[4];
     static u32 heartbeat;
+    static bool layout_drawn;
     u64 now_ms = timer_monotonic_ms();
     if (now_ms < last_ms + 1000ULL)
         return;
@@ -7717,10 +7718,29 @@ static void hdmi_dashboard_render(void)
         else if (proc[i].state == PROC_DEAD) dead++;
     }
 
-    fb_clear(0x00000000);
-    fb_set_color(0x0000FF80, 0x00000000);
-    fb_set_cursor(0, 0);
-    fb_box(78, 4, "PIOS>");
+    u32 log_top = fb_rows() > 10 ? fb_rows() - 9 : 28;
+    if (!layout_drawn) {
+        fb_clear(0x00000000);
+        fb_set_color(0x0000FF80, 0x00000000);
+        fb_set_cursor(0, 0);
+        fb_box(78, 4, "PIOS>");
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_set_cursor(0, 5);
+        fb_box(78, 5, "SYSTEM");
+        fb_set_color(0x00FFAA00, 0x00000000);
+        fb_set_cursor(0, 11);
+        fb_box(78, 7, "LISTENING PORTS");
+        fb_set_color(0x0080FF80, 0x00000000);
+        fb_set_cursor(0, 19);
+        fb_box(78, 7, "PROCESSES");
+        fb_set_color(0x00FF4040, 0x00000000);
+        fb_set_cursor(0, log_top);
+        fb_box(78, 8, "WARNINGS / ERRORS");
+        layout_drawn = true;
+    }
+
+    fb_clear_row(1);
+    fb_clear_row(2);
     fb_set_cursor(3, 1);
     fb_set_color(0x00FF80FF, 0x00000000);
     fb_puts(PIOS_BUILD_LABEL);
@@ -7733,9 +7753,9 @@ static void hdmi_dashboard_render(void)
     fb_puts(" ip=");
     dash_ip(net_get_our_ip());
 
-    fb_set_color(0x0000CCFF, 0x00000000);
-    fb_set_cursor(0, 5);
-    fb_box(78, 5, "SYSTEM");
+    fb_clear_row(6);
+    fb_clear_row(7);
+    fb_clear_row(8);
     fb_set_cursor(3, 6);
     fb_set_color(0x00FFFFFF, 0x00000000);
     fb_printf("CPU active: c0=%u%% c1=%u%% c2=%u%% c3=%u%%", last_cpu[0], last_cpu[1], last_cpu[2], last_cpu[3]);
@@ -7745,9 +7765,7 @@ static void hdmi_dashboard_render(void)
     fb_printf("Packets: rx=%u tx=%u drop=%u fw=%u", (u32)pc.rx_total, (u32)pc.tx_total,
               (u32)pc.dropped, (u32)pc.firewalled);
 
-    fb_set_color(0x00FFAA00, 0x00000000);
-    fb_set_cursor(0, 11);
-    fb_box(78, 7, "LISTENING PORTS");
+    for (u32 r = 12; r < 17; r++) fb_clear_row(r);
     u32 row = 12;
     for (u32 i = 0; i < tcp_n && row < 17; i++) {
         if (tcp[i].state != TCP_LISTEN)
@@ -7761,9 +7779,7 @@ static void hdmi_dashboard_render(void)
         fb_printf("%u", tcp[i].pending_count);
     }
 
-    fb_set_color(0x0080FF80, 0x00000000);
-    fb_set_cursor(0, 19);
-    fb_box(78, 7, "PROCESSES");
+    for (u32 r = 20; r < 25; r++) fb_clear_row(r);
     fb_set_cursor(3, 20);
     fb_set_color(0x00FFFFFF, 0x00000000);
     fb_printf("total=%u ready=%u running=%u blocked=%u dead=%u", proc_n, ready, running, blocked, dead);
@@ -7775,10 +7791,7 @@ static void hdmi_dashboard_render(void)
                   proc[i].mem_kib, ui_proc_state_str(proc[i].state), proc[i].image_path);
     }
 
-    u32 log_top = fb_rows() > 10 ? fb_rows() - 9 : 28;
-    fb_set_color(0x00FF4040, 0x00000000);
-    fb_set_cursor(0, log_top);
-    fb_box(78, 8, "WARNINGS / ERRORS");
+    for (u32 r = log_top + 1; r < log_top + 7; r++) fb_clear_row(r);
     row = log_top + 1;
     u32 shown = 0;
     u32 max_back = http_log_seq < HTTP_LOG_RING_SIZE ? http_log_seq : HTTP_LOG_RING_SIZE;
