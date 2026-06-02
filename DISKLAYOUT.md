@@ -63,6 +63,19 @@ All offsets below are relative to the start of partition 2.
 
 If the new image is corrupt and will not boot, recover by cold-patching the SD card from a host.
 
+## WALFS initialization behavior
+
+WALFS mounts only from the post-reserved base at partition 2 offset `0xA00000`.
+
+At init, PIOS:
+
+1. Discovers partition 2 from the MBR.
+2. Validates the block-0 PIOS reserved-area header when present.
+3. Computes WALFS capacity as `partition2_size - 10 MiB`, not whole-card size.
+4. Reads the WALFS superblock at `partition2_start + 0xA00000`.
+5. Refuses to auto-format if it finds a legacy WALFS superblock in the reserved area, so older data is not silently overwritten.
+6. Formats only when no valid WALFS exists at the new base and no legacy superblock is detected.
+
 ## Constants
 
 The layout is codified in `include/walfs.h`:

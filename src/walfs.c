@@ -29,6 +29,9 @@
 
 static u32 partition_lba = 2048;
 static u32 base_lba = WALFS_BASE_LBA;
+static u32 partition_blocks;
+static u32 walfs_region_blocks;
+static bool legacy_walfs_present;
 
 static u32 read_le32(const u8 *p)
 {
@@ -38,6 +41,7 @@ static u32 read_le32(const u8 *p)
 static bool discover_partition(void)
 {
     static u8 ALIGNED(64) mbr[SD_BLOCK_SIZE];
+    static u8 ALIGNED(64) hdr[SD_BLOCK_SIZE];
     if (!sd_read_block(0, mbr)) {
         uart_puts("[wal] MBR read fail\n");
         return false;
@@ -79,10 +83,39 @@ static bool discover_partition(void)
 
     partition_lba = p2_start;
     base_lba = p2_start + WALFS_BOOT_SLOT_LBAS;
+    partition_blocks = p2_size;
+    walfs_region_blocks = p2_size - WALFS_BOOT_SLOT_LBAS;
+    legacy_walfs_present = false;
+
+    if (sd_read_block(partition_lba, hdr)) {
+        u32 magic = read_le32(hdr + PIOS_HDR_MAGIC_OFF);
+        if (magic == PIOS_RESERVED_HEADER_MAGIC) {
+            u32 layout = read_le32(hdr + PIOS_HDR_LAYOUT_VERSION_OFF);
+            u32 walfs_off = read_le32(hdr + PIOS_HDR_WALFS_OFF);
+            if (layout != 0 && (layout != PIOS_RESERVED_LAYOUT_VERSION || walfs_off != PIOS_WALFS_OFFSET)) {
+                uart_puts("[wal] reserved layout mismatch; WALFS disabled\n");
+                return false;
+            }
+        } else if (magic == WALFS_MAGIC) {
+            legacy_walfs_present = true;
+            uart_puts("[wal] legacy WALFS super at p2 root; not auto-migrating\n");
+        } else {
+            uart_puts("[wal] no reserved header; assuming legacy/new blank media\n");
+        }
+    }
+
+    if (sd_read_block(partition_lba + (PIOS_STAGE2_END_OFFSET + 1U) / SD_BLOCK_SIZE, hdr) &&
+        read_le32(hdr) == WALFS_MAGIC) {
+        legacy_walfs_present = true;
+        uart_puts("[wal] legacy WALFS super at old post-kernel offset; not auto-migrating\n");
+    }
+
     uart_puts("[wal] p2 LBA=");
     uart_hex(partition_lba);
     uart_puts(" walfs LBA=");
     uart_hex(base_lba);
+    uart_puts(" walfs blocks=");
+    uart_hex(walfs_region_blocks);
     uart_puts("\n");
     return true;
 }
@@ -92,6 +125,11 @@ u32 walfs_part2_lba(void) { return base_lba; }
 
 /* Translate a WALFS-relative LBA to an absolute SD LBA (u64 to catch overflow) */
 static inline u64 abs_lba64(u32 rel) { return (u64)base_lba + (u64)rel; }
+
+static u64 walfs_capacity_bytes(void)
+{
+    return (u64)walfs_region_blocks * SD_BLOCK_SIZE;
+}
 
 struct readdir_entry_wire {
     u64 inode_id;
@@ -554,8 +592,7 @@ static bool format_disk(void)
     super.wal_head     = WAL_START;
     super.record_count = 0;
 
-    const sd_card_t *card = sd_get_card_info();
-    if (card) super.total_blocks = (u32)(card->capacity / SD_BLOCK_SIZE);
+    super.total_blocks = walfs_region_blocks;
     memcpy(super.label, "PIOS", 4);
 
     next_seq   = 0;
@@ -603,9 +640,10 @@ bool walfs_init(void)
             return false;
         }
         /* Validate wal_head is within sane bounds */
+        if (super.total_blocks == 0 || super.total_blocks > walfs_region_blocks)
+            super.total_blocks = walfs_region_blocks;
         if (super.wal_head < WAL_START ||
-            (super.total_blocks > 0 &&
-             super.wal_head > (u64)super.total_blocks * SD_BLOCK_SIZE)) {
+            super.wal_head > walfs_capacity_bytes()) {
             uart_puts("[wal] head OOB\n");
             return false;
         }
@@ -615,6 +653,11 @@ bool walfs_init(void)
         uart_hex(super.record_count);
         uart_puts("\n");
         return true;
+    }
+
+    if (legacy_walfs_present) {
+        uart_puts("[wal] no WALFS at reserved base, legacy super exists; refusing format\n");
+        return false;
     }
 
     if (!format_disk()) return false;
