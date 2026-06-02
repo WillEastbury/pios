@@ -28,6 +28,7 @@ struct proc_ui_entry {
     u32 cpu_percent;
     u32 preemptions;
     u64 runtime_ticks;
+    char image_path[96];
 } PACKED;
 
 struct proc_capsule_ui_entry {
@@ -65,6 +66,14 @@ struct appf_log_record {
     u32 level;
     u32 len;
     u8  msg[APPF_LOG_MSG_MAX];
+} PACKED;
+
+struct proc_log_ui_entry {
+    u32 core;
+    u32 seq;
+    u32 level;
+    u32 len;
+    char msg[APPF_LOG_MSG_MAX + 1];
 } PACKED;
 
 struct appf_service_record {
@@ -335,9 +344,11 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms);
 void proc_irq_maybe_preempt(struct irq_frame *frame);
 u64  proc_preemptions(void);
 u32  proc_snapshot(struct proc_ui_entry *out, u32 max_entries);
+u32  proc_log_snapshot(struct proc_log_ui_entry *out, u32 max_entries);
 u32  proc_capsule_snapshot(struct proc_capsule_ui_entry *out, u32 max_entries);
 void proc_security_stats_snapshot(struct proc_security_stats *out);
 bool proc_kill_pid(u32 pid, u32 code);
+i32  proc_restart_pid(u32 pid, u32 code);
 i32  proc_launch_on_core(u32 target_core, const char *path);
 i32  proc_launch_on_core_as(u32 target_core, const char *path, u32 principal_id);
 i32  proc_launch_on_core_as_prio(u32 target_core, const char *path, u32 principal_id, u32 priority_class);

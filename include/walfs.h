@@ -24,9 +24,12 @@
  * This protects the FAT32 boot partition on partition 1.
  * Set at runtime from MBR partition 2, or falls back to WALFS_BASE_LBA.
  */
-#define WALFS_BASE_LBA      2048
+#define WALFS_BOOT_SLOT_BYTES  (10U * 1024U * 1024U)
+#define WALFS_BOOT_SLOT_LBAS   (WALFS_BOOT_SLOT_BYTES / 512U)
+#define WALFS_BASE_LBA         (2048U + WALFS_BOOT_SLOT_LBAS)
 
 /* Runtime partition 2 base, set by walfs_discover_partition() */
+u32 walfs_partition_lba(void);
 u32 walfs_part2_lba(void);
 
 /* Record magic and types */

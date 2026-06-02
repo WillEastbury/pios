@@ -14,6 +14,12 @@ _start:
     and     x0, x0, #0x3
     cbnz    x0, .Lpark          /* only core 0 continues */
 
+    /* Stage0 handoff enters here at EL1 with MMU/caches disabled. */
+    mrs     x0, CurrentEL
+    lsr     x0, x0, #2
+    cmp     x0, #1
+    b.eq    .Lstage1_from_el1
+
     /* ── EL2 phase: stack, NEON, BSS ── */
     ldr     x1, =_start
     mov     sp, x1
@@ -76,6 +82,25 @@ _start:
     ldr     x0, =.Lel1_entry
     msr     elr_el2, x0
     eret
+
+/* ── Stage1 handoff from stage0: already at EL1, must do BSS+FB ourselves. */
+.Lstage1_from_el1:
+    ldr     x1, =_start
+    mov     sp, x1
+    mrs     x1, cpacr_el1
+    orr     x1, x1, #(3 << 20)
+    msr     cpacr_el1, x1
+    isb
+    ldr     x1, =__bss_start
+    ldr     w2, =__bss_size
+.Lstage1_bss_loop:
+    cbz     w2, .Lstage1_bss_done
+    str     xzr, [x1], #8
+    sub     w2, w2, #1
+    cbnz    w2, .Lstage1_bss_loop
+.Lstage1_bss_done:
+    bl      kernel_fb_early
+    b       .Lel1_entry
 
 /* ── EL1 landing pad ── */
 .Lel1_entry:

@@ -25,6 +25,7 @@
 #include "uart.h"
 #include "timer.h"
 #include "lru.h"
+#include "fb.h"
 
 /* ---- ARP opcodes ---- */
 
@@ -205,6 +206,25 @@ static void send_arp(u16 opcode, const u8 *target_mac, u32 target_ip) {
     for (u32 i = sizeof(struct eth_hdr) + ARP_FRAME_LEN; i < 60; i++)
         arp_tx[i] = 0;
 
+    /* Diagnostic: dump the first few outgoing ARP frames so we can verify
+     * exactly what we put on the wire. Catches malformed replies that the
+     * host's NIC would silently filter. */
+    static u32 send_count;
+    send_count++;
+    if (send_count <= 10 || (send_count & 0x1F) == 0) {
+        uart_puts("[arp] tx#");
+        uart_hex(send_count);
+        uart_puts(" op=");
+        uart_hex(opcode);
+        uart_puts(" frame=");
+        for (u32 i = 0; i < 42; i++) {
+            static const char hex[] = "0123456789ABCDEF";
+            uart_putc(hex[arp_tx[i] >> 4]);
+            uart_putc(hex[arp_tx[i] & 0xF]);
+        }
+        uart_puts("\n");
+    }
+
     nic_send(arp_tx, 60);
 }
 
@@ -313,6 +333,7 @@ void arp_input(const u8 *frame, u32 len) {
         u64 now = now_ms();
         if (now - last_reply_time < ARP_REPLY_INTERVAL_MS) {
             arp_stats.drop_ratelimit++;
+            nic_record_rate_limited();
             return;
         }
         last_reply_time = now;
@@ -389,6 +410,13 @@ void arp_announce(void) {
         timer_delay_ms(delay);
         delay *= 2; /* exponential backoff */
     }
+}
+
+void arp_probe(void) {
+    /* Single broadcast ARP request for our own IP. Used by the stall detector
+     * to test whether the TX path can still put a frame on the wire. */
+    send_arp(ARP_OP_REQUEST, NULL, my_ip);
+    arp_stats.requests_sent++;
 }
 
 void arp_tick(void) {

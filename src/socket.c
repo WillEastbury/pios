@@ -48,6 +48,19 @@ struct socket_desc {
 /* Per-core socket tables (cores 2 and 3) */
 static struct socket_desc sockets[2][SOCKET_MAX];
 
+u32 socket_udp_active_count(void)
+{
+    u32 n = 0;
+    for (u32 c = 0; c < 2; c++) {
+        for (u32 i = 0; i < SOCKET_MAX; i++) {
+            if (sockets[c][i].used && sockets[c][i].type == SOCK_DGRAM &&
+                sockets[c][i].state != SOCK_STATE_CLOSED)
+                n++;
+        }
+    }
+    return n;
+}
+
 static struct socket_desc *get_sock(i32 fd) {
     u32 core = core_id();
     u32 ci = (core >= CORE_USER0) ? core - CORE_USER0 : 0;

@@ -9,8 +9,9 @@
 #pragma once
 #include "types.h"
 
-/* BCM2712 DMA base address */
-#define DMA_BASE            (PERIPH_BASE + 0x007000)
+/* BCM2712 dma32 node from DT: dma@10000 reg = <0x10 0x00010000 0 0x600>.
+ * This is not the legacy 0x107c007000 DMA block. */
+#define DMA_BASE            0x1000010000UL
 #define DMA_CHAN_STRIDE      0x100
 
 /* DMA Channel count — using channels 0-5 (full channels, not lite) */
@@ -59,16 +60,17 @@ struct dma_cb {
 #define DMA_CH_NEXTCB        0x1C
 #define DMA_CH_DEBUG         0x20
 
-/* DMA channel assignment for PIOS */
+/* BCM2712 dma32 brcm,dma-channel-mask = 0x35 => channels 0,2,4,5. */
 #define DMA_CHAN_NET_TX      0
-#define DMA_CHAN_NET_RX      1
+#define DMA_CHAN_NET_RX      0
 #define DMA_CHAN_SD          2
-#define DMA_CHAN_MEMCPY      3
 #define DMA_CHAN_GPU         4
+#define DMA_CHAN_MEMCPY      5
 #define DMA_CHAN_SPARE       5
 
 /* Init the DMA engine */
 void dma_init(void);
+bool dma_selftest(void);
 
 /* Simple one-shot memcpy via DMA (blocks until complete) */
 bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len);

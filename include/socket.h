@@ -91,3 +91,6 @@ void socket_handle_fifo(u32 from_core);
 
 /* Init socket subsystem on Core 0 */
 void socket_init(void);
+
+/* Count active UDP sockets across user cores. */
+u32 socket_udp_active_count(void);

@@ -21,6 +21,7 @@
 #include "fb.h"
 #include "pcie.h"
 #include "mmio.h"
+#include "macb.h"
 
 /* ---- Network state ---- */
 
@@ -53,30 +54,104 @@ static u64 icmp_min_interval;
 
 static u8 rx_frame[2048] ALIGNED(64);
 static u8 tx_frame[2048] ALIGNED(64);
-#define NET_RX_BURST_MAX 4U
+#define NET_RX_BURST_MAX 1U
 #define NET_FIFO_BURST_MAX 4U
+#define NET_MAX_MULTICAST_MACS 8U
+
+static u8 multicast_macs[NET_MAX_MULTICAST_MACS][6];
+static u32 multicast_count;
 
 static u16 ip_id_counter;
-static volatile bool net_maint_queued;
 
-static void net_maintenance_work(void *ctx)
-{
-    (void)ctx;
-    arp_tick();
-    tcp_tick();
-    net_maint_queued = false;
+static bool mac_eq_6(const u8 *a, const u8 *b) {
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] &&
+           a[3] == b[3] && a[4] == b[4] && a[5] == b[5];
 }
 
-static void net_tick_hook(u32 core, u64 tick)
-{
-    if (core != CORE_NET)
-        return;
-    if ((tick % 100U) != 0)
-        return;
-    if (net_maint_queued)
-        return;
-    if (workq_enqueue(CORE_NET, net_maintenance_work, NULL))
-        net_maint_queued = true;
+static bool mac_is_broadcast_6(const u8 *m) {
+    return m[0] == 0xFF && m[1] == 0xFF && m[2] == 0xFF &&
+           m[3] == 0xFF && m[4] == 0xFF && m[5] == 0xFF;
+}
+
+static bool mac_is_multicast_6(const u8 *m) {
+    return (m[0] & 0x01) != 0;
+}
+
+static bool net_multicast_joined(const u8 *mac) {
+    for (u32 i = 0; i < multicast_count; i++)
+        if (mac_eq_6(multicast_macs[i], mac))
+            return true;
+    return false;
+}
+
+static bool net_accept_eth_dst(const u8 *dst) {
+    if (mac_eq_6(dst, our_mac))
+        return true;
+    if (mac_is_broadcast_6(dst))
+        return true;
+    if (mac_is_multicast_6(dst) && net_multicast_joined(dst))
+        return true;
+    return false;
+}
+
+static u32 net_read_be32(const u8 *p) {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+static bool net_drop_arp_not_for_us(const u8 *frame, u32 len) {
+    if (len < sizeof(struct eth_hdr) + 28)
+        return false;
+    const struct eth_hdr *eth = (const struct eth_hdr *)frame;
+    if (ntohs(eth->ethertype) != ETH_P_ARP)
+        return false;
+    const u8 *arp = frame + sizeof(struct eth_hdr);
+    u16 opcode = ((u16)arp[6] << 8) | arp[7];
+    if (opcode != 1 && opcode != 2)
+        return false;
+    return net_read_be32(arp + 24) != our_ip;
+}
+
+static void net_install_ingress_firewall(void) {
+    nic_filter_rule_t rule;
+
+    nic_filter_clear();
+    nic_filter_set_default(false, true);
+
+    simd_zero(&rule, sizeof(rule));
+    rule.direction = NIC_FILTER_DIR_IN;
+    rule.action = NIC_FILTER_ALLOW;
+    rule.flags = NIC_FILTER_ETHERTYPE | NIC_FILTER_IP_TO;
+    rule.ethertype = ETH_P_ARP;
+    rule.ip_to = our_ip;
+    (void)nic_filter_add(&rule);
+
+    simd_zero(&rule, sizeof(rule));
+    rule.direction = NIC_FILTER_DIR_IN;
+    rule.action = NIC_FILTER_ALLOW;
+    rule.flags = NIC_FILTER_ETHERTYPE | NIC_FILTER_IP_TO |
+                 NIC_FILTER_IP_PROTO | NIC_FILTER_TCP_PORT_TO;
+    rule.ethertype = ETH_P_IP;
+    rule.ip_to = our_ip;
+    rule.ip_proto = IP_PROTO_TCP;
+    rule.tcp_port_to = 80;
+    (void)nic_filter_add(&rule);
+
+    rule.tcp_port_to = 8080;
+    (void)nic_filter_add(&rule);
+    rule.tcp_port_to = 8081;
+    (void)nic_filter_add(&rule);
+    rule.tcp_port_to = 8082;
+    (void)nic_filter_add(&rule);
+
+    simd_zero(&rule, sizeof(rule));
+    rule.direction = NIC_FILTER_DIR_IN;
+    rule.action = NIC_FILTER_ALLOW;
+    rule.flags = NIC_FILTER_ETHERTYPE | NIC_FILTER_IP_TO |
+                 NIC_FILTER_IP_PROTO;
+    rule.ethertype = ETH_P_IP;
+    rule.ip_to = our_ip;
+    rule.ip_proto = IP_PROTO_ICMP;
+    (void)nic_filter_add(&rule);
 }
 
 /* ================================================================== */
@@ -104,6 +179,34 @@ static const u8 *neighbor_lookup(u32 ip) {
         if (neighbors[i].ip == ip)
             return neighbors[i].mac;
     return NULL;
+}
+
+bool net_join_multicast_mac(const u8 *mac) {
+    if (!mac || !mac_is_multicast_6(mac) || mac_is_broadcast_6(mac))
+        return false;
+    for (u32 i = 0; i < multicast_count; i++) {
+        if (mac_eq_6(multicast_macs[i], mac))
+            return true;
+    }
+    if (multicast_count >= NET_MAX_MULTICAST_MACS)
+        return false;
+    simd_memcpy(multicast_macs[multicast_count], mac, 6);
+    multicast_count++;
+    return true;
+}
+
+bool net_leave_multicast_mac(const u8 *mac) {
+    if (!mac)
+        return false;
+    for (u32 i = 0; i < multicast_count; i++) {
+        if (!mac_eq_6(multicast_macs[i], mac))
+            continue;
+        multicast_count--;
+        if (i != multicast_count)
+            simd_memcpy(multicast_macs[i], multicast_macs[multicast_count], 6);
+        return true;
+    }
+    return false;
 }
 
 /* ================================================================== */
@@ -134,6 +237,7 @@ static void handle_icmp(const u8 *frame, u32 len,
 
     if (unlikely(!icmp_rate_ok())) {
         stats.drop_icmp_ratelimit++;
+        nic_record_rate_limited();
         return;
     }
 
@@ -143,6 +247,12 @@ static void handle_icmp(const u8 *frame, u32 len,
     simd_memcpy(eth_out->dst, eth_in->src, 6);
     simd_memcpy(eth_out->src, our_mac, 6);
     eth_out->ethertype = htons(ETH_P_IP);
+    
+    uart_puts("[icmp] dst_mac=");
+    for (u32 i = 0; i < 6; i++) { uart_hex(eth_out->dst[i]); }
+    uart_puts(" src_mac=");
+    for (u32 i = 0; i < 6; i++) { uart_hex(eth_out->src[i]); }
+    uart_puts("\n");
 
     u16 ip_total = ntohs(ip->total_len);
 
@@ -167,7 +277,24 @@ static void handle_icmp(const u8 *frame, u32 len,
     icmp_out->checksum = simd_checksum(icmp_out, icmp_len);
 
     u32 frame_len = sizeof(struct eth_hdr) + ip_total;
-    nic_send(tx_frame, frame_len);
+    static u32 icmp_reply_count = 0;
+    if (icmp_reply_count < 10) {
+        uart_puts("[icmp] reply #");
+        uart_hex(icmp_reply_count++);
+        uart_puts(" dst=");
+        for (u32 i = 0; i < 6; i++) { uart_hex(eth_out->dst[i]); if (i<5) uart_puts(":"); }
+        uart_puts(" src=");
+        for (u32 i = 0; i < 6; i++) { uart_hex(eth_out->src[i]); if (i<5) uart_puts(":"); }
+        uart_puts("\n");
+    }
+    if (!nic_send(tx_frame, frame_len)) {
+        static u32 send_fail_count = 0;
+        if (send_fail_count++ < 5) {
+            uart_puts("[icmp] TX FAILED #");
+            uart_hex(send_fail_count);
+            uart_puts("\n");
+        }
+    }
     stats.icmp_echo_replies++;
     stats.tx_packets++;
     stats.tx_bytes += frame_len;
@@ -458,37 +585,6 @@ void net_handle_fifo_request(void) {
 void net_poll(void) {
     u32 len;
     bool checksum_trusted;
-    static u32 poll_count;
-    static u32 rx_count;
-
-    /* Log occasionally with MACB state */
-    if ((poll_count & 0x3FFFFF) == 0 && poll_count > 0) {
-        uart_puts("[net] p=");
-        uart_hex(poll_count);
-        uart_puts(" r=");
-        uart_hex(rx_count);
-        uart_puts("\n");
-        fb_set_color(0x00AAAAAA, 0x00000000);
-        fb_printf("p=%X r=%X\n", poll_count, rx_count);
-    }
-    /* Every ~16M polls, dump MACB state */
-    if ((poll_count & 0xFFFFFF) == 0 && poll_count > 0) {
-        #define MACB_BASE_NET 0x1F00100000UL
-        uart_puts("[net] ISR="); uart_hex(mmio_read(MACB_BASE_NET + 0x0024));
-        uart_puts(" RSR="); uart_hex(mmio_read(MACB_BASE_NET + 0x0020));
-        uart_puts(" TSR="); uart_hex(mmio_read(MACB_BASE_NET + 0x0014));
-        uart_puts(" RXC="); uart_hex(mmio_read(MACB_BASE_NET + 0x0158));
-        uart_puts(" TXC="); uart_hex(mmio_read(MACB_BASE_NET + 0x0108));
-        uart_puts("\n");
-        fb_set_color(0x00FFAA00, 0x00000000);
-        fb_printf("ISR=%X RSR=%X TSR=%X RXCNT=%X TXCNT=%X\n",
-            mmio_read(MACB_BASE_NET + 0x0024),
-            mmio_read(MACB_BASE_NET + 0x0020),
-            mmio_read(MACB_BASE_NET + 0x0014),
-            mmio_read(MACB_BASE_NET + 0x0158),
-            mmio_read(MACB_BASE_NET + 0x0108));
-    }
-    poll_count++;
 
     prefetch_r(rx_frame);
 
@@ -497,35 +593,28 @@ void net_poll(void) {
         if (!likely(nic_recv(rx_frame, &len, &checksum_trusted)))
             break;
 
-        rx_count++;
         stats.rx_packets++;
         stats.rx_bytes += len;
 
-        /* Log first few received frames */
-        if (rx_count <= 5) {
-            uart_puts("[net] RX#");
-            uart_hex(rx_count);
-            uart_puts(" len=");
-            uart_hex(len);
-            uart_puts(" eth=");
-            for (u32 i = 0; i < 14 && i < len; i++) {
-                static const char hex[] = "0123456789ABCDEF";
-                uart_putc(hex[rx_frame[i] >> 4]);
-                uart_putc(hex[rx_frame[i] & 0xF]);
-            }
-            uart_puts("\n");
-        }
-
         if (unlikely(len < sizeof(struct eth_hdr))) {
             stats.drop_runt++;
-            return;
+            continue;
         }
         if (unlikely(len > 1518)) {
             stats.drop_oversized++;
-            return;
+            continue;
         }
 
         struct eth_hdr *eth = (struct eth_hdr *)rx_frame;
+        if (unlikely(net_drop_arp_not_for_us(rx_frame, len))) {
+            stats.drop_not_for_us++;
+            continue;
+        }
+        if (unlikely(!net_accept_eth_dst(eth->dst))) {
+            stats.drop_not_for_us++;
+            continue;
+        }
+
         u16 etype = ntohs(eth->ethertype);
 
         /* Dispatch by EtherType */
@@ -544,7 +633,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     our_ip   = ip;
     our_gw   = gateway;
     our_mask = netmask;
+    nic_set_local_ipv4(ip);
     nic_get_mac(our_mac);
+    net_install_ingress_firewall();
 
     if (gateway_mac) {
         simd_memcpy(gw_mac, gateway_mac, 6);
@@ -553,14 +644,16 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
 
     simd_zero(&stats, sizeof(stats));
     simd_zero(neighbors, sizeof(neighbors));
+    simd_zero(multicast_macs, sizeof(multicast_macs));
     neighbor_count = 0;
+    multicast_count = 0;
     udp_callback   = NULL;
     for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++)
         udp_subscribers[i] = NULL;
     ip_id_counter  = 1;
 
-    u64 freq = read_cntfrq();
-    icmp_min_interval = freq / 10;
+    icmp_min_interval = 0;  /* Disable ICMP rate limiting for testing */
+    udp_callback = NULL;
     icmp_last_tick    = 0;
 
     /* Init ARP subsystem */
@@ -572,13 +665,10 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     /* Init socket layer */
     socket_init();
 
-    /* Enable safe NIC checksum assist paths by default. */
+    /* MACB/GEM TX checksum generation enabled via DMACFG.TXCOEN. */
     nic_set_rx_checksum_offload(true);
     nic_set_tx_checksum_offload(true);
-    nic_set_tso(true);
-
-    net_maint_queued = false;
-    timer_set_tick_hook(net_tick_hook);
+    nic_set_tso(false);
 
     /* Init TLS wrapper subsystem */
     tls_init();

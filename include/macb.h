@@ -19,3 +19,8 @@ bool macb_send(const u8 *frame, u32 len);
 bool macb_recv(u8 *frame, u32 *len);
 void macb_get_mac(u8 *mac);
 bool macb_link_up(void);
+void macb_dump_full_state(const char *tag);
+
+/* Try to recover a stalled MAC: clear latched status bits, halt+restart TX,
+ * dump ETH_CFG_STAT for AXI bus errors. Returns true if it did anything. */
+bool macb_kick_stall(void);

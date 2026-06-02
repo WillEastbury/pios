@@ -1632,8 +1632,42 @@ u32 proc_snapshot(struct proc_ui_entry *out, u32 max_entries)
         out[i].cpu_percent = (u32)((snap[i].runtime_ticks * 100ULL) / total_runtime);
         out[i].preemptions = snap[i].preemptions;
         out[i].runtime_ticks = snap[i].runtime_ticks;
+        for (u32 j = 0; j < sizeof(out[i].image_path); j++)
+            out[i].image_path[j] = snap[i].image_path[j];
+        out[i].image_path[sizeof(out[i].image_path) - 1] = 0;
     }
     return out_n;
+}
+
+u32 proc_log_snapshot(struct proc_log_ui_entry *out, u32 max_entries)
+{
+    if (!out || max_entries == 0)
+        return 0;
+    u32 n = 0;
+    for (u32 cs = 0; cs < 3 && n < max_entries; cs++) {
+        struct appf_ring_log *q = &appf_logs[cs];
+        u32 head = q->head;
+        u32 tail = q->tail;
+        if (head >= APPF_LOG_RING_SIZE || tail >= APPF_LOG_RING_SIZE)
+            continue;
+        u32 i = q->tail;
+        u32 scanned = 0;
+        while (i != head && scanned < APPF_LOG_RING_SIZE && n < max_entries) {
+            struct appf_log_record *r = &q->recs[i];
+            out[n].core = cs + CORE_USERM;
+            out[n].seq = r->seq;
+            out[n].level = r->level;
+            out[n].len = r->len;
+            u32 copy = r->len < APPF_LOG_MSG_MAX ? r->len : APPF_LOG_MSG_MAX;
+            for (u32 j = 0; j < copy; j++)
+                out[n].msg[j] = (char)r->msg[j];
+            out[n].msg[copy] = 0;
+            n++;
+            i = (i + 1U) % APPF_LOG_RING_SIZE;
+            scanned++;
+        }
+    }
+    return n;
 }
 
 u32 proc_capsule_snapshot(struct proc_capsule_ui_entry *out, u32 max_entries)
@@ -1680,6 +1714,39 @@ bool proc_kill_pid(u32 pid, u32 code)
         return false;
     }
     return false;
+}
+
+i32 proc_restart_pid(u32 pid, u32 code)
+{
+    char path[PROC_LAUNCH_PATH_MAX];
+    u32 target_core = 0;
+    u32 principal_id = PRINCIPAL_ROOT;
+    u32 priority_class = PROC_PRIO_NORMAL;
+
+    for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+        if (procs[i].pid != pid)
+            continue;
+        if (procs[i].state != PROC_READY && procs[i].state != PROC_RUNNING &&
+            procs[i].state != PROC_BLOCKED)
+            return -1;
+        if (procs[i].image_path[0] == 0)
+            return -1;
+
+        u32 j = 0;
+        for (; j + 1 < sizeof(path) && procs[i].image_path[j]; j++)
+            path[j] = procs[i].image_path[j];
+        path[j] = 0;
+        target_core = procs[i].affinity_core;
+        principal_id = procs[i].principal_id;
+        priority_class = procs[i].priority_class;
+
+        if (procs[i].state == PROC_RUNNING)
+            proc_account_runtime(&procs[i]);
+        procs[i].state = PROC_DEAD;
+        procs[i].exit_code = code;
+        return proc_launch_on_core_as_prio(target_core, path, principal_id, priority_class);
+    }
+    return -1;
 }
 
 i32 proc_launch_on_core(u32 target_core, const char *path)

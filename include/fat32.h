@@ -72,6 +72,13 @@ void fat32_close(fat32_file_t *f);
 bool fat32_exists(const char *path);
 u32  fat32_file_size(const char *path);
 
+/* Narrow write support for hot-patching existing files in-place. */
+bool fat32_overwrite_existing(const char *path, const u8 *data, u32 len,
+                              u32 *out_written, u32 *out_capacity);
+bool fat32_overwrite_existing_range(const char *path, u32 offset,
+                                    const u8 *data, u32 len, u32 final_size,
+                                    u32 *out_written, u32 *out_capacity);
+
 /* Directory listing */
 bool fat32_opendir(const char *path, fat32_dir_t *d);
 bool fat32_readdir(fat32_dir_t *d, fat32_dirent_t *entry);

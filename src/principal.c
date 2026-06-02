@@ -249,6 +249,32 @@ bool principal_set_password(const char *name, const char *pass)
     return flush_principals();
 }
 
+bool principal_set_flags(const char *name, u32 flags)
+{
+    i32 idx = find_by_name(name);
+    if (idx < 0) return false;
+    if (flags & PRINCIPAL_ADMIN) flags |= PRINCIPAL_IPC;
+    principals[idx].flags = flags & (PRINCIPAL_ADMIN | PRINCIPAL_NET |
+                                     PRINCIPAL_DISK | PRINCIPAL_EXEC |
+                                     PRINCIPAL_IPC);
+    return flush_principals();
+}
+
+u32 principal_snapshot(struct principal_ui_entry *out, u32 max_entries)
+{
+    if (!out || max_entries == 0)
+        return 0;
+    u32 n = principal_count < max_entries ? principal_count : max_entries;
+    for (u32 i = 0; i < n; i++) {
+        out[i].id = principals[i].id;
+        out[i].flags = principals[i].flags;
+        for (u32 j = 0; j < sizeof(out[i].name); j++)
+            out[i].name[j] = (char)principals[i].name[j];
+        out[i].name[sizeof(out[i].name) - 1] = 0;
+    }
+    return n;
+}
+
 bool principal_tls_psk(u32 id, u8 *out, u32 out_len)
 {
     if (!out || out_len == 0) return false;

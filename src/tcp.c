@@ -42,7 +42,8 @@ extern u32 net_get_our_ip(void);
 
 #define RTO_INIT_MS         1000
 #define RTO_MAX_MS          60000
-#define TIME_WAIT_MS        120000   /* 2 * MSL (60s each) */
+#define TIME_WAIT_MS        1500
+#define CLOSE_STATE_MS      1500
 #define MAX_RETRIES         8
 
 #define LISTEN_BACKLOG      4
@@ -89,9 +90,9 @@ static u32 ring_used(const struct ring_buf *r) {
 
 static inline void tcp_memcpy_accel(void *dst, const void *src, u32 len)
 {
-    if (len >= TCP_DMA_COPY_THRESHOLD &&
-        dma_memcpy(DMA_CHAN_MEMCPY, dst, src, len))
-        return;
+    /* TCP ring data may be consumed in the same call chain by tcp_output().
+     * Keep this copy synchronous and CPU-visible; the DMA path still needs a
+     * standalone self-test before it can be trusted for hot TX buffers. */
     simd_memcpy(dst, src, len);
 }
 
@@ -252,6 +253,7 @@ static struct tcb tcbs[TCP_MAX_CONNECTIONS];
 static u32 tcp_local_ip;
 static u8  tcp_local_mac[6];
 static u16 tcp_ip_id;
+static tcp_diag_t tcp_diag_counts;
 
 /* SYN cookie secret, initialized once */
 static u32 syn_secret;
@@ -304,6 +306,29 @@ static i32 tcb_index(const struct tcb *t) {
 
 static bool tcb_valid(tcp_conn_t c) {
     return c >= 0 && c < TCP_MAX_CONNECTIONS && tcbs[c].state != TCP_CLOSED;
+}
+
+static void tcp_log_ip(u32 ip)
+{
+    uart_hex((ip >> 24) & 0xFF); uart_putc('.');
+    uart_hex((ip >> 16) & 0xFF); uart_putc('.');
+    uart_hex((ip >> 8) & 0xFF);  uart_putc('.');
+    uart_hex(ip & 0xFF);
+}
+
+static void tcp_log_established(const struct tcb *t, const char *kind)
+{
+    uart_puts("[tcp] ESTABLISHED ");
+    uart_puts(kind);
+    uart_puts(" local=");
+    tcp_log_ip(t->local_ip);
+    uart_putc(':');
+    uart_hex(t->local_port);
+    uart_puts(" remote=");
+    tcp_log_ip(t->remote_ip);
+    uart_putc(':');
+    uart_hex(t->remote_port);
+    uart_putc('\n');
 }
 
 /* Ephemeral port allocator */
@@ -368,61 +393,53 @@ static bool validate_syn_cookie(u32 local_port, u32 remote_ip, u16 remote_port,
 /*  TCP checksum                                                       */
 /* ================================================================== */
 
-static u16 tcp_checksum(u32 src_ip, u32 dst_ip,
-                        const void *tcp_data, u32 tcp_len) {
-    /* Two-pass checksum: pseudo-header on stack (12 bytes), then TCP data in-place */
-    struct tcp_pseudo ph;
-    ph.src_ip   = htonl(src_ip);
-    ph.dst_ip   = htonl(dst_ip);
-    ph.zero     = 0;
-    ph.protocol = IP_PROTO_TCP;
-    ph.tcp_len  = htons((u16)tcp_len);
+static u32 csum_add_bytes(u32 sum, const void *data, u32 len)
+{
+    const u8 *p = (const u8 *)data;
+    while (len >= 2) {
+        sum += ((u16)p[0] << 8) | p[1];
+        p += 2;
+        len -= 2;
+    }
+    if (len)
+        sum += ((u16)p[0] << 8);
+    return sum;
+}
 
-    /* Accumulate checksum manually: pseudo-header then TCP data */
-    u32 sum = 0;
-    const u16 *p = (const u16 *)&ph;
-    for (u32 i = 0; i < sizeof(ph) / 2; i++)
-        sum += p[i];
-    p = (const u16 *)tcp_data;
-    u32 words = tcp_len / 2;
-    for (u32 i = 0; i < words; i++)
-        sum += p[i];
-    if (tcp_len & 1)
-        sum += ((const u8 *)tcp_data)[tcp_len - 1];
+static u16 csum_fold(u32 sum)
+{
     while (sum >> 16)
         sum = (sum & 0xFFFF) + (sum >> 16);
     return (u16)~sum;
+}
+
+static u32 tcp_pseudo_sum(u32 src_ip, u32 dst_ip, u32 tcp_len)
+{
+    u32 sum = 0;
+    sum += (src_ip >> 16) & 0xFFFF;
+    sum += src_ip & 0xFFFF;
+    sum += (dst_ip >> 16) & 0xFFFF;
+    sum += dst_ip & 0xFFFF;
+    sum += IP_PROTO_TCP;
+    sum += (u16)tcp_len;
+    return sum;
+}
+
+static u16 tcp_checksum(u32 src_ip, u32 dst_ip,
+                        const void *tcp_data, u32 tcp_len) {
+    u32 sum = tcp_pseudo_sum(src_ip, dst_ip, tcp_len);
+    sum = csum_add_bytes(sum, tcp_data, tcp_len);
+    return htons(csum_fold(sum));
 }
 
 static u16 tcp_checksum_split(u32 src_ip, u32 dst_ip,
                               const void *tcp_hdr, u32 tcp_hdr_len,
                               const void *payload, u32 payload_len)
 {
-    struct tcp_pseudo ph;
-    ph.src_ip   = htonl(src_ip);
-    ph.dst_ip   = htonl(dst_ip);
-    ph.zero     = 0;
-    ph.protocol = IP_PROTO_TCP;
-    ph.tcp_len  = htons((u16)(tcp_hdr_len + payload_len));
-
-    u32 sum = 0;
-    const u16 *p = (const u16 *)&ph;
-    for (u32 i = 0; i < sizeof(ph) / 2; i++)
-        sum += p[i];
-
-    p = (const u16 *)tcp_hdr;
-    for (u32 i = 0; i < (tcp_hdr_len / 2); i++)
-        sum += p[i];
-
-    p = (const u16 *)payload;
-    for (u32 i = 0; i < (payload_len / 2); i++)
-        sum += p[i];
-    if (payload_len & 1)
-        sum += ((const u8 *)payload)[payload_len - 1];
-
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    return (u16)~sum;
+    u32 sum = tcp_pseudo_sum(src_ip, dst_ip, tcp_hdr_len + payload_len);
+    sum = csum_add_bytes(sum, tcp_hdr, tcp_hdr_len);
+    sum = csum_add_bytes(sum, payload, payload_len);
+    return htons(csum_fold(sum));
 }
 
 /* ================================================================== */
@@ -654,7 +671,10 @@ static void tcp_send_synack_cookie(u32 remote_ip, u16 remote_port,
     tcp->checksum = tcp_checksum(tcp_local_ip, remote_ip, tcp, TCP_HDR_SIZE);
 
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
-    nic_send(tx_frame, frame_len);
+    if (nic_send(tx_frame, frame_len))
+        tcp_diag_counts.synack_sent++;
+    else
+        uart_puts("[tcp] SYNACK nic_send failed\n");
 }
 
 /* ================================================================== */
@@ -929,15 +949,21 @@ static void handle_established(struct tcb *t, u32 seg_seq, u32 seg_ack,
 
 void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
                const u8 *payload, u32 payload_len, bool checksum_trusted) {
-    if (unlikely(payload_len < TCP_HDR_SIZE))
+    if (unlikely(payload_len < TCP_HDR_SIZE)) {
+        tcp_diag_counts.in_short++;
         return;
+    }
 
     const struct tcp_hdr *tcp = (const struct tcp_hdr *)payload;
 
     /* Verify TCP checksum unless explicitly trusted by RX offload window. */
     if (!checksum_trusted &&
-        unlikely(tcp_checksum(src_ip, dst_ip, payload, payload_len) != 0))
+        unlikely(tcp_checksum(src_ip, dst_ip, payload, payload_len) != 0)) {
+        tcp_diag_counts.bad_checksum++;
+        if ((tcp_diag_counts.bad_checksum & 0x0F) == 1)
+            uart_puts("[tcp] drop bad checksum\n");
         return;
+    }
 
     u16 src_port = ntohs(tcp->src_port);
     u16 dst_port = ntohs(tcp->dst_port);
@@ -947,8 +973,10 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
     u16 seg_wnd  = ntohs(tcp->window);
 
     u32 hdr_len = (tcp->data_off >> 4) * 4;
-    if (unlikely(hdr_len < TCP_HDR_SIZE || hdr_len > payload_len))
+    if (unlikely(hdr_len < TCP_HDR_SIZE || hdr_len > payload_len)) {
+        tcp_diag_counts.bad_header++;
         return;
+    }
 
     const u8 *seg_data = payload + hdr_len;
     u32 data_len = payload_len - hdr_len;
@@ -960,6 +988,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
     if (!t) {
         struct tcb *listen = tcb_find_listen(dst_port);
         if (!listen) {
+            tcp_diag_counts.no_listener++;
             /* No matching socket — send RST */
             if (!(flags & TCP_RST)) {
                 if (flags & TCP_ACK) {
@@ -976,6 +1005,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
         }
 
         if (flags & TCP_SYN) {
+            tcp_diag_counts.syn_seen++;
             /* Respond with SYN-ACK using SYN cookie ISN — no TCB allocated */
             u32 cookie = make_syn_cookie(dst_port, src_ip, src_port, seg_seq);
             tcp_send_synack_cookie(src_ip, src_port, dst_port, seg_seq, cookie);
@@ -983,23 +1013,35 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
         }
 
         if (flags & TCP_ACK) {
+            tcp_diag_counts.ack_cookie_seen++;
             /* Validate SYN cookie: the ACK should be cookie+1 */
             u32 their_seq = seg_ack - 1;  /* this was our ISN (cookie) */
             u32 their_iss = seg_seq - 1;  /* their ISN was seg_seq - 1 */
             if (!validate_syn_cookie(dst_port, src_ip, src_port,
                                      their_iss, their_seq)) {
-                /* Bad cookie — send RST */
-                tcp_send_rst(dst_ip, src_ip, dst_port, src_port, seg_ack, 0);
+                /* Ignore stale/stray ACKs in LISTEN. Browsers can retransmit
+                 * final ACK+HTTP data while core0 has not accepted yet; an RST
+                 * here kills an otherwise recoverable connection attempt.
+                 * Do not count these as bad cookies: on noisy networks they
+                 * are expected background churn and are intentionally ignored. */
                 return;
             }
 
             /* Valid cookie — queue in listen backlog */
+            for (u32 i = 0; i < listen->pending_count; i++) {
+                if (listen->pending[i].remote_ip == src_ip &&
+                    listen->pending[i].remote_port == src_port)
+                    return;
+            }
             if (listen->pending_count < LISTEN_BACKLOG) {
+                tcp_diag_counts.pending_queued++;
                 u32 idx = listen->pending_count++;
                 listen->pending[idx].remote_ip   = src_ip;
                 listen->pending[idx].remote_port  = src_port;
                 listen->pending[idx].irs          = their_iss;
                 listen->pending[idx].iss          = their_seq;
+            } else {
+                tcp_diag_counts.pending_full++;
             }
             return;
         }
@@ -1033,6 +1075,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
                 t->state   = TCP_ESTABLISHED;
                 tcp_send_ack(t);
                 cc_init(t);
+                tcp_log_established(t, "active");
             } else {
                 /* Simultaneous open */
                 t->state = TCP_SYN_RECEIVED;
@@ -1058,6 +1101,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
                 t->snd_wnd = seg_wnd;
                 t->state   = TCP_ESTABLISHED;
                 cc_init(t);
+                tcp_log_established(t, "passive");
             } else {
                 tcp_send_rst(t->local_ip, t->remote_ip,
                              t->local_port, t->remote_port, seg_ack, 0);
@@ -1209,6 +1253,13 @@ void tcp_tick(void) {
             continue;
         }
 
+        if ((t->state == TCP_FIN_WAIT_1 || t->state == TCP_FIN_WAIT_2 ||
+             t->state == TCP_CLOSING || t->state == TCP_LAST_ACK) &&
+            t->tw_expiry != 0 && now >= t->tw_expiry) {
+            tcb_reset(t);
+            continue;
+        }
+
         /* Retransmit timer */
         if (t->rto_deadline != 0 && now >= t->rto_deadline) {
             t->retries++;
@@ -1315,6 +1366,10 @@ tcp_conn_t tcp_accept(tcp_conn_t listen_conn) {
     struct tcb *lt = &tcbs[listen_conn];
     if (lt->state != TCP_LISTEN || lt->pending_count == 0) return -1;
 
+    /* Do not consume backlog entries if no TCB is available yet. */
+    struct tcb *t = tcb_alloc();
+    if (!t) return -1;
+
     /* Pop oldest pending connection */
     u32 remote_ip   = lt->pending[0].remote_ip;
     u16 remote_port = lt->pending[0].remote_port;
@@ -1325,10 +1380,6 @@ tcp_conn_t tcp_accept(tcp_conn_t listen_conn) {
     for (u32 i = 1; i < lt->pending_count; i++)
         lt->pending[i - 1] = lt->pending[i];
     lt->pending_count--;
-
-    /* Allocate new TCB for the accepted connection */
-    struct tcb *t = tcb_alloc();
-    if (!t) return -1;
 
     simd_zero(t, sizeof(struct tcb));
     t->local_ip    = tcp_local_ip;
@@ -1348,6 +1399,8 @@ tcp_conn_t tcp_accept(tcp_conn_t listen_conn) {
     cc_init(t);
 
     t->state = TCP_ESTABLISHED;
+    tcp_diag_counts.accepted++;
+    tcp_log_established(t, "accepted");
     return tcb_index(t);
 }
 
@@ -1381,17 +1434,43 @@ void tcp_close(tcp_conn_t conn) {
     case TCP_ESTABLISHED:
         tcp_send_fin(t);
         t->state = TCP_FIN_WAIT_1;
+        t->tw_expiry = timer_ticks() + CLOSE_STATE_MS;
         break;
     case TCP_CLOSE_WAIT:
         tcp_send_fin(t);
         t->state = TCP_LAST_ACK;
+        t->tw_expiry = timer_ticks() + CLOSE_STATE_MS;
         break;
     case TCP_SYN_RECEIVED:
         tcp_send_fin(t);
         t->state = TCP_FIN_WAIT_1;
+        t->tw_expiry = timer_ticks() + CLOSE_STATE_MS;
         break;
     default:
         break;
+    }
+}
+
+void tcp_abort(tcp_conn_t conn)
+{
+    if (conn < 0 || conn >= TCP_MAX_CONNECTIONS)
+        return;
+    tcb_reset(&tcbs[conn]);
+}
+
+void tcp_purge_port(u16 local_port)
+{
+    for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        struct tcb *t = &tcbs[i];
+        if (t->state == TCP_CLOSED)
+            continue;
+        if (t->local_port != local_port)
+            continue;
+        if (t->state == TCP_LISTEN) {
+            t->pending_count = 0;
+        } else {
+            tcb_reset(t);
+        }
     }
 }
 
@@ -1415,4 +1494,20 @@ u32 tcp_writable(tcp_conn_t conn) {
     u32 n = ring_free(&tcbs[conn].tx_buf);
     dmb();
     return n;
+}
+
+u32 tcp_active_count(void)
+{
+    u32 n = 0;
+    for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        u32 st = tcbs[i].state;
+        if (st != TCP_CLOSED && st != TCP_LISTEN)
+            n++;
+    }
+    return n;
+}
+
+const tcp_diag_t *tcp_diag(void)
+{
+    return &tcp_diag_counts;
 }

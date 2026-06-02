@@ -48,6 +48,14 @@ static u32 read_le32(const u8 *p)
     return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
 }
 
+static void write_le32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
 static u32 cluster_to_lba(u32 cluster)
 {
     return data_start_lba + (cluster - 2) * sectors_per_cluster;
@@ -57,6 +65,11 @@ static u32 cluster_to_lba(u32 cluster)
 static bool read_sector(u32 lba, u8 *buf)
 {
     return sd_read_block(lba, buf);
+}
+
+static bool write_sector(u32 lba, const u8 *buf)
+{
+    return sd_write_block(lba, buf);
 }
 
 /* Get next cluster from FAT, returns 0 on error/EOC */
@@ -620,4 +633,196 @@ void fat32_close(fat32_file_t *f)
 {
     f->current_cluster = 0;
     f->position = 0;
+}
+
+struct fat32_entry_ref {
+    u32 cluster;
+    u32 size;
+    u32 entry_lba;
+    u32 entry_off;
+};
+
+static bool find_root_file_entry(const char *name, struct fat32_entry_ref *ref)
+{
+    if (!fat32_ready || !name || !ref)
+        return false;
+
+    u32 cluster = root_cluster;
+    u32 scanned_clusters = 0;
+    while (cluster >= 2 && scanned_clusters++ < total_clusters) {
+        for (u32 sec = 0; sec < sectors_per_cluster; sec++) {
+            u32 lba = cluster_to_lba(cluster) + sec;
+            if (!read_sector(lba, fat32_buf))
+                return false;
+
+            for (u32 off = 0; off < FAT32_SECTOR_SIZE; off += 32) {
+                const u8 *e = &fat32_buf[off];
+                if (e[0] == 0x00)
+                    return false;
+                if (e[0] == 0xE5 || e[11] == FAT32_ATTR_LFN ||
+                    (e[11] & FAT32_ATTR_VOLUME_ID))
+                    continue;
+
+                char short_name[FAT32_MAX_NAME];
+                build_short_name(e, short_name);
+                if (!name_eq_ci(short_name, name))
+                    continue;
+
+                ref->cluster = (read_le16(&e[20]) << 16) | read_le16(&e[26]);
+                ref->size = read_le32(&e[28]);
+                ref->entry_lba = lba;
+                ref->entry_off = off;
+                return ref->cluster >= 2;
+            }
+        }
+        cluster = fat_next_cluster(cluster);
+    }
+    return false;
+}
+
+static u32 cluster_chain_capacity(u32 start_cluster)
+{
+    u32 clusters = 0;
+    u32 cluster = start_cluster;
+    while (cluster >= 2 && clusters < total_clusters) {
+        clusters++;
+        cluster = fat_next_cluster(cluster);
+    }
+    return clusters * sectors_per_cluster * FAT32_SECTOR_SIZE;
+}
+
+bool fat32_overwrite_existing(const char *path, const u8 *data, u32 len,
+                              u32 *out_written, u32 *out_capacity)
+{
+    if (out_written) *out_written = 0;
+    if (out_capacity) *out_capacity = 0;
+    if (!fat32_ready || !path || !data)
+        return false;
+
+    if (path[0] == '/' || path[0] == '\\')
+        path++;
+    if (!path[0] || path[0] == '/' || path[0] == '\\')
+        return false;
+
+    struct fat32_entry_ref ref;
+    if (!find_root_file_entry(path, &ref))
+        return false;
+
+    u32 capacity = cluster_chain_capacity(ref.cluster);
+    if (out_capacity) *out_capacity = capacity;
+    if (len > capacity)
+        return false;
+
+    u32 written = 0;
+    u32 cluster = ref.cluster;
+    while (written < len && cluster >= 2) {
+        for (u32 sec = 0; sec < sectors_per_cluster && written < len; sec++) {
+            u32 lba = cluster_to_lba(cluster) + sec;
+            u32 remain = len - written;
+            if (remain >= FAT32_SECTOR_SIZE) {
+                if (!write_sector(lba, data + written))
+                    return false;
+                written += FAT32_SECTOR_SIZE;
+            } else {
+                if (!read_sector(lba, fat32_buf))
+                    return false;
+                for (u32 i = 0; i < remain; i++)
+                    fat32_buf[i] = data[written + i];
+                for (u32 i = remain; i < FAT32_SECTOR_SIZE; i++)
+                    fat32_buf[i] = 0;
+                if (!write_sector(lba, fat32_buf))
+                    return false;
+                written += remain;
+            }
+        }
+        if (written < len)
+            cluster = fat_next_cluster(cluster);
+    }
+
+    if (written != len)
+        return false;
+
+    if (!read_sector(ref.entry_lba, fat32_buf))
+        return false;
+    write_le32(&fat32_buf[ref.entry_off + 28], len);
+    if (!write_sector(ref.entry_lba, fat32_buf))
+        return false;
+
+    if (out_written) *out_written = written;
+    return true;
+}
+
+bool fat32_overwrite_existing_range(const char *path, u32 offset,
+                                    const u8 *data, u32 len, u32 final_size,
+                                    u32 *out_written, u32 *out_capacity)
+{
+    if (out_written) *out_written = 0;
+    if (out_capacity) *out_capacity = 0;
+    if (!fat32_ready || !path || (!data && len != 0))
+        return false;
+
+    if (path[0] == '/' || path[0] == '\\')
+        path++;
+    if (!path[0] || path[0] == '/' || path[0] == '\\')
+        return false;
+
+    struct fat32_entry_ref ref;
+    if (!find_root_file_entry(path, &ref))
+        return false;
+
+    u32 capacity = cluster_chain_capacity(ref.cluster);
+    if (out_capacity) *out_capacity = capacity;
+    if (offset > capacity || len > capacity - offset || final_size > capacity)
+        return false;
+
+    u32 target_cluster_index = offset / (sectors_per_cluster * FAT32_SECTOR_SIZE);
+    u32 cluster = ref.cluster;
+    for (u32 i = 0; i < target_cluster_index; i++) {
+        cluster = fat_next_cluster(cluster);
+        if (cluster < 2)
+            return false;
+    }
+
+    u32 pos = offset;
+    u32 written = 0;
+    while (written < len && cluster >= 2) {
+        u32 cluster_off = pos % (sectors_per_cluster * FAT32_SECTOR_SIZE);
+        u32 sec_start = cluster_off / FAT32_SECTOR_SIZE;
+        for (u32 sec = sec_start; sec < sectors_per_cluster && written < len; sec++) {
+            u32 sector_off = pos % FAT32_SECTOR_SIZE;
+            u32 n = FAT32_SECTOR_SIZE - sector_off;
+            if (n > len - written)
+                n = len - written;
+            u32 lba = cluster_to_lba(cluster) + sec;
+            if (n == FAT32_SECTOR_SIZE && sector_off == 0) {
+                if (!write_sector(lba, data + written))
+                    return false;
+            } else {
+                if (!read_sector(lba, fat32_buf))
+                    return false;
+                for (u32 i = 0; i < n; i++)
+                    fat32_buf[sector_off + i] = data[written + i];
+                if (!write_sector(lba, fat32_buf))
+                    return false;
+            }
+            written += n;
+            pos += n;
+        }
+        if (written < len)
+            cluster = fat_next_cluster(cluster);
+    }
+
+    if (written != len)
+        return false;
+
+    if (final_size != 0) {
+        if (!read_sector(ref.entry_lba, fat32_buf))
+            return false;
+        write_le32(&fat32_buf[ref.entry_off + 28], final_size);
+        if (!write_sector(ref.entry_lba, fat32_buf))
+            return false;
+    }
+
+    if (out_written) *out_written = written;
+    return true;
 }

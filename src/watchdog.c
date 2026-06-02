@@ -9,12 +9,27 @@
 #define PM_WDOG        (PM_BASE + 0x24U)
 #define PM_PASSWORD    0x5A000000U
 #define PM_RSTC_FULL   0x00000020U
+#define PSCI_SYSTEM_RESET 0x84000009U
 
 static struct watchdog_status g_wdog;
 static u64 g_last_poll;
 
+static void watchdog_psci_system_reset(void)
+{
+    register u64 x0 __asm__("x0") = PSCI_SYSTEM_RESET;
+    __asm__ volatile("smc #0" : "+r"(x0) :: "memory");
+}
+
 static NORETURN void watchdog_reboot_best_effort(void)
 {
+    dsb();
+    isb();
+    watchdog_psci_system_reset();
+    dsb();
+    isb();
+
+    /* Fallback for platforms without PSCI reset. On Pi 5 this legacy path can
+     * be a partial warm reset, so PSCI above is the preferred reboot path. */
     mmio_write(PM_WDOG, PM_PASSWORD | 10U);
     mmio_write(PM_RSTC, PM_PASSWORD | PM_RSTC_FULL);
     for (;;) wfe();
@@ -62,6 +77,15 @@ void watchdog_trip(u32 core, u32 reason)
     if (g_wdog.reboot_on_trip)
         watchdog_reboot_best_effort();
     exception_pisod("Watchdog liveness failure", 5, reason, 0, core, g_wdog.timeout_ticks);
+}
+
+NORETURN void watchdog_reboot_now(u32 reason)
+{
+    g_wdog.trip_count++;
+    g_wdog.last_trip_core = core_id();
+    g_wdog.reboot_on_trip = true;
+    (void)reason;
+    watchdog_reboot_best_effort();
 }
 
 void watchdog_poll(void)

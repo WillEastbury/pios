@@ -11,7 +11,7 @@
 #pragma once
 #include "types.h"
 
-#define TCP_MAX_CONNECTIONS 8
+#define TCP_MAX_CONNECTIONS 128
 #define TCP_BUF_SIZE        4096
 #define TCP_MSS             1460
 #define TCP_DEFAULT_WINDOW  TCP_BUF_SIZE
@@ -68,6 +68,12 @@ u32 tcp_read(tcp_conn_t conn, void *data, u32 len);
 /* Initiate graceful close (FIN) */
 void tcp_close(tcp_conn_t conn);
 
+/* Immediately discard a connection control block. */
+void tcp_abort(tcp_conn_t conn);
+
+/* Drop non-listener TCBs and queued SYN-cookie accepts for a local port. */
+void tcp_purge_port(u16 local_port);
+
 /* Get connection state */
 u32 tcp_state(tcp_conn_t conn);
 
@@ -76,3 +82,22 @@ u32 tcp_readable(tcp_conn_t conn);
 
 /* Check how much space is in send buffer */
 u32 tcp_writable(tcp_conn_t conn);
+
+/* Count non-listener active TCP control blocks. */
+u32 tcp_active_count(void);
+
+typedef struct {
+    u64 in_short;
+    u64 bad_checksum;
+    u64 bad_header;
+    u64 no_listener;
+    u64 syn_seen;
+    u64 synack_sent;
+    u64 ack_cookie_seen;
+    u64 ack_cookie_bad;
+    u64 pending_queued;
+    u64 pending_full;
+    u64 accepted;
+} tcp_diag_t;
+
+const tcp_diag_t *tcp_diag(void);

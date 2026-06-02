@@ -25,6 +25,12 @@ struct principal {
     u32 flags;
 };
 
+struct principal_ui_entry {
+    u32 id;
+    u32 flags;
+    char name[32];
+} PACKED;
+
 /* Forward declaration for walfs inode */
 struct walfs_inode;
 
@@ -36,6 +42,8 @@ void principal_set_current(u32 id);
 bool principal_has_cap(u32 id, u32 cap_flag);
 bool principal_create(const char *name, const char *pass, u32 flags);
 bool principal_set_password(const char *name, const char *pass);
+bool principal_set_flags(const char *name, u32 flags);
+u32  principal_snapshot(struct principal_ui_entry *out, u32 max_entries);
 bool principal_tls_psk(u32 id, u8 *out, u32 out_len);
 bool principal_root_present(void);
 bool principal_root_uses_default_secret(void);

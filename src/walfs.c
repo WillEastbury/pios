@@ -27,6 +27,7 @@
 
 /* ---- Partition offset ---- */
 
+static u32 partition_lba = 2048;
 static u32 base_lba = WALFS_BASE_LBA;
 
 static u32 read_le32(const u8 *p)
@@ -44,11 +45,8 @@ static bool discover_partition(void)
 
     /* Check MBR signature */
     if (mbr[510] != 0x55 || mbr[511] != 0xAA) {
-        uart_puts("[wal] no MBR sig, default LBA=");
-        uart_hex(WALFS_BASE_LBA);
-        uart_puts("\n");
-        base_lba = WALFS_BASE_LBA;
-        return true;
+        uart_puts("[wal] no MBR sig; WALFS disabled\n");
+        return false;
     }
 
     /* MBR partition table starts at offset 0x1BE, each entry is 16 bytes.
@@ -66,24 +64,30 @@ static bool discover_partition(void)
     uart_puts("\n");
 
     if (p2_start == 0 || p2_size == 0) {
-        uart_puts("[wal] p2 missing, default LBA=");
-        uart_hex(WALFS_BASE_LBA);
-        uart_puts("\n");
-        base_lba = WALFS_BASE_LBA;
-        return true;
+        uart_puts("[wal] p2 missing; WALFS disabled\n");
+        return false;
+    }
+
+    if (p2_size <= WALFS_BOOT_SLOT_LBAS) {
+        uart_puts("[wal] p2 too small for boot slot; WALFS disabled\n");
+        return false;
     }
 
     if ((u64)p2_start + (u64)p2_size > 0xFFFFFFFF) {
         uart_puts("[wal] partition exceeds u32 LBA\n");
     }
 
-    base_lba = p2_start;
+    partition_lba = p2_start;
+    base_lba = p2_start + WALFS_BOOT_SLOT_LBAS;
     uart_puts("[wal] p2 LBA=");
+    uart_hex(partition_lba);
+    uart_puts(" walfs LBA=");
     uart_hex(base_lba);
     uart_puts("\n");
     return true;
 }
 
+u32 walfs_partition_lba(void) { return partition_lba; }
 u32 walfs_part2_lba(void) { return base_lba; }
 
 /* Translate a WALFS-relative LBA to an absolute SD LBA (u64 to catch overflow) */

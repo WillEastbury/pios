@@ -23,6 +23,8 @@ static u32  cursor_x;
 static u32  cursor_y;
 static u32  cols;
 static u32  rows;
+static u32  reserved_rows;
+static bool console_wrapped;
 
 /* Mailbox buffer - must be 16-byte aligned */
 static volatile u32 __attribute__((aligned(16))) mbox_fb[36];
@@ -258,12 +260,62 @@ void fb_clear(u32 color) {
         fb_ptr[i] = color;
     cursor_x = 0;
     cursor_y = 0;
+    console_wrapped = false;
 }
 
 void fb_pixel(u32 x, u32 y, u32 color) {
     if (x < fb_width && y < fb_height) {
         u32 *row = (u32 *)((u8 *)fb_ptr + y * fb_pitch);
         row[x] = color;
+    }
+}
+
+/* ── Network activity status strip ──
+ * Paints a 14x14 block (with 2px gap) advancing across the bottom of the
+ * screen, wrapping rows upward when full. Provides a visual liveness +
+ * traffic indicator independent of the scrolling text console. */
+#define FB_STAT_BLOCK   14
+#define FB_STAT_STEP    16
+static u32 fb_stat_x;
+static u32 fb_stat_y_off;  /* offset from bottom in step units */
+
+void fb_status_block(u32 color) {
+    if (!fb_ptr || fb_width == 0 || fb_height == 0) return;
+
+    u32 step = FB_STAT_STEP;
+    u32 cols = fb_width / step;
+    if (cols == 0) return;
+
+    u32 y_base = fb_height - step - fb_stat_y_off * step;
+    /* If we've climbed past the top quarter of the screen, wrap back to bottom. */
+    if (y_base < fb_height / 4) {
+        fb_stat_y_off = 0;
+        fb_stat_x = 0;
+        y_base = fb_height - step;
+    }
+
+    /* When starting a new horizontal line (first slot in the row), wipe the
+     * whole strip-row to black so old blocks from previous wraps don't smear
+     * with the new line of indicators. */
+    if (fb_stat_x == 0) {
+        for (u32 dy = 0; dy < FB_STAT_BLOCK; dy++) {
+            u32 *row = (u32 *)((u8 *)fb_ptr + (y_base + dy) * fb_pitch);
+            for (u32 dx = 0; dx < fb_width; dx++)
+                row[dx] = 0x00000000;
+        }
+    }
+
+    u32 x_base = fb_stat_x * step;
+    for (u32 dy = 0; dy < FB_STAT_BLOCK; dy++) {
+        u32 *row = (u32 *)((u8 *)fb_ptr + (y_base + dy) * fb_pitch);
+        for (u32 dx = 0; dx < FB_STAT_BLOCK; dx++)
+            row[x_base + dx] = color;
+    }
+
+    fb_stat_x++;
+    if (fb_stat_x >= cols) {
+        fb_stat_x = 0;
+        fb_stat_y_off++;
     }
 }
 
@@ -277,15 +329,43 @@ void fb_set_cursor(u32 col, u32 row) {
     if (row < rows) cursor_y = row;
 }
 
-/* Scroll screen up by one text row (8 pixels) — DMA-accelerated */
-static void fb_scroll(void) {
-    u32 row_bytes = fb_pitch * 8;
-    u32 total_bytes = fb_pitch * fb_height;
-    u8 *base = (u8 *)fb_ptr;
+void fb_set_reserved_rows(u32 r) {
+    reserved_rows = (r < rows) ? r : 0;
+    if (cursor_y < reserved_rows)
+        cursor_y = reserved_rows;
+}
 
-    /* Simple memcpy scroll — DMA scroll can crash when called from hot loop */
-    memcpy(base, base + row_bytes, total_bytes - row_bytes);
-    memset(base + total_bytes - row_bytes, 0, row_bytes);
+u32 fb_cols(void) {
+    return cols;
+}
+
+u32 fb_rows(void) {
+    return rows;
+}
+
+u32 fb_reserved_rows(void) {
+    return reserved_rows;
+}
+
+static void fb_clear_text_row(u32 cy) {
+    if (!fb_ptr || cy >= rows) return;
+    u32 py = cy * 8;
+    for (u32 row = 0; row < 8; row++) {
+        u32 *scanline = (u32 *)((u8 *)fb_ptr + (py + row) * fb_pitch);
+        for (u32 x = 0; x < fb_width; x++)
+            scanline[x] = fb_bg;
+    }
+}
+
+static void fb_advance_row(void) {
+    cursor_x = 0;
+    cursor_y++;
+    if (cursor_y >= rows) {
+        cursor_y = reserved_rows;
+        console_wrapped = true;
+    }
+    if (console_wrapped)
+        fb_clear_text_row(cursor_y);
 }
 
 /* Draw one 8x8 character at text position (cx, cy) */
@@ -309,24 +389,20 @@ static void fb_draw_char(u32 cx, u32 cy, char c) {
 
 void fb_putc(char c) {
     if (c == '\n') {
-        cursor_x = 0;
-        cursor_y++;
+        fb_advance_row();
     } else if (c == '\r') {
         cursor_x = 0;
     } else if (c == '\t') {
         cursor_x = (cursor_x + 4) & ~3;
     } else {
+        if (console_wrapped && cursor_x == 0)
+            fb_clear_text_row(cursor_y);
         fb_draw_char(cursor_x, cursor_y, c);
         cursor_x++;
     }
 
     if (cursor_x >= cols) {
-        cursor_x = 0;
-        cursor_y++;
-    }
-    if (cursor_y >= rows) {
-        fb_scroll();
-        cursor_y = rows - 1;
+        fb_advance_row();
     }
 }
 

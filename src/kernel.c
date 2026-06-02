@@ -22,6 +22,7 @@
 #include "sd.h"
 #include "nic.h"
 #include "net.h"
+#include "arp.h"
 #include "tcp.h"
 #include "dhcp.h"
 #include "dns.h"
@@ -46,9 +47,11 @@
 #include "rp1_clk.h"
 #include "rp1_uart.h"
 #include "usb.h"
+#include "xhci.h"
 #include "usb_storage.h"
 #include "usb_kbd.h"
 #include "ipc_queue.h"
+#include "build_version.h"
 #include "ipc_stream.h"
 #include "ipc_proc.h"
 #include "pipe.h"
@@ -92,24 +95,184 @@ u32 pios_strlen(const char *s) {
     return n;
 }
 
-/* ---- Network configuration (static - no ARP/DHCP) ---- */
+/* ---- Version + network configuration (static - no ARP/DHCP) ---- */
 
-#define MY_IP       IP4(192, 168, 3, 1)
-#define MY_GW       IP4(192, 168, 3, 1)
-#define MY_MASK     IP4(255, 255, 255, 0)
+#define MY_IP       IP4(192, 168, 218, 101)
+#define MY_GW       IP4(192, 168, 0, 1)
+#define MY_MASK     IP4(255, 255, 0, 0)
 
 /* Gateway MAC - MUST be configured (no ARP to discover it) */
 static const u8 MY_GW_MAC[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+/* Static neighbor: the dev host PC. Pre-populates the ARP/neighbor table
+ * so the Pi can reply to and originate frames to this peer even when
+ * inbound ARP processing is suspect. */
+#define HOST_PC_IP  IP4(192, 168, 218, 9)
+static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 
 /* ---- Echo servers ---- */
 #define ECHO_UDP_PORT  7
 #define ECHO_TCP_PORT  7
 #define HTTP_TCP_PORT  80
+#define ADMIN_STATUS_TCP_PORT  8080
+#define ADMIN_REBOOT_TCP_PORT  8081
+#define ADMIN_UPDATE_TCP_PORT  8082
+#define DEBUG_TCP_PORT 2323
+#define DEBUG_TCP_LINE_MAX 256
+#define HTTP_AUTH_ENABLED 0
+#define HTTP_SIMPLE_MODE 0
+#define HTTP_DIAG_VERBOSE 0
+#define HTTP_ADMIN_EXPERIMENTAL 0
+#define HOTPATCH_SLOT_BYTES (2U * 1024U * 1024U)
+#define HOTPATCH_SLOT_MAGIC 0x50494F53U /* PIOS */
+#define HTTP_LOG_RING_SIZE 64
+#define ADMIN_HTTP_REQ_MAX 8192
+#define ADMIN_HTTP_RESP_MAX 4096
+#define ADMIN_SERVICE_WATCHDOG_MS 180000ULL
+#define ADMIN_CLIENT_STALL_MS 10000ULL
+
+#define HTTP_EVT_LISTEN       1U
+#define HTTP_EVT_ACCEPT       2U
+#define HTTP_EVT_RX           3U
+#define HTTP_EVT_COMPLETE     4U
+#define HTTP_EVT_BUILD_ENTER  5U
+#define HTTP_EVT_BUILD_EXIT   6U
+#define HTTP_EVT_TX           7U
+#define HTTP_EVT_CLOSE        8U
+#define HTTP_EVT_ABORT        9U
+#define HTTP_EVT_RESET        10U
+#define HTTP_EVT_BAD_STATE    11U
+#define HTTP_EVT_STATUS_ENTER 12U
+#define HTTP_EVT_STATUS_EXIT  13U
+#define HTTP_EVT_ADMIN_BUILD  14U
+
+#define HTTP_ROUTE_UNKNOWN    0U
+#define HTTP_ROUTE_ROOT       1U
+#define HTTP_ROUTE_STATUS     2U
+#define HTTP_ROUTE_REBOOT     3U
+#define HTTP_ROUTE_LOGS       4U
+#define HTTP_ROUTE_UPDATE     5U
+#define HTTP_ROUTE_HOTPATCH   6U
+#define HTTP_ROUTE_PLACEHOLDER 7U
+#define HTTP_ROUTE_NOT_FOUND  8U
+
+#define HTTP_ERR_NONE         0U
+#define HTTP_ERR_RESP_TIMEOUT 1U
+#define HTTP_ERR_REQ_TIMEOUT  2U
+#define HTTP_ERR_BAD_STATE    3U
+#define HTTP_ERR_HEADER_BIG   4U
 
 static tcp_conn_t echo_listen_conn = -1;
 static tcp_conn_t echo_client_conn = -1;
 static tcp_conn_t http_listen_conn = -1;
 static tcp_conn_t http_client_conn = -1;
+static u8 http_req_buf[1024];
+static u32 http_req_len;
+static bool http_auth_checked;
+static bool http_auth_ok;
+static bool http_reboot_pending;
+static char http_resp_buf[16000];
+static u32 http_resp_len;
+static u32 http_resp_off;
+static u32 http_last_state;
+static u32 http_last_readable;
+static u32 http_last_writable;
+static u32 http_last_write;
+static u32 http_complete_tick;
+static bool http_prefix_dumped;
+static bool http_req_prefix_dumped;
+static u64 http_last_activity_ms;
+static char http_last_req_prefix[25];
+static char http_last_resp_prefix[25];
+static struct {
+    u64 accepts;
+    u64 reads;
+    u64 built;
+    u64 write_calls;
+    u64 write_bytes;
+    u64 write_zero;
+    u64 closes;
+    u64 aborts;
+    u64 unauthorized;
+    u64 not_found;
+    u32 event;
+    u32 route;
+    u32 error;
+    u32 conn;
+    u32 build_len;
+    u32 body_off;
+    u32 content_len;
+    u32 request_done;
+} http_diag;
+
+struct admin_http_service {
+    const char *name;
+    u16 port;
+    tcp_conn_t listen_conn;
+    tcp_conn_t client_conn;
+    u8 req[ADMIN_HTTP_REQ_MAX];
+    u32 req_len;
+    char resp[ADMIN_HTTP_RESP_MAX];
+    u32 resp_len;
+    u32 resp_off;
+    u64 last_activity_ms;
+    u64 last_ok_ms;
+    u32 completions;
+};
+
+static struct admin_http_service admin_status_svc = {
+    .name = "status", .port = ADMIN_STATUS_TCP_PORT,
+    .listen_conn = -1, .client_conn = -1
+};
+static struct admin_http_service admin_reboot_svc = {
+    .name = "reboot", .port = ADMIN_REBOOT_TCP_PORT,
+    .listen_conn = -1, .client_conn = -1
+};
+static struct admin_http_service admin_update_svc = {
+    .name = "update", .port = ADMIN_UPDATE_TCP_PORT,
+    .listen_conn = -1, .client_conn = -1
+};
+
+struct http_log_entry {
+    u32 seq;
+    u32 tick_ms;
+    const char *event;
+    u32 a;
+    u32 b;
+};
+static struct http_log_entry http_log_ring[HTTP_LOG_RING_SIZE];
+static u32 http_log_seq;
+struct ota_update_state {
+    bool active;
+    u32 total;
+    u32 received;
+    u32 chunks;
+    u32 commits;
+    u32 errors;
+    const char *last_error;
+};
+static struct ota_update_state ota_update;
+static tcp_conn_t debug_listen_conn = -1;
+static tcp_conn_t debug_client_conn = -1;
+static bool debug_tcp_unlocked;
+static char debug_tcp_line[DEBUG_TCP_LINE_MAX];
+static u32 debug_tcp_len;
+static u32 debug_tcp_iac_skip;
+
+static bool ui_streq(const char *a, const char *b);
+static const char *ui_proc_state_str(u32 s);
+static const char *ui_priority_str(u32 p);
+static u32 http_header_body_offset(const u8 *buf, u32 len);
+static bool http_content_length(const u8 *req, u32 len, u32 *out);
+static void ui_console_write(const char *s);
+static void ui_console_exec(char *line);
+static void debug_tcp_poll(void);
+static void net_services_listen(void);
+static void admin_services_listen(void);
+static void admin_services_poll(void);
+static void http_log_event(const char *event, u32 a, u32 b);
+static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len);
+static bool http_request_complete(const u8 *req, u32 len);
 
 /* UDP echo: reflect any packet back to sender */
 static void echo_udp_cb(u32 src_ip, u16 src_port, u16 dst_port,
@@ -117,6 +280,2108 @@ static void echo_udp_cb(u32 src_ip, u16 src_port, u16 dst_port,
     if (dst_port == ECHO_UDP_PORT) {
         net_send_udp(src_ip, ECHO_UDP_PORT, src_port, data, len);
     }
+}
+
+static void debug_tcp_send_len(const char *s, u32 len)
+{
+    if (debug_client_conn < 0 || !debug_tcp_unlocked)
+        return;
+    if (tcp_state(debug_client_conn) != TCP_ESTABLISHED)
+        return;
+    (void)tcp_write(debug_client_conn, s, len);
+}
+
+static void debug_tcp_send(const char *s)
+{
+    debug_tcp_send_len(s, pios_strlen(s));
+}
+
+static bool debug_tcp_unlock_line(const char *line)
+{
+    return ui_streq(line, "unlock pios");
+}
+
+static void debug_tcp_close(void)
+{
+    if (debug_client_conn >= 0)
+        tcp_close(debug_client_conn);
+    debug_client_conn = -1;
+    debug_tcp_unlocked = false;
+    debug_tcp_len = 0;
+    debug_tcp_iac_skip = 0;
+}
+
+static void debug_tcp_handle_line(void)
+{
+    debug_tcp_line[debug_tcp_len] = 0;
+    debug_tcp_len = 0;
+
+    if (!debug_tcp_unlocked) {
+        if (debug_tcp_unlock_line(debug_tcp_line)) {
+            debug_tcp_unlocked = true;
+            debug_tcp_send("\r\nOK: debug console unlocked\r\npios> ");
+        } else {
+            static const char msg[] = "\r\nERR: type 'unlock pios' first\r\ndebug> ";
+            (void)tcp_write(debug_client_conn, msg, sizeof(msg) - 1);
+        }
+        return;
+    }
+
+    if (debug_tcp_line[0])
+        ui_console_exec(debug_tcp_line);
+    debug_tcp_send("\r\npios> ");
+}
+
+static void debug_tcp_feed(u8 c)
+{
+    if (debug_tcp_iac_skip) {
+        debug_tcp_iac_skip--;
+        return;
+    }
+    if (c == 0xFF) {
+        debug_tcp_iac_skip = 2; /* ignore simple TELNET IAC command triplets */
+        return;
+    }
+    if (c == '\r')
+        return;
+    if (c == '\n') {
+        debug_tcp_handle_line();
+        return;
+    }
+    if (c == 8 || c == 127) {
+        if (debug_tcp_len > 0) {
+            debug_tcp_len--;
+            static const char bs[] = "\b \b";
+            (void)tcp_write(debug_client_conn, bs, sizeof(bs) - 1);
+        }
+        return;
+    }
+    if (c < 0x20 || c > 0x7E)
+        return;
+    if (debug_tcp_len + 1 >= sizeof(debug_tcp_line)) {
+        static const char msg[] = "\r\nERR: line too long\r\ndebug> ";
+        (void)tcp_write(debug_client_conn, msg, sizeof(msg) - 1);
+        debug_tcp_len = 0;
+        return;
+    }
+    debug_tcp_line[debug_tcp_len++] = (char)c;
+    (void)tcp_write(debug_client_conn, &c, 1);
+}
+
+static void debug_tcp_poll(void)
+{
+    if (debug_client_conn < 0 && debug_listen_conn >= 0) {
+        debug_client_conn = tcp_accept(debug_listen_conn);
+        if (debug_client_conn >= 0) {
+            debug_tcp_unlocked = false;
+            debug_tcp_len = 0;
+            debug_tcp_iac_skip = 0;
+            static const char banner[] =
+                "\r\nPIOS TCP debug console\r\n"
+                "WARNING: commands run on the live kernel.\r\n"
+                "Type: unlock pios\r\n"
+                "debug> ";
+            (void)tcp_write(debug_client_conn, banner, sizeof(banner) - 1);
+        }
+    }
+
+    if (debug_client_conn < 0)
+        return;
+
+    u32 st = tcp_state(debug_client_conn);
+    if (st == TCP_ESTABLISHED) {
+        static u8 buf[128];
+        u32 n = tcp_read(debug_client_conn, buf, sizeof(buf));
+        for (u32 i = 0; i < n; i++)
+            debug_tcp_feed(buf[i]);
+    } else if (st == TCP_CLOSED || st >= TCP_CLOSING) {
+        debug_tcp_close();
+    }
+}
+
+static void net_services_listen(void)
+{
+    echo_client_conn = -1;
+    http_client_conn = -1;
+    debug_client_conn = -1;
+    debug_tcp_unlocked = false;
+    debug_tcp_len = 0;
+    debug_tcp_iac_skip = 0;
+
+    echo_listen_conn = tcp_listen(ECHO_TCP_PORT);
+    http_listen_conn = tcp_listen(HTTP_TCP_PORT);
+    debug_listen_conn = tcp_listen(DEBUG_TCP_PORT);
+    admin_services_listen();
+    http_log_event("net-listen", HTTP_TCP_PORT, ADMIN_STATUS_TCP_PORT);
+}
+
+static void http_log_event(const char *event, u32 a, u32 b)
+{
+    u32 slot = http_log_seq % HTTP_LOG_RING_SIZE;
+    http_log_ring[slot].seq = http_log_seq++;
+    http_log_ring[slot].tick_ms = (u32)timer_monotonic_ms();
+    http_log_ring[slot].event = event;
+    http_log_ring[slot].a = a;
+    http_log_ring[slot].b = b;
+}
+
+static void http_trace(u32 event, u32 route, u32 a, u32 b)
+{
+    http_diag.event = event;
+    http_diag.route = route;
+    if (event != HTTP_EVT_ABORT && event != HTTP_EVT_BAD_STATE)
+        http_diag.error = HTTP_ERR_NONE;
+    http_log_event("http-trace", (event << 24) | (route << 16) | (a & 0xFFFFU), b);
+    uart_puts("[http-trace] ev=");
+    uart_hex(event);
+    uart_puts(" route=");
+    uart_hex(route);
+    uart_puts(" a=");
+    uart_hex(a);
+    uart_puts(" b=");
+    uart_hex(b);
+    uart_puts("\n");
+}
+
+static void http_append(char *out, u32 *len, u32 max, const char *s)
+{
+    if (!out || !len || max == 0)
+        return;
+    while (*s && *len < max - 1)
+        out[(*len)++] = *s++;
+    out[*len] = 0;
+}
+
+static void http_append_u64(char *out, u32 *len, u32 max, u64 v)
+{
+    char tmp[21];
+    u32 n = 0;
+    if (v == 0) {
+        http_append(out, len, max, "0");
+        return;
+    }
+    while (v && n < sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (n && *len < max - 1)
+        out[(*len)++] = tmp[--n];
+    out[*len] = 0;
+}
+
+static bool http_char_ieq(char a, char b)
+{
+    if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
+    if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
+    return a == b;
+}
+
+static bool http_match_ci(const u8 *p, const char *s)
+{
+    while (*s) {
+        if (!http_char_ieq((char)*p++, *s++))
+            return false;
+    }
+    return true;
+}
+
+static i32 http_b64_val(u8 c)
+{
+    if (c >= 'A' && c <= 'Z') return (i32)(c - 'A');
+    if (c >= 'a' && c <= 'z') return (i32)(c - 'a' + 26);
+    if (c >= '0' && c <= '9') return (i32)(c - '0' + 52);
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    if (c == '=') return -2;
+    return -1;
+}
+
+static bool http_b64_decode(const u8 *in, u32 in_len, u8 *out, u32 out_max, u32 *out_len)
+{
+    u32 o = 0;
+    u32 i = 0;
+    while (i < in_len) {
+        i32 v[4];
+        for (u32 j = 0; j < 4; j++) {
+            if (i >= in_len) return false;
+            v[j] = http_b64_val(in[i++]);
+            if (v[j] == -1) return false;
+        }
+        if (v[0] < 0 || v[1] < 0) return false;
+        u32 n = ((u32)v[0] << 18) | ((u32)v[1] << 12);
+        if (v[2] >= 0) n |= (u32)v[2] << 6;
+        if (v[3] >= 0) n |= (u32)v[3];
+        if (o >= out_max) return false;
+        out[o++] = (u8)(n >> 16);
+        if (v[2] != -2) {
+            if (o >= out_max) return false;
+            out[o++] = (u8)(n >> 8);
+        }
+        if (v[3] != -2) {
+            if (o >= out_max) return false;
+            out[o++] = (u8)n;
+        }
+        if (v[2] == -2 || v[3] == -2)
+            break;
+    }
+    if (out_len) *out_len = o;
+    return true;
+}
+
+static bool http_admin_authorized(const u8 *req, u32 len)
+{
+    static const char auth_hdr[] = "authorization:";
+    static const char basic[] = "basic ";
+
+    for (u32 i = 0; i + sizeof(auth_hdr) - 1 < len; i++) {
+        if (i != 0 && req[i - 1] != '\n')
+            continue;
+        if (!http_match_ci(&req[i], auth_hdr))
+            continue;
+        i += (u32)sizeof(auth_hdr) - 1;
+        while (i < len && (req[i] == ' ' || req[i] == '\t')) i++;
+        if (i + sizeof(basic) - 1 >= len || !http_match_ci(&req[i], basic))
+            return false;
+        i += (u32)sizeof(basic) - 1;
+
+        u32 start = i;
+        while (i < len && req[i] != '\r' && req[i] != '\n' && req[i] != ' ' && req[i] != '\t')
+            i++;
+
+        u8 decoded[96];
+        u32 decoded_len = 0;
+        if (!http_b64_decode(&req[start], i - start, decoded, sizeof(decoded) - 1, &decoded_len))
+            return false;
+        decoded[decoded_len] = 0;
+
+        char user[32];
+        char pass[64];
+        u32 u = 0, p = 0;
+        u32 j = 0;
+        while (j < decoded_len && decoded[j] != ':' && u < sizeof(user) - 1)
+            user[u++] = (char)decoded[j++];
+        if (j >= decoded_len || decoded[j] != ':')
+            return false;
+        j++;
+        while (j < decoded_len && p < sizeof(pass) - 1)
+            pass[p++] = (char)decoded[j++];
+        user[u] = 0;
+        pass[p] = 0;
+
+        u32 principal_id = PRINCIPAL_ROOT;
+        if (!principal_auth(user, pass, &principal_id))
+            return false;
+        return principal_has_cap(principal_id, PRINCIPAL_ADMIN);
+    }
+    return false;
+}
+
+static bool http_try_early_auth(const u8 *req, u32 len, bool *complete, bool *authorized)
+{
+    static const char auth_hdr[] = "authorization:";
+    if (complete) *complete = false;
+    if (authorized) *authorized = false;
+
+    for (u32 i = 0; i + sizeof(auth_hdr) - 1 < len; i++) {
+        if (i != 0 && req[i - 1] != '\n')
+            continue;
+        if (!http_match_ci(&req[i], auth_hdr))
+            continue;
+
+        u32 line_end = i;
+        while (line_end < len && req[line_end] != '\n')
+            line_end++;
+        if (line_end >= len)
+            return false;
+
+        if (complete) *complete = true;
+        if (authorized) *authorized = http_admin_authorized(&req[i], line_end - i);
+        return true;
+    }
+    return false;
+}
+
+static u32 http_build_unauthorized(char *out, u32 max)
+{
+    u32 len = 0;
+    http_append(out, &len, max,
+        "HTTP/1.0 401 Unauthorized\r\n"
+        "WWW-Authenticate: Basic realm=\"PIOS Admin\"\r\n"
+        "Content-Type: text/plain\r\n"
+        "Connection: close\r\n\r\n"
+        "PIOS admin authentication required.\n");
+    return len;
+}
+
+static bool http_request_path_start(const u8 *req, u32 len, u32 *out)
+{
+    if (!req || len < 3 || !out)
+        return false;
+    u32 i = 0;
+    while (i < len && req[i] != ' ' && req[i] != '\r' && req[i] != '\n')
+        i++;
+    if (i == 0 || i >= len || req[i] != ' ')
+        return false;
+    i++;
+    if (i >= len || req[i] != '/')
+        return false;
+    *out = i;
+    return true;
+}
+
+static bool http_request_is_root_get(const u8 *req, u32 len)
+{
+    if (!req || len < 6)
+        return false;
+    if (req[0] != 'G' || req[1] != 'E' || req[2] != 'T' || req[3] != ' ')
+        return false;
+    if (req[4] != '/')
+        return false;
+    return req[5] == ' ' || req[5] == '?' || req[5] == '\r' || req[5] == '\n';
+}
+
+static bool http_request_path_is(const u8 *req, u32 len, const char *path)
+{
+    if (!req || !path || len < 6)
+        return false;
+    u32 i = 0;
+    if (!http_request_path_start(req, len, &i))
+        return false;
+    while (*path) {
+        if (i >= len || req[i++] != (u8)*path++)
+            return false;
+    }
+    return i < len && (req[i] == ' ' || req[i] == '?' || req[i] == '\r' || req[i] == '\n');
+}
+
+static u32 http_route_id(const u8 *req, u32 len)
+{
+    if (http_request_path_is(req, len, "/api/status"))
+        return HTTP_ROUTE_STATUS;
+    if (http_request_path_is(req, len, "/api/admin/reboot"))
+        return HTTP_ROUTE_REBOOT;
+    if (http_request_path_is(req, len, "/api/admin/log-stream") ||
+        http_request_path_is(req, len, "/api/logs") ||
+        http_request_path_is(req, len, "/logs"))
+        return HTTP_ROUTE_LOGS;
+    if (http_request_path_is(req, len, "/api/admin/kernel-update"))
+        return HTTP_ROUTE_UPDATE;
+    if (http_request_path_is(req, len, "/api/admin/hotpatch-kernel"))
+        return HTTP_ROUTE_HOTPATCH;
+    if (http_request_path_is(req, len, "/api/terminal") ||
+        http_request_path_is(req, len, "/api/process") ||
+        http_request_path_is(req, len, "/api/user") ||
+        http_request_path_is(req, len, "/api/walfs"))
+        return HTTP_ROUTE_PLACEHOLDER;
+    if (http_request_is_root_get(req, len))
+        return HTTP_ROUTE_ROOT;
+    return HTTP_ROUTE_NOT_FOUND;
+}
+
+static i32 http_hex_value(u8 c)
+{
+    if (c >= '0' && c <= '9') return (i32)(c - '0');
+    if (c >= 'a' && c <= 'f') return (i32)(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F') return (i32)(c - 'A' + 10);
+    return -1;
+}
+
+static bool http_query_value(const u8 *req, u32 len, const char *path,
+                             const char *key, char *out, u32 out_max)
+{
+    if (!out || out_max == 0 || !key)
+        return false;
+    out[0] = 0;
+    if (!http_request_path_is(req, len, path))
+        return false;
+
+    u32 i = 0;
+    if (!http_request_path_start(req, len, &i))
+        return false;
+    while (i < len && req[i] != '?' && req[i] != ' ' && req[i] != '\r' && req[i] != '\n')
+        i++;
+    if (i >= len || req[i] != '?')
+        return false;
+    i++;
+
+    while (i < len && req[i] != ' ' && req[i] != '\r' && req[i] != '\n') {
+        u32 k = 0;
+        u32 start = i;
+        bool key_bad = false;
+        while (i < len && req[i] != '=' && req[i] != '&' && req[i] != ' ' &&
+               req[i] != '\r' && req[i] != '\n') {
+            if (!key_bad && key[k] && req[i] == (u8)key[k])
+                k++;
+            else
+                key_bad = true;
+            i++;
+        }
+        bool match = !key_bad && key[k] == 0;
+        if (i < len && req[i] == '=') {
+            i++;
+            u32 o = 0;
+            while (i < len && req[i] != '&' && req[i] != ' ' &&
+                   req[i] != '\r' && req[i] != '\n') {
+                u8 c = req[i++];
+                if (c == '+') c = ' ';
+                else if (c == '%' && i + 1 < len) {
+                    i32 hi = http_hex_value(req[i]);
+                    i32 lo = http_hex_value(req[i + 1]);
+                    if (hi >= 0 && lo >= 0) {
+                        c = (u8)((hi << 4) | lo);
+                        i += 2;
+                    }
+                }
+                if (match && o + 1 < out_max)
+                    out[o++] = (char)c;
+            }
+            if (match) {
+                out[o] = 0;
+                return true;
+            }
+        } else {
+            i = start;
+            while (i < len && req[i] != '&' && req[i] != ' ' &&
+                   req[i] != '\r' && req[i] != '\n')
+                i++;
+        }
+        if (i < len && req[i] == '&')
+            i++;
+    }
+    return false;
+}
+
+static bool http_parse_u32(const char *s, u32 *out)
+{
+    if (!s || !*s || !out) return false;
+    u32 base = 10;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        base = 16;
+        s += 2;
+        if (!*s) return false;
+    }
+    u32 v = 0;
+    while (*s) {
+        u32 d;
+        char c = *s++;
+        if (c >= '0' && c <= '9') d = (u32)(c - '0');
+        else if (base == 16 && c >= 'a' && c <= 'f') d = (u32)(c - 'a' + 10);
+        else if (base == 16 && c >= 'A' && c <= 'F') d = (u32)(c - 'A' + 10);
+        else return false;
+        if (d >= base) return false;
+        v = v * base + d;
+    }
+    *out = v;
+    return true;
+}
+
+static void http_append_json_string(char *out, u32 *len, u32 max, const char *s)
+{
+    http_append(out, len, max, "\"");
+    if (s) {
+        while (*s && *len < max - 1) {
+            u8 c = (u8)*s++;
+            if (c == '"' || c == '\\') {
+                if (*len < max - 1) out[(*len)++] = '\\';
+                if (*len < max - 1) out[(*len)++] = (char)c;
+            } else if (c == '\n') {
+                http_append(out, len, max, "\\n");
+            } else if (c == '\r') {
+                http_append(out, len, max, "\\r");
+            } else if (c == '\t') {
+                http_append(out, len, max, "\\t");
+            } else if (c >= 32 && c < 127) {
+                out[(*len)++] = (char)c;
+            }
+        }
+        out[*len] = 0;
+    }
+    http_append(out, len, max, "\"");
+}
+
+static void http_append_json_bytes_text(char *out, u32 *len, u32 max, const u8 *data, u32 n)
+{
+    http_append(out, len, max, "\"");
+    static const char hx[] = "0123456789ABCDEF";
+    for (u32 i = 0; i < n && *len < max - 1; i++) {
+        u8 c = data[i];
+        if (c == '"' || c == '\\') {
+            if (*len < max - 1) out[(*len)++] = '\\';
+            if (*len < max - 1) out[(*len)++] = (char)c;
+        } else if (c == '\n') {
+            http_append(out, len, max, "\\n");
+        } else if (c == '\r') {
+            http_append(out, len, max, "\\r");
+        } else if (c == '\t') {
+            http_append(out, len, max, "\\t");
+        } else if (c >= 32 && c < 127) {
+            out[(*len)++] = (char)c;
+            out[*len] = 0;
+        } else {
+            http_append(out, len, max, "\\u00");
+            if (*len < max - 1) out[(*len)++] = hx[(c >> 4) & 0xF];
+            if (*len < max - 1) out[(*len)++] = hx[c & 0xF];
+            out[*len] = 0;
+        }
+    }
+    http_append(out, len, max, "\"");
+}
+
+static void http_append_hex8(char *out, u32 *len, u32 max, u8 v)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    char s[3] = { hx[(v >> 4) & 0xF], hx[v & 0xF], 0 };
+    http_append(out, len, max, s);
+}
+
+static void http_append_hex32(char *out, u32 *len, u32 max, u32 v)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    char s[9];
+    for (u32 i = 0; i < 8; i++)
+        s[i] = hx[(v >> ((7 - i) * 4)) & 0xF];
+    s[8] = 0;
+    http_append(out, len, max, s);
+}
+
+static void http_append_json_metric(char *out, u32 *len, u32 max,
+                                    const char *name, u64 value, bool comma)
+{
+    http_append(out, len, max, "\"");
+    http_append(out, len, max, name);
+    http_append(out, len, max, "\":");
+    http_append_u64(out, len, max, value);
+    if (comma) http_append(out, len, max, ",");
+}
+
+static u32 http_core_ram_used_kib(u32 core)
+{
+    struct core_env *e = core_env_of(core);
+    if (e->id == core && e->ram_base == (u8 *)(usize)core_ram_bases[core] &&
+        e->ram_end == e->ram_base + CORE_PRIV_SIZE &&
+        e->heap_ptr >= e->ram_base && e->heap_ptr <= e->ram_end)
+        return (u32)((usize)(e->heap_ptr - e->ram_base) >> 10);
+    return 0;
+}
+
+static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    (void)req;
+    (void)req_len;
+    u32 len = 0;
+    http_trace(HTTP_EVT_STATUS_ENTER, HTTP_ROUTE_STATUS, req_len, max);
+
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+
+    http_append(out, &len, max, "{\"ok\":true,\"version\":\"");
+    http_append(out, &len, max, PIOS_VERSION);
+    http_append(out, &len, max, "\",\"build\":\"");
+    http_append(out, &len, max, PIOS_BUILD_LABEL);
+    http_append(out, &len, max, "\",");
+    http_append_json_metric(out, &len, max, "uptime", timer_monotonic_ms() / 1000ULL, true);
+    http_append(out, &len, max, "\"ip\":\"192.168.218.101\",");
+    http_append(out, &len, max, "\"mode\":\"minimal-json-safe\",");
+    http_append(out, &len, max, "\"diag\":{");
+    http_append_json_metric(out, &len, max, "event", http_diag.event, true);
+    http_append_json_metric(out, &len, max, "route", http_diag.route, true);
+    http_append_json_metric(out, &len, max, "error", http_diag.error, true);
+    http_append_json_metric(out, &len, max, "conn", http_diag.conn, true);
+    http_append_json_metric(out, &len, max, "req", http_req_len, true);
+    http_append_json_metric(out, &len, max, "resp", http_resp_len, true);
+    http_append_json_metric(out, &len, max, "off", http_resp_off, true);
+    http_append_json_metric(out, &len, max, "body", http_diag.body_off, true);
+    http_append_json_metric(out, &len, max, "clen", http_diag.content_len, false);
+    http_append(out, &len, max, "}}");
+    http_append(out, &len, max, "\n");
+    http_trace(HTTP_EVT_STATUS_EXIT, HTTP_ROUTE_STATUS, len, max);
+    return len;
+}
+
+static bool http_query_cmd(const u8 *req, u32 len, char *out, u32 out_max)
+{
+    return http_query_value(req, len, "/api/terminal", "cmd", out, out_max) && out[0] != 0;
+}
+
+static bool http_streq(const char *a, const char *b)
+{
+    if (!a || !b)
+        return false;
+    while (*a && *b) {
+        if (*a != *b)
+            return false;
+        a++;
+        b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static bool http_starts_with(const char *s, const char *prefix)
+{
+    if (!s || !prefix) return false;
+    while (*prefix) {
+        if (*s++ != *prefix++) return false;
+    }
+    return true;
+}
+
+static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    char cmd[32];
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+
+    if (!http_query_cmd(req, req_len, cmd, sizeof(cmd)))
+        http_append(out, &len, max, "usage: /api/terminal?cmd=<help|status|netstat|processes|users|kill pid|restart pid>\n");
+    else if (http_streq(cmd, "help"))
+        http_append(out, &len, max, "commands: help status netstat processes users kill <pid> restart <pid>\nauth gates will be restored later\n");
+    else if (http_streq(cmd, "status")) {
+        nic_packet_counters_t pc;
+        nic_packet_counters(&pc);
+        http_append(out, &len, max, "PIOS ");
+        http_append(out, &len, max, PIOS_BUILD_LABEL);
+        http_append(out, &len, max, "\nuptime=");
+        http_append_u64(out, &len, max, timer_monotonic_ms() / 1000ULL);
+        http_append(out, &len, max, "s\nrx=");
+        http_append_u64(out, &len, max, pc.rx_total);
+        http_append(out, &len, max, " tx=");
+        http_append_u64(out, &len, max, pc.tx_total);
+        http_append(out, &len, max, " flood=");
+        http_append_u64(out, &len, max, pc.flood_blocked);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "netstat")) {
+        const tcp_diag_t *td = tcp_diag();
+        http_append(out, &len, max, "Proto Port Owner        State\n");
+        http_append(out, &len, max, "tcp   7    kernel/echo  LISTEN\n");
+        http_append(out, &len, max, "tcp   80   kernel/http  LISTEN\n");
+        http_append(out, &len, max, "tcp   2323 kernel/debug LISTEN\n");
+        http_append(out, &len, max, "syn=");
+        http_append_u64(out, &len, max, td->syn_seen);
+        http_append(out, &len, max, " synack=");
+        http_append_u64(out, &len, max, td->synack_sent);
+        http_append(out, &len, max, " accepted=");
+        http_append_u64(out, &len, max, td->accepted);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "processes")) {
+        struct proc_ui_entry snap[MAX_PROCS_PER_CORE];
+        u32 n = proc_snapshot(snap, MAX_PROCS_PER_CORE);
+        http_append(out, &len, max, "PID        CORE STATE    PRI      CPU MEMK IMAGE\n");
+        for (u32 i = 0; i < n; i++) {
+            http_append_u64(out, &len, max, snap[i].pid);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, snap[i].affinity_core);
+            http_append(out, &len, max, " ");
+            http_append(out, &len, max, ui_proc_state_str(snap[i].state));
+            http_append(out, &len, max, " ");
+            http_append(out, &len, max, ui_priority_str(snap[i].priority_class));
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, snap[i].cpu_percent);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, snap[i].mem_kib);
+            http_append(out, &len, max, " ");
+            http_append(out, &len, max, snap[i].image_path);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "users")) {
+        struct principal_ui_entry users[PRINCIPAL_MAX];
+        u32 n = principal_snapshot(users, PRINCIPAL_MAX);
+        http_append(out, &len, max, "ID FLAGS NAME\n");
+        for (u32 i = 0; i < n; i++) {
+            http_append_u64(out, &len, max, users[i].id);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, users[i].flags);
+            http_append(out, &len, max, " ");
+            http_append(out, &len, max, users[i].name);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "kill ")) {
+        u32 pid = 0;
+        if (http_parse_u32(cmd + 5, &pid) && proc_kill_pid(pid, 0xFFFF5002U))
+            http_append(out, &len, max, "killed\n");
+        else
+            http_append(out, &len, max, "kill failed\n");
+    } else if (http_starts_with(cmd, "restart ")) {
+        u32 pid = 0;
+        i32 new_pid = -1;
+        if (http_parse_u32(cmd + 8, &pid))
+            new_pid = proc_restart_pid(pid, 0xFFFF5003U);
+        if (new_pid > 0) {
+            http_append(out, &len, max, "restarted new_pid=");
+            http_append_u64(out, &len, max, (u32)new_pid);
+            http_append(out, &len, max, "\n");
+        } else {
+            http_append(out, &len, max, "restart failed\n");
+        }
+    } else {
+        http_append(out, &len, max, "unknown command\n");
+    }
+    return len;
+}
+
+static void http_append_action_result(char *out, u32 *len, u32 max,
+                                      const char *action, bool ok,
+                                      const char *message)
+{
+    http_append(out, len, max, "{\"ok\":");
+    http_append(out, len, max, ok ? "true" : "false");
+    http_append(out, len, max, ",\"action\":");
+    http_append_json_string(out, len, max, action ? action : "");
+    http_append(out, len, max, ",\"message\":");
+    http_append_json_string(out, len, max, message ? message : "");
+}
+
+static u32 http_build_process_action_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    char action[16];
+    char pid_s[16];
+    char path[96];
+    char core_s[8];
+    char principal_s[16];
+    char prio_s[8];
+    u32 pid = 0;
+    i32 new_pid = -1;
+    bool ok = false;
+    const char *message = "bad request";
+
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+
+    if (!http_query_value(req, req_len, "/api/process", "action", action, sizeof(action))) {
+        http_append_action_result(out, &len, max, "", false, "missing action");
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+
+    if (ui_streq(action, "kill") || ui_streq(action, "restart")) {
+        if (!http_query_value(req, req_len, "/api/process", "pid", pid_s, sizeof(pid_s)) ||
+            !http_parse_u32(pid_s, &pid)) {
+            message = "invalid pid";
+        } else if (ui_streq(action, "kill")) {
+            ok = proc_kill_pid(pid, 0xFFFF5000U);
+            message = ok ? "killed" : "kill failed";
+        } else {
+            new_pid = proc_restart_pid(pid, 0xFFFF5001U);
+            ok = new_pid > 0;
+            message = ok ? "restarted" : "restart failed";
+        }
+    } else if (ui_streq(action, "launch")) {
+        u32 core = CORE_USERM;
+        u32 principal_id = principal_current();
+        u32 priority = PROC_PRIO_NORMAL;
+        if (!http_query_value(req, req_len, "/api/process", "path", path, sizeof(path))) {
+            message = "missing path";
+        } else {
+            if (http_query_value(req, req_len, "/api/process", "core", core_s, sizeof(core_s))) {
+                if (core_s[0] == '2') core = CORE_USER0;
+                else if (core_s[0] == '3') core = CORE_USER1;
+                else core = CORE_USERM;
+            }
+            if (http_query_value(req, req_len, "/api/process", "principal", principal_s, sizeof(principal_s)))
+                (void)http_parse_u32(principal_s, &principal_id);
+            if (http_query_value(req, req_len, "/api/process", "prio", prio_s, sizeof(prio_s)))
+                (void)http_parse_u32(prio_s, &priority);
+            new_pid = proc_launch_on_core_as_prio(core, path, principal_id, priority);
+            ok = new_pid > 0;
+            message = ok ? "launched" : "launch failed";
+        }
+    } else {
+        message = "unknown action";
+    }
+
+    http_append_action_result(out, &len, max, action, ok, message);
+    if (pid) {
+        http_append(out, &len, max, ",\"pid\":");
+        http_append_u64(out, &len, max, pid);
+    }
+    if (new_pid > 0) {
+        http_append(out, &len, max, ",\"newPid\":");
+        http_append_u64(out, &len, max, (u32)new_pid);
+    }
+    http_append(out, &len, max, "}\n");
+    return len;
+}
+
+static u32 http_build_user_action_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    char action[16];
+    char name[32];
+    char pass[48];
+    char flags_s[16];
+    u32 flags = PRINCIPAL_EXEC;
+    bool ok = false;
+    const char *message = "bad request";
+
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+
+    if (!http_query_value(req, req_len, "/api/user", "action", action, sizeof(action))) {
+        http_append_action_result(out, &len, max, "", false, "missing action");
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+    if (!http_query_value(req, req_len, "/api/user", "name", name, sizeof(name))) {
+        http_append_action_result(out, &len, max, action, false, "missing name");
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+
+    if (ui_streq(action, "create")) {
+        if (!http_query_value(req, req_len, "/api/user", "pass", pass, sizeof(pass))) {
+            message = "missing password";
+        } else {
+            if (http_query_value(req, req_len, "/api/user", "flags", flags_s, sizeof(flags_s)))
+                (void)http_parse_u32(flags_s, &flags);
+            ok = principal_create(name, pass, flags);
+            message = ok ? "created" : "create failed";
+        }
+    } else if (ui_streq(action, "passwd")) {
+        if (!http_query_value(req, req_len, "/api/user", "pass", pass, sizeof(pass))) {
+            message = "missing password";
+        } else {
+            ok = principal_set_password(name, pass);
+            message = ok ? "password updated" : "password update failed";
+        }
+    } else if (ui_streq(action, "flags")) {
+        if (!http_query_value(req, req_len, "/api/user", "flags", flags_s, sizeof(flags_s)) ||
+            !http_parse_u32(flags_s, &flags)) {
+            message = "invalid flags";
+        } else {
+            ok = principal_set_flags(name, flags);
+            message = ok ? "flags updated" : "flags update failed";
+        }
+    } else {
+        message = "unknown action";
+    }
+
+    http_append_action_result(out, &len, max, action, ok, message);
+    http_append(out, &len, max, "}\n");
+    return len;
+}
+
+static u32 http_build_logs_response(char *out, u32 max)
+{
+    u32 len = 0;
+    static struct proc_log_ui_entry logs[16];
+    u32 n = proc_log_snapshot(logs, 16);
+
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    http_append(out, &len, max, "{\"version\":\"");
+    http_append(out, &len, max, PIOS_VERSION);
+    http_append(out, &len, max, "\",\"build\":\"");
+    http_append(out, &len, max, PIOS_BUILD_LABEL);
+    http_append(out, &len, max, "\",\"uptime\":");
+    http_append_u64(out, &len, max, timer_monotonic_ms() / 1000ULL);
+    http_append(out, &len, max, ",\"http\":{");
+    http_append_json_metric(out, &len, max, "accepts", http_diag.accepts, true);
+    http_append_json_metric(out, &len, max, "reads", http_diag.reads, true);
+    http_append_json_metric(out, &len, max, "built", http_diag.built, true);
+    http_append_json_metric(out, &len, max, "writes", http_diag.write_calls, true);
+    http_append_json_metric(out, &len, max, "writeBytes", http_diag.write_bytes, true);
+    http_append_json_metric(out, &len, max, "closes", http_diag.closes, true);
+    http_append_json_metric(out, &len, max, "aborts", http_diag.aborts, true);
+    http_append_json_metric(out, &len, max, "notFound", http_diag.not_found, false);
+    http_append(out, &len, max, "},\"entries\":[");
+    for (u32 i = 0; i < n; i++) {
+        if (i) http_append(out, &len, max, ",");
+        http_append(out, &len, max, "{\"core\":"); http_append_u64(out, &len, max, logs[i].core);
+        http_append(out, &len, max, ",\"seq\":"); http_append_u64(out, &len, max, logs[i].seq);
+        http_append(out, &len, max, ",\"level\":"); http_append_u64(out, &len, max, logs[i].level);
+        http_append(out, &len, max, ",\"msg\":"); http_append_json_string(out, &len, max, logs[i].msg);
+        http_append(out, &len, max, "}");
+    }
+    http_append(out, &len, max, "]}\n");
+    return len;
+}
+
+struct http_walfs_dir_ctx {
+    char *out;
+    u32 *len;
+    u32 max;
+    u32 count;
+};
+
+static struct http_walfs_dir_ctx http_walfs_dir;
+
+static void http_walfs_readdir_cb(const struct walfs_dirent *entry)
+{
+    if (!entry || http_walfs_dir.count >= 64)
+        return;
+    struct walfs_inode ino;
+    if (!walfs_stat(entry->child_id, &ino))
+        return;
+    if (http_walfs_dir.count)
+        http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, ",");
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, "{\"name\":");
+    http_append_json_string(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, (const char *)entry->name);
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, ",\"id\":");
+    http_append_u64(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, entry->child_id);
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, ",\"size\":");
+    http_append_u64(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, ino.size);
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, ",\"dir\":");
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, (ino.flags & WALFS_DIR) ? "true" : "false");
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, ",\"flags\":");
+    http_append_u64(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, ino.flags);
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, "}");
+    http_walfs_dir.count++;
+}
+
+static void http_append_walfs_hex(char *out, u32 *len, u32 max, const u8 *buf, u32 n, u32 base_off)
+{
+    http_append(out, len, max, "\"");
+    for (u32 off = 0; off < n; off += 16) {
+        if (off) http_append(out, len, max, "\\n");
+        http_append_hex32(out, len, max, base_off + off);
+        http_append(out, len, max, ": ");
+        for (u32 i = 0; i < 16; i++) {
+            if (off + i < n) {
+                http_append_hex8(out, len, max, buf[off + i]);
+                http_append(out, len, max, " ");
+            } else {
+                http_append(out, len, max, "   ");
+            }
+        }
+        http_append(out, len, max, " ");
+        for (u32 i = 0; i < 16 && off + i < n; i++) {
+            u8 c = buf[off + i];
+            char s[2] = { (c >= 32 && c < 127) ? (char)c : '.', 0 };
+            if (c == '"' || c == '\\')
+                s[0] = '.';
+            http_append(out, len, max, s);
+        }
+    }
+    http_append(out, len, max, "\"");
+}
+
+static u32 http_build_walfs_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    char path[256];
+    char mode[12];
+    char off_s[16];
+    char max_s[16];
+    u32 offset = 0;
+    u32 want = 768;
+    static u8 buf[1024];
+
+    if (!http_query_value(req, req_len, "/api/walfs", "path", path, sizeof(path))) {
+        u32 p = 0;
+        http_append(path, &p, sizeof(path), "/");
+    }
+    if (!http_query_value(req, req_len, "/api/walfs", "mode", mode, sizeof(mode))) {
+        u32 m = 0;
+        http_append(mode, &m, sizeof(mode), "dir");
+    }
+    if (http_query_value(req, req_len, "/api/walfs", "offset", off_s, sizeof(off_s)))
+        (void)http_parse_u32(off_s, &offset);
+    if (http_query_value(req, req_len, "/api/walfs", "max", max_s, sizeof(max_s)))
+        (void)http_parse_u32(max_s, &want);
+    if (want == 0 || want > sizeof(buf))
+        want = 768;
+
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+
+    if (path[0] != '/') {
+        http_append(out, &len, max, "{\"ok\":false,\"error\":\"path must be absolute\"}\n");
+        return len;
+    }
+    u64 id = walfs_find(path);
+    struct walfs_inode ino;
+    if (!id || !walfs_stat(id, &ino)) {
+        http_append(out, &len, max, "{\"ok\":false,\"error\":\"path not found\",\"path\":");
+        http_append_json_string(out, &len, max, path);
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+
+    http_append(out, &len, max, "{\"ok\":true,\"path\":");
+    http_append_json_string(out, &len, max, path);
+    http_append(out, &len, max, ",\"id\":"); http_append_u64(out, &len, max, id);
+    http_append(out, &len, max, ",\"name\":"); http_append_json_string(out, &len, max, (const char *)ino.name);
+    http_append(out, &len, max, ",\"size\":"); http_append_u64(out, &len, max, ino.size);
+    http_append(out, &len, max, ",\"flags\":"); http_append_u64(out, &len, max, ino.flags);
+    http_append(out, &len, max, ",\"modeBits\":"); http_append_u64(out, &len, max, ino.mode);
+    http_append(out, &len, max, ",\"dir\":");
+    http_append(out, &len, max, (ino.flags & WALFS_DIR) ? "true" : "false");
+
+    if (ino.flags & WALFS_DIR) {
+        http_append(out, &len, max, ",\"entries\":[");
+        http_walfs_dir.out = out;
+        http_walfs_dir.len = &len;
+        http_walfs_dir.max = max;
+        http_walfs_dir.count = 0;
+        walfs_readdir(id, http_walfs_readdir_cb);
+        http_append(out, &len, max, "],\"count\":");
+        http_append_u64(out, &len, max, http_walfs_dir.count);
+    } else {
+        if (offset > ino.size)
+            offset = (u32)ino.size;
+        u32 remain = (u32)((ino.size - offset) > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (ino.size - offset));
+        u32 n = remain < want ? remain : want;
+        n = walfs_read(id, offset, buf, n);
+        http_append(out, &len, max, ",\"offset\":"); http_append_u64(out, &len, max, offset);
+        http_append(out, &len, max, ",\"read\":"); http_append_u64(out, &len, max, n);
+        http_append(out, &len, max, ",\"view\":");
+        http_append_json_string(out, &len, max, ui_streq(mode, "hex") ? "hex" : "text");
+        if (ui_streq(mode, "hex")) {
+            http_append(out, &len, max, ",\"data\":");
+            http_append_walfs_hex(out, &len, max, buf, n, offset);
+        } else {
+            http_append(out, &len, max, ",\"data\":");
+            http_append_json_bytes_text(out, &len, max, buf, n);
+        }
+    }
+    http_append(out, &len, max, "}\n");
+    return len;
+}
+
+extern u8 _start;
+extern u8 __bss_start;
+
+static bool http_confirmed(const u8 *req, u32 req_len, const char *path)
+{
+    char confirm[8];
+    return http_query_value(req, req_len, path, "confirm", confirm, sizeof(confirm)) &&
+           http_streq(confirm, "1");
+}
+
+static u32 http_query_u32_default(const u8 *req, u32 req_len, const char *path,
+                                  const char *key, u32 def)
+{
+    char tmp[16];
+    u32 v = def;
+    if (http_query_value(req, req_len, path, key, tmp, sizeof(tmp)))
+        (void)http_parse_u32(tmp, &v);
+    return v;
+}
+
+static bool http_update_query_value(const u8 *req, u32 req_len, const char *key,
+                                    char *out, u32 out_max)
+{
+    return http_query_value(req, req_len, "/api/admin/kernel-update", key, out, out_max) ||
+           http_query_value(req, req_len, "/", key, out, out_max);
+}
+
+static bool http_update_confirmed(const u8 *req, u32 req_len)
+{
+    char confirm[8];
+    return http_update_query_value(req, req_len, "confirm", confirm, sizeof(confirm)) &&
+           http_streq(confirm, "1");
+}
+
+static u32 http_update_query_u32_default(const u8 *req, u32 req_len,
+                                         const char *key, u32 def)
+{
+    char tmp[16];
+    u32 v = def;
+    if (http_update_query_value(req, req_len, key, tmp, sizeof(tmp)))
+        (void)http_parse_u32(tmp, &v);
+    return v;
+}
+
+static u32 http_running_kernel_image_len(void)
+{
+    u64 start = (u64)(usize)&_start;
+    u64 end = (u64)(usize)&__bss_start;
+    if (end <= start || (end - start) > 0xFFFFFFFFULL)
+        return 0;
+    return (u32)(end - start);
+}
+
+static bool http_write_kernel_slot_range(u32 offset, const u8 *data, u32 len,
+                                         u32 *out_written)
+{
+    static u8 block[SD_BLOCK_SIZE] ALIGNED(64);
+    if (out_written) *out_written = 0;
+    if (!data && len != 0)
+        return false;
+    if (offset > HOTPATCH_SLOT_BYTES || len > HOTPATCH_SLOT_BYTES - offset)
+        return false;
+
+    u32 base_lba = walfs_partition_lba();
+    u32 pos = offset;
+    u32 written = 0;
+    while (written < len) {
+        u32 sector_off = pos % SD_BLOCK_SIZE;
+        u32 n = SD_BLOCK_SIZE - sector_off;
+        if (n > len - written)
+            n = len - written;
+        u32 lba = base_lba + (pos / SD_BLOCK_SIZE);
+        if (sector_off == 0 && n == SD_BLOCK_SIZE) {
+            if (!sd_write_block(lba, data + written))
+                return false;
+        } else {
+            if (!sd_read_block(lba, block))
+                simd_zero(block, sizeof(block));
+            simd_memcpy(block + sector_off, data + written, n);
+            if (!sd_write_block(lba, block))
+                return false;
+        }
+        pos += n;
+        written += n;
+    }
+    if (out_written) *out_written = written;
+    return true;
+}
+
+static bool http_write_kernel_slot_header(u32 payload_len, bool valid)
+{
+    static u8 header[SD_BLOCK_SIZE] ALIGNED(64);
+    u32 written = 0;
+    u32 magic = valid ? HOTPATCH_SLOT_MAGIC : 0U;
+    simd_zero(header, sizeof(header));
+    header[0] = (u8)(magic & 0xFF);
+    header[1] = (u8)((magic >> 8) & 0xFF);
+    header[2] = (u8)((magic >> 16) & 0xFF);
+    header[3] = (u8)((magic >> 24) & 0xFF);
+    header[4] = (u8)(payload_len & 0xFF);
+    header[5] = (u8)((payload_len >> 8) & 0xFF);
+    header[6] = (u8)((payload_len >> 16) & 0xFF);
+    header[7] = (u8)((payload_len >> 24) & 0xFF);
+    return http_write_kernel_slot_range(0, header, SD_BLOCK_SIZE, &written) &&
+           written == SD_BLOCK_SIZE;
+}
+
+static bool http_write_kernel_payload_range(u32 offset, const u8 *data, u32 len,
+                                            u32 *out_written)
+{
+    if (offset > HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE ||
+        len > (HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE) - offset)
+        return false;
+    return http_write_kernel_slot_range(SD_BLOCK_SIZE + offset, data, len,
+                                        out_written);
+}
+
+static bool http_write_kernel_slot_image(const u8 *data, u32 len, u32 *out_written)
+{
+    if (out_written) *out_written = 0;
+    if (!data || len == 0 || len > HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE)
+        return false;
+    u32 written = 0;
+    if (!http_write_kernel_slot_header(len, false))
+        return false;
+    if (!http_write_kernel_payload_range(0, data, len, &written))
+        return false;
+    if (written != len)
+        return false;
+    if (!http_write_kernel_slot_header(len, true))
+        return false;
+    if (out_written) *out_written = len;
+    return true;
+}
+
+static u32 http_build_reboot_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    bool confirmed = http_confirmed(req, req_len, "/api/admin/reboot");
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    if (!confirmed) {
+        http_append(out, &len, max,
+            "{\"ok\":false,\"error\":\"requires confirm=1\",\"endpoint\":\"/api/admin/reboot\"}\n");
+        return len;
+    }
+    http_reboot_pending = true;
+    http_log_event("reboot-queued", 0, 0);
+    http_append(out, &len, max,
+        "{\"ok\":true,\"message\":\"reboot queued after HTTP response close\"}\n");
+    return len;
+}
+
+static u32 http_build_log_stream_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    u32 since = http_query_u32_default(req, req_len, "/api/admin/log-stream", "since", 0);
+    if (since == 0)
+        since = http_query_u32_default(req, req_len, "/logs", "since", 0);
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    http_append(out, &len, max, "PIOS log-stream next=");
+    http_append_u64(out, &len, max, http_log_seq);
+    http_append(out, &len, max, "\n");
+    u32 start = http_log_seq > HTTP_LOG_RING_SIZE ? http_log_seq - HTTP_LOG_RING_SIZE : 0;
+    if (since > start) start = since;
+    for (u32 seq = start; seq < http_log_seq; seq++) {
+        struct http_log_entry *e = &http_log_ring[seq % HTTP_LOG_RING_SIZE];
+        if (e->seq != seq)
+            continue;
+        http_append_u64(out, &len, max, e->seq);
+        http_append(out, &len, max, " t=");
+        http_append_u64(out, &len, max, e->tick_ms);
+        http_append(out, &len, max, " ");
+        http_append(out, &len, max, e->event ? e->event : "?");
+        http_append(out, &len, max, " a=");
+        http_append_u64(out, &len, max, e->a);
+        http_append(out, &len, max, " b=");
+        http_append_u64(out, &len, max, e->b);
+        http_append(out, &len, max, "\n");
+    }
+    return len;
+}
+
+static u32 http_build_hotpatch_kernel_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    bool confirmed = http_confirmed(req, req_len, "/api/admin/hotpatch-kernel");
+    char target[12];
+    u32 image_len = http_running_kernel_image_len();
+    u32 written = 0;
+    u32 capacity = HOTPATCH_SLOT_BYTES;
+    bool ok = false;
+    const char *error = NULL;
+
+    if (!http_query_value(req, req_len, "/api/admin/hotpatch-kernel", "target",
+                          target, sizeof(target))) {
+        u32 target_len = 0;
+        http_append(target, &target_len, sizeof(target), "slot");
+    }
+
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    if (!confirmed) {
+        http_append(out, &len, max,
+            "{\"ok\":false,\"error\":\"requires confirm=1\",\"endpoint\":\"/api/admin/hotpatch-kernel\"}\n");
+        return len;
+    }
+
+    if (ui_streq(target, "slot")) {
+        capacity = HOTPATCH_SLOT_BYTES;
+        if (image_len == 0 || image_len > HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE) {
+            error = "image does not fit raw bootstrap slot";
+        } else {
+            ok = http_write_kernel_slot_image((const u8 *)(usize)&_start,
+                                              image_len, &written);
+            if (!ok) error = "raw slot write failed";
+        }
+    } else {
+        error = "unsupported target; use target=slot";
+    }
+
+    http_append(out, &len, max, "{\"ok\":");
+    http_append(out, &len, max, ok ? "true" : "false");
+    http_append(out, &len, max, ",\"target\":");
+    http_append_json_string(out, &len, max, target);
+    http_append(out, &len, max, ",\"path\":\"raw-partition2-kernel-slot\",\"imageBytes\":");
+    http_append_u64(out, &len, max, image_len);
+    http_append(out, &len, max, ",\"written\":");
+    http_append_u64(out, &len, max, written);
+    http_append(out, &len, max, ",\"capacity\":");
+    http_append_u64(out, &len, max, capacity);
+    http_append(out, &len, max, ",\"slotLba\":");
+    http_append_u64(out, &len, max, walfs_partition_lba());
+    http_append(out, &len, max, ",\"slotBytes\":");
+    http_append_u64(out, &len, max, HOTPATCH_SLOT_BYTES);
+    if (!ok && error) {
+        http_append(out, &len, max, ",\"error\":");
+        http_append_json_string(out, &len, max, error);
+    }
+    http_append(out, &len, max, ",\"bootstrapPlan\":\"kernel8.img becomes stable bootstrap; real kernel lives in partition-2 raw 2MiB slot; WALFS starts 10MiB after partition root\"");
+    http_append(out, &len, max, "}\n");
+    return len;
+}
+
+static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    bool confirmed = http_update_confirmed(req, req_len);
+    u32 body_off = http_header_body_offset(req, req_len);
+    u32 body_len = 0;
+    u32 content_len = 0;
+    bool has_content_len = false;
+    char action[16];
+    u32 offset = http_update_query_u32_default(req, req_len, "offset", 0);
+    u32 total = http_update_query_u32_default(req, req_len, "total", 0);
+    u32 written = 0;
+    u32 capacity = HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE;
+    bool ok = false;
+    const char *error = NULL;
+
+    action[0] = 0;
+    (void)http_update_query_value(req, req_len, "action", action, sizeof(action));
+    if (body_off != 0 && body_off <= req_len)
+        body_len = req_len - body_off;
+    if (body_off != 0)
+        has_content_len = http_content_length(req, body_off, &content_len);
+
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    if (!confirmed) {
+        http_append(out, &len, max,
+            "{\"ok\":false,\"error\":\"requires confirm=1\",\"endpoint\":\"/api/admin/kernel-update\"}\n");
+        return len;
+    }
+
+    if (action[0] == 0 && body_len > 0) {
+        action[0] = 'c';
+        action[1] = 'h';
+        action[2] = 'u';
+        action[3] = 'n';
+        action[4] = 'k';
+        action[5] = 0;
+    }
+
+    if (action[0] == 0 || http_streq(action, "status")) {
+        ok = true;
+    } else if (http_streq(action, "self")) {
+        u32 image_len = http_running_kernel_image_len();
+        ok = image_len != 0 &&
+             http_write_kernel_slot_image((const u8 *)(usize)&_start,
+                                          image_len, &written);
+        if (!ok) error = "self-update raw slot write failed";
+        else {
+            ota_update.active = false;
+            ota_update.total = image_len;
+            ota_update.received = image_len;
+        }
+    } else if (http_streq(action, "begin")) {
+        if (total == 0 || total > capacity) {
+            error = "invalid total; must fit raw payload slot";
+        } else if (!http_write_kernel_slot_header(total, false)) {
+            error = "failed to invalidate slot header";
+        } else {
+            ota_update.active = true;
+            ota_update.total = total;
+            ota_update.received = 0;
+            ota_update.chunks = 0;
+            ota_update.last_error = NULL;
+            ok = true;
+            http_log_event("ota-begin", total, walfs_partition_lba());
+        }
+    } else if (http_streq(action, "chunk") || http_streq(action, "data")) {
+        if (!ota_update.active) {
+            error = "no OTA update active; call action=begin first";
+        } else if (total != 0 && total != ota_update.total) {
+            error = "total does not match active OTA update";
+        } else if (!has_content_len) {
+            error = "chunk requires Content-Length";
+        } else if (body_len != content_len) {
+            error = "incomplete or truncated chunk body";
+        } else if (body_len == 0) {
+            error = "empty chunk";
+        } else if (body_len > ADMIN_HTTP_REQ_MAX - 512U) {
+            error = "chunk too large for request buffer";
+        } else if (offset > ota_update.received) {
+            error = "chunk offset is ahead of next expected byte";
+        } else if (offset > ota_update.total || body_len > ota_update.total - offset) {
+            error = "chunk exceeds declared total";
+        } else {
+            u32 skip = ota_update.received - offset;
+            if (skip >= body_len) {
+                written = body_len;
+                ok = true;
+            } else {
+                u32 new_len = body_len - skip;
+                ok = http_write_kernel_payload_range(ota_update.received,
+                                                    req + body_off + skip,
+                                                    new_len, &written);
+                if (ok && written == new_len) {
+                    ota_update.received += written;
+                    written = body_len;
+                } else {
+                    error = "raw slot payload write failed";
+                    ok = false;
+                }
+            }
+            if (ok) {
+                ota_update.chunks++;
+                if ((ota_update.chunks & 0x3FU) == 1U || ota_update.received == ota_update.total)
+                    http_log_event("ota-chunk", ota_update.received, ota_update.total);
+            }
+        }
+    } else if (http_streq(action, "commit")) {
+        if (!ota_update.active) {
+            error = "no OTA update active";
+        } else if (total != 0 && total != ota_update.total) {
+            error = "total does not match active OTA update";
+        } else if (ota_update.received != ota_update.total) {
+            error = "OTA image incomplete";
+        } else if (!http_write_kernel_slot_header(ota_update.received, true)) {
+            error = "failed to commit slot header";
+        } else {
+            ok = true;
+            ota_update.active = false;
+            ota_update.commits++;
+            http_log_event("ota-commit", ota_update.received, ota_update.commits);
+            char reboot[8];
+            if (http_update_query_value(req, req_len, "reboot", reboot, sizeof(reboot)) &&
+                http_streq(reboot, "1"))
+                http_reboot_pending = true;
+        }
+    } else if (http_streq(action, "cancel")) {
+        ota_update.active = false;
+        ota_update.last_error = "cancelled";
+        ok = true;
+        http_log_event("ota-cancel", ota_update.received, ota_update.total);
+    } else {
+        error = "unknown action; use status, begin, chunk, commit, cancel, or self";
+    }
+
+    if (!ok && error) {
+        ota_update.errors++;
+        ota_update.last_error = error;
+        http_log_event("ota-error", offset, body_len);
+    }
+
+    http_append(out, &len, max, "{\"ok\":");
+    http_append(out, &len, max, ok ? "true" : "false");
+    http_append(out, &len, max, ",\"action\":");
+    http_append_json_string(out, &len, max, action[0] ? action : "status");
+    http_append(out, &len, max, ",\"offset\":");
+    http_append_u64(out, &len, max, offset);
+    http_append(out, &len, max, ",\"bodyBytes\":");
+    http_append_u64(out, &len, max, body_len);
+    http_append(out, &len, max, ",\"written\":");
+    http_append_u64(out, &len, max, written);
+    http_append(out, &len, max, ",\"capacity\":");
+    http_append_u64(out, &len, max, capacity);
+    http_append(out, &len, max, ",\"total\":");
+    http_append_u64(out, &len, max, ota_update.total);
+    http_append(out, &len, max, ",\"received\":");
+    http_append_u64(out, &len, max, ota_update.received);
+    http_append(out, &len, max, ",\"nextOffset\":");
+    http_append_u64(out, &len, max, ota_update.received);
+    http_append(out, &len, max, ",\"active\":");
+    http_append(out, &len, max, ota_update.active ? "true" : "false");
+    http_append(out, &len, max, ",\"chunks\":");
+    http_append_u64(out, &len, max, ota_update.chunks);
+    http_append(out, &len, max, ",\"commits\":");
+    http_append_u64(out, &len, max, ota_update.commits);
+    http_append(out, &len, max, ",\"errors\":");
+    http_append_u64(out, &len, max, ota_update.errors);
+    http_append(out, &len, max, ",\"slotLba\":");
+    http_append_u64(out, &len, max, walfs_partition_lba());
+    if (error) {
+        http_append(out, &len, max, ",\"error\":");
+        http_append_json_string(out, &len, max, error);
+    } else if (ota_update.last_error) {
+        http_append(out, &len, max, ",\"lastError\":");
+        http_append_json_string(out, &len, max, ota_update.last_error);
+    }
+    http_append(out, &len, max, "}\n");
+    return len;
+}
+
+static u32 http_build_safe_placeholder_response(char *out, u32 max, const char *name)
+{
+    u32 len = 0;
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    http_append(out, &len, max, name);
+    http_append(out, &len, max,
+        " is visible in the tabbed console but its live data path is disabled "
+        "until the snapshot code is re-enabled defensively.\n");
+    return len;
+}
+
+static u32 http_build_spa_response(char *out, u32 max)
+{
+    u32 len = 0;
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n"
+        "<!doctype html><html><head><meta charset='utf-8'><title>PIOS Admin</title>"
+        "<style>:root{--bs-font-sans:'Segoe UI',Aptos,Calibri,sans-serif;--bs-font-mono:Consolas,'Courier New',monospace;--bs-body-bg:#0f172a;--bs-body-color:#f1f5f9;--bs-secondary-color:#94a3b8;--bs-primary:#6366f1;--bs-light:#1e293b;--bs-dark:#020617;--bs-border-color:#334155;--bs-danger:#ef4444}body{margin:0;background:var(--bs-body-bg);color:var(--bs-body-color);font-family:var(--bs-font-sans)}.wrap{padding:24px}.tabs button,.bt{border:1px solid var(--bs-border-color);background:var(--bs-dark);color:var(--bs-body-color);border-radius:10px;padding:8px 12px;margin:4px}.tabs button.act{background:var(--bs-primary)}.danger{background:var(--bs-danger)}.cd{background:var(--bs-light);border:1px solid var(--bs-border-color);border-radius:16px;padding:16px;margin:12px 0}input{background:var(--bs-dark);color:var(--bs-body-color);border:1px solid var(--bs-border-color);border-radius:10px;padding:8px}pre,code{font-family:var(--bs-font-mono)}pre{white-space:pre-wrap}</style></head><body><div class='wrap'><h1>PIOS Admin Console</h1><p id='sub'>Lazy tabs; no polling.</p><div class='tabs'><button class='act' data-t='overview'>Overview</button><button data-t='processes'>Processes</button><button data-t='netstat'>Netstat</button><button data-t='system'>System</button><button data-t='users'>Users</button><button data-t='logs'>Logs</button><button data-t='walfs'>WALFS</button><button data-t='terminal'>Terminal</button><button data-t='admin'>Admin</button></div><div id='app'></div></div>");
+    http_append(out, &len, max,
+        "<script>let tab='overview';const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}async function txt(u){let r=await fetch(u);return await r.text()}async function js(u){let r=await fetch(u);return await r.json()}function pre(t,h){app.innerHTML=card(t,`<pre>${esc(h)}</pre>`)}async function draw(){sub.textContent='Loading '+tab+'...';try{if(tab==='overview'){let d=await js('/api/status');pre('Overview',JSON.stringify(d,null,2))}else if(tab==='system'){pre('System',await txt('/api/terminal?cmd=status'))}else if(tab==='netstat'){pre('Netstat',await txt('/api/terminal?cmd=netstat'))}else if(tab==='processes'){pre('Processes',await txt('/api/terminal?cmd=processes'))}else if(tab==='users'){pre('Users',await txt('/api/terminal?cmd=users'))}else if(tab==='logs'){let a=await txt('/api/admin/log-stream'),b=await txt('/api/logs');pre('Logs',a+'\\n--- proc logs ---\\n'+b)}else if(tab==='walfs'){pre('WALFS',await txt('/api/walfs?path=/'))}else if(tab==='terminal'){app.innerHTML=card('Terminal',`<input id=cmd value='help'><button class=bt id=run>Run</button><pre id=term></pre>`);document.getElementById('run').onclick=async()=>{document.getElementById('term').textContent=await txt('/api/terminal?cmd='+encodeURIComponent(document.getElementById('cmd').value))}}else if(tab==='admin'){app.innerHTML=card('Admin',`<p>Operator endpoints.</p><p><a href='/api/admin/log-stream'>log stream</a></p><p><a href='/api/admin/kernel-update?confirm=1'>kernel update</a></p><p><a href='/api/admin/reboot?confirm=1'>hot reboot</a></p>`)}else pre(tab,'unknown tab')}catch(e){pre('Error',e)}sub.textContent='Tab '+tab}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
+    return len;
+}
+
+static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    u32 route = http_route_id(req, req_len);
+    http_diag.route = route;
+    http_trace(HTTP_EVT_BUILD_ENTER, route, req_len, max);
+    if (HTTP_AUTH_ENABLED && !http_admin_authorized(req, req_len)) {
+        http_diag.unauthorized++;
+        len = http_build_unauthorized(out, max);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 401);
+        return len;
+    }
+
+    if (route == HTTP_ROUTE_STATUS) {
+        len = http_build_status_json(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (route == HTTP_ROUTE_REBOOT) {
+        len = http_build_reboot_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (route == HTTP_ROUTE_LOGS) {
+        len = http_build_log_stream_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (route == HTTP_ROUTE_UPDATE) {
+        len = http_build_kernel_update_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (route == HTTP_ROUTE_HOTPATCH) {
+        len = http_build_hotpatch_kernel_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/terminal")) {
+        len = http_build_terminal_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/logs")) {
+        len = http_build_logs_response(out, max);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/walfs")) {
+        len = http_build_walfs_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/process") &&
+        http_query_value(req, req_len, "/api/process", "action", (char[2]){0}, 2)) {
+        len = http_build_process_action_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/user") &&
+        http_query_value(req, req_len, "/api/user", "action", (char[2]){0}, 2)) {
+        len = http_build_user_action_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/process")) {
+        static const u8 processes_req[] = "GET /api/terminal?cmd=processes HTTP/1.0\r\n\r\n";
+        len = http_build_terminal_response(out, max,
+                                           processes_req,
+                                           (u32)sizeof(processes_req) - 1U);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/process")) {
+        len = http_build_safe_placeholder_response(out, max, "process manager");
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/user")) {
+        static const u8 users_req[] = "GET /api/terminal?cmd=users HTTP/1.0\r\n\r\n";
+        len = http_build_terminal_response(out, max,
+                                           users_req,
+                                           (u32)sizeof(users_req) - 1U);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/logs")) {
+        len = http_build_safe_placeholder_response(out, max, "log viewer");
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/walfs")) {
+        len = http_build_safe_placeholder_response(out, max, "WALFS browser");
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+#if HTTP_ADMIN_EXPERIMENTAL
+    if (http_request_path_is(req, req_len, "/api/terminal"))
+        return http_build_terminal_response(out, max, req, req_len);
+    if (http_request_path_is(req, req_len, "/api/process"))
+        return http_build_process_action_response(out, max, req, req_len);
+    if (http_request_path_is(req, req_len, "/api/user"))
+        return http_build_user_action_response(out, max, req, req_len);
+    if (http_request_path_is(req, req_len, "/api/logs"))
+        return http_build_logs_response(out, max);
+    if (http_request_path_is(req, req_len, "/api/walfs"))
+        return http_build_walfs_response(out, max, req, req_len);
+#endif
+
+    if (!http_request_is_root_get(req, req_len)) {
+        http_diag.not_found++;
+        http_append(out, &len, max,
+            "HTTP/1.0 404 Not Found\r\n"
+            "Content-Type: text/plain\r\n"
+            "Connection: close\r\n\r\n"
+            "PIOS admin console: unknown endpoint.\n");
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, HTTP_ROUTE_NOT_FOUND, len, 404);
+        return len;
+    }
+
+    (void)len;
+    len = http_build_spa_response(out, max);
+    http_diag.build_len = len;
+    http_trace(HTTP_EVT_BUILD_EXIT, HTTP_ROUTE_ROOT, len, 200);
+    return len;
+}
+
+static bool http_headers_complete(const u8 *buf, u32 len)
+{
+    if (!buf || len < 4)
+        return false;
+    for (u32 i = 0; i + 3 < len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+            buf[i + 2] == '\r' && buf[i + 3] == '\n')
+            return true;
+    }
+    return false;
+}
+
+static u32 http_header_body_offset(const u8 *buf, u32 len)
+{
+    if (!buf || len < 4)
+        return 0;
+    for (u32 i = 0; i + 3 < len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+            buf[i + 2] == '\r' && buf[i + 3] == '\n')
+            return i + 4;
+    }
+    return 0;
+}
+
+static bool http_method_has_body(const u8 *req, u32 len)
+{
+    if (!req || len < 4)
+        return false;
+    return (req[0] == 'P' && req[1] == 'O' && req[2] == 'S' && req[3] == 'T') ||
+           (req[0] == 'P' && req[1] == 'U' && req[2] == 'T');
+}
+
+static bool http_content_length(const u8 *req, u32 len, u32 *out)
+{
+    static const char hdr[] = "content-length:";
+    if (out) *out = 0;
+    for (u32 i = 0; i + sizeof(hdr) - 1 < len; i++) {
+        if (i != 0 && req[i - 1] != '\n')
+            continue;
+        if (!http_match_ci(&req[i], hdr))
+            continue;
+        i += (u32)sizeof(hdr) - 1;
+        while (i < len && (req[i] == ' ' || req[i] == '\t')) i++;
+        u32 v = 0;
+        bool any = false;
+        while (i < len && req[i] >= '0' && req[i] <= '9') {
+            any = true;
+            v = v * 10U + (u32)(req[i] - '0');
+            i++;
+        }
+        if (out) *out = v;
+        return any;
+    }
+    return false;
+}
+
+static bool http_request_complete(const u8 *req, u32 len)
+{
+    u32 body = http_header_body_offset(req, len);
+    http_diag.body_off = body;
+    http_diag.content_len = 0;
+    http_diag.request_done = 0;
+    if (body == 0)
+        return false;
+    if (!http_method_has_body(req, len)) {
+        http_diag.request_done = 1;
+        return true;
+    }
+    u32 content_len = 0;
+    if (!http_content_length(req, body, &content_len)) {
+        http_diag.request_done = 1;
+        return true;
+    }
+    http_diag.content_len = content_len;
+    bool done = len >= body + content_len;
+    http_diag.request_done = done ? 1U : 0U;
+    return done;
+}
+
+static u32 http_build_header_too_large(char *out, u32 max)
+{
+    u32 len = 0;
+    http_append(out, &len, max,
+        "HTTP/1.0 431 Request Header Fields Too Large\r\n"
+        "Content-Type: text/plain\r\n"
+        "Connection: close\r\n\r\n"
+        "PIOS admin request headers too large.\n");
+    return len;
+}
+
+static void http_save_ascii_prefix(char out[25], const void *data, u32 len)
+{
+    const u8 *p = (const u8 *)data;
+    u32 n = len < 24 ? len : 24;
+    for (u32 i = 0; i < n; i++) {
+        u8 b = p[i];
+        out[i] = (b >= 32 && b < 127) ? (char)b : '.';
+    }
+    out[n] = 0;
+}
+
+static void http_dump_prefix(const char *tag, const void *data, u32 len)
+{
+    const u8 *p = (const u8 *)data;
+    u32 dump = len < 24 ? len : 24;
+    uart_puts("[http] ");
+    uart_puts(tag);
+    uart_puts(" prefix=");
+    for (u32 i = 0; i < dump; i++) {
+        static const char hex[] = "0123456789ABCDEF";
+        u8 b = p[i];
+        uart_putc(hex[b >> 4]);
+        uart_putc(hex[b & 0x0F]);
+    }
+    uart_puts(" ascii=");
+    for (u32 i = 0; i < dump; i++) {
+        u8 b = p[i];
+        uart_putc((b >= 32 && b < 127) ? (char)b : '.');
+    }
+    uart_puts("\n");
+}
+
+static void http_reset_client(bool close_conn)
+{
+    http_trace(HTTP_EVT_RESET, http_diag.route, close_conn ? 1U : 0U,
+               http_client_conn >= 0 ? (u32)http_client_conn : 0xFFFFFFFFU);
+    if (http_client_conn >= 0 && close_conn)
+        tcp_close(http_client_conn);
+    http_client_conn = -1;
+    http_req_len = 0;
+    http_auth_checked = false;
+    http_auth_ok = false;
+    http_prefix_dumped = false;
+    http_req_prefix_dumped = false;
+    http_resp_len = 0;
+    http_resp_off = 0;
+    http_last_write = 0;
+}
+
+static void http_abort_client(void)
+{
+    http_trace(HTTP_EVT_ABORT, http_diag.route, http_diag.error,
+               http_client_conn >= 0 ? (u32)http_client_conn : 0xFFFFFFFFU);
+    if (http_client_conn >= 0)
+        tcp_abort(http_client_conn);
+    tcp_purge_port(HTTP_TCP_PORT);
+    http_reset_client(false);
+}
+
+static void admin_service_clear_client(struct admin_http_service *svc, bool abort_conn)
+{
+    if (!svc) return;
+    if (svc->client_conn >= 0) {
+        if (abort_conn)
+            tcp_abort(svc->client_conn);
+        else
+            tcp_close(svc->client_conn);
+    }
+    svc->client_conn = -1;
+    svc->req_len = 0;
+    svc->resp_len = 0;
+    svc->resp_off = 0;
+}
+
+static void admin_service_restart(struct admin_http_service *svc)
+{
+    if (!svc) return;
+    admin_service_clear_client(svc, true);
+    tcp_purge_port(svc->port);
+    if (svc->listen_conn >= 0)
+        tcp_abort(svc->listen_conn);
+    svc->listen_conn = tcp_listen(svc->port);
+    svc->last_activity_ms = timer_monotonic_ms();
+    svc->last_ok_ms = svc->last_activity_ms;
+    http_log_event("admin-restart", svc->port, svc->listen_conn >= 0 ? 1U : 0U);
+}
+
+static void admin_service_init(struct admin_http_service *svc)
+{
+    if (!svc) return;
+    svc->listen_conn = tcp_listen(svc->port);
+    svc->client_conn = -1;
+    svc->req_len = 0;
+    svc->resp_len = 0;
+    svc->resp_off = 0;
+    svc->last_activity_ms = timer_monotonic_ms();
+    svc->last_ok_ms = svc->last_activity_ms;
+}
+
+static void admin_services_listen(void)
+{
+    admin_service_init(&admin_status_svc);
+    admin_service_init(&admin_reboot_svc);
+    admin_service_init(&admin_update_svc);
+}
+
+static u32 admin_build_status_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    if (http_request_path_is(req, req_len, "/api/admin/log-stream") ||
+        http_request_path_is(req, req_len, "/logs"))
+        return http_build_log_stream_response(out, max, req, req_len);
+    if (http_request_path_is(req, req_len, "/api/status"))
+        return http_build_status_json(out, max, req, req_len);
+
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n"
+        "PIOS status ok\nversion=");
+    http_append(out, &len, max, PIOS_VERSION);
+    http_append(out, &len, max, "\nbuild=");
+    http_append(out, &len, max, PIOS_BUILD_LABEL);
+    http_append(out, &len, max, "\nuptime=");
+    http_append_u64(out, &len, max, timer_monotonic_ms() / 1000ULL);
+    http_append(out, &len, max, "\nlogs=/logs\nupdate_port=");
+    http_append_u64(out, &len, max, ADMIN_UPDATE_TCP_PORT);
+    http_append(out, &len, max, "\nreboot_port=");
+    http_append_u64(out, &len, max, ADMIN_REBOOT_TCP_PORT);
+    http_append(out, &len, max, "\n");
+    return len;
+}
+
+static u32 admin_build_reboot_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    bool confirmed = http_confirmed(req, req_len, "/");
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    if (!confirmed) {
+        http_append(out, &len, max, "reboot requires ?confirm=1\n");
+        return len;
+    }
+    http_reboot_pending = true;
+    http_log_event("reboot-queued", ADMIN_REBOOT_TCP_PORT, 0);
+    http_append(out, &len, max, "reboot queued\n");
+    return len;
+}
+
+static u32 admin_build_update_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    return http_build_kernel_update_response(out, max, req, req_len);
+}
+
+static void admin_service_build_response(struct admin_http_service *svc)
+{
+    u32 route = http_route_id(svc->req, svc->req_len);
+    http_trace(HTTP_EVT_ADMIN_BUILD, route, svc->port, svc->req_len);
+    if (svc == &admin_status_svc)
+        svc->resp_len = admin_build_status_response(svc->resp, sizeof(svc->resp),
+                                                    svc->req, svc->req_len);
+    else if (svc == &admin_reboot_svc)
+        svc->resp_len = admin_build_reboot_response(svc->resp, sizeof(svc->resp),
+                                                    svc->req, svc->req_len);
+    else
+        svc->resp_len = admin_build_update_response(svc->resp, sizeof(svc->resp),
+                                                    svc->req, svc->req_len);
+    http_diag.build_len = svc->resp_len;
+    svc->resp_off = 0;
+}
+
+static void admin_service_poll(struct admin_http_service *svc)
+{
+    if (!svc) return;
+    u64 now = timer_monotonic_ms();
+    if (svc->listen_conn < 0 ||
+        (svc->client_conn >= 0 && now - svc->last_activity_ms > ADMIN_CLIENT_STALL_MS) ||
+        (now - svc->last_ok_ms > ADMIN_SERVICE_WATCHDOG_MS && svc->completions > 0)) {
+        admin_service_restart(svc);
+    }
+
+    if (svc->client_conn < 0 && svc->listen_conn >= 0) {
+        svc->client_conn = tcp_accept(svc->listen_conn);
+        if (svc->client_conn >= 0) {
+            svc->req_len = 0;
+            svc->resp_len = 0;
+            svc->resp_off = 0;
+            svc->last_activity_ms = now;
+            http_log_event("admin-accept", svc->port, 0);
+            http_trace(HTTP_EVT_ACCEPT, HTTP_ROUTE_UNKNOWN, svc->port, (u32)svc->client_conn);
+        }
+    }
+    if (svc->client_conn < 0)
+        return;
+
+    u32 st = tcp_state(svc->client_conn);
+    if (st != TCP_ESTABLISHED) {
+        if (st == TCP_CLOSED || st >= TCP_CLOSING || now - svc->last_activity_ms > 1000ULL)
+            admin_service_clear_client(svc, st != TCP_CLOSED);
+        return;
+    }
+
+    if (svc->resp_len == 0) {
+        u32 readable = tcp_readable(svc->client_conn);
+        if (readable > 0 && svc->req_len < sizeof(svc->req)) {
+            u32 want = sizeof(svc->req) - svc->req_len;
+            if (want > readable) want = readable;
+            u32 n = tcp_read(svc->client_conn, svc->req + svc->req_len, want);
+            svc->req_len += n;
+            svc->last_activity_ms = now;
+            http_trace(HTTP_EVT_RX, http_route_id(svc->req, svc->req_len), svc->port, svc->req_len);
+        }
+        if (http_request_complete(svc->req, svc->req_len) ||
+            svc->req_len >= sizeof(svc->req)) {
+            http_trace(HTTP_EVT_COMPLETE, http_route_id(svc->req, svc->req_len), svc->port, svc->req_len);
+            admin_service_build_response(svc);
+            svc->last_activity_ms = now;
+        }
+    }
+
+    if (svc->resp_len > 0 && svc->resp_off < svc->resp_len) {
+        u32 writable = tcp_writable(svc->client_conn);
+        if (writable > 0) {
+            u32 remain = svc->resp_len - svc->resp_off;
+            u32 chunk = remain < writable ? remain : writable;
+            if (chunk > 512) chunk = 512;
+            u32 n = tcp_write(svc->client_conn, svc->resp + svc->resp_off, chunk);
+            if (svc->resp_off == 0)
+                http_trace(HTTP_EVT_TX, http_route_id(svc->req, svc->req_len), svc->port, svc->resp_len);
+            svc->resp_off += n;
+            if (n > 0)
+                svc->last_activity_ms = now;
+        }
+    }
+
+    if (svc->resp_len > 0 && svc->resp_off >= svc->resp_len) {
+        svc->completions++;
+        svc->last_ok_ms = now;
+        http_log_event("admin-complete", svc->port, svc->completions);
+        http_trace(HTTP_EVT_CLOSE, http_route_id(svc->req, svc->req_len), svc->port, svc->resp_len);
+        if (http_reboot_pending) {
+            timer_delay_ms(250);
+            watchdog_reboot_now(0x52454254U);
+        }
+        admin_service_clear_client(svc, false);
+    }
+}
+
+static void admin_services_poll(void)
+{
+    admin_service_poll(&admin_status_svc);
+    admin_service_poll(&admin_reboot_svc);
+    admin_service_poll(&admin_update_svc);
+}
+
+static void http_render_diag(void)
+{
+    u32 row = fb_reserved_rows();
+    if (row < 5) row = 5;
+    row -= 4;
+    fb_set_cursor(0, row);
+    fb_set_color(0x00FFAA00, 0x00000000);
+    fb_puts("HTTP open=");
+    fb_printf("%u", http_client_conn >= 0 ? 1U : 0U);
+    fb_puts(" st=");
+    fb_printf("%u", http_last_state);
+    fb_puts(" acc=");
+    fb_printf("%u", (u32)http_diag.accepts);
+    fb_puts(" tick=");
+    fb_printf("%u", http_complete_tick);
+    fb_puts(" close=");
+    fb_printf("%u", (u32)http_diag.closes);
+    fb_puts(" abort=");
+    fb_printf("%u", (u32)http_diag.aborts);
+    fb_puts(" ev=");
+    fb_printf("%u", http_diag.event);
+    fb_puts(" rt=");
+    fb_printf("%u", http_diag.route);
+    fb_puts(" err=");
+    fb_printf("%u", http_diag.error);
+    fb_puts("                              ");
+    fb_set_cursor(0, row + 1);
+    fb_puts("HTTP in-flight req=");
+    fb_printf("%u", http_req_len);
+    fb_puts(" queued=");
+    fb_printf("%u", http_resp_off);
+    fb_putc('/');
+    fb_printf("%u", http_resp_len);
+    fb_puts(" rd=");
+    fb_printf("%u", http_last_readable);
+    fb_puts(" wr=");
+    fb_printf("%u", http_last_writable);
+    fb_puts(" last=");
+    fb_printf("%u", http_last_write);
+    fb_puts(" calls=");
+    fb_printf("%u", (u32)http_diag.write_calls);
+    fb_puts(" done=");
+    fb_printf("%u", http_diag.request_done);
+    fb_puts("                              ");
+    fb_set_cursor(0, row + 2);
+    fb_puts("HTTP complete ");
+    fb_putc((http_complete_tick & 1U) ? '/' : '\\');
+    fb_puts(" bytes=");
+    fb_printf("%u", (u32)http_diag.write_bytes);
+    fb_puts(" zero=");
+    fb_printf("%u", (u32)http_diag.write_zero);
+    fb_puts(" body=");
+    fb_printf("%u", http_diag.body_off);
+    fb_puts(" clen=");
+    fb_printf("%u", http_diag.content_len);
+    fb_puts(" blen=");
+    fb_printf("%u", http_diag.build_len);
+    fb_puts("                              ");
+    fb_set_cursor(0, row + 3);
+    fb_puts("HTTP req='");
+    fb_puts(http_last_req_prefix);
+    fb_puts("' resp='");
+    fb_puts(http_last_resp_prefix);
+    fb_puts("'                              ");
 }
 
 /* TCP echo + HTTP poll — called from core0 main loop */
@@ -141,29 +2406,170 @@ static void echo_tcp_poll(void) {
     /* HTTP server on port 80 — returns simple status page */
     if (http_client_conn < 0 && http_listen_conn >= 0) {
         http_client_conn = tcp_accept(http_listen_conn);
+        if (http_client_conn >= 0) {
+            http_diag.accepts++;
+            http_diag.conn = (u32)http_client_conn;
+            http_diag.route = HTTP_ROUTE_UNKNOWN;
+            http_diag.error = HTTP_ERR_NONE;
+            http_trace(HTTP_EVT_ACCEPT, HTTP_ROUTE_UNKNOWN, (u32)http_client_conn, http_diag.accepts);
+            http_req_len = 0;
+            http_auth_checked = false;
+            http_auth_ok = false;
+            http_resp_len = 0;
+            http_resp_off = 0;
+            http_last_write = 0;
+            http_prefix_dumped = false;
+            http_req_prefix_dumped = false;
+            http_last_req_prefix[0] = 0;
+            http_last_resp_prefix[0] = 0;
+            http_last_activity_ms = timer_monotonic_ms();
+            if (HTTP_DIAG_VERBOSE) uart_puts("[http] accepted\n");
+        }
     }
     if (http_client_conn >= 0) {
         u32 st = tcp_state(http_client_conn);
+        http_last_state = st;
+        http_last_readable = tcp_readable(http_client_conn);
+        http_last_writable = tcp_writable(http_client_conn);
         if (st == 4 /* ESTABLISHED */) {
-            static u8 http_buf[512];
-            u32 n = tcp_read(http_client_conn, http_buf, sizeof(http_buf));
-            if (n > 0) {
-                static const char http_resp[] =
-                    "HTTP/1.0 200 OK\r\n"
-                    "Content-Type: text/plain\r\n"
-                    "Connection: close\r\n\r\n"
-                    "PIOS bare-metal Pi 5\n"
-                    "Ethernet: 1000Mbps FD\n"
-                    "Status: operational\n";
-                tcp_write(http_client_conn, http_resp, pios_strlen(http_resp));
-                tcp_close(http_client_conn);
-                http_client_conn = -1;
+            if (http_resp_len == 0) {
+                u32 readable = tcp_readable(http_client_conn);
+                if (readable > 0 && http_req_len < sizeof(http_req_buf)) {
+                    u32 want = sizeof(http_req_buf) - http_req_len;
+                    if (want > readable) want = readable;
+                    u32 n = tcp_read(http_client_conn, http_req_buf + http_req_len, want);
+                    http_req_len += n;
+                    http_diag.reads++;
+                    http_last_activity_ms = timer_monotonic_ms();
+                    http_trace(HTTP_EVT_RX, http_diag.route, n, http_req_len);
+                    if (HTTP_DIAG_VERBOSE) {
+                        uart_puts("[http] request bytes=");
+                        uart_hex(n);
+                        uart_puts(" total=");
+                        uart_hex(http_req_len);
+                        uart_puts("\n");
+                    }
+                    if (!http_req_prefix_dumped) {
+                        http_req_prefix_dumped = true;
+                        http_save_ascii_prefix(http_last_req_prefix, http_req_buf, http_req_len);
+                        if (HTTP_DIAG_VERBOSE) http_dump_prefix("rx", http_req_buf, http_req_len);
+                    }
+
+                    if (HTTP_AUTH_ENABLED && !http_auth_checked) {
+                        bool auth_complete = false;
+                        bool auth_ok = false;
+                        if (http_try_early_auth(http_req_buf, http_req_len, &auth_complete, &auth_ok) &&
+                            auth_complete) {
+                            http_auth_checked = true;
+                            http_auth_ok = auth_ok;
+                            if (HTTP_DIAG_VERBOSE) uart_puts(auth_ok ? "[http] auth ok early\n" : "[http] auth failed early\n");
+                            if (!auth_ok) {
+                                http_diag.unauthorized++;
+                                http_resp_len = http_build_unauthorized(http_resp_buf, sizeof(http_resp_buf));
+                                http_diag.built++;
+                            }
+                        }
+                    }
+                }
+
+                if (HTTP_SIMPLE_MODE && http_resp_len == 0 && http_req_len > 0) {
+                    static const char simple[] =
+                        "HTTP/1.0 200 OK\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Content-Length: 8\r\n"
+                        "Connection: close\r\n\r\n"
+                        "PIOS OK\n";
+                    http_resp_len = 0;
+                    http_append(http_resp_buf, &http_resp_len, sizeof(http_resp_buf), simple);
+                    http_diag.built++;
+                    if (HTTP_DIAG_VERBOSE) {
+                        uart_puts("[http] simple response len=");
+                        uart_hex(http_resp_len);
+                        uart_puts("\n");
+                    }
+                } else if (http_resp_len == 0 && http_request_complete(http_req_buf, http_req_len)) {
+                    http_diag.route = http_route_id(http_req_buf, http_req_len);
+                    http_trace(HTTP_EVT_COMPLETE, http_diag.route, http_req_len, http_diag.body_off);
+                    http_resp_len = http_build_stats_response(http_resp_buf, sizeof(http_resp_buf), http_req_buf, http_req_len);
+                    http_diag.built++;
+                    if (HTTP_DIAG_VERBOSE) {
+                        uart_puts("[http] response len=");
+                        uart_hex(http_resp_len);
+                        uart_puts("\n");
+                    }
+                } else if (http_req_len >= sizeof(http_req_buf)) {
+                    http_diag.error = HTTP_ERR_HEADER_BIG;
+                    http_trace(HTTP_EVT_COMPLETE, HTTP_ROUTE_UNKNOWN, http_req_len, sizeof(http_req_buf));
+                    http_resp_len = http_build_header_too_large(http_resp_buf, sizeof(http_resp_buf));
+                    http_diag.built++;
+                    if (HTTP_DIAG_VERBOSE) uart_puts("[http] header too large\n");
+                }
             }
-        } else if (st == 0 || st >= 8) {
-            tcp_close(http_client_conn);
-            http_client_conn = -1;
+
+            if (http_resp_len > 0 && http_resp_off < http_resp_len) {
+                u32 writable = tcp_writable(http_client_conn);
+                u32 remain = http_resp_len - http_resp_off;
+                if (writable > 0) {
+                    u32 chunk = remain < writable ? remain : writable;
+                    if (chunk > 512) chunk = 512;
+                    if (!http_prefix_dumped) {
+                        http_prefix_dumped = true;
+                        http_save_ascii_prefix(http_last_resp_prefix, http_resp_buf, http_resp_len);
+                        http_trace(HTTP_EVT_TX, http_diag.route, http_resp_len, writable);
+                        if (HTTP_DIAG_VERBOSE) http_dump_prefix("tx", http_resp_buf, http_resp_len);
+                    }
+                    u32 n = tcp_write(http_client_conn, http_resp_buf + http_resp_off, chunk);
+                    http_diag.write_calls++;
+                    http_last_write = n;
+                    if (n == 0) {
+                        http_diag.write_zero++;
+                    } else {
+                        http_diag.write_bytes += n;
+                        http_last_activity_ms = timer_monotonic_ms();
+                    }
+                    http_resp_off += n;
+                }
+            }
+
+            if (http_resp_len > 0 && http_resp_off >= http_resp_len) {
+                http_diag.closes++;
+                http_complete_tick++;
+                http_trace(HTTP_EVT_CLOSE, http_diag.route, http_resp_len, http_resp_off);
+                if (HTTP_DIAG_VERBOSE) uart_puts("[http] close complete\n");
+                if (http_reboot_pending) {
+                    timer_delay_ms(250);
+                    watchdog_reboot_now(0x48545450U);
+                }
+                http_reset_client(true);
+            } else if (http_resp_len > 0 && (timer_monotonic_ms() - http_last_activity_ms) > 15000ULL) {
+                http_diag.aborts++;
+                http_diag.error = HTTP_ERR_RESP_TIMEOUT;
+                uart_puts("[http] abort timeout st=");
+                uart_hex(st);
+                uart_puts(" off=");
+                uart_hex(http_resp_off);
+                uart_puts(" len=");
+                uart_hex(http_resp_len);
+                uart_puts(" writable=");
+                uart_hex(http_last_writable);
+                uart_puts("\n");
+                http_abort_client();
+            } else if (http_resp_len == 0 && (timer_monotonic_ms() - http_last_activity_ms) > 3000ULL) {
+                http_diag.aborts++;
+                http_diag.error = HTTP_ERR_REQ_TIMEOUT;
+                http_abort_client();
+            }
+        } else {
+            http_diag.aborts++;
+            http_diag.error = HTTP_ERR_BAD_STATE;
+            http_trace(HTTP_EVT_BAD_STATE, http_diag.route, st, http_last_activity_ms ? (u32)(timer_monotonic_ms() - http_last_activity_ms) : 0);
+            if ((timer_monotonic_ms() - http_last_activity_ms) > 1000ULL ||
+                st == 0 || st >= 8)
+                http_abort_client();
         }
+        http_render_diag();
     }
+    admin_services_poll();
 }
 
 #define UI_MODE_NONE          0
@@ -203,6 +2609,7 @@ static const char *ui_proc_state_str(u32 s);
 static void ui_dump_sector(u32 lba);
 static void ui_cmd_fsinspect(const char *path);
 static void ui_cmd_netcfg(u32 argc, char **argv);
+static void ui_cmd_usb(u32 argc, char **argv);
 static void ui_cmd_disk(u32 argc, char **argv);
 static void ui_cmd_db(u32 argc, char **argv);
 static void ui_cmd_lsdir(const char *path);
@@ -507,7 +2914,9 @@ static void bp_init(void) {
     fb_clear(BOOT_BLACK);
     fb_set_cursor(0, 0);
     fb_set_color(BOOT_FG_PINK, BOOT_BLACK);
-    fb_puts("PIOS v0.3 Boot Sequence\n");
+    fb_puts("PIOS ");
+    fb_puts(PIOS_BUILD_LABEL);
+    fb_puts(" Boot Sequence\n");
     fb_set_color(0x00444444, BOOT_BLACK);
     fb_puts("=============================================\n");
 
@@ -530,7 +2939,9 @@ static void bp_init(void) {
     fb_puts("---------------------------------------------");
     bp_log_y = BP_LIST_ROW + BP_COUNT + 2;
 
-    uart_puts("\n[bt] PIOS v0.3 Boot\n");
+    uart_puts("\n[bt] PIOS ");
+    uart_puts(PIOS_BUILD_LABEL);
+    uart_puts(" Boot\n");
     for (u32 i = 0; i < BP_COUNT; i++)
         bp_uart_phase(i, "pending");
 }
@@ -912,6 +3323,7 @@ static void ui_console_write(const char *s)
 {
     uart_puts(s);
     fb_puts(s);
+    debug_tcp_send(s);
 }
 
 static void ui_console_prompt(void)
@@ -1229,6 +3641,58 @@ static void ui_cmd_fsinspect(const char *path)
 /* WiFi support has been parked in spike/wifi/ — see GitHub issue.
  * The 'wifi' console command now returns an ERR stub. */
 
+static void ui_cmd_usb(u32 argc, char **argv)
+{
+    if (argc < 2 || ui_streq(argv[1], "status")) {
+        struct usb_device *dev = usb_get_device();
+        const struct xhci_stats *st = xhci_get_stats();
+        fb_printf("USB: dev=%s kbd=%s\n",
+                  dev ? "yes" : "no",
+                  usb_kbd_available() ? "ready" : "not-ready");
+        if (dev) {
+            fb_printf("USB: vid=%x pid=%x class=%x eps=%u\n",
+                      dev->vendor_id, dev->product_id, dev->dev_class, dev->num_eps);
+            for (u32 i = 0; i < dev->num_eps; i++) {
+                fb_printf("  ep=%x attr=%x max=%u int=%u iface=%u cls=%x sub=%x proto=%x\n",
+                          dev->eps[i].address, dev->eps[i].attributes,
+                          dev->eps[i].max_packet, dev->eps[i].interval,
+                          dev->eps[i].iface_number, dev->eps[i].iface_class,
+                          dev->eps[i].iface_subclass, dev->eps[i].iface_protocol);
+            }
+        }
+        fb_printf("xHCI: cmd=%u/%u timeout=%u xfer=%u/%u evt=%u stale=%u reset=%u stall=%u ringfull=%u\n",
+                  st->cmd_completed, st->cmd_submitted, st->cmd_timeout,
+                  st->xfer_ok, st->xfer_fail, st->evt_polled,
+                  st->evt_stale_drained, st->ep_resets, st->ep_stalls,
+                  st->ring_full);
+        ui_console_write("usage: usb status|reinit|poll\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "reinit")) {
+        ui_console_write("USB: reinitializing xHCI...\n");
+        if (usb_init())
+            ui_console_write("OK: usb initialized\n");
+        else
+            ui_console_write("ERR: usb init failed\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "poll")) {
+        i32 c;
+        u32 n = 0;
+        while ((c = usb_kbd_try_getc()) >= 0) {
+            char s[2] = { (char)c, 0 };
+            ui_console_write(s);
+            n++;
+        }
+        fb_printf("\nUSB: drained %u chars\n", n);
+        return;
+    }
+
+    ui_console_write("ERR: usage usb status|reinit|poll\n");
+}
+
 static void ui_cmd_netcfg(u32 argc, char **argv)
 {
     if (argc >= 2 && ui_streq(argv[1], "set")) {
@@ -1256,6 +3720,7 @@ static void ui_cmd_netcfg(u32 argc, char **argv)
     if (argc >= 2 && ui_streq(argv[1], "apply")) {
         net_init(ui_cfg_ip, ui_cfg_gw, ui_cfg_mask, NULL);
         dns_init(ui_cfg_dns);
+        net_services_listen();
         ui_cfg_dhcp = false;
         ui_console_write("OK: static net config applied\n");
         return;
@@ -3799,10 +6264,10 @@ static void ui_console_exec(char *line)
         ui_console_write("help echo clear time ps kill launch run pwd cd lsdir mkdir touch\n");
         ui_console_write("copy cp cpdir mv cat stat rm find hexdump df mount umount\n");
         ui_console_write("stream if for foreach source env batch svc update watchdog edit\n");
-        ui_console_write("hexsec fsinspect netcfg wifi disk db capsule obs\n");
+        ui_console_write("hexsec fsinspect netcfg wifi usb disk db capsule obs\n");
         ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d> | netcfg apply\n");
         ui_console_write("netcfg dhcp <on|off> [timeout_ms] | netcfg addnbr <ip> <mac>\n");
-        ui_console_write("wifi init|scan|connect [ssid] [pass]|status|disconnect\n");
+        ui_console_write("wifi disabled | usb status|reinit|poll | tcp debug :2323\n");
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
         ui_console_write("batch add|at|every supports [core] [priority] [principal] [retries]\n");
         ui_console_write("batch run [parallel] | batch stop | batch status | batch list\n");
@@ -4055,6 +6520,8 @@ static void ui_console_exec(char *line)
         ui_cmd_svc(argc, argv);
     } else if (ui_streq(argv[0], "wifi")) {
         ui_console_write("ERR: wifi support removed (parked in spike/wifi/, see GitHub issue)\n");
+    } else if (ui_streq(argv[0], "usb")) {
+        ui_cmd_usb(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "disk")) {
@@ -4300,6 +6767,28 @@ void spin_set_color(u32 color) {
     spin_color = color;
 }
 
+/* Core 0 I/O reactor: timer IRQ only marks work due and wakes the service
+ * loop. Real I/O stays in thread context so IRQ latency remains bounded. */
+#define CORE0_IO_NET     (1U << 0)
+#define CORE0_IO_TCP     (1U << 1)
+#define CORE0_IO_UART    (1U << 2)
+#define CORE0_IO_USB     (1U << 3)
+#define CORE0_IO_MAINT   (1U << 4)
+
+static volatile u32 core0_io_flags;
+
+static void core0_io_tick_hook(u32 core, u64 tick)
+{
+    if (core != CORE_NET)
+        return;
+
+    u32 flags = CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART | CORE0_IO_USB;
+    if ((tick % 100U) == 0)
+        flags |= CORE0_IO_MAINT;
+    core0_io_flags |= flags;
+    sev();
+}
+
 /* Core 0: Kernel services + network */
 NORETURN void core0_main(void) {
     struct core_env *env = core_env_of(CORE_NET);
@@ -4309,30 +6798,54 @@ NORETURN void core0_main(void) {
     ui_launch_idx = -1;
     ui_status_code = 0;
 
+    /* Clear the framebuffer once we hit the network poll loop so the
+     * visual status strip (network heartbeat blocks) starts on a blank
+     * canvas. Boot logs scrolled past, this gives us a clean diagnostic
+     * surface for ICMP/heartbeat activity. */
+    fb_clear(0x00000000);
+    u32 stats_rows = fb_rows() / 2;
+    if (stats_rows < 20) stats_rows = 20;
+    fb_set_reserved_rows(stats_rows);
+    fb_set_cursor(0, stats_rows);
+    fb_set_color(0x0000FF80, 0x00000000);
+    fb_puts("INIT COMPLETE\n");
+
     /* Serial-only console */
+    uart_puts("[sys] INIT COMPLETE\n");
+
+    fb_set_color(0x00FFAA00, 0x00000000);
+    fb_puts("[dma] late memcpy selftest...\n");
+    uart_puts("[dma] late memcpy selftest...\n");
+    if (dma_selftest()) {
+        fb_puts("[dma] late memcpy selftest OK\n");
+        uart_puts("[dma] late memcpy selftest OK\n");
+    } else {
+        fb_puts("[dma] late memcpy selftest FAILED (using NEON fallback)\n");
+        uart_puts("[dma] late memcpy selftest FAILED (using NEON fallback)\n");
+    }
+
     uart_puts("\r\nPIOS Console ready. Type 'help'.\r\n> ");
 
     static char cmd_buf[128];
     static u32 cmd_len;
 
     for (;;) {
-        /* Network poll — process incoming packets */
         net_poll();
-
-        /* Service TCP echo + HTTP servers */
         echo_tcp_poll();
+        debug_tcp_poll();
 
-        /* UART RX poll via driver function */
-        i32 rx = uart_try_getc();
-        if (rx >= 0) {
+        for (u32 i = 0; i < 8; i++) {
+            i32 rx = uart_try_getc();
+            if (rx < 0)
+                break;
             char c = (char)(rx & 0xFF);
             uart_putc(c);  /* echo */
             if (c == '\r' || c == '\n') {
                 uart_puts("\r\n");
                 cmd_buf[cmd_len] = 0;
                 if (cmd_len > 0) {
-                    for (u32 i = 0; i < cmd_len; i++)
-                        ui_console_feed_char(cmd_buf[i]);
+                    for (u32 j = 0; j < cmd_len; j++)
+                        ui_console_feed_char(cmd_buf[j]);
                     ui_console_feed_char('\n');
                 }
                 cmd_len = 0;
@@ -4344,12 +6857,11 @@ NORETURN void core0_main(void) {
             }
         }
 
-        /* USB keyboard (when available) */
         ui_handle_keys();
 
-        /* Periodic serial heartbeat every ~10M iterations */
-        if ((env->poll_count & 0xFFFFFF) == 0 && env->poll_count > 0) {
-            uart_putc('.');
+        if ((env->poll_count & 0x3FFF) == 0) {
+            arp_tick();
+            tcp_tick();
         }
 
         env->poll_count++;
@@ -4442,7 +6954,9 @@ static void boot_diag(bool sd_ok, bool walfs_ok, bool nic_ok, bool usb_ok) {
     fb_clear(BOOT_PURPLE);
     fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
 
-    fb_printf("PIOS v0.3 - Pi 5 Bare Metal Microkernel\n");
+    fb_puts("PIOS ");
+    fb_puts(PIOS_BUILD_LABEL);
+    fb_puts(" - Pi 5 Bare Metal Microkernel\n");
     fb_set_color(BOOT_FG_WHITE, BOOT_PURPLE);
     fb_printf("========================================\n\n");
 
@@ -4501,12 +7015,15 @@ static void boot_diag(bool sd_ok, bool walfs_ok, bool nic_ok, bool usb_ok) {
  * No macros, no helper functions, no optimisation surprises.
  */
 void kernel_fb_early(void) {
-    if (!fb_init(1024, 768)) return;
+    if (!fb_init(1920, 1080) && !fb_init(1280, 720) && !fb_init(1024, 768))
+        return;
 
     u64 val;
 
     fb_set_color(0x0000FF00, 0x00000000);
-    fb_puts("PIOS v0.31\n");
+    fb_puts("PIOS ");
+    fb_puts(PIOS_BUILD_LABEL);
+    fb_putc('\n');
     fb_set_color(0x00FFFFFF, 0x00000000);
     fb_printf("FB addr = 0x%X\n", fb_get_phys_addr());
     fb_puts("Entering kernel_main...\n");
@@ -4754,6 +7271,74 @@ static void reg_panel(u32 at_el1) {
     uart_puts("[reg] ---\n");
 }
 
+#ifdef PIOS_ONEOFF_PROVISION
+extern const u8 provision_payload_start[];
+extern const u8 provision_payload_end[];
+
+static u32 provision_read_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static u32 provision_slot_lba(void)
+{
+    static u8 mbr[SD_BLOCK_SIZE] ALIGNED(64);
+    if (!sd_read_block(0, mbr))
+        return 2048;
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA)
+        return 2048;
+    u32 p2_start = provision_read_le32(&mbr[0x1CE + 8]);
+    u32 p2_size = provision_read_le32(&mbr[0x1CE + 12]);
+    if (p2_start == 0 || p2_size < (HOTPATCH_SLOT_BYTES / SD_BLOCK_SIZE))
+        return 2048;
+    return p2_start;
+}
+
+static bool provision_write_payload_to_slot(void)
+{
+    static u8 block[SD_BLOCK_SIZE] ALIGNED(64);
+    const u8 *payload = provision_payload_start;
+    u32 len = (u32)(provision_payload_end - provision_payload_start);
+    if (len == 0 || len > HOTPATCH_SLOT_BYTES - SD_BLOCK_SIZE)
+        return false;
+
+    u32 lba = provision_slot_lba();
+    uart_puts("[prov] oneoff slot LBA=");
+    uart_hex(lba);
+    uart_puts(" bytes=");
+    uart_hex(len);
+    uart_puts("\n");
+
+    simd_zero(block, sizeof(block));
+    block[0] = (u8)(HOTPATCH_SLOT_MAGIC & 0xFF);
+    block[1] = (u8)((HOTPATCH_SLOT_MAGIC >> 8) & 0xFF);
+    block[2] = (u8)((HOTPATCH_SLOT_MAGIC >> 16) & 0xFF);
+    block[3] = (u8)((HOTPATCH_SLOT_MAGIC >> 24) & 0xFF);
+    block[4] = (u8)(len & 0xFF);
+    block[5] = (u8)((len >> 8) & 0xFF);
+    block[6] = (u8)((len >> 16) & 0xFF);
+    block[7] = (u8)((len >> 24) & 0xFF);
+    if (!sd_write_block(lba, block))
+        return false;
+
+    for (u32 b = 0; b < (HOTPATCH_SLOT_BYTES / SD_BLOCK_SIZE); b++) {
+        u32 off = b * SD_BLOCK_SIZE;
+        u32 dst_lba = lba + 1 + b;
+        if (off + SD_BLOCK_SIZE <= len) {
+            if (!sd_write_block(dst_lba, payload + off))
+                return false;
+        } else {
+            simd_zero(block, sizeof(block));
+            if (off < len)
+                simd_memcpy(block, payload + off, len - off);
+            if (!sd_write_block(dst_lba, block))
+                return false;
+        }
+    }
+    return true;
+}
+#endif
+
 void kernel_main(void) {
     bool usb_ok = false;
     bool fb_ok = true;  /* fb already init'd by kernel_fb_early */
@@ -4882,6 +7467,13 @@ void kernel_main(void) {
         bp_err("[sd] SD init FAILED"); bp_done(4, false);
     } else {
         bp_ok("[sd] card detected OK");
+#ifdef PIOS_ONEOFF_PROVISION
+        bp_log("[prov] writing embedded second-stage slot...");
+        if (provision_write_payload_to_slot())
+            bp_ok("[prov] second-stage slot written");
+        else
+            bp_warn("[prov] second-stage slot write FAILED");
+#endif
         bp_log("[cache] bcache_init...");
         bcache_init();
         bp_log("[walfs] walfs_init...");
@@ -4931,6 +7523,10 @@ void kernel_main(void) {
     /* Init network stack */
     bp_log("[net] net_init (static IP)...");
     net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
+    /* Pin the dev host PC as a static neighbor so we never need ARP
+     * resolution to talk back to it, and unsolicited replies are valid. */
+    net_add_neighbor(HOST_PC_IP, HOST_PC_MAC);
+    uart_puts("[net] static neighbor 192.168.218.9 -> 04:bf:1b:e1:d7:78\n");
     ui_cfg_ip = MY_IP;
     ui_cfg_mask = MY_MASK;
     ui_cfg_gw = MY_GW;
@@ -4939,9 +7535,8 @@ void kernel_main(void) {
     dns_init(ui_cfg_dns);
     /* Echo servers */
     net_udp_subscribe(echo_udp_cb);
-    echo_listen_conn = tcp_listen(ECHO_TCP_PORT);
-    http_listen_conn = tcp_listen(HTTP_TCP_PORT);
-    uart_puts("[net] echo UDP:7 TCP:7 HTTP:80\n");
+    net_services_listen();
+    uart_puts("[net] echo UDP:7 TCP:7 HTTP:80 DBG:2323\n");
     bp_ok("[net] IP stack ready");
 
     /* GPU + Tensor */

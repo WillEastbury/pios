@@ -113,6 +113,7 @@ static void kbd_push_key(u8 code) {
 static struct usb_device *kbd_dev;
 static u8 int_ep_addr;
 static u16 int_ep_maxpkt;
+static u8 kbd_iface;
 static bool kbd_ready;
 static u8 prev_keys[6];
 
@@ -204,6 +205,7 @@ static bool kbd_probe(struct usb_device *dev) {
             (dev->eps[i].address & USB_DIR_IN)) {
             int_ep_addr = dev->eps[i].address;
             int_ep_maxpkt = dev->eps[i].max_packet;
+            kbd_iface = dev->eps[i].iface_number;
             break;
         }
     }
@@ -215,10 +217,10 @@ static bool kbd_probe(struct usb_device *dev) {
 
     /* SET_PROTOCOL: Boot Protocol (0) — fixed 8-byte reports */
     usb_control_msg(dev, 0x21, HID_SET_PROTOCOL, HID_BOOT_PROTOCOL,
-                    0, 0, NULL, NULL);
+                    0, kbd_iface, NULL, NULL);
 
     /* SET_IDLE: report only on change */
-    usb_control_msg(dev, 0x21, HID_SET_IDLE, 0, 0, 0, NULL, NULL);
+    usb_control_msg(dev, 0x21, HID_SET_IDLE, 0, kbd_iface, 0, NULL, NULL);
 
     for (u32 i = 0; i < 6; i++) prev_keys[i] = 0;
     kbd_head = 0;

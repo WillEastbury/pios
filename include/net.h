@@ -90,6 +90,11 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac);
 /* Add a static neighbor (IP → MAC mapping). No ARP. */
 void net_add_neighbor(u32 ip, const u8 *mac);
 
+/* Join/leave an Ethernet multicast destination MAC. Frames for multicast
+ * groups not in this table are dropped before protocol dispatch. */
+bool net_join_multicast_mac(const u8 *mac);
+bool net_leave_multicast_mac(const u8 *mac);
+
 /* Poll: process one incoming frame (call in tight loop on core 0) */
 void net_poll(void);
 

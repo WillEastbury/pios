@@ -34,6 +34,7 @@
 #define GCTL_DSBLCLKGTNG    (1U << 0)
 #define GCTL_CORESOFTRESET  (1U << 11)
 #define GUSB2_PHYSOFTRST    (1U << 31)
+#define GUSB2_SUSPHY        (1U << 6)
 
 /* ---- xHCI Capability Registers ---- */
 
@@ -190,6 +191,7 @@ static u32 hci_max_ports, hci_max_slots, ctx_size;
 
 static u32 cmd_enq, cmd_cycle;
 static u32 evt_deq, evt_cycle;
+static u32 selected_controller;
 
 /* ---- Instrumentation ---- */
 
@@ -371,12 +373,21 @@ static bool dwc3_init(u64 base) {
     mmio_write(base + DWC3_GCTL, gctl);
     timer_delay_us(100);
 
-    /* PHY soft reset */
+    /* PHY soft reset. Keep the USB2 PHY out of suspend in host mode; DWC3
+     * controllers can otherwise report transaction errors on full-speed
+     * devices during Address Device. */
     u32 phycfg = mmio_read(base + DWC3_GUSB2PHYCFG);
+    uart_puts("[xhci] DWC3 GUSB2PHYCFG before=");
+    uart_hex(phycfg);
+    uart_puts("\n");
+    phycfg &= ~GUSB2_SUSPHY;
     mmio_write(base + DWC3_GUSB2PHYCFG, phycfg | GUSB2_PHYSOFTRST);
     timer_delay_us(100);
-    mmio_write(base + DWC3_GUSB2PHYCFG, phycfg & ~GUSB2_PHYSOFTRST);
+    mmio_write(base + DWC3_GUSB2PHYCFG, phycfg & ~(GUSB2_PHYSOFTRST | GUSB2_SUSPHY));
     timer_delay_ms(10);
+    uart_puts("[xhci] DWC3 GUSB2PHYCFG after=");
+    uart_hex(mmio_read(base + DWC3_GUSB2PHYCFG));
+    uart_puts("\n");
 
     /* Clear core reset, set host mode */
     gctl = mmio_read(base + DWC3_GCTL);
@@ -393,8 +404,15 @@ static bool dwc3_init(u64 base) {
 
 /* ---- Public: Init ---- */
 
+void xhci_select_controller(u32 controller)
+{
+    selected_controller = controller ? 1 : 0;
+}
+
 bool xhci_init(void) {
-    uart_puts("[xhci] Init USB0 (DWC3)...\n");
+    uart_puts("[xhci] Init USB");
+    uart_hex(selected_controller);
+    uart_puts(" (DWC3)...\n");
 
     /* Reset instrumentation counters */
     memset(&stats, 0, sizeof(stats));
@@ -406,7 +424,8 @@ bool xhci_init(void) {
     rp1_gpio_write(USB_VBUS_GPIO, true);
     timer_delay_ms(100);  /* let VBUS stabilise and devices power up */
 
-    xhci_base = RP1_BAR_BASE + XHCI_USB0_OFFSET;
+    xhci_base = RP1_BAR_BASE +
+        (selected_controller ? XHCI_USB1_OFFSET : XHCI_USB0_OFFSET);
 
     if (!dwc3_init(xhci_base)) return false;
 
@@ -604,23 +623,30 @@ bool xhci_port_reset(u32 port, u32 *speed) {
         return false;
     }
 
-    /* USB2: standard port reset */
-    sc &= ~PORTSC_RW1C_MASK;
+    /* USB2: standard port reset. Circle writes PR while preserving PORTSC
+     * status bits except PED; then waits for PR itself to clear. */
     sc |= PORTSC_PR;
+    sc &= ~PORTSC_PED;
     mmio_write(pa, sc);
     stats.port_resets++;
 
     for (u32 i = 0; i < 200; i++) {
         timer_delay_ms(5);
         sc = mmio_read(pa);
-        if (sc & PORTSC_PRC) {
+        if (!(sc & PORTSC_PR)) {
+            uart_puts("[xhci] Port reset done PORTSC=");
+            uart_hex(sc);
+            uart_puts("\n");
             sc &= ~PORTSC_RW1C_MASK;
-            sc |= PORTSC_PRC;
+            sc |= (PORTSC_PRC | PORTSC_CSC);
             mmio_write(pa, sc);
             *speed = (sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
-            return true;
+            return (sc & PORTSC_CCS) && (sc & PORTSC_PED) && *speed != 0;
         }
     }
+    uart_puts("[xhci] Port reset timeout PORTSC=");
+    uart_hex(sc);
+    uart_puts("\n");
     return false;
 }
 
@@ -635,6 +661,16 @@ bool xhci_enable_slot(u32 *slot) {
 }
 
 bool xhci_address_device(u32 slot, u32 port, u32 speed, u32 max_packet) {
+    uart_puts("[xhci] Address Device slot=");
+    uart_hex(slot);
+    uart_puts(" port=");
+    uart_hex(port);
+    uart_puts(" speed=");
+    uart_hex(speed);
+    uart_puts(" mps=");
+    uart_hex(max_packet);
+    uart_puts("\n");
+
     u8 *input = input_ctx_buf;
     for (u32 i = 0; i < sizeof(input_ctx_buf); i++) input[i] = 0;
 
@@ -664,8 +700,10 @@ bool xhci_address_device(u32 slot, u32 port, u32 speed, u32 max_packet) {
     dcache_clean_range((u64)(usize)ep_rings[ri], sizeof(ep_rings[ri]));
 
     struct xhci_trb evt;
-    return cmd_submit(dma_addr(input), 0,
-                      TRB_TYPE(TRB_ADDRESS_DEV) | (slot << 24), &evt);
+    bool ok = cmd_submit(dma_addr(input), 0,
+                         TRB_TYPE(TRB_ADDRESS_DEV) | (slot << 24), &evt);
+    uart_puts(ok ? "[xhci] Address Device OK\n" : "[xhci] Address Device FAIL\n");
+    return ok;
 }
 
 bool xhci_configure_endpoints(u32 slot, u32 port, u32 speed,
@@ -765,10 +803,41 @@ bool xhci_control_transfer(u32 slot, u8 bmReq, u8 bReq, u16 wVal,
     ring_db(slot, 1);
 
     struct xhci_trb evt;
-    if (!evt_poll(&evt, 1000)) { stats.xfer_fail++; return false; }
+    if (!evt_poll(&evt, 1000)) {
+        stats.xfer_fail++;
+        uart_puts("[xhci] ctrl timeout req=");
+        uart_hex(bReq);
+        uart_puts(" val=");
+        uart_hex(wVal);
+        uart_puts(" len=");
+        uart_hex(wLen);
+        uart_puts("\n");
+        return false;
+    }
     u32 cc = TRB_COMP_CODE(evt.status);
-    if (cc == CC_STALL) { stats.ep_stalls++; stats.xfer_fail++; return false; }
-    if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) { stats.xfer_fail++; return false; }
+    if (cc == CC_STALL) {
+        stats.ep_stalls++;
+        stats.xfer_fail++;
+        uart_puts("[xhci] ctrl STALL req=");
+        uart_hex(bReq);
+        uart_puts(" val=");
+        uart_hex(wVal);
+        uart_puts("\n");
+        return false;
+    }
+    if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
+        stats.xfer_fail++;
+        uart_puts("[xhci] ctrl cc=");
+        uart_hex(cc);
+        uart_puts(" req=");
+        uart_hex(bReq);
+        uart_puts(" val=");
+        uart_hex(wVal);
+        uart_puts(" len=");
+        uart_hex(wLen);
+        uart_puts("\n");
+        return false;
+    }
 
     if (data && (bmReq & 0x80))
         dcache_invalidate_range((u64)(usize)data, wLen);

@@ -43,6 +43,7 @@ struct xhci_stats {
 };
 
 /* Controller lifecycle */
+void xhci_select_controller(u32 controller);
 bool xhci_init(void);
 
 /* Port operations */

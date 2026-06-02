@@ -40,6 +40,7 @@ struct usb_device {
         u8  attributes;
         u16 max_packet;
         u8  interval;
+        u8  iface_number;
         u8  iface_class;
         u8  iface_subclass;
         u8  iface_protocol;

@@ -54,6 +54,9 @@ void arp_input(const u8 *frame, u32 len);
 /* Send gratuitous ARP announcements (call at boot) */
 void arp_announce(void);
 
+/* Fire a single gratuitous ARP probe (no delay) — for stall recovery testing. */
+void arp_probe(void);
+
 /* Age out stale entries (call periodically, e.g. once per second) */
 void arp_tick(void);
 

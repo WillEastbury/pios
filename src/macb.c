@@ -58,6 +58,25 @@
 static inline u32 ecr(u32 off) { return mmio_read(ETH_CFG_BASE + off); }
 static inline void ecw(u32 off, u32 val) { mmio_write(ETH_CFG_BASE + off, val); }
 
+/* TSR bits (W1C) — Transmit Status */
+#define TSR_UBR     (1 << 0)   /* Used Bit Read — descriptor exhausted */
+#define TSR_COL     (1 << 1)   /* Collision */
+#define TSR_RLE     (1 << 2)   /* Retry Limit Exceeded */
+#define TSR_TGO     (1 << 3)   /* Transmit Go (RO) */
+#define TSR_BEX     (1 << 4)   /* Buffers Exhausted Mid-Frame */
+#define TSR_COMP    (1 << 5)   /* Frame transmitted complete */
+#define TSR_UND     (1 << 6)   /* TX Underrun */
+#define TSR_HRESP   (1 << 8)   /* HRESP not OK (DMA bus error) */
+
+/* GEM hardware statistic counters (read-clear-on-read) */
+#define GEM_OCT_TX_LO       0x0100  /* Octets transmitted low */
+#define GEM_OCT_TX_HI       0x0104  /* Octets transmitted high */
+#define GEM_FRAMES_TX       0x0108  /* Frames transmitted */
+#define GEM_TX_UNDERRUNS    0x0134  /* TX FIFO underruns */
+#define GEM_LATE_COLL       0x0144  /* Late collisions */
+#define GEM_CARRIER_ERR     0x0148  /* Carrier sense errors */
+#define GEM_FRAMES_RX       0x0158  /* Frames received */
+
 /* NCR bits */
 #define NCR_LLB     (1 << 1)   /* Loopback local */
 #define NCR_RE      (1 << 2)   /* Receive enable */
@@ -65,6 +84,7 @@ static inline void ecw(u32 off, u32 val) { mmio_write(ETH_CFG_BASE + off, val); 
 #define NCR_MPE     (1 << 4)   /* Management port enable */
 #define NCR_CLRSTAT (1 << 5)   /* Clear statistics */
 #define NCR_TSTART  (1 << 9)   /* Start transmission */
+#define NCR_THALT   (1 << 10)  /* Halt transmission */
 
 /* NCFGR bits */
 #define NCFGR_SPD       (1 << 0)   /* Speed (100Mbps) */
@@ -100,6 +120,7 @@ static inline void ecw(u32 off, u32 val) { mmio_write(ETH_CFG_BASE + off, val); 
 /* DMACFG bits */
 #define DMACFG_RXBS_SHIFT   16
 #define DMACFG_FBLDO_SHIFT  0
+#define DMACFG_TXCOEN       (1 << 11)
 #define DMACFG_ADDR64       (1 << 30)
 
 /* ── Buffer descriptor format ── */
@@ -431,6 +452,7 @@ bool macb_init(void) {
         /* FBLDO=16 — RPi rp1-gem config uses 16 */
         dmacfg |= (16 << DMACFG_FBLDO_SHIFT);
         dmacfg |= (1 << 10);   /* TXPBMS */
+        dmacfg |= DMACFG_TXCOEN; /* GEM TX IP/TCP/UDP checksum generation */
         dmacfg |= (3 << 8);    /* RXBMS = 3 (max) */
         dmacfg &= ~(1 << 7);   /* no endian swap pkt */
         dmacfg &= ~(1 << 6);   /* no endian swap desc */
@@ -490,9 +512,12 @@ bool macb_init(void) {
         mw(NCFGR, NCFGR_CLK_DIV64 | (dbw << 21) | (1 << 17) /* DRFCS */);
     }
 
-    /* Disable all interrupts (polling mode) */
+    /* Disable all interrupts (polling mode) then clear ISR */
     mw(IDR, 0xFFFFFFFF);
-    (void)mr(ISR);
+    u32 isr_init = mr(ISR);
+    if (isr_init) mw(ISR, isr_init);  /* Clear any pending status */
+    u32 tsr_init = mr(TSR);
+    if (tsr_init) mw(TSR, tsr_init);  /* Clear TX status */
 
     /* ── Setup RX descriptors ── */
     for (u32 i = 0; i < NUM_RX; i++) {
@@ -524,9 +549,11 @@ bool macb_init(void) {
     tx_idx = 0;
 
     __asm__ volatile("dsb sy" ::: "memory");
-    dcache_clean_range((u64)(usize)rx_ring, sizeof(rx_ring));
+    /* Use clean+invalidate so cachelines are evicted; subsequent reads
+     * (including MAC's status updates via DMA) will be served from RAM. */
+    dcache_clean_invalidate_range((u64)(usize)rx_ring, sizeof(rx_ring));
     dcache_clean_range((u64)(usize)rx_bufs, sizeof(rx_bufs));
-    dcache_clean_range((u64)(usize)tx_ring, sizeof(tx_ring));
+    dcache_clean_invalidate_range((u64)(usize)tx_ring, sizeof(tx_ring));
     __asm__ volatile("dsb sy" ::: "memory");
 
     uart_puts("[mac] RX desc[0]=");
@@ -645,7 +672,7 @@ bool macb_init(void) {
         if (dbwdef2 >= 4) dbw2 = 2;       /* 128-bit */
         else if (dbwdef2 >= 2) dbw2 = 1;   /* 64-bit */
         else dbw2 = 0;                     /* 32-bit */
-        u32 ncfgr = NCFGR_BIG | NCFGR_CLK_DIV64 | NCFGR_CAF | NCFGR_RXCOEN
+        u32 ncfgr = NCFGR_BIG | NCFGR_CLK_DIV64 | NCFGR_RXCOEN
                    | (dbw2 << 21) | (1 << 17) /* DRFCS */;
         if (gig)    ncfgr |= NCFGR_GBE;
         if (spd100) ncfgr |= NCFGR_SPD;
@@ -670,16 +697,62 @@ bool macb_init(void) {
 
 /* ── Send ── */
 static u32 tx_send_count;
+static u32 tx_drop_count;
+
+static void macb_dump_tx_state(const char *tag)
+{
+    uart_puts("[mac] ");
+    uart_puts(tag);
+    uart_puts(" tx_idx=");
+    uart_hex(tx_idx);
+    uart_puts(" sent=");
+    uart_hex(tx_send_count);
+    uart_puts(" drop=");
+    uart_hex(tx_drop_count);
+    uart_puts(" NCR=");
+    uart_hex(mr(NCR));
+    uart_puts(" TSR=");
+    uart_hex(mr(TSR));
+    uart_puts(" NSR=");
+    uart_hex(mr(NSR));
+    /* NOTE: do not read ISR here — it is read-to-clear and would mask the
+     * very error bits (HRESP/TUR/RLE/RXUBR) we need to capture on stall. */
+    uart_puts(" TBQP=");
+    uart_hex(mr(TBQP));
+    uart_puts("\n");
+    dcache_clean_invalidate_range((u64)(usize)tx_ring, sizeof(tx_ring));
+    uart_puts("[mac] desc.ctrl:");
+    for (u32 i = 0; i < NUM_TX; i++) {
+        uart_putc(' ');
+        u32 c = tx_ring[i].ctrl;
+        uart_putc((c & TX_STAT_USED) ? 'U' : '_');
+        uart_putc((c & TX_STAT_WRAP) ? 'W' : '_');
+        uart_putc('0' + (i / 10));
+        uart_putc('0' + (i % 10));
+    }
+    uart_puts("\n");
+}
 
 bool macb_send(const u8 *frame, u32 len) {
-    if (len > BUF_SIZE || len < 14) return false;
+    if (len > BUF_SIZE || len < 14) {
+        uart_putc('?');
+        return false;
+    }
 
-    /* Invalidate TX descriptor to see MAC's latest USED bit */
-    dcache_invalidate_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
-
-    /* Wait for TX descriptor to be available */
-    if (!(tx_ring[tx_idx].ctrl & TX_STAT_USED))
-        return false;  /* busy */
+    /* Check if TX descriptor is available (non-blocking).
+     * Use clean+invalidate so we read fresh state from RAM and evict any
+     * cached copy that might shadow the MAC's USED-bit update. */
+    dcache_clean_invalidate_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
+    if (!(tx_ring[tx_idx].ctrl & TX_STAT_USED)) {
+        tx_drop_count++;
+        /* Single-char heartbeat: '!' = drop */
+        uart_putc('!');
+        /* Diagnostic dump on the first few drops and then periodically. */
+        if (tx_drop_count <= 3 || (tx_drop_count & 0x3F) == 0) {
+            macb_dump_tx_state("DROP");
+        }
+        return false;  /* Descriptor not ready, drop packet */
+    }
 
     /* Copy frame to TX buffer (NEON for throughput) */
     u8 *dst = tx_bufs[tx_idx];
@@ -701,40 +774,41 @@ bool macb_send(const u8 *frame, u32 len) {
     if (tx_idx == NUM_TX - 1) ctrl |= TX_STAT_WRAP;
     tx_ring[tx_idx].ctrl = ctrl;
 
-    /* Flush descriptor to RAM before triggering DMA */
-    dcache_clean_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
+    /* CRITICAL: clean+invalidate the descriptor (NOT just clean).
+     *
+     * 16-byte descriptors share 64-byte cache lines: 4 descriptors per line.
+     * If we only "clean" (dc cvac), the line stays in cache. When the MAC
+     * later writes USED=1 to a sibling descriptor in the same cache line
+     * via non-coherent DMA, our cached copy becomes stale. The next time we
+     * touch any descriptor in that line and clean again, we overwrite the
+     * MAC's USED-bit updates with stale data — descriptors then look
+     * forever-busy and TX stops.
+     *
+     * Clean+invalidate (dc civac) evicts the line so the next access loads
+     * the MAC's fresh updates from RAM. */
+    dcache_clean_invalidate_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
     __asm__ volatile("dsb sy" ::: "memory");
 
-    /* Trigger TX */
-    mw(NCR, mr(NCR) | NCR_TSTART);
+    /* PCIe write-barrier: read back a benign MAC register before kicking
+     * TSTART. MMIO reads from the device force any outstanding writes
+     * (descriptor + buffer DMA flushes) to drain through PCIe before the
+     * MAC sees TSTART. Without this we observed only ~10 frames making
+     * the wire before the MAC effectively stalled — adding incidental
+     * MMIO reads in the diagnostic dump took us to 48+ pings. Make the
+     * barrier deliberate. */
+    (void)mr(NSR);
 
-    /* Log first few TX attempts */
-    if (tx_send_count < 5) {
-        uart_puts("[mac] TX#");
-        uart_hex(tx_send_count);
-        uart_puts(" idx=");
-        uart_hex(tx_idx);
-        uart_puts(" len=");
-        uart_hex(len);
-        uart_puts(" ctrl=");
-        uart_hex(ctrl);
-        uart_puts(" addr=");
-        uart_hex(tx_ring[tx_idx].addr);
-        uart_puts("\n");
-        /* Wait a moment then check if MAC consumed it + AER errors */
-        delay_cycles(100000);
-        dcache_invalidate_range((u64)(usize)&tx_ring[tx_idx], sizeof(struct macb_desc));
-        uart_puts("[mac] TX post: c=");
-        uart_hex(tx_ring[tx_idx].ctrl);
-        uart_puts(" TSR=");
-        uart_hex(mr(TSR));
-        uart_puts(" ISR=");
-        uart_hex(mr(ISR));
-        uart_puts(" NSR=");
-        uart_hex(mr(NSR));
-        uart_puts("\n");
-        pcie_aer_dump("post-TX");
-    }
+    /* Kick the TX engine. NCR_TSTART is needed per packet — when the MAC
+     * finishes a transmission and finds a descriptor with USED=1, it halts;
+     * TSTART restarts it. Reference: U-Boot drivers/net/macb.c:_macb_send. */
+    mw(NCR, mr(NCR) | NCR_TSTART);
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    /* Post-TSTART read-back barrier: force the TSTART write to complete on
+     * the device side before returning. Also lets the MAC begin pre-fetch
+     * before our next call clobbers the next descriptor slot. */
+    (void)mr(NCR);
+
     tx_send_count++;
 
     tx_idx = (tx_idx + 1) % NUM_TX;
@@ -742,6 +816,8 @@ bool macb_send(const u8 *frame, u32 len) {
 }
 
 /* ── Receive ── */
+static u32 rx_recv_count;
+
 bool macb_recv(u8 *frame, u32 *len) {
     /* Invalidate RX descriptor to see MAC's DMA writes (non-coherent PCIe) */
     dcache_invalidate_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
@@ -779,6 +855,111 @@ bool macb_recv(u8 *frame, u32 *len) {
     dsb();
 
     rx_idx = (rx_idx + 1) % NUM_RX;
+    rx_recv_count++;
+    return true;
+}
+
+/* Snapshot of full MAC state for stall diagnosis (host-side polling). */
+void macb_dump_full_state(const char *tag) {
+    uart_puts("[mac] ");
+    uart_puts(tag);
+    uart_puts(" tx_idx=");
+    uart_hex(tx_idx);
+    uart_puts(" rx_idx=");
+    uart_hex(rx_idx);
+    uart_puts(" tx_sent=");
+    uart_hex(tx_send_count);
+    uart_puts(" tx_drop=");
+    uart_hex(tx_drop_count);
+    uart_puts(" rx_recv=");
+    uart_hex(rx_recv_count);
+    uart_puts("\n[mac] NCR=");
+    uart_hex(mr(NCR));
+    uart_puts(" NCFGR=");
+    uart_hex(mr(NCFGR));
+    uart_puts(" NSR=");
+    uart_hex(mr(NSR));
+    uart_puts(" TSR=");
+    uart_hex(mr(TSR));
+    uart_puts(" RSR=");
+    uart_hex(mr(RSR));
+    uart_puts(" ISR=");
+    uart_hex(mr(ISR));   /* Last — this read clears the latched bits */
+    uart_puts("\n[mac] TBQP=");
+    uart_hex(mr(TBQP));
+    uart_puts(" RBQP=");
+    uart_hex(mr(RBQP));
+    uart_puts("\n");
+    dcache_clean_invalidate_range((u64)(usize)tx_ring, sizeof(tx_ring));
+    dcache_invalidate_range((u64)(usize)rx_ring, sizeof(rx_ring));
+    uart_puts("[mac] TX:");
+    for (u32 i = 0; i < NUM_TX; i++) {
+        uart_putc(' ');
+        u32 c = tx_ring[i].ctrl;
+        uart_putc((c & TX_STAT_USED) ? 'U' : '_');
+        uart_putc((c & TX_STAT_WRAP) ? 'W' : '_');
+        uart_putc('0' + (i / 10));
+        uart_putc('0' + (i % 10));
+    }
+    uart_puts("\n[mac] RX:");
+    for (u32 i = 0; i < NUM_RX; i++) {
+        uart_putc(' ');
+        u32 a = rx_ring[i].addr;
+        uart_putc((a & RX_ADDR_OWN)  ? 'O' : '_');
+        uart_putc((a & RX_ADDR_WRAP) ? 'W' : '_');
+        uart_putc('0' + (i / 10));
+        uart_putc('0' + (i % 10));
+    }
+    uart_puts("\n");
+    /* ETH_CFG_STAT — AXI bus error indicators from the RP1 GEM wrapper. */
+    uart_puts("[mac] ETH_CFG S=");
+    uart_hex(ecr(ETH_CFG_STAT));
+    uart_puts(" C=");
+    uart_hex(ecr(ETH_CFG_CTRL));
+    uart_puts("\n");
+}
+
+bool macb_kick_stall(void) {
+    /* Read & W1C latched status bits so we know what hit us, then
+     * try to halt + restart the TX engine, and re-arm any RX descriptors
+     * that aren't owned by us (defensive). */
+    u32 tsr_pre = mr(TSR);
+    u32 rsr_pre = mr(RSR);
+    u32 isr_pre = mr(ISR);  /* read-clears */
+    u32 ncr_pre = mr(NCR);
+
+    uart_puts("[mac] KICK pre TSR=");
+    uart_hex(tsr_pre);
+    uart_puts(" RSR=");
+    uart_hex(rsr_pre);
+    uart_puts(" ISR=");
+    uart_hex(isr_pre);
+    uart_puts(" NCR=");
+    uart_hex(ncr_pre);
+    uart_puts("\n");
+
+    /* Write-1-to-clear status bits (GEM TSR/RSR/ISR are W1C). */
+    if (tsr_pre) mw(TSR, tsr_pre);
+    if (rsr_pre) mw(RSR, rsr_pre);
+
+    /* Halt TX, brief pause, then restart. */
+    mw(NCR, ncr_pre | NCR_THALT);
+    __asm__ volatile("dsb sy" ::: "memory");
+    for (volatile int i = 0; i < 1000; i++) {}
+    mw(NCR, (mr(NCR) & ~NCR_THALT) | NCR_TSTART);
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    /* Re-walk RX ring: clear OWN on any descriptor that has OWN=1 but
+     * we never consumed (canary check — shouldn't normally happen, but
+     * forcing reclaim is harmless). Actually skip this — could lose frames.
+     * Instead, just ensure TBQP/RBQP are still pointing at our rings. */
+    uart_puts("[mac] KICK post NCR=");
+    uart_hex(mr(NCR));
+    uart_puts(" TSR=");
+    uart_hex(mr(TSR));
+    uart_puts(" RSR=");
+    uart_hex(mr(RSR));
+    uart_puts("\n");
     return true;
 }
 

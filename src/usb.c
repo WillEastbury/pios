@@ -120,6 +120,8 @@ static bool enumerate_device(u32 port, u32 speed) {
         uart_puts("[usb] Address device failed\n");
         return false;
     }
+    uart_puts("[usb] Address device OK, settle 50ms\n");
+    timer_delay_ms(50); /* Circle does this before first descriptor fetch. */
 
     /* GET_DESCRIPTOR: Device */
     struct usb_dev_desc *dd = (struct usb_dev_desc *)desc_buf;
@@ -155,7 +157,7 @@ static bool enumerate_device(u32 port, u32 speed) {
     dev->num_interfaces = cfg->bNumInterfaces;
 
     /* Parse descriptors: collect endpoints with interface context */
-    u8 cur_class = 0, cur_sub = 0, cur_proto = 0;
+    u8 cur_iface = 0, cur_class = 0, cur_sub = 0, cur_proto = 0;
     u32 off = 0;
     while (off + 2 <= got && dev->num_eps < USB_MAX_ENDPOINTS) {
         u8 len = desc_buf[off];
@@ -164,6 +166,7 @@ static bool enumerate_device(u32 port, u32 speed) {
 
         if (type == DESC_INTERFACE && len >= 9 && off + 9 <= got) {
             struct usb_iface_desc *id = (struct usb_iface_desc *)(desc_buf + off);
+            cur_iface = id->bInterfaceNumber;
             cur_class = id->bInterfaceClass;
             cur_sub = id->bInterfaceSubClass;
             cur_proto = id->bInterfaceProtocol;
@@ -174,6 +177,7 @@ static bool enumerate_device(u32 port, u32 speed) {
             dev->eps[idx].attributes = ep->bmAttributes;
             dev->eps[idx].max_packet = ep->wMaxPacketSize & 0x7FF;
             dev->eps[idx].interval = ep->bInterval;
+            dev->eps[idx].iface_number = cur_iface;
             dev->eps[idx].iface_class = cur_class;
             dev->eps[idx].iface_subclass = cur_sub;
             dev->eps[idx].iface_protocol = cur_proto;
@@ -232,39 +236,46 @@ bool usb_init(void) {
     device_valid = false;
     num_drivers = num_drivers; /* preserve pre-registered drivers */
 
-    if (!xhci_init())
-        return false;
-
-    timer_delay_ms(200); /* settling time */
-
-    /* Scan ports */
-    u32 nports = xhci_port_count();
-    uart_puts("[usb] Scanning ");
-    uart_hex(nports);
-    uart_puts(" ports\n");
-    for (u32 p = 0; p < nports; p++) {
-        bool conn = xhci_port_connected(p);
-        uart_puts("[usb] Port ");
-        uart_hex(p);
-        uart_puts(conn ? " connected\n" : " empty\n");
-        if (!conn)
+    for (u32 ctl = 0; ctl < 2; ctl++) {
+        xhci_select_controller(ctl);
+        if (!xhci_init())
             continue;
 
-        u32 speed = 0;
-        if (!xhci_port_reset(p, &speed)) {
-            uart_puts("[usb] Port reset failed\n");
-            continue;
-        }
+        timer_delay_ms(300); /* Circle uses a longer root-port settle delay. */
 
-        uart_puts("[usb] Speed=");
-        uart_hex(speed);
-        uart_puts("\n");
+        /* Scan ports */
+        u32 nports = xhci_port_count();
+        uart_puts("[usb] Scanning USB");
+        uart_hex(ctl);
+        uart_puts(" ");
+        uart_hex(nports);
+        uart_puts(" ports\n");
+        for (u32 p = 0; p < nports; p++) {
+            bool conn = xhci_port_connected(p);
+            uart_puts("[usb] USB");
+            uart_hex(ctl);
+            uart_puts(" Port ");
+            uart_hex(p);
+            uart_puts(conn ? " connected\n" : " empty\n");
+            if (!conn)
+                continue;
 
-        timer_delay_ms(200);  /* USB spec: 200ms after port reset */
+            u32 speed = 0;
+            if (!xhci_port_reset(p, &speed)) {
+                uart_puts("[usb] Port reset failed\n");
+                continue;
+            }
 
-        if (enumerate_device(p, speed)) {
-            probe_drivers();
-            return true;
+            uart_puts("[usb] Speed=");
+            uart_hex(speed);
+            uart_puts("\n");
+
+            timer_delay_ms(200);  /* USB spec: 200ms after port reset */
+
+            if (enumerate_device(p, speed)) {
+                probe_drivers();
+                return true;
+            }
         }
     }
 
