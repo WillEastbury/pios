@@ -268,6 +268,17 @@ http://192.168.218.101:8082/?confirm=1&action=status
 
 The FAT `kernel8.img` should be the stable stage0 loader. The second-stage kernel lives in the raw partition-2 slot and is what OTA updates.
 
+## DMA diagnostics
+
+DMA memcpy is self-tested during boot and can be checked from the console or Web Admin terminal:
+
+```text
+dma status
+dma selftest
+```
+
+On BCM2712, PIOS uses the `dma32` controller with physical low-RAM DMA addresses, not the old `0xC0000000` legacy alias. The working memcpy path uses the 32-byte control-block format with shifted CB address mode; startup keeps the NEON fallback disabled only after the DMA selftest passes.
+
 ## Firewall command
 
 Defaults:

@@ -1106,8 +1106,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "poke <addr> <value> [1|2|4|8]\n  Write live memory from UART/TCP console admin/debug context.\n");
         } else if (http_streq(topic, "dumpmem")) {
             http_append(out, &len, max, "dumpmem <addr> [bytes]\n  Dump memory from UART/TCP console admin/debug context.\n");
+        } else if (http_streq(topic, "dma")) {
+            http_append(out, &len, max, "dma status | dma selftest\n  Show DMA channel registers, selftest result, selected CB address mode, and retry selftest.\n");
         } else {
-            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help peek\n");
+            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma\n");
         }
     }
     else if (http_streq(cmd, "status")) {
@@ -1171,6 +1173,58 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " fw_tx_drop=");
         http_append_u64(out, &len, max, tx_drop);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "dma") || http_streq(cmd, "dma status")) {
+        struct dma_diag_snapshot d;
+        dma_diag_snapshot(&d);
+        http_append(out, &len, max, "DMA enabled=");
+        http_append(out, &len, max, d.hw_memcpy_enabled ? "yes" : "no");
+        http_append(out, &len, max, " mode=");
+        http_append(out, &len, max, d.direct_mode ? "direct" : "cb");
+        http_append(out, &len, max, " cbaddr=");
+        http_append(out, &len, max, d.cbaddr_shifted ? "shifted" : "raw");
+        http_append(out, &len, max, " selftests=");
+        http_append_u64(out, &len, max, d.selftest_runs);
+        http_append(out, &len, max, " failures=");
+        http_append_u64(out, &len, max, d.selftest_failures);
+        http_append(out, &len, max, " last_error=");
+        http_append_u64(out, &len, max, d.last_error);
+        http_append(out, &len, max, " last_ch=");
+        http_append_u64(out, &len, max, d.last_channel);
+        http_append(out, &len, max, " len=");
+        http_append_u64(out, &len, max, d.last_len);
+        http_append(out, &len, max, " enable=");
+        http_append_u64(out, &len, max, d.enable_reg);
+        http_append(out, &len, max, "\nCH CS CBADDR TI SRC DST LEN DEBUG\n");
+        for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
+            http_append_u64(out, &len, max, ch);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.channel[ch].cs);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.channel[ch].cbaddr);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.channel[ch].ti);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.channel[ch].src);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.channel[ch].dst);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.channel[ch].len);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.channel[ch].debug);
+            http_append(out, &len, max, "\n");
+        }
+        if (d.last_error == 4U) {
+            http_append(out, &len, max, "mismatch off=");
+            http_append_u64(out, &len, max, d.last_mismatch_off);
+            http_append(out, &len, max, " got=");
+            http_append_u64(out, &len, max, d.last_got);
+            http_append(out, &len, max, " expected=");
+            http_append_u64(out, &len, max, d.last_expected);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "dma selftest")) {
+        bool ok = dma_selftest();
+        http_append(out, &len, max, ok ? "DMA selftest OK\n" : "DMA selftest FAILED\n");
     } else if (http_streq(cmd, "processes")) {
         struct proc_ui_entry snap[MAX_PROCS_PER_CORE];
         u32 n = proc_snapshot(snap, MAX_PROCS_PER_CORE);
@@ -2915,6 +2969,7 @@ static void ui_cmd_capsule(u32 argc, char **argv);
 static void ui_cmd_obs(u32 argc, char **argv);
 static void ui_cmd_update(u32 argc, char **argv);
 static void ui_cmd_watchdog(u32 argc, char **argv);
+static void ui_cmd_dma(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -4250,6 +4305,72 @@ static void ui_console_ip4(u32 ip)
     ui_console_u32_dec(ip & 0xFF);
 }
 
+static void ui_print_dma_diag(void)
+{
+    struct dma_diag_snapshot d;
+    dma_diag_snapshot(&d);
+    ui_console_write("DMA enabled=");
+    ui_console_write(d.hw_memcpy_enabled ? "yes" : "no");
+    ui_console_write(" mode=");
+    ui_console_write(d.direct_mode ? "direct" : "cb");
+    ui_console_write(" cbaddr=");
+    ui_console_write(d.cbaddr_shifted ? "shifted" : "raw");
+    ui_console_write(" selftests=");
+    ui_console_u32_dec(d.selftest_runs);
+    ui_console_write(" failures=");
+    ui_console_u32_dec(d.selftest_failures);
+    ui_console_write(" last_error=");
+    ui_console_u32_dec(d.last_error);
+    ui_console_write(" last_ch=");
+    ui_console_u32_dec(d.last_channel);
+    ui_console_write(" len=");
+    ui_console_u32_dec(d.last_len);
+    ui_console_write(" enable=");
+    ui_console_hex_fixed(d.enable_reg, 8);
+    ui_console_write("\nCH CS CBADDR TI SRC DST LEN DEBUG\n");
+    for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
+        ui_console_u32_dec(ch);
+        ui_console_write(" ");
+        ui_console_hex_fixed(d.channel[ch].cs, 8);
+        ui_console_write(" ");
+        ui_console_hex_fixed(d.channel[ch].cbaddr, 8);
+        ui_console_write(" ");
+        ui_console_hex_fixed(d.channel[ch].ti, 8);
+        ui_console_write(" ");
+        ui_console_hex_fixed(d.channel[ch].src, 8);
+        ui_console_write(" ");
+        ui_console_hex_fixed(d.channel[ch].dst, 8);
+        ui_console_write(" ");
+        ui_console_hex_fixed(d.channel[ch].len, 8);
+        ui_console_write(" ");
+        ui_console_hex_fixed(d.channel[ch].debug, 8);
+        ui_console_write("\n");
+    }
+    if (d.last_error == 4U) {
+        ui_console_write("mismatch off=");
+        ui_console_u32_dec(d.last_mismatch_off);
+        ui_console_write(" got=");
+        ui_console_u32_dec(d.last_got);
+        ui_console_write(" expected=");
+        ui_console_u32_dec(d.last_expected);
+        ui_console_write("\n");
+    }
+}
+
+static void ui_cmd_dma(u32 argc, char **argv)
+{
+    if (argc >= 2 && ui_streq(argv[1], "selftest")) {
+        ui_console_write(dma_selftest() ? "DMA selftest OK\n" : "DMA selftest FAILED\n");
+        ui_print_dma_diag();
+        return;
+    }
+    if (argc < 2 || ui_streq(argv[1], "status")) {
+        ui_print_dma_diag();
+        return;
+    }
+    ui_console_write("ERR: usage dma status | dma selftest\n");
+}
+
 static void ui_console_print_netstat(void)
 {
     tcp_snapshot_entry_t snap[TCP_MAX_CONNECTIONS];
@@ -4275,6 +4396,7 @@ static void ui_console_print_netstat(void)
         } else {
             ui_console_write("*:*");
         }
+
         ui_console_write("    ");
         ui_console_write(tcp_owner_label(e->local_port));
         ui_console_write("    ");
@@ -7107,6 +7229,9 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("reboot confirm\n  Reboot via PSCI SYSTEM_RESET; confirmation word is required.\n");
     } else if (ui_streq(topic, "watchdog")) {
         ui_console_write("watchdog status\nwatchdog arm|disarm\nwatchdog timeout <ticks>\nwatchdog mode <halt|reboot>\nwatchdog trip\n");
+    } else if (ui_streq(topic, "dma")) {
+        ui_console_write("dma status\n  Show DMA enable state, CB address mode, selftest counters, and channel registers.\n");
+        ui_console_write("dma selftest\n  Re-run the memcpy selftest and auto-select raw/shifted CB address mode if hardware passes.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -7205,7 +7330,7 @@ static void ui_console_exec(char *line)
             ui_console_write("  if for foreach update status|stage <slot> [tries]|success\n");
         } else if (ui_streq(argv[1], "dev")) {
             ui_console_write("Device/debug commands:\n");
-            ui_console_write("  usb status|reinit|poll  wifi disabled\n");
+            ui_console_write("  dma status|selftest  usb status|reinit|poll  wifi disabled\n");
             ui_console_write("  capsule ...  obs ...  hexsec <lba>\n");
             ui_console_write("  edit|edit.pix <path>  clear echo\n");
         } else if (!ui_console_help_topic(argv[1])) {
@@ -7468,6 +7593,8 @@ static void ui_console_exec(char *line)
         ui_console_write("ERR: wifi support removed (parked in spike/wifi/, see GitHub issue)\n");
     } else if (ui_streq(argv[0], "usb")) {
         ui_cmd_usb(argc, argv);
+    } else if (ui_streq(argv[0], "dma")) {
+        ui_cmd_dma(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "firewall")) {

@@ -13,6 +13,11 @@
 #include "uart.h"
 #include "fb.h"
 
+#define DMA_ENABLE_OFFSET 0xFF0U
+
+static bool dma_cbaddr_shifted;
+static bool dma_direct_mode;
+
 /* DMA channel register access */
 static inline u64 dma_reg(u32 ch, u32 off) {
     return DMA_BASE + (u64)ch * DMA_CHAN_STRIDE + off;
@@ -20,7 +25,8 @@ static inline u64 dma_reg(u32 ch, u32 off) {
 
 static inline u32 dma_cb_addr(const struct dma_cb *cb)
 {
-    return (u32)((((usize)cb) | 0xC0000000UL) >> 5);
+    u32 bus = (u32)(usize)cb;
+    return dma_cbaddr_shifted ? (bus >> 5) : bus;
 }
 
 /* Static control block pool — 16 CBs per channel, 32-byte aligned */
@@ -31,13 +37,29 @@ static const u32 zero_word ALIGNED(32) = 0;
 static u8 dma_test_src[1024] ALIGNED(64);
 static u8 dma_test_dst[1024] ALIGNED(64);
 static bool dma_hw_memcpy_enabled;
+static u32 dma_selftest_runs;
+static u32 dma_selftest_failures;
+static u32 dma_last_error;
+static u32 dma_last_channel;
+static u32 dma_last_len;
+static u32 dma_last_mismatch_off;
+static u32 dma_last_got;
+static u32 dma_last_expected;
+
+#define DMA_ERR_NONE        0U
+#define DMA_ERR_START       1U
+#define DMA_ERR_TIMEOUT     2U
+#define DMA_ERR_HW_ERROR    3U
+#define DMA_ERR_MISMATCH    4U
+#define DMA_ERR_ADDR_RANGE  5U
 
 static inline u32 dma_ram_addr(const void *p)
 {
-    return (u32)(((usize)p) | 0xC0000000UL);
+    return (u32)(usize)p;
 }
 
 static bool dma_memcpy_hw(u32 channel, void *dst, const void *src, u32 len);
+static bool dma_selftest_mode(u32 mode);
 
 static bool dma_channel_allowed(u32 ch)
 {
@@ -46,6 +68,11 @@ static bool dma_channel_allowed(u32 ch)
 
 void dma_init(void) {
     dma_hw_memcpy_enabled = false;
+    dma_direct_mode = false;
+    dma_cbaddr_shifted = false;
+    dma_last_error = DMA_ERR_NONE;
+    mmio_write(DMA_BASE + DMA_ENABLE_OFFSET, DMA_CHAN_MASK);
+    delay_cycles(1000);
     /* Reset usable dma32 channels. DT mask 0x35 exposes channels 0,2,4,5. */
     for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
         if (!dma_channel_allowed(ch))
@@ -86,8 +113,71 @@ static void dma_dump_channel(u32 ch, const char *tag)
     uart_puts("\n");
 }
 
+void dma_diag_snapshot(struct dma_diag_snapshot *out)
+{
+    if (!out)
+        return;
+    out->hw_memcpy_enabled = dma_hw_memcpy_enabled;
+    out->direct_mode = dma_direct_mode;
+    out->cbaddr_shifted = dma_cbaddr_shifted;
+    out->selftest_runs = dma_selftest_runs;
+    out->selftest_failures = dma_selftest_failures;
+    out->last_error = dma_last_error;
+    out->last_channel = dma_last_channel;
+    out->last_len = dma_last_len;
+    out->last_mismatch_off = dma_last_mismatch_off;
+    out->last_got = dma_last_got;
+    out->last_expected = dma_last_expected;
+    out->enable_reg = mmio_read(DMA_BASE + DMA_ENABLE_OFFSET);
+    for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
+        out->channel[ch].cs = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_CS)) : 0;
+        out->channel[ch].cbaddr = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_CBADDR)) : 0;
+        out->channel[ch].ti = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_TI)) : 0;
+        out->channel[ch].src = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_SRC)) : 0;
+        out->channel[ch].dst = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_DST)) : 0;
+        out->channel[ch].len = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_LEN)) : 0;
+        out->channel[ch].debug = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_DEBUG)) : 0;
+    }
+}
+
 bool dma_selftest(void)
 {
+    dma_selftest_runs++;
+    dma_hw_memcpy_enabled = false;
+    dma_last_error = DMA_ERR_NONE;
+    if (dma_selftest_mode(0)) {
+        dma_direct_mode = true;
+        dma_cbaddr_shifted = false;
+        dma_hw_memcpy_enabled = true;
+        uart_puts("[dma] selftest ok mode=direct\n");
+        return true;
+    }
+    dma_selftest_failures++;
+    if (dma_selftest_mode(1)) {
+        dma_direct_mode = false;
+        dma_cbaddr_shifted = false;
+        dma_hw_memcpy_enabled = true;
+        uart_puts("[dma] selftest ok cbaddr=raw\n");
+        return true;
+    }
+    dma_selftest_failures++;
+    if (dma_selftest_mode(2)) {
+        dma_direct_mode = false;
+        dma_cbaddr_shifted = true;
+        dma_hw_memcpy_enabled = true;
+        uart_puts("[dma] selftest ok cbaddr=shifted\n");
+        return true;
+    }
+    dma_selftest_failures++;
+    dma_hw_memcpy_enabled = false;
+    uart_puts("[dma] selftest failed both cbaddr modes\n");
+    return false;
+}
+
+static bool dma_selftest_mode(u32 mode)
+{
+    dma_direct_mode = mode == 0;
+    dma_cbaddr_shifted = mode == 2;
     for (u32 i = 0; i < sizeof(dma_test_src); i++) {
         dma_test_src[i] = (u8)(0xA5U ^ (i * 37U) ^ (i >> 2));
         dma_test_dst[i] = 0;
@@ -101,8 +191,12 @@ bool dma_selftest(void)
     uart_hex((u32)(usize)dma_test_dst);
     uart_puts(" cb=");
     uart_hex((u32)(usize)&cb_pool[DMA_CHAN_MEMCPY][0]);
+    uart_puts(" mode=");
+    if (mode == 0) uart_puts("direct");
+    else uart_puts(dma_cbaddr_shifted ? "shifted" : "raw");
     uart_puts("\n");
 
+    dma_abort(DMA_CHAN_MEMCPY);
     if (!dma_memcpy_hw(DMA_CHAN_MEMCPY, dma_test_dst, dma_test_src, sizeof(dma_test_src))) {
         uart_puts("[dma] selftest memcpy returned false\n");
         dma_dump_channel(DMA_CHAN_MEMCPY, "selftest-fail");
@@ -119,13 +213,32 @@ bool dma_selftest(void)
             uart_puts(" exp=");
             uart_hex(dma_test_src[i]);
             uart_puts("\n");
+            dma_last_error = DMA_ERR_MISMATCH;
+            dma_last_mismatch_off = i;
+            dma_last_got = dma_test_dst[i];
+            dma_last_expected = dma_test_src[i];
             dma_dump_channel(DMA_CHAN_MEMCPY, "selftest-mismatch");
             return false;
         }
     }
 
-    uart_puts("[dma] selftest ok\n");
-    dma_hw_memcpy_enabled = true;
+    return true;
+}
+
+static bool dma_start_direct(u32 channel, u32 ti, u32 src, u32 dst, u32 len)
+{
+    if (channel >= DMA_NUM_CHANNELS) return false;
+    if (!dma_channel_allowed(channel)) return false;
+    if (dma_busy(channel)) return false;
+    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
+    mmio_write(dma_reg(channel, DMA_CH_TI), ti);
+    mmio_write(dma_reg(channel, DMA_CH_SRC), src);
+    mmio_write(dma_reg(channel, DMA_CH_DST), dst);
+    mmio_write(dma_reg(channel, DMA_CH_LEN), len);
+    mmio_write(dma_reg(channel, DMA_CH_STRIDE), 0);
+    mmio_write(dma_reg(channel, DMA_CH_NEXTCB), 0);
+    dsb();
+    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_ACTIVE);
     return true;
 }
 
@@ -165,7 +278,6 @@ bool dma_start(u32 channel, struct dma_cb *cb) {
     dcache_clean_range((u64)(usize)cb, sizeof(*cb));
     dsb();
 
-    /* BCM2712 dma32 expects the CB address shifted right by 5. */
     mmio_write(dma_reg(channel, DMA_CH_CBADDR), dma_cb_addr(cb));
 
     /* Activate */
@@ -183,9 +295,12 @@ static bool dma_memcpy_hw(u32 channel, void *dst, const void *src, u32 len) {
     if (!dma_channel_allowed(channel)) return false;
     if (dma_busy(channel)) return false;
 
-    /* bcm2712 dma32 sees RAM through child DMA alias 0xC0000000. */
+    /* BCM2712 dma32 uses the SoC DMA address; for low RAM this is PA. */
     if ((u64)(usize)src >= 0x40000000ULL || (u64)(usize)dst >= 0x40000000ULL) {
         uart_puts("[dma] addr outside dma-ranges\n");
+        dma_last_error = DMA_ERR_ADDR_RANGE;
+        dma_last_channel = channel;
+        dma_last_len = len;
         return false;
     }
 
@@ -203,12 +318,20 @@ static bool dma_memcpy_hw(u32 channel, void *dst, const void *src, u32 len) {
     cb->stride   = 0;
     cb->next_cb  = 0;  /* single transfer */
 
-    if (!dma_start(channel, cb))
+    dma_last_channel = channel;
+    dma_last_len = len;
+    bool started = dma_direct_mode ?
+        dma_start_direct(channel, cb->ti, cb->src_addr, cb->dst_addr, cb->xfer_len) :
+        dma_start(channel, cb);
+    if (!started) {
+        dma_last_error = DMA_ERR_START;
         return false;
+    }
 
     dma_wait(channel);
     if (mmio_read(dma_reg(channel, DMA_CH_CS)) & DMA_CS_ACTIVE) {
         uart_puts("[dma] memcpy timeout\n");
+        dma_last_error = DMA_ERR_TIMEOUT;
         dma_dump_channel(channel, "memcpy-timeout");
         dma_abort(channel);
         return false;
@@ -220,10 +343,12 @@ static bool dma_memcpy_hw(u32 channel, void *dst, const void *src, u32 len) {
     /* Check for errors */
     u32 cs = mmio_read(dma_reg(channel, DMA_CH_CS));
     if (cs & DMA_CS_ERROR) {
+        dma_last_error = DMA_ERR_HW_ERROR;
         mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_ERROR);
         return false;
     }
 
+    dma_last_error = DMA_ERR_NONE;
     return true;
 }
 
@@ -244,7 +369,7 @@ bool dma_zero(u32 channel, void *dst, u32 len) {
     if (!dma_channel_allowed(channel)) return false;
     if (dma_busy(channel)) return false;
 
-    /* bcm2712 dma32 sees RAM through child DMA alias 0xC0000000. */
+    /* BCM2712 dma32 uses the SoC DMA address; for low RAM this is PA. */
     if ((u64)(usize)dst >= 0x40000000ULL) {
         uart_puts("[dma] addr outside dma-ranges\n");
         return false;
@@ -264,7 +389,10 @@ bool dma_zero(u32 channel, void *dst, u32 len) {
     cb->stride   = 0;
     cb->next_cb  = 0;
 
-    if (!dma_start(channel, cb))
+    bool started = dma_direct_mode ?
+        dma_start_direct(channel, cb->ti, cb->src_addr, cb->dst_addr, cb->xfer_len) :
+        dma_start(channel, cb);
+    if (!started)
         return false;
 
     dma_wait(channel);

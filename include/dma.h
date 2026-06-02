@@ -28,6 +28,32 @@ struct dma_cb {
     u32 _pad[2];        /* Pad to 32 bytes */
 } ALIGNED(32);
 
+struct dma_channel_diag {
+    u32 cs;
+    u32 cbaddr;
+    u32 ti;
+    u32 src;
+    u32 dst;
+    u32 len;
+    u32 debug;
+} PACKED;
+
+struct dma_diag_snapshot {
+    bool hw_memcpy_enabled;
+    bool direct_mode;
+    bool cbaddr_shifted;
+    u32 selftest_runs;
+    u32 selftest_failures;
+    u32 last_error;
+    u32 last_channel;
+    u32 last_len;
+    u32 last_mismatch_off;
+    u32 last_got;
+    u32 last_expected;
+    u32 enable_reg;
+    struct dma_channel_diag channel[DMA_NUM_CHANNELS];
+} PACKED;
+
 /* Transfer Information (TI) register bits */
 #define DMA_TI_INTEN        (1 << 0)     /* Interrupt enable */
 #define DMA_TI_TDMODE       (1 << 1)     /* 2D mode */
@@ -67,10 +93,12 @@ struct dma_cb {
 #define DMA_CHAN_GPU         4
 #define DMA_CHAN_MEMCPY      5
 #define DMA_CHAN_SPARE       5
+#define DMA_CHAN_MASK        ((1U << 0) | (1U << 2) | (1U << 4) | (1U << 5))
 
 /* Init the DMA engine */
 void dma_init(void);
 bool dma_selftest(void);
+void dma_diag_snapshot(struct dma_diag_snapshot *out);
 
 /* Simple one-shot memcpy via DMA (blocks until complete) */
 bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len);
