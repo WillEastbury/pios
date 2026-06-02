@@ -9,6 +9,7 @@
 #pragma once
 #include "types.h"
 #include "pipe.h"
+#include "mem_arena.h"
 struct irq_frame;
 
 struct paged_io_stat {
@@ -26,6 +27,12 @@ struct proc_ui_entry {
     u32 affinity_core;
     u32 priority_class;
     u32 mem_kib;
+    u32 arena_capacity_kib;
+    u32 arena_used_kib;
+    u32 arena_high_kib;
+    u32 arena_bump_kib;
+    u32 arena_span_kib;
+    u32 arena_span_count;
     u32 cpu_percent;
     u32 preemptions;
     u64 runtime_ticks;
@@ -162,6 +169,14 @@ struct process {
     u32 exec_hash_last;
     u64 exec_hash_next_check_tick;
     u32 exec_hash_check_nonce;
+    u64 arena_base;
+    u64 arena_limit;
+    u32 arena_capacity_bytes;
+    u32 arena_high_bytes;
+    u32 arena_span_bytes;
+    u32 arena_span_high_bytes;
+    u32 arena_span_count;
+    u32 arena_span_high_count;
 };
 
 /* PIKEE (Pi Kernel Execution Environment) API table passed to processes in x0 at entry.
@@ -323,6 +338,10 @@ struct kernel_api {
     i32 (*tensor_scale)(void *b, const void *a, float scalar);
     i32 (*tensor_bind_kernel_blob)(u32 kernel_id, const void *uniform_data, u32 uniform_bytes,
                                    const u64 *shader_code, u32 shader_insts);
+
+    /* ---- Arena/span allocation extensions ---- */
+    void *(*span_rent)(u32 bytes, u32 align, u32 type);
+    i32   (*span_release)(void *ptr);
 };
 
 typedef struct kernel_api pikee_api;
@@ -345,6 +364,8 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms);
 void proc_irq_maybe_preempt(struct irq_frame *frame);
 u64  proc_preemptions(void);
 u32  proc_snapshot(struct proc_ui_entry *out, u32 max_entries);
+void *proc_span_rent(u32 bytes, u32 align, u32 type);
+bool proc_span_release(void *ptr);
 u32  proc_log_snapshot(struct proc_log_ui_entry *out, u32 max_entries);
 u32  proc_capsule_snapshot(struct proc_capsule_ui_entry *out, u32 max_entries);
 void proc_security_stats_snapshot(struct proc_security_stats *out);

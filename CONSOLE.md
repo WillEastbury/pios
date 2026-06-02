@@ -161,7 +161,7 @@ Tabs include:
 - **Overview**: `/api/status` JSON, including `version` and `build`.
 - **System**: terminal `status` output as summary cards/table plus raw text.
 - **Netstat**: TCP diagnostics as a connection/session table.
-- **Processes**: process snapshot table with PPID and graph section.
+- **Processes**: process snapshot table with PPID, arena/span memory columns, and graph section.
 - **Users**: user/principal table.
 - **Logs**: operator log tail and process logs in side-by-side cards.
 - **WALFS**: root WALFS browser/status table.
@@ -197,7 +197,27 @@ http://192.168.218.101:8080/logs?tail=24
 http://192.168.218.101/api/admin/log-stream?tail=24
 ```
 
-`ps` and the Web Admin Processes tab include parent PID (`PPID`) and a simple process graph/tree section.
+`ps`, `/api/terminal?cmd=processes`, HDMI process views, and the Web Admin Processes tab include parent PID (`PPID`) and a simple process graph/tree section.
+
+Process memory columns:
+
+```text
+ACAP   arena capacity KiB available after loaded code and guard space
+AUSED  current arena KiB in use by bump allocations plus rented spans
+AHI    high-water/max arena KiB observed
+ABUMP  KiB used through the process bump/sbrk arena
+ASPAN  KiB currently held by rented spans
+SCNT   active rented span count
+```
+
+PIOS userland also exposes arena span primitives through the kernel API:
+
+```c
+void *span_rent(u32 bytes, u32 align, u32 type);
+i32 span_release(void *ptr);
+```
+
+Rented spans grow downward from the top of the process data arena, while `sbrk` grows upward. Allocation fails before the two regions can overlap.
 
 Use `tail=N` to limit the returned ring entries.
 

@@ -1091,7 +1091,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         if (http_streq(topic, "status")) {
             http_append(out, &len, max, "status\n  Show system/build/network summary.\n");
         } else if (http_streq(topic, "ps") || http_streq(topic, "processes")) {
-            http_append(out, &len, max, "processes\n  Show process snapshot with PPID and process graph roots/children.\n");
+            http_append(out, &len, max, "processes\n  Show process snapshot with PPID, arena/span telemetry, and process graph roots/children.\n");
         } else if (http_streq(topic, "netstat")) {
             http_append(out, &len, max, "netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
         } else if (http_streq(topic, "firewall")) {
@@ -1174,7 +1174,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     } else if (http_streq(cmd, "processes")) {
         struct proc_ui_entry snap[MAX_PROCS_PER_CORE];
         u32 n = proc_snapshot(snap, MAX_PROCS_PER_CORE);
-        http_append(out, &len, max, "PID        PPID       CORE STATE    PRI      CPU MEMK IMAGE\n");
+        http_append(out, &len, max, "PID PPID CORE STATE PRI CPU MEMK ACAP AUSED AHI ABUMP ASPAN SCNT IMAGE\n");
         for (u32 i = 0; i < n; i++) {
             http_append_u64(out, &len, max, snap[i].pid);
             http_append(out, &len, max, " ");
@@ -1189,6 +1189,18 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, snap[i].cpu_percent);
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, snap[i].mem_kib);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, snap[i].arena_capacity_kib);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, snap[i].arena_used_kib);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, snap[i].arena_high_kib);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, snap[i].arena_bump_kib);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, snap[i].arena_span_kib);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, snap[i].arena_span_count);
             http_append(out, &len, max, " ");
             http_append(out, &len, max, snap[i].image_path);
             http_append(out, &len, max, "\n");
@@ -2079,7 +2091,7 @@ static u32 http_build_spa_response(char *out, u32 max)
         "<style>:root{color-scheme:light;--cp-bg:#f7f4ef;--cp-bg-elevated:#fcfbf8;--cp-surface:#ffffff;--cp-surface-soft:#f5f5f5;--cp-border:#dedede;--cp-border-strong:#919191;--cp-text:#242424;--cp-text-muted:#5c5c5c;--cp-text-soft:#6f6f6f;--cp-accent:#b11f4b;--cp-accent-hover:#9a1a41;--cp-accent-soft:rgba(177,31,75,.08);--cp-accent-fg:#ffffff;--cp-success:#16a34a;--cp-danger:#dc2626;--cp-warning:#f59e0b;--cp-link:#0078d4;--cp-shadow:0 18px 48px rgba(0,0,0,.12);--cp-overlay:rgba(255,255,255,.8);--cp-panel:rgba(255,255,255,.86);--cp-panel-strong:rgba(255,255,255,.96);--cp-sheen:rgba(255,255,255,.55);--cp-highlight:rgba(177,31,75,.12)}html[data-theme='dark']{color-scheme:dark;--cp-bg:#3d3b3a;--cp-bg-elevated:#343231;--cp-surface:#292929;--cp-surface-soft:#2e2e2e;--cp-border:#474747;--cp-border-strong:#5f5f5f;--cp-text:#dedede;--cp-text-muted:#919191;--cp-text-soft:#b0b0b0;--cp-accent:#fd8ea1;--cp-accent-hover:#fb7b91;--cp-accent-soft:rgba(253,142,161,.14);--cp-accent-fg:#1a1a1a;--cp-success:#4ade80;--cp-danger:#f87171;--cp-warning:#fbbf24;--cp-link:#4da6ff;--cp-shadow:0 18px 48px rgba(0,0,0,.32);--cp-overlay:rgba(41,41,41,.88);--cp-panel:rgba(41,41,41,.72);--cp-panel-strong:rgba(41,41,41,.96);--cp-sheen:rgba(255,255,255,.04);--cp-highlight:rgba(253,142,161,.12)}</style>"
         "<style>body{margin:0;background:var(--cp-bg);color:var(--cp-text);font-family:'Segoe UI',Aptos,Calibri,-apple-system,BlinkMacSystemFont,sans-serif}.wrap{padding:24px}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-end}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:16px 0}.tabs button,.bt{border:1px solid var(--cp-border);background:var(--cp-surface);color:var(--cp-text);border-radius:.625rem;padding:8px 12px}.tabs button.act,.bt.primary{background:var(--cp-accent);color:var(--cp-accent-fg);border-color:var(--cp-accent)}.tabs button:hover,.bt:hover{border-color:var(--cp-border-strong)}.tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px}.tools input{width:88px}.tools label{color:var(--cp-text-muted)}input{background:var(--cp-surface);color:var(--cp-text);border:1px solid var(--cp-border);border-radius:.625rem;padding:7px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.cd,.tile{background:var(--cp-surface);border:1px solid var(--cp-border);border-radius:16px;box-shadow:0 0 2px rgba(0,0,0,.12),0 1px 2px rgba(0,0,0,.14);padding:16px;margin:12px 0}.tile{margin:0}.muted{color:var(--cp-text-muted)}.pill{display:inline-block;border:1px solid var(--cp-border);border-radius:.625rem;padding:2px 7px;background:var(--cp-accent-soft)}a{color:var(--cp-link)}pre,code,.nt{font-family:Consolas,'Courier New',Courier,monospace}pre{white-space:pre-wrap;overflow:auto}.nt{width:100%;border-collapse:collapse;font-size:13px}.nt th,.nt td{border-bottom:1px solid var(--cp-border);padding:7px 8px;text-align:left;vertical-align:top}.nt th{color:var(--cp-text-muted);background:var(--cp-surface-soft)}.ok{color:var(--cp-success)}.warn{color:var(--cp-warning)}.bad{color:var(--cp-danger)}.term{background:var(--cp-bg-elevated);color:var(--cp-success);border:1px solid var(--cp-success);border-radius:.625rem;overflow:hidden;font-family:Consolas,'Courier New',Courier,monospace}.bar{background:var(--cp-surface-soft);padding:8px 12px;border-bottom:1px solid var(--cp-border);letter-spacing:.08em}.screen{height:420px;overflow:auto;padding:14px;white-space:pre-wrap;font-size:14px;line-height:1.35}.prompt{display:flex;gap:8px;align-items:center;border-top:1px solid var(--cp-border);background:var(--cp-surface-soft);padding:10px 12px}.prompt input{flex:1;border:0;outline:0;font-family:Consolas,'Courier New',Courier,monospace}.cursor{animation:blink 1s steps(1) infinite}@keyframes blink{50%{opacity:0}}</style></head><body><div class='wrap'><div class='top'><div><h1>PIOS Admin Console</h1><p id='sub' class='muted'>Structured tabs; manual refresh.</p></div><div class='muted'>SECOND STAGE</div></div><div class='tabs'><button class='act' data-t='overview'>Overview</button><button data-t='processes'>Processes</button><button data-t='netstat'>Netstat</button><button data-t='system'>System</button><button data-t='users'>Users</button><button data-t='logs'>Logs</button><button data-t='walfs'>WALFS</button><button data-t='firewall'>Firewall</button><button data-t='terminal'>Terminal</button><button data-t='admin'>Admin</button></div><div id='app'></div></div>");
     http_append(out, &len, max,
-        "<script>let tab='overview',hist=['PIOS remote terminal ready. Type Help for assistance!'],auto=false,ms=3000,timer=0;const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function bust(u){return u+(u.includes('?')?'&':'?')+'_='+Date.now()}async function txt(u){let r=await fetch(bust(u));return await r.text()}async function js(u){let r=await fetch(bust(u));return await r.json()}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}function tools(){return `<div class=tools><button class='bt primary' id=rf>Refresh</button><label><input id=ar type=checkbox ${auto?'checked':''}> auto-refresh</label><input id=ms type=number min=250 step=250 value='${ms}'><span class=muted>ms</span></div>`}function bind(){let r=document.getElementById('rf'),a=document.getElementById('ar'),m=document.getElementById('ms');if(r)r.onclick=draw;if(a)a.onchange=()=>{auto=a.checked;sync()};if(m)m.onchange=()=>{ms=Math.max(250,parseInt(m.value||'3000'));m.value=ms;sync()};sync()}function sync(){if(timer){clearInterval(timer);timer=0}if(auto&&tab!=='terminal')timer=setInterval(draw,ms)}function table(h,rows){let b=rows.length?rows.map(r=>'<tr>'+h.map((_,i)=>'<td>'+esc(r[i]||'')+'</td>').join('')+'</tr>').join(''):`<tr><td colspan='${h.length}' class=muted>No rows</td></tr>`;return '<table class=nt><thead><tr>'+h.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+b+'</tbody></table>'}function kv(o){return table(['Key','Value'],Object.keys(o).map(k=>[k,o[k]]))}function splitRows(t){return t.trim().split('\\n').filter(x=>x&&x[0]>='0'&&x[0]<='9').map(x=>x.trim().split(/\\s+/))}async function overview(){let d=await js('/api/status'),dg=d.diag||{};app.innerHTML=card('Overview',tools()+`<div class=grid><div class=tile><b>Build</b><p>${esc(d.build)}</p><span class=pill>${esc(d.version)}</span></div><div class=tile><b>Network</b><p>${esc(d.ip)}</p><p class=muted>${esc(d.mode)}</p></div><div class=tile><b>Uptime</b><p>${esc(d.uptime)} seconds</p></div><div class=tile><b>HTTP diagnostics</b>${kv(dg)}</div></div>`);bind()}async function system(){let r=await txt('/api/terminal?cmd=status'),rows=[];r.split(/\\s+/).forEach(p=>{let i=p.indexOf('=');if(i>0)rows.push([p.slice(0,i),p.slice(i+1)])});app.innerHTML=card('System',tools()+`<div class=grid><div class=tile><b>${esc((r.split('\\n')[0]||'PIOS'))}</b></div><div class=tile>${table(['Metric','Value'],rows)}</div></div><pre>${esc(r)}</pre>`);bind()}async function netstat(){let r=await txt('/api/terminal?cmd=netstat'),lines=r.trim().split('\\n'),stats='';let rows=splitRows(r);for(let l of lines)if(l.startsWith('syn='))stats=l;app.innerHTML=card('Netstat',tools()+table(['Conn','State','Local','Remote','Owner','Pending','RX','TX','Retry'],rows)+`<p class=muted>${esc(stats)}</p>`);bind()}async function processes(){let r=await txt('/api/terminal?cmd=processes'),p=r.split('\\n\\nGRAPH\\n'),rows=splitRows(p[0]);app.innerHTML=card('Processes',tools()+table(['PID','PPID','Core','State','Pri','CPU','MemK','Image'],rows)+`<h3>Process graph</h3><pre>${esc(p[1]||'')}</pre>`);bind()}async function users(){let r=await txt('/api/terminal?cmd=users');app.innerHTML=card('Users',tools()+table(['ID','Flags','Name'],splitRows(r)));bind()}async function logs(){let a=await txt('/api/admin/log-stream?tail=24'),b=await txt('/api/logs');app.innerHTML=card('Logs',tools()+`<div class=grid><div class=tile><h3>Operator tail</h3><pre>${esc(a)}</pre></div><div class=tile><h3>Process logs</h3><pre>${esc(b)}</pre></div></div>`);bind()}async function walfs(){let d=await js('/api/walfs?path=/'),body='';if(d.entries)body=table(['ID','Name','Size','Flags'],d.entries.map(e=>[e.id,e.name,e.size,e.flags]));else body=kv(d);app.innerHTML=card('WALFS',tools()+body);bind()}async function firewall(){let r=await txt('/api/terminal?cmd=firewall%20list'),rows=[];r.split('\\n').forEach(l=>{let m=l.match(/^(\\d+):\\s+(\\S+)\\s+(\\S+)\\s+(.*)$/);if(m)rows.push([m[1],m[2],m[3],m[4]])});app.innerHTML=card('Firewall',tools()+`<p class=muted>${esc(r.split('\\n')[0]||'')}</p>`+table(['#','Action','Dir','Match'],rows)+`<h3>Mutation examples</h3><pre>firewall allow in tcp port 2323 src 192.168.218.9\\nfirewall deny in tcp port 80 src 192.168.218.0/24\\nfirewall reset</pre>`);bind()}function term(){sync();app.innerHTML=card('Terminal',`<div class=term><div class=bar>PIOS // SECOND STAGE LOADER // REMOTE CONSOLE</div><div class=screen id=screen></div><div class=prompt><span>ready&gt;</span><input id=cmd autocomplete=off spellcheck=false autofocus><span class=cursor>_</span></div></div>`);const sc=document.getElementById('screen'),cmd=document.getElementById('cmd');function paint(){sc.textContent=hist.join('\\n');sc.scrollTop=sc.scrollHeight}async function run(){let c=cmd.value.trim();cmd.value='';if(!c)return;if(c==='clear'){hist=[];paint();return}hist.push('ready> '+c);try{hist.push(await txt('/api/terminal?cmd='+encodeURIComponent(c)))}catch(e){hist.push('ERR '+e)}while(hist.length>160)hist.shift();paint()}cmd.onkeydown=e=>{if(e.key==='Enter')run()};paint();cmd.focus()}function admin(){app.innerHTML=card('Admin',tools()+`<div class=grid><div class=tile><b>Logs</b><p><a href='/api/admin/log-stream?tail=24'>Tail log stream</a></p></div><div class=tile><b>OTA</b><p><a href='/api/admin/kernel-update?confirm=1'>Kernel update status</a></p></div><div class=tile><b>Reboot</b><p><a href='/api/admin/reboot?confirm=1'>Queue hot reboot</a></p></div></div>`);bind()}async function draw(){sub.textContent='Loading '+tab+'...';try{if(tab==='overview')await overview();else if(tab==='system')await system();else if(tab==='netstat')await netstat();else if(tab==='processes')await processes();else if(tab==='users')await users();else if(tab==='logs')await logs();else if(tab==='walfs')await walfs();else if(tab==='firewall')await firewall();else if(tab==='terminal')term();else if(tab==='admin')admin();else app.innerHTML=card(tab,'unknown tab')}catch(e){app.innerHTML=card('Error',`<pre>${esc(e)}</pre>`)}sub.textContent='Tab '+tab+(auto&&tab!=='terminal'?` // auto ${ms}ms`:'')}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
+        "<script>let tab='overview',hist=['PIOS remote terminal ready. Type Help for assistance!'],auto=false,ms=3000,timer=0;const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function bust(u){return u+(u.includes('?')?'&':'?')+'_='+Date.now()}async function txt(u){let r=await fetch(bust(u));return await r.text()}async function js(u){let r=await fetch(bust(u));return await r.json()}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}function tools(){return `<div class=tools><button class='bt primary' id=rf>Refresh</button><label><input id=ar type=checkbox ${auto?'checked':''}> auto-refresh</label><input id=ms type=number min=250 step=250 value='${ms}'><span class=muted>ms</span></div>`}function bind(){let r=document.getElementById('rf'),a=document.getElementById('ar'),m=document.getElementById('ms');if(r)r.onclick=draw;if(a)a.onchange=()=>{auto=a.checked;sync()};if(m)m.onchange=()=>{ms=Math.max(250,parseInt(m.value||'3000'));m.value=ms;sync()};sync()}function sync(){if(timer){clearInterval(timer);timer=0}if(auto&&tab!=='terminal')timer=setInterval(draw,ms)}function table(h,rows){let b=rows.length?rows.map(r=>'<tr>'+h.map((_,i)=>'<td>'+esc(r[i]||'')+'</td>').join('')+'</tr>').join(''):`<tr><td colspan='${h.length}' class=muted>No rows</td></tr>`;return '<table class=nt><thead><tr>'+h.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+b+'</tbody></table>'}function kv(o){return table(['Key','Value'],Object.keys(o).map(k=>[k,o[k]]))}function splitRows(t){return t.trim().split('\\n').filter(x=>x&&x[0]>='0'&&x[0]<='9').map(x=>x.trim().split(/\\s+/))}async function overview(){let d=await js('/api/status'),dg=d.diag||{};app.innerHTML=card('Overview',tools()+`<div class=grid><div class=tile><b>Build</b><p>${esc(d.build)}</p><span class=pill>${esc(d.version)}</span></div><div class=tile><b>Network</b><p>${esc(d.ip)}</p><p class=muted>${esc(d.mode)}</p></div><div class=tile><b>Uptime</b><p>${esc(d.uptime)} seconds</p></div><div class=tile><b>HTTP diagnostics</b>${kv(dg)}</div></div>`);bind()}async function system(){let r=await txt('/api/terminal?cmd=status'),rows=[];r.split(/\\s+/).forEach(p=>{let i=p.indexOf('=');if(i>0)rows.push([p.slice(0,i),p.slice(i+1)])});app.innerHTML=card('System',tools()+`<div class=grid><div class=tile><b>${esc((r.split('\\n')[0]||'PIOS'))}</b></div><div class=tile>${table(['Metric','Value'],rows)}</div></div><pre>${esc(r)}</pre>`);bind()}async function netstat(){let r=await txt('/api/terminal?cmd=netstat'),lines=r.trim().split('\\n'),stats='';let rows=splitRows(r);for(let l of lines)if(l.startsWith('syn='))stats=l;app.innerHTML=card('Netstat',tools()+table(['Conn','State','Local','Remote','Owner','Pending','RX','TX','Retry'],rows)+`<p class=muted>${esc(stats)}</p>`);bind()}async function processes(){let r=await txt('/api/terminal?cmd=processes'),p=r.split('\\n\\nGRAPH\\n'),rows=splitRows(p[0]);app.innerHTML=card('Processes',tools()+table(['PID','PPID','Core','State','Pri','CPU','MemK','ArenaCap','ArenaUsed','ArenaHigh','Bump','SpanK','Span#','Image'],rows)+`<h3>Process graph</h3><pre>${esc(p[1]||'')}</pre>`);bind()}async function users(){let r=await txt('/api/terminal?cmd=users');app.innerHTML=card('Users',tools()+table(['ID','Flags','Name'],splitRows(r)));bind()}async function logs(){let a=await txt('/api/admin/log-stream?tail=24'),b=await txt('/api/logs');app.innerHTML=card('Logs',tools()+`<div class=grid><div class=tile><h3>Operator tail</h3><pre>${esc(a)}</pre></div><div class=tile><h3>Process logs</h3><pre>${esc(b)}</pre></div></div>`);bind()}async function walfs(){let d=await js('/api/walfs?path=/'),body='';if(d.entries)body=table(['ID','Name','Size','Flags'],d.entries.map(e=>[e.id,e.name,e.size,e.flags]));else body=kv(d);app.innerHTML=card('WALFS',tools()+body);bind()}async function firewall(){let r=await txt('/api/terminal?cmd=firewall%20list'),rows=[];r.split('\\n').forEach(l=>{let m=l.match(/^(\\d+):\\s+(\\S+)\\s+(\\S+)\\s+(.*)$/);if(m)rows.push([m[1],m[2],m[3],m[4]])});app.innerHTML=card('Firewall',tools()+`<p class=muted>${esc(r.split('\\n')[0]||'')}</p>`+table(['#','Action','Dir','Match'],rows)+`<h3>Mutation examples</h3><pre>firewall allow in tcp port 2323 src 192.168.218.9\\nfirewall deny in tcp port 80 src 192.168.218.0/24\\nfirewall reset</pre>`);bind()}function term(){sync();app.innerHTML=card('Terminal',`<div class=term><div class=bar>PIOS // SECOND STAGE LOADER // REMOTE CONSOLE</div><div class=screen id=screen></div><div class=prompt><span>ready&gt;</span><input id=cmd autocomplete=off spellcheck=false autofocus><span class=cursor>_</span></div></div>`);const sc=document.getElementById('screen'),cmd=document.getElementById('cmd');function paint(){sc.textContent=hist.join('\\n');sc.scrollTop=sc.scrollHeight}async function run(){let c=cmd.value.trim();cmd.value='';if(!c)return;if(c==='clear'){hist=[];paint();return}hist.push('ready> '+c);try{hist.push(await txt('/api/terminal?cmd='+encodeURIComponent(c)))}catch(e){hist.push('ERR '+e)}while(hist.length>160)hist.shift();paint()}cmd.onkeydown=e=>{if(e.key==='Enter')run()};paint();cmd.focus()}function admin(){app.innerHTML=card('Admin',tools()+`<div class=grid><div class=tile><b>Logs</b><p><a href='/api/admin/log-stream?tail=24'>Tail log stream</a></p></div><div class=tile><b>OTA</b><p><a href='/api/admin/kernel-update?confirm=1'>Kernel update status</a></p></div><div class=tile><b>Reboot</b><p><a href='/api/admin/reboot?confirm=1'>Queue hot reboot</a></p></div></div>`);bind()}async function draw(){sub.textContent='Loading '+tab+'...';try{if(tab==='overview')await overview();else if(tab==='system')await system();else if(tab==='netstat')await netstat();else if(tab==='processes')await processes();else if(tab==='users')await users();else if(tab==='logs')await logs();else if(tab==='walfs')await walfs();else if(tab==='firewall')await firewall();else if(tab==='terminal')term();else if(tab==='admin')admin();else app.innerHTML=card(tab,'unknown tab')}catch(e){app.innerHTML=card('Error',`<pre>${esc(e)}</pre>`)}sub.textContent='Tab '+tab+(auto&&tab!=='terminal'?` // auto ${ms}ms`:'')}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
     return len;
 }
 
@@ -3725,7 +3737,7 @@ static void ui_console_print_ps(void)
 {
     struct proc_ui_entry snap[UI_SNAPSHOT_MAX];
     u32 n = proc_snapshot(snap, UI_SNAPSHOT_MAX);
-    ui_console_write("PID      PPID     AFF  PRI       CPU%  MEM(KiB)  STATE\n");
+    ui_console_write("PID      PPID     AFF  PRI       CPU%  MEM  ARENA used/high/bump/span#  STATE\n");
     for (u32 i = 0; i < n; i++) {
         fb_printf("0x%x   0x%x   %u    %s   %u    %u       %s\n",
                   snap[i].pid, snap[i].parent_pid, snap[i].affinity_core,
@@ -3742,6 +3754,16 @@ static void ui_console_print_ps(void)
         uart_hex(snap[i].cpu_percent);
         uart_puts(" mem=");
         uart_hex(snap[i].mem_kib);
+        uart_puts(" arena=");
+        uart_hex(snap[i].arena_used_kib);
+        uart_puts("/");
+        uart_hex(snap[i].arena_high_kib);
+        uart_puts(" bump=");
+        uart_hex(snap[i].arena_bump_kib);
+        uart_puts(" span=");
+        uart_hex(snap[i].arena_span_kib);
+        uart_puts("#");
+        uart_hex(snap[i].arena_span_count);
         uart_puts(" state=");
         uart_puts(ui_proc_state_str(snap[i].state));
         uart_puts("\n");
@@ -7540,15 +7562,19 @@ static void ui_render_process_view(void)
 
     struct proc_ui_entry *e = &snap[ui_selected];
     const char *keys[] = {
-        "pid", "ppid", "state", "affinity", "cpu_pct", "mem_kib", "principal", "preemptions"
+        "pid", "ppid", "state", "affinity", "cpu_pct", "mem_kib", "arena_cap_kib",
+        "arena_used_kib", "arena_high_kib", "arena_bump_kib", "arena_span_kib",
+        "span_count", "principal", "preemptions"
     };
     u32 vals[] = {
         e->pid, e->parent_pid, e->state, e->affinity_core, e->cpu_percent,
-        e->mem_kib, e->principal_id, e->preemptions
+        e->mem_kib, e->arena_capacity_kib, e->arena_used_kib, e->arena_high_kib,
+        e->arena_bump_kib, e->arena_span_kib, e->arena_span_count,
+        e->principal_id, e->preemptions
     };
 
     fb_printf("Process %u / %u\n\n", ui_selected + 1, n);
-    for (u32 i = 0; i < 8; i++) {
+    for (u32 i = 0; i < 14; i++) {
         if (i == 2) {
             fb_printf("%s: %s\n", keys[i], ui_proc_state_str(vals[i]));
         } else if (i == 0 || i == 1) {
@@ -7570,7 +7596,7 @@ static void ui_render_process_manager(void)
     fb_set_color(0x00FFFFFF, UI_SHELL_BG_COLOR);
     fb_printf("========================================\n");
     fb_printf("Controls: F1 detail | K kill selected | L launch next | C open console\n\n");
-    fb_printf("PID      PPID     AFF  CPU%%  MEM(KiB)  STATE\n");
+    fb_printf("PID      PPID     AFF  CPU%%  MEM  ARENA  STATE\n");
 
     if (n == 0) {
         fb_printf("(no active processes)\n");
@@ -7579,9 +7605,10 @@ static void ui_render_process_manager(void)
             ui_selected = 0;
         for (u32 i = 0; i < n; i++) {
             fb_set_color((i == ui_selected) ? 0x00FF9900 : 0x00FFFFFF, UI_SHELL_BG_COLOR);
-            fb_printf("0x%x   0x%x   %u    %u     %u      %s\n",
+            fb_printf("0x%x   0x%x   %u    %u     %u   %u/%u  %s\n",
                       snap[i].pid, snap[i].parent_pid, snap[i].affinity_core,
-                      snap[i].cpu_percent, snap[i].mem_kib, ui_proc_state_str(snap[i].state));
+                      snap[i].cpu_percent, snap[i].mem_kib, snap[i].arena_used_kib,
+                      snap[i].arena_high_kib, ui_proc_state_str(snap[i].state));
         }
         fb_set_color(0x00FFFFFF, UI_SHELL_BG_COLOR);
     }
@@ -7843,9 +7870,10 @@ static void hdmi_dashboard_render(void)
     row = 21;
     for (u32 i = 0; i < proc_n && row < 25; i++) {
         fb_set_cursor(3, row++);
-        fb_printf("pid=0x%x ppid=0x%x core=%u cpu=%u%% mem=%uK %s %s",
+        fb_printf("pid=0x%x ppid=0x%x core=%u cpu=%u%% mem=%uK arena=%u/%uK %s %s",
                   proc[i].pid, proc[i].parent_pid, proc[i].affinity_core,
-                  proc[i].cpu_percent, proc[i].mem_kib,
+                  proc[i].cpu_percent, proc[i].mem_kib, proc[i].arena_used_kib,
+                  proc[i].arena_high_kib,
                   ui_proc_state_str(proc[i].state), proc[i].image_path);
     }
 

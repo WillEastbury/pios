@@ -63,6 +63,7 @@ struct proc_launch_req {
     u32 migrate_usage_ipc_objs;
     u64 migrate_usage_fs_write_bytes;
     u32 migrate_heap_used;
+    u32 migrate_arena_high_bytes;
     u32 migrate_exec_image_size;
     u32 migrate_exec_hash_baseline;
     u32 migrate_exec_hash_last;
@@ -72,10 +73,22 @@ struct proc_launch_req {
     char path[PROC_LAUNCH_PATH_MAX];
 };
 static struct proc_launch_req launch_req[3];
+#define PROC_SPANS_PER_PROCESS 8U
+struct proc_span_slot {
+    bool used;
+    u32 type;
+    u32 size;
+    u64 addr;
+};
+static struct proc_span_slot proc_spans[MAX_PROCS_PER_CORE][PROC_SPANS_PER_PROCESS];
+static u64 proc_span_floor[MAX_PROCS_PER_CORE];
 static inline bool on_user_core(void);
 static inline u32 user_core_slot(void);
 static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affinity_core);
 static void proc_account_runtime(struct process *p);
+static u32 proc_arena_bump_bytes(u32 slot);
+static void proc_arena_update_high(struct process *p, u32 slot);
+static void proc_span_reset(u32 slot);
 
 extern u8 __text_start;
 extern u8 __text_end;
@@ -214,6 +227,44 @@ static void proc_account_runtime(struct process *p)
     }
 }
 
+static u32 proc_arena_bump_bytes(u32 slot)
+{
+    if (slot >= MAX_PROCS_PER_CORE)
+        return 0;
+    struct process *p = &procs[slot];
+    if (p->arena_base == 0 || heap_top[slot] <= p->arena_base)
+        return 0;
+    u64 used = heap_top[slot] - p->arena_base;
+    return used > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (u32)used;
+}
+
+static void proc_arena_update_high(struct process *p, u32 slot)
+{
+    if (!p || slot >= MAX_PROCS_PER_CORE)
+        return;
+    u32 bump = proc_arena_bump_bytes(slot);
+    u64 used = (u64)bump + p->arena_span_bytes;
+    if (used > 0xFFFFFFFFULL)
+        used = 0xFFFFFFFFULL;
+    if ((u32)used > p->arena_high_bytes)
+        p->arena_high_bytes = (u32)used;
+    if (p->arena_span_bytes > p->arena_span_high_bytes)
+        p->arena_span_high_bytes = p->arena_span_bytes;
+    if (p->arena_span_count > p->arena_span_high_count)
+        p->arena_span_high_count = p->arena_span_count;
+}
+
+static void proc_span_reset(u32 slot)
+{
+    if (slot >= MAX_PROCS_PER_CORE)
+        return;
+    for (u32 i = 0; i < PROC_SPANS_PER_PROCESS; i++)
+        proc_spans[slot][i].used = false;
+    proc_span_floor[slot] = procs[slot].arena_limit;
+    procs[slot].arena_span_bytes = 0;
+    procs[slot].arena_span_count = 0;
+}
+
 static void proc_handle_launch_request(void)
 {
     if (!on_user_core())
@@ -242,6 +293,7 @@ static void proc_handle_launch_request(void)
             p->quota_fs_write_kib = launch_req[uc].migrate_quota_fs_write_kib;
             p->usage_ipc_objs = launch_req[uc].migrate_usage_ipc_objs;
             p->usage_fs_write_bytes = launch_req[uc].migrate_usage_fs_write_bytes;
+            p->arena_high_bytes = launch_req[uc].migrate_arena_high_bytes;
             p->exec_image_size = launch_req[uc].migrate_exec_image_size;
             p->exec_hash_baseline = launch_req[uc].migrate_exec_hash_baseline;
             p->exec_hash_last = launch_req[uc].migrate_exec_hash_last;
@@ -780,6 +832,8 @@ static i32   sys_resolve(const char *hostname, u32 *ip_out);
 static u32   sys_whoami(void);
 static i32   sys_auth(const char *user, const char *pass);
 static void *sys_sbrk(i32 increment);
+static void *sys_span_rent(u32 bytes, u32 align, u32 type);
+static i32   sys_span_release(void *ptr);
 static void *sys_memset(void *dst, i32 c, u32 n);
 static void *sys_memcpy(void *dst, const void *src, u32 n);
 static u32   sys_strlen(const char *s);
@@ -1041,6 +1095,8 @@ static struct kernel_api kernel_api_tab = {
     .auth            = sys_auth,
     /* Memory */
     .sbrk            = sys_sbrk,
+    .span_rent       = sys_span_rent,
+    .span_release    = sys_span_release,
     .memset          = sys_memset,
     .memcpy          = sys_memcpy,
     .strlen          = sys_strlen,
@@ -1191,6 +1247,7 @@ void proc_init(void)
         launch_req[uc].migrate_usage_ipc_objs = 0;
         launch_req[uc].migrate_usage_fs_write_bytes = 0;
         launch_req[uc].migrate_heap_used = 0;
+        launch_req[uc].migrate_arena_high_bytes = 0;
         launch_req[uc].migrate_exec_image_size = 0;
         launch_req[uc].migrate_exec_hash_baseline = 0;
         launch_req[uc].migrate_exec_hash_last = 0;
@@ -1282,6 +1339,15 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->exec_hash_last = exec_hash;
     p->exec_hash_check_nonce = 1;
     p->exec_hash_next_check_tick = proc_integrity_next_tick(p->pid, p->exec_hash_check_nonce);
+    p->arena_base = ((u64)(usize)base + loaded + 15) & ~15ULL;
+    p->arena_limit = (u64)(usize)base + PROC_SLOT_SIZE - 65536ULL;
+    p->arena_capacity_bytes = (p->arena_limit > p->arena_base) ?
+                              (u32)(p->arena_limit - p->arena_base) : 0;
+    p->arena_high_bytes = 0;
+    p->arena_span_bytes = 0;
+    p->arena_span_high_bytes = 0;
+    p->arena_span_count = 0;
+    p->arena_span_high_count = 0;
     p->image_path[0] = 0;
     for (u32 pi = 0; pi + 1 < sizeof(p->image_path) && path[pi]; pi++) {
         p->image_path[pi] = path[pi];
@@ -1306,7 +1372,8 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
         }
     }
 
-    heap_top[(u32)slot] = ((u64)(usize)base + loaded + 15) & ~15UL;
+    heap_top[(u32)slot] = p->arena_base;
+    proc_span_reset((u32)slot);
 
     simd_zero(&p->ctx, sizeof(p->ctx));
     p->ctx.x19_x30[0] = (u64)(usize)&kernel_api_tab;  /* x19 */
@@ -1602,6 +1669,7 @@ u32 proc_snapshot(struct proc_ui_entry *out, u32 max_entries)
         return 0;
 
     struct process snap[MAX_PROCS_PER_CORE];
+    u32 snap_bump[MAX_PROCS_PER_CORE];
     u32 n = 0;
     u64 total_runtime = 0;
     u64 now = timer_ticks();
@@ -1612,7 +1680,14 @@ u32 proc_snapshot(struct proc_ui_entry *out, u32 max_entries)
             continue;
         if (p.state == PROC_RUNNING && now >= p.ticks)
             p.runtime_ticks += (now - p.ticks);
-        snap[n++] = p;
+        u32 bump = 0;
+        if (p.arena_base != 0 && heap_top[i] > p.arena_base) {
+            u64 b = heap_top[i] - p.arena_base;
+            bump = b > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (u32)b;
+        }
+        snap[n] = p;
+        snap_bump[n] = bump;
+        n++;
         total_runtime += p.runtime_ticks;
         if (n == MAX_PROCS_PER_CORE)
             break;
@@ -1630,6 +1705,16 @@ u32 proc_snapshot(struct proc_ui_entry *out, u32 max_entries)
         out[i].affinity_core = snap[i].affinity_core;
         out[i].priority_class = snap[i].priority_class;
         out[i].mem_kib = snap[i].mem_size >> 10;
+        out[i].arena_capacity_kib = snap[i].arena_capacity_bytes >> 10;
+        u32 bump = snap_bump[i];
+        u64 used = (u64)bump + snap[i].arena_span_bytes;
+        if (used > 0xFFFFFFFFULL)
+            used = 0xFFFFFFFFULL;
+        out[i].arena_used_kib = (u32)used >> 10;
+        out[i].arena_high_kib = snap[i].arena_high_bytes >> 10;
+        out[i].arena_bump_kib = bump >> 10;
+        out[i].arena_span_kib = snap[i].arena_span_bytes >> 10;
+        out[i].arena_span_count = snap[i].arena_span_count;
         out[i].cpu_percent = (u32)((snap[i].runtime_ticks * 100ULL) / total_runtime);
         out[i].preemptions = snap[i].preemptions;
         out[i].runtime_ticks = snap[i].runtime_ticks;
@@ -1854,8 +1939,10 @@ bool proc_set_affinity(u32 pid, u32 core)
                 return false;
             if (procs[i].state == PROC_RUNNING)
                 proc_account_runtime(&procs[i]);
+            if (procs[i].arena_span_count != 0)
+                return false;
             u64 hb = heap_top[i];
-            u64 lo = (u64)(usize)procs[i].base;
+            u64 lo = procs[i].arena_base ? procs[i].arena_base : (u64)(usize)procs[i].base;
             u32 heap_used = 0;
             if (hb > lo) {
                 u64 d = hb - lo;
@@ -1878,6 +1965,7 @@ bool proc_set_affinity(u32 pid, u32 core)
             launch_req[uc].migrate_usage_ipc_objs = procs[i].usage_ipc_objs;
             launch_req[uc].migrate_usage_fs_write_bytes = procs[i].usage_fs_write_bytes;
             launch_req[uc].migrate_heap_used = heap_used;
+            launch_req[uc].migrate_arena_high_bytes = procs[i].arena_high_bytes;
             launch_req[uc].migrate_exec_image_size = procs[i].exec_image_size;
             launch_req[uc].migrate_exec_hash_baseline = procs[i].exec_hash_baseline;
             launch_req[uc].migrate_exec_hash_last = procs[i].exec_hash_last;
@@ -2454,16 +2542,115 @@ static void *sys_sbrk(i32 increment)
 {
     struct process *p = &procs[current_proc];
     u64 old = heap_top[current_proc];
-    u64 new_top = old + increment;
-    u64 limit = (u64)(usize)p->base + p->mem_size - 65536;
+    u64 arena_base = p->arena_base ? p->arena_base : (u64)(usize)p->base;
+    u64 new_top;
+    if (increment >= 0) {
+        new_top = old + (u32)increment;
+        if (new_top < old)
+            return (void *)(usize)-1;
+    } else {
+        u32 dec = (u32)(-increment);
+        if (old < arena_base + dec)
+            return (void *)(usize)-1;
+        new_top = old - dec;
+    }
+    u64 limit = p->arena_limit ? p->arena_limit : (u64)(usize)p->base + p->mem_size - 65536;
+    u64 span_floor = proc_span_floor[current_proc] ? proc_span_floor[current_proc] : limit;
+    if (span_floor < limit)
+        limit = span_floor;
     if (p->capsule_enabled && p->quota_mem_kib > 0) {
         u64 qlim = (u64)(usize)p->base + ((u64)p->quota_mem_kib << 10);
         if (qlim < limit) limit = qlim;
     }
-    if (new_top > limit || new_top < (u64)(usize)p->base)
+    if (new_top > limit || new_top < arena_base)
         return (void *)(usize)-1;
     heap_top[current_proc] = new_top;
+    proc_arena_update_high(p, current_proc);
     return (void *)(usize)old;
+}
+
+void *proc_span_rent(u32 bytes, u32 align, u32 type)
+{
+    if (!on_user_core() || bytes == 0 || type >= MEM_ARENA_TYPE_COUNT)
+        return NULL;
+    if (align < 16)
+        align = 16;
+    if ((align & (align - 1U)) != 0 || align > 4096U)
+        return NULL;
+    struct process *p = &procs[current_proc];
+    if (p->state != PROC_RUNNING && p->state != PROC_READY && p->state != PROC_BLOCKED)
+        return NULL;
+    i32 free_slot = -1;
+    for (u32 i = 0; i < PROC_SPANS_PER_PROCESS; i++) {
+        if (!proc_spans[current_proc][i].used) {
+            free_slot = (i32)i;
+            break;
+        }
+    }
+    if (free_slot < 0)
+        return NULL;
+    if (bytes > p->arena_capacity_bytes)
+        return NULL;
+    u64 floor = proc_span_floor[current_proc] ? proc_span_floor[current_proc] : p->arena_limit;
+    if ((u64)bytes > floor)
+        return NULL;
+    u64 candidate = (floor - bytes) & ~((u64)align - 1ULL);
+    if (candidate + bytes > floor || candidate < heap_top[current_proc] || candidate < p->arena_base)
+        return NULL;
+    struct proc_span_slot *s = &proc_spans[current_proc][(u32)free_slot];
+    s->used = true;
+    s->type = type;
+    s->size = bytes;
+    s->addr = candidate;
+    proc_span_floor[current_proc] = candidate;
+    p->arena_span_bytes += bytes;
+    p->arena_span_count++;
+    proc_arena_update_high(p, current_proc);
+    return (void *)(usize)candidate;
+}
+
+bool proc_span_release(void *ptr)
+{
+    if (!on_user_core() || !ptr)
+        return false;
+    u64 addr = (u64)(usize)ptr;
+    struct process *p = &procs[current_proc];
+    bool released = false;
+    for (u32 i = 0; i < PROC_SPANS_PER_PROCESS; i++) {
+        struct proc_span_slot *s = &proc_spans[current_proc][i];
+        if (!s->used || s->addr != addr)
+            continue;
+        if (p->arena_span_bytes >= s->size)
+            p->arena_span_bytes -= s->size;
+        else
+            p->arena_span_bytes = 0;
+        if (p->arena_span_count > 0)
+            p->arena_span_count--;
+        s->used = false;
+        released = true;
+        break;
+    }
+    if (!released)
+        return false;
+    u64 floor = p->arena_limit;
+    for (u32 i = 0; i < PROC_SPANS_PER_PROCESS; i++) {
+        struct proc_span_slot *s = &proc_spans[current_proc][i];
+        if (s->used && s->addr < floor)
+            floor = s->addr;
+    }
+    proc_span_floor[current_proc] = floor;
+    proc_arena_update_high(p, current_proc);
+    return true;
+}
+
+static void *sys_span_rent(u32 bytes, u32 align, u32 type)
+{
+    return proc_span_rent(bytes, align, type);
+}
+
+static i32 sys_span_release(void *ptr)
+{
+    return proc_span_release(ptr) ? 0 : -1;
 }
 
 /* ---- libc stubs ---- */
