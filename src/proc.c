@@ -1339,8 +1339,14 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->exec_hash_last = exec_hash;
     p->exec_hash_check_nonce = 1;
     p->exec_hash_next_check_tick = proc_integrity_next_tick(p->pid, p->exec_hash_check_nonce);
-    p->arena_base = ((u64)(usize)base + loaded + 15) & ~15ULL;
+    p->arena_base = ((u64)(usize)base + loaded + L3_PAGE_SIZE - 1) & ~(L3_PAGE_SIZE - 1);
     p->arena_limit = (u64)(usize)base + PROC_SLOT_SIZE - 65536ULL;
+    if (p->arena_base >= p->arena_limit) {
+        uart_puts("[proc] image leaves no data arena\n");
+        p->state = PROC_EMPTY;
+        p->pid = 0;
+        return -1;
+    }
     p->arena_capacity_bytes = (p->arena_limit > p->arena_base) ?
                               (u32)(p->arena_limit - p->arena_base) : 0;
     p->arena_high_bytes = 0;
@@ -1374,6 +1380,8 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
 
     heap_top[(u32)slot] = p->arena_base;
     proc_span_reset((u32)slot);
+    dcache_clean_range((u64)(usize)base, loaded);
+    icache_invalidate_range((u64)(usize)base, loaded);
 
     simd_zero(&p->ctx, sizeof(p->ctx));
     p->ctx.x19_x30[0] = (u64)(usize)&kernel_api_tab;  /* x19 */
@@ -1381,7 +1389,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->ctx.x19_x30[11] = (u64)(usize)proc_trampoline; /* x30 = LR */
     p->ctx.sp = (u64)(usize)(base + PROC_SLOT_SIZE - 16);
 
-    if (!mmu_user_table_build(core_id(), (u32)slot, (u64)(usize)base, PROC_SLOT_SIZE)) {
+    if (!mmu_user_table_build_split(core_id(), (u32)slot, (u64)(usize)base, PROC_SLOT_SIZE, loaded)) {
         p->state = PROC_EMPTY;
         p->pid = 0;
         return -1;

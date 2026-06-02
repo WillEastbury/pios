@@ -31,9 +31,11 @@
 u64 l1_table[512] ALIGNED(4096);
 static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
 
-/* Per-process user tables for user cores (core2/core3). */
+/* Per-process user tables for user cores. Process slots are 1MiB-misaligned,
+ * so each 2MiB slot can straddle two L2 entries and needs two L3 tables. */
 static u64 user_l1[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
 static u64 user_l2_low[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
+static u64 user_l3_proc[3][MAX_PROCS_PER_CORE][2][512] ALIGNED(4096);
 static bool user_table_valid[3][MAX_PROCS_PER_CORE];
 
 /* Exported for secondary cores (read by start.S) */
@@ -120,6 +122,66 @@ static inline u64 user_ram_attrs(void)
 {
     return PTE_VALID | PTE_BLOCK | PTE_AF |
            PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+}
+
+static inline u64 user_page_rwx_attrs(void)
+{
+    return PTE_VALID | PTE_PAGE | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+}
+
+static inline u64 user_page_rx_attrs(void)
+{
+    return PTE_VALID | PTE_PAGE | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RO_EL1 | PTE_UXN;
+}
+
+static inline u64 user_page_rw_xn_attrs(void)
+{
+    return PTE_VALID | PTE_PAGE | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+}
+
+static bool mmu_user_slot_pages(u32 core, u32 slot, u64 slot_base, u64 slot_size,
+                                u32 code_bytes, bool split)
+{
+    if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE || slot_size != PROC_SLOT_SIZE)
+        return false;
+    if ((slot_base & (L3_PAGE_SIZE - 1)) != 0)
+        return false;
+
+    u32 uc = user_core_index(core);
+    u64 *l2 = user_l2_low[uc][slot];
+    u64 first_l2 = slot_base / L2_BLOCK_SIZE;
+    u64 end = slot_base + slot_size;
+    u64 code_end = slot_base + code_bytes;
+    u64 data_start = split ? ((code_end + L3_PAGE_SIZE - 1) & ~(L3_PAGE_SIZE - 1)) : slot_base;
+    if (end < slot_base || first_l2 >= 512 || (end - 1) / L2_BLOCK_SIZE >= 512)
+        return false;
+    if (split && (code_bytes == 0 || code_end > end || data_start >= end))
+        return false;
+
+    simd_zero(user_l3_proc[uc][slot][0], 512 * sizeof(u64));
+    simd_zero(user_l3_proc[uc][slot][1], 512 * sizeof(u64));
+
+    u32 l3_count = 0;
+    for (u64 a = slot_base; a < end; a += L3_PAGE_SIZE) {
+        u64 l2idx = a / L2_BLOCK_SIZE;
+        u32 table = (u32)(l2idx - first_l2);
+        if (table >= 2)
+            return false;
+        if (l2[l2idx] == 0) {
+            l2[l2idx] = (u64)(usize)user_l3_proc[uc][slot][table] | PTE_VALID | PTE_TABLE;
+            l3_count++;
+        }
+        u64 attrs = user_page_rwx_attrs();
+        if (split)
+            attrs = (a < data_start) ? user_page_rx_attrs() : user_page_rw_xn_attrs();
+        user_l3_proc[uc][slot][table][(a / L3_PAGE_SIZE) & 511U] =
+            (a & ~(L3_PAGE_SIZE - 1)) | attrs;
+    }
+
+    return l3_count > 0;
 }
 
 void mmu_init(void) {
@@ -209,7 +271,7 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
 {
     if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
         return false;
-    if ((slot_base & (L2_BLOCK_SIZE - 1)) != 0 || slot_size != PROC_SLOT_SIZE)
+    if ((slot_base & (L3_PAGE_SIZE - 1)) != 0 || slot_size != PROC_SLOT_SIZE)
         return false;
 
     u32 uc = user_core_index(core);
@@ -225,10 +287,41 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
     map_user_low_2m(l2, 0, 0, ram_attrs);
 
     /* Map this process slot and shared FIFO window (kernel ABI FIFO path). */
-    map_user_low_2m(l2, (u32)(slot_base / L2_BLOCK_SIZE), slot_base, ram_attrs);
+    if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, 0, false))
+        return false;
     map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
 
     /* Keep peripheral MMIO mapped for current direct-call kernel API ABI. */
+    for (u32 idx = 4; idx < 8; idx++)
+        l1[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
+    for (u32 idx = 124; idx < 128; idx++)
+        l1[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
+
+    user_table_valid[uc][slot] = true;
+    return true;
+}
+
+bool mmu_user_table_build_split(u32 core, u32 slot, u64 slot_base, u64 slot_size, u32 code_bytes)
+{
+    if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
+        return false;
+    if ((slot_base & (L3_PAGE_SIZE - 1)) != 0 || slot_size != PROC_SLOT_SIZE)
+        return false;
+
+    u32 uc = user_core_index(core);
+    u64 *l1 = user_l1[uc][slot];
+    u64 *l2 = user_l2_low[uc][slot];
+    simd_zero(l1, 512 * sizeof(u64));
+    simd_zero(l2, 512 * sizeof(u64));
+
+    l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
+
+    const u64 ram_attrs = user_ram_attrs();
+    map_user_low_2m(l2, 0, 0, ram_attrs);
+    if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, code_bytes, true))
+        return false;
+    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
+
     for (u32 idx = 4; idx < 8; idx++)
         l1[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
     for (u32 idx = 124; idx < 128; idx++)
@@ -310,4 +403,16 @@ void dcache_clean_invalidate_range(u64 start, u64 size) {
         addr += line;
     }
     dsb();
+}
+
+void icache_invalidate_range(u64 start, u64 size) {
+    u64 line = 64;
+    u64 addr = start & ~(line - 1);
+    u64 end = start + size;
+    while (addr < end) {
+        __asm__ volatile("ic ivau, %0" :: "r"(addr) : "memory");
+        addr += line;
+    }
+    dsb();
+    isb();
 }

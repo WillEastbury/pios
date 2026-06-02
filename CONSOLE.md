@@ -219,6 +219,13 @@ i32 span_release(void *ptr);
 
 Rented spans grow downward from the top of the process data arena, while `sbrk` grows upward. Allocation fails before the two regions can overlap.
 
+Process memory protection:
+
+- Loaded program image pages are mapped read-only/executable in the process slot.
+- The process arena and stack start at the next 4 KiB page and are mapped read/write plus execute-never.
+- The process slot uses W^X permissions; writable data pages are not executable.
+- The low kernel/ABI region remains mapped for the current direct-call kernel API and is outside the process-slot W^X claim.
+
 Use `tail=N` to limit the returned ring entries.
 
 ## Remote reboot

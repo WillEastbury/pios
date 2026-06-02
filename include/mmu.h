@@ -57,6 +57,9 @@ u64 mmu_kernel_ttbr0(void);
 /* Build an isolated user table for a process slot on core 2 or 3 */
 bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size);
 
+/* Build a split process table: loaded image pages RX/RO, arena+stack RW/XN. */
+bool mmu_user_table_build_split(u32 core, u32 slot, u64 slot_base, u64 slot_size, u32 code_bytes);
+
 /* Switch active TTBR0 to a process table on core 2/3 */
 bool mmu_switch_to_user(u32 core, u32 slot);
 
@@ -70,3 +73,4 @@ void mmu_switch_to_kernel(void);
 void dcache_clean_range(u64 start, u64 size);
 void dcache_invalidate_range(u64 start, u64 size);
 void dcache_clean_invalidate_range(u64 start, u64 size);
+void icache_invalidate_range(u64 start, u64 size);
