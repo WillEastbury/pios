@@ -7,6 +7,7 @@
 
 /* Common property tags */
 #define TAG_GET_BOARD_REV       0x00010002
+#define TAG_GET_BOARD_SERIAL    0x00010004
 #define TAG_GET_ARM_MEMORY      0x00010005
 #define TAG_SET_PHYS_WH         0x00048003
 #define TAG_SET_VIRT_WH         0x00048004

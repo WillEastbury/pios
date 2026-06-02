@@ -65,6 +65,7 @@
 #include "fat32.h"
 #include "pios_addr.h"
 #include "picoscript.h"
+#include "keystore.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -1151,6 +1152,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "dma status | dma selftest\n  Show DMA channel registers, selftest result, selected CB address mode, and retry selftest.\n");
         } else if (http_streq(topic, "addr")) {
             http_append(out, &len, max, "addr <kind:pack/card[/tail]>\n  Parse and canonicalize PIOS resource addresses. Kinds: wal,tcp,udp,stream,dev,file.\n");
+        } else if (http_streq(topic, "keystore")) {
+            http_append(out, &len, max, "keystore status | keystore derive <label>\n  Show sealed root status or derive a non-secret fingerprint for a label.\n");
         } else {
             http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma\n");
         }
@@ -1297,6 +1300,33 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
                 http_append(out, &len, max, a.tail);
             }
             http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "keystore") || http_streq(cmd, "keystore status")) {
+        struct keystore_status st;
+        keystore_status(&st);
+        http_append(out, &len, max, "keystore initialized=");
+        http_append(out, &len, max, st.initialized ? "yes" : "no");
+        http_append(out, &len, max, " sealed=");
+        http_append(out, &len, max, st.sealed ? "yes" : "no");
+        http_append(out, &len, max, " serial=");
+        http_append(out, &len, max, st.board_serial_ok ? "ok" : "fallback");
+        http_append(out, &len, max, " generation=");
+        http_append_u64(out, &len, max, st.generation);
+        http_append(out, &len, max, " error=");
+        http_append_u64(out, &len, max, st.last_error);
+        http_append(out, &len, max, " lba=");
+        http_append_u64(out, &len, max, st.user_records_lba);
+        http_append(out, &len, max, " fingerprint=");
+        http_append_u64(out, &len, max, st.fingerprint32);
+        http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "keystore derive ")) {
+        u32 fp = 0;
+        if (keystore_derive_fingerprint(cmd + 16, &fp)) {
+            http_append(out, &len, max, "derive fingerprint=");
+            http_append_u64(out, &len, max, fp);
+            http_append(out, &len, max, "\n");
+        } else {
+            http_append(out, &len, max, "ERR: derive failed\n");
         }
     } else if (http_starts_with(cmd, "db ")) {
         char *argv[10];
@@ -3137,6 +3167,7 @@ static void ui_cmd_update(u32 argc, char **argv);
 static void ui_cmd_watchdog(u32 argc, char **argv);
 static void ui_cmd_dma(u32 argc, char **argv);
 static void ui_cmd_addr(u32 argc, char **argv);
+static void ui_cmd_keystore(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -4537,6 +4568,46 @@ static void ui_cmd_dma(u32 argc, char **argv)
         return;
     }
     ui_console_write("ERR: usage dma status | dma selftest\n");
+}
+
+static void ui_cmd_keystore(u32 argc, char **argv)
+{
+    if (argc >= 2 && ui_streq(argv[1], "derive")) {
+        if (argc < 3) {
+            ui_console_write("ERR: usage keystore derive <label>\n");
+            return;
+        }
+        u32 fp = 0;
+        if (!keystore_derive_fingerprint(argv[2], &fp)) {
+            ui_console_write("ERR: derive failed\n");
+            return;
+        }
+        ui_console_write("derive fingerprint=");
+        ui_console_hex_fixed(fp, 8);
+        ui_console_write("\n");
+        return;
+    }
+    if (argc < 2 || ui_streq(argv[1], "status")) {
+        struct keystore_status st;
+        keystore_status(&st);
+        ui_console_write("keystore initialized=");
+        ui_console_write(st.initialized ? "yes" : "no");
+        ui_console_write(" sealed=");
+        ui_console_write(st.sealed ? "yes" : "no");
+        ui_console_write(" serial=");
+        ui_console_write(st.board_serial_ok ? "ok" : "fallback");
+        ui_console_write(" generation=");
+        ui_console_u32_dec(st.generation);
+        ui_console_write(" error=");
+        ui_console_u32_dec(st.last_error);
+        ui_console_write(" lba=");
+        ui_console_u32_dec(st.user_records_lba);
+        ui_console_write(" fingerprint=");
+        ui_console_hex_fixed(st.fingerprint32, 8);
+        ui_console_write("\n");
+        return;
+    }
+    ui_console_write("ERR: usage keystore status | keystore derive <label>\n");
 }
 
 static void ui_console_print_netstat(void)
@@ -7513,6 +7584,9 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "dma")) {
         ui_console_write("dma status\n  Show DMA enable state, CB address mode, selftest counters, and channel registers.\n");
         ui_console_write("dma selftest\n  Re-run the memcpy selftest and auto-select raw/shifted CB address mode if hardware passes.\n");
+    } else if (ui_streq(topic, "keystore")) {
+        ui_console_write("keystore status\n  Show sealed-root status, user-records LBA, and non-secret fingerprint.\n");
+        ui_console_write("keystore derive <label>\n  Derive and print a non-secret fingerprint for a label.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -7613,7 +7687,7 @@ static void ui_console_exec(char *line)
             ui_console_write("Device/debug commands:\n");
             ui_console_write("  dma status|selftest  usb status|reinit|poll  wifi disabled\n");
             ui_console_write("  capsule ...  obs ...  hexsec <lba>\n");
-            ui_console_write("  edit|edit.pix <path>  clear echo\n");
+            ui_console_write("  keystore status|derive <label>  edit|edit.pix <path>  clear echo\n");
             ui_console_write("  addr <kind:pack/card[/tail]>\n");
         } else if (!ui_console_help_topic(argv[1])) {
             ui_console_write("ERR: unknown help topic. Try: help, help core, help status, help firewall\n");
@@ -7879,6 +7953,8 @@ static void ui_console_exec(char *line)
         ui_cmd_usb(argc, argv);
     } else if (ui_streq(argv[0], "dma")) {
         ui_cmd_dma(argc, argv);
+    } else if (ui_streq(argv[0], "keystore")) {
+        ui_cmd_keystore(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "firewall")) {
@@ -9034,6 +9110,11 @@ void kernel_main(void) {
         }
         if (walfs_ok) bp_ok("[fs] SD + WALFS online");
         else bp_warn("[fs] SD ok, WALFS failed");
+        bp_log("[key] keystore_init...");
+        if (keystore_init())
+            bp_ok("[key] sealed root ready");
+        else
+            bp_warn("[key] keystore unavailable");
         bp_done(4, sd_ok);
     }
 

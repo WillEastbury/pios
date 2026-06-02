@@ -325,6 +325,21 @@ python tools\picoscript.py disasm script.pbc
 
 The `.pbc` format stores validated command records and executes them through the existing console command dispatcher, so compiled scripts preserve current command behavior.
 
+## User keystore / root of trust
+
+PIOS seeds a sealed user root key into partition-2 reserved User Records block zero (`PIOS_USER_RECORDS_OFFSET`, currently LBA `12288` on the standard layout). The plaintext root key is never stored on disk and is not kept globally in memory.
+
+The wrapping key is derived at boot from the board serial via HKDF-SHA256. The sealed record uses AES-GCM and stores only nonce, ciphertext, tag, and metadata. If VideoCore board-serial lookup fails, the status reports `serial=fallback` and the keystore remains unavailable or fallback-derived depending on boot state.
+
+Console/Web Admin terminal:
+
+```text
+keystore status
+keystore derive <label>
+```
+
+`keystore status` prints non-secret metadata and a root fingerprint. `keystore derive <label>` prints a non-secret fingerprint for a label-derived key; it does not expose key material.
+
 ## Firewall command
 
 Defaults:
