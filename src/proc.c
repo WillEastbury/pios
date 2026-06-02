@@ -1624,6 +1624,7 @@ u32 proc_snapshot(struct proc_ui_entry *out, u32 max_entries)
     u32 out_n = (n < max_entries) ? n : max_entries;
     for (u32 i = 0; i < out_n; i++) {
         out[i].pid = snap[i].pid;
+        out[i].parent_pid = snap[i].parent_pid;
         out[i].principal_id = snap[i].principal_id;
         out[i].state = snap[i].state;
         out[i].affinity_core = snap[i].affinity_core;

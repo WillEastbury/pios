@@ -1034,6 +1034,17 @@ static const char *tcp_owner_label(u16 port)
     return "-";
 }
 
+static bool proc_ui_has_pid(const struct proc_ui_entry *snap, u32 n, u32 pid)
+{
+    if (!snap || pid == 0)
+        return false;
+    for (u32 i = 0; i < n; i++) {
+        if (snap[i].pid == pid)
+            return true;
+    }
+    return false;
+}
+
 static bool http_streq(const char *a, const char *b)
 {
     if (!a || !b)
@@ -1080,7 +1091,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         if (http_streq(topic, "status")) {
             http_append(out, &len, max, "status\n  Show system/build/network summary.\n");
         } else if (http_streq(topic, "ps") || http_streq(topic, "processes")) {
-            http_append(out, &len, max, "processes\n  Show process snapshot.\n");
+            http_append(out, &len, max, "processes\n  Show process snapshot with PPID and process graph roots/children.\n");
         } else if (http_streq(topic, "netstat")) {
             http_append(out, &len, max, "netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
         } else if (http_streq(topic, "firewall")) {
@@ -1163,9 +1174,11 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     } else if (http_streq(cmd, "processes")) {
         struct proc_ui_entry snap[MAX_PROCS_PER_CORE];
         u32 n = proc_snapshot(snap, MAX_PROCS_PER_CORE);
-        http_append(out, &len, max, "PID        CORE STATE    PRI      CPU MEMK IMAGE\n");
+        http_append(out, &len, max, "PID        PPID       CORE STATE    PRI      CPU MEMK IMAGE\n");
         for (u32 i = 0; i < n; i++) {
             http_append_u64(out, &len, max, snap[i].pid);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, snap[i].parent_pid);
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, snap[i].affinity_core);
             http_append(out, &len, max, " ");
@@ -1179,6 +1192,24 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, " ");
             http_append(out, &len, max, snap[i].image_path);
             http_append(out, &len, max, "\n");
+        }
+        http_append(out, &len, max, "\nGRAPH\n");
+        for (u32 i = 0; i < n; i++) {
+            if (snap[i].parent_pid != 0 && proc_ui_has_pid(snap, n, snap[i].parent_pid))
+                continue;
+            http_append_u64(out, &len, max, snap[i].pid);
+            http_append(out, &len, max, " ");
+            http_append(out, &len, max, snap[i].image_path);
+            http_append(out, &len, max, "\n");
+            for (u32 j = 0; j < n; j++) {
+                if (snap[j].parent_pid != snap[i].pid)
+                    continue;
+                http_append(out, &len, max, "  -> ");
+                http_append_u64(out, &len, max, snap[j].pid);
+                http_append(out, &len, max, " ");
+                http_append(out, &len, max, snap[j].image_path);
+                http_append(out, &len, max, "\n");
+            }
         }
     } else if (http_streq(cmd, "users")) {
         struct principal_ui_entry users[PRINCIPAL_MAX];
@@ -2869,6 +2900,7 @@ static void ui_cmd_watchdog(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
+static void ui_console_hex_fixed(u64 v, u32 digits);
 static bool ui_resolve_pis_path(const char *in, char *out, u32 out_max);
 static bool ui_resolve_pix_path(const char *in, char *out, u32 out_max);
 static bool ui_resolve_job_path(const char *in, char *out, u32 out_max, bool *is_script_out);
@@ -3691,12 +3723,15 @@ static void ui_console_print_ps(void)
 {
     struct proc_ui_entry snap[UI_SNAPSHOT_MAX];
     u32 n = proc_snapshot(snap, UI_SNAPSHOT_MAX);
-    ui_console_write("PID      AFF  PRI       CPU%  MEM(KiB)  STATE\n");
+    ui_console_write("PID      PPID     AFF  PRI       CPU%  MEM(KiB)  STATE\n");
     for (u32 i = 0; i < n; i++) {
-        fb_printf("0x%x   %u    %s   %u    %u       %s\n",
-                  snap[i].pid, snap[i].affinity_core, ui_priority_str(snap[i].priority_class), snap[i].cpu_percent,
+        fb_printf("0x%x   0x%x   %u    %s   %u    %u       %s\n",
+                  snap[i].pid, snap[i].parent_pid, snap[i].affinity_core,
+                  ui_priority_str(snap[i].priority_class), snap[i].cpu_percent,
                   snap[i].mem_kib, ui_proc_state_str(snap[i].state));
         uart_hex(snap[i].pid);
+        uart_puts(" ppid=");
+        uart_hex(snap[i].parent_pid);
         uart_puts(" aff=");
         uart_hex(snap[i].affinity_core);
         uart_puts(" pri=");
@@ -3708,6 +3743,25 @@ static void ui_console_print_ps(void)
         uart_puts(" state=");
         uart_puts(ui_proc_state_str(snap[i].state));
         uart_puts("\n");
+    }
+    ui_console_write("\nProcess graph:\n");
+    for (u32 i = 0; i < n; i++) {
+        if (snap[i].parent_pid != 0 && proc_ui_has_pid(snap, n, snap[i].parent_pid))
+            continue;
+        ui_console_write("  ");
+        ui_console_hex_fixed(snap[i].pid, 8);
+        ui_console_write(" ");
+        ui_console_write(snap[i].image_path);
+        ui_console_write("\n");
+        for (u32 j = 0; j < n; j++) {
+            if (snap[j].parent_pid != snap[i].pid)
+                continue;
+            ui_console_write("    -> ");
+            ui_console_hex_fixed(snap[j].pid, 8);
+            ui_console_write(" ");
+            ui_console_write(snap[j].image_path);
+            ui_console_write("\n");
+        }
     }
 }
 
@@ -7484,17 +7538,18 @@ static void ui_render_process_view(void)
 
     struct proc_ui_entry *e = &snap[ui_selected];
     const char *keys[] = {
-        "pid", "state", "affinity", "cpu_pct", "mem_kib", "principal", "preemptions"
+        "pid", "ppid", "state", "affinity", "cpu_pct", "mem_kib", "principal", "preemptions"
     };
     u32 vals[] = {
-        e->pid, e->state, e->affinity_core, e->cpu_percent, e->mem_kib, e->principal_id, e->preemptions
+        e->pid, e->parent_pid, e->state, e->affinity_core, e->cpu_percent,
+        e->mem_kib, e->principal_id, e->preemptions
     };
 
     fb_printf("Process %u / %u\n\n", ui_selected + 1, n);
-    for (u32 i = 0; i < 7; i++) {
-        if (i == 1) {
+    for (u32 i = 0; i < 8; i++) {
+        if (i == 2) {
             fb_printf("%s: %s\n", keys[i], ui_proc_state_str(vals[i]));
-        } else if (i == 0) {
+        } else if (i == 0 || i == 1) {
             fb_printf("%s: 0x%x\n", keys[i], vals[i]);
         } else {
             fb_printf("%s: %u\n", keys[i], vals[i]);
@@ -7513,7 +7568,7 @@ static void ui_render_process_manager(void)
     fb_set_color(0x00FFFFFF, UI_SHELL_BG_COLOR);
     fb_printf("========================================\n");
     fb_printf("Controls: F1 detail | K kill selected | L launch next | C open console\n\n");
-    fb_printf("PID      AFF  CPU%%  MEM(KiB)  STATE\n");
+    fb_printf("PID      PPID     AFF  CPU%%  MEM(KiB)  STATE\n");
 
     if (n == 0) {
         fb_printf("(no active processes)\n");
@@ -7522,9 +7577,9 @@ static void ui_render_process_manager(void)
             ui_selected = 0;
         for (u32 i = 0; i < n; i++) {
             fb_set_color((i == ui_selected) ? 0x00FF9900 : 0x00FFFFFF, UI_SHELL_BG_COLOR);
-            fb_printf("0x%x   %u    %u     %u      %s\n",
-                      snap[i].pid, snap[i].affinity_core, snap[i].cpu_percent,
-                      snap[i].mem_kib, ui_proc_state_str(snap[i].state));
+            fb_printf("0x%x   0x%x   %u    %u     %u      %s\n",
+                      snap[i].pid, snap[i].parent_pid, snap[i].affinity_core,
+                      snap[i].cpu_percent, snap[i].mem_kib, ui_proc_state_str(snap[i].state));
         }
         fb_set_color(0x00FFFFFF, UI_SHELL_BG_COLOR);
     }
@@ -7786,9 +7841,10 @@ static void hdmi_dashboard_render(void)
     row = 21;
     for (u32 i = 0; i < proc_n && row < 25; i++) {
         fb_set_cursor(3, row++);
-        fb_printf("pid=0x%x core=%u cpu=%u%% mem=%uK %s %s",
-                  proc[i].pid, proc[i].affinity_core, proc[i].cpu_percent,
-                  proc[i].mem_kib, ui_proc_state_str(proc[i].state), proc[i].image_path);
+        fb_printf("pid=0x%x ppid=0x%x core=%u cpu=%u%% mem=%uK %s %s",
+                  proc[i].pid, proc[i].parent_pid, proc[i].affinity_core,
+                  proc[i].cpu_percent, proc[i].mem_kib,
+                  ui_proc_state_str(proc[i].state), proc[i].image_path);
     }
 
     for (u32 r = log_top + 1; r < log_top + 7; r++) fb_clear_row(r);

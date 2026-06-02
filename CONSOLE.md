@@ -195,6 +195,8 @@ http://192.168.218.101:8080/logs?tail=24
 http://192.168.218.101/api/admin/log-stream?tail=24
 ```
 
+`ps` and the Web Admin Processes tab include parent PID (`PPID`) and a simple process graph/tree section.
+
 Use `tail=N` to limit the returned ring entries.
 
 ## Remote reboot

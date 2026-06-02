@@ -20,6 +20,7 @@ struct paged_io_stat {
 
 struct proc_ui_entry {
     u32 pid;
+    u32 parent_pid;
     u32 principal_id;
     u32 state;
     u32 affinity_core;
