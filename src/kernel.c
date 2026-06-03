@@ -1397,7 +1397,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     } else if (http_streq(cmd, "ksvc") || http_streq(cmd, "ksvc status")) {
         struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
         u32 kn = ksvc_snapshot(ks, KSVC_MAX_SERVICES);
-        http_append(out, &len, max, "ID CORE PRI STATE KIND CALLS ERR PEND SENT RECV DROP LAST_T MAX_T TOTAL_T NAME\n");
+        http_append(out, &len, max, "ID CORE PRI STATE KIND CALLS ERR RST LERR PEND SENT RECV DROP LAST_T MAX_T TOTAL_T NAME\n");
         for (u32 i = 0; i < kn; i++) {
             http_append_u64(out, &len, max, ks[i].id);
             http_append(out, &len, max, " ");
@@ -1412,6 +1412,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, ks[i].calls);
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, ks[i].errors);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].restarts);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].last_error);
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, ks[i].mailbox_pending);
             http_append(out, &len, max, " ");
@@ -1431,7 +1435,32 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "\n");
         }
     } else if (http_streq(cmd, "ksvc selftest")) {
-        http_append(out, &len, max, ksvc_mailbox_selftest(ksvc_debug_id) ? "KSVC mailbox selftest OK\n" : "KSVC mailbox selftest FAILED\n");
+        bool ok = ksvc_mailbox_selftest(ksvc_debug_id) && ksvc_fault_policy_selftest(ksvc_debug_id);
+        http_append(out, &len, max, ok ? "KSVC selftest OK\n" : "KSVC selftest FAILED\n");
+    } else if (http_starts_with(cmd, "ksvc pause ")) {
+        u32 id = 0;
+        if (!http_parse_u32(cmd + 11, &id) || !ksvc_pause((i32)id))
+            http_append(out, &len, max, "KSVC pause FAILED\n");
+        else
+            http_append(out, &len, max, "KSVC pause OK\n");
+    } else if (http_starts_with(cmd, "ksvc resume ")) {
+        u32 id = 0;
+        if (!http_parse_u32(cmd + 12, &id) || !ksvc_resume((i32)id))
+            http_append(out, &len, max, "KSVC resume FAILED\n");
+        else
+            http_append(out, &len, max, "KSVC resume OK\n");
+    } else if (http_starts_with(cmd, "ksvc restart ")) {
+        u32 id = 0;
+        if (!http_parse_u32(cmd + 13, &id) || !ksvc_restart((i32)id))
+            http_append(out, &len, max, "KSVC restart FAILED\n");
+        else
+            http_append(out, &len, max, "KSVC restart OK\n");
+    } else if (http_starts_with(cmd, "ksvc fault ")) {
+        u32 id = 0;
+        if (!http_parse_u32(cmd + 11, &id) || !ksvc_mark_error_code((i32)id, 0x4B534643U))
+            http_append(out, &len, max, "KSVC fault FAILED\n");
+        else
+            http_append(out, &len, max, "KSVC fault OK\n");
     } else if (http_starts_with(cmd, "addr ")) {
         struct pios_addr a;
         char canon[160];
@@ -4992,16 +5021,32 @@ static void ui_cmd_x509(u32 argc, char **argv)
 static void ui_cmd_ksvc(u32 argc, char **argv)
 {
     if (argc >= 2 && ui_streq(argv[1], "selftest")) {
-        ui_console_write(ksvc_mailbox_selftest(ksvc_debug_id) ? "KSVC mailbox selftest OK\n" : "KSVC mailbox selftest FAILED\n");
+        bool ok = ksvc_mailbox_selftest(ksvc_debug_id) && ksvc_fault_policy_selftest(ksvc_debug_id);
+        ui_console_write(ok ? "KSVC selftest OK\n" : "KSVC selftest FAILED\n");
+        return;
+    }
+    if (argc >= 3 && (ui_streq(argv[1], "pause") || ui_streq(argv[1], "resume") ||
+                      ui_streq(argv[1], "restart") || ui_streq(argv[1], "fault"))) {
+        u32 id = 0;
+        if (!ui_parse_u32(argv[2], &id)) {
+            ui_console_write("ERR: invalid service id\n");
+            return;
+        }
+        bool ok = false;
+        if (ui_streq(argv[1], "pause")) ok = ksvc_pause((i32)id);
+        else if (ui_streq(argv[1], "resume")) ok = ksvc_resume((i32)id);
+        else if (ui_streq(argv[1], "restart")) ok = ksvc_restart((i32)id);
+        else ok = ksvc_mark_error_code((i32)id, 0x4B534643U);
+        ui_console_write(ok ? "OK: ksvc updated\n" : "ERR: ksvc update failed\n");
         return;
     }
     if (argc >= 2 && !ui_streq(argv[1], "status")) {
-        ui_console_write("ERR: usage ksvc status | ksvc selftest\n");
+        ui_console_write("ERR: usage ksvc status | ksvc selftest | ksvc pause|resume|restart|fault <id>\n");
         return;
     }
     struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
     u32 n = ksvc_snapshot(ks, KSVC_MAX_SERVICES);
-    ui_console_write("ID CORE PRI STATE      KIND CALLS ERR PEND SENT RECV DROP LAST_T MAX_T TOTAL_T NAME\n");
+    ui_console_write("ID CORE PRI STATE      KIND CALLS ERR RST LERR PEND SENT RECV DROP LAST_T MAX_T TOTAL_T NAME\n");
     for (u32 i = 0; i < n; i++) {
         ui_console_hex_fixed(ks[i].id, 4);
         ui_console_write(" ");
@@ -5016,6 +5061,10 @@ static void ui_cmd_ksvc(u32 argc, char **argv)
         ui_console_u64_dec(ks[i].calls);
         ui_console_write(" ");
         ui_console_u64_dec(ks[i].errors);
+        ui_console_write(" ");
+        ui_console_u64_dec(ks[i].restarts);
+        ui_console_write(" ");
+        ui_console_u32_dec(ks[i].last_error);
         ui_console_write(" ");
         ui_console_u32_dec(ks[i].mailbox_pending);
         ui_console_write(" ");
@@ -8026,7 +8075,8 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("x509 selftest\n  Generate and bind a selftest descriptor.\n");
     } else if (ui_streq(topic, "ksvc")) {
         ui_console_write("ksvc status\n  Show kernel service/plugin registry, mailbox counters, and runtime counters.\n");
-        ui_console_write("ksvc selftest\n  Round-trip a core-local kernel service mailbox message.\n");
+        ui_console_write("ksvc selftest\n  Round-trip mailbox and fault/restart policy.\n");
+        ui_console_write("ksvc pause|resume|restart|fault <id>\n  Update lifecycle state metadata for a registered service.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");

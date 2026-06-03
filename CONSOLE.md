@@ -321,9 +321,13 @@ Console/Web Admin terminal:
 ```text
 ksvc status
 ksvc selftest
+ksvc pause <id>
+ksvc resume <id>
+ksvc restart <id>
+ksvc fault <id>
 ```
 
-`ksvc selftest` round-trips a bounded core-local mailbox message through the registry. Mailboxes are EL1 service-to-service plumbing only in this slice; they do not yet schedule services through indirect callbacks or move them to EL0.
+`ksvc selftest` round-trips a bounded core-local mailbox message and exercises pause/resume/fault/restart lifecycle metadata. Mailboxes are EL1 service-to-service plumbing only in this slice; they do not yet schedule services through indirect callbacks or move them to EL0. Lifecycle controls update service metadata and counters; direct-call services still run in the existing core loop until scheduler-owned callbacks land.
 
 ## Brotli codec diagnostics
 

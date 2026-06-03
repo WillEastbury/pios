@@ -21,6 +21,8 @@ struct ksvc_entry {
     u64 messages_sent;
     u64 messages_recv;
     u64 mailbox_drops;
+    u64 restarts;
+    u32 last_error;
     struct ksvc_msg mailbox[KSVC_MBOX_DEPTH];
     char name[32];
 };
@@ -111,10 +113,46 @@ void ksvc_end(i32 id, u64 start_ticks, bool error)
 
 void ksvc_mark_error(i32 id)
 {
+    ksvc_mark_error_code(id, 1U);
+}
+
+bool ksvc_mark_error_code(i32 id, u32 error_code)
+{
     struct ksvc_entry *e = ksvc_get(id);
-    if (!e) return;
+    if (!e) return false;
     e->errors++;
+    e->last_error = error_code;
     e->state = KSVC_STATE_FAULTED;
+    return true;
+}
+
+bool ksvc_pause(i32 id)
+{
+    struct ksvc_entry *e = ksvc_get(id);
+    if (!e || e->state == KSVC_STATE_FAULTED) return false;
+    e->state = KSVC_STATE_PAUSED;
+    return true;
+}
+
+bool ksvc_resume(i32 id)
+{
+    struct ksvc_entry *e = ksvc_get(id);
+    if (!e || e->state != KSVC_STATE_PAUSED) return false;
+    e->state = KSVC_STATE_REGISTERED;
+    return true;
+}
+
+bool ksvc_restart(i32 id)
+{
+    struct ksvc_entry *e = ksvc_get(id);
+    if (!e) return false;
+    e->mb_head = 0;
+    e->mb_tail = 0;
+    e->last_error = 0;
+    e->restarts++;
+    e->state = KSVC_STATE_REGISTERED;
+    dmb();
+    return true;
 }
 
 static u32 ksvc_mailbox_count(const struct ksvc_entry *e)
@@ -188,6 +226,28 @@ bool ksvc_mailbox_selftest(i32 service_id)
            got.data[2] == 'O' && got.data[3] == 'S';
 }
 
+bool ksvc_fault_policy_selftest(i32 service_id)
+{
+    struct ksvc_entry *e = ksvc_get(service_id);
+    if (!e) return false;
+    u32 before_state = e->state;
+    u64 before_errors = e->errors;
+    u64 before_restarts = e->restarts;
+    if (!ksvc_pause(service_id)) return false;
+    if (e->state != KSVC_STATE_PAUSED) return false;
+    if (!ksvc_resume(service_id)) return false;
+    if (e->state != KSVC_STATE_REGISTERED) return false;
+    ksvc_mark_error_code(service_id, 0x51564331U);
+    if (e->state != KSVC_STATE_FAULTED || e->errors != before_errors + 1U ||
+        e->last_error != 0x51564331U) return false;
+    if (!ksvc_restart(service_id)) return false;
+    if (e->state != KSVC_STATE_REGISTERED || e->restarts != before_restarts + 1U ||
+        e->last_error != 0) return false;
+    if (before_state == KSVC_STATE_PAUSED)
+        (void)ksvc_pause(service_id);
+    return true;
+}
+
 u32 ksvc_snapshot(struct ksvc_snapshot_entry *out, u32 max_entries)
 {
     if (!out || max_entries == 0) return 0;
@@ -210,6 +270,8 @@ u32 ksvc_snapshot(struct ksvc_snapshot_entry *out, u32 max_entries)
             out[n].messages_sent = e->messages_sent;
             out[n].messages_recv = e->messages_recv;
             out[n].mailbox_drops = e->mailbox_drops;
+            out[n].restarts = e->restarts;
+            out[n].last_error = e->last_error;
             out[n].mailbox_pending = ksvc_mailbox_count(e);
             copy_name(out[n].name, sizeof(out[n].name), e->name);
             n++;
