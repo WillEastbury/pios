@@ -95,6 +95,43 @@ bool net_route_add(u32 dst, u32 mask, u32 gateway, u8 flags);
 u32 net_route_snapshot(struct net_route_entry *out, u32 max);
 bool net_route_lookup(u32 dst_ip, struct net_route_entry *out);
 
+#define NET_EGRESS_MAC_NONE       0U
+#define NET_EGRESS_MAC_BCAST      1U
+#define NET_EGRESS_MAC_GW_STATIC  2U
+#define NET_EGRESS_MAC_NEIGHBOR   3U
+#define NET_EGRESS_MAC_ARP        4U
+#define NET_EGRESS_MAC_NO_ROUTE   5U
+#define NET_EGRESS_MAC_NO_MAC     6U
+
+struct net_egress_snapshot {
+    u64 resolve_calls;
+    u64 no_route;
+    u64 no_mac;
+    u64 udp_attempts;
+    u64 udp_ok;
+    u64 udp_fail;
+    u32 last_dst_ip;
+    u32 last_next_hop;
+    u32 last_route_dst;
+    u32 last_route_mask;
+    u32 last_route_gateway;
+    u32 last_udp_dst_ip;
+    u32 last_udp_next_hop;
+    u8  last_route_flags;
+    u8  last_route_prefix;
+    u8  last_mac_source;
+    u8  last_udp_ok;
+    u8  last_udp_mac_source;
+    u8  _pad0;
+    u16 last_udp_src_port;
+    u16 last_udp_dst_port;
+    u16 last_udp_len;
+    u8  last_mac[6];
+    u8  last_udp_mac[6];
+} PACKED;
+
+void net_egress_snapshot(struct net_egress_snapshot *out);
+
 /* UDP receive callback */
 typedef void (*udp_recv_cb)(u32 src_ip, u16 src_port, u16 dst_port,
                             const u8 *data, u16 len);

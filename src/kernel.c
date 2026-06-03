@@ -647,6 +647,80 @@ static void http_append_route_table(char *out, u32 *len, u32 max)
     }
 }
 
+static const char *net_egress_source_name(u8 s)
+{
+    switch (s) {
+    case NET_EGRESS_MAC_BCAST:     return "broadcast";
+    case NET_EGRESS_MAC_GW_STATIC: return "gateway-static";
+    case NET_EGRESS_MAC_NEIGHBOR:  return "neighbor-static";
+    case NET_EGRESS_MAC_ARP:       return "arp";
+    case NET_EGRESS_MAC_NO_ROUTE:  return "no-route";
+    case NET_EGRESS_MAC_NO_MAC:    return "no-mac";
+    default:                       return "none";
+    }
+}
+
+static void http_append_mac6(char *out, u32 *len, u32 max, const u8 *mac)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    for (u32 i = 0; i < 6; i++) {
+        if (i) http_append(out, len, max, ":");
+        char b[3] = { hx[mac[i] >> 4], hx[mac[i] & 0xF], 0 };
+        http_append(out, len, max, b);
+    }
+}
+
+static void http_append_net_egress_trace(char *out, u32 *len, u32 max)
+{
+    struct net_egress_snapshot e;
+    net_egress_snapshot(&e);
+    http_append(out, len, max, "egress resolves=");
+    http_append_u64(out, len, max, e.resolve_calls);
+    http_append(out, len, max, " no_route=");
+    http_append_u64(out, len, max, e.no_route);
+    http_append(out, len, max, " no_mac=");
+    http_append_u64(out, len, max, e.no_mac);
+    http_append(out, len, max, " udp_attempts=");
+    http_append_u64(out, len, max, e.udp_attempts);
+    http_append(out, len, max, " udp_ok=");
+    http_append_u64(out, len, max, e.udp_ok);
+    http_append(out, len, max, " udp_fail=");
+    http_append_u64(out, len, max, e.udp_fail);
+    http_append(out, len, max, "\nlast dst=");
+    http_append_ip4(out, len, max, e.last_dst_ip);
+    http_append(out, len, max, " next_hop=");
+    http_append_ip4(out, len, max, e.last_next_hop);
+    http_append(out, len, max, " route=");
+    http_append_ip4(out, len, max, e.last_route_dst);
+    http_append(out, len, max, "/");
+    http_append_u64(out, len, max, e.last_route_prefix);
+    http_append(out, len, max, " gw=");
+    http_append_ip4(out, len, max, e.last_route_gateway);
+    http_append(out, len, max, " flags=");
+    http_append_u64(out, len, max, e.last_route_flags);
+    http_append(out, len, max, " mac_source=");
+    http_append(out, len, max, net_egress_source_name(e.last_mac_source));
+    http_append(out, len, max, " mac=");
+    http_append_mac6(out, len, max, e.last_mac);
+    http_append(out, len, max, "\nlast_udp sport=");
+    http_append_u64(out, len, max, e.last_udp_src_port);
+    http_append(out, len, max, " dport=");
+    http_append_u64(out, len, max, e.last_udp_dst_port);
+    http_append(out, len, max, " len=");
+    http_append_u64(out, len, max, e.last_udp_len);
+    http_append(out, len, max, " dst=");
+    http_append_ip4(out, len, max, e.last_udp_dst_ip);
+    http_append(out, len, max, " next_hop=");
+    http_append_ip4(out, len, max, e.last_udp_next_hop);
+    http_append(out, len, max, " mac_source=");
+    http_append(out, len, max, net_egress_source_name(e.last_udp_mac_source));
+    http_append(out, len, max, " mac=");
+    http_append_mac6(out, len, max, e.last_udp_mac);
+    http_append(out, len, max, " ok=");
+    http_append(out, len, max, e.last_udp_ok ? "yes" : "no");
+    http_append(out, len, max, "\n");
+}
+
 static void http_append_arp_table(char *out, u32 *len, u32 max)
 {
     struct arp_snapshot_entry e[ARP_TABLE_SIZE];
@@ -1369,7 +1443,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "netstat")) {
             http_append(out, &len, max, "netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
         } else if (http_streq(topic, "netcfg")) {
-            http_append(out, &len, max, "netcfg | netcfg routes | netcfg neighbors\n  Show current network summary, route table, and ARP/neighbor table.\n");
+            http_append(out, &len, max, "netcfg | netcfg routes | netcfg neighbors | netcfg trace\n  Show network summary, route table, ARP/neighbor table, and last outbound route/MAC/UDP decision.\n");
         } else if (http_streq(topic, "dns")) {
             http_append(out, &len, max, "dns resolve <hostname> | dns status | dns flush\n  Start/poll an async A-record resolver job without blocking HTTP service loops.\n");
         } else if (http_streq(topic, "http") || http_streq(topic, "https")) {
@@ -1506,6 +1580,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_arp_table(out, &len, max);
     } else if (http_streq(cmd, "netcfg neighbors")) {
         http_append_arp_table(out, &len, max);
+    } else if (http_streq(cmd, "netcfg trace")) {
+        http_append_net_egress_trace(out, &len, max);
     } else if (http_starts_with(cmd, "dns resolve ")) {
         const char *host = cmd + 12;
         if (dns_resolve_async_start(host))
@@ -4207,6 +4283,8 @@ static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
 static void ui_cmd_dns(u32 argc, char **argv);
 static void ui_cmd_mem(u32 argc, char **argv);
+static void ui_console_u32_dec(u32 v);
+static void ui_console_u64_dec(u64 v);
 static void ui_console_hex_fixed(u64 v, u32 digits);
 static bool ui_resolve_pis_path(const char *in, char *out, u32 out_max);
 static bool ui_resolve_pix_path(const char *in, char *out, u32 out_max);
@@ -5057,6 +5135,56 @@ static void ui_console_mac(const u8 *mac)
         char b[3] = { hx[mac[i] >> 4], hx[mac[i] & 0xF], 0 };
         ui_console_write(b);
     }
+}
+
+static void ui_console_net_egress_trace(void)
+{
+    struct net_egress_snapshot e;
+    net_egress_snapshot(&e);
+    ui_console_write("egress resolves=");
+    ui_console_u64_dec(e.resolve_calls);
+    ui_console_write(" no_route=");
+    ui_console_u64_dec(e.no_route);
+    ui_console_write(" no_mac=");
+    ui_console_u64_dec(e.no_mac);
+    ui_console_write(" udp_attempts=");
+    ui_console_u64_dec(e.udp_attempts);
+    ui_console_write(" udp_ok=");
+    ui_console_u64_dec(e.udp_ok);
+    ui_console_write(" udp_fail=");
+    ui_console_u64_dec(e.udp_fail);
+    ui_console_write("\nlast dst=");
+    ui_console_ip(e.last_dst_ip);
+    ui_console_write(" next_hop=");
+    ui_console_ip(e.last_next_hop);
+    ui_console_write(" route=");
+    ui_console_ip(e.last_route_dst);
+    ui_console_write("/");
+    ui_console_u32_dec(e.last_route_prefix);
+    ui_console_write(" gw=");
+    ui_console_ip(e.last_route_gateway);
+    ui_console_write(" flags=");
+    ui_console_u32_dec(e.last_route_flags);
+    ui_console_write(" mac_source=");
+    ui_console_write(net_egress_source_name(e.last_mac_source));
+    ui_console_write(" mac=");
+    ui_console_mac(e.last_mac);
+    ui_console_write("\nlast_udp sport=");
+    ui_console_u32_dec(e.last_udp_src_port);
+    ui_console_write(" dport=");
+    ui_console_u32_dec(e.last_udp_dst_port);
+    ui_console_write(" len=");
+    ui_console_u32_dec(e.last_udp_len);
+    ui_console_write(" dst=");
+    ui_console_ip(e.last_udp_dst_ip);
+    ui_console_write(" next_hop=");
+    ui_console_ip(e.last_udp_next_hop);
+    ui_console_write(" mac_source=");
+    ui_console_write(net_egress_source_name(e.last_udp_mac_source));
+    ui_console_write(" mac=");
+    ui_console_mac(e.last_udp_mac);
+    ui_console_write(" ok=");
+    ui_console_write(e.last_udp_ok ? "yes\n" : "no\n");
 }
 
 static void ui_console_arp_table(void)
@@ -6675,6 +6803,10 @@ static void ui_cmd_netcfg(u32 argc, char **argv)
 
     if (argc >= 2 && (ui_streq(argv[1], "neighbors") || ui_streq(argv[1], "arp"))) {
         ui_console_arp_table();
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "trace")) {
+        ui_console_net_egress_trace();
         return;
     }
 
@@ -9540,7 +9672,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("db list <card>\n");
     } else if (ui_streq(topic, "netcfg")) {
         ui_console_write("netcfg\n  Show current network config.\n");
-        ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d>\nnetcfg apply\nnetcfg dhcp <on|off> [timeout_ms]\nnetcfg addnbr <ip> <mac>\nnetcfg routes|neighbors\nnetcfg route add <dst> <mask> <gw> <connected|via>\n");
+        ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d>\nnetcfg apply\nnetcfg dhcp <on|off> [timeout_ms]\nnetcfg addnbr <ip> <mac>\nnetcfg routes|neighbors|trace\nnetcfg route add <dst> <mask> <gw> <connected|via>\n");
     } else if (ui_streq(topic, "stream")) {
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
         ui_console_write("http get <ip> [path] [port] [timeout_ms]\nhttps get <ip> [path] [port] [timeout_ms]\n");

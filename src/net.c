@@ -48,6 +48,7 @@ static struct net_route_entry routes[NET_ROUTE_MAX];
 static u32 route_count;
 static u8  gw_mac[6];
 static bool gw_mac_set;
+static struct net_egress_snapshot egress_trace;
 
 /* ---- ICMP rate limiter ---- */
 
@@ -96,6 +97,52 @@ static bool net_accept_eth_dst(const u8 *dst) {
     if (mac_is_multicast_6(dst) && net_multicast_joined(dst))
         return true;
     return false;
+}
+
+static void egress_set_mac(const u8 *mac)
+{
+    if (mac)
+        simd_memcpy(egress_trace.last_mac, mac, 6);
+    else
+        simd_zero(egress_trace.last_mac, sizeof(egress_trace.last_mac));
+}
+
+static void egress_record_route(u32 dst_ip, const struct net_route_entry *route,
+                                u32 next_hop, u8 source, const u8 *mac)
+{
+    egress_trace.last_dst_ip = dst_ip;
+    egress_trace.last_next_hop = next_hop;
+    egress_trace.last_mac_source = source;
+    if (route) {
+        egress_trace.last_route_dst = route->dst;
+        egress_trace.last_route_mask = route->mask;
+        egress_trace.last_route_gateway = route->gateway;
+        egress_trace.last_route_flags = route->flags;
+        egress_trace.last_route_prefix = route->prefix_len;
+    } else {
+        egress_trace.last_route_dst = 0;
+        egress_trace.last_route_mask = 0;
+        egress_trace.last_route_gateway = 0;
+        egress_trace.last_route_flags = 0;
+        egress_trace.last_route_prefix = 0;
+    }
+    egress_set_mac(mac);
+}
+
+static void egress_record_udp_route(u32 dst_ip)
+{
+    egress_trace.last_udp_dst_ip = dst_ip;
+    egress_trace.last_udp_next_hop = egress_trace.last_next_hop;
+    egress_trace.last_udp_mac_source = egress_trace.last_mac_source;
+    simd_memcpy(egress_trace.last_udp_mac, egress_trace.last_mac,
+                sizeof(egress_trace.last_udp_mac));
+}
+
+void net_egress_snapshot(struct net_egress_snapshot *out)
+{
+    if (!out)
+        return;
+    *out = egress_trace;
 }
 
 static u32 net_read_be32(const u8 *p) {
@@ -537,20 +584,26 @@ static void handle_ip(const u8 *frame, u32 len, bool checksum_trusted) {
 static bool resolve_mac(u32 dst_ip, const u8 **mac_out) {
     struct net_route_entry route;
     u32 next_hop = 0;
-    if (!net_route_lookup(dst_ip, &route))
+    egress_trace.resolve_calls++;
+    if (!net_route_lookup(dst_ip, &route)) {
+        egress_trace.no_route++;
+        egress_record_route(dst_ip, NULL, 0, NET_EGRESS_MAC_NO_ROUTE, NULL);
         return false;
+    }
     next_hop = (route.flags & NET_ROUTE_F_CONNECTED) ? dst_ip : route.gateway;
 
     /* Broadcast */
     if (dst_ip == 0xFFFFFFFF) {
         static const u8 bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
         *mac_out = bcast;
+        egress_record_route(dst_ip, &route, next_hop, NET_EGRESS_MAC_BCAST, bcast);
         return true;
     }
 
     /* Try static gateway MAC first */
     if (next_hop == our_gw && gw_mac_set) {
         *mac_out = gw_mac;
+        egress_record_route(dst_ip, &route, next_hop, NET_EGRESS_MAC_GW_STATIC, gw_mac);
         return true;
     }
 
@@ -558,6 +611,7 @@ static bool resolve_mac(u32 dst_ip, const u8 **mac_out) {
     const u8 *mac = neighbor_lookup(next_hop);
     if (mac) {
         *mac_out = mac;
+        egress_record_route(dst_ip, &route, next_hop, NET_EGRESS_MAC_NEIGHBOR, mac);
         return true;
     }
 
@@ -565,10 +619,13 @@ static bool resolve_mac(u32 dst_ip, const u8 **mac_out) {
     mac = arp_resolve(next_hop);
     if (mac) {
         *mac_out = mac;
+        egress_record_route(dst_ip, &route, next_hop, NET_EGRESS_MAC_ARP, mac);
         return true;
     }
 
     stats.drop_no_neighbor++;
+    egress_trace.no_mac++;
+    egress_record_route(dst_ip, &route, next_hop, NET_EGRESS_MAC_NO_MAC, NULL);
     return false;
 }
 
@@ -582,19 +639,33 @@ const u8 *net_resolve_mac(u32 dst_ip)
 
 bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
                   const u8 *data, u16 len) {
+    egress_trace.udp_attempts++;
+    egress_trace.last_udp_src_port = src_port;
+    egress_trace.last_udp_dst_port = dst_port;
+    egress_trace.last_udp_len = len;
+    egress_trace.last_udp_ok = 0;
+
     /* Guard against u16 overflow: max frame 2048 minus IP+UDP headers */
-    if (len > 2048 - 42)
+    if (len > 2048 - 42) {
+        egress_trace.udp_fail++;
         return false;
+    }
 
     const u8 *dst_mac;
-    if (unlikely(!resolve_mac(dst_ip, &dst_mac)))
+    if (unlikely(!resolve_mac(dst_ip, &dst_mac))) {
+        egress_record_udp_route(dst_ip);
+        egress_trace.udp_fail++;
         return false;
+    }
+    egress_record_udp_route(dst_ip);
 
     u16 udp_len  = sizeof(struct udp_hdr) + len;
     u16 ip_total = 20 + udp_len;
 
-    if (unlikely(sizeof(struct eth_hdr) + ip_total > 1514))
+    if (unlikely(sizeof(struct eth_hdr) + ip_total > 1514)) {
+        egress_trace.udp_fail++;
         return false;
+    }
 
     struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
     simd_memcpy(eth->dst, dst_mac, 6);
@@ -628,17 +699,31 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
     stats.tx_bytes += frame_len;
     stats.udp_sent++;
 
-    if (len == 0)
-        return nic_send(tx_frame, frame_len);
+    bool ok = false;
+    if (len == 0) {
+        ok = nic_send(tx_frame, frame_len);
+        egress_trace.last_udp_ok = ok ? 1U : 0U;
+        if (ok) egress_trace.udp_ok++;
+        else egress_trace.udp_fail++;
+        return ok;
+    }
 
     if (need_pad) {
         simd_memcpy(tx_frame + sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr),
                     data, len);
-        return nic_send(tx_frame, frame_len);
+        ok = nic_send(tx_frame, frame_len);
+        egress_trace.last_udp_ok = ok ? 1U : 0U;
+        if (ok) egress_trace.udp_ok++;
+        else egress_trace.udp_fail++;
+        return ok;
     }
 
     u32 head_len = sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr);
-    return nic_send_parts(tx_frame, head_len, data, len);
+    ok = nic_send_parts(tx_frame, head_len, data, len);
+    egress_trace.last_udp_ok = ok ? 1U : 0U;
+    if (ok) egress_trace.udp_ok++;
+    else egress_trace.udp_fail++;
+    return ok;
 }
 
 /* ================================================================== */
@@ -749,7 +834,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     nic_get_mac(our_mac);
     net_firewall_install_defaults();
 
-    if (gateway_mac) {
+    gw_mac_set = false;
+    simd_zero(gw_mac, sizeof(gw_mac));
+    if (gateway_mac && !mac_is_zero_6(gateway_mac)) {
         simd_memcpy(gw_mac, gateway_mac, 6);
         gw_mac_set = true;
     }

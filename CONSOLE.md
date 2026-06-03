@@ -484,6 +484,19 @@ keystore derive <label>
 
 `keystore status` prints non-secret metadata and a root fingerprint. `keystore derive <label>` prints a non-secret fingerprint for a label-derived key; it does not expose key material.
 
+## Network diagnostics
+
+Console/Web Admin terminal:
+
+```text
+netcfg
+netcfg routes
+netcfg neighbors
+netcfg trace
+```
+
+`netcfg routes` shows the bounded route table used by outbound TCP/UDP. `netcfg neighbors` shows the dynamic/static ARP neighbor snapshot with state, retry, consistency, and age fields. `netcfg trace` shows the last outbound route lookup, next hop, MAC source, UDP send result, and counters for missing routes/MACs. Use it after `dns resolve`, `http get`, or `https get` attempts to separate routing/ARP/firewall/TX issues from remote timeout behavior.
+
 ## Firewall command
 
 Defaults:
