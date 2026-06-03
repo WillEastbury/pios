@@ -174,7 +174,58 @@ static void ghash_shift_right_one(u8 *v) {
     }
 }
 
-static void ghash_mul(u8 *x, const u8 *h) {
+static void ghash_shift_x(u8 *v)
+{
+    bool lsb = (v[15] & 1U) != 0;
+    ghash_shift_right_one(v);
+    if (lsb)
+        v[0] ^= 0xE1U;
+}
+
+static void xor16(u8 *dst, const u8 *src)
+{
+    for (u32 i = 0; i < 16; i++)
+        dst[i] ^= src[i];
+}
+
+static void ghash_build_nibble_table(struct aes_gcm_ctx *ctx)
+{
+    u8 v[16];
+    if (!ctx) return;
+
+    simd_memcpy(v, ctx->h, sizeof(v));
+    simd_zero(ctx->ghash_nibble, sizeof(ctx->ghash_nibble));
+    for (u32 pos = 0; pos < 32; pos++) {
+        u8 powers[4][16];
+        for (u32 bit = 0; bit < 4; bit++) {
+            simd_memcpy(powers[bit], v, 16);
+            ghash_shift_x(v);
+        }
+        for (u32 n = 0; n < 16; n++) {
+            u8 *row = ctx->ghash_nibble[pos][n];
+            if (n & 8U) xor16(row, powers[0]);
+            if (n & 4U) xor16(row, powers[1]);
+            if (n & 2U) xor16(row, powers[2]);
+            if (n & 1U) xor16(row, powers[3]);
+        }
+    }
+}
+
+static void ghash_mul(u8 *x, const struct aes_gcm_ctx *ctx) {
+    u8 z[16];
+    u32 pos = 0;
+    simd_zero(z, sizeof(z));
+
+    for (u32 i = 0; i < 16; i++) {
+        xor16(z, ctx->ghash_nibble[pos++][x[i] >> 4]);
+        xor16(z, ctx->ghash_nibble[pos++][x[i] & 0x0FU]);
+    }
+
+    simd_memcpy(x, z, sizeof(z));
+}
+
+static void ghash_mul_scalar_compat(u8 *x, const u8 *h)
+{
     u8 z[16];
     u8 v[16];
     simd_zero(z, sizeof(z));
@@ -183,15 +234,9 @@ static void ghash_mul(u8 *x, const u8 *h) {
     for (u32 i = 0; i < 16; i++) {
         u8 xi = x[i];
         for (u32 b = 0; b < 8; b++) {
-            if (xi & 0x80) {
-                for (u32 j = 0; j < 16; j++)
-                    z[j] ^= v[j];
-            }
-
-            bool lsb = (v[15] & 1U) != 0;
-            ghash_shift_right_one(v);
-            if (lsb)
-                v[0] ^= 0xE1U;
+            if (xi & 0x80)
+                xor16(z, v);
+            ghash_shift_x(v);
             xi <<= 1;
         }
     }
@@ -199,11 +244,11 @@ static void ghash_mul(u8 *x, const u8 *h) {
     simd_memcpy(x, z, sizeof(z));
 }
 
-static void ghash_update(u8 *y, const u8 *h, const u8 *data, u32 len) {
+static void ghash_update(u8 *y, const struct aes_gcm_ctx *ctx, const u8 *data, u32 len) {
     while (len >= 16) {
         for (u32 i = 0; i < 16; i++)
             y[i] ^= data[i];
-        ghash_mul(y, h);
+        ghash_mul(y, ctx);
         data += 16;
         len  -= 16;
     }
@@ -214,7 +259,7 @@ static void ghash_update(u8 *y, const u8 *h, const u8 *data, u32 len) {
         simd_memcpy(last, data, len);
         for (u32 i = 0; i < 16; i++)
             y[i] ^= last[i];
-        ghash_mul(y, h);
+        ghash_mul(y, ctx);
     }
 }
 
@@ -397,6 +442,7 @@ void aes_gcm_init(struct aes_gcm_ctx *ctx, const u8 *key, u32 key_bits) {
     aes_key_expand(&ctx->key, key, key_bits);
     aes_encrypt_block(&ctx->key, zero_block, ctx->h);
     simd_zero(ctx->j0, sizeof(ctx->j0));
+    ghash_build_nibble_table(ctx);
 }
 
 bool aes_gcm_encrypt(struct aes_gcm_ctx *ctx,
@@ -434,15 +480,15 @@ bool aes_gcm_encrypt(struct aes_gcm_ctx *ctx,
 
     simd_zero(y, sizeof(y));
     if (aad && aad_len)
-        ghash_update(y, ctx->h, aad, aad_len);
+        ghash_update(y, ctx, aad, aad_len);
     if (plain_len)
-        ghash_update(y, ctx->h, cipher, plain_len);
+        ghash_update(y, ctx, cipher, plain_len);
 
     store_be64(len_block + 0, (u64)aad_len * 8U);
     store_be64(len_block + 8, (u64)plain_len * 8U);
     for (u32 i = 0; i < 16; i++)
         y[i] ^= len_block[i];
-    ghash_mul(y, ctx->h);
+    ghash_mul(y, ctx);
 
     aes_encrypt_block(&ctx->key, ctx->j0, s);
     for (u32 i = 0; i < 16; i++)
@@ -474,15 +520,15 @@ bool aes_gcm_decrypt(struct aes_gcm_ctx *ctx,
 
     simd_zero(y, sizeof(y));
     if (aad && aad_len)
-        ghash_update(y, ctx->h, aad, aad_len);
+        ghash_update(y, ctx, aad, aad_len);
     if (cipher_len)
-        ghash_update(y, ctx->h, cipher, cipher_len);
+        ghash_update(y, ctx, cipher, cipher_len);
 
     store_be64(len_block + 0, (u64)aad_len * 8U);
     store_be64(len_block + 8, (u64)cipher_len * 8U);
     for (u32 i = 0; i < 16; i++)
         y[i] ^= len_block[i];
-    ghash_mul(y, ctx->h);
+    ghash_mul(y, ctx);
 
     aes_encrypt_block(&ctx->key, ctx->j0, s);
     for (u32 i = 0; i < 16; i++)
@@ -508,6 +554,51 @@ bool aes_gcm_decrypt(struct aes_gcm_ctx *ctx,
     }
 
     return true;
+}
+
+bool crypto_selftest(void)
+{
+    static const u8 key[16] = {
+        0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
+        0x88,0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF
+    };
+    static const u8 nonce[12] = {
+        0x10,0x32,0x54,0x76,0x98,0xBA,0xDC,0xFE,0x01,0x23,0x45,0x67
+    };
+    static const u8 aad[7] = { 'P','I','O','S','-','A','D' };
+    static const u8 plain[31] = {
+        'P','I','O','S',' ','G','H','A','S','H',' ','n','i','b','b','l',
+        'e',' ','s','e','l','f','t','e','s','t',' ','v','1','!','!'
+    };
+    struct aes_gcm_ctx ctx;
+    u8 cipher[sizeof(plain)];
+    u8 tag[16];
+    u8 out[sizeof(plain)];
+    u8 table_x[16];
+    u8 scalar_x[16];
+    u32 diff = 0;
+
+    aes_gcm_init(&ctx, key, 128);
+    for (u32 i = 0; i < 16; i++) {
+        table_x[i] = (u8)(0xA5U ^ (i * 17U));
+        scalar_x[i] = table_x[i];
+    }
+    ghash_mul(table_x, &ctx);
+    ghash_mul_scalar_compat(scalar_x, ctx.h);
+    for (u32 i = 0; i < 16; i++)
+        diff |= (u32)(table_x[i] ^ scalar_x[i]);
+    if (diff != 0)
+        return false;
+
+    if (!aes_gcm_encrypt(&ctx, nonce, sizeof(nonce), aad, sizeof(aad),
+                         plain, sizeof(plain), cipher, tag))
+        return false;
+    if (!aes_gcm_decrypt(&ctx, nonce, sizeof(nonce), aad, sizeof(aad),
+                         cipher, sizeof(cipher), out, tag))
+        return false;
+    for (u32 i = 0; i < sizeof(plain); i++)
+        diff |= (u32)(out[i] ^ plain[i]);
+    return diff == 0;
 }
 
 void sha256_init(struct sha256_ctx *ctx) {

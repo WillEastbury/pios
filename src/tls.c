@@ -413,6 +413,11 @@ void tls_diag_snapshot(struct tls_diag_snapshot *out)
 bool tls_selftest(void)
 {
     tls_diag.selftests++;
+    if (!crypto_selftest()) {
+        tls_diag.selftest_failures++;
+        tls_diag.last_error = TLS_ERR_RECORD;
+        return false;
+    }
     struct tls_handshake ch;
     struct tls_handshake sh;
     struct tls_conn_state client;

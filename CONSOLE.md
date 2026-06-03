@@ -282,7 +282,7 @@ On BCM2712, PIOS uses the `dma32` controller with physical low-RAM DMA addresses
 
 ## Kernel TLS diagnostics
 
-PIOS keeps TLS termination in kernel space. The current kernel layer provides a PSK/HKDF/AES-GCM record wrapper plus a PicoWeb-style bridge boundary that parses decrypted plaintext HTTP requests before handing them to a kernel service or future process-hosted webserver.
+PIOS keeps TLS termination in kernel space. The current kernel layer provides a PSK/HKDF/AES-GCM record wrapper plus a PicoWeb-style bridge boundary that parses decrypted plaintext HTTP requests before handing them to a kernel service or future process-hosted webserver. AES rounds use ARM crypto instructions and GHASH uses a precomputed nibble table in the AES-GCM context.
 
 Console/Web Admin terminal:
 

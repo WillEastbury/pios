@@ -1,8 +1,8 @@
 /*
  * crypto.h - Hardware-accelerated cryptographic primitives
  *
- * Uses ARMv8.2-A Crypto Extensions (AESE/AESD/AESMC/AESIMC for AES,
- * SHA256H/SHA256SU0/SHA256SU1 for SHA-256, PMULL for GCM).
+ * Uses ARMv8.2-A Crypto Extensions for AES rounds and a precomputed
+ * nibble table for GHASH.
  * Already compiled with +crypto flag in CFLAGS.
  */
 
@@ -26,6 +26,7 @@ struct aes_gcm_ctx {
     struct aes_key key;
     u8  h[16];       /* GHASH key: AES(K, 0) */
     u8  j0[16];      /* pre-counter block */
+    u8  ghash_nibble[32][16][16];
 };
 
 void aes_gcm_init(struct aes_gcm_ctx *ctx, const u8 *key, u32 key_bits);
@@ -73,3 +74,5 @@ void hkdf_extract(const u8 *salt, u32 salt_len,
 void hkdf_expand(const u8 *prk, u32 prk_len,
                  const u8 *info, u32 info_len,
                  u8 *okm, u32 okm_len);
+
+bool crypto_selftest(void);

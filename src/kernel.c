@@ -1277,7 +1277,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     } else if (http_streq(cmd, "tls") || http_streq(cmd, "tls status")) {
         struct tls_diag_snapshot t;
         tls_diag_snapshot(&t);
-        http_append(out, &len, max, "TLS kernel=enabled bridge=picoweb-style active=");
+        http_append(out, &len, max, "TLS kernel=enabled crypto=arm-aese+ghash-nibble bridge=picoweb-style active=");
         http_append_u64(out, &len, max, t.active);
         http_append(out, &len, max, " established=");
         http_append_u64(out, &len, max, t.established);
@@ -4680,7 +4680,7 @@ static void ui_print_tls_diag(void)
 {
     struct tls_diag_snapshot t;
     tls_diag_snapshot(&t);
-    ui_console_write("TLS kernel=enabled bridge=picoweb-style active=");
+    ui_console_write("TLS kernel=enabled crypto=arm-aese+ghash-nibble bridge=picoweb-style active=");
     ui_console_u32_dec(t.active);
     ui_console_write(" established=");
     ui_console_u32_dec(t.established);
