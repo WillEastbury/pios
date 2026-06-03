@@ -331,6 +331,16 @@ ksvc fault <id>
 
 Low-risk services (`debug-console`, `dashboard`, and `tcp-timers`) are scheduler-owned callbacks; core network/TCP/TLS poll ordering remains direct and unchanged.
 
+## IRQ diagnostics
+
+PIOS exposes interrupt dispatch telemetry without changing the polling service model.
+
+```text
+irq status
+```
+
+The status includes total/handled/unhandled/spurious IRQs, timer IRQ count, last interrupt ID/core/tick, and per-core totals.
+
 ## Brotli codec diagnostics
 
 PIOS includes a no-external-dependency Brotli codec library. The encoder emits conservative stored Brotli streams; the decoder supports stored streams plus the compressed subset emitted by PicoWeb's micro-Brotli encoder. Large copies use the kernel SIMD copy path.

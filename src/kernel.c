@@ -1270,6 +1270,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "x509 status | x509 generate [cn] | x509 bind | x509 selftest\n  Manage kernel-only X.509 cert/key service foundation and TLS binding state.\n");
         } else if (http_streq(topic, "ksvc")) {
             http_append(out, &len, max, "ksvc status\n  Show kernel service/plugin registry, core ownership, priorities, and runtime counters.\n");
+        } else if (http_streq(topic, "irq")) {
+            http_append(out, &len, max, "irq status\n  Show IRQ dispatch counters, last interrupt ID/core, timer IRQ count, and per-core totals.\n");
         } else {
             http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls, help brotli\n");
         }
@@ -1535,6 +1537,31 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "KSVC fault FAILED\n");
         else
             http_append(out, &len, max, "KSVC fault OK\n");
+    } else if (http_streq(cmd, "irq") || http_streq(cmd, "irq status")) {
+        struct irq_diag_snapshot d;
+        irq_diag_snapshot(&d);
+        http_append(out, &len, max, "irq total=");
+        http_append_u64(out, &len, max, d.total);
+        http_append(out, &len, max, " handled=");
+        http_append_u64(out, &len, max, d.handled);
+        http_append(out, &len, max, " unhandled=");
+        http_append_u64(out, &len, max, d.unhandled);
+        http_append(out, &len, max, " spurious=");
+        http_append_u64(out, &len, max, d.spurious);
+        http_append(out, &len, max, " timer=");
+        http_append_u64(out, &len, max, d.timer);
+        http_append(out, &len, max, " last_intid=");
+        http_append_u64(out, &len, max, d.last_intid);
+        http_append(out, &len, max, " last_core=");
+        http_append_u64(out, &len, max, d.last_core);
+        http_append(out, &len, max, " last_tick=");
+        http_append_u64(out, &len, max, d.last_tick);
+        http_append(out, &len, max, "\nper_core=");
+        for (u32 i = 0; i < 4; i++) {
+            if (i) http_append(out, &len, max, ",");
+            http_append_u64(out, &len, max, d.per_core[i]);
+        }
+        http_append(out, &len, max, "\n");
     } else if (http_starts_with(cmd, "addr ")) {
         struct pios_addr a;
         char canon[160];
@@ -3506,6 +3533,7 @@ static void ui_cmd_tls(u32 argc, char **argv);
 static void ui_cmd_brotli(u32 argc, char **argv);
 static void ui_cmd_x509(u32 argc, char **argv);
 static void ui_cmd_ksvc(u32 argc, char **argv);
+static void ui_cmd_irq(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -5163,6 +5191,38 @@ static void ui_cmd_ksvc(u32 argc, char **argv)
         ui_console_write(ks[i].name);
         ui_console_write("\n");
     }
+}
+
+static void ui_cmd_irq(u32 argc, char **argv)
+{
+    if (argc >= 2 && !ui_streq(argv[1], "status")) {
+        ui_console_write("ERR: usage irq status\n");
+        return;
+    }
+    struct irq_diag_snapshot d;
+    irq_diag_snapshot(&d);
+    ui_console_write("irq total=");
+    ui_console_u64_dec(d.total);
+    ui_console_write(" handled=");
+    ui_console_u64_dec(d.handled);
+    ui_console_write(" unhandled=");
+    ui_console_u64_dec(d.unhandled);
+    ui_console_write(" spurious=");
+    ui_console_u64_dec(d.spurious);
+    ui_console_write(" timer=");
+    ui_console_u64_dec(d.timer);
+    ui_console_write(" last_intid=");
+    ui_console_u32_dec(d.last_intid);
+    ui_console_write(" last_core=");
+    ui_console_u32_dec(d.last_core);
+    ui_console_write(" last_tick=");
+    ui_console_u64_dec(d.last_tick);
+    ui_console_write("\nper_core=");
+    for (u32 i = 0; i < 4; i++) {
+        if (i) ui_console_write(",");
+        ui_console_u64_dec(d.per_core[i]);
+    }
+    ui_console_write("\n");
 }
 
 static void ui_console_print_netstat(void)
@@ -8157,6 +8217,8 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("ksvc status\n  Show kernel service/plugin registry, mailbox counters, and runtime counters.\n");
         ui_console_write("ksvc selftest\n  Round-trip mailbox and fault/restart policy.\n");
         ui_console_write("ksvc pause|resume|restart|fault <id>\n  Update lifecycle state metadata for a registered service.\n");
+    } else if (ui_streq(topic, "irq")) {
+        ui_console_write("irq status\n  Show IRQ dispatch counters, timer count, last interrupt ID/core, and per-core totals.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -8533,6 +8595,8 @@ static void ui_console_exec(char *line)
         ui_cmd_x509(argc, argv);
     } else if (ui_streq(argv[0], "ksvc")) {
         ui_cmd_ksvc(argc, argv);
+    } else if (ui_streq(argv[0], "irq")) {
+        ui_cmd_irq(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "firewall")) {

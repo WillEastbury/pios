@@ -41,6 +41,18 @@ struct irq_frame {
     u64 pad;     /* reserved/alignment */
 } ALIGNED(16);
 
+struct irq_diag_snapshot {
+    u64 total;
+    u64 handled;
+    u64 unhandled;
+    u64 spurious;
+    u64 timer;
+    u64 per_core[4];
+    u32 last_intid;
+    u32 last_core;
+    u64 last_tick;
+} PACKED;
+
 /* Install the exception vector table */
 void exception_init(void);
 
@@ -49,5 +61,6 @@ void irq_register(u32 intid, irq_handler_t handler);
 
 /* IRQ dispatcher called from vectors.S */
 void irq_dispatch(struct irq_frame *frame);
+void irq_diag_snapshot(struct irq_diag_snapshot *out);
 
 NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far);

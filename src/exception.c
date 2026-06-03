@@ -18,6 +18,8 @@ extern void vector_table(void);
 static irq_handler_t irq_handlers[GIC_MAX_IRQ];
 static volatile bool panic_in_progress;
 
+static struct irq_diag_snapshot irq_diag;
+
 struct crash_record {
     u32 magic;
     u32 kind;   /* 1 sync, 2 serror */
@@ -103,15 +105,34 @@ void irq_register(u32 intid, irq_handler_t handler) {
 /* Called from vectors.S irq_handler */
 void irq_dispatch(struct irq_frame *frame) {
     u32 intid = gic_acknowledge();
+    u32 c = core_id() & 3U;
+    irq_diag.total++;
+    irq_diag.per_core[c]++;
+    irq_diag.last_intid = intid;
+    irq_diag.last_core = c;
+    irq_diag.last_tick = timer_ticks();
 
     if (intid < GIC_MAX_IRQ && irq_handlers[intid]) {
+        irq_diag.handled++;
+        if (intid == GIC_TIMER_VIRT || intid == GIC_TIMER_NS_PHYS)
+            irq_diag.timer++;
         irq_handlers[intid]();
+    } else if (intid == GIC_INTID_SPURIOUS) {
+        irq_diag.spurious++;
+    } else {
+        irq_diag.unhandled++;
     }
 
     proc_irq_maybe_preempt(frame);
 
     if (intid != GIC_INTID_SPURIOUS)
         gic_end_of_interrupt(intid);
+}
+
+void irq_diag_snapshot(struct irq_diag_snapshot *out)
+{
+    if (!out) return;
+    *out = irq_diag;
 }
 
 /* Called from vectors.S sync_handler */
