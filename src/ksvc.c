@@ -16,6 +16,12 @@ struct ksvc_entry {
     u64 last_run_ms;
     u64 last_duration_ticks;
     u64 max_duration_ticks;
+    volatile u32 mb_head;
+    volatile u32 mb_tail;
+    u64 messages_sent;
+    u64 messages_recv;
+    u64 mailbox_drops;
+    struct ksvc_msg mailbox[KSVC_MBOX_DEPTH];
     char name[32];
 };
 
@@ -111,6 +117,77 @@ void ksvc_mark_error(i32 id)
     e->state = KSVC_STATE_FAULTED;
 }
 
+static u32 ksvc_mailbox_count(const struct ksvc_entry *e)
+{
+    return (e->mb_head - e->mb_tail) & (KSVC_MBOX_DEPTH - 1U);
+}
+
+bool ksvc_send(i32 dst_id, const struct ksvc_msg *msg)
+{
+    struct ksvc_entry *e = ksvc_get(dst_id);
+    if (!e || !msg) return false;
+    if (e->owner_core != (core_id() & 3U)) return false;
+    u32 head = e->mb_head;
+    u32 next = (head + 1U) & (KSVC_MBOX_DEPTH - 1U);
+    if (next == e->mb_tail) {
+        e->mailbox_drops++;
+        return false;
+    }
+    struct ksvc_msg m = *msg;
+    m.dst = e->id;
+    if (m.len > KSVC_MSG_DATA_MAX) m.len = KSVC_MSG_DATA_MAX;
+    e->mailbox[head] = m;
+    dmb();
+    e->mb_head = next;
+    e->messages_sent++;
+    sev();
+    return true;
+}
+
+bool ksvc_recv(i32 service_id, struct ksvc_msg *out)
+{
+    struct ksvc_entry *e = ksvc_get(service_id);
+    if (!e || !out) return false;
+    if (e->owner_core != (core_id() & 3U)) return false;
+    u32 tail = e->mb_tail;
+    if (tail == e->mb_head) return false;
+    *out = e->mailbox[tail];
+    e->mb_tail = (tail + 1U) & (KSVC_MBOX_DEPTH - 1U);
+    e->messages_recv++;
+    dmb();
+    return true;
+}
+
+u32 ksvc_mailbox_pending(i32 service_id)
+{
+    struct ksvc_entry *e = ksvc_get(service_id);
+    if (!e) return 0;
+    return ksvc_mailbox_count(e);
+}
+
+bool ksvc_mailbox_selftest(i32 service_id)
+{
+    struct ksvc_msg msg;
+    struct ksvc_msg got;
+    simd_zero(&msg, sizeof(msg));
+    simd_zero(&got, sizeof(got));
+    msg.type = 0x4B535643U; /* KSVC */
+    msg.src = (u32)service_id;
+    msg.param = 0x12345678U;
+    msg.tag = 0x1122334455667788ULL;
+    msg.len = 4;
+    msg.data[0] = 'P';
+    msg.data[1] = 'I';
+    msg.data[2] = 'O';
+    msg.data[3] = 'S';
+    if (!ksvc_send(service_id, &msg)) return false;
+    if (!ksvc_recv(service_id, &got)) return false;
+    return got.type == msg.type && got.src == msg.src && got.dst == (u32)service_id &&
+           got.param == msg.param && got.tag == msg.tag && got.len == msg.len &&
+           got.data[0] == 'P' && got.data[1] == 'I' &&
+           got.data[2] == 'O' && got.data[3] == 'S';
+}
+
 u32 ksvc_snapshot(struct ksvc_snapshot_entry *out, u32 max_entries)
 {
     if (!out || max_entries == 0) return 0;
@@ -130,6 +207,10 @@ u32 ksvc_snapshot(struct ksvc_snapshot_entry *out, u32 max_entries)
             out[n].last_run_ms = e->last_run_ms;
             out[n].last_duration_ticks = e->last_duration_ticks;
             out[n].max_duration_ticks = e->max_duration_ticks;
+            out[n].messages_sent = e->messages_sent;
+            out[n].messages_recv = e->messages_recv;
+            out[n].mailbox_drops = e->mailbox_drops;
+            out[n].mailbox_pending = ksvc_mailbox_count(e);
             copy_name(out[n].name, sizeof(out[n].name), e->name);
             n++;
         }

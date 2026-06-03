@@ -314,15 +314,16 @@ x509 selftest
 
 ## Kernel service/plugin registry
 
-PIOS exposes a kernel-internal service registry for EL1 services that still run in the monolithic loop today. This is the first slice of the plugin/threading model: existing direct calls keep their exact order, while the registry records owner core, priority, service kind, call counts, errors, and duration ticks.
+PIOS exposes a kernel-internal service registry for EL1 services that still run in the monolithic loop today. This is the first slice of the plugin/threading model: existing direct calls keep their exact order, while the registry records owner core, priority, service kind, mailbox counters, call counts, errors, and duration ticks.
 
 Console/Web Admin terminal:
 
 ```text
 ksvc status
+ksvc selftest
 ```
 
-This is observability and lifecycle metadata only. It does not yet schedule services through indirect callbacks or move them to EL0.
+`ksvc selftest` round-trips a bounded core-local mailbox message through the registry. Mailboxes are EL1 service-to-service plumbing only in this slice; they do not yet schedule services through indirect callbacks or move them to EL0.
 
 ## Brotli codec diagnostics
 

@@ -1397,7 +1397,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     } else if (http_streq(cmd, "ksvc") || http_streq(cmd, "ksvc status")) {
         struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
         u32 kn = ksvc_snapshot(ks, KSVC_MAX_SERVICES);
-        http_append(out, &len, max, "ID CORE PRI STATE KIND CALLS ERR LAST_T MAX_T TOTAL_T NAME\n");
+        http_append(out, &len, max, "ID CORE PRI STATE KIND CALLS ERR PEND SENT RECV DROP LAST_T MAX_T TOTAL_T NAME\n");
         for (u32 i = 0; i < kn; i++) {
             http_append_u64(out, &len, max, ks[i].id);
             http_append(out, &len, max, " ");
@@ -1413,6 +1413,14 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, ks[i].errors);
             http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].mailbox_pending);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].messages_sent);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].messages_recv);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].mailbox_drops);
+            http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, ks[i].last_duration_ticks);
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, ks[i].max_duration_ticks);
@@ -1422,6 +1430,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, ks[i].name);
             http_append(out, &len, max, "\n");
         }
+    } else if (http_streq(cmd, "ksvc selftest")) {
+        http_append(out, &len, max, ksvc_mailbox_selftest(ksvc_debug_id) ? "KSVC mailbox selftest OK\n" : "KSVC mailbox selftest FAILED\n");
     } else if (http_starts_with(cmd, "addr ")) {
         struct pios_addr a;
         char canon[160];
@@ -4981,13 +4991,17 @@ static void ui_cmd_x509(u32 argc, char **argv)
 
 static void ui_cmd_ksvc(u32 argc, char **argv)
 {
+    if (argc >= 2 && ui_streq(argv[1], "selftest")) {
+        ui_console_write(ksvc_mailbox_selftest(ksvc_debug_id) ? "KSVC mailbox selftest OK\n" : "KSVC mailbox selftest FAILED\n");
+        return;
+    }
     if (argc >= 2 && !ui_streq(argv[1], "status")) {
-        ui_console_write("ERR: usage ksvc status\n");
+        ui_console_write("ERR: usage ksvc status | ksvc selftest\n");
         return;
     }
     struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
     u32 n = ksvc_snapshot(ks, KSVC_MAX_SERVICES);
-    ui_console_write("ID CORE PRI STATE      KIND CALLS ERR LAST_T MAX_T TOTAL_T NAME\n");
+    ui_console_write("ID CORE PRI STATE      KIND CALLS ERR PEND SENT RECV DROP LAST_T MAX_T TOTAL_T NAME\n");
     for (u32 i = 0; i < n; i++) {
         ui_console_hex_fixed(ks[i].id, 4);
         ui_console_write(" ");
@@ -5002,6 +5016,14 @@ static void ui_cmd_ksvc(u32 argc, char **argv)
         ui_console_u64_dec(ks[i].calls);
         ui_console_write(" ");
         ui_console_u64_dec(ks[i].errors);
+        ui_console_write(" ");
+        ui_console_u32_dec(ks[i].mailbox_pending);
+        ui_console_write(" ");
+        ui_console_u64_dec(ks[i].messages_sent);
+        ui_console_write(" ");
+        ui_console_u64_dec(ks[i].messages_recv);
+        ui_console_write(" ");
+        ui_console_u64_dec(ks[i].mailbox_drops);
         ui_console_write(" ");
         ui_console_u64_dec(ks[i].last_duration_ticks);
         ui_console_write(" ");
@@ -8003,7 +8025,8 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("x509 bind\n  Mark the generated cert descriptor as bound to kernel TLS.\n");
         ui_console_write("x509 selftest\n  Generate and bind a selftest descriptor.\n");
     } else if (ui_streq(topic, "ksvc")) {
-        ui_console_write("ksvc status\n  Show kernel service/plugin registry and runtime counters.\n");
+        ui_console_write("ksvc status\n  Show kernel service/plugin registry, mailbox counters, and runtime counters.\n");
+        ui_console_write("ksvc selftest\n  Round-trip a core-local kernel service mailbox message.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
