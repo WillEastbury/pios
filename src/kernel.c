@@ -58,6 +58,7 @@
 #include "setup.h"
 #include "ksem.h"
 #include "workq.h"
+#include "ksvc.h"
 #include "picowal_db.h"
 #include "el2.h"
 #include "crypto.h"
@@ -188,6 +189,12 @@ static u32 http_req_len;
 static bool http_auth_checked;
 static bool http_auth_ok;
 static bool http_reboot_pending;
+static i32 ksvc_net_id = -1;
+static i32 ksvc_tcp_id = -1;
+static i32 ksvc_debug_id = -1;
+static i32 ksvc_ui_id = -1;
+static i32 ksvc_dashboard_id = -1;
+static i32 ksvc_timer_id = -1;
 static char http_resp_buf[16000];
 static u32 http_resp_len;
 static u32 http_resp_off;
@@ -1187,6 +1194,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "brotli selftest\n  Verify the no-external-dependency Brotli stored encoder and PicoWeb micro-Brotli decoder.\n");
         } else if (http_streq(topic, "x509")) {
             http_append(out, &len, max, "x509 status | x509 generate [cn] | x509 bind | x509 selftest\n  Manage kernel-only X.509 cert/key service foundation and TLS binding state.\n");
+        } else if (http_streq(topic, "ksvc")) {
+            http_append(out, &len, max, "ksvc status\n  Show kernel service/plugin registry, core ownership, priorities, and runtime counters.\n");
         } else {
             http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls, help brotli\n");
         }
@@ -1385,6 +1394,34 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, x509_bind_tls() ? "X509 bind OK\n" : "X509 bind FAILED\n");
     } else if (http_streq(cmd, "x509 selftest")) {
         http_append(out, &len, max, x509_selftest() ? "X509 selftest OK\n" : "X509 selftest FAILED\n");
+    } else if (http_streq(cmd, "ksvc") || http_streq(cmd, "ksvc status")) {
+        struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
+        u32 kn = ksvc_snapshot(ks, KSVC_MAX_SERVICES);
+        http_append(out, &len, max, "ID CORE PRI STATE KIND CALLS ERR LAST_T MAX_T TOTAL_T NAME\n");
+        for (u32 i = 0; i < kn; i++) {
+            http_append_u64(out, &len, max, ks[i].id);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].owner_core);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].priority);
+            http_append(out, &len, max, " ");
+            http_append(out, &len, max, ksvc_state_name(ks[i].state));
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].kind);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].calls);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].errors);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].last_duration_ticks);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].max_duration_ticks);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ks[i].total_ticks);
+            http_append(out, &len, max, " ");
+            http_append(out, &len, max, ks[i].name);
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_starts_with(cmd, "addr ")) {
         struct pios_addr a;
         char canon[160];
@@ -3349,6 +3386,7 @@ static void ui_cmd_keystore(u32 argc, char **argv);
 static void ui_cmd_tls(u32 argc, char **argv);
 static void ui_cmd_brotli(u32 argc, char **argv);
 static void ui_cmd_x509(u32 argc, char **argv);
+static void ui_cmd_ksvc(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -4939,6 +4977,41 @@ static void ui_cmd_x509(u32 argc, char **argv)
         return;
     }
     ui_console_write("ERR: usage x509 status | x509 generate [cn] | x509 bind | x509 selftest\n");
+}
+
+static void ui_cmd_ksvc(u32 argc, char **argv)
+{
+    if (argc >= 2 && !ui_streq(argv[1], "status")) {
+        ui_console_write("ERR: usage ksvc status\n");
+        return;
+    }
+    struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
+    u32 n = ksvc_snapshot(ks, KSVC_MAX_SERVICES);
+    ui_console_write("ID CORE PRI STATE      KIND CALLS ERR LAST_T MAX_T TOTAL_T NAME\n");
+    for (u32 i = 0; i < n; i++) {
+        ui_console_hex_fixed(ks[i].id, 4);
+        ui_console_write(" ");
+        ui_console_u32_dec(ks[i].owner_core);
+        ui_console_write(" ");
+        ui_console_u32_dec(ks[i].priority);
+        ui_console_write(" ");
+        ui_console_write(ksvc_state_name(ks[i].state));
+        ui_console_write(" ");
+        ui_console_hex_fixed(ks[i].kind, 4);
+        ui_console_write(" ");
+        ui_console_u64_dec(ks[i].calls);
+        ui_console_write(" ");
+        ui_console_u64_dec(ks[i].errors);
+        ui_console_write(" ");
+        ui_console_u64_dec(ks[i].last_duration_ticks);
+        ui_console_write(" ");
+        ui_console_u64_dec(ks[i].max_duration_ticks);
+        ui_console_write(" ");
+        ui_console_u64_dec(ks[i].total_ticks);
+        ui_console_write(" ");
+        ui_console_write(ks[i].name);
+        ui_console_write("\n");
+    }
 }
 
 static void ui_console_print_netstat(void)
@@ -7929,6 +8002,8 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("x509 generate [cn]\n  Generate a keystore-backed development certificate descriptor.\n");
         ui_console_write("x509 bind\n  Mark the generated cert descriptor as bound to kernel TLS.\n");
         ui_console_write("x509 selftest\n  Generate and bind a selftest descriptor.\n");
+    } else if (ui_streq(topic, "ksvc")) {
+        ui_console_write("ksvc status\n  Show kernel service/plugin registry and runtime counters.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -8303,6 +8378,8 @@ static void ui_console_exec(char *line)
         ui_cmd_brotli(argc, argv);
     } else if (ui_streq(argv[0], "x509")) {
         ui_cmd_x509(argc, argv);
+    } else if (ui_streq(argv[0], "ksvc")) {
+        ui_cmd_ksvc(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "firewall")) {
@@ -8824,10 +8901,18 @@ NORETURN void core0_main(void) {
     ui_console_prompt();
 
     for (;;) {
+        u64 svc_start;
+        svc_start = ksvc_begin(ksvc_net_id);
         net_poll();
+        ksvc_end(ksvc_net_id, svc_start, false);
+        svc_start = ksvc_begin(ksvc_tcp_id);
         echo_tcp_poll();
+        ksvc_end(ksvc_tcp_id, svc_start, false);
+        svc_start = ksvc_begin(ksvc_debug_id);
         debug_tcp_poll();
+        ksvc_end(ksvc_debug_id, svc_start, false);
 
+        svc_start = ksvc_begin(ksvc_ui_id);
         for (u32 i = 0; i < 16; i++) {
             i32 rx = uart_try_getc();
             if (rx < 0)
@@ -8836,12 +8921,18 @@ NORETURN void core0_main(void) {
         }
 
         ui_handle_keys();
-        if (ui_mode == UI_MODE_NONE)
+        ksvc_end(ksvc_ui_id, svc_start, false);
+        if (ui_mode == UI_MODE_NONE) {
+            svc_start = ksvc_begin(ksvc_dashboard_id);
             hdmi_dashboard_render();
+            ksvc_end(ksvc_dashboard_id, svc_start, false);
+        }
 
         if ((env->poll_count & 0x3FFF) == 0) {
+            svc_start = ksvc_begin(ksvc_timer_id);
             arp_tick();
             tcp_tick();
+            ksvc_end(ksvc_timer_id, svc_start, false);
         }
 
         env->poll_count++;
@@ -9536,6 +9627,14 @@ void kernel_main(void) {
     ksem_init_core();
     bp_log("[core] workq_init_core...");
     workq_init_core();
+    bp_log("[core] ksvc_init_core...");
+    ksvc_init_core();
+    ksvc_net_id = ksvc_register("net-poll", KSVC_KIND_POLL | KSVC_KIND_NETWORK, CORE_NET, 100);
+    ksvc_tcp_id = ksvc_register("tcp-http-tls", KSVC_KIND_POLL | KSVC_KIND_NETWORK | KSVC_KIND_TLS, CORE_NET, 90);
+    ksvc_debug_id = ksvc_register("debug-console", KSVC_KIND_POLL | KSVC_KIND_CONSOLE, CORE_NET, 50);
+    ksvc_ui_id = ksvc_register("ui-input", KSVC_KIND_POLL | KSVC_KIND_UI, CORE_NET, 40);
+    ksvc_dashboard_id = ksvc_register("dashboard", KSVC_KIND_POLL | KSVC_KIND_UI, CORE_NET, 20);
+    ksvc_timer_id = ksvc_register("tcp-timers", KSVC_KIND_POLL | KSVC_KIND_TIMER | KSVC_KIND_NETWORK, CORE_NET, 80);
     bp_log("[core] module_init...");
     module_init();
     bp_ok("[core] env ready");

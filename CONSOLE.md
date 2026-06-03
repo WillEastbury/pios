@@ -312,6 +312,18 @@ x509 selftest
 
 `der_ready=no` means the service has key/cert identity state but not a signed ASN.1 DER X.509 certificate yet.
 
+## Kernel service/plugin registry
+
+PIOS exposes a kernel-internal service registry for EL1 services that still run in the monolithic loop today. This is the first slice of the plugin/threading model: existing direct calls keep their exact order, while the registry records owner core, priority, service kind, call counts, errors, and duration ticks.
+
+Console/Web Admin terminal:
+
+```text
+ksvc status
+```
+
+This is observability and lifecycle metadata only. It does not yet schedule services through indirect callbacks or move them to EL0.
+
 ## Brotli codec diagnostics
 
 PIOS includes a no-external-dependency Brotli codec library. The encoder emits conservative stored Brotli streams; the decoder supports stored streams plus the compressed subset emitted by PicoWeb's micro-Brotli encoder. Large copies use the kernel SIMD copy path.
