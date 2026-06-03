@@ -53,6 +53,22 @@ struct irq_diag_snapshot {
     u64 last_tick;
 } PACKED;
 
+struct irq_hw_diag_snapshot {
+    u64 current_el;
+    u64 daif;
+    u64 vbar_el1;
+    u64 cntv_ctl;
+    u64 cntv_cval;
+    u64 cntvct;
+    u32 gicd_ctlr;
+    u32 gicc_ctlr;
+    u32 gicc_pmr;
+    bool vectors_ready;
+    bool gic_ready;
+    bool timer_enabled;
+    bool irq_masked;
+} PACKED;
+
 /* Install the exception vector table */
 void exception_init(void);
 
@@ -62,5 +78,7 @@ void irq_register(u32 intid, irq_handler_t handler);
 /* IRQ dispatcher called from vectors.S */
 void irq_dispatch(struct irq_frame *frame);
 void irq_diag_snapshot(struct irq_diag_snapshot *out);
+void irq_hw_diag_snapshot(struct irq_hw_diag_snapshot *out);
+bool irq_diag_selftest(void);
 
 NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far);

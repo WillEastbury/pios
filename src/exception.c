@@ -135,6 +135,38 @@ void irq_diag_snapshot(struct irq_diag_snapshot *out)
     *out = irq_diag;
 }
 
+void irq_hw_diag_snapshot(struct irq_hw_diag_snapshot *out)
+{
+    if (!out) return;
+    out->current_el = 0;
+    out->daif = 0;
+    out->vbar_el1 = 0;
+    out->cntv_ctl = 0;
+    out->cntv_cval = 0;
+    out->cntvct = 0;
+    __asm__ volatile("mrs %0, CurrentEL" : "=r"(out->current_el));
+    __asm__ volatile("mrs %0, DAIF" : "=r"(out->daif));
+    __asm__ volatile("mrs %0, VBAR_EL1" : "=r"(out->vbar_el1));
+    __asm__ volatile("mrs %0, CNTV_CTL_EL0" : "=r"(out->cntv_ctl));
+    __asm__ volatile("mrs %0, CNTV_CVAL_EL0" : "=r"(out->cntv_cval));
+    __asm__ volatile("mrs %0, CNTVCT_EL0" : "=r"(out->cntvct));
+    out->gicd_ctlr = mmio_read(GICD_CTLR);
+    out->gicc_ctlr = mmio_read(GICC_CTLR);
+    out->gicc_pmr = mmio_read(GICC_PMR);
+    out->vectors_ready = out->vbar_el1 == (u64)(usize)&vector_table;
+    out->gic_ready = (out->gicd_ctlr & 1U) != 0 && (out->gicc_ctlr & 1U) != 0;
+    out->timer_enabled = (out->cntv_ctl & 1U) != 0;
+    out->irq_masked = (out->daif & (1U << 7)) != 0;
+}
+
+bool irq_diag_selftest(void)
+{
+    struct irq_hw_diag_snapshot d;
+    irq_hw_diag_snapshot(&d);
+    return d.vectors_ready && d.gic_ready && d.timer_enabled &&
+           d.gicc_pmr != 0 && ((d.current_el >> 2) & 3U) == 1U;
+}
+
 /* Called from vectors.S sync_handler */
 void sync_exception(struct irq_frame *frame, u64 esr, u64 far) {
     u32 ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;

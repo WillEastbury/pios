@@ -1387,7 +1387,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "ksvc")) {
             http_append(out, &len, max, "ksvc status\n  Show kernel service/plugin registry, core ownership, priorities, and runtime counters.\n");
         } else if (http_streq(topic, "irq")) {
-            http_append(out, &len, max, "irq status\n  Show IRQ dispatch counters, last interrupt ID/core, timer IRQ count, and per-core totals.\n");
+            http_append(out, &len, max, "irq status | irq selftest\n  Show IRQ dispatch counters plus vector/GIC/timer register diagnostics.\n");
         } else if (http_streq(topic, "abi")) {
             http_append(out, &len, max, "abi status | abi selftest\n  Show kernel/user ABI transition stage, ksvc foundations, and pending EL0/SVC work.\n");
         } else if (http_streq(topic, "qpu") || http_streq(topic, "tensor")) {
@@ -1806,7 +1806,9 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "KSVC fault OK\n");
     } else if (http_streq(cmd, "irq") || http_streq(cmd, "irq status")) {
         struct irq_diag_snapshot d;
+        struct irq_hw_diag_snapshot hw;
         irq_diag_snapshot(&d);
+        irq_hw_diag_snapshot(&hw);
         http_append(out, &len, max, "irq total=");
         http_append_u64(out, &len, max, d.total);
         http_append(out, &len, max, " handled=");
@@ -1828,7 +1830,27 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             if (i) http_append(out, &len, max, ",");
             http_append_u64(out, &len, max, d.per_core[i]);
         }
+        http_append(out, &len, max, " current_el=");
+        http_append_u64(out, &len, max, (hw.current_el >> 2) & 3U);
+        http_append(out, &len, max, " daif=");
+        http_append_u64(out, &len, max, hw.daif);
+        http_append(out, &len, max, " vectors=");
+        http_append(out, &len, max, hw.vectors_ready ? "ready" : "bad");
+        http_append(out, &len, max, " gic=");
+        http_append(out, &len, max, hw.gic_ready ? "ready" : "bad");
+        http_append(out, &len, max, " timer=");
+        http_append(out, &len, max, hw.timer_enabled ? "enabled" : "disabled");
+        http_append(out, &len, max, " irq_masked=");
+        http_append(out, &len, max, hw.irq_masked ? "yes" : "no");
+        http_append(out, &len, max, " gicd_ctlr=");
+        http_append_u64(out, &len, max, hw.gicd_ctlr);
+        http_append(out, &len, max, " gicc_ctlr=");
+        http_append_u64(out, &len, max, hw.gicc_ctlr);
+        http_append(out, &len, max, " pmr=");
+        http_append_u64(out, &len, max, hw.gicc_pmr);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "irq selftest")) {
+        http_append(out, &len, max, irq_diag_selftest() ? "IRQ selftest OK\n" : "IRQ selftest FAILED\n");
     } else if (http_streq(cmd, "abi") || http_streq(cmd, "abi status")) {
         struct abi_status a;
         abi_status(&a);
@@ -5702,12 +5724,18 @@ static void ui_cmd_ksvc(u32 argc, char **argv)
 
 static void ui_cmd_irq(u32 argc, char **argv)
 {
+    if (argc >= 2 && ui_streq(argv[1], "selftest")) {
+        ui_console_write(irq_diag_selftest() ? "IRQ selftest OK\n" : "IRQ selftest FAILED\n");
+        return;
+    }
     if (argc >= 2 && !ui_streq(argv[1], "status")) {
-        ui_console_write("ERR: usage irq status\n");
+        ui_console_write("ERR: usage irq status | irq selftest\n");
         return;
     }
     struct irq_diag_snapshot d;
+    struct irq_hw_diag_snapshot hw;
     irq_diag_snapshot(&d);
+    irq_hw_diag_snapshot(&hw);
     ui_console_write("irq total=");
     ui_console_u64_dec(d.total);
     ui_console_write(" handled=");
@@ -5729,6 +5757,18 @@ static void ui_cmd_irq(u32 argc, char **argv)
         if (i) ui_console_write(",");
         ui_console_u64_dec(d.per_core[i]);
     }
+    ui_console_write(" current_el=");
+    ui_console_u64_dec((hw.current_el >> 2) & 3U);
+    ui_console_write(" daif=");
+    ui_console_hex_fixed(hw.daif, 8);
+    ui_console_write(" vectors=");
+    ui_console_write(hw.vectors_ready ? "ready" : "bad");
+    ui_console_write(" gic=");
+    ui_console_write(hw.gic_ready ? "ready" : "bad");
+    ui_console_write(" timer=");
+    ui_console_write(hw.timer_enabled ? "enabled" : "disabled");
+    ui_console_write(" irq_masked=");
+    ui_console_write(hw.irq_masked ? "yes" : "no");
     ui_console_write("\n");
 }
 
@@ -9073,7 +9113,8 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("ksvc selftest\n  Round-trip mailbox and fault/restart policy.\n");
         ui_console_write("ksvc pause|resume|restart|fault <id>\n  Update lifecycle state metadata for a registered service.\n");
     } else if (ui_streq(topic, "irq")) {
-        ui_console_write("irq status\n  Show IRQ dispatch counters, timer count, last interrupt ID/core, and per-core totals.\n");
+        ui_console_write("irq status\n  Show IRQ counters plus vector/GIC/timer register diagnostics.\n");
+        ui_console_write("irq selftest\n  Verify diagnostic invariants without enabling IRQ-driven service loops.\n");
     } else if (ui_streq(topic, "abi")) {
         ui_console_write("abi status\n  Show current direct-KPI/ksvc/EL0 transition state.\n");
         ui_console_write("abi selftest\n  Verify ABI transition metadata invariants.\n");
