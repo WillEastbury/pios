@@ -295,6 +295,8 @@ tls bridge
 
 `tls selftest` verifies that client and server key agreement produce compatible AES-GCM record keys. `tls bridge` parses a fixed sample HTTP request through the same complete/need-more/error convention used by PicoWeb's TLS-to-HTTP bridge.
 
+PIOS also listens on TCP port `443` as `kernel/tls443` and serves a fixed plaintext HTTP test response inside the current kernel TLS-style record wrapper. This is the kernel TLS boundary test path; browser-compatible X.509/ACME HTTPS is tracked separately.
+
 ## Brotli codec diagnostics
 
 PIOS includes a no-external-dependency Brotli codec library. The encoder emits conservative stored Brotli streams; the decoder supports stored streams plus the compressed subset emitted by PicoWeb's micro-Brotli encoder. Large copies use the kernel SIMD copy path.

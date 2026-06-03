@@ -119,6 +119,7 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define ECHO_UDP_PORT  7
 #define ECHO_TCP_PORT  7
 #define HTTP_TCP_PORT  80
+#define HTTPS_TLS_TCP_PORT 443
 #define ADMIN_STATUS_TCP_PORT  8080
 #define ADMIN_REBOOT_TCP_PORT  8081
 #define ADMIN_UPDATE_TCP_PORT  8082
@@ -173,6 +174,14 @@ static tcp_conn_t echo_listen_conn = -1;
 static tcp_conn_t echo_client_conn = -1;
 static tcp_conn_t http_listen_conn = -1;
 static tcp_conn_t http_client_conn = -1;
+static tcp_conn_t https_tls_listen_conn = -1;
+static tcp_conn_t https_tls_tcp_conn = -1;
+static tls_conn_t https_tls_conn = -1;
+static u8 https_tls_req_buf[512];
+static u32 https_tls_req_len;
+static bool https_tls_accepted;
+static bool https_tls_response_sent;
+static u64 https_tls_last_activity_ms;
 static u8 http_req_buf[1024];
 static u32 http_req_len;
 static bool http_auth_checked;
@@ -410,6 +419,11 @@ static void net_services_listen(void)
 {
     echo_client_conn = -1;
     http_client_conn = -1;
+    https_tls_tcp_conn = -1;
+    https_tls_conn = -1;
+    https_tls_req_len = 0;
+    https_tls_accepted = false;
+    https_tls_response_sent = false;
     debug_client_conn = -1;
     debug_tcp_unlocked = false;
     debug_tcp_len = 0;
@@ -417,6 +431,7 @@ static void net_services_listen(void)
 
     echo_listen_conn = tcp_listen(ECHO_TCP_PORT);
     http_listen_conn = tcp_listen(HTTP_TCP_PORT);
+    https_tls_listen_conn = tcp_listen(HTTPS_TLS_TCP_PORT);
     debug_listen_conn = tcp_listen(DEBUG_TCP_PORT);
     admin_services_listen();
     http_log_event("net-listen", HTTP_TCP_PORT, ADMIN_STATUS_TCP_PORT);
@@ -1032,6 +1047,7 @@ static const char *tcp_owner_label(u16 port)
 {
     if (port == ECHO_TCP_PORT) return "kernel/echo";
     if (port == HTTP_TCP_PORT) return "kernel/http";
+    if (port == HTTPS_TLS_TCP_PORT) return "kernel/tls443";
     if (port == ADMIN_STATUS_TCP_PORT) return "admin/status";
     if (port == ADMIN_REBOOT_TCP_PORT) return "admin/reboot";
     if (port == ADMIN_UPDATE_TCP_PORT) return "admin/update";
@@ -2976,6 +2992,70 @@ static void echo_tcp_poll(void) {
         } else if (st == 0 || st >= 8 /* CLOSED or closing */) {
             tcp_close(echo_client_conn);
             echo_client_conn = -1;
+        }
+    }
+
+    /* Kernel TLS test server on port 443. This uses PIOS's kernel TLS-style
+     * record wrapper, not a browser-compatible X.509 TLS endpoint yet. */
+    if (https_tls_tcp_conn < 0 && https_tls_listen_conn >= 0) {
+        https_tls_tcp_conn = tcp_accept(https_tls_listen_conn);
+        if (https_tls_tcp_conn >= 0) {
+            https_tls_conn = -1;
+            https_tls_req_len = 0;
+            https_tls_accepted = false;
+            https_tls_response_sent = false;
+            https_tls_last_activity_ms = timer_monotonic_ms();
+            http_log_event("tls443-accept", HTTPS_TLS_TCP_PORT, (u32)https_tls_tcp_conn);
+        }
+    }
+    if (https_tls_tcp_conn >= 0) {
+        u32 st = tcp_state(https_tls_tcp_conn);
+        if (st == TCP_CLOSED || st == TCP_CLOSE_WAIT || st >= TCP_CLOSING) {
+            if (https_tls_conn >= 0) tls_close(https_tls_conn);
+            else tcp_close(https_tls_tcp_conn);
+            https_tls_tcp_conn = -1;
+            https_tls_conn = -1;
+        } else if (st == TCP_ESTABLISHED) {
+            if (!https_tls_accepted) {
+                if (tcp_readable(https_tls_tcp_conn) > 0) {
+                    https_tls_conn = tls_accept(https_tls_tcp_conn);
+                    if (https_tls_conn < 0) {
+                        http_log_event("tls443-handshake-fail", HTTPS_TLS_TCP_PORT, (u32)https_tls_tcp_conn);
+                        tcp_close(https_tls_tcp_conn);
+                        https_tls_tcp_conn = -1;
+                    } else {
+                        https_tls_accepted = true;
+                        https_tls_last_activity_ms = timer_monotonic_ms();
+                        http_log_event("tls443-handshake-ok", HTTPS_TLS_TCP_PORT, (u32)https_tls_conn);
+                    }
+                } else if ((timer_monotonic_ms() - https_tls_last_activity_ms) > 5000ULL) {
+                    tcp_close(https_tls_tcp_conn);
+                    https_tls_tcp_conn = -1;
+                }
+            } else if (!https_tls_response_sent) {
+                if (tcp_readable(https_tls_tcp_conn) > 0 && https_tls_req_len == 0) {
+                    i32 rn = tls_read(https_tls_conn, https_tls_req_buf, sizeof(https_tls_req_buf));
+                    if (rn > 0) https_tls_req_len = (u32)rn;
+                }
+                static const char resp[] =
+                    "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: 20\r\n"
+                    "Connection: close\r\n\r\n"
+                    "PIOS kernel TLS 443\n";
+                if (tls_write(https_tls_conn, resp, sizeof(resp) - 1) > 0) {
+                    https_tls_response_sent = true;
+                    https_tls_last_activity_ms = timer_monotonic_ms();
+                    http_log_event("tls443-response", HTTPS_TLS_TCP_PORT, sizeof(resp) - 1);
+                    tls_close(https_tls_conn);
+                    https_tls_tcp_conn = -1;
+                    https_tls_conn = -1;
+                }
+            } else if ((timer_monotonic_ms() - https_tls_last_activity_ms) > 1000ULL) {
+                tls_close(https_tls_conn);
+                https_tls_tcp_conn = -1;
+                https_tls_conn = -1;
+            }
         }
     }
 
