@@ -299,18 +299,20 @@ PIOS also listens on TCP port `443` as `kernel/tls443` and serves a fixed plaint
 
 ## Kernel X.509 certificate service
 
-PIOS has a kernel-only X.509 service foundation for certificate/key lifecycle work. It derives Ed25519 private key seed material from the sealed keystore, keeps private material kernel-only, and exposes only non-secret fingerprints. The current implementation generates a self-signed ASN.1 DER X.509 certificate and TLS binding state; CSR/import and ACME chain issuance remain pending before browser-compatible HTTPS.
+PIOS has a kernel-only X.509 service foundation for certificate/key lifecycle work. It derives Ed25519 private key seed material from the sealed keystore, keeps private material kernel-only, and exposes only non-secret fingerprints. The current implementation generates a self-signed ASN.1 DER X.509 certificate, a PKCS#10 Ed25519 CSR, DER certificate import plumbing, and TLS binding state. Browser-compatible HTTPS still needs TLS certificate integration plus an ACME-compatible P-256 ECDSA certificate path; Let's Encrypt does not issue Ed25519 leaf certificates.
 
 Console/Web Admin terminal:
 
 ```text
 x509 status
 x509 generate [common-name]
+x509 csr [common-name]
 x509 bind
+x509 import-self
 x509 selftest
 ```
 
-`der_ready=yes` means a signed DER certificate is available in kernel memory. The current certificate is self-signed for development; ACME/chain issuance still depends on the CSR API and TLS integration follow-ups.
+`der_ready=yes` means a signed DER certificate is available in kernel memory. `csr_ready=yes` means a signed PKCS#10 CSR is available in kernel memory for future export/ACME plumbing. `x509 import-self` re-imports the current DER certificate to exercise the bounded import path; real ACME import should pass only the leaf DER certificate, then call `x509 bind` after validation.
 
 ## Kernel service/plugin registry
 

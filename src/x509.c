@@ -9,9 +9,11 @@
 #define X509_ERR_KEYSTORE  1U
 #define X509_ERR_ARG       2U
 #define X509_ERR_DER       3U
-#define X509_ERR_SIGN      4U
+#define X509_ERR_CSR       4U
+#define X509_ERR_IMPORT    5U
 
-#define X509_DER_MAX       1024U
+#define X509_DER_MAX       4096U
+#define X509_CSR_MAX       2048U
 #define X509_TBS_MAX       768U
 
 struct x509_state {
@@ -20,6 +22,8 @@ struct x509_state {
     u8 public_key[ED25519_PUBKEY_LEN];
     u8 public_id[32];
     u8 tbs_der[X509_TBS_MAX];
+    u8 csr_info_der[X509_TBS_MAX];
+    u8 csr_der[X509_CSR_MAX];
     u8 cert_der[X509_DER_MAX];
 };
 
@@ -154,6 +158,12 @@ static void derw_tlv(struct der_writer *w, u8 tag, const u8 *src, u32 n)
     derw_byte(w, tag);
     derw_len(w, n);
     derw_raw(w, src, n);
+}
+
+static void derw_empty_tlv(struct der_writer *w, u8 tag)
+{
+    derw_byte(w, tag);
+    derw_len(w, 0);
 }
 
 static bool der_wrap(u8 tag, const u8 *body, u32 body_len, u8 *out, u32 out_cap, u32 *out_len)
@@ -326,6 +336,120 @@ static bool x509_build_certificate_der(const char *cn)
     return true;
 }
 
+static bool x509_build_csr_info(const char *cn, u8 *out, u32 out_cap, u32 *out_len)
+{
+    static const u8 version_zero[] = { 0x00U };
+    u8 subject[160];
+    u8 spki[80];
+    u8 body[512];
+    u32 subject_len = 0;
+    u32 spki_len = 0;
+    struct der_writer w;
+
+    if (!x509_build_name(cn, subject, sizeof(subject), &subject_len))
+        return false;
+    if (!x509_build_spki(g_x509.public_key, spki, sizeof(spki), &spki_len))
+        return false;
+
+    derw_init(&w, body, sizeof(body));
+    derw_tlv(&w, 0x02U, version_zero, sizeof(version_zero));
+    derw_raw(&w, subject, subject_len);
+    derw_raw(&w, spki, spki_len);
+    derw_empty_tlv(&w, 0xA0U);
+    if (!w.ok) return false;
+    return der_wrap(0x30U, body, w.len, out, out_cap, out_len);
+}
+
+static bool x509_build_csr_der(const char *cn)
+{
+    static const u8 alg_ed25519[] = { 0x30U, 0x05U, 0x06U, 0x03U, 0x2BU, 0x65U, 0x70U };
+    u8 sig[ED25519_SIG_LEN];
+    u8 sig_bits[1 + ED25519_SIG_LEN];
+    u8 sig_tlv[80];
+    u8 csr_body[X509_TBS_MAX + 96];
+    u32 cri_len = 0;
+    u32 sig_tlv_len = 0;
+    u32 csr_len = 0;
+    struct der_writer w;
+
+    if (!x509_build_csr_info(cn, g_x509.csr_info_der, sizeof(g_x509.csr_info_der), &cri_len))
+        return false;
+
+    ed25519_sign(sig, g_x509.csr_info_der, cri_len, g_x509.key_seed, g_x509.public_key);
+    if (!ed25519_verify(sig, g_x509.csr_info_der, cri_len, g_x509.public_key)) {
+        secure_zero(sig, sizeof(sig));
+        return false;
+    }
+
+    sig_bits[0] = 0;
+    simd_memcpy(sig_bits + 1, sig, ED25519_SIG_LEN);
+    if (!der_wrap(0x03U, sig_bits, sizeof(sig_bits), sig_tlv, sizeof(sig_tlv), &sig_tlv_len)) {
+        secure_zero(sig, sizeof(sig));
+        secure_zero(sig_bits, sizeof(sig_bits));
+        return false;
+    }
+
+    derw_init(&w, csr_body, sizeof(csr_body));
+    derw_raw(&w, g_x509.csr_info_der, cri_len);
+    derw_raw(&w, alg_ed25519, sizeof(alg_ed25519));
+    derw_raw(&w, sig_tlv, sig_tlv_len);
+    if (!w.ok) {
+        secure_zero(sig, sizeof(sig));
+        secure_zero(sig_bits, sizeof(sig_bits));
+        return false;
+    }
+    if (!der_wrap(0x30U, csr_body, w.len, g_x509.csr_der, sizeof(g_x509.csr_der), &csr_len)) {
+        secure_zero(sig, sizeof(sig));
+        secure_zero(sig_bits, sizeof(sig_bits));
+        return false;
+    }
+    g_x509.st.csr_len = csr_len;
+
+    secure_zero(sig, sizeof(sig));
+    secure_zero(sig_bits, sizeof(sig_bits));
+    return true;
+}
+
+static bool der_outer_sequence_len_ok(const u8 *der, u32 len)
+{
+    u32 hdr_len = 2;
+    u32 body_len = 0;
+    u32 n;
+    u32 i;
+
+    if (!der || len < 2 || der[0] != 0x30U)
+        return false;
+    if ((der[1] & 0x80U) == 0) {
+        body_len = der[1];
+    } else {
+        n = der[1] & 0x7FU;
+        if (n == 0 || n > 3 || len < 2U + n)
+            return false;
+        hdr_len = 2U + n;
+        for (i = 0; i < n; i++)
+            body_len = (body_len << 8) | der[2U + i];
+        if (body_len < 128U)
+            return false;
+    }
+    return hdr_len + body_len == len;
+}
+
+static bool x509_ensure_key(void)
+{
+    if (!g_x509.st.initialized)
+        x509_init();
+    if (g_x509.st.has_key)
+        return true;
+    if (!keystore_derive_secret("x509-dev-key-v1", g_x509.key_seed, sizeof(g_x509.key_seed))) {
+        g_x509.st.last_error = X509_ERR_KEYSTORE;
+        return false;
+    }
+    build_public_id();
+    g_x509.st.has_key = true;
+    g_x509.st.key_fingerprint = fp32(g_x509.public_id, sizeof(g_x509.public_id), "PIOS X509 key");
+    return true;
+}
+
 bool x509_init(void)
 {
     simd_zero(&g_x509, sizeof(g_x509));
@@ -339,19 +463,14 @@ bool x509_generate_dev_cert(const char *common_name)
     const char *cn = (common_name && common_name[0]) ? common_name : "PIOS kernel dev";
     if (!g_x509.st.initialized)
         x509_init();
-    if (!keystore_derive_secret("x509-dev-key-v1", g_x509.key_seed, sizeof(g_x509.key_seed))) {
-        g_x509.st.last_error = X509_ERR_KEYSTORE;
+    if (!x509_ensure_key())
         return false;
-    }
-    build_public_id();
-    g_x509.st.has_key = true;
     g_x509.st.has_cert = false;
     g_x509.st.der_ready = false;
     g_x509.st.der_len = 0;
     g_x509.st.generation++;
     str_copy(g_x509.st.subject, sizeof(g_x509.st.subject), cn);
     str_copy(g_x509.st.issuer, sizeof(g_x509.st.issuer), cn);
-    g_x509.st.key_fingerprint = fp32(g_x509.public_id, sizeof(g_x509.public_id), "PIOS X509 key");
     if (!x509_build_certificate_der(cn)) {
         g_x509.st.last_error = X509_ERR_DER;
         build_cert_fingerprint();
@@ -359,6 +478,46 @@ bool x509_generate_dev_cert(const char *common_name)
     }
     g_x509.st.has_cert = true;
     g_x509.st.der_ready = true;
+    build_cert_fingerprint();
+    g_x509.st.last_error = X509_ERR_NONE;
+    return true;
+}
+
+bool x509_generate_csr(const char *common_name)
+{
+    const char *cn = (common_name && common_name[0]) ? common_name :
+                     (g_x509.st.subject[0] ? g_x509.st.subject : "PIOS kernel dev");
+    if (!x509_ensure_key())
+        return false;
+    g_x509.st.csr_ready = false;
+    g_x509.st.csr_len = 0;
+    if (!x509_build_csr_der(cn)) {
+        g_x509.st.last_error = X509_ERR_CSR;
+        return false;
+    }
+    g_x509.st.csr_ready = true;
+    g_x509.st.last_error = X509_ERR_NONE;
+    return true;
+}
+
+bool x509_import_certificate_der(const u8 *der, u32 len)
+{
+    if (!g_x509.st.initialized)
+        x509_init();
+    if (!der || len == 0 || len > X509_DER_MAX || !der_outer_sequence_len_ok(der, len)) {
+        g_x509.st.last_error = X509_ERR_IMPORT;
+        return false;
+    }
+    if (der != g_x509.cert_der)
+        simd_memcpy(g_x509.cert_der, der, len);
+    g_x509.st.has_cert = true;
+    g_x509.st.der_ready = true;
+    g_x509.st.der_len = len;
+    g_x509.st.tls_bound = false;
+    if (!g_x509.st.subject[0])
+        str_copy(g_x509.st.subject, sizeof(g_x509.st.subject), "imported");
+    if (!g_x509.st.issuer[0])
+        str_copy(g_x509.st.issuer, sizeof(g_x509.st.issuer), "imported");
     build_cert_fingerprint();
     g_x509.st.last_error = X509_ERR_NONE;
     return true;
@@ -387,11 +546,21 @@ const u8 *x509_certificate_der(u32 *len)
     return g_x509.st.der_ready ? g_x509.cert_der : NULL;
 }
 
+const u8 *x509_csr_der(u32 *len)
+{
+    if (len) *len = (g_x509.st.csr_ready ? g_x509.st.csr_len : 0);
+    return g_x509.st.csr_ready ? g_x509.csr_der : NULL;
+}
+
 bool x509_selftest(void)
 {
     if (!x509_generate_dev_cert("PIOS selftest"))
         return false;
     if (!g_x509.st.has_key || !g_x509.st.has_cert || !g_x509.st.der_ready || g_x509.st.der_len == 0)
+        return false;
+    if (!x509_generate_csr("PIOS selftest"))
+        return false;
+    if (!g_x509.st.csr_ready || g_x509.st.csr_len == 0)
         return false;
     if (g_x509.st.key_fingerprint == 0 || g_x509.st.cert_fingerprint == 0)
         return false;
