@@ -165,6 +165,7 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HTTP_ROUTE_HOTPATCH   6U
 #define HTTP_ROUTE_PLACEHOLDER 7U
 #define HTTP_ROUTE_NOT_FOUND  8U
+#define HTTP_ROUTE_NETSTAT    9U
 
 #define HTTP_ERR_NONE         0U
 #define HTTP_ERR_RESP_TIMEOUT 1U
@@ -296,6 +297,8 @@ static void admin_services_listen(void);
 static void admin_services_poll(void);
 static void http_log_event(const char *event, u32 a, u32 b);
 static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len);
+static const char *tcp_state_name(u32 state);
+static const char *tcp_owner_label(u16 port);
 static bool http_request_complete(const u8 *req, u32 len);
 
 /* UDP echo: reflect any packet back to sender */
@@ -785,6 +788,8 @@ static u32 http_route_id(const u8 *req, u32 len)
 {
     if (http_request_path_is(req, len, "/api/status"))
         return HTTP_ROUTE_STATUS;
+    if (http_request_path_is(req, len, "/api/netstat"))
+        return HTTP_ROUTE_NETSTAT;
     if (http_request_path_is(req, len, "/api/admin/reboot"))
         return HTTP_ROUTE_REBOOT;
     if (http_request_path_is(req, len, "/api/admin/log-stream") ||
@@ -1025,6 +1030,75 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append(out, &len, max, "}}");
     http_append(out, &len, max, "\n");
     http_trace(HTTP_EVT_STATUS_EXIT, HTTP_ROUTE_STATUS, len, max);
+    return len;
+}
+
+static void http_append_json_ip4(char *out, u32 *len, u32 max, u32 ip)
+{
+    http_append(out, len, max, "\"");
+    if (ip)
+        http_append_ip4(out, len, max, ip);
+    else
+        http_append(out, len, max, "0.0.0.0");
+    http_append(out, len, max, "\"");
+}
+
+static u32 http_build_netstat_json(char *out, u32 max)
+{
+    u32 len = 0;
+    tcp_snapshot_entry_t snap[TCP_MAX_CONNECTIONS];
+    u32 n = tcp_snapshot(snap, TCP_MAX_CONNECTIONS);
+    const tcp_diag_t *td = tcp_diag();
+    u64 rx_drop = 0, tx_drop = 0;
+    nic_filter_stats(&rx_drop, &tx_drop);
+
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    http_append(out, &len, max, "{\"ok\":true,\"count\":");
+    http_append_u64(out, &len, max, n);
+    http_append(out, &len, max, ",\"diag\":{");
+    http_append_json_metric(out, &len, max, "syn", td->syn_seen, true);
+    http_append_json_metric(out, &len, max, "synack", td->synack_sent, true);
+    http_append_json_metric(out, &len, max, "accepted", td->accepted, true);
+    http_append_json_metric(out, &len, max, "noListen", td->no_listener, true);
+    http_append_json_metric(out, &len, max, "badCsum", td->bad_checksum, true);
+    http_append_json_metric(out, &len, max, "pendQ", td->pending_queued, true);
+    http_append_json_metric(out, &len, max, "pendFull", td->pending_full, false);
+    http_append(out, &len, max, "},\"fw\":{");
+    http_append_json_metric(out, &len, max, "rxDrop", rx_drop, true);
+    http_append_json_metric(out, &len, max, "txDrop", tx_drop, false);
+    http_append(out, &len, max, "},\"cols\":[\"id\",\"st\",\"lip\",\"lp\",\"rip\",\"rp\",\"own\",\"pend\",\"rx\",\"tx\",\"ret\"],\"rows\":[");
+    for (u32 i = 0; i < n; i++) {
+        tcp_snapshot_entry_t *e = &snap[i];
+        if (i) http_append(out, &len, max, ",");
+        http_append(out, &len, max, "[");
+        http_append_u64(out, &len, max, (u32)e->conn);
+        http_append(out, &len, max, ",");
+        http_append_json_string(out, &len, max, tcp_state_name(e->state));
+        http_append(out, &len, max, ",");
+        http_append_json_ip4(out, &len, max, e->local_ip);
+        http_append(out, &len, max, ",");
+        http_append_u64(out, &len, max, e->local_port);
+        http_append(out, &len, max, ",");
+        http_append_json_ip4(out, &len, max, e->remote_ip);
+        http_append(out, &len, max, ",");
+        http_append_u64(out, &len, max, e->remote_port);
+        http_append(out, &len, max, ",");
+        http_append_json_string(out, &len, max, tcp_owner_label(e->local_port));
+        http_append(out, &len, max, ",");
+        http_append_u64(out, &len, max, e->pending_count);
+        http_append(out, &len, max, ",");
+        http_append_u64(out, &len, max, e->rx_used);
+        http_append(out, &len, max, ",");
+        http_append_u64(out, &len, max, e->tx_used);
+        http_append(out, &len, max, ",");
+        http_append_u64(out, &len, max, e->retries);
+        http_append(out, &len, max, "]");
+    }
+    http_append(out, &len, max, "]}\n");
     return len;
 }
 
@@ -2551,6 +2625,12 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
 
     if (route == HTTP_ROUTE_STATUS) {
         len = http_build_status_json(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (route == HTTP_ROUTE_NETSTAT) {
+        len = http_build_netstat_json(out, max);
         http_diag.build_len = len;
         http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
         return len;
