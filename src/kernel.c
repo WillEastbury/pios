@@ -1300,6 +1300,7 @@ static bool ui_http_client_parse_common(u32 argc, char **argv, bool use_tls,
                                         u32 *ip, u16 *port, const char **path,
                                         u32 *timeout_ms);
 static void http_append_mem_analyze(char *out, u32 *len, u32 max);
+static void http_append_walfs_list_text(char *out, u32 *len, u32 max, const char *path);
 static void http_append_proc_image_validation(char *out, u32 *len, u32 max,
                                               const struct proc_image_validation *v);
 static void http_append_proc_image_validation_json(char *out, u32 *len, u32 max,
@@ -1341,12 +1342,12 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         "Connection: close\r\n\r\n");
 
     if (!http_query_cmd(req, req_len, cmd, sizeof(cmd)))
-        http_append(out, &len, max, "usage: /api/terminal?cmd=<help|status|netstat|processes|users|firewall list|addr spec|kill pid|restart pid>\n");
+        http_append(out, &len, max, "usage: /api/terminal?cmd=<help|status|netstat|processes|users|ls /|firewall list|addr spec|kill pid|restart pid>\n");
     else if (http_streq(cmd, "help")) {
         http_append(out, &len, max,
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
-            "Examples: status | ps | netstat | firewall list | addr wal:0/3 | reboot confirm\n"
+            "Examples: status | ps | netstat | ls / | firewall list | addr wal:0/3 | reboot confirm\n"
             "Command help: help status | help netstat | help firewall | help reboot | help peek\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
     } else if (http_starts_with(cmd, "help ")) {
@@ -1377,6 +1378,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "dumpmem <addr> [bytes]\n  Dump memory from UART/TCP console admin/debug context.\n");
         } else if (http_streq(topic, "mem")) {
             http_append(out, &len, max, "mem analyze\n  Show kernel image, raw-slot, per-core RAM, and process memory layout diagnostics.\n");
+        } else if (http_streq(topic, "fs") || http_streq(topic, "ls") || http_streq(topic, "fsinspect")) {
+            http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path]\n  Read-only bounded WALFS listing/stat view for the Web/TCP terminal.\n");
         } else if (http_streq(topic, "dma")) {
             http_append(out, &len, max, "dma status | dma selftest\n  Show DMA channel registers, selftest result, selected CB address mode, and retry selftest.\n");
         } else if (http_streq(topic, "addr")) {
@@ -1966,6 +1969,14 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         }
     } else if (http_streq(cmd, "mem") || http_streq(cmd, "mem analyze")) {
         http_append_mem_analyze(out, &len, max);
+    } else if (http_streq(cmd, "ls") || http_streq(cmd, "lsdir") || http_streq(cmd, "fsinspect")) {
+        http_append_walfs_list_text(out, &len, max, "/");
+    } else if (http_starts_with(cmd, "ls ")) {
+        http_append_walfs_list_text(out, &len, max, cmd + 3);
+    } else if (http_starts_with(cmd, "lsdir ")) {
+        http_append_walfs_list_text(out, &len, max, cmd + 6);
+    } else if (http_starts_with(cmd, "fsinspect ")) {
+        http_append_walfs_list_text(out, &len, max, cmd + 10);
     } else if (http_streq(cmd, "keystore") || http_streq(cmd, "keystore status")) {
         struct keystore_status st;
         keystore_status(&st);
@@ -2386,6 +2397,67 @@ static void http_walfs_readdir_cb(const struct walfs_dirent *entry)
     http_append_u64(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, ino.flags);
     http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, "}");
     http_walfs_dir.count++;
+}
+
+static void http_walfs_text_readdir_cb(const struct walfs_dirent *entry)
+{
+    if (!entry || http_walfs_dir.count >= 64)
+        return;
+    struct walfs_inode ino;
+    if (!walfs_stat(entry->child_id, &ino))
+        return;
+    http_append_u64(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, entry->child_id);
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, " ");
+    http_append_u64(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, ino.size);
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, " ");
+    http_append_u64(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, ino.flags);
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max,
+                (ino.flags & WALFS_DIR) ? " dir " : " file ");
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, (const char *)ino.name);
+    http_append(http_walfs_dir.out, http_walfs_dir.len, http_walfs_dir.max, "\n");
+    http_walfs_dir.count++;
+}
+
+static void http_append_walfs_list_text(char *out, u32 *len, u32 max, const char *path)
+{
+    if (!path || !*path)
+        path = "/";
+    if (path[0] != '/') {
+        http_append(out, len, max, "ERR: path must be absolute\n");
+        return;
+    }
+
+    u64 id = walfs_find(path);
+    struct walfs_inode ino;
+    if (!id || !walfs_stat(id, &ino)) {
+        if (path[0] == '/' && path[1] == 0)
+            http_append(out, len, max, "ERR: WALFS root unavailable\n");
+        else
+            http_append(out, len, max, "ERR: path not found\n");
+        return;
+    }
+
+    http_append(out, len, max, "path=");
+    http_append(out, len, max, path);
+    http_append(out, len, max, " id=");
+    http_append_u64(out, len, max, id);
+    http_append(out, len, max, " size=");
+    http_append_u64(out, len, max, ino.size);
+    http_append(out, len, max, " flags=");
+    http_append_u64(out, len, max, ino.flags);
+    http_append(out, len, max, (ino.flags & WALFS_DIR) ? " dir\n" : " file\n");
+    if (!(ino.flags & WALFS_DIR))
+        return;
+
+    http_append(out, len, max, "ID SIZE FLAGS TYPE NAME\n");
+    http_walfs_dir.out = out;
+    http_walfs_dir.len = len;
+    http_walfs_dir.max = max;
+    http_walfs_dir.count = 0;
+    walfs_readdir(id, http_walfs_text_readdir_cb);
+    http_append(out, len, max, "entries=");
+    http_append_u64(out, len, max, http_walfs_dir.count);
+    http_append(out, len, max, "\n");
 }
 
 static void http_append_walfs_hex(char *out, u32 *len, u32 max, const u8 *buf, u32 n, u32 base_off)

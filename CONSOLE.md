@@ -85,6 +85,7 @@ ps
 netstat
 processes
 mem analyze
+ls /
 users
 firewall list
 watchdog status
@@ -215,6 +216,17 @@ process validate <path>
 ```
 
 Validation is read-only and bounded to the image header from the TCP/Web terminal path. It reports `format=flat|pix|elf64`, the current launch verdict (`flat-compatible` or `blocked-loader-required`), entry offset, load span, section sizes, and PIX import/relocation counts. HTTP/API process launch and restart remain blocked in this development build until loader dispatch and the process crash root cause are resolved.
+
+Local process launch is also fail-closed for recognized loader formats: PIX/ELF64 images are refused with `blocked-loader-required` until the process launch path dispatches through the loader instead of flat-entering byte zero.
+
+Read-only WALFS discovery from the Web/TCP terminal:
+
+```text
+ls [absolute-path]
+fsinspect [absolute-path]
+```
+
+These commands list/stat at most a bounded page of directory entries and are intended for finding live artifacts to pass to `process validate`.
 
 Process memory columns:
 

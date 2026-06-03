@@ -1406,6 +1406,26 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
         return -1;
     }
 
+    struct proc_image_validation image;
+    if (!proc_validate_image_path(path, &image)) {
+        uart_puts("[proc] image validate failed status=");
+        uart_puts(proc_image_status_name(image.status));
+        uart_puts(" path=");
+        uart_puts(path);
+        uart_putc('\n');
+        return -1;
+    }
+    if (image.launch_mode != PROC_IMAGE_LAUNCH_FLAT_DIRECT) {
+        uart_puts("[proc] launch blocked format=");
+        uart_puts(proc_image_format_name(image.format));
+        uart_puts(" launch=");
+        uart_puts(proc_image_launch_mode_name(image.launch_mode));
+        uart_puts(" path=");
+        uart_puts(path);
+        uart_putc('\n');
+        return -1;
+    }
+
     i32 slot = find_empty_slot();
     if (slot < 0) {
         uart_puts("[proc] no free slot\n");
