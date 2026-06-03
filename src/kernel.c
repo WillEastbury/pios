@@ -1300,6 +1300,10 @@ static bool ui_http_client_parse_common(u32 argc, char **argv, bool use_tls,
                                         u32 *ip, u16 *port, const char **path,
                                         u32 *timeout_ms);
 static void http_append_mem_analyze(char *out, u32 *len, u32 max);
+static void http_append_proc_image_validation(char *out, u32 *len, u32 max,
+                                              const struct proc_image_validation *v);
+static void http_append_proc_image_validation_json(char *out, u32 *len, u32 max,
+                                                   const struct proc_image_validation *v);
 
 static bool http_parse_db_ref(u32 argc, char **argv, u32 start, u32 *card_out, u32 *rec_out, u32 *next_arg)
 {
@@ -2136,23 +2140,9 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         }
     } else if (http_starts_with(cmd, "process validate ")) {
         const char *path = cmd + 17;
-        u64 id = walfs_find(path);
-        struct walfs_inode ino;
-        if (!id) {
-            http_append(out, &len, max, "process validate FAILED: image not found\n");
-        } else if (!walfs_stat(id, &ino)) {
-            http_append(out, &len, max, "process validate FAILED: stat failed\n");
-        } else if (ino.flags & WALFS_DIR) {
-            http_append(out, &len, max, "process validate FAILED: directory\n");
-        } else if (ino.size == 0 || ino.size > PROC_SLOT_SIZE - 64U) {
-            http_append(out, &len, max, "process validate FAILED: invalid size\n");
-        } else {
-            http_append(out, &len, max, "process validate OK image_id=");
-            http_append_u64(out, &len, max, id);
-            http_append(out, &len, max, " bytes=");
-            http_append_u64(out, &len, max, (u32)ino.size);
-            http_append(out, &len, max, "\n");
-        }
+        struct proc_image_validation v;
+        (void)proc_validate_image_path(path, &v);
+        http_append_proc_image_validation(out, &len, max, &v);
     } else if (http_streq(cmd, "users")) {
         struct principal_ui_entry users[PRINCIPAL_MAX];
         u32 n = principal_snapshot(users, PRINCIPAL_MAX);
@@ -2206,8 +2196,8 @@ static u32 http_build_process_action_response(char *out, u32 max, const u8 *req,
     i32 new_pid = -1;
     bool ok = false;
     const char *message = "bad request";
-    u64 image_id = 0;
-    struct walfs_inode image_ino;
+    struct proc_image_validation image_val;
+    bool have_image_val = false;
 
     http_append(out, &len, max,
         "HTTP/1.0 200 OK\r\n"
@@ -2225,19 +2215,9 @@ static u32 http_build_process_action_response(char *out, u32 max, const u8 *req,
         if (!http_query_value(req, req_len, "/api/process", "path", path, sizeof(path))) {
             message = "missing path";
         } else {
-            image_id = walfs_find(path);
-            if (!image_id) {
-                message = "image not found";
-            } else if (!walfs_stat(image_id, &image_ino)) {
-                message = "image stat failed";
-            } else if (image_ino.flags & WALFS_DIR) {
-                message = "image is directory";
-            } else if (image_ino.size == 0 || image_ino.size > PROC_SLOT_SIZE - 64U) {
-                message = "image size invalid";
-            } else {
-                ok = true;
-                message = "image validates for non-executing dry run";
-            }
+            have_image_val = true;
+            ok = proc_validate_image_path(path, &image_val);
+            message = proc_image_status_name(image_val.status);
         }
     } else if (ui_streq(action, "kill") || ui_streq(action, "restart")) {
         if (!http_query_value(req, req_len, "/api/process", "pid", pid_s, sizeof(pid_s)) ||
@@ -2270,12 +2250,8 @@ static u32 http_build_process_action_response(char *out, u32 max, const u8 *req,
         http_append(out, &len, max, ",\"newPid\":");
         http_append_u64(out, &len, max, (u32)new_pid);
     }
-    if (image_id) {
-        http_append(out, &len, max, ",\"imageId\":");
-        http_append_u64(out, &len, max, image_id);
-        http_append(out, &len, max, ",\"imageBytes\":");
-        http_append_u64(out, &len, max, (u32)image_ino.size);
-    }
+    if (have_image_val)
+        http_append_proc_image_validation_json(out, &len, max, &image_val);
     http_append(out, &len, max, "}\n");
     return len;
 }
@@ -2652,6 +2628,84 @@ static void http_append_mem_analyze(char *out, u32 *len, u32 max)
         http_append(out, len, max, snap[i].image_path);
         http_append(out, len, max, "\n");
     }
+}
+
+static void http_append_proc_image_validation(char *out, u32 *len, u32 max,
+                                              const struct proc_image_validation *v)
+{
+    bool ok = v && v->status == PROC_IMAGE_STATUS_OK;
+    http_append(out, len, max, "process validate ");
+    http_append(out, len, max, ok ? "OK" : "FAILED");
+    http_append(out, len, max, " status=");
+    http_append(out, len, max, proc_image_status_name(v ? v->status : PROC_IMAGE_STATUS_HEADER_INVALID));
+    http_append(out, len, max, " format=");
+    http_append(out, len, max, proc_image_format_name(v ? v->format : PROC_IMAGE_FORMAT_NONE));
+    http_append(out, len, max, " launch=");
+    http_append(out, len, max, proc_image_launch_mode_name(v ? v->launch_mode : PROC_IMAGE_LAUNCH_BLOCKED));
+    if (v) {
+        http_append(out, len, max, " file_bytes=");
+        http_append_u64(out, len, max, v->file_bytes);
+        http_append(out, len, max, " header_bytes=");
+        http_append_u64(out, len, max, v->header_bytes);
+        http_append(out, len, max, " entry_offset=");
+        http_append_u64(out, len, max, v->entry_offset);
+        http_append(out, len, max, " code=");
+        http_append_u64(out, len, max, v->code_size);
+        http_append(out, len, max, " data=");
+        http_append_u64(out, len, max, v->data_size);
+        http_append(out, len, max, " bss=");
+        http_append_u64(out, len, max, v->bss_size);
+        http_append(out, len, max, " load_span=");
+        http_append_u64(out, len, max, v->load_span);
+        if (v->format == PROC_IMAGE_FORMAT_PIX) {
+            http_append(out, len, max, " type=");
+            http_append_u64(out, len, max, v->image_type);
+            http_append(out, len, max, " flags=");
+            http_append_u64(out, len, max, v->image_flags);
+            http_append(out, len, max, " relocs=");
+            http_append_u64(out, len, max, v->reloc_count);
+            http_append(out, len, max, " imports=");
+            http_append_u64(out, len, max, v->import_count);
+        }
+        if (v->validator_status) {
+            http_append(out, len, max, " validator=");
+            http_append_u64(out, len, max, v->validator_status);
+        }
+    }
+    http_append(out, len, max, "\n");
+}
+
+static void http_append_proc_image_validation_json(char *out, u32 *len, u32 max,
+                                                   const struct proc_image_validation *v)
+{
+    if (!v)
+        return;
+    http_append(out, len, max, ",\"status\":\"");
+    http_append(out, len, max, proc_image_status_name(v->status));
+    http_append(out, len, max, "\",\"format\":\"");
+    http_append(out, len, max, proc_image_format_name(v->format));
+    http_append(out, len, max, "\",\"launchMode\":\"");
+    http_append(out, len, max, proc_image_launch_mode_name(v->launch_mode));
+    http_append(out, len, max, "\",\"fileBytes\":");
+    http_append_u64(out, len, max, v->file_bytes);
+    http_append(out, len, max, ",\"headerBytes\":");
+    http_append_u64(out, len, max, v->header_bytes);
+    http_append(out, len, max, ",\"entryOffset\":");
+    http_append_u64(out, len, max, v->entry_offset);
+    http_append(out, len, max, ",\"codeBytes\":");
+    http_append_u64(out, len, max, v->code_size);
+    http_append(out, len, max, ",\"dataBytes\":");
+    http_append_u64(out, len, max, v->data_size);
+    http_append(out, len, max, ",\"bssBytes\":");
+    http_append_u64(out, len, max, v->bss_size);
+    http_append(out, len, max, ",\"loadSpan\":");
+    http_append_u64(out, len, max, v->load_span);
+    http_append(out, len, max, ",\"imageType\":");
+    http_append_u64(out, len, max, v->image_type);
+    http_append(out, len, max, ",\"imageFlags\":");
+    http_append_u64(out, len, max, v->image_flags);
+    http_append(out, len, max, ",\"validatorStatus\":");
+    http_append_u64(out, len, max, v->validator_status);
 }
 
 static void pios_write_le32(u8 *p, u32 v)

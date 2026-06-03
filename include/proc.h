@@ -58,6 +58,45 @@ struct proc_security_stats {
     u64 port_claim_denies;
 } PACKED;
 
+#define PROC_IMAGE_FORMAT_NONE     0U
+#define PROC_IMAGE_FORMAT_FLAT     1U
+#define PROC_IMAGE_FORMAT_PIX      2U
+#define PROC_IMAGE_FORMAT_ELF64    3U
+
+#define PROC_IMAGE_STATUS_OK              0U
+#define PROC_IMAGE_STATUS_NOT_FOUND       1U
+#define PROC_IMAGE_STATUS_STAT_FAILED     2U
+#define PROC_IMAGE_STATUS_DIRECTORY       3U
+#define PROC_IMAGE_STATUS_INVALID_SIZE    4U
+#define PROC_IMAGE_STATUS_READ_FAILED     5U
+#define PROC_IMAGE_STATUS_UNSUPPORTED     6U
+#define PROC_IMAGE_STATUS_HEADER_INVALID  7U
+#define PROC_IMAGE_STATUS_HEADER_PARTIAL  8U
+
+#define PROC_IMAGE_LAUNCH_BLOCKED       0U
+#define PROC_IMAGE_LAUNCH_FLAT_DIRECT   1U
+#define PROC_IMAGE_LAUNCH_LOADER_NEEDED 2U
+
+struct proc_image_validation {
+    u32 status;
+    u32 format;
+    u32 launch_mode;
+    u32 file_bytes;
+    u32 header_bytes;
+    u32 image_type;
+    u32 image_flags;
+    u32 validator_status;
+    u64 entry_offset;
+    u64 code_size;
+    u64 data_size;
+    u64 bss_size;
+    u64 load_span;
+    u64 stack_size;
+    u64 min_memory;
+    u32 reloc_count;
+    u32 import_count;
+};
+
 #define APPF_EVENT_DATA_MAX   224U
 #define APPF_LOG_MSG_MAX      224U
 #define APPF_SERVICE_NAME_MAX 31U
@@ -398,3 +437,7 @@ i32  proc_launch_on_core_as(u32 target_core, const char *path, u32 principal_id)
 i32  proc_launch_on_core_as_prio(u32 target_core, const char *path, u32 principal_id, u32 priority_class);
 bool proc_set_priority(u32 pid, u32 priority_class);
 bool proc_set_affinity(u32 pid, u32 core);
+bool proc_validate_image_path(const char *path, struct proc_image_validation *out);
+const char *proc_image_format_name(u32 format);
+const char *proc_image_status_name(u32 status);
+const char *proc_image_launch_mode_name(u32 mode);

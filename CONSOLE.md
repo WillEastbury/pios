@@ -207,6 +207,15 @@ http://192.168.218.101/api/admin/log-stream?tail=24
 
 `ps`, `/api/terminal?cmd=processes`, HDMI process views, and the Web Admin Processes tab include parent PID (`PPID`) and a simple process graph/tree section. The kernel is exposed as synthetic PID `0` with `PPID=-1`, so root user processes appear under the kernel node.
 
+Safe process image diagnostics:
+
+```text
+process validate <path>
+/api/process?action=validate&path=<path>
+```
+
+Validation is read-only and bounded to the image header from the TCP/Web terminal path. It reports `format=flat|pix|elf64`, the current launch verdict (`flat-compatible` or `blocked-loader-required`), entry offset, load span, section sizes, and PIX import/relocation counts. HTTP/API process launch and restart remain blocked in this development build until loader dispatch and the process crash root cause are resolved.
+
 Process memory columns:
 
 ```text

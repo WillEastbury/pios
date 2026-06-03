@@ -45,6 +45,9 @@ static u64 svc_call_count;
 static u64 svc_bad_count;
 static struct proc_security_stats proc_sec_stats;
 
+#define PROC_IMAGE_VALIDATE_HEADER_MAX 4096U
+static u8 proc_image_validate_scratch[PROC_IMAGE_VALIDATE_HEADER_MAX];
+
 #define PROC_LAUNCH_PATH_MAX 96
 struct proc_launch_req {
     volatile u32 pending;
@@ -1943,6 +1946,156 @@ void proc_security_stats_snapshot(struct proc_security_stats *out)
 {
     if (!out) return;
     simd_memcpy(out, &proc_sec_stats, sizeof(*out));
+}
+
+const char *proc_image_format_name(u32 format)
+{
+    switch (format) {
+    case PROC_IMAGE_FORMAT_FLAT:  return "flat";
+    case PROC_IMAGE_FORMAT_PIX:   return "pix";
+    case PROC_IMAGE_FORMAT_ELF64: return "elf64";
+    default:                      return "none";
+    }
+}
+
+const char *proc_image_status_name(u32 status)
+{
+    switch (status) {
+    case PROC_IMAGE_STATUS_OK:             return "ok";
+    case PROC_IMAGE_STATUS_NOT_FOUND:      return "not_found";
+    case PROC_IMAGE_STATUS_STAT_FAILED:    return "stat_failed";
+    case PROC_IMAGE_STATUS_DIRECTORY:      return "directory";
+    case PROC_IMAGE_STATUS_INVALID_SIZE:   return "invalid_size";
+    case PROC_IMAGE_STATUS_READ_FAILED:    return "read_failed";
+    case PROC_IMAGE_STATUS_UNSUPPORTED:    return "unsupported";
+    case PROC_IMAGE_STATUS_HEADER_INVALID: return "header_invalid";
+    case PROC_IMAGE_STATUS_HEADER_PARTIAL: return "header_partial";
+    default:                               return "unknown";
+    }
+}
+
+const char *proc_image_launch_mode_name(u32 mode)
+{
+    switch (mode) {
+    case PROC_IMAGE_LAUNCH_FLAT_DIRECT:   return "flat-compatible";
+    case PROC_IMAGE_LAUNCH_LOADER_NEEDED: return "blocked-loader-required";
+    default:                              return "blocked";
+    }
+}
+
+static u32 proc_image_magic32(const u8 *p)
+{
+    return ((u32)p[0]) | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static void proc_image_copy_info(struct proc_image_validation *out,
+                                 const struct pix_image_info *info)
+{
+    out->image_type = info->type;
+    out->image_flags = info->flags;
+    out->validator_status = info->status;
+    out->entry_offset = info->entry_offset;
+    out->code_size = info->code_size;
+    out->data_size = info->data_size;
+    out->bss_size = info->bss_size;
+    out->load_span = info->load_span;
+    out->stack_size = info->stack_size;
+    out->min_memory = info->min_memory;
+    out->reloc_count = info->reloc_count;
+    out->import_count = info->import_count;
+}
+
+bool proc_validate_image_path(const char *path, struct proc_image_validation *out)
+{
+    if (!out)
+        return false;
+    simd_zero(out, sizeof(*out));
+    out->status = PROC_IMAGE_STATUS_NOT_FOUND;
+    out->format = PROC_IMAGE_FORMAT_NONE;
+    out->launch_mode = PROC_IMAGE_LAUNCH_BLOCKED;
+
+    if (!path || !path[0])
+        return false;
+
+    u64 inode = walfs_find(path);
+    if (!inode)
+        return false;
+
+    struct walfs_inode info;
+    if (!walfs_stat(inode, &info)) {
+        out->status = PROC_IMAGE_STATUS_STAT_FAILED;
+        return false;
+    }
+    if (info.flags & WALFS_DIR) {
+        out->status = PROC_IMAGE_STATUS_DIRECTORY;
+        return false;
+    }
+    if (info.size == 0 || info.size > PROC_SLOT_SIZE - 64U) {
+        out->status = PROC_IMAGE_STATUS_INVALID_SIZE;
+        out->file_bytes = (u32)info.size;
+        return false;
+    }
+
+    out->file_bytes = (u32)info.size;
+    out->header_bytes = out->file_bytes < PROC_IMAGE_VALIDATE_HEADER_MAX ?
+                        out->file_bytes : PROC_IMAGE_VALIDATE_HEADER_MAX;
+    u32 loaded = walfs_read(inode, 0, proc_image_validate_scratch, out->header_bytes);
+    if (loaded != out->header_bytes) {
+        out->status = PROC_IMAGE_STATUS_READ_FAILED;
+        out->header_bytes = loaded;
+        return false;
+    }
+
+    if (out->header_bytes >= 4 && proc_image_magic32(proc_image_validate_scratch) == PIX_MAGIC) {
+        struct pix_image_info pi;
+        out->format = PROC_IMAGE_FORMAT_PIX;
+        bool ok = pix_validate_header(proc_image_validate_scratch, out->header_bytes,
+                                      out->file_bytes, PROC_SLOT_SIZE, &pi);
+        proc_image_copy_info(out, &pi);
+        out->launch_mode = PROC_IMAGE_LAUNCH_LOADER_NEEDED;
+        if (!ok) {
+            out->status = (pi.status == PIX_VALIDATE_SHORT_HEADER ||
+                           pi.status == PIX_VALIDATE_PARTIAL) ?
+                          PROC_IMAGE_STATUS_HEADER_PARTIAL :
+                          PROC_IMAGE_STATUS_HEADER_INVALID;
+            return false;
+        }
+        if (pi.type != PIX_EXEC) {
+            out->status = PROC_IMAGE_STATUS_UNSUPPORTED;
+            return false;
+        }
+        out->status = PROC_IMAGE_STATUS_OK;
+        return true;
+    }
+
+    if (out->header_bytes >= 4 &&
+        proc_image_validate_scratch[0] == 0x7F &&
+        proc_image_validate_scratch[1] == 'E' &&
+        proc_image_validate_scratch[2] == 'L' &&
+        proc_image_validate_scratch[3] == 'F') {
+        struct pix_image_info ei;
+        out->format = PROC_IMAGE_FORMAT_ELF64;
+        bool ok = elf64_validate_header(proc_image_validate_scratch, out->header_bytes,
+                                        out->file_bytes, PROC_SLOT_SIZE, &ei);
+        proc_image_copy_info(out, &ei);
+        out->launch_mode = PROC_IMAGE_LAUNCH_LOADER_NEEDED;
+        if (!ok) {
+            out->status = (ei.status == PIX_VALIDATE_PARTIAL) ?
+                          PROC_IMAGE_STATUS_HEADER_PARTIAL :
+                          PROC_IMAGE_STATUS_HEADER_INVALID;
+            return false;
+        }
+        out->status = PROC_IMAGE_STATUS_OK;
+        return true;
+    }
+
+    out->status = PROC_IMAGE_STATUS_OK;
+    out->format = PROC_IMAGE_FORMAT_FLAT;
+    out->launch_mode = PROC_IMAGE_LAUNCH_FLAT_DIRECT;
+    out->entry_offset = 0;
+    out->code_size = out->file_bytes;
+    out->load_span = out->file_bytes;
+    return true;
 }
 
 bool proc_kill_pid(u32 pid, u32 code)

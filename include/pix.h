@@ -56,6 +56,39 @@ struct pix_import {
     u32 patch_offset;   /* offset into code to patch */
 } PACKED;
 
+#define PIX_IMAGE_FORMAT_NONE   0U
+#define PIX_IMAGE_FORMAT_PIX    1U
+#define PIX_IMAGE_FORMAT_ELF64  2U
+
+#define PIX_VALIDATE_OK             0U
+#define PIX_VALIDATE_SHORT_HEADER   1U
+#define PIX_VALIDATE_BAD_MAGIC      2U
+#define PIX_VALIDATE_BAD_VERSION    3U
+#define PIX_VALIDATE_BAD_CRC        4U
+#define PIX_VALIDATE_BAD_BOUNDS     5U
+#define PIX_VALIDATE_BAD_ENTRY      6U
+#define PIX_VALIDATE_BAD_CLASS      7U
+#define PIX_VALIDATE_BAD_MACHINE    8U
+#define PIX_VALIDATE_BAD_PHDR       9U
+#define PIX_VALIDATE_NO_LOAD        10U
+#define PIX_VALIDATE_PARTIAL        11U
+
+struct pix_image_info {
+    u32 format;
+    u32 status;
+    u32 type;
+    u32 flags;
+    u64 entry_offset;
+    u64 code_size;
+    u64 data_size;
+    u64 bss_size;
+    u64 load_span;
+    u64 stack_size;
+    u64 min_memory;
+    u32 reloc_count;
+    u32 import_count;
+};
+
 /* Module hook types */
 #define MODULE_NET_FILTER   1
 #define MODULE_FS_HOOK      2
@@ -75,6 +108,12 @@ u64 pix_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size,
 
 /* Load a minimal ELF64 binary. Returns entry point or 0. */
 u64 elf64_load(const u8 *file, u32 file_size, u8 *base, u32 slot_size);
+
+/* Read-only validators used by diagnostics and by loaders before mutation. */
+bool pix_validate_header(const u8 *file, u32 available, u32 file_size,
+                         u32 slot_size, struct pix_image_info *out);
+bool elf64_validate_header(const u8 *file, u32 available, u32 file_size,
+                           u32 slot_size, struct pix_image_info *out);
 
 /* Load and install a kernel module. Returns true on success. */
 bool module_load(const u8 *file, u32 file_size);
