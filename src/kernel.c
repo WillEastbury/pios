@@ -647,6 +647,32 @@ static void http_append_route_table(char *out, u32 *len, u32 max)
     }
 }
 
+static void http_append_arp_table(char *out, u32 *len, u32 max)
+{
+    struct arp_snapshot_entry e[ARP_TABLE_SIZE];
+    u32 n = arp_snapshot(e, ARP_TABLE_SIZE);
+    http_append(out, len, max, "ARP IP MAC STATE RETRY CONS AGE_MS\n");
+    for (u32 i = 0; i < n; i++) {
+        http_append_ip4(out, len, max, e[i].ip);
+        http_append(out, len, max, " ");
+        for (u32 j = 0; j < 6; j++) {
+            static const char hx[] = "0123456789ABCDEF";
+            if (j) http_append(out, len, max, ":");
+            char b[3] = { hx[e[i].mac[j] >> 4], hx[e[i].mac[j] & 0xF], 0 };
+            http_append(out, len, max, b);
+        }
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, e[i].state);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, e[i].retries);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, e[i].consistency);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, e[i].age_ms);
+        http_append(out, len, max, "\n");
+    }
+}
+
 static bool http_char_ieq(char a, char b)
 {
     if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
@@ -1327,7 +1353,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "netstat")) {
             http_append(out, &len, max, "netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
         } else if (http_streq(topic, "netcfg")) {
-            http_append(out, &len, max, "netcfg | netcfg routes\n  Show current network summary and route table.\n");
+            http_append(out, &len, max, "netcfg | netcfg routes | netcfg neighbors\n  Show current network summary, route table, and ARP/neighbor table.\n");
         } else if (http_streq(topic, "http") || http_streq(topic, "https")) {
             http_append(out, &len, max, "http get <ip> [path] [port] [timeout_ms]\nhttps get <ip> [path] [port] [timeout_ms]\n  Console-mode HTTP client; https targets the PIOS kernel TLS-wrapper endpoint.\n");
         } else if (http_streq(topic, "firewall")) {
@@ -1454,6 +1480,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, st ? st->drop_no_neighbor : 0);
         http_append(out, &len, max, "\n");
         http_append_route_table(out, &len, max);
+        if (http_streq(cmd, "netcfg"))
+            http_append_arp_table(out, &len, max);
+    } else if (http_streq(cmd, "netcfg neighbors")) {
+        http_append_arp_table(out, &len, max);
     } else if (http_starts_with(cmd, "http get ") || http_starts_with(cmd, "https get ")) {
         bool use_tls = http_starts_with(cmd, "https ");
         char line[160];
@@ -4686,6 +4716,31 @@ static void ui_console_route_table(void)
     }
 }
 
+static void ui_console_mac(const u8 *mac)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    for (u32 i = 0; i < 6; i++) {
+        if (i) ui_console_write(":");
+        char b[3] = { hx[mac[i] >> 4], hx[mac[i] & 0xF], 0 };
+        ui_console_write(b);
+    }
+}
+
+static void ui_console_arp_table(void)
+{
+    struct arp_snapshot_entry e[ARP_TABLE_SIZE];
+    u32 n = arp_snapshot(e, ARP_TABLE_SIZE);
+    ui_console_write("ARP IP MAC STATE RETRY CONS AGE_MS\n");
+    for (u32 i = 0; i < n; i++) {
+        ui_console_ip(e[i].ip);
+        ui_console_write(" ");
+        ui_console_mac(e[i].mac);
+        ui_console_write(" ");
+        fb_printf("%u %u %u %u\n", e[i].state, e[i].retries,
+                  e[i].consistency, (u32)e[i].age_ms);
+    }
+}
+
 static void ui_console_print_ps(void)
 {
     struct proc_ui_entry snap[UI_SNAPSHOT_MAX];
@@ -6109,6 +6164,11 @@ static void ui_cmd_netcfg(u32 argc, char **argv)
         return;
     }
 
+    if (argc >= 2 && (ui_streq(argv[1], "neighbors") || ui_streq(argv[1], "arp"))) {
+        ui_console_arp_table();
+        return;
+    }
+
     if (argc >= 2 && ui_streq(argv[1], "route")) {
         if (argc < 7 || !ui_streq(argv[2], "add")) {
             ui_console_write("ERR: usage netcfg route add <dst> <mask> <gw> <connected|via>\n");
@@ -6171,6 +6231,7 @@ static void ui_cmd_netcfg(u32 argc, char **argv)
     uart_hex((u32)st->rx_packets);
     uart_puts("\n");
     ui_console_route_table();
+    ui_console_arp_table();
 }
 
 static void ui_cmd_disk(u32 argc, char **argv)
@@ -8961,7 +9022,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("db list <card>\n");
     } else if (ui_streq(topic, "netcfg")) {
         ui_console_write("netcfg\n  Show current network config.\n");
-        ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d>\nnetcfg apply\nnetcfg dhcp <on|off> [timeout_ms]\nnetcfg addnbr <ip> <mac>\nnetcfg routes\nnetcfg route add <dst> <mask> <gw> <connected|via>\n");
+        ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d>\nnetcfg apply\nnetcfg dhcp <on|off> [timeout_ms]\nnetcfg addnbr <ip> <mac>\nnetcfg routes|neighbors\nnetcfg route add <dst> <mask> <gw> <connected|via>\n");
     } else if (ui_streq(topic, "stream")) {
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
         ui_console_write("http get <ip> [path] [port] [timeout_ms]\nhttps get <ip> [path] [port] [timeout_ms]\n");

@@ -38,6 +38,16 @@ typedef struct {
     u64 conflicts;
 } arp_stats_t;
 
+struct arp_snapshot_entry {
+    u32 ip;
+    u8 mac[6];
+    u8 state;
+    u8 retries;
+    u8 consistency;
+    u8 _pad[3];
+    u64 age_ms;
+} PACKED;
+
 /* Init ARP subsystem (called from net_init) */
 void arp_init(u32 our_ip, u32 our_mask, const u8 *our_mac);
 
@@ -62,3 +72,4 @@ void arp_tick(void);
 
 /* Get ARP stats */
 const arp_stats_t *arp_get_stats(void);
+u32 arp_snapshot(struct arp_snapshot_entry *out, u32 max_entries);

@@ -367,9 +367,12 @@ void arp_input(const u8 *frame, u32 len) {
             return;
 
         if (e->state == ARP_INCOMPLETE) {
-            /* First reply: record and start consistency check */
-            simd_memcpy(e->pending_mac, sender_mac, 6);
-            e->consistency = 1;
+            if (e->consistency > 0 && mac_eq(sender_mac, e->pending_mac)) {
+                e->consistency++;
+            } else {
+                simd_memcpy(e->pending_mac, sender_mac, 6);
+                e->consistency = 1;
+            }
 
             if (e->consistency >= ARP_CONSISTENCY_COUNT) {
                 simd_memcpy(e->mac, sender_mac, 6);
@@ -436,4 +439,25 @@ void arp_tick(void) {
 
 const arp_stats_t *arp_get_stats(void) {
     return &arp_stats;
+}
+
+u32 arp_snapshot(struct arp_snapshot_entry *out, u32 max_entries)
+{
+    u32 n = 0;
+    u64 now = now_ms();
+    if (!out || max_entries == 0)
+        return 0;
+    for (u32 i = 0; i < ARP_TABLE_SIZE && n < max_entries; i++) {
+        struct arp_entry *e = &table[i];
+        if (e->state == ARP_FREE)
+            continue;
+        out[n].ip = e->ip;
+        simd_memcpy(out[n].mac, (e->state == ARP_INCOMPLETE) ? e->pending_mac : e->mac, 6);
+        out[n].state = e->state;
+        out[n].retries = e->retries;
+        out[n].consistency = e->consistency;
+        out[n].age_ms = now >= e->timestamp ? now - e->timestamp : 0;
+        n++;
+    }
+    return n;
 }
