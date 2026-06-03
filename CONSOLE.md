@@ -381,9 +381,11 @@ PIOS exposes interrupt dispatch telemetry without changing the polling service m
 
 ```text
 irq status
+irq probe
+irq selftest
 ```
 
-The status includes total/handled/unhandled/spurious IRQs, timer IRQ count, last interrupt ID/core/tick, and per-core totals.
+The status includes total/handled/unhandled/spurious IRQs, timer IRQ count, last interrupt ID/core/tick, per-core totals, vector state, timer state, and current GIC register readings. `irq probe` is read-only and samples a small set of plausible BCM2712/RPi5 GIC distributor/interface windows so the current zero-register blocker can be diagnosed before any IRQ-driven service-loop retry.
 
 ## Kernel/user ABI transition
 

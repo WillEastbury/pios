@@ -159,6 +159,60 @@ void irq_hw_diag_snapshot(struct irq_hw_diag_snapshot *out)
     out->irq_masked = (out->daif & (1U << 7)) != 0;
 }
 
+struct gic_probe_candidate {
+    u32 id;
+    u64 gicd_base;
+    u64 gicc_base;
+};
+
+static const struct gic_probe_candidate gic_probe_candidates[] = {
+    { 1, GICD_BASE,                    GICC_BASE                    },
+    { 2, GIC_BASE,                     GIC_BASE + 0x1000UL          },
+    { 3, PERIPH_BASE + 0x0041000UL,    PERIPH_BASE + 0x0042000UL    },
+    { 4, PERIPH_BASE + 0x01840000UL,   PERIPH_BASE + 0x01841000UL   },
+    { 5, PERIPH_BASE + 0x03FF9000UL,   PERIPH_BASE + 0x03FFA000UL   },
+    { 6, 0x107FFF9000UL,               0x107FFFA000UL               },
+    { 7, 0x107D841000UL,               0x107D842000UL               },
+    { 8, 0x107C041000UL,               0x107C042000UL               },
+};
+
+static bool gic_probe_plausible(u32 ctlr, u32 typer, u32 iidr, u32 cctlr, u32 pmr)
+{
+    if (typer == 0 || typer == 0xFFFFFFFFU)
+        return false;
+    if (iidr == 0xFFFFFFFFU)
+        return false;
+    if (typer == iidr || (ctlr == typer && typer == iidr))
+        return false;
+    if (cctlr == 0 && pmr == 0)
+        return false;
+    u32 lines = ((typer & 0x1FU) + 1U) * 32U;
+    return lines >= 32U && lines <= 1020U;
+}
+
+void irq_gic_probe_snapshot(struct irq_gic_probe_snapshot *out)
+{
+    if (!out) return;
+    out->count = 0;
+    out->current_driver_id = 1;
+    for (u32 i = 0; i < sizeof(gic_probe_candidates) / sizeof(gic_probe_candidates[0]) &&
+                    out->count < IRQ_GIC_PROBE_MAX; i++) {
+        const struct gic_probe_candidate *c = &gic_probe_candidates[i];
+        struct irq_gic_probe_entry *e = &out->entries[out->count++];
+        e->id = c->id;
+        e->gicd_base = c->gicd_base;
+        e->gicc_base = c->gicc_base;
+        e->gicd_ctlr = mmio_read(c->gicd_base + 0x000);
+        e->gicd_typer = mmio_read(c->gicd_base + 0x004);
+        e->gicd_iidr = mmio_read(c->gicd_base + 0x008);
+        e->gicc_ctlr = mmio_read(c->gicc_base + 0x000);
+        e->gicc_pmr = mmio_read(c->gicc_base + 0x004);
+        e->plausible = gic_probe_plausible(e->gicd_ctlr, e->gicd_typer,
+                                           e->gicd_iidr, e->gicc_ctlr,
+                                           e->gicc_pmr);
+    }
+}
+
 bool irq_diag_selftest(void)
 {
     struct irq_hw_diag_snapshot d;

@@ -1075,6 +1075,16 @@ static void http_append_hex32(char *out, u32 *len, u32 max, u32 v)
     http_append(out, len, max, s);
 }
 
+static void http_append_hex64(char *out, u32 *len, u32 max, u64 v)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    char s[17];
+    for (u32 i = 0; i < 16; i++)
+        s[i] = hx[(v >> ((15 - i) * 4)) & 0xF];
+    s[16] = 0;
+    http_append(out, len, max, s);
+}
+
 static void http_append_json_metric(char *out, u32 *len, u32 max,
                                     const char *name, u64 value, bool comma)
 {
@@ -1397,7 +1407,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "ksvc")) {
             http_append(out, &len, max, "ksvc status\n  Show kernel service/plugin registry, core ownership, priorities, and runtime counters.\n");
         } else if (http_streq(topic, "irq")) {
-            http_append(out, &len, max, "irq status | irq selftest\n  Show IRQ dispatch counters plus vector/GIC/timer register diagnostics.\n");
+            http_append(out, &len, max, "irq status | irq probe | irq selftest\n  Show IRQ counters, read-only GIC base probes, and diagnostic invariants without enabling IRQ service loops.\n");
         } else if (http_streq(topic, "abi")) {
             http_append(out, &len, max, "abi status | abi selftest\n  Show kernel/user ABI transition stage, ksvc foundations, and pending EL0/SVC work.\n");
         } else if (http_streq(topic, "qpu") || http_streq(topic, "tensor")) {
@@ -1876,6 +1886,35 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "irq selftest")) {
         http_append(out, &len, max, irq_diag_selftest() ? "IRQ selftest OK\n" : "IRQ selftest FAILED\n");
+    } else if (http_streq(cmd, "irq probe")) {
+        struct irq_gic_probe_snapshot p;
+        irq_gic_probe_snapshot(&p);
+        http_append(out, &len, max, "irq probe current_driver_id=");
+        http_append_u64(out, &len, max, p.current_driver_id);
+        http_append(out, &len, max, " count=");
+        http_append_u64(out, &len, max, p.count);
+        http_append(out, &len, max, "\nID D_BASE C_BASE D_CTLR D_TYPER D_IIDR C_CTLR C_PMR PLAUSIBLE\n");
+        for (u32 i = 0; i < p.count; i++) {
+            const struct irq_gic_probe_entry *e = &p.entries[i];
+            http_append_u64(out, &len, max, e->id);
+            http_append(out, &len, max, " ");
+            http_append_hex64(out, &len, max, e->gicd_base);
+            http_append(out, &len, max, " ");
+            http_append_hex64(out, &len, max, e->gicc_base);
+            http_append(out, &len, max, " ");
+            http_append_hex32(out, &len, max, e->gicd_ctlr);
+            http_append(out, &len, max, " ");
+            http_append_hex32(out, &len, max, e->gicd_typer);
+            http_append(out, &len, max, " ");
+            http_append_hex32(out, &len, max, e->gicd_iidr);
+            http_append(out, &len, max, " ");
+            http_append_hex32(out, &len, max, e->gicc_ctlr);
+            http_append(out, &len, max, " ");
+            http_append_hex32(out, &len, max, e->gicc_pmr);
+            http_append(out, &len, max, " ");
+            http_append(out, &len, max, e->plausible ? "yes" : "no");
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "abi") || http_streq(cmd, "abi status")) {
         struct abi_status a;
         abi_status(&a);
@@ -6061,8 +6100,37 @@ static void ui_cmd_irq(u32 argc, char **argv)
         ui_console_write(irq_diag_selftest() ? "IRQ selftest OK\n" : "IRQ selftest FAILED\n");
         return;
     }
+    if (argc >= 2 && ui_streq(argv[1], "probe")) {
+        struct irq_gic_probe_snapshot p;
+        irq_gic_probe_snapshot(&p);
+        ui_console_write("irq probe current_driver_id=");
+        ui_console_u32_dec(p.current_driver_id);
+        ui_console_write(" count=");
+        ui_console_u32_dec(p.count);
+        ui_console_write("\nID D_BASE C_BASE D_CTLR D_TYPER D_IIDR C_CTLR C_PMR PLAUSIBLE\n");
+        for (u32 i = 0; i < p.count; i++) {
+            const struct irq_gic_probe_entry *e = &p.entries[i];
+            ui_console_u32_dec(e->id);
+            ui_console_write(" ");
+            ui_console_hex_fixed(e->gicd_base, 16);
+            ui_console_write(" ");
+            ui_console_hex_fixed(e->gicc_base, 16);
+            ui_console_write(" ");
+            ui_console_hex_fixed(e->gicd_ctlr, 8);
+            ui_console_write(" ");
+            ui_console_hex_fixed(e->gicd_typer, 8);
+            ui_console_write(" ");
+            ui_console_hex_fixed(e->gicd_iidr, 8);
+            ui_console_write(" ");
+            ui_console_hex_fixed(e->gicc_ctlr, 8);
+            ui_console_write(" ");
+            ui_console_hex_fixed(e->gicc_pmr, 8);
+            ui_console_write(e->plausible ? " yes\n" : " no\n");
+        }
+        return;
+    }
     if (argc >= 2 && !ui_streq(argv[1], "status")) {
-        ui_console_write("ERR: usage irq status | irq selftest\n");
+        ui_console_write("ERR: usage irq status | irq probe | irq selftest\n");
         return;
     }
     struct irq_diag_snapshot d;
@@ -9450,6 +9518,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("ksvc pause|resume|restart|fault <id>\n  Update lifecycle state metadata for a registered service.\n");
     } else if (ui_streq(topic, "irq")) {
         ui_console_write("irq status\n  Show IRQ counters plus vector/GIC/timer register diagnostics.\n");
+        ui_console_write("irq probe\n  Read plausible GIC distributor/interface windows without enabling IRQ-driven loops.\n");
         ui_console_write("irq selftest\n  Verify diagnostic invariants without enabling IRQ-driven service loops.\n");
     } else if (ui_streq(topic, "abi")) {
         ui_console_write("abi status\n  Show current direct-KPI/ksvc/EL0 transition state.\n");

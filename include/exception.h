@@ -69,6 +69,26 @@ struct irq_hw_diag_snapshot {
     bool irq_masked;
 } PACKED;
 
+#define IRQ_GIC_PROBE_MAX 8U
+
+struct irq_gic_probe_entry {
+    u32 id;
+    u64 gicd_base;
+    u64 gicc_base;
+    u32 gicd_ctlr;
+    u32 gicd_typer;
+    u32 gicd_iidr;
+    u32 gicc_ctlr;
+    u32 gicc_pmr;
+    bool plausible;
+} PACKED;
+
+struct irq_gic_probe_snapshot {
+    u32 count;
+    u32 current_driver_id;
+    struct irq_gic_probe_entry entries[IRQ_GIC_PROBE_MAX];
+} PACKED;
+
 /* Install the exception vector table */
 void exception_init(void);
 
@@ -79,6 +99,7 @@ void irq_register(u32 intid, irq_handler_t handler);
 void irq_dispatch(struct irq_frame *frame);
 void irq_diag_snapshot(struct irq_diag_snapshot *out);
 void irq_hw_diag_snapshot(struct irq_hw_diag_snapshot *out);
+void irq_gic_probe_snapshot(struct irq_gic_probe_snapshot *out);
 bool irq_diag_selftest(void);
 
 NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far);
