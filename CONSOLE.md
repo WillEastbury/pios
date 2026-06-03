@@ -329,6 +329,8 @@ ksvc fault <id>
 
 `ksvc selftest` round-trips a bounded core-local mailbox message and exercises pause/resume/fault/restart lifecycle metadata. Mailboxes are EL1 service-to-service plumbing only in this slice; they do not yet schedule services through indirect callbacks or move them to EL0. Lifecycle controls update service metadata and counters; direct-call services still run in the existing core loop until scheduler-owned callbacks land.
 
+Low-risk services (`debug-console`, `dashboard`, and `tcp-timers`) are scheduler-owned callbacks; core network/TCP/TLS poll ordering remains direct and unchanged.
+
 ## Brotli codec diagnostics
 
 PIOS includes a no-external-dependency Brotli codec library. The encoder emits conservative stored Brotli streams; the decoder supports stored streams plus the compressed subset emitted by PicoWeb's micro-Brotli encoder. Large copies use the kernel SIMD copy path.

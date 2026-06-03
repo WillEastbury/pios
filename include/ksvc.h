@@ -20,6 +20,8 @@
 #define KSVC_STATE_PAUSED     3U
 #define KSVC_STATE_FAULTED    4U
 
+typedef bool (*ksvc_poll_fn_t)(void *ctx);
+
 struct ksvc_snapshot_entry {
     u32 id;
     u32 owner_core;
@@ -53,6 +55,9 @@ struct ksvc_msg {
 
 void ksvc_init_core(void);
 i32  ksvc_register(const char *name, u32 kind, u32 owner_core, u32 priority);
+i32  ksvc_register_poll(const char *name, u32 kind, u32 owner_core, u32 priority,
+                        ksvc_poll_fn_t poll_fn, void *ctx);
+bool ksvc_run(i32 id);
 u64  ksvc_begin(i32 id);
 void ksvc_end(i32 id, u64 start_ticks, bool error);
 void ksvc_mark_error(i32 id);

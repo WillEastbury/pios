@@ -8930,6 +8930,28 @@ static void core0_io_tick_hook(u32 core, u64 tick)
     sev();
 }
 
+static bool ksvc_debug_poll(void *ctx)
+{
+    (void)ctx;
+    debug_tcp_poll();
+    return true;
+}
+
+static bool ksvc_dashboard_poll(void *ctx)
+{
+    (void)ctx;
+    hdmi_dashboard_render();
+    return true;
+}
+
+static bool ksvc_timer_poll(void *ctx)
+{
+    (void)ctx;
+    arp_tick();
+    tcp_tick();
+    return true;
+}
+
 /* Core 0: Kernel services + network */
 NORETURN void core0_main(void) {
     struct core_env *env = core_env_of(CORE_NET);
@@ -8981,9 +9003,7 @@ NORETURN void core0_main(void) {
         svc_start = ksvc_begin(ksvc_tcp_id);
         echo_tcp_poll();
         ksvc_end(ksvc_tcp_id, svc_start, false);
-        svc_start = ksvc_begin(ksvc_debug_id);
-        debug_tcp_poll();
-        ksvc_end(ksvc_debug_id, svc_start, false);
+        ksvc_run(ksvc_debug_id);
 
         svc_start = ksvc_begin(ksvc_ui_id);
         for (u32 i = 0; i < 16; i++) {
@@ -8995,18 +9015,11 @@ NORETURN void core0_main(void) {
 
         ui_handle_keys();
         ksvc_end(ksvc_ui_id, svc_start, false);
-        if (ui_mode == UI_MODE_NONE) {
-            svc_start = ksvc_begin(ksvc_dashboard_id);
-            hdmi_dashboard_render();
-            ksvc_end(ksvc_dashboard_id, svc_start, false);
-        }
+        if (ui_mode == UI_MODE_NONE)
+            ksvc_run(ksvc_dashboard_id);
 
-        if ((env->poll_count & 0x3FFF) == 0) {
-            svc_start = ksvc_begin(ksvc_timer_id);
-            arp_tick();
-            tcp_tick();
-            ksvc_end(ksvc_timer_id, svc_start, false);
-        }
+        if ((env->poll_count & 0x3FFF) == 0)
+            ksvc_run(ksvc_timer_id);
 
         env->poll_count++;
     }
@@ -9704,10 +9717,10 @@ void kernel_main(void) {
     ksvc_init_core();
     ksvc_net_id = ksvc_register("net-poll", KSVC_KIND_POLL | KSVC_KIND_NETWORK, CORE_NET, 100);
     ksvc_tcp_id = ksvc_register("tcp-http-tls", KSVC_KIND_POLL | KSVC_KIND_NETWORK | KSVC_KIND_TLS, CORE_NET, 90);
-    ksvc_debug_id = ksvc_register("debug-console", KSVC_KIND_POLL | KSVC_KIND_CONSOLE, CORE_NET, 50);
+    ksvc_debug_id = ksvc_register_poll("debug-console", KSVC_KIND_POLL | KSVC_KIND_CONSOLE, CORE_NET, 50, ksvc_debug_poll, NULL);
     ksvc_ui_id = ksvc_register("ui-input", KSVC_KIND_POLL | KSVC_KIND_UI, CORE_NET, 40);
-    ksvc_dashboard_id = ksvc_register("dashboard", KSVC_KIND_POLL | KSVC_KIND_UI, CORE_NET, 20);
-    ksvc_timer_id = ksvc_register("tcp-timers", KSVC_KIND_POLL | KSVC_KIND_TIMER | KSVC_KIND_NETWORK, CORE_NET, 80);
+    ksvc_dashboard_id = ksvc_register_poll("dashboard", KSVC_KIND_POLL | KSVC_KIND_UI, CORE_NET, 20, ksvc_dashboard_poll, NULL);
+    ksvc_timer_id = ksvc_register_poll("tcp-timers", KSVC_KIND_POLL | KSVC_KIND_TIMER | KSVC_KIND_NETWORK, CORE_NET, 80, ksvc_timer_poll, NULL);
     bp_log("[core] module_init...");
     module_init();
     bp_ok("[core] env ready");

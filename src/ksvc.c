@@ -23,6 +23,8 @@ struct ksvc_entry {
     u64 mailbox_drops;
     u64 restarts;
     u32 last_error;
+    ksvc_poll_fn_t poll_fn;
+    void *poll_ctx;
     struct ksvc_msg mailbox[KSVC_MBOX_DEPTH];
     char name[32];
 };
@@ -82,6 +84,29 @@ i32 ksvc_register(const char *name, u32 kind, u32 owner_core, u32 priority)
         }
     }
     return -1;
+}
+
+i32 ksvc_register_poll(const char *name, u32 kind, u32 owner_core, u32 priority,
+                       ksvc_poll_fn_t poll_fn, void *ctx)
+{
+    i32 id = ksvc_register(name, kind, owner_core, priority);
+    struct ksvc_entry *e = ksvc_get(id);
+    if (!e) return -1;
+    e->poll_fn = poll_fn;
+    e->poll_ctx = ctx;
+    return id;
+}
+
+bool ksvc_run(i32 id)
+{
+    struct ksvc_entry *e = ksvc_get(id);
+    if (!e || !e->poll_fn) return false;
+    if (e->state == KSVC_STATE_PAUSED || e->state == KSVC_STATE_FAULTED)
+        return false;
+    u64 start = ksvc_begin(id);
+    bool ok = e->poll_fn(e->poll_ctx);
+    ksvc_end(id, start, !ok);
+    return ok;
 }
 
 u64 ksvc_begin(i32 id)
