@@ -70,6 +70,7 @@
 #include "tls.h"
 #include "brotli.h"
 #include "x509.h"
+#include "abi.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -1272,6 +1273,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "ksvc status\n  Show kernel service/plugin registry, core ownership, priorities, and runtime counters.\n");
         } else if (http_streq(topic, "irq")) {
             http_append(out, &len, max, "irq status\n  Show IRQ dispatch counters, last interrupt ID/core, timer IRQ count, and per-core totals.\n");
+        } else if (http_streq(topic, "abi")) {
+            http_append(out, &len, max, "abi status | abi selftest\n  Show kernel/user ABI transition stage, ksvc foundations, and pending EL0/SVC work.\n");
         } else {
             http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls, help brotli\n");
         }
@@ -1562,6 +1565,32 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, d.per_core[i]);
         }
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "abi") || http_streq(cmd, "abi status")) {
+        struct abi_status a;
+        abi_status(&a);
+        http_append(out, &len, max, "abi stage=");
+        http_append(out, &len, max, abi_stage_name(a.stage));
+        http_append(out, &len, max, " direct_kpi=");
+        http_append(out, &len, max, a.direct_kpi ? "yes" : "no");
+        http_append(out, &len, max, " ksvc_registry=");
+        http_append(out, &len, max, a.ksvc_registry ? "yes" : "no");
+        http_append(out, &len, max, " ksvc_mailboxes=");
+        http_append(out, &len, max, a.ksvc_mailboxes ? "yes" : "no");
+        http_append(out, &len, max, " ksvc_callbacks=");
+        http_append(out, &len, max, a.ksvc_callbacks ? "yes" : "no");
+        http_append(out, &len, max, " svc_trap=");
+        http_append(out, &len, max, a.svc_trap_ready ? "ready" : "pending");
+        http_append(out, &len, max, " el0=");
+        http_append(out, &len, max, a.el0_ready ? "ready" : "pending");
+        http_append(out, &len, max, " ttbr_split=");
+        http_append(out, &len, max, a.user_ttbr_split ? "yes" : "no");
+        http_append(out, &len, max, " kapi_size=");
+        http_append_u64(out, &len, max, a.kernel_api_version);
+        http_append(out, &len, max, " pending_steps=");
+        http_append_u64(out, &len, max, a.pending_steps);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "abi selftest")) {
+        http_append(out, &len, max, abi_selftest() ? "ABI selftest OK\n" : "ABI selftest FAILED\n");
     } else if (http_starts_with(cmd, "addr ")) {
         struct pios_addr a;
         char canon[160];
@@ -3534,6 +3563,7 @@ static void ui_cmd_brotli(u32 argc, char **argv);
 static void ui_cmd_x509(u32 argc, char **argv);
 static void ui_cmd_ksvc(u32 argc, char **argv);
 static void ui_cmd_irq(u32 argc, char **argv);
+static void ui_cmd_abi(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -5222,6 +5252,41 @@ static void ui_cmd_irq(u32 argc, char **argv)
         if (i) ui_console_write(",");
         ui_console_u64_dec(d.per_core[i]);
     }
+    ui_console_write("\n");
+}
+
+static void ui_cmd_abi(u32 argc, char **argv)
+{
+    if (argc >= 2 && ui_streq(argv[1], "selftest")) {
+        ui_console_write(abi_selftest() ? "ABI selftest OK\n" : "ABI selftest FAILED\n");
+        return;
+    }
+    if (argc >= 2 && !ui_streq(argv[1], "status")) {
+        ui_console_write("ERR: usage abi status | abi selftest\n");
+        return;
+    }
+    struct abi_status a;
+    abi_status(&a);
+    ui_console_write("abi stage=");
+    ui_console_write(abi_stage_name(a.stage));
+    ui_console_write(" direct_kpi=");
+    ui_console_write(a.direct_kpi ? "yes" : "no");
+    ui_console_write(" ksvc_registry=");
+    ui_console_write(a.ksvc_registry ? "yes" : "no");
+    ui_console_write(" ksvc_mailboxes=");
+    ui_console_write(a.ksvc_mailboxes ? "yes" : "no");
+    ui_console_write(" ksvc_callbacks=");
+    ui_console_write(a.ksvc_callbacks ? "yes" : "no");
+    ui_console_write(" svc_trap=");
+    ui_console_write(a.svc_trap_ready ? "ready" : "pending");
+    ui_console_write(" el0=");
+    ui_console_write(a.el0_ready ? "ready" : "pending");
+    ui_console_write(" ttbr_split=");
+    ui_console_write(a.user_ttbr_split ? "yes" : "no");
+    ui_console_write(" kapi_size=");
+    ui_console_u32_dec(a.kernel_api_version);
+    ui_console_write(" pending_steps=");
+    ui_console_u32_dec(a.pending_steps);
     ui_console_write("\n");
 }
 
@@ -8219,6 +8284,9 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("ksvc pause|resume|restart|fault <id>\n  Update lifecycle state metadata for a registered service.\n");
     } else if (ui_streq(topic, "irq")) {
         ui_console_write("irq status\n  Show IRQ dispatch counters, timer count, last interrupt ID/core, and per-core totals.\n");
+    } else if (ui_streq(topic, "abi")) {
+        ui_console_write("abi status\n  Show current direct-KPI/ksvc/EL0 transition state.\n");
+        ui_console_write("abi selftest\n  Verify ABI transition metadata invariants.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -8597,6 +8665,8 @@ static void ui_console_exec(char *line)
         ui_cmd_ksvc(argc, argv);
     } else if (ui_streq(argv[0], "irq")) {
         ui_cmd_irq(argc, argv);
+    } else if (ui_streq(argv[0], "abi")) {
+        ui_cmd_abi(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "firewall")) {

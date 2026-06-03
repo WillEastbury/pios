@@ -341,6 +341,15 @@ irq status
 
 The status includes total/handled/unhandled/spurious IRQs, timer IRQ count, last interrupt ID/core/tick, and per-core totals.
 
+## Kernel/user ABI transition
+
+PIOS exposes the current user ABI transition state. Today processes still enter through the direct PIKEE/KPI table while ksvc provides EL1 service foundations; SVC trap and full EL0 ABI migration remain pending.
+
+```text
+abi status
+abi selftest
+```
+
 ## Brotli codec diagnostics
 
 PIOS includes a no-external-dependency Brotli codec library. The encoder emits conservative stored Brotli streams; the decoder supports stored streams plus the compressed subset emitted by PicoWeb's micro-Brotli encoder. Large copies use the kernel SIMD copy path.
