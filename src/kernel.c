@@ -1268,7 +1268,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "brotli")) {
             http_append(out, &len, max, "brotli selftest\n  Verify the no-external-dependency Brotli stored encoder and PicoWeb micro-Brotli decoder.\n");
         } else if (http_streq(topic, "x509")) {
-            http_append(out, &len, max, "x509 status | x509 generate [cn] | x509 csr [cn] | x509 bind | x509 import-self | x509 selftest\n  Manage kernel-only X.509 cert/key, CSR, import, and TLS binding state.\n");
+            http_append(out, &len, max, "x509 status | x509 generate [cn] | x509 csr [cn] | x509 p256 [cn] | x509 bind | x509 import-self | x509 selftest\n  Manage kernel-only X.509 cert/key, CSR, import, and TLS binding state.\n");
         } else if (http_streq(topic, "ksvc")) {
             http_append(out, &len, max, "ksvc status\n  Show kernel service/plugin registry, core ownership, priorities, and runtime counters.\n");
         } else if (http_streq(topic, "irq")) {
@@ -1446,6 +1446,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, xs.initialized ? "yes" : "no");
         http_append(out, &len, max, " key=");
         http_append(out, &len, max, xs.has_key ? "yes" : "no");
+        http_append(out, &len, max, " p256_key=");
+        http_append(out, &len, max, xs.has_p256_key ? "yes" : "no");
         http_append(out, &len, max, " cert=");
         http_append(out, &len, max, xs.has_cert ? "yes" : "no");
         http_append(out, &len, max, " tls_bound=");
@@ -1458,10 +1460,15 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, xs.csr_ready ? "yes" : "no");
         http_append(out, &len, max, " csr_len=");
         http_append_u64(out, &len, max, xs.csr_len);
+        http_append(out, &len, max, " csr_alg=");
+        http_append(out, &len, max, xs.csr_alg == X509_CSR_ALG_P256 ? "p256" :
+                    (xs.csr_alg == X509_CSR_ALG_ED25519 ? "ed25519" : "none"));
         http_append(out, &len, max, " generation=");
         http_append_u64(out, &len, max, xs.generation);
         http_append(out, &len, max, " key_fp=");
         http_append_u64(out, &len, max, xs.key_fingerprint);
+        http_append(out, &len, max, " p256_fp=");
+        http_append_u64(out, &len, max, xs.p256_key_fingerprint);
         http_append(out, &len, max, " cert_fp=");
         http_append_u64(out, &len, max, xs.cert_fingerprint);
         http_append(out, &len, max, " error=");
@@ -1479,6 +1486,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         const char *cn = "";
         if (cmd[8] == ' ') cn = cmd + 9;
         http_append(out, &len, max, x509_generate_csr(cn) ? "X509 CSR OK\n" : "X509 CSR FAILED\n");
+    } else if (http_starts_with(cmd, "x509 p256")) {
+        const char *cn = "";
+        if (cmd[9] == ' ') cn = cmd + 10;
+        http_append(out, &len, max, x509_generate_p256_csr(cn) ? "X509 P256 CSR OK\n" : "X509 P256 CSR FAILED\n");
     } else if (http_streq(cmd, "x509 import-self")) {
         u32 cert_len = 0;
         const u8 *cert = x509_certificate_der(&cert_len);
@@ -5124,6 +5135,8 @@ static void ui_print_x509_status(void)
     ui_console_write(xs.initialized ? "yes" : "no");
     ui_console_write(" key=");
     ui_console_write(xs.has_key ? "yes" : "no");
+    ui_console_write(" p256_key=");
+    ui_console_write(xs.has_p256_key ? "yes" : "no");
     ui_console_write(" cert=");
     ui_console_write(xs.has_cert ? "yes" : "no");
     ui_console_write(" tls_bound=");
@@ -5136,10 +5149,15 @@ static void ui_print_x509_status(void)
     ui_console_write(xs.csr_ready ? "yes" : "no");
     ui_console_write(" csr_len=");
     ui_console_u32_dec(xs.csr_len);
+    ui_console_write(" csr_alg=");
+    ui_console_write(xs.csr_alg == X509_CSR_ALG_P256 ? "p256" :
+                     (xs.csr_alg == X509_CSR_ALG_ED25519 ? "ed25519" : "none"));
     ui_console_write(" generation=");
     ui_console_u32_dec(xs.generation);
     ui_console_write(" key_fp=");
     ui_console_hex_fixed(xs.key_fingerprint, 8);
+    ui_console_write(" p256_fp=");
+    ui_console_hex_fixed(xs.p256_key_fingerprint, 8);
     ui_console_write(" cert_fp=");
     ui_console_hex_fixed(xs.cert_fingerprint, 8);
     ui_console_write(" error=");
@@ -5165,6 +5183,12 @@ static void ui_cmd_x509(u32 argc, char **argv)
         ui_print_x509_status();
         return;
     }
+    if (argc >= 2 && ui_streq(argv[1], "p256")) {
+        const char *cn = argc >= 3 ? argv[2] : "";
+        ui_console_write(x509_generate_p256_csr(cn) ? "X509 P256 CSR OK\n" : "X509 P256 CSR FAILED\n");
+        ui_print_x509_status();
+        return;
+    }
     if (argc >= 2 && ui_streq(argv[1], "import-self")) {
         u32 cert_len = 0;
         const u8 *cert = x509_certificate_der(&cert_len);
@@ -5186,7 +5210,7 @@ static void ui_cmd_x509(u32 argc, char **argv)
         ui_print_x509_status();
         return;
     }
-    ui_console_write("ERR: usage x509 status | x509 generate [cn] | x509 csr [cn] | x509 bind | x509 import-self | x509 selftest\n");
+    ui_console_write("ERR: usage x509 status | x509 generate [cn] | x509 csr [cn] | x509 p256 [cn] | x509 bind | x509 import-self | x509 selftest\n");
 }
 
 static void ui_cmd_ksvc(u32 argc, char **argv)
@@ -8310,6 +8334,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("x509 status\n  Show kernel cert/key service state, DER/CSR lengths, and fingerprints.\n");
         ui_console_write("x509 generate [cn]\n  Generate a keystore-backed self-signed Ed25519 DER certificate.\n");
         ui_console_write("x509 csr [cn]\n  Generate a keystore-backed Ed25519 PKCS#10 CSR.\n");
+        ui_console_write("x509 p256 [cn]\n  Generate a keystore-backed ECDSA P-256 PKCS#10 CSR for ACME.\n");
         ui_console_write("x509 bind\n  Mark the generated DER certificate as bound to kernel TLS.\n");
         ui_console_write("x509 import-self\n  Re-import the current DER certificate to exercise the import API.\n");
         ui_console_write("x509 selftest\n  Generate and bind a selftest DER certificate and CSR.\n");

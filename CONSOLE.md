@@ -307,12 +307,13 @@ Console/Web Admin terminal:
 x509 status
 x509 generate [common-name]
 x509 csr [common-name]
+x509 p256 [common-name]
 x509 bind
 x509 import-self
 x509 selftest
 ```
 
-`der_ready=yes` means a signed DER certificate is available in kernel memory. `csr_ready=yes` means a signed PKCS#10 CSR is available in kernel memory for future export/ACME plumbing. `x509 import-self` re-imports the current DER certificate to exercise the bounded import path; real ACME import should pass only the leaf DER certificate, then call `x509 bind` after validation.
+`der_ready=yes` means a signed DER certificate is available in kernel memory. `csr_ready=yes` means a signed PKCS#10 CSR is available in kernel memory for future export/ACME plumbing. `x509 csr` emits the Ed25519 CSR path; `x509 p256` emits the ECDSA P-256/SHA-256 CSR path that ACME CAs such as Let's Encrypt can issue against. `x509 import-self` re-imports the current DER certificate to exercise the bounded import path; real ACME import should pass only the leaf DER certificate, then call `x509 bind` after validation.
 
 ## Kernel service/plugin registry
 
