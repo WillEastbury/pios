@@ -68,6 +68,7 @@
 #include "keystore.h"
 #include "tls.h"
 #include "brotli.h"
+#include "x509.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -1176,6 +1177,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "tls status | tls selftest | tls bridge\n  Show kernel TLS diagnostics, run record-layer selftest, or parse a PicoWeb-style plaintext HTTP bridge sample.\n");
         } else if (http_streq(topic, "brotli")) {
             http_append(out, &len, max, "brotli selftest\n  Verify the no-external-dependency Brotli stored encoder and PicoWeb micro-Brotli decoder.\n");
+        } else if (http_streq(topic, "x509")) {
+            http_append(out, &len, max, "x509 status | x509 generate [cn] | x509 bind | x509 selftest\n  Manage kernel-only X.509 cert/key service foundation and TLS binding state.\n");
         } else {
             http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls, help brotli\n");
         }
@@ -1340,6 +1343,40 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "brotli") || http_streq(cmd, "brotli selftest")) {
         http_append(out, &len, max, brotli_selftest() ? "Brotli selftest OK\n" : "Brotli selftest FAILED\n");
+    } else if (http_streq(cmd, "x509") || http_streq(cmd, "x509 status")) {
+        struct x509_status xs;
+        x509_status(&xs);
+        http_append(out, &len, max, "x509 initialized=");
+        http_append(out, &len, max, xs.initialized ? "yes" : "no");
+        http_append(out, &len, max, " key=");
+        http_append(out, &len, max, xs.has_key ? "yes" : "no");
+        http_append(out, &len, max, " cert=");
+        http_append(out, &len, max, xs.has_cert ? "yes" : "no");
+        http_append(out, &len, max, " tls_bound=");
+        http_append(out, &len, max, xs.tls_bound ? "yes" : "no");
+        http_append(out, &len, max, " der_ready=");
+        http_append(out, &len, max, xs.der_ready ? "yes" : "no");
+        http_append(out, &len, max, " generation=");
+        http_append_u64(out, &len, max, xs.generation);
+        http_append(out, &len, max, " key_fp=");
+        http_append_u64(out, &len, max, xs.key_fingerprint);
+        http_append(out, &len, max, " cert_fp=");
+        http_append_u64(out, &len, max, xs.cert_fingerprint);
+        http_append(out, &len, max, " error=");
+        http_append_u64(out, &len, max, xs.last_error);
+        http_append(out, &len, max, "\nsubject=");
+        http_append(out, &len, max, xs.subject);
+        http_append(out, &len, max, "\nissuer=");
+        http_append(out, &len, max, xs.issuer);
+        http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "x509 generate")) {
+        const char *cn = "";
+        if (cmd[13] == ' ') cn = cmd + 14;
+        http_append(out, &len, max, x509_generate_dev_cert(cn) ? "X509 generate OK\n" : "X509 generate FAILED\n");
+    } else if (http_streq(cmd, "x509 bind")) {
+        http_append(out, &len, max, x509_bind_tls() ? "X509 bind OK\n" : "X509 bind FAILED\n");
+    } else if (http_streq(cmd, "x509 selftest")) {
+        http_append(out, &len, max, x509_selftest() ? "X509 selftest OK\n" : "X509 selftest FAILED\n");
     } else if (http_starts_with(cmd, "addr ")) {
         struct pios_addr a;
         char canon[160];
@@ -3303,6 +3340,7 @@ static void ui_cmd_addr(u32 argc, char **argv);
 static void ui_cmd_keystore(u32 argc, char **argv);
 static void ui_cmd_tls(u32 argc, char **argv);
 static void ui_cmd_brotli(u32 argc, char **argv);
+static void ui_cmd_x509(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -4831,6 +4869,60 @@ static void ui_cmd_brotli(u32 argc, char **argv)
         return;
     }
     ui_console_write("ERR: usage brotli selftest\n");
+}
+
+static void ui_print_x509_status(void)
+{
+    struct x509_status xs;
+    x509_status(&xs);
+    ui_console_write("x509 initialized=");
+    ui_console_write(xs.initialized ? "yes" : "no");
+    ui_console_write(" key=");
+    ui_console_write(xs.has_key ? "yes" : "no");
+    ui_console_write(" cert=");
+    ui_console_write(xs.has_cert ? "yes" : "no");
+    ui_console_write(" tls_bound=");
+    ui_console_write(xs.tls_bound ? "yes" : "no");
+    ui_console_write(" der_ready=");
+    ui_console_write(xs.der_ready ? "yes" : "no");
+    ui_console_write(" generation=");
+    ui_console_u32_dec(xs.generation);
+    ui_console_write(" key_fp=");
+    ui_console_hex_fixed(xs.key_fingerprint, 8);
+    ui_console_write(" cert_fp=");
+    ui_console_hex_fixed(xs.cert_fingerprint, 8);
+    ui_console_write(" error=");
+    ui_console_u32_dec(xs.last_error);
+    ui_console_write("\nsubject=");
+    ui_console_write(xs.subject);
+    ui_console_write("\nissuer=");
+    ui_console_write(xs.issuer);
+    ui_console_write("\n");
+}
+
+static void ui_cmd_x509(u32 argc, char **argv)
+{
+    if (argc >= 2 && ui_streq(argv[1], "generate")) {
+        const char *cn = argc >= 3 ? argv[2] : "PIOS kernel dev";
+        ui_console_write(x509_generate_dev_cert(cn) ? "X509 generate OK\n" : "X509 generate FAILED\n");
+        ui_print_x509_status();
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "bind")) {
+        ui_console_write(x509_bind_tls() ? "X509 bind OK\n" : "X509 bind FAILED\n");
+        ui_print_x509_status();
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "selftest")) {
+        ui_console_write(x509_selftest() ? "X509 selftest OK\n" : "X509 selftest FAILED\n");
+        ui_print_x509_status();
+        return;
+    }
+    if (argc < 2 || ui_streq(argv[1], "status")) {
+        ui_print_x509_status();
+        return;
+    }
+    ui_console_write("ERR: usage x509 status | x509 generate [cn] | x509 bind | x509 selftest\n");
 }
 
 static void ui_console_print_netstat(void)
@@ -7816,6 +7908,11 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("tls bridge\n  Parse a sample plaintext HTTP request through the PicoWeb-style TLS bridge boundary.\n");
     } else if (ui_streq(topic, "brotli")) {
         ui_console_write("brotli selftest\n  Verify PIOS Brotli stored encoder and PicoWeb micro-Brotli decoder.\n");
+    } else if (ui_streq(topic, "x509")) {
+        ui_console_write("x509 status\n  Show kernel cert/key service state and fingerprints.\n");
+        ui_console_write("x509 generate [cn]\n  Generate a keystore-backed development certificate descriptor.\n");
+        ui_console_write("x509 bind\n  Mark the generated cert descriptor as bound to kernel TLS.\n");
+        ui_console_write("x509 selftest\n  Generate and bind a selftest descriptor.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -8188,6 +8285,8 @@ static void ui_console_exec(char *line)
         ui_cmd_tls(argc, argv);
     } else if (ui_streq(argv[0], "brotli")) {
         ui_cmd_brotli(argc, argv);
+    } else if (ui_streq(argv[0], "x509")) {
+        ui_cmd_x509(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "firewall")) {
@@ -9344,10 +9443,18 @@ void kernel_main(void) {
         if (walfs_ok) bp_ok("[fs] SD + WALFS online");
         else bp_warn("[fs] SD ok, WALFS failed");
         bp_log("[key] keystore_init...");
-        if (keystore_init())
+        if (keystore_init()) {
             bp_ok("[key] sealed root ready");
-        else
+            bp_log("[x509] x509_init...");
+            x509_init();
+            if (x509_generate_dev_cert("PIOS kernel dev") && x509_bind_tls())
+                bp_ok("[x509] dev certificate descriptor ready");
+            else
+                bp_warn("[x509] dev certificate descriptor unavailable");
+        } else {
             bp_warn("[key] keystore unavailable");
+            x509_init();
+        }
         bp_done(4, sd_ok);
     }
 

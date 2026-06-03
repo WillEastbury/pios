@@ -297,6 +297,21 @@ tls bridge
 
 PIOS also listens on TCP port `443` as `kernel/tls443` and serves a fixed plaintext HTTP test response inside the current kernel TLS-style record wrapper. This is the kernel TLS boundary test path; browser-compatible X.509/ACME HTTPS is tracked separately.
 
+## Kernel X.509 certificate service
+
+PIOS has a kernel-only X.509 service foundation for certificate/key lifecycle work. It derives private key seed material from the sealed keystore and exposes only non-secret fingerprints. The current implementation generates a development certificate descriptor and TLS binding state; DER certificate generation/signing remains pending before browser-compatible HTTPS.
+
+Console/Web Admin terminal:
+
+```text
+x509 status
+x509 generate [common-name]
+x509 bind
+x509 selftest
+```
+
+`der_ready=no` means the service has key/cert identity state but not a signed ASN.1 DER X.509 certificate yet.
+
 ## Brotli codec diagnostics
 
 PIOS includes a no-external-dependency Brotli codec library. The encoder emits conservative stored Brotli streams; the decoder supports stored streams plus the compressed subset emitted by PicoWeb's micro-Brotli encoder. Large copies use the kernel SIMD copy path.
