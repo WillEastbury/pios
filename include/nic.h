@@ -77,6 +77,10 @@ void nic_record_rate_limited(void);
 #define NIC_FILTER_UDP_PORT_FROM (1U << 9)
 #define NIC_FILTER_IP_TO_RANGE   (1U << 10)
 #define NIC_FILTER_IP_FROM_RANGE (1U << 11)
+#define NIC_FILTER_TCP_PORT_TO_RANGE   (1U << 12)
+#define NIC_FILTER_TCP_PORT_FROM_RANGE (1U << 13)
+#define NIC_FILTER_UDP_PORT_TO_RANGE   (1U << 14)
+#define NIC_FILTER_UDP_PORT_FROM_RANGE (1U << 15)
 
 typedef struct {
     u32 flags;
@@ -97,6 +101,10 @@ typedef struct {
     u16 tcp_port_from;
     u16 udp_port_to;
     u16 udp_port_from;
+    u16 tcp_port_to_end;
+    u16 tcp_port_from_end;
+    u16 udp_port_to_end;
+    u16 udp_port_from_end;
 } nic_filter_rule_t;
 
 void nic_filter_clear(void);

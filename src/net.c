@@ -149,6 +149,33 @@ void net_firewall_install_defaults(void) {
     rule.tcp_port_to = 2323;
     (void)nic_filter_add(&rule);
 
+    /* Replies to outbound TCP clients target our ephemeral source ports.
+     * The NIC firewall is stateless, so allow the client port range while
+     * keeping privileged inbound services deny-by-default. */
+    simd_zero(&rule, sizeof(rule));
+    rule.direction = NIC_FILTER_DIR_IN;
+    rule.action = NIC_FILTER_ALLOW;
+    rule.flags = NIC_FILTER_ETHERTYPE | NIC_FILTER_IP_TO |
+                 NIC_FILTER_IP_PROTO | NIC_FILTER_TCP_PORT_TO_RANGE;
+    rule.ethertype = ETH_P_IP;
+    rule.ip_to = our_ip;
+    rule.ip_proto = IP_PROTO_TCP;
+    rule.tcp_port_to = 49152;
+    rule.tcp_port_to_end = 65535;
+    (void)nic_filter_add(&rule);
+
+    simd_zero(&rule, sizeof(rule));
+    rule.direction = NIC_FILTER_DIR_IN;
+    rule.action = NIC_FILTER_ALLOW;
+    rule.flags = NIC_FILTER_ETHERTYPE | NIC_FILTER_IP_TO |
+                 NIC_FILTER_IP_PROTO | NIC_FILTER_UDP_PORT_TO_RANGE;
+    rule.ethertype = ETH_P_IP;
+    rule.ip_to = our_ip;
+    rule.ip_proto = IP_PROTO_UDP;
+    rule.udp_port_to = 49152;
+    rule.udp_port_to_end = 65535;
+    (void)nic_filter_add(&rule);
+
     simd_zero(&rule, sizeof(rule));
     rule.direction = NIC_FILTER_DIR_IN;
     rule.action = NIC_FILTER_ALLOW;
@@ -470,6 +497,14 @@ static bool resolve_mac(u32 dst_ip, const u8 **mac_out) {
 
     stats.drop_no_neighbor++;
     return false;
+}
+
+const u8 *net_resolve_mac(u32 dst_ip)
+{
+    const u8 *mac = NULL;
+    if (!resolve_mac(dst_ip, &mac))
+        return NULL;
+    return mac;
 }
 
 bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,

@@ -93,6 +93,10 @@ void net_firewall_install_defaults(void);
 /* Add a static neighbor (IP → MAC mapping). No ARP. */
 void net_add_neighbor(u32 ip, const u8 *mac);
 
+/* Resolve destination IP to next-hop Ethernet MAC using route/gateway policy,
+ * static neighbors, and dynamic ARP. Returns NULL while ARP is unresolved. */
+const u8 *net_resolve_mac(u32 dst_ip);
+
 /* Join/leave an Ethernet multicast destination MAC. Frames for multicast
  * groups not in this table are dropped before protocol dispatch. */
 bool net_join_multicast_mac(const u8 *mac);

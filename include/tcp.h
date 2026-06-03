@@ -114,6 +114,9 @@ typedef struct {
     u64 pending_queued;
     u64 pending_full;
     u64 accepted;
+    u64 tx_segments;
+    u64 tx_no_mac;
+    u64 tx_send_fail;
 } tcp_diag_t;
 
 const tcp_diag_t *tcp_diag(void);

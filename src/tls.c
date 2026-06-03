@@ -1,6 +1,7 @@
 #include "tls.h"
 #include "crypto.h"
 #include "keystore.h"
+#include "net.h"
 #include "principal.h"
 #include "simd.h"
 #include "timer.h"
@@ -81,6 +82,8 @@ static bool tcp_write_all(tcp_conn_t tcp, const u8 *buf, u32 len) {
             off += n;
             continue;
         }
+        net_poll();
+        timer_delay_ms(1);
         if ((timer_ticks() - start) > TLS_IO_TIMEOUT)
             return false;
     }
@@ -97,6 +100,8 @@ static bool tcp_read_all(tcp_conn_t tcp, u8 *buf, u32 len) {
             off += n;
             continue;
         }
+        net_poll();
+        timer_delay_ms(1);
         if ((timer_ticks() - start) > TLS_IO_TIMEOUT)
             return false;
     }

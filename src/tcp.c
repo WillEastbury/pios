@@ -13,7 +13,6 @@
 #include "tcp.h"
 #include "net.h"
 #include "nic.h"
-#include "arp.h"
 #include "dma.h"
 #include "simd.h"
 #include "uart.h"
@@ -460,8 +459,11 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     if (data_len > 2048 - 54) return;
 
     /* Resolve destination MAC */
-    const u8 *dst_mac = arp_resolve(t->remote_ip);
-    if (unlikely(!dst_mac)) return;
+    const u8 *dst_mac = net_resolve_mac(t->remote_ip);
+    if (unlikely(!dst_mac)) {
+        tcp_diag_counts.tx_no_mac++;
+        return;
+    }
 
     u16 tcp_len = TCP_HDR_SIZE + data_len;
     u16 ip_total = IP_HDR_SIZE + tcp_len;
@@ -513,15 +515,18 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     }
 
     if (data_len == 0) {
-        nic_send(tx_frame, frame_len);
+        tcp_diag_counts.tx_segments++;
+        if (!nic_send(tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
         return;
     }
     if (need_pad) {
         tcp_memcpy_accel(tx_frame + TCP_OVERHEAD, data, data_len);
-        nic_send(tx_frame, frame_len);
+        tcp_diag_counts.tx_segments++;
+        if (!nic_send(tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
         return;
     }
-    nic_send_parts(tx_frame, TCP_OVERHEAD, data, data_len);
+    tcp_diag_counts.tx_segments++;
+    if (!nic_send_parts(tx_frame, TCP_OVERHEAD, data, data_len)) tcp_diag_counts.tx_send_fail++;
 }
 
 static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
@@ -529,8 +534,11 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
     /* Guard against u16 overflow: max frame 2048 minus IP+TCP headers */
     if (data_len > 2048 - 54) return;
 
-    const u8 *dst_mac = arp_resolve(t->remote_ip);
-    if (unlikely(!dst_mac)) return;
+    const u8 *dst_mac = net_resolve_mac(t->remote_ip);
+    if (unlikely(!dst_mac)) {
+        tcp_diag_counts.tx_no_mac++;
+        return;
+    }
 
     u16 tcp_len = TCP_HDR_SIZE + data_len;
     u16 ip_total = IP_HDR_SIZE + tcp_len;
@@ -573,7 +581,8 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
     if (data_len == 0) {
         if (!tx_offload_window)
             tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
-        nic_send(tx_frame, frame_len);
+        tcp_diag_counts.tx_segments++;
+        if (!nic_send(tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
         return;
     }
 
@@ -583,21 +592,23 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
         if (!tx_offload_window)
             tcp->checksum = tcp_checksum_split(t->local_ip, t->remote_ip,
                                                tcp, TCP_HDR_SIZE, lin, data_len);
-        nic_send_parts(tx_frame, TCP_OVERHEAD, lin, data_len);
+        tcp_diag_counts.tx_segments++;
+        if (!nic_send_parts(tx_frame, TCP_OVERHEAD, lin, data_len)) tcp_diag_counts.tx_send_fail++;
         return;
     }
 
     ring_copy_from_offset(&t->tx_buf, tx_off, tx_frame + TCP_OVERHEAD, data_len);
     if (!tx_offload_window)
         tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
-    nic_send(tx_frame, frame_len);
+    tcp_diag_counts.tx_segments++;
+    if (!nic_send(tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
 }
 
 /* Send a raw RST/ACK without a TCB (for rejecting unexpected segments) */
 static void tcp_send_rst(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port,
                          u32 seq, u32 ack) {
-    const u8 *dst_mac = arp_resolve(dst_ip);
-    if (!dst_mac) return;
+    const u8 *dst_mac = net_resolve_mac(dst_ip);
+    if (!dst_mac) { tcp_diag_counts.tx_no_mac++; return; }
 
     u16 ip_total = IP_HDR_SIZE + TCP_HDR_SIZE;
     u32 frame_len = ETH_HDR_SIZE + ip_total;
@@ -634,15 +645,16 @@ static void tcp_send_rst(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port,
     tcp->checksum = tcp_checksum(src_ip, dst_ip, tcp, TCP_HDR_SIZE);
 
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
-    nic_send(tx_frame, frame_len);
+    tcp_diag_counts.tx_segments++;
+    if (!nic_send(tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
 }
 
 /* Send a SYN-ACK with SYN cookie ISN (no TCB needed) */
 static void tcp_send_synack_cookie(u32 remote_ip, u16 remote_port,
                                    u16 local_port, u32 their_seq,
                                    u32 cookie_isn) {
-    const u8 *dst_mac = arp_resolve(remote_ip);
-    if (!dst_mac) return;
+    const u8 *dst_mac = net_resolve_mac(remote_ip);
+    if (!dst_mac) { tcp_diag_counts.tx_no_mac++; return; }
 
     u16 ip_total = IP_HDR_SIZE + TCP_HDR_SIZE;
     u32 frame_len = ETH_HDR_SIZE + ip_total;
@@ -679,9 +691,11 @@ static void tcp_send_synack_cookie(u32 remote_ip, u16 remote_port,
     tcp->checksum = tcp_checksum(tcp_local_ip, remote_ip, tcp, TCP_HDR_SIZE);
 
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
+    tcp_diag_counts.tx_segments++;
     if (nic_send(tx_frame, frame_len))
         tcp_diag_counts.synack_sent++;
     else {
+        tcp_diag_counts.tx_send_fail++;
 #if TCP_UART_DIAG_VERBOSE
         uart_puts("[tcp] SYNACK nic_send failed\n");
 #endif

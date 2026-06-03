@@ -271,6 +271,18 @@ static bool filter_rule_matches(const nic_filter_rule_t *rule, const struct filt
         return false;
     if ((rule->flags & NIC_FILTER_UDP_PORT_FROM) && (!pkt->has_udp || pkt->port_from != rule->udp_port_from))
         return false;
+    if ((rule->flags & NIC_FILTER_TCP_PORT_TO_RANGE) &&
+        (!pkt->has_tcp || pkt->port_to < rule->tcp_port_to || pkt->port_to > rule->tcp_port_to_end))
+        return false;
+    if ((rule->flags & NIC_FILTER_TCP_PORT_FROM_RANGE) &&
+        (!pkt->has_tcp || pkt->port_from < rule->tcp_port_from || pkt->port_from > rule->tcp_port_from_end))
+        return false;
+    if ((rule->flags & NIC_FILTER_UDP_PORT_TO_RANGE) &&
+        (!pkt->has_udp || pkt->port_to < rule->udp_port_to || pkt->port_to > rule->udp_port_to_end))
+        return false;
+    if ((rule->flags & NIC_FILTER_UDP_PORT_FROM_RANGE) &&
+        (!pkt->has_udp || pkt->port_from < rule->udp_port_from || pkt->port_from > rule->udp_port_from_end))
+        return false;
     return true;
 }
 

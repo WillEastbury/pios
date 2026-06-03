@@ -586,17 +586,41 @@ static void http_append_firewall_list(char *out, u32 *len, u32 max)
             http_append(out, len, max, " tcp_dport=");
             http_append_u64(out, len, max, r.tcp_port_to);
         }
+        if (r.flags & NIC_FILTER_TCP_PORT_TO_RANGE) {
+            http_append(out, len, max, " tcp_dport=");
+            http_append_u64(out, len, max, r.tcp_port_to);
+            http_append(out, len, max, "-");
+            http_append_u64(out, len, max, r.tcp_port_to_end);
+        }
         if (r.flags & NIC_FILTER_TCP_PORT_FROM) {
             http_append(out, len, max, " tcp_sport=");
             http_append_u64(out, len, max, r.tcp_port_from);
+        }
+        if (r.flags & NIC_FILTER_TCP_PORT_FROM_RANGE) {
+            http_append(out, len, max, " tcp_sport=");
+            http_append_u64(out, len, max, r.tcp_port_from);
+            http_append(out, len, max, "-");
+            http_append_u64(out, len, max, r.tcp_port_from_end);
         }
         if (r.flags & NIC_FILTER_UDP_PORT_TO) {
             http_append(out, len, max, " udp_dport=");
             http_append_u64(out, len, max, r.udp_port_to);
         }
+        if (r.flags & NIC_FILTER_UDP_PORT_TO_RANGE) {
+            http_append(out, len, max, " udp_dport=");
+            http_append_u64(out, len, max, r.udp_port_to);
+            http_append(out, len, max, "-");
+            http_append_u64(out, len, max, r.udp_port_to_end);
+        }
         if (r.flags & NIC_FILTER_UDP_PORT_FROM) {
             http_append(out, len, max, " udp_sport=");
             http_append_u64(out, len, max, r.udp_port_from);
+        }
+        if (r.flags & NIC_FILTER_UDP_PORT_FROM_RANGE) {
+            http_append(out, len, max, " udp_sport=");
+            http_append_u64(out, len, max, r.udp_port_from);
+            http_append(out, len, max, "-");
+            http_append_u64(out, len, max, r.udp_port_from_end);
         }
         http_append(out, len, max, "\n");
     }
@@ -1220,6 +1244,15 @@ static u32 http_split_args(char *line, char **argv, u32 max_args)
     return argc;
 }
 
+static void http_append_sanitized_bytes(char *out, u32 *len, u32 max, const u8 *data, u32 n);
+static bool ui_http_fetch(bool use_tls, u32 dst_ip, u16 port,
+                          const char *host, const char *path,
+                          u32 timeout_ms, u8 *out, u32 out_max,
+                          u32 *out_len, const char **err);
+static bool ui_http_client_parse_common(u32 argc, char **argv, bool use_tls,
+                                        u32 *ip, u16 *port, const char **path,
+                                        u32 *timeout_ms);
+
 static bool http_parse_db_ref(u32 argc, char **argv, u32 start, u32 *card_out, u32 *rec_out, u32 *next_arg)
 {
     if (!argv || !card_out || !rec_out || !next_arg || start >= argc)
@@ -1272,6 +1305,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "processes\n  Show process snapshot with PPID, arena/span telemetry, and process graph roots/children.\n");
         } else if (http_streq(topic, "netstat")) {
             http_append(out, &len, max, "netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
+        } else if (http_streq(topic, "http") || http_streq(topic, "https")) {
+            http_append(out, &len, max, "http get <ip> [path] [port] [timeout_ms]\nhttps get <ip> [path] [port] [timeout_ms]\n  Console-mode HTTP client; https targets the PIOS kernel TLS-wrapper endpoint.\n");
         } else if (http_streq(topic, "firewall")) {
             http_append(out, &len, max, "firewall list\n  List firewall rules.\nMutations are available from UART/TCP console.\n");
         } else if (http_streq(topic, "reboot")) {
@@ -1326,6 +1361,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "netstat")) {
         const tcp_diag_t *td = tcp_diag();
+        const arp_stats_t *ad = arp_get_stats();
         tcp_snapshot_entry_t snap[TCP_MAX_CONNECTIONS];
         u32 n = tcp_snapshot(snap, TCP_MAX_CONNECTIONS);
         u64 rx_drop = 0, tx_drop = 0;
@@ -1366,11 +1402,50 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, td->synack_sent);
         http_append(out, &len, max, " accepted=");
         http_append_u64(out, &len, max, td->accepted);
+        http_append(out, &len, max, " txseg=");
+        http_append_u64(out, &len, max, td->tx_segments);
+        http_append(out, &len, max, " tx_nomac=");
+        http_append_u64(out, &len, max, td->tx_no_mac);
+        http_append(out, &len, max, " tx_fail=");
+        http_append_u64(out, &len, max, td->tx_send_fail);
+        http_append(out, &len, max, " arp_req=");
+        http_append_u64(out, &len, max, ad ? ad->requests_sent : 0);
+        http_append(out, &len, max, " arp_learn=");
+        http_append_u64(out, &len, max, ad ? ad->learned : 0);
+        http_append(out, &len, max, " arp_spoof=");
+        http_append_u64(out, &len, max, ad ? ad->drop_spoof : 0);
         http_append(out, &len, max, " fw_rx_drop=");
         http_append_u64(out, &len, max, rx_drop);
         http_append(out, &len, max, " fw_tx_drop=");
         http_append_u64(out, &len, max, tx_drop);
         http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "http get ") || http_starts_with(cmd, "https get ")) {
+        bool use_tls = http_starts_with(cmd, "https ");
+        char line[160];
+        char *argv[8];
+        u32 p = 0;
+        while (cmd[p] && p + 1 < sizeof(line)) { line[p] = cmd[p]; p++; }
+        line[p] = 0;
+        u32 argc = http_split_args(line, argv, 8);
+        u32 ip = 0;
+        u16 port = 0;
+        u32 timeout_ms = 0;
+        const char *path = NULL;
+        u8 body[2048];
+        u32 body_len = 0;
+        const char *err = NULL;
+        if (!ui_http_client_parse_common(argc, argv, use_tls, &ip, &port, &path, &timeout_ms)) {
+            http_append(out, &len, max, use_tls ?
+                "ERR: usage https get <ip> [path] [port] [timeout_ms]\n" :
+                "ERR: usage http get <ip> [path] [port] [timeout_ms]\n");
+        } else if (!ui_http_fetch(use_tls, ip, port, argv[2], path, timeout_ms,
+                                  body, sizeof(body), &body_len, &err)) {
+            http_append(out, &len, max, "ERR: ");
+            http_append(out, &len, max, err ? err : "request failed");
+            http_append(out, &len, max, "\n");
+        } else {
+            http_append_sanitized_bytes(out, &len, max, body, body_len);
+        }
     } else if (http_streq(cmd, "dma") || http_streq(cmd, "dma status")) {
         struct dma_diag_snapshot d;
         dma_diag_snapshot(&d);
@@ -7250,6 +7325,178 @@ static void ui_stream_emit(const u8 *data, u32 len, bool to_file, const char *pa
         ui_console_write("OK: output saved\n");
 }
 
+static void http_append_sanitized_bytes(char *out, u32 *len, u32 max, const u8 *data, u32 n)
+{
+    if (!data) return;
+    for (u32 i = 0; i < n; i++) {
+        char c = (char)data[i];
+        if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') c = '.';
+        char s[2] = { c, 0 };
+        http_append(out, len, max, s);
+    }
+}
+
+static bool ui_tcp_wait_established(tcp_conn_t c, u32 timeout_ms)
+{
+    for (u32 t = 0; t < timeout_ms; t++) {
+        net_poll();
+        u32 st = tcp_state(c);
+        if (st == TCP_ESTABLISHED) return true;
+        if (st == TCP_CLOSED) return false;
+        timer_delay_ms(1);
+    }
+    return false;
+}
+
+static bool ui_tcp_write_all(tcp_conn_t c, const u8 *data, u32 len, u32 timeout_ms)
+{
+    u32 off = 0;
+    u32 idle = 0;
+    while (off < len && idle < timeout_ms) {
+        u32 n = tcp_write(c, data + off, len - off);
+        if (n > 0) {
+            off += n;
+            idle = 0;
+        } else {
+            idle++;
+            timer_delay_ms(1);
+        }
+        net_poll();
+    }
+    return off == len;
+}
+
+static bool ui_http_fetch(bool use_tls, u32 dst_ip, u16 port,
+                          const char *host, const char *path,
+                          u32 timeout_ms, u8 *out, u32 out_max,
+                          u32 *out_len, const char **err)
+{
+    char req[384];
+    u32 req_len = 0;
+    tcp_conn_t c;
+    if (out_len) *out_len = 0;
+    if (err) *err = NULL;
+    if (!out || out_max == 0 || !host || !path || !path[0]) {
+        if (err) *err = "bad args";
+        return false;
+    }
+
+    http_append(req, &req_len, sizeof(req), "GET ");
+    http_append(req, &req_len, sizeof(req), path);
+    http_append(req, &req_len, sizeof(req), " HTTP/1.0\r\nHost: ");
+    http_append(req, &req_len, sizeof(req), host);
+    http_append(req, &req_len, sizeof(req), "\r\nConnection: close\r\n\r\n");
+
+    c = tcp_connect(dst_ip, port);
+    if (c < 0) {
+        if (err) *err = "tcp connect failed";
+        return false;
+    }
+    if (!ui_tcp_wait_established(c, timeout_ms)) {
+        tcp_close(c);
+        if (err) *err = "tcp connect timeout";
+        return false;
+    }
+
+    if (use_tls) {
+        tls_conn_t tc = tls_connect(c);
+        if (tc < 0) {
+            tcp_close(c);
+            if (err) *err = "tls handshake failed";
+            return false;
+        }
+        if (tls_write(tc, req, req_len) < 0) {
+            tls_close(tc);
+            if (err) *err = "tls write failed";
+            return false;
+        }
+        i32 n = tls_read(tc, out, out_max);
+        tls_close(tc);
+        if (n < 0) {
+            if (err) *err = "tls read failed";
+            return false;
+        }
+        if (out_len) *out_len = (u32)n;
+        return true;
+    }
+
+    if (!ui_tcp_write_all(c, (const u8 *)req, req_len, timeout_ms)) {
+        tcp_close(c);
+        if (err) *err = "tcp write timeout";
+        return false;
+    }
+
+    u32 nout = 0;
+    u32 idle = 0;
+    while (idle < timeout_ms && nout < out_max) {
+        net_poll();
+        u32 avail = tcp_readable(c);
+        if (avail > 0) {
+            u32 want = out_max - nout;
+            if (want > avail) want = avail;
+            u32 n = tcp_read(c, out + nout, want);
+            nout += n;
+            idle = 0;
+        } else {
+            u32 st = tcp_state(c);
+            if (st == TCP_CLOSED || st >= TCP_CLOSING) break;
+            idle++;
+            timer_delay_ms(1);
+        }
+    }
+    tcp_close(c);
+    if (out_len) *out_len = nout;
+    return true;
+}
+
+static bool ui_http_client_parse_common(u32 argc, char **argv, bool use_tls,
+                                        u32 *ip, u16 *port, const char **path,
+                                        u32 *timeout_ms)
+{
+    u32 p = use_tls ? 443U : 80U;
+    u32 to = 3000U;
+    if (argc < 3 || !ui_streq(argv[1], "get"))
+        return false;
+    if (!ui_parse_ip4(argv[2], ip))
+        return false;
+    *path = (argc >= 4) ? argv[3] : "/";
+    if ((*path)[0] != '/')
+        return false;
+    if (argc >= 5 && (!ui_parse_u32(argv[4], &p) || p > 65535U))
+        return false;
+    if (argc >= 6 && (!ui_parse_u32(argv[5], &to) || to == 0 || to > 30000U))
+        return false;
+    *port = (u16)p;
+    *timeout_ms = to;
+    return true;
+}
+
+static void ui_cmd_http_client(u32 argc, char **argv, bool use_tls)
+{
+    u32 ip = 0;
+    u16 port = 0;
+    u32 timeout_ms = 0;
+    const char *path = NULL;
+    u8 out[UI_STREAM_OUT_MAX];
+    u32 out_len = 0;
+    const char *err = NULL;
+
+    if (!ui_http_client_parse_common(argc, argv, use_tls, &ip, &port, &path, &timeout_ms)) {
+        ui_console_write(use_tls ?
+            "ERR: usage https get <ip> [path] [port] [timeout_ms]\n" :
+            "ERR: usage http get <ip> [path] [port] [timeout_ms]\n");
+        return;
+    }
+    if (!ui_http_fetch(use_tls, ip, port, argv[2], path, timeout_ms,
+                       out, sizeof(out), &out_len, &err)) {
+        ui_console_write("ERR: ");
+        ui_console_write(err ? err : "request failed");
+        ui_console_write("\n");
+        return;
+    }
+    ui_stream_emit(out, out_len, false, NULL);
+}
+
 static void ui_cmd_stream(u32 argc, char **argv)
 {
     if (argc < 8 || !ui_streq(argv[4], "from")) {
@@ -8562,6 +8809,9 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("launch <path> [1|2|3] [lazy|low|normal|high|realtime]\n  Launch executable on a core.\n");
     } else if (ui_streq(topic, "netstat")) {
         ui_console_write("netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
+    } else if (ui_streq(topic, "http") || ui_streq(topic, "https")) {
+        ui_console_write("http get <ip> [path] [port] [timeout_ms]\n  Fetch plaintext HTTP over TCP.\n");
+        ui_console_write("https get <ip> [path] [port] [timeout_ms]\n  Fetch through the PIOS kernel TLS-wrapper endpoint, not browser HTTPS.\n");
     } else if (ui_streq(topic, "firewall")) {
         ui_console_write("firewall list\n  List rules.\n");
         ui_console_write("firewall reset\n  Restore inbound deny/outbound allow defaults plus service allows.\n");
@@ -8626,6 +8876,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d>\nnetcfg apply\nnetcfg dhcp <on|off> [timeout_ms]\nnetcfg addnbr <ip> <mac>\n");
     } else if (ui_streq(topic, "stream")) {
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
+        ui_console_write("http get <ip> [path] [port] [timeout_ms]\nhttps get <ip> [path] [port] [timeout_ms]\n");
     } else if (ui_streq(topic, "svc")) {
         ui_console_write("svc add <name> <path> [dep|-] [target] [1|2|3] [priority] [principal] [restart] [max] [backoff]\n");
         ui_console_write("svc start|stop|restart <name> | svc run|pause | svc target <default|rescue|all> | svc list | svc clear\n");
@@ -8698,6 +8949,7 @@ static void ui_console_exec(char *line)
             ui_console_write("  firewall list|reset|clear|remove <idx>|default in <allow|deny> out <allow|deny>\n");
             ui_console_write("  firewall allow|deny <in|out|both> <tcp|udp|icmp|ip|arp> [port N] [src SPEC] [dst SPEC]\n");
             ui_console_write("  stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
+            ui_console_write("  http get <ip> [path] [port] [timeout_ms] | https get <ip> [path] [port] [timeout_ms]\n");
             ui_console_write("  TCP debug console: port 2323, then 'unlock pios'\n");
         } else if (ui_streq(argv[1], "svc")) {
             ui_console_write("Service/script commands:\n");
@@ -8792,6 +9044,10 @@ static void ui_console_exec(char *line)
         ui_cmd_addr(argc, argv);
     } else if (ui_streq(argv[0], "netstat")) {
         ui_console_print_netstat();
+    } else if (ui_streq(argv[0], "http")) {
+        ui_cmd_http_client(argc, argv, false);
+    } else if (ui_streq(argv[0], "https")) {
+        ui_cmd_http_client(argc, argv, true);
     } else if (ui_streq(argv[0], "ps")) {
         ui_console_print_ps();
     } else if (ui_streq(argv[0], "kill")) {
