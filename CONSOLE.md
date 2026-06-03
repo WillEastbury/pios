@@ -299,7 +299,7 @@ PIOS also listens on TCP port `443` as `kernel/tls443` and serves a fixed plaint
 
 ## Kernel X.509 certificate service
 
-PIOS has a kernel-only X.509 service foundation for certificate/key lifecycle work. It derives private key seed material from the sealed keystore and exposes only non-secret fingerprints. The current implementation generates a development certificate descriptor and TLS binding state; DER certificate generation/signing remains pending before browser-compatible HTTPS.
+PIOS has a kernel-only X.509 service foundation for certificate/key lifecycle work. It derives Ed25519 private key seed material from the sealed keystore, keeps private material kernel-only, and exposes only non-secret fingerprints. The current implementation generates a self-signed ASN.1 DER X.509 certificate and TLS binding state; CSR/import and ACME chain issuance remain pending before browser-compatible HTTPS.
 
 Console/Web Admin terminal:
 
@@ -310,7 +310,7 @@ x509 bind
 x509 selftest
 ```
 
-`der_ready=no` means the service has key/cert identity state but not a signed ASN.1 DER X.509 certificate yet.
+`der_ready=yes` means a signed DER certificate is available in kernel memory. The current certificate is self-signed for development; ACME/chain issuance still depends on the CSR API and TLS integration follow-ups.
 
 ## Kernel service/plugin registry
 

@@ -1452,6 +1452,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, xs.tls_bound ? "yes" : "no");
         http_append(out, &len, max, " der_ready=");
         http_append(out, &len, max, xs.der_ready ? "yes" : "no");
+        http_append(out, &len, max, " der_len=");
+        http_append_u64(out, &len, max, xs.der_len);
         http_append(out, &len, max, " generation=");
         http_append_u64(out, &len, max, xs.generation);
         http_append(out, &len, max, " key_fp=");
@@ -5116,6 +5118,8 @@ static void ui_print_x509_status(void)
     ui_console_write(xs.tls_bound ? "yes" : "no");
     ui_console_write(" der_ready=");
     ui_console_write(xs.der_ready ? "yes" : "no");
+    ui_console_write(" der_len=");
+    ui_console_u32_dec(xs.der_len);
     ui_console_write(" generation=");
     ui_console_u32_dec(xs.generation);
     ui_console_write(" key_fp=");
@@ -8274,10 +8278,10 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "brotli")) {
         ui_console_write("brotli selftest\n  Verify PIOS Brotli stored encoder and PicoWeb micro-Brotli decoder.\n");
     } else if (ui_streq(topic, "x509")) {
-        ui_console_write("x509 status\n  Show kernel cert/key service state and fingerprints.\n");
-        ui_console_write("x509 generate [cn]\n  Generate a keystore-backed development certificate descriptor.\n");
-        ui_console_write("x509 bind\n  Mark the generated cert descriptor as bound to kernel TLS.\n");
-        ui_console_write("x509 selftest\n  Generate and bind a selftest descriptor.\n");
+        ui_console_write("x509 status\n  Show kernel cert/key service state, DER length, and fingerprints.\n");
+        ui_console_write("x509 generate [cn]\n  Generate a keystore-backed self-signed Ed25519 DER certificate.\n");
+        ui_console_write("x509 bind\n  Mark the generated DER certificate as bound to kernel TLS.\n");
+        ui_console_write("x509 selftest\n  Generate and bind a selftest DER certificate.\n");
     } else if (ui_streq(topic, "ksvc")) {
         ui_console_write("ksvc status\n  Show kernel service/plugin registry, mailbox counters, and runtime counters.\n");
         ui_console_write("ksvc selftest\n  Round-trip mailbox and fault/restart policy.\n");
