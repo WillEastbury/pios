@@ -66,6 +66,7 @@
 #include "pios_addr.h"
 #include "picoscript.h"
 #include "keystore.h"
+#include "tls.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -1154,8 +1155,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "addr <kind:pack/card[/tail]>\n  Parse and canonicalize PIOS resource addresses. Kinds: wal,tcp,udp,stream,dev,file.\n");
         } else if (http_streq(topic, "keystore")) {
             http_append(out, &len, max, "keystore status | keystore derive <label>\n  Show sealed root status or derive a non-secret fingerprint for a label.\n");
+        } else if (http_streq(topic, "tls")) {
+            http_append(out, &len, max, "tls status | tls selftest | tls bridge\n  Show kernel TLS diagnostics, run record-layer selftest, or parse a PicoWeb-style plaintext HTTP bridge sample.\n");
         } else {
-            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma\n");
+            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls\n");
         }
     }
     else if (http_streq(cmd, "status")) {
@@ -1271,6 +1274,51 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     } else if (http_streq(cmd, "dma selftest")) {
         bool ok = dma_selftest();
         http_append(out, &len, max, ok ? "DMA selftest OK\n" : "DMA selftest FAILED\n");
+    } else if (http_streq(cmd, "tls") || http_streq(cmd, "tls status")) {
+        struct tls_diag_snapshot t;
+        tls_diag_snapshot(&t);
+        http_append(out, &len, max, "TLS kernel=enabled bridge=picoweb-style active=");
+        http_append_u64(out, &len, max, t.active);
+        http_append(out, &len, max, " established=");
+        http_append_u64(out, &len, max, t.established);
+        http_append(out, &len, max, " hs_ok=");
+        http_append_u64(out, &len, max, t.handshakes_ok);
+        http_append(out, &len, max, " hs_fail=");
+        http_append_u64(out, &len, max, t.handshake_failures);
+        http_append(out, &len, max, " tx=");
+        http_append_u64(out, &len, max, t.records_tx);
+        http_append(out, &len, max, " rx=");
+        http_append_u64(out, &len, max, t.records_rx);
+        http_append(out, &len, max, " decrypt_fail=");
+        http_append_u64(out, &len, max, t.decrypt_failures);
+        http_append(out, &len, max, " bridge_ok=");
+        http_append_u64(out, &len, max, t.bridge_parse_ok);
+        http_append(out, &len, max, " bridge_more=");
+        http_append_u64(out, &len, max, t.bridge_parse_need_more);
+        http_append(out, &len, max, " bridge_err=");
+        http_append_u64(out, &len, max, t.bridge_parse_error);
+        http_append(out, &len, max, " selftests=");
+        http_append_u64(out, &len, max, t.selftests);
+        http_append(out, &len, max, " failures=");
+        http_append_u64(out, &len, max, t.selftest_failures);
+        http_append(out, &len, max, " last_error=");
+        http_append_u64(out, &len, max, t.last_error);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tls selftest")) {
+        http_append(out, &len, max, tls_selftest() ? "TLS selftest OK\n" : "TLS selftest FAILED\n");
+    } else if (http_streq(cmd, "tls bridge")) {
+        static const u8 sample[] = "GET / HTTP/1.1\r\nHost: pios\r\nConnection: close\r\n\r\n";
+        struct tls_bridge_request br;
+        i32 r = tls_bridge_parse_request(sample, (u32)(sizeof(sample) - 1), &br);
+        http_append(out, &len, max, "TLS bridge result=");
+        http_append_u64(out, &len, max, (u32)r);
+        http_append(out, &len, max, " method=");
+        http_append(out, &len, max, br.method);
+        http_append(out, &len, max, " path=");
+        http_append(out, &len, max, br.path);
+        http_append(out, &len, max, " header_bytes=");
+        http_append_u64(out, &len, max, br.header_bytes);
+        http_append(out, &len, max, "\n");
     } else if (http_starts_with(cmd, "addr ")) {
         struct pios_addr a;
         char canon[160];
@@ -3168,6 +3216,7 @@ static void ui_cmd_watchdog(u32 argc, char **argv);
 static void ui_cmd_dma(u32 argc, char **argv);
 static void ui_cmd_addr(u32 argc, char **argv);
 static void ui_cmd_keystore(u32 argc, char **argv);
+static void ui_cmd_tls(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -4379,6 +4428,7 @@ static void ui_console_u32_dec(u32 v)
         ui_console_write("0");
         return;
     }
+
     while (v && n < sizeof(tmp)) {
         tmp[n++] = (char)('0' + (v % 10U));
         v /= 10U;
@@ -4387,6 +4437,22 @@ static void ui_console_u32_dec(u32 v)
         char s[2] = { tmp[--n], 0 };
         ui_console_write(s);
     }
+}
+
+static void ui_console_u64_dec(u64 v)
+{
+    char buf[24];
+    int i = (int)sizeof(buf) - 1;
+    buf[i] = 0;
+    if (v == 0) {
+        ui_console_write("0");
+        return;
+    }
+    while (v && i > 0) {
+        buf[--i] = (char)('0' + (v % 10U));
+        v /= 10U;
+    }
+    ui_console_write(&buf[i]);
 }
 
 static void ui_console_hex_fixed(u64 v, u32 digits)
@@ -4608,6 +4674,68 @@ static void ui_cmd_keystore(u32 argc, char **argv)
         return;
     }
     ui_console_write("ERR: usage keystore status | keystore derive <label>\n");
+}
+
+static void ui_print_tls_diag(void)
+{
+    struct tls_diag_snapshot t;
+    tls_diag_snapshot(&t);
+    ui_console_write("TLS kernel=enabled bridge=picoweb-style active=");
+    ui_console_u32_dec(t.active);
+    ui_console_write(" established=");
+    ui_console_u32_dec(t.established);
+    ui_console_write(" hs_ok=");
+    ui_console_u64_dec(t.handshakes_ok);
+    ui_console_write(" hs_fail=");
+    ui_console_u64_dec(t.handshake_failures);
+    ui_console_write(" tx=");
+    ui_console_u64_dec(t.records_tx);
+    ui_console_write(" rx=");
+    ui_console_u64_dec(t.records_rx);
+    ui_console_write(" decrypt_fail=");
+    ui_console_u64_dec(t.decrypt_failures);
+    ui_console_write(" bridge_ok=");
+    ui_console_u64_dec(t.bridge_parse_ok);
+    ui_console_write(" bridge_more=");
+    ui_console_u64_dec(t.bridge_parse_need_more);
+    ui_console_write(" bridge_err=");
+    ui_console_u64_dec(t.bridge_parse_error);
+    ui_console_write(" selftests=");
+    ui_console_u32_dec(t.selftests);
+    ui_console_write(" failures=");
+    ui_console_u32_dec(t.selftest_failures);
+    ui_console_write(" last_error=");
+    ui_console_u32_dec(t.last_error);
+    ui_console_write("\n");
+}
+
+static void ui_cmd_tls(u32 argc, char **argv)
+{
+    if (argc >= 2 && ui_streq(argv[1], "selftest")) {
+        ui_console_write(tls_selftest() ? "TLS selftest OK\n" : "TLS selftest FAILED\n");
+        ui_print_tls_diag();
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "bridge")) {
+        static const u8 sample[] = "GET / HTTP/1.1\r\nHost: pios\r\nConnection: close\r\n\r\n";
+        struct tls_bridge_request br;
+        i32 r = tls_bridge_parse_request(sample, (u32)(sizeof(sample) - 1), &br);
+        ui_console_write("TLS bridge result=");
+        ui_console_u32_dec((u32)r);
+        ui_console_write(" method=");
+        ui_console_write(br.method);
+        ui_console_write(" path=");
+        ui_console_write(br.path);
+        ui_console_write(" header_bytes=");
+        ui_console_u32_dec(br.header_bytes);
+        ui_console_write("\n");
+        return;
+    }
+    if (argc < 2 || ui_streq(argv[1], "status")) {
+        ui_print_tls_diag();
+        return;
+    }
+    ui_console_write("ERR: usage tls status | tls selftest | tls bridge\n");
 }
 
 static void ui_console_print_netstat(void)
@@ -7587,6 +7715,10 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "keystore")) {
         ui_console_write("keystore status\n  Show sealed-root status, user-records LBA, and non-secret fingerprint.\n");
         ui_console_write("keystore derive <label>\n  Derive and print a non-secret fingerprint for a label.\n");
+    } else if (ui_streq(topic, "tls")) {
+        ui_console_write("tls status\n  Show kernel TLS connection, record, selftest, and bridge diagnostics.\n");
+        ui_console_write("tls selftest\n  Verify client/server key agreement and AES-GCM record compatibility.\n");
+        ui_console_write("tls bridge\n  Parse a sample plaintext HTTP request through the PicoWeb-style TLS bridge boundary.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -7652,7 +7784,7 @@ static void ui_console_exec(char *line)
             ui_console_write("PIOS help\n");
             ui_console_write("Run commands exactly as shown; category names are help topics, not prefixes.\n");
             ui_console_write("Examples: status | ps | netstat | addr wal:0/3 | firewall list | reboot confirm\n");
-            ui_console_write("Command help: help <command>, e.g. help status, help firewall, help reboot\n");
+            ui_console_write("Command help: help <command>, e.g. help status, help firewall, help reboot, help tls\n");
             ui_console_write("Category help: help core | help fs | help net | help svc | help dev\n");
         } else if (ui_streq(argv[1], "core")) {
             ui_console_write("Core/process commands:\n");
@@ -7955,6 +8087,8 @@ static void ui_console_exec(char *line)
         ui_cmd_dma(argc, argv);
     } else if (ui_streq(argv[0], "keystore")) {
         ui_cmd_keystore(argc, argv);
+    } else if (ui_streq(argv[0], "tls")) {
+        ui_cmd_tls(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "firewall")) {

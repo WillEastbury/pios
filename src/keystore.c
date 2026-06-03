@@ -246,7 +246,19 @@ void keystore_status(struct keystore_status *out)
 
 bool keystore_derive_fingerprint(const char *label, u32 *out_fingerprint)
 {
-    if (!label || !out_fingerprint || !g_ks.sealed)
+    u8 derived[32];
+    if (!out_fingerprint)
+        return false;
+    if (!keystore_derive_secret(label, derived, sizeof(derived)))
+        return false;
+    *out_fingerprint = get32(derived);
+    secure_zero(derived, sizeof(derived));
+    return true;
+}
+
+bool keystore_derive_secret(const char *label, u8 *out, u32 out_len)
+{
+    if (!label || !out || out_len == 0 || out_len > 32 || !g_ks.sealed)
         return false;
     u32 lba = keystore_lba();
     if (!lba || !sd_read_block(lba, ks_sector))
@@ -263,7 +275,7 @@ bool keystore_derive_fingerprint(const char *label, u32 *out_fingerprint)
     bool ok = decrypt_root(&rec, wrap_key, root);
     if (ok) {
         hmac_sha256(root, 32, (const u8 *)label, pios_strlen(label), derived);
-        *out_fingerprint = get32(derived);
+        simd_memcpy(out, derived, out_len);
     }
     secure_zero(wrap_key, sizeof(wrap_key));
     secure_zero(root, sizeof(root));

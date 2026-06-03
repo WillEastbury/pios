@@ -14,3 +14,4 @@ struct keystore_status {
 bool keystore_init(void);
 void keystore_status(struct keystore_status *out);
 bool keystore_derive_fingerprint(const char *label, u32 *out_fingerprint);
+bool keystore_derive_secret(const char *label, u8 *out, u32 out_len);

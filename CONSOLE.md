@@ -87,6 +87,7 @@ processes
 users
 firewall list
 watchdog status
+tls status
 reboot confirm
 peek 0x1000FFF000 4
 dumpmem 0x80000 128
@@ -278,6 +279,20 @@ dma selftest
 ```
 
 On BCM2712, PIOS uses the `dma32` controller with physical low-RAM DMA addresses, not the old `0xC0000000` legacy alias. The working memcpy path uses the 32-byte control-block format with shifted CB address mode; startup keeps the NEON fallback disabled only after the DMA selftest passes.
+
+## Kernel TLS diagnostics
+
+PIOS keeps TLS termination in kernel space. The current kernel layer provides a PSK/HKDF/AES-GCM record wrapper plus a PicoWeb-style bridge boundary that parses decrypted plaintext HTTP requests before handing them to a kernel service or future process-hosted webserver.
+
+Console/Web Admin terminal:
+
+```text
+tls status
+tls selftest
+tls bridge
+```
+
+`tls selftest` verifies that client and server key agreement produce compatible AES-GCM record keys. `tls bridge` parses a fixed sample HTTP request through the same complete/need-more/error convention used by PicoWeb's TLS-to-HTTP bridge.
 
 ## Pack/Card resource addresses
 
