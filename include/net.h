@@ -73,12 +73,27 @@ struct udp_hdr {
 
 /* Static neighbor entry (replaces ARP entirely) */
 #define MAX_NEIGHBORS   16
+#define NET_ROUTE_MAX   16
 
 struct neighbor_entry {
     u32 ip;
     u8  mac[6];
     u8  _pad[2];
 };
+
+struct net_route_entry {
+    u32 dst;
+    u32 mask;
+    u32 gateway;
+    u8  prefix_len;
+    u8  flags;
+    u16 _pad;
+} PACKED;
+
+#define NET_ROUTE_F_CONNECTED 1U
+bool net_route_add(u32 dst, u32 mask, u32 gateway, u8 flags);
+u32 net_route_snapshot(struct net_route_entry *out, u32 max);
+bool net_route_lookup(u32 dst_ip, struct net_route_entry *out);
 
 /* UDP receive callback */
 typedef void (*udp_recv_cb)(u32 src_ip, u16 src_port, u16 dst_port,

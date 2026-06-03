@@ -44,6 +44,8 @@ static bool mac_is_zero_6(const u8 *m) {
 
 static struct neighbor_entry neighbors[MAX_NEIGHBORS];
 static u32 neighbor_count;
+static struct net_route_entry routes[NET_ROUTE_MAX];
+static u32 route_count;
 static u8  gw_mac[6];
 static bool gw_mac_set;
 
@@ -212,6 +214,74 @@ static const u8 *neighbor_lookup(u32 ip) {
         if (neighbors[i].ip == ip)
             return neighbors[i].mac;
     return NULL;
+}
+
+static u8 prefix_len_from_mask(u32 mask)
+{
+    u8 n = 0;
+    bool zero_seen = false;
+    for (i32 i = 31; i >= 0; i--) {
+        bool bit = ((mask >> (u32)i) & 1U) != 0;
+        if (bit && zero_seen)
+            return 0xFFU;
+        if (bit) n++;
+        else zero_seen = true;
+    }
+    return n;
+}
+
+bool net_route_add(u32 dst, u32 mask, u32 gateway, u8 flags)
+{
+    u8 prefix = prefix_len_from_mask(mask);
+    if (prefix == 0xFFU)
+        return false;
+    dst &= mask;
+    for (u32 i = 0; i < route_count; i++) {
+        if (routes[i].dst == dst && routes[i].mask == mask) {
+            routes[i].gateway = gateway;
+            routes[i].prefix_len = prefix;
+            routes[i].flags = flags;
+            return true;
+        }
+    }
+    if (route_count >= NET_ROUTE_MAX)
+        return false;
+    routes[route_count].dst = dst;
+    routes[route_count].mask = mask;
+    routes[route_count].gateway = gateway;
+    routes[route_count].prefix_len = prefix;
+    routes[route_count].flags = flags;
+    route_count++;
+    return true;
+}
+
+u32 net_route_snapshot(struct net_route_entry *out, u32 max)
+{
+    u32 n = 0;
+    if (!out || max == 0)
+        return 0;
+    for (u32 i = 0; i < route_count && n < max; i++)
+        out[n++] = routes[i];
+    return n;
+}
+
+bool net_route_lookup(u32 dst_ip, struct net_route_entry *out)
+{
+    i32 best = -1;
+    u8 best_prefix = 0;
+    for (u32 i = 0; i < route_count; i++) {
+        if ((dst_ip & routes[i].mask) != routes[i].dst)
+            continue;
+        if (best < 0 || routes[i].prefix_len >= best_prefix) {
+            best = (i32)i;
+            best_prefix = routes[i].prefix_len;
+        }
+    }
+    if (best < 0)
+        return false;
+    if (out)
+        *out = routes[best];
+    return true;
 }
 
 bool net_join_multicast_mac(const u8 *mac) {
@@ -465,8 +535,11 @@ static void handle_ip(const u8 *frame, u32 len, bool checksum_trusted) {
 /* ================================================================== */
 
 static bool resolve_mac(u32 dst_ip, const u8 **mac_out) {
-    u32 next_hop = ((dst_ip & our_mask) == (our_ip & our_mask))
-                    ? dst_ip : our_gw;
+    struct net_route_entry route;
+    u32 next_hop = 0;
+    if (!net_route_lookup(dst_ip, &route))
+        return false;
+    next_hop = (route.flags & NET_ROUTE_F_CONNECTED) ? dst_ip : route.gateway;
 
     /* Broadcast */
     if (dst_ip == 0xFFFFFFFF) {
@@ -683,8 +756,10 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
 
     simd_zero(&stats, sizeof(stats));
     simd_zero(neighbors, sizeof(neighbors));
+    simd_zero(routes, sizeof(routes));
     simd_zero(multicast_macs, sizeof(multicast_macs));
     neighbor_count = 0;
+    route_count = 0;
     multicast_count = 0;
     udp_callback   = NULL;
     for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++)
@@ -697,6 +772,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
 
     /* Init ARP subsystem */
     arp_init(ip, netmask, our_mac);
+    (void)net_route_add(ip & netmask, netmask, 0, NET_ROUTE_F_CONNECTED);
+    if (gateway != 0)
+        (void)net_route_add(0, 0, gateway, 0);
 
     /* Init TCP subsystem */
     tcp_init();

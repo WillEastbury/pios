@@ -626,6 +626,27 @@ static void http_append_firewall_list(char *out, u32 *len, u32 max)
     }
 }
 
+static void http_append_route_table(char *out, u32 *len, u32 max)
+{
+    struct net_route_entry routes[NET_ROUTE_MAX];
+    u32 n = net_route_snapshot(routes, NET_ROUTE_MAX);
+    http_append(out, len, max, "ROUTE DST MASK GW FLAGS PFX\n");
+    for (u32 i = 0; i < n; i++) {
+        http_append_u64(out, len, max, i);
+        http_append(out, len, max, " ");
+        http_append_ip4(out, len, max, routes[i].dst);
+        http_append(out, len, max, " ");
+        http_append_ip4(out, len, max, routes[i].mask);
+        http_append(out, len, max, " ");
+        http_append_ip4(out, len, max, routes[i].gateway);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, routes[i].flags);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, routes[i].prefix_len);
+        http_append(out, len, max, "\n");
+    }
+}
+
 static bool http_char_ieq(char a, char b)
 {
     if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
@@ -1305,6 +1326,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "processes\n  Show process snapshot with PPID, arena/span telemetry, and process graph roots/children.\n");
         } else if (http_streq(topic, "netstat")) {
             http_append(out, &len, max, "netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
+        } else if (http_streq(topic, "netcfg")) {
+            http_append(out, &len, max, "netcfg | netcfg routes\n  Show current network summary and route table.\n");
         } else if (http_streq(topic, "http") || http_streq(topic, "https")) {
             http_append(out, &len, max, "http get <ip> [path] [port] [timeout_ms]\nhttps get <ip> [path] [port] [timeout_ms]\n  Console-mode HTTP client; https targets the PIOS kernel TLS-wrapper endpoint.\n");
         } else if (http_streq(topic, "firewall")) {
@@ -1419,6 +1442,18 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " fw_tx_drop=");
         http_append_u64(out, &len, max, tx_drop);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "netcfg") || http_streq(cmd, "netcfg routes")) {
+        const net_stats_t *st = net_get_stats();
+        http_append(out, &len, max, "net ip=");
+        http_append_ip4(out, &len, max, net_get_our_ip());
+        http_append(out, &len, max, " tx=");
+        http_append_u64(out, &len, max, st ? st->tx_packets : 0);
+        http_append(out, &len, max, " rx=");
+        http_append_u64(out, &len, max, st ? st->rx_packets : 0);
+        http_append(out, &len, max, " no_neighbor=");
+        http_append_u64(out, &len, max, st ? st->drop_no_neighbor : 0);
+        http_append(out, &len, max, "\n");
+        http_append_route_table(out, &len, max);
     } else if (http_starts_with(cmd, "http get ") || http_starts_with(cmd, "https get ")) {
         bool use_tls = http_starts_with(cmd, "https ");
         char line[160];
@@ -4628,6 +4663,29 @@ static void ui_print_ip(u32 ip)
     uart_hex(d); uart_puts("]");
 }
 
+static void ui_console_ip(u32 ip)
+{
+    fb_printf("%u.%u.%u.%u", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF,
+              (ip >> 8) & 0xFF, ip & 0xFF);
+}
+
+static void ui_console_route_table(void)
+{
+    struct net_route_entry routes[NET_ROUTE_MAX];
+    u32 n = net_route_snapshot(routes, NET_ROUTE_MAX);
+    ui_console_write("ROUTE DST MASK GW FLAGS PFX\n");
+    for (u32 i = 0; i < n; i++) {
+        fb_printf("%u ", i);
+        ui_console_ip(routes[i].dst);
+        ui_console_write(" ");
+        ui_console_ip(routes[i].mask);
+        ui_console_write(" ");
+        ui_console_ip(routes[i].gateway);
+        ui_console_write(" ");
+        fb_printf("%u %u\n", routes[i].flags, routes[i].prefix_len);
+    }
+}
+
 static void ui_console_print_ps(void)
 {
     struct proc_ui_entry snap[UI_SNAPSHOT_MAX];
@@ -6046,6 +6104,35 @@ static void ui_cmd_netcfg(u32 argc, char **argv)
         return;
     }
 
+    if (argc >= 2 && ui_streq(argv[1], "routes")) {
+        ui_console_route_table();
+        return;
+    }
+
+    if (argc >= 2 && ui_streq(argv[1], "route")) {
+        if (argc < 7 || !ui_streq(argv[2], "add")) {
+            ui_console_write("ERR: usage netcfg route add <dst> <mask> <gw> <connected|via>\n");
+            return;
+        }
+        u32 dst = 0, mask = 0, gw = 0;
+        if (!ui_parse_ip4(argv[3], &dst) || !ui_parse_ip4(argv[4], &mask) ||
+            !ui_parse_ip4(argv[5], &gw)) {
+            ui_console_write("ERR: invalid route ip/mask/gw\n");
+            return;
+        }
+        u8 flags = ui_streq(argv[6], "connected") ? NET_ROUTE_F_CONNECTED : 0;
+        if (!ui_streq(argv[6], "connected") && !ui_streq(argv[6], "via")) {
+            ui_console_write("ERR: route mode connected|via\n");
+            return;
+        }
+        if (!net_route_add(dst, mask, gw, flags)) {
+            ui_console_write("ERR: route add failed\n");
+            return;
+        }
+        ui_console_write("OK: route added\n");
+        return;
+    }
+
     const net_stats_t *st = net_get_stats();
     u8 mac[6];
     nic_get_mac(mac);
@@ -6083,6 +6170,7 @@ static void ui_cmd_netcfg(u32 argc, char **argv)
     uart_puts(" rx=");
     uart_hex((u32)st->rx_packets);
     uart_puts("\n");
+    ui_console_route_table();
 }
 
 static void ui_cmd_disk(u32 argc, char **argv)
@@ -8873,7 +8961,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("db list <card>\n");
     } else if (ui_streq(topic, "netcfg")) {
         ui_console_write("netcfg\n  Show current network config.\n");
-        ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d>\nnetcfg apply\nnetcfg dhcp <on|off> [timeout_ms]\nnetcfg addnbr <ip> <mac>\n");
+        ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d>\nnetcfg apply\nnetcfg dhcp <on|off> [timeout_ms]\nnetcfg addnbr <ip> <mac>\nnetcfg routes\nnetcfg route add <dst> <mask> <gw> <connected|via>\n");
     } else if (ui_streq(topic, "stream")) {
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
         ui_console_write("http get <ip> [path] [port] [timeout_ms]\nhttps get <ip> [path] [port] [timeout_ms]\n");
