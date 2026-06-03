@@ -49,6 +49,18 @@ static volatile bool got_response;
 static u32 resp_ip;
 static u16 expected_txid;
 static u32 resp_ttl;
+static struct dns_async_status async_status;
+static u16 async_src_port;
+static u16 async_txid;
+static u32 async_query_len;
+static u64 async_deadline;
+static bool async_callback_installed;
+
+#define DNS_ERR_NONE       0U
+#define DNS_ERR_NO_SERVER  1U
+#define DNS_ERR_BAD_HOST   2U
+#define DNS_ERR_SEND       3U
+#define DNS_ERR_TIMEOUT    4U
 
 /* ---- Helpers ---- */
 
@@ -57,6 +69,19 @@ static u32 str_hash(const char *s) {
     while (*s)
         h = ((h << 5) + h) + (u8)*s++;
     return h;
+}
+
+static void str_copy(char *dst, u32 cap, const char *src)
+{
+    u32 i = 0;
+    if (!dst || cap == 0) return;
+    if (src) {
+        while (i + 1 < cap && src[i]) {
+            dst[i] = src[i];
+            i++;
+        }
+    }
+    dst[i] = 0;
 }
 
 static u16 gen_txid(void) {
@@ -254,6 +279,10 @@ void dns_init(u32 server_ip) {
     dns_server = server_ip;
     txid_counter = 0;
     lru_init(&dns_cache, NULL, 60000); /* 60s TTL */
+    simd_zero(&async_status, sizeof(async_status));
+    async_status.state = DNS_ASYNC_IDLE;
+    async_status.server_ip = server_ip;
+    async_callback_installed = false;
     uart_puts("[dns] Server: ");
     uart_hex(server_ip);
     uart_puts("\n");
@@ -261,6 +290,109 @@ void dns_init(u32 server_ip) {
 
 void dns_cache_flush(void) {
     lru_flush(&dns_cache);
+}
+
+bool dns_cache_lookup(const char *hostname, u32 *ip_out)
+{
+    if (!hostname || !ip_out)
+        return false;
+    u32 hash = str_hash(hostname);
+    u32 *cached_ip = cache_lookup(hash);
+    if (!cached_ip)
+        return false;
+    *ip_out = *cached_ip;
+    return true;
+}
+
+static void dns_async_finish(u32 state, u32 err)
+{
+    if (async_callback_installed) {
+        net_set_udp_callback(prev_callback);
+        async_callback_installed = false;
+    }
+    async_status.state = state;
+    async_status.last_error = err;
+}
+
+static bool dns_async_send_query(void)
+{
+    bool sent = net_send_udp(dns_server, async_src_port, DNS_PORT,
+                             query_buf, (u16)async_query_len);
+    async_status.attempts++;
+    async_deadline = timer_monotonic_ms() + QUERY_TIMEOUT;
+    if (!sent)
+        async_status.last_error = DNS_ERR_SEND;
+    return sent;
+}
+
+bool dns_resolve_async_start(const char *hostname)
+{
+    u32 cached = 0;
+    if (!dns_server) {
+        async_status.last_error = DNS_ERR_NO_SERVER;
+        return false;
+    }
+    if (!hostname || !hostname[0]) {
+        async_status.last_error = DNS_ERR_BAD_HOST;
+        return false;
+    }
+    if (dns_cache_lookup(hostname, &cached)) {
+        simd_zero(&async_status, sizeof(async_status));
+        async_status.state = DNS_ASYNC_DONE;
+        async_status.server_ip = dns_server;
+        async_status.result_ip = cached;
+        str_copy(async_status.hostname, sizeof(async_status.hostname), hostname);
+        return true;
+    }
+
+    async_txid = gen_txid();
+    async_src_port = gen_src_port();
+    expected_txid = async_txid;
+    got_response = false;
+    resp_ip = 0;
+    resp_ttl = 0;
+    async_query_len = build_query(async_txid, hostname);
+    if (async_query_len == 0) {
+        async_status.last_error = DNS_ERR_BAD_HOST;
+        return false;
+    }
+
+    if (async_callback_installed)
+        net_set_udp_callback(prev_callback);
+    prev_callback = net_swap_udp_callback(dns_udp_handler);
+    async_callback_installed = true;
+
+    simd_zero(&async_status, sizeof(async_status));
+    async_status.state = DNS_ASYNC_RUNNING;
+    async_status.server_ip = dns_server;
+    str_copy(async_status.hostname, sizeof(async_status.hostname), hostname);
+    (void)dns_async_send_query();
+    return true;
+}
+
+void dns_poll(void)
+{
+    if (async_status.state != DNS_ASYNC_RUNNING)
+        return;
+    if (got_response) {
+        async_status.result_ip = resp_ip;
+        cache_insert(str_hash(async_status.hostname), resp_ip, resp_ttl);
+        dns_async_finish(DNS_ASYNC_DONE, DNS_ERR_NONE);
+        return;
+    }
+    if (timer_monotonic_ms() < async_deadline)
+        return;
+    if (async_status.attempts >= MAX_RETRIES) {
+        dns_async_finish(DNS_ASYNC_FAILED, DNS_ERR_TIMEOUT);
+        return;
+    }
+    (void)dns_async_send_query();
+}
+
+void dns_async_status(struct dns_async_status *out)
+{
+    if (!out) return;
+    *out = async_status;
 }
 
 bool dns_resolve(const char *hostname, u32 *ip_out) {
@@ -291,8 +423,8 @@ bool dns_resolve(const char *hostname, u32 *ip_out) {
         net_send_udp(dns_server, src_port, DNS_PORT, query_buf, (u16)qlen);
 
         /* Poll for response */
-        u64 deadline = timer_ticks() + QUERY_TIMEOUT;
-        while (timer_ticks() < deadline) {
+        u64 deadline = timer_monotonic_ms() + QUERY_TIMEOUT;
+        while (timer_monotonic_ms() < deadline) {
             net_poll();
             if (got_response) {
                 *ip_out = resp_ip;

@@ -1354,6 +1354,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
         } else if (http_streq(topic, "netcfg")) {
             http_append(out, &len, max, "netcfg | netcfg routes | netcfg neighbors\n  Show current network summary, route table, and ARP/neighbor table.\n");
+        } else if (http_streq(topic, "dns")) {
+            http_append(out, &len, max, "dns resolve <hostname> | dns status | dns flush\n  Start/poll an async A-record resolver job without blocking HTTP service loops.\n");
         } else if (http_streq(topic, "http") || http_streq(topic, "https")) {
             http_append(out, &len, max, "http get <ip> [path] [port] [timeout_ms]\nhttps get <ip> [path] [port] [timeout_ms]\n  Console-mode HTTP client; https targets the PIOS kernel TLS-wrapper endpoint.\n");
         } else if (http_streq(topic, "firewall")) {
@@ -1484,6 +1486,31 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_arp_table(out, &len, max);
     } else if (http_streq(cmd, "netcfg neighbors")) {
         http_append_arp_table(out, &len, max);
+    } else if (http_starts_with(cmd, "dns resolve ")) {
+        const char *host = cmd + 12;
+        if (dns_resolve_async_start(host))
+            http_append(out, &len, max, "DNS resolve started\n");
+        else
+            http_append(out, &len, max, "ERR: dns resolve start failed\n");
+    } else if (http_streq(cmd, "dns") || http_streq(cmd, "dns status")) {
+        struct dns_async_status ds;
+        dns_async_status(&ds);
+        http_append(out, &len, max, "dns state=");
+        http_append_u64(out, &len, max, ds.state);
+        http_append(out, &len, max, " server=");
+        http_append_ip4(out, &len, max, ds.server_ip);
+        http_append(out, &len, max, " result=");
+        http_append_ip4(out, &len, max, ds.result_ip);
+        http_append(out, &len, max, " attempts=");
+        http_append_u64(out, &len, max, ds.attempts);
+        http_append(out, &len, max, " error=");
+        http_append_u64(out, &len, max, ds.last_error);
+        http_append(out, &len, max, "\nhostname=");
+        http_append(out, &len, max, ds.hostname);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "dns flush")) {
+        dns_cache_flush();
+        http_append(out, &len, max, "DNS cache flushed\n");
     } else if (http_starts_with(cmd, "http get ") || http_starts_with(cmd, "https get ")) {
         bool use_tls = http_starts_with(cmd, "https ");
         char line[160];
@@ -3874,6 +3901,7 @@ static void ui_cmd_tensor(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
+static void ui_cmd_dns(u32 argc, char **argv);
 static void ui_console_hex_fixed(u64 v, u32 digits);
 static bool ui_resolve_pis_path(const char *in, char *out, u32 out_max);
 static bool ui_resolve_pix_path(const char *in, char *out, u32 out_max);
@@ -5786,6 +5814,46 @@ static void ui_cmd_tensor(u32 argc, char **argv)
         return;
     }
     ui_console_write("ERR: usage qpu status | qpu selftest | tensor status | tensor selftest\n");
+}
+
+static void ui_print_dns_status(void)
+{
+    struct dns_async_status ds;
+    dns_async_status(&ds);
+    ui_console_write("dns state=");
+    fb_printf("%u", ds.state);
+    ui_console_write(" server=");
+    ui_console_ip(ds.server_ip);
+    ui_console_write(" result=");
+    ui_console_ip(ds.result_ip);
+    ui_console_write(" attempts=");
+    fb_printf("%u", ds.attempts);
+    ui_console_write(" error=");
+    fb_printf("%u", ds.last_error);
+    ui_console_write("\nhostname=");
+    ui_console_write(ds.hostname);
+    ui_console_write("\n");
+}
+
+static void ui_cmd_dns(u32 argc, char **argv)
+{
+    if (argc >= 3 && ui_streq(argv[1], "resolve")) {
+        ui_console_write(dns_resolve_async_start(argv[2]) ?
+                         "DNS resolve started\n" :
+                         "ERR: dns resolve start failed\n");
+        ui_print_dns_status();
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "flush")) {
+        dns_cache_flush();
+        ui_console_write("DNS cache flushed\n");
+        return;
+    }
+    if (argc < 2 || ui_streq(argv[1], "status")) {
+        ui_print_dns_status();
+        return;
+    }
+    ui_console_write("ERR: usage dns resolve <hostname> | dns status | dns flush\n");
 }
 
 static void ui_console_print_netstat(void)
@@ -8961,6 +9029,10 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "http") || ui_streq(topic, "https")) {
         ui_console_write("http get <ip> [path] [port] [timeout_ms]\n  Fetch plaintext HTTP over TCP.\n");
         ui_console_write("https get <ip> [path] [port] [timeout_ms]\n  Fetch through the PIOS kernel TLS-wrapper endpoint, not browser HTTPS.\n");
+    } else if (ui_streq(topic, "dns")) {
+        ui_console_write("dns resolve <hostname>\n  Start async A-record lookup.\n");
+        ui_console_write("dns status\n  Poll resolver job status.\n");
+        ui_console_write("dns flush\n  Flush DNS cache.\n");
     } else if (ui_streq(topic, "firewall")) {
         ui_console_write("firewall list\n  List rules.\n");
         ui_console_write("firewall reset\n  Restore inbound deny/outbound allow defaults plus service allows.\n");
@@ -9099,6 +9171,7 @@ static void ui_console_exec(char *line)
             ui_console_write("  firewall allow|deny <in|out|both> <tcp|udp|icmp|ip|arp> [port N] [src SPEC] [dst SPEC]\n");
             ui_console_write("  stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
             ui_console_write("  http get <ip> [path] [port] [timeout_ms] | https get <ip> [path] [port] [timeout_ms]\n");
+            ui_console_write("  dns resolve <host> | dns status | dns flush\n");
             ui_console_write("  TCP debug console: port 2323, then 'unlock pios'\n");
         } else if (ui_streq(argv[1], "svc")) {
             ui_console_write("Service/script commands:\n");
@@ -9197,6 +9270,8 @@ static void ui_console_exec(char *line)
         ui_cmd_http_client(argc, argv, false);
     } else if (ui_streq(argv[0], "https")) {
         ui_cmd_http_client(argc, argv, true);
+    } else if (ui_streq(argv[0], "dns")) {
+        ui_cmd_dns(argc, argv);
     } else if (ui_streq(argv[0], "ps")) {
         ui_console_print_ps();
     } else if (ui_streq(argv[0], "kill")) {
@@ -9944,6 +10019,7 @@ NORETURN void core0_main(void) {
         u64 svc_start;
         svc_start = ksvc_begin(ksvc_net_id);
         net_poll();
+        dns_poll();
         ksvc_end(ksvc_net_id, svc_start, false);
         svc_start = ksvc_begin(ksvc_tcp_id);
         echo_tcp_poll();
