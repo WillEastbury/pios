@@ -88,6 +88,7 @@ users
 firewall list
 watchdog status
 tls status
+brotli selftest
 reboot confirm
 peek 0x1000FFF000 4
 dumpmem 0x80000 128
@@ -293,6 +294,18 @@ tls bridge
 ```
 
 `tls selftest` verifies that client and server key agreement produce compatible AES-GCM record keys. `tls bridge` parses a fixed sample HTTP request through the same complete/need-more/error convention used by PicoWeb's TLS-to-HTTP bridge.
+
+## Brotli codec diagnostics
+
+PIOS includes a no-external-dependency Brotli codec library. The encoder emits conservative stored Brotli streams; the decoder supports stored streams plus the compressed subset emitted by PicoWeb's micro-Brotli encoder. Large copies use the kernel SIMD copy path.
+
+Console/Web Admin terminal:
+
+```text
+brotli selftest
+```
+
+The selftest round-trips a stored stream and decodes a compressed PicoWeb micro-Brotli fixture.
 
 ## Pack/Card resource addresses
 

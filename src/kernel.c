@@ -67,6 +67,7 @@
 #include "picoscript.h"
 #include "keystore.h"
 #include "tls.h"
+#include "brotli.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -1157,8 +1158,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "keystore status | keystore derive <label>\n  Show sealed root status or derive a non-secret fingerprint for a label.\n");
         } else if (http_streq(topic, "tls")) {
             http_append(out, &len, max, "tls status | tls selftest | tls bridge\n  Show kernel TLS diagnostics, run record-layer selftest, or parse a PicoWeb-style plaintext HTTP bridge sample.\n");
+        } else if (http_streq(topic, "brotli")) {
+            http_append(out, &len, max, "brotli selftest\n  Verify the no-external-dependency Brotli stored encoder and PicoWeb micro-Brotli decoder.\n");
         } else {
-            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls\n");
+            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls, help brotli\n");
         }
     }
     else if (http_streq(cmd, "status")) {
@@ -1319,6 +1322,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " header_bytes=");
         http_append_u64(out, &len, max, br.header_bytes);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "brotli") || http_streq(cmd, "brotli selftest")) {
+        http_append(out, &len, max, brotli_selftest() ? "Brotli selftest OK\n" : "Brotli selftest FAILED\n");
     } else if (http_starts_with(cmd, "addr ")) {
         struct pios_addr a;
         char canon[160];
@@ -3217,6 +3222,7 @@ static void ui_cmd_dma(u32 argc, char **argv);
 static void ui_cmd_addr(u32 argc, char **argv);
 static void ui_cmd_keystore(u32 argc, char **argv);
 static void ui_cmd_tls(u32 argc, char **argv);
+static void ui_cmd_brotli(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -4736,6 +4742,15 @@ static void ui_cmd_tls(u32 argc, char **argv)
         return;
     }
     ui_console_write("ERR: usage tls status | tls selftest | tls bridge\n");
+}
+
+static void ui_cmd_brotli(u32 argc, char **argv)
+{
+    if (argc < 2 || ui_streq(argv[1], "selftest")) {
+        ui_console_write(brotli_selftest() ? "Brotli selftest OK\n" : "Brotli selftest FAILED\n");
+        return;
+    }
+    ui_console_write("ERR: usage brotli selftest\n");
 }
 
 static void ui_console_print_netstat(void)
@@ -7719,6 +7734,8 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("tls status\n  Show kernel TLS connection, record, selftest, and bridge diagnostics.\n");
         ui_console_write("tls selftest\n  Verify client/server key agreement and AES-GCM record compatibility.\n");
         ui_console_write("tls bridge\n  Parse a sample plaintext HTTP request through the PicoWeb-style TLS bridge boundary.\n");
+    } else if (ui_streq(topic, "brotli")) {
+        ui_console_write("brotli selftest\n  Verify PIOS Brotli stored encoder and PicoWeb micro-Brotli decoder.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -8089,6 +8106,8 @@ static void ui_console_exec(char *line)
         ui_cmd_keystore(argc, argv);
     } else if (ui_streq(argv[0], "tls")) {
         ui_cmd_tls(argc, argv);
+    } else if (ui_streq(argv[0], "brotli")) {
+        ui_cmd_brotli(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "firewall")) {
