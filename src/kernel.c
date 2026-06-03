@@ -1299,6 +1299,7 @@ static bool ui_http_fetch(bool use_tls, u32 dst_ip, u16 port,
 static bool ui_http_client_parse_common(u32 argc, char **argv, bool use_tls,
                                         u32 *ip, u16 *port, const char **path,
                                         u32 *timeout_ms);
+static void http_append_mem_analyze(char *out, u32 *len, u32 max);
 
 static bool http_parse_db_ref(u32 argc, char **argv, u32 start, u32 *card_out, u32 *rec_out, u32 *next_arg)
 {
@@ -1370,6 +1371,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "poke <addr> <value> [1|2|4|8]\n  Write live memory from UART/TCP console admin/debug context.\n");
         } else if (http_streq(topic, "dumpmem")) {
             http_append(out, &len, max, "dumpmem <addr> [bytes]\n  Dump memory from UART/TCP console admin/debug context.\n");
+        } else if (http_streq(topic, "mem")) {
+            http_append(out, &len, max, "mem analyze\n  Show kernel image, raw-slot, per-core RAM, and process memory layout diagnostics.\n");
         } else if (http_streq(topic, "dma")) {
             http_append(out, &len, max, "dma status | dma selftest\n  Show DMA channel registers, selftest result, selected CB address mode, and retry selftest.\n");
         } else if (http_streq(topic, "addr")) {
@@ -1957,6 +1960,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             }
             http_append(out, &len, max, "\n");
         }
+    } else if (http_streq(cmd, "mem") || http_streq(cmd, "mem analyze")) {
+        http_append_mem_analyze(out, &len, max);
     } else if (http_streq(cmd, "keystore") || http_streq(cmd, "keystore status")) {
         struct keystore_status st;
         keystore_status(&st);
@@ -2129,6 +2134,25 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
                 http_append(out, &len, max, "\n");
             }
         }
+    } else if (http_starts_with(cmd, "process validate ")) {
+        const char *path = cmd + 17;
+        u64 id = walfs_find(path);
+        struct walfs_inode ino;
+        if (!id) {
+            http_append(out, &len, max, "process validate FAILED: image not found\n");
+        } else if (!walfs_stat(id, &ino)) {
+            http_append(out, &len, max, "process validate FAILED: stat failed\n");
+        } else if (ino.flags & WALFS_DIR) {
+            http_append(out, &len, max, "process validate FAILED: directory\n");
+        } else if (ino.size == 0 || ino.size > PROC_SLOT_SIZE - 64U) {
+            http_append(out, &len, max, "process validate FAILED: invalid size\n");
+        } else {
+            http_append(out, &len, max, "process validate OK image_id=");
+            http_append_u64(out, &len, max, id);
+            http_append(out, &len, max, " bytes=");
+            http_append_u64(out, &len, max, (u32)ino.size);
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "users")) {
         struct principal_ui_entry users[PRINCIPAL_MAX];
         u32 n = principal_snapshot(users, PRINCIPAL_MAX);
@@ -2182,6 +2206,8 @@ static u32 http_build_process_action_response(char *out, u32 max, const u8 *req,
     i32 new_pid = -1;
     bool ok = false;
     const char *message = "bad request";
+    u64 image_id = 0;
+    struct walfs_inode image_ino;
 
     http_append(out, &len, max,
         "HTTP/1.0 200 OK\r\n"
@@ -2195,7 +2221,25 @@ static u32 http_build_process_action_response(char *out, u32 max, const u8 *req,
         return len;
     }
 
-    if (ui_streq(action, "kill") || ui_streq(action, "restart")) {
+    if (ui_streq(action, "validate")) {
+        if (!http_query_value(req, req_len, "/api/process", "path", path, sizeof(path))) {
+            message = "missing path";
+        } else {
+            image_id = walfs_find(path);
+            if (!image_id) {
+                message = "image not found";
+            } else if (!walfs_stat(image_id, &image_ino)) {
+                message = "image stat failed";
+            } else if (image_ino.flags & WALFS_DIR) {
+                message = "image is directory";
+            } else if (image_ino.size == 0 || image_ino.size > PROC_SLOT_SIZE - 64U) {
+                message = "image size invalid";
+            } else {
+                ok = true;
+                message = "image validates for non-executing dry run";
+            }
+        }
+    } else if (ui_streq(action, "kill") || ui_streq(action, "restart")) {
         if (!http_query_value(req, req_len, "/api/process", "pid", pid_s, sizeof(pid_s)) ||
             !http_parse_u32(pid_s, &pid)) {
             message = "invalid pid";
@@ -2225,6 +2269,12 @@ static u32 http_build_process_action_response(char *out, u32 max, const u8 *req,
     if (new_pid > 0) {
         http_append(out, &len, max, ",\"newPid\":");
         http_append_u64(out, &len, max, (u32)new_pid);
+    }
+    if (image_id) {
+        http_append(out, &len, max, ",\"imageId\":");
+        http_append_u64(out, &len, max, image_id);
+        http_append(out, &len, max, ",\"imageBytes\":");
+        http_append_u64(out, &len, max, (u32)image_ino.size);
     }
     http_append(out, &len, max, "}\n");
     return len;
@@ -2476,7 +2526,12 @@ static u32 http_build_walfs_response(char *out, u32 max, const u8 *req, u32 req_
 }
 
 extern u8 _start;
+extern u8 __text_start;
+extern u8 __text_end;
 extern u8 __bss_start;
+extern u8 __bss_end;
+extern u8 __heap_start;
+static const char *ui_proc_state_str(u32 s);
 
 static bool http_confirmed(const u8 *req, u32 req_len, const char *path)
 {
@@ -2526,6 +2581,77 @@ static u32 http_running_kernel_image_len(void)
     if (end <= start || (end - start) > 0xFFFFFFFFULL)
         return 0;
     return (u32)(end - start);
+}
+
+static void http_append_mem_analyze(char *out, u32 *len, u32 max)
+{
+    u64 k_start = (u64)(usize)&_start;
+    u64 text_start = (u64)(usize)&__text_start;
+    u64 text_end = (u64)(usize)&__text_end;
+    u64 bss_start = (u64)(usize)&__bss_start;
+    u64 bss_end = (u64)(usize)&__bss_end;
+    u64 heap_start = (u64)(usize)&__heap_start;
+    u32 image_len = http_running_kernel_image_len();
+    struct proc_ui_entry snap[MAX_PROCS_PER_CORE + 1U];
+    u32 n = proc_snapshot(snap, MAX_PROCS_PER_CORE + 1U);
+
+    http_append(out, len, max, "mem kernel_start=");
+    http_append_u64(out, len, max, k_start);
+    http_append(out, len, max, " image_bytes=");
+    http_append_u64(out, len, max, image_len);
+    http_append(out, len, max, " slot_capacity=");
+    http_append_u64(out, len, max, PIOS_STAGE2_ZONE_BYTES);
+    http_append(out, len, max, " slot_free=");
+    http_append_u64(out, len, max, image_len < PIOS_STAGE2_ZONE_BYTES ? PIOS_STAGE2_ZONE_BYTES - image_len : 0);
+    http_append(out, len, max, "\ntext=");
+    http_append_u64(out, len, max, text_start);
+    http_append(out, len, max, "..");
+    http_append_u64(out, len, max, text_end);
+    http_append(out, len, max, " rodata_data_to_bss=");
+    http_append_u64(out, len, max, bss_start > text_end ? bss_start - text_end : 0);
+    http_append(out, len, max, " bss=");
+    http_append_u64(out, len, max, bss_start);
+    http_append(out, len, max, "..");
+    http_append_u64(out, len, max, bss_end);
+    http_append(out, len, max, " heap_start=");
+    http_append_u64(out, len, max, heap_start);
+    http_append(out, len, max, "\nCORE RAM_BASE SLOT0 SLOT_END\n");
+    for (u32 c = 0; c < 4; c++) {
+        u64 base = core_ram_bases[c];
+        http_append_u64(out, len, max, c);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, base);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, base + PROC_SLOT_OFFSET);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, base + PROC_SLOT_OFFSET + ((u64)MAX_PROCS_PER_CORE * PROC_SLOT_SIZE));
+        http_append(out, len, max, "\n");
+    }
+    http_append(out, len, max, "PROC PID CORE STATE MEMK ACAP AUSED AHI ABUMP ASPAN SCNT IMAGE\n");
+    for (u32 i = 0; i < n; i++) {
+        http_append_u64(out, len, max, snap[i].pid);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, snap[i].affinity_core);
+        http_append(out, len, max, " ");
+        http_append(out, len, max, ui_proc_state_str(snap[i].state));
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, snap[i].mem_kib);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, snap[i].arena_capacity_kib);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, snap[i].arena_used_kib);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, snap[i].arena_high_kib);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, snap[i].arena_bump_kib);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, snap[i].arena_span_kib);
+        http_append(out, len, max, " ");
+        http_append_u64(out, len, max, snap[i].arena_span_count);
+        http_append(out, len, max, " ");
+        http_append(out, len, max, snap[i].image_path);
+        http_append(out, len, max, "\n");
+    }
 }
 
 static void pios_write_le32(u8 *p, u32 v)
@@ -3915,6 +4041,7 @@ static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
 static void ui_cmd_dns(u32 argc, char **argv);
+static void ui_cmd_mem(u32 argc, char **argv);
 static void ui_console_hex_fixed(u64 v, u32 digits);
 static bool ui_resolve_pis_path(const char *in, char *out, u32 out_max);
 static bool ui_resolve_pix_path(const char *in, char *out, u32 out_max);
@@ -5213,6 +5340,78 @@ static void ui_console_hex_fixed(u64 v, u32 digits)
     for (i32 i = (i32)((digits - 1U) * 4U); i >= 0; i -= 4) {
         char s[2] = { hx[(v >> (u32)i) & 0xFULL], 0 };
         ui_console_write(s);
+    }
+}
+
+static void ui_cmd_mem(u32 argc, char **argv)
+{
+    if (argc >= 2 && !ui_streq(argv[1], "analyze")) {
+        ui_console_write("ERR: usage mem analyze\n");
+        return;
+    }
+    u64 k_start = (u64)(usize)&_start;
+    u64 text_start = (u64)(usize)&__text_start;
+    u64 text_end = (u64)(usize)&__text_end;
+    u64 bss_start = (u64)(usize)&__bss_start;
+    u64 bss_end = (u64)(usize)&__bss_end;
+    u64 heap_start = (u64)(usize)&__heap_start;
+    u32 image_len = http_running_kernel_image_len();
+    struct proc_ui_entry snap[MAX_PROCS_PER_CORE + 1U];
+    u32 n = proc_snapshot(snap, MAX_PROCS_PER_CORE + 1U);
+
+    ui_console_write("mem kernel_start=");
+    ui_console_hex_fixed(k_start, 16);
+    ui_console_write(" image_bytes=");
+    ui_console_u32_dec(image_len);
+    ui_console_write(" slot_capacity=");
+    ui_console_u32_dec(PIOS_STAGE2_ZONE_BYTES);
+    ui_console_write(" slot_free=");
+    ui_console_u32_dec(image_len < PIOS_STAGE2_ZONE_BYTES ? PIOS_STAGE2_ZONE_BYTES - image_len : 0);
+    ui_console_write("\ntext=");
+    ui_console_hex_fixed(text_start, 16);
+    ui_console_write("..");
+    ui_console_hex_fixed(text_end, 16);
+    ui_console_write(" bss=");
+    ui_console_hex_fixed(bss_start, 16);
+    ui_console_write("..");
+    ui_console_hex_fixed(bss_end, 16);
+    ui_console_write(" heap_start=");
+    ui_console_hex_fixed(heap_start, 16);
+    ui_console_write("\nCORE RAM_BASE SLOT0 SLOT_END\n");
+    for (u32 c = 0; c < 4; c++) {
+        ui_console_u32_dec(c);
+        ui_console_write(" ");
+        ui_console_hex_fixed(core_ram_bases[c], 16);
+        ui_console_write(" ");
+        ui_console_hex_fixed(core_ram_bases[c] + PROC_SLOT_OFFSET, 16);
+        ui_console_write(" ");
+        ui_console_hex_fixed(core_ram_bases[c] + PROC_SLOT_OFFSET + ((u64)MAX_PROCS_PER_CORE * PROC_SLOT_SIZE), 16);
+        ui_console_write("\n");
+    }
+    ui_console_write("PROC PID CORE STATE MEMK ACAP AUSED AHI ABUMP ASPAN SCNT IMAGE\n");
+    for (u32 i = 0; i < n; i++) {
+        ui_console_u32_dec(snap[i].pid);
+        ui_console_write(" ");
+        ui_console_u32_dec(snap[i].affinity_core);
+        ui_console_write(" ");
+        ui_console_write(ui_proc_state_str(snap[i].state));
+        ui_console_write(" ");
+        ui_console_u32_dec(snap[i].mem_kib);
+        ui_console_write(" ");
+        ui_console_u32_dec(snap[i].arena_capacity_kib);
+        ui_console_write(" ");
+        ui_console_u32_dec(snap[i].arena_used_kib);
+        ui_console_write(" ");
+        ui_console_u32_dec(snap[i].arena_high_kib);
+        ui_console_write(" ");
+        ui_console_u32_dec(snap[i].arena_bump_kib);
+        ui_console_write(" ");
+        ui_console_u32_dec(snap[i].arena_span_kib);
+        ui_console_write(" ");
+        ui_console_u32_dec(snap[i].arena_span_count);
+        ui_console_write(" ");
+        ui_console_write(snap[i].image_path);
+        ui_console_write("\n");
     }
 }
 
@@ -9074,6 +9273,8 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("launch <path> [1|2|3] [lazy|low|normal|high|realtime]\n  Launch executable on a core.\n");
     } else if (ui_streq(topic, "netstat")) {
         ui_console_write("netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
+    } else if (ui_streq(topic, "mem")) {
+        ui_console_write("mem analyze\n  Show kernel image, raw-slot, per-core RAM, and process memory layout diagnostics.\n");
     } else if (ui_streq(topic, "http") || ui_streq(topic, "https")) {
         ui_console_write("http get <ip> [path] [port] [timeout_ms]\n  Fetch plaintext HTTP over TCP.\n");
         ui_console_write("https get <ip> [path] [port] [timeout_ms]\n  Fetch through the PIOS kernel TLS-wrapper endpoint, not browser HTTPS.\n");
@@ -9201,6 +9402,7 @@ static void ui_console_exec(char *line)
         } else if (ui_streq(argv[1], "core")) {
             ui_console_write("Core/process commands:\n");
             ui_console_write("  status\n  time\n  ps\n  kill <pid>\n");
+            ui_console_write("  mem analyze\n");
             ui_console_write("  launch|run <path> [1|2|3] [priority]\n");
             ui_console_write("  prio <pid> <lazy|low|normal|high|realtime>\n");
             ui_console_write("  affinity <pid> <1|2|3>\n");
@@ -9316,6 +9518,8 @@ static void ui_console_exec(char *line)
         ui_cmd_addr(argc, argv);
     } else if (ui_streq(argv[0], "netstat")) {
         ui_console_print_netstat();
+    } else if (ui_streq(argv[0], "mem")) {
+        ui_cmd_mem(argc, argv);
     } else if (ui_streq(argv[0], "http")) {
         ui_cmd_http_client(argc, argv, false);
     } else if (ui_streq(argv[0], "https")) {

@@ -84,6 +84,7 @@ status
 ps
 netstat
 processes
+mem analyze
 users
 firewall list
 watchdog status
@@ -101,10 +102,13 @@ dumpmem 0x80000 128
 The debug/admin console includes direct memory inspection commands:
 
 ```text
+mem analyze
 peek <addr> [1|2|4|8]
 poke <addr> <value> [1|2|4|8]
 dumpmem <addr> [bytes]
 ```
+
+`mem analyze` is read-only and safe for the TCP/Web terminal. It reports the running kernel image footprint, raw-slot free space, linker section addresses, per-core process slot layout, and current process arena/span memory telemetry before retrying risky process work.
 
 Examples:
 
