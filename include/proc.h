@@ -122,12 +122,6 @@ struct appf_service_record {
 #define PROC_ENTRY_FLAG_SVC_REQUIRED    0x00000040U
 #define PROC_ENTRY_SPSR_EL0_DAIF        0x000003C0U
 
-#define PROC_SVC_NOP         0U
-#define PROC_SVC_GETPID      1U
-#define PROC_SVC_YIELD       2U
-#define PROC_SVC_TICKS       3U
-#define PROC_SVC_ABI_VERSION 4U
-
 /* Saved context for cooperative context switch (callee-saved only) */
 struct proc_context {
     u64 x19_x30[12];   /* x19-x30 (12 callee-saved registers) */
@@ -379,7 +373,6 @@ u32  proc_count(void);             /* number of active processes on this core */
 bool proc_handle_fault(u64 esr, u64 elr, u64 far); /* kill faulting user proc */
 bool proc_handle_svc(struct irq_frame *frame, u64 esr);
 bool proc_svc_selftest(void);
-bool proc_kpi_migration_selftest(void);
 u64  proc_svc_calls(void);
 u64  proc_svc_bad_calls(void);
 
