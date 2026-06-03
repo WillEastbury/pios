@@ -10,8 +10,11 @@ struct abi_status {
     bool ksvc_mailboxes;
     bool ksvc_callbacks;
     bool svc_trap_ready;
+    bool el0_entry_contract;
     bool el0_ready;
     bool user_ttbr_split;
+    u32 el0_entry_flags;
+    u32 el0_spsr;
     u32 kernel_api_version;
     u32 pending_steps;
 } PACKED;

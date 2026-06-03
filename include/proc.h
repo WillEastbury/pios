@@ -113,6 +113,15 @@ struct appf_service_record {
 #define PROC_PRIO_REALTIME  4
 #define PROC_CAPSULE_ID_NONE 0xFFFFFFFFU
 
+#define PROC_ENTRY_FLAG_DIRECT_KPI      0x00000001U
+#define PROC_ENTRY_FLAG_EL0_CONTRACT    0x00000002U
+#define PROC_ENTRY_FLAG_CODE_RX_RO      0x00000004U
+#define PROC_ENTRY_FLAG_DATA_RW_XN      0x00000008U
+#define PROC_ENTRY_FLAG_STACK_16_ALIGN  0x00000010U
+#define PROC_ENTRY_FLAG_API_IN_X0       0x00000020U
+#define PROC_ENTRY_FLAG_SVC_REQUIRED    0x00000040U
+#define PROC_ENTRY_SPSR_EL0_DAIF        0x000003C0U
+
 /* Saved context for cooperative context switch (callee-saved only) */
 struct proc_context {
     u64 x19_x30[12];   /* x19-x30 (12 callee-saved registers) */
@@ -171,6 +180,10 @@ struct process {
     u32 exec_hash_last;
     u64 exec_hash_next_check_tick;
     u32 exec_hash_check_nonce;
+    u64 entry_pc;
+    u64 entry_sp;
+    u64 entry_spsr;
+    u32 entry_flags;
     u64 arena_base;
     u64 arena_limit;
     u32 arena_capacity_bytes;
@@ -371,6 +384,9 @@ bool proc_span_release(void *ptr);
 u32  proc_log_snapshot(struct proc_log_ui_entry *out, u32 max_entries);
 u32  proc_capsule_snapshot(struct proc_capsule_ui_entry *out, u32 max_entries);
 void proc_security_stats_snapshot(struct proc_security_stats *out);
+bool proc_entry_contract_selftest(void);
+u32  proc_entry_contract_flags(void);
+u32  proc_entry_contract_spsr(void);
 bool proc_kill_pid(u32 pid, u32 code);
 i32  proc_restart_pid(u32 pid, u32 code);
 i32  proc_launch_on_core(u32 target_core, const char *path);

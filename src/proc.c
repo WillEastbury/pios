@@ -89,6 +89,7 @@ static void proc_account_runtime(struct process *p);
 static u32 proc_arena_bump_bytes(u32 slot);
 static void proc_arena_update_high(struct process *p, u32 slot);
 static void proc_span_reset(u32 slot);
+static bool proc_entry_contract_validate(const struct process *p);
 
 extern u8 __text_start;
 extern u8 __text_end;
@@ -236,6 +237,60 @@ static u32 proc_arena_bump_bytes(u32 slot)
         return 0;
     u64 used = heap_top[slot] - p->arena_base;
     return used > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (u32)used;
+}
+
+u32 proc_entry_contract_flags(void)
+{
+    return PROC_ENTRY_FLAG_DIRECT_KPI |
+           PROC_ENTRY_FLAG_EL0_CONTRACT |
+           PROC_ENTRY_FLAG_CODE_RX_RO |
+           PROC_ENTRY_FLAG_DATA_RW_XN |
+           PROC_ENTRY_FLAG_STACK_16_ALIGN |
+           PROC_ENTRY_FLAG_API_IN_X0 |
+           PROC_ENTRY_FLAG_SVC_REQUIRED;
+}
+
+u32 proc_entry_contract_spsr(void)
+{
+    return PROC_ENTRY_SPSR_EL0_DAIF;
+}
+
+static bool proc_entry_contract_validate(const struct process *p)
+{
+    u64 base;
+    u64 limit;
+    if (!p || !p->base || p->mem_size != PROC_SLOT_SIZE || p->exec_image_size == 0)
+        return false;
+    base = (u64)(usize)p->base;
+    limit = base + p->mem_size;
+    if (limit <= base)
+        return false;
+    if ((p->entry_pc & 3ULL) != 0 || p->entry_pc < base || p->entry_pc >= base + p->exec_image_size)
+        return false;
+    if ((p->entry_sp & 15ULL) != 0 || p->entry_sp <= p->arena_limit || p->entry_sp >= limit)
+        return false;
+    if (p->arena_base <= base || p->arena_base >= p->arena_limit || p->arena_limit >= p->entry_sp)
+        return false;
+    if ((p->entry_flags & proc_entry_contract_flags()) != proc_entry_contract_flags())
+        return false;
+    return p->entry_spsr == PROC_ENTRY_SPSR_EL0_DAIF;
+}
+
+bool proc_entry_contract_selftest(void)
+{
+    struct process p;
+    u8 *fake_slot = (u8 *)(usize)0x40000000ULL;
+    simd_zero(&p, sizeof(p));
+    p.base = fake_slot;
+    p.mem_size = PROC_SLOT_SIZE;
+    p.exec_image_size = 4096U;
+    p.entry_pc = (u64)(usize)fake_slot;
+    p.arena_base = ((u64)(usize)fake_slot + 4096U + L3_PAGE_SIZE - 1U) & ~(u64)(L3_PAGE_SIZE - 1U);
+    p.arena_limit = (u64)(usize)fake_slot + PROC_SLOT_SIZE - 65536ULL;
+    p.entry_sp = (u64)(usize)(fake_slot + PROC_SLOT_SIZE - 16U);
+    p.entry_spsr = PROC_ENTRY_SPSR_EL0_DAIF;
+    p.entry_flags = proc_entry_contract_flags();
+    return proc_entry_contract_validate(&p);
 }
 
 static void proc_arena_update_high(struct process *p, u32 slot)
@@ -1339,6 +1394,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->exec_hash_last = exec_hash;
     p->exec_hash_check_nonce = 1;
     p->exec_hash_next_check_tick = proc_integrity_next_tick(p->pid, p->exec_hash_check_nonce);
+    p->entry_pc = (u64)(usize)base;
     p->arena_base = ((u64)(usize)base + loaded + L3_PAGE_SIZE - 1) & ~(L3_PAGE_SIZE - 1);
     p->arena_limit = (u64)(usize)base + PROC_SLOT_SIZE - 65536ULL;
     if (p->arena_base >= p->arena_limit) {
@@ -1383,11 +1439,21 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     dcache_clean_range((u64)(usize)base, loaded);
     icache_invalidate_range((u64)(usize)base, loaded);
 
+    p->entry_sp = (u64)(usize)(base + PROC_SLOT_SIZE - 16);
+    p->entry_spsr = PROC_ENTRY_SPSR_EL0_DAIF;
+    p->entry_flags = proc_entry_contract_flags();
+    if (!proc_entry_contract_validate(p)) {
+        uart_puts("[proc] invalid entry contract\n");
+        p->state = PROC_EMPTY;
+        p->pid = 0;
+        return -1;
+    }
+
     simd_zero(&p->ctx, sizeof(p->ctx));
     p->ctx.x19_x30[0] = (u64)(usize)&kernel_api_tab;  /* x19 */
-    p->ctx.x19_x30[1] = (u64)(usize)base;           /* x20 */
+    p->ctx.x19_x30[1] = p->entry_pc;                /* x20 */
     p->ctx.x19_x30[11] = (u64)(usize)proc_trampoline; /* x30 = LR */
-    p->ctx.sp = (u64)(usize)(base + PROC_SLOT_SIZE - 16);
+    p->ctx.sp = p->entry_sp;
 
     if (!mmu_user_table_build_split(core_id(), (u32)slot, (u64)(usize)base, PROC_SLOT_SIZE, loaded)) {
         p->state = PROC_EMPTY;

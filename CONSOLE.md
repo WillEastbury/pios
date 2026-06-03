@@ -346,7 +346,7 @@ The status includes total/handled/unhandled/spurious IRQs, timer IRQ count, last
 
 ## Kernel/user ABI transition
 
-PIOS exposes the current user ABI transition state. Today processes still enter through the direct PIKEE/KPI table while ksvc provides EL1 service foundations; SVC trap and full EL0 ABI migration remain pending.
+PIOS exposes the current user ABI transition state. Today processes still enter through the direct PIKEE/KPI table while ksvc provides EL1 service foundations. The EL0 entry contract is now defined and validated for process launches: entry PC must be aligned and inside the loaded image, SP must be 16-byte aligned in the stack band, code/data split assumptions must be present, and the future EL0 return SPSR is fixed. SVC trap and full EL0 ABI migration remain pending.
 
 ```text
 abi status
