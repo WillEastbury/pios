@@ -1383,7 +1383,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "x509")) {
             http_append(out, &len, max, "x509 status | x509 generate [cn] | x509 csr [cn] | x509 p256 [cn] | x509 bind | x509 import-self | x509 selftest\n  Manage kernel-only X.509 cert/key, CSR, import, and TLS binding state.\n");
         } else if (http_streq(topic, "acme")) {
-            http_append(out, &len, max, "acme status | acme prepare <domain> | acme challenge <token> <keyauth> | acme clear | acme selftest\n  Prepare ACME HTTP-01 state and serve /.well-known/acme-challenge/<token>.\n");
+            http_append(out, &len, max, "acme status | acme prepare <domain> | acme csrhex | acme challenge <token> <keyauth> | acme clear | acme selftest\n  Prepare ACME HTTP-01 state, export CSR DER hex, and serve /.well-known/acme-challenge/<token>.\n");
         } else if (http_streq(topic, "ksvc")) {
             http_append(out, &len, max, "ksvc status\n  Show kernel service/plugin registry, core ownership, priorities, and runtime counters.\n");
         } else if (http_streq(topic, "irq")) {
@@ -1724,6 +1724,21 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "\n");
     } else if (http_starts_with(cmd, "acme prepare ")) {
         http_append(out, &len, max, acme_prepare_http01(cmd + 13) ? "ACME prepare OK\n" : "ACME prepare FAILED\n");
+    } else if (http_streq(cmd, "acme csrhex")) {
+        u32 csr_len = 0;
+        const u8 *csr = x509_csr_der(&csr_len);
+        if (!csr || csr_len == 0) {
+            http_append(out, &len, max, "ERR: no CSR ready; run acme prepare <domain>\n");
+        } else {
+            http_append(out, &len, max, "csr_der_hex len=");
+            http_append_u64(out, &len, max, csr_len);
+            http_append(out, &len, max, "\n");
+            for (u32 i = 0; i < csr_len; i++) {
+                http_append_hex8(out, &len, max, csr[i]);
+                if ((i & 31U) == 31U) http_append(out, &len, max, "\n");
+            }
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_starts_with(cmd, "acme challenge ")) {
         char token[ACME_TOKEN_MAX];
         const char *p = cmd + 15;
@@ -5613,6 +5628,23 @@ static void ui_cmd_acme(u32 argc, char **argv)
         ui_print_acme_status();
         return;
     }
+    if (argc >= 2 && ui_streq(argv[1], "csrhex")) {
+        u32 csr_len = 0;
+        const u8 *csr = x509_csr_der(&csr_len);
+        if (!csr || csr_len == 0) {
+            ui_console_write("ERR: no CSR ready; run acme prepare <domain>\n");
+            return;
+        }
+        ui_console_write("csr_der_hex len=");
+        ui_console_u32_dec(csr_len);
+        ui_console_write("\n");
+        for (u32 i = 0; i < csr_len; i++) {
+            ui_console_hex_fixed(csr[i], 2);
+            if ((i & 31U) == 31U) ui_console_write("\n");
+        }
+        ui_console_write("\n");
+        return;
+    }
     if (argc >= 2 && ui_streq(argv[1], "clear")) {
         acme_clear_http01_challenge();
         ui_console_write("ACME clear OK\n");
@@ -5628,7 +5660,7 @@ static void ui_cmd_acme(u32 argc, char **argv)
         ui_print_acme_status();
         return;
     }
-    ui_console_write("ERR: usage acme status | acme prepare <domain> | acme challenge <token> <keyauth> | acme clear | acme selftest\n");
+    ui_console_write("ERR: usage acme status | acme prepare <domain> | acme csrhex | acme challenge <token> <keyauth> | acme clear | acme selftest\n");
 }
 
 static void ui_cmd_ksvc(u32 argc, char **argv)
@@ -9081,6 +9113,7 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "acme")) {
         ui_console_write("acme status\n  Show ACME account, CSR, and HTTP-01 challenge state.\n");
         ui_console_write("acme prepare <domain>\n  Generate an ACME-compatible P-256 CSR for the domain.\n");
+        ui_console_write("acme csrhex\n  Export the prepared CSR DER as hex.\n");
         ui_console_write("acme challenge <token> <keyauth>\n  Arm /.well-known/acme-challenge/<token>.\n");
         ui_console_write("acme clear\n  Clear the current HTTP-01 challenge.\n");
         ui_console_write("acme selftest\n  Exercise CSR prep and challenge response state.\n");
