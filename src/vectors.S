@@ -246,8 +246,8 @@ sync_handler:
     mov     w13, #'1'
     str     w13, [x12, #0x00]
     SAVE_CONTEXT
-    mrs     x0, esr_el1
-    mrs     x1, elr_el1
+    mov     x0, sp
+    mrs     x1, esr_el1
     mrs     x2, far_el1
     bl      sync_exception      /* C function */
     RESTORE_CONTEXT

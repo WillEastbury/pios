@@ -41,6 +41,8 @@ static volatile bool preempt_armed[3];
 static volatile bool preempt_pending[3];
 static u64 preempt_quantum_ticks[3];
 static u64 preempt_count_core[3];
+static u64 svc_call_count;
+static u64 svc_bad_count;
 static struct proc_security_stats proc_sec_stats;
 
 #define PROC_LAUNCH_PATH_MAX 96
@@ -291,6 +293,68 @@ bool proc_entry_contract_selftest(void)
     p.entry_spsr = PROC_ENTRY_SPSR_EL0_DAIF;
     p.entry_flags = proc_entry_contract_flags();
     return proc_entry_contract_validate(&p);
+}
+
+#define PROC_SVC_NOP     0U
+#define PROC_SVC_GETPID  1U
+
+u64 proc_svc_calls(void)
+{
+    return svc_call_count;
+}
+
+u64 proc_svc_bad_calls(void)
+{
+    return svc_bad_count;
+}
+
+static u32 proc_current_pid_for_svc(void)
+{
+    if (!on_user_core() || current_proc >= MAX_PROCS_PER_CORE)
+        return 0;
+    if (procs[current_proc].state != PROC_RUNNING)
+        return 0;
+    return procs[current_proc].pid;
+}
+
+static bool proc_handle_svc_inner(struct irq_frame *frame, u64 esr, bool account)
+{
+    u32 imm = (u32)(esr & 0xFFFFU);
+    if (!frame)
+        return false;
+    if (account)
+        svc_call_count++;
+    switch (imm) {
+    case PROC_SVC_NOP:
+        frame->x[0] = 0;
+        return true;
+    case PROC_SVC_GETPID:
+        frame->x[0] = proc_current_pid_for_svc();
+        return true;
+    default:
+        if (account)
+            svc_bad_count++;
+        frame->x[0] = (u64)-38; /* ENOSYS */
+        return true;
+    }
+}
+
+bool proc_handle_svc(struct irq_frame *frame, u64 esr)
+{
+    return proc_handle_svc_inner(frame, esr, true);
+}
+
+bool proc_svc_selftest(void)
+{
+    struct irq_frame f;
+    simd_zero(&f, sizeof(f));
+    if (!proc_handle_svc_inner(&f, ((u64)EC_SVC64 << ESR_EC_SHIFT) | PROC_SVC_NOP, false))
+        return false;
+    if (f.x[0] != 0)
+        return false;
+    if (!proc_handle_svc_inner(&f, ((u64)EC_SVC64 << ESR_EC_SHIFT) | 0xFFFFU, false))
+        return false;
+    return f.x[0] == (u64)-38;
 }
 
 static void proc_arena_update_high(struct process *p, u32 slot)

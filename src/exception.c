@@ -136,8 +136,12 @@ void irq_diag_snapshot(struct irq_diag_snapshot *out)
 }
 
 /* Called from vectors.S sync_handler */
-void sync_exception(u64 esr, u64 elr, u64 far) {
+void sync_exception(struct irq_frame *frame, u64 esr, u64 far) {
     u32 ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
+    u64 elr = frame ? frame->elr : 0;
+
+    if (ec == EC_SVC64 && proc_handle_svc(frame, esr))
+        return;
 
     if ((ec == EC_DABT_CUR || ec == EC_DABT_LOW ||
          ec == EC_IABT_CUR || ec == EC_IABT_LOW) &&

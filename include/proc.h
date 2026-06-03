@@ -371,6 +371,10 @@ NORETURN void proc_exit(u32 code); /* terminate current process */
 void proc_schedule(void);          /* run scheduler loop (called from coreN_main) */
 u32  proc_count(void);             /* number of active processes on this core */
 bool proc_handle_fault(u64 esr, u64 elr, u64 far); /* kill faulting user proc */
+bool proc_handle_svc(struct irq_frame *frame, u64 esr);
+bool proc_svc_selftest(void);
+u64  proc_svc_calls(void);
+u64  proc_svc_bad_calls(void);
 
 /* Preemption (user cores only) */
 #define PROC_PREEMPT_TIMER_HZ    1000U

@@ -13,6 +13,8 @@ struct abi_status {
     bool el0_entry_contract;
     bool el0_ready;
     bool user_ttbr_split;
+    u64 svc_calls;
+    u64 svc_bad_calls;
     u32 el0_entry_flags;
     u32 el0_spsr;
     u32 kernel_api_version;

@@ -1605,6 +1605,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, a.ksvc_callbacks ? "yes" : "no");
         http_append(out, &len, max, " svc_trap=");
         http_append(out, &len, max, a.svc_trap_ready ? "ready" : "pending");
+        http_append(out, &len, max, " svc_calls=");
+        http_append_u64(out, &len, max, a.svc_calls);
+        http_append(out, &len, max, " svc_bad=");
+        http_append_u64(out, &len, max, a.svc_bad_calls);
         http_append(out, &len, max, " entry_contract=");
         http_append(out, &len, max, a.el0_entry_contract ? "ready" : "pending");
         http_append(out, &len, max, " el0=");
@@ -5342,6 +5346,10 @@ static void ui_cmd_abi(u32 argc, char **argv)
     ui_console_write(a.ksvc_callbacks ? "yes" : "no");
     ui_console_write(" svc_trap=");
     ui_console_write(a.svc_trap_ready ? "ready" : "pending");
+    ui_console_write(" svc_calls=");
+    ui_console_u64_dec(a.svc_calls);
+    ui_console_write(" svc_bad=");
+    ui_console_u64_dec(a.svc_bad_calls);
     ui_console_write(" entry_contract=");
     ui_console_write(a.el0_entry_contract ? "ready" : "pending");
     ui_console_write(" el0=");
