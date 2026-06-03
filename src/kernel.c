@@ -2135,17 +2135,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         else
             http_append(out, &len, max, "kill failed\n");
     } else if (http_starts_with(cmd, "restart ")) {
-        u32 pid = 0;
-        i32 new_pid = -1;
-        if (http_parse_u32(cmd + 8, &pid))
-            new_pid = proc_restart_pid(pid, 0xFFFF5003U);
-        if (new_pid > 0) {
-            http_append(out, &len, max, "restarted new_pid=");
-            http_append_u64(out, &len, max, (u32)new_pid);
-            http_append(out, &len, max, "\n");
-        } else {
-            http_append(out, &len, max, "restart failed\n");
-        }
+        http_append(out, &len, max, "restart blocked: process launch/restart is disabled on HTTP console until non-crashing harness exists\n");
     } else {
         http_append(out, &len, max, "unknown command\n");
     }
@@ -2198,30 +2188,16 @@ static u32 http_build_process_action_response(char *out, u32 max, const u8 *req,
             ok = proc_kill_pid(pid, 0xFFFF5000U);
             message = ok ? "killed" : "kill failed";
         } else {
-            new_pid = proc_restart_pid(pid, 0xFFFF5001U);
-            ok = new_pid > 0;
-            message = ok ? "restarted" : "restart failed";
+            ok = false;
+            message = "restart blocked: process launch/restart disabled until non-crashing harness exists";
         }
     } else if (ui_streq(action, "launch")) {
-        u32 core = CORE_USERM;
-        u32 principal_id = principal_current();
-        u32 priority = PROC_PRIO_NORMAL;
-        if (!http_query_value(req, req_len, "/api/process", "path", path, sizeof(path))) {
-            message = "missing path";
-        } else {
-            if (http_query_value(req, req_len, "/api/process", "core", core_s, sizeof(core_s))) {
-                if (core_s[0] == '2') core = CORE_USER0;
-                else if (core_s[0] == '3') core = CORE_USER1;
-                else core = CORE_USERM;
-            }
-            if (http_query_value(req, req_len, "/api/process", "principal", principal_s, sizeof(principal_s)))
-                (void)http_parse_u32(principal_s, &principal_id);
-            if (http_query_value(req, req_len, "/api/process", "prio", prio_s, sizeof(prio_s)))
-                (void)http_parse_u32(prio_s, &priority);
-            new_pid = proc_launch_on_core_as_prio(core, path, principal_id, priority);
-            ok = new_pid > 0;
-            message = ok ? "launched" : "launch failed";
-        }
+        (void)path;
+        (void)core_s;
+        (void)principal_s;
+        (void)prio_s;
+        ok = false;
+        message = "launch blocked: prior live process launch wedged board; use local console only after root-cause harness";
     } else {
         message = "unknown action";
     }
