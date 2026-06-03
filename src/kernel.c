@@ -70,6 +70,7 @@
 #include "tls.h"
 #include "brotli.h"
 #include "x509.h"
+#include "acme.h"
 #include "abi.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
@@ -167,6 +168,7 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HTTP_ROUTE_PLACEHOLDER 7U
 #define HTTP_ROUTE_NOT_FOUND  8U
 #define HTTP_ROUTE_NETSTAT    9U
+#define HTTP_ROUTE_ACME       10U
 
 #define HTTP_ERR_NONE         0U
 #define HTTP_ERR_RESP_TIMEOUT 1U
@@ -785,8 +787,33 @@ static bool http_request_path_is(const u8 *req, u32 len, const char *path)
     return i < len && (req[i] == ' ' || req[i] == '?' || req[i] == '\r' || req[i] == '\n');
 }
 
+static bool http_request_path_prefix_token(const u8 *req, u32 len, const char *prefix,
+                                           char *out, u32 out_max)
+{
+    u32 i = 0;
+    u32 o = 0;
+    if (!out || out_max == 0) return false;
+    out[0] = 0;
+    if (!http_request_path_start(req, len, &i))
+        return false;
+    while (*prefix) {
+        if (i >= len || req[i++] != (u8)*prefix++)
+            return false;
+    }
+    while (i < len && req[i] != ' ' && req[i] != '?' && req[i] != '\r' && req[i] != '\n') {
+        if (o + 1 >= out_max)
+            return false;
+        out[o++] = (char)req[i++];
+    }
+    out[o] = 0;
+    return o > 0;
+}
+
 static u32 http_route_id(const u8 *req, u32 len)
 {
+    char token[ACME_TOKEN_MAX];
+    if (http_request_path_prefix_token(req, len, "/.well-known/acme-challenge/", token, sizeof(token)))
+        return HTTP_ROUTE_ACME;
     if (http_request_path_is(req, len, "/api/status"))
         return HTTP_ROUTE_STATUS;
     if (http_request_path_is(req, len, "/api/netstat"))
@@ -1269,6 +1296,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "brotli selftest\n  Verify the no-external-dependency Brotli stored encoder and PicoWeb micro-Brotli decoder.\n");
         } else if (http_streq(topic, "x509")) {
             http_append(out, &len, max, "x509 status | x509 generate [cn] | x509 csr [cn] | x509 p256 [cn] | x509 bind | x509 import-self | x509 selftest\n  Manage kernel-only X.509 cert/key, CSR, import, and TLS binding state.\n");
+        } else if (http_streq(topic, "acme")) {
+            http_append(out, &len, max, "acme status | acme prepare <domain> | acme challenge <token> <keyauth> | acme clear | acme selftest\n  Prepare ACME HTTP-01 state and serve /.well-known/acme-challenge/<token>.\n");
         } else if (http_streq(topic, "ksvc")) {
             http_append(out, &len, max, "ksvc status\n  Show kernel service/plugin registry, core ownership, priorities, and runtime counters.\n");
         } else if (http_streq(topic, "irq")) {
@@ -1498,6 +1527,47 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, x509_bind_tls() ? "X509 bind OK\n" : "X509 bind FAILED\n");
     } else if (http_streq(cmd, "x509 selftest")) {
         http_append(out, &len, max, x509_selftest() ? "X509 selftest OK\n" : "X509 selftest FAILED\n");
+    } else if (http_streq(cmd, "acme") || http_streq(cmd, "acme status")) {
+        struct acme_status as;
+        acme_status(&as);
+        http_append(out, &len, max, "acme initialized=");
+        http_append(out, &len, max, as.initialized ? "yes" : "no");
+        http_append(out, &len, max, " account_key=");
+        http_append(out, &len, max, as.account_key ? "yes" : "no");
+        http_append(out, &len, max, " csr_ready=");
+        http_append(out, &len, max, as.csr_ready ? "yes" : "no");
+        http_append(out, &len, max, " challenge_ready=");
+        http_append(out, &len, max, as.challenge_ready ? "yes" : "no");
+        http_append(out, &len, max, " state=");
+        http_append_u64(out, &len, max, as.state);
+        http_append(out, &len, max, " account_fp=");
+        http_append_u64(out, &len, max, as.account_fingerprint);
+        http_append(out, &len, max, " csr_len=");
+        http_append_u64(out, &len, max, as.csr_len);
+        http_append(out, &len, max, " error=");
+        http_append_u64(out, &len, max, as.last_error);
+        http_append(out, &len, max, "\ndirectory=");
+        http_append(out, &len, max, as.directory);
+        http_append(out, &len, max, "\ndomain=");
+        http_append(out, &len, max, as.domain);
+        http_append(out, &len, max, "\ntoken=");
+        http_append(out, &len, max, as.token);
+        http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "acme prepare ")) {
+        http_append(out, &len, max, acme_prepare_http01(cmd + 13) ? "ACME prepare OK\n" : "ACME prepare FAILED\n");
+    } else if (http_starts_with(cmd, "acme challenge ")) {
+        char token[ACME_TOKEN_MAX];
+        const char *p = cmd + 15;
+        u32 ti = 0;
+        while (*p && *p != ' ' && ti + 1 < sizeof(token)) token[ti++] = *p++;
+        token[ti] = 0;
+        if (*p == ' ') p++;
+        http_append(out, &len, max, acme_set_http01_challenge(token, p) ? "ACME challenge OK\n" : "ACME challenge FAILED\n");
+    } else if (http_streq(cmd, "acme clear")) {
+        acme_clear_http01_challenge();
+        http_append(out, &len, max, "ACME clear OK\n");
+    } else if (http_streq(cmd, "acme selftest")) {
+        http_append(out, &len, max, acme_selftest() ? "ACME selftest OK\n" : "ACME selftest FAILED\n");
     } else if (http_streq(cmd, "ksvc") || http_streq(cmd, "ksvc status")) {
         struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
         u32 kn = ksvc_snapshot(ks, KSVC_MAX_SERVICES);
@@ -2683,6 +2753,33 @@ static u32 http_build_safe_placeholder_response(char *out, u32 max, const char *
     return len;
 }
 
+static u32 http_build_acme_challenge_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    char token[ACME_TOKEN_MAX];
+    char keyauth[ACME_KEY_AUTH_MAX];
+    bool ok = http_request_path_prefix_token(req, req_len, "/.well-known/acme-challenge/",
+                                             token, sizeof(token)) &&
+              acme_http01_key_authorization(token, keyauth, sizeof(keyauth));
+    if (!ok) {
+        http_append(out, &len, max,
+            "HTTP/1.0 404 Not Found\r\n"
+            "Content-Type: text/plain\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n"
+            "acme challenge not found\n");
+        return len;
+    }
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    http_append(out, &len, max, keyauth);
+    http_append(out, &len, max, "\n");
+    return len;
+}
+
 static u32 http_build_spa_response(char *out, u32 max)
 {
     u32 len = 0;
@@ -2706,6 +2803,12 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
     u32 route = http_route_id(req, req_len);
     http_diag.route = route;
     http_trace(HTTP_EVT_BUILD_ENTER, route, req_len, max);
+    if (route == HTTP_ROUTE_ACME) {
+        len = http_build_acme_challenge_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
     if (HTTP_AUTH_ENABLED && !http_admin_authorized(req, req_len)) {
         http_diag.unauthorized++;
         len = http_build_unauthorized(out, max);
@@ -3596,6 +3699,7 @@ static void ui_cmd_keystore(u32 argc, char **argv);
 static void ui_cmd_tls(u32 argc, char **argv);
 static void ui_cmd_brotli(u32 argc, char **argv);
 static void ui_cmd_x509(u32 argc, char **argv);
+static void ui_cmd_acme(u32 argc, char **argv);
 static void ui_cmd_ksvc(u32 argc, char **argv);
 static void ui_cmd_irq(u32 argc, char **argv);
 static void ui_cmd_abi(u32 argc, char **argv);
@@ -5221,6 +5325,68 @@ static void ui_cmd_x509(u32 argc, char **argv)
         return;
     }
     ui_console_write("ERR: usage x509 status | x509 generate [cn] | x509 csr [cn] | x509 p256 [cn] | x509 bind | x509 import-self | x509 selftest\n");
+}
+
+static void ui_print_acme_status(void)
+{
+    struct acme_status as;
+    acme_status(&as);
+    ui_console_write("acme initialized=");
+    ui_console_write(as.initialized ? "yes" : "no");
+    ui_console_write(" account_key=");
+    ui_console_write(as.account_key ? "yes" : "no");
+    ui_console_write(" csr_ready=");
+    ui_console_write(as.csr_ready ? "yes" : "no");
+    ui_console_write(" challenge_ready=");
+    ui_console_write(as.challenge_ready ? "yes" : "no");
+    ui_console_write(" state=");
+    ui_console_u32_dec(as.state);
+    ui_console_write(" account_fp=");
+    ui_console_hex_fixed(as.account_fingerprint, 8);
+    ui_console_write(" csr_len=");
+    ui_console_u32_dec(as.csr_len);
+    ui_console_write(" error=");
+    ui_console_u32_dec(as.last_error);
+    ui_console_write("\ndirectory=");
+    ui_console_write(as.directory);
+    ui_console_write("\ndomain=");
+    ui_console_write(as.domain);
+    ui_console_write("\ntoken=");
+    ui_console_write(as.token);
+    ui_console_write("\n");
+}
+
+static void ui_cmd_acme(u32 argc, char **argv)
+{
+    if (argc >= 2 && ui_streq(argv[1], "prepare")) {
+        const char *domain = argc >= 3 ? argv[2] : "";
+        ui_console_write(acme_prepare_http01(domain) ? "ACME prepare OK\n" : "ACME prepare FAILED\n");
+        ui_print_acme_status();
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "challenge")) {
+        const char *token = argc >= 3 ? argv[2] : "";
+        const char *keyauth = argc >= 4 ? argv[3] : "";
+        ui_console_write(acme_set_http01_challenge(token, keyauth) ? "ACME challenge OK\n" : "ACME challenge FAILED\n");
+        ui_print_acme_status();
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "clear")) {
+        acme_clear_http01_challenge();
+        ui_console_write("ACME clear OK\n");
+        ui_print_acme_status();
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "selftest")) {
+        ui_console_write(acme_selftest() ? "ACME selftest OK\n" : "ACME selftest FAILED\n");
+        ui_print_acme_status();
+        return;
+    }
+    if (argc < 2 || ui_streq(argv[1], "status")) {
+        ui_print_acme_status();
+        return;
+    }
+    ui_console_write("ERR: usage acme status | acme prepare <domain> | acme challenge <token> <keyauth> | acme clear | acme selftest\n");
 }
 
 static void ui_cmd_ksvc(u32 argc, char **argv)
@@ -8358,6 +8524,12 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("x509 bind\n  Mark the generated DER certificate as bound to kernel TLS.\n");
         ui_console_write("x509 import-self\n  Re-import the current DER certificate to exercise the import API.\n");
         ui_console_write("x509 selftest\n  Generate and bind a selftest DER certificate and CSR.\n");
+    } else if (ui_streq(topic, "acme")) {
+        ui_console_write("acme status\n  Show ACME account, CSR, and HTTP-01 challenge state.\n");
+        ui_console_write("acme prepare <domain>\n  Generate an ACME-compatible P-256 CSR for the domain.\n");
+        ui_console_write("acme challenge <token> <keyauth>\n  Arm /.well-known/acme-challenge/<token>.\n");
+        ui_console_write("acme clear\n  Clear the current HTTP-01 challenge.\n");
+        ui_console_write("acme selftest\n  Exercise CSR prep and challenge response state.\n");
     } else if (ui_streq(topic, "ksvc")) {
         ui_console_write("ksvc status\n  Show kernel service/plugin registry, mailbox counters, and runtime counters.\n");
         ui_console_write("ksvc selftest\n  Round-trip mailbox and fault/restart policy.\n");
@@ -8741,6 +8913,8 @@ static void ui_console_exec(char *line)
         ui_cmd_brotli(argc, argv);
     } else if (ui_streq(argv[0], "x509")) {
         ui_cmd_x509(argc, argv);
+    } else if (ui_streq(argv[0], "acme")) {
+        ui_cmd_acme(argc, argv);
     } else if (ui_streq(argv[0], "ksvc")) {
         ui_cmd_ksvc(argc, argv);
     } else if (ui_streq(argv[0], "irq")) {
@@ -9956,9 +10130,15 @@ void kernel_main(void) {
                 bp_ok("[x509] dev certificate descriptor ready");
             else
                 bp_warn("[x509] dev certificate descriptor unavailable");
+            bp_log("[acme] acme_init...");
+            if (acme_init())
+                bp_ok("[acme] account state ready");
+            else
+                bp_warn("[acme] account state unavailable");
         } else {
             bp_warn("[key] keystore unavailable");
             x509_init();
+            acme_init();
         }
         bp_done(4, sd_ok);
     }

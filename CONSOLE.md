@@ -315,6 +315,22 @@ x509 selftest
 
 `der_ready=yes` means a signed DER certificate is available in kernel memory. `csr_ready=yes` means a signed PKCS#10 CSR is available in kernel memory for future export/ACME plumbing. `x509 csr` emits the Ed25519 CSR path; `x509 p256` emits the ECDSA P-256/SHA-256 CSR path that ACME CAs such as Let's Encrypt can issue against. `x509 import-self` re-imports the current DER certificate to exercise the bounded import path; real ACME import should pass only the leaf DER certificate, then call `x509 bind` after validation.
 
+## ACME / Let's Encrypt foundation
+
+PIOS has a kernel ACME foundation for HTTP-01 issuance. It keeps account state kernel-owned, prepares an ACME-compatible P-256 CSR through the X.509 service, stores bounded HTTP-01 challenge state, and serves `/.well-known/acme-challenge/<token>` without requiring admin authentication. The outbound ACME JWS/order/finalize client is still pending before real Let's Encrypt issuance can complete end-to-end.
+
+Console/Web Admin terminal:
+
+```text
+acme status
+acme prepare <domain>
+acme challenge <token> <key-authorization>
+acme clear
+acme selftest
+```
+
+`acme prepare` generates a P-256 CSR for the requested domain. `acme challenge` arms the HTTP-01 response path; ACME clients should publish the exact key authorization value returned by the CA workflow.
+
 ## Kernel service/plugin registry
 
 PIOS exposes a kernel-internal service registry for EL1 services that still run in the monolithic loop today. This is the first slice of the plugin/threading model: existing direct calls keep their exact order, while the registry records owner core, priority, service kind, mailbox counters, call counts, errors, and duration ticks.
