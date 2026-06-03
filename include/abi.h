@@ -2,10 +2,12 @@
 #include "types.h"
 
 #define ABI_STAGE_DIRECT_KPI 1U
+#define ABI_STAGE_SVC_SHIM   2U
 
 struct abi_status {
     u32 stage;
     bool direct_kpi;
+    bool kpi_svc_shims;
     bool ksvc_registry;
     bool ksvc_mailboxes;
     bool ksvc_callbacks;
@@ -15,6 +17,7 @@ struct abi_status {
     bool user_ttbr_split;
     u64 svc_calls;
     u64 svc_bad_calls;
+    u32 svc_max;
     u32 el0_entry_flags;
     u32 el0_spsr;
     u32 kernel_api_version;

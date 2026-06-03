@@ -4,8 +4,9 @@
 void abi_status(struct abi_status *out)
 {
     if (!out) return;
-    out->stage = ABI_STAGE_DIRECT_KPI;
+    out->stage = ABI_STAGE_SVC_SHIM;
     out->direct_kpi = true;
+    out->kpi_svc_shims = proc_kpi_migration_selftest();
     out->ksvc_registry = true;
     out->ksvc_mailboxes = true;
     out->ksvc_callbacks = true;
@@ -15,18 +16,20 @@ void abi_status(struct abi_status *out)
     out->user_ttbr_split = true;
     out->svc_calls = proc_svc_calls();
     out->svc_bad_calls = proc_svc_bad_calls();
+    out->svc_max = PROC_SVC_ABI_VERSION;
     out->el0_entry_flags = proc_entry_contract_flags();
     out->el0_spsr = proc_entry_contract_spsr();
     out->kernel_api_version = (u32)sizeof(struct kernel_api);
-    out->pending_steps = 1; /* KPI migration */
+    out->pending_steps = 0;
 }
 
 bool abi_selftest(void)
 {
     struct abi_status st;
     abi_status(&st);
-    return st.stage == ABI_STAGE_DIRECT_KPI &&
+    return st.stage == ABI_STAGE_SVC_SHIM &&
            st.direct_kpi &&
+           st.kpi_svc_shims &&
            st.ksvc_registry &&
            st.ksvc_mailboxes &&
            st.ksvc_callbacks &&
@@ -41,5 +44,6 @@ bool abi_selftest(void)
 const char *abi_stage_name(u32 stage)
 {
     if (stage == ABI_STAGE_DIRECT_KPI) return "direct-kpi";
+    if (stage == ABI_STAGE_SVC_SHIM) return "svc-shim";
     return "unknown";
 }

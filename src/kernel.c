@@ -1597,6 +1597,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, abi_stage_name(a.stage));
         http_append(out, &len, max, " direct_kpi=");
         http_append(out, &len, max, a.direct_kpi ? "yes" : "no");
+        http_append(out, &len, max, " kpi_svc_shims=");
+        http_append(out, &len, max, a.kpi_svc_shims ? "yes" : "no");
         http_append(out, &len, max, " ksvc_registry=");
         http_append(out, &len, max, a.ksvc_registry ? "yes" : "no");
         http_append(out, &len, max, " ksvc_mailboxes=");
@@ -1609,6 +1611,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, a.svc_calls);
         http_append(out, &len, max, " svc_bad=");
         http_append_u64(out, &len, max, a.svc_bad_calls);
+        http_append(out, &len, max, " svc_max=");
+        http_append_u64(out, &len, max, a.svc_max);
         http_append(out, &len, max, " entry_contract=");
         http_append(out, &len, max, a.el0_entry_contract ? "ready" : "pending");
         http_append(out, &len, max, " el0=");
@@ -5338,6 +5342,8 @@ static void ui_cmd_abi(u32 argc, char **argv)
     ui_console_write(abi_stage_name(a.stage));
     ui_console_write(" direct_kpi=");
     ui_console_write(a.direct_kpi ? "yes" : "no");
+    ui_console_write(" kpi_svc_shims=");
+    ui_console_write(a.kpi_svc_shims ? "yes" : "no");
     ui_console_write(" ksvc_registry=");
     ui_console_write(a.ksvc_registry ? "yes" : "no");
     ui_console_write(" ksvc_mailboxes=");
@@ -5350,6 +5356,8 @@ static void ui_cmd_abi(u32 argc, char **argv)
     ui_console_u64_dec(a.svc_calls);
     ui_console_write(" svc_bad=");
     ui_console_u64_dec(a.svc_bad_calls);
+    ui_console_write(" svc_max=");
+    ui_console_u32_dec(a.svc_max);
     ui_console_write(" entry_contract=");
     ui_console_write(a.el0_entry_contract ? "ready" : "pending");
     ui_console_write(" el0=");
