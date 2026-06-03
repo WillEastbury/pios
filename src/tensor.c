@@ -120,6 +120,28 @@ static bool tensor_any_bound_v3d_kernel(void)
     return false;
 }
 
+void tensor_status(struct tensor_status *out)
+{
+    if (!out) return;
+    const struct v3d_caps *c = v3d_caps_get();
+    out->v3d_available = v3d_available();
+    out->v3d_dispatch_supported = v3d_dispatch_supported();
+    out->qpu_fallback = use_qpu_fallback;
+    out->any_kernel_bound = tensor_any_bound_v3d_kernel();
+    out->ready_mask = 0;
+    out->disabled_mask = 0;
+    out->ident0 = c ? c->ident0 : 0;
+    out->ident1 = c ? c->ident1 : 0;
+    out->ident2 = c ? c->ident2 : 0;
+    for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
+        const struct v3d_kernel_desc *k = v3d_kernel_desc_get((v3d_kernel_id_t)i);
+        if (k && k->ready)
+            out->ready_mask |= (1U << i);
+        if (v3d_kernel_disabled[i])
+            out->disabled_mask |= (1U << i);
+    }
+}
+
 static bool tensor_verify_add_sample(const float *c, const float *a,
                                      const float *b, u32 n)
 {
@@ -378,6 +400,59 @@ static void neon_matmul_f32(float *c, const float *a, const float *b,
             }
         }
     }
+}
+
+static bool f32_close(float a, float b)
+{
+    float d = a - b;
+    if (d < 0.0f) d = -d;
+    return d < 0.001f;
+}
+
+bool tensor_selftest(void)
+{
+    float a[16];
+    float b[16];
+    float c[16];
+    float r[16];
+    for (u32 i = 0; i < 16; i++) {
+        a[i] = (float)i - 4.0f;
+        b[i] = (float)(i + 1) * 0.5f;
+        c[i] = 0.0f;
+        r[i] = 0.0f;
+    }
+
+    neon_vec_add_f32(c, a, b, 16);
+    for (u32 i = 0; i < 16; i++)
+        if (!f32_close(c[i], a[i] + b[i])) return false;
+
+    neon_vec_mul_f32(c, a, b, 16);
+    for (u32 i = 0; i < 16; i++)
+        if (!f32_close(c[i], a[i] * b[i])) return false;
+
+    neon_vec_scale_f32(c, a, 2.0f, 16);
+    for (u32 i = 0; i < 16; i++)
+        if (!f32_close(c[i], a[i] * 2.0f)) return false;
+
+    neon_vec_relu_f32(c, a, 16);
+    for (u32 i = 0; i < 16; i++)
+        if (!f32_close(c[i], a[i] > 0.0f ? a[i] : 0.0f)) return false;
+
+    float dot = neon_vec_dot_f32(a, b, 16);
+    float expect = 0.0f;
+    for (u32 i = 0; i < 16; i++) expect += a[i] * b[i];
+    if (!f32_close(dot, expect)) return false;
+
+    float ma[4] = { 1, 2, 3, 4 };
+    float mb[4] = { 5, 6, 7, 8 };
+    float mc[4] = { 0, 0, 0, 0 };
+    neon_matmul_f32(mc, ma, mb, 2, 2, 2);
+    if (!f32_close(mc[0], 19.0f) || !f32_close(mc[1], 22.0f) ||
+        !f32_close(mc[2], 43.0f) || !f32_close(mc[3], 50.0f))
+        return false;
+
+    neon_vec_scale_f32(r, b, 1.0f, 16);
+    return true;
 }
 
 /* ---- Public tensor operations ---- */

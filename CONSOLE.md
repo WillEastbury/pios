@@ -369,6 +369,21 @@ abi status
 abi selftest
 ```
 
+## QPU / tensor diagnostics
+
+PIOS tensor operations keep deterministic NEON fallback enabled unless validated V3D/QPU shader descriptors are bound. QPU work should start from diagnostics before attempting new shader dispatch because failed dispatch paths quarantine kernels and fall back to NEON.
+
+Console/Web Admin terminal:
+
+```text
+qpu status
+qpu selftest
+tensor status
+tensor selftest
+```
+
+`qpu status` reports V3D availability, dispatch support, fallback state, bound-kernel masks, disabled-kernel masks, and V3D identity registers. `tensor selftest` verifies the safe NEON fallback kernels without touching QPU dispatch.
+
 ## Brotli codec diagnostics
 
 PIOS includes a no-external-dependency Brotli codec library. The encoder emits conservative stored Brotli streams; the decoder supports stored streams plus the compressed subset emitted by PicoWeb's micro-Brotli encoder. Large copies use the kernel SIMD copy path.

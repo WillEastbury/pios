@@ -1304,6 +1304,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "irq status\n  Show IRQ dispatch counters, last interrupt ID/core, timer IRQ count, and per-core totals.\n");
         } else if (http_streq(topic, "abi")) {
             http_append(out, &len, max, "abi status | abi selftest\n  Show kernel/user ABI transition stage, ksvc foundations, and pending EL0/SVC work.\n");
+        } else if (http_streq(topic, "qpu") || http_streq(topic, "tensor")) {
+            http_append(out, &len, max, "qpu status | tensor selftest\n  Show V3D/QPU tensor dispatch diagnostics and verify safe NEON fallback kernels.\n");
         } else {
             http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls, help brotli\n");
         }
@@ -1696,6 +1698,31 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "abi selftest")) {
         http_append(out, &len, max, abi_selftest() ? "ABI selftest OK\n" : "ABI selftest FAILED\n");
+    } else if (http_streq(cmd, "qpu") || http_streq(cmd, "qpu status") ||
+               http_streq(cmd, "tensor") || http_streq(cmd, "tensor status")) {
+        struct tensor_status ts;
+        tensor_status(&ts);
+        http_append(out, &len, max, "tensor v3d_available=");
+        http_append(out, &len, max, ts.v3d_available ? "yes" : "no");
+        http_append(out, &len, max, " dispatch=");
+        http_append(out, &len, max, ts.v3d_dispatch_supported ? "yes" : "no");
+        http_append(out, &len, max, " fallback=");
+        http_append(out, &len, max, ts.qpu_fallback ? "yes" : "no");
+        http_append(out, &len, max, " any_kernel=");
+        http_append(out, &len, max, ts.any_kernel_bound ? "yes" : "no");
+        http_append(out, &len, max, " ready_mask=");
+        http_append_u64(out, &len, max, ts.ready_mask);
+        http_append(out, &len, max, " disabled_mask=");
+        http_append_u64(out, &len, max, ts.disabled_mask);
+        http_append(out, &len, max, " ident0=");
+        http_append_u64(out, &len, max, ts.ident0);
+        http_append(out, &len, max, " ident1=");
+        http_append_u64(out, &len, max, ts.ident1);
+        http_append(out, &len, max, " ident2=");
+        http_append_u64(out, &len, max, ts.ident2);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tensor selftest") || http_streq(cmd, "qpu selftest")) {
+        http_append(out, &len, max, tensor_selftest() ? "Tensor selftest OK\n" : "Tensor selftest FAILED\n");
     } else if (http_starts_with(cmd, "addr ")) {
         struct pios_addr a;
         char canon[160];
@@ -3703,6 +3730,7 @@ static void ui_cmd_acme(u32 argc, char **argv);
 static void ui_cmd_ksvc(u32 argc, char **argv);
 static void ui_cmd_irq(u32 argc, char **argv);
 static void ui_cmd_abi(u32 argc, char **argv);
+static void ui_cmd_tensor(u32 argc, char **argv);
 static void ui_console_exec(char *line);
 static bool ui_parse_priority(const char *s, u32 *out_prio);
 static const char *ui_priority_str(u32 p);
@@ -5531,6 +5559,45 @@ static void ui_cmd_abi(u32 argc, char **argv)
     ui_console_write(" pending_steps=");
     ui_console_u32_dec(a.pending_steps);
     ui_console_write("\n");
+}
+
+static void ui_print_tensor_status(void)
+{
+    struct tensor_status ts;
+    tensor_status(&ts);
+    ui_console_write("tensor v3d_available=");
+    ui_console_write(ts.v3d_available ? "yes" : "no");
+    ui_console_write(" dispatch=");
+    ui_console_write(ts.v3d_dispatch_supported ? "yes" : "no");
+    ui_console_write(" fallback=");
+    ui_console_write(ts.qpu_fallback ? "yes" : "no");
+    ui_console_write(" any_kernel=");
+    ui_console_write(ts.any_kernel_bound ? "yes" : "no");
+    ui_console_write(" ready_mask=");
+    ui_console_hex_fixed(ts.ready_mask, 8);
+    ui_console_write(" disabled_mask=");
+    ui_console_hex_fixed(ts.disabled_mask, 8);
+    ui_console_write(" ident0=");
+    ui_console_hex_fixed(ts.ident0, 8);
+    ui_console_write(" ident1=");
+    ui_console_hex_fixed(ts.ident1, 8);
+    ui_console_write(" ident2=");
+    ui_console_hex_fixed(ts.ident2, 8);
+    ui_console_write("\n");
+}
+
+static void ui_cmd_tensor(u32 argc, char **argv)
+{
+    if (argc >= 2 && ui_streq(argv[1], "selftest")) {
+        ui_console_write(tensor_selftest() ? "Tensor selftest OK\n" : "Tensor selftest FAILED\n");
+        ui_print_tensor_status();
+        return;
+    }
+    if (argc < 2 || ui_streq(argv[1], "status")) {
+        ui_print_tensor_status();
+        return;
+    }
+    ui_console_write("ERR: usage qpu status | qpu selftest | tensor status | tensor selftest\n");
 }
 
 static void ui_console_print_netstat(void)
@@ -8539,6 +8606,9 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "abi")) {
         ui_console_write("abi status\n  Show current direct-KPI/ksvc/EL0 transition state.\n");
         ui_console_write("abi selftest\n  Verify ABI transition metadata invariants.\n");
+    } else if (ui_streq(topic, "qpu") || ui_streq(topic, "tensor")) {
+        ui_console_write("qpu status\n  Show V3D/QPU tensor dispatch diagnostics.\n");
+        ui_console_write("tensor selftest\n  Verify safe NEON fallback tensor kernels.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -8921,6 +8991,8 @@ static void ui_console_exec(char *line)
         ui_cmd_irq(argc, argv);
     } else if (ui_streq(argv[0], "abi")) {
         ui_cmd_abi(argc, argv);
+    } else if (ui_streq(argv[0], "qpu") || ui_streq(argv[0], "tensor")) {
+        ui_cmd_tensor(argc, argv);
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "firewall")) {

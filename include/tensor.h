@@ -36,6 +36,18 @@ typedef struct {
     u32 code_size;
 } qpu_program_t;
 
+struct tensor_status {
+    bool v3d_available;
+    bool v3d_dispatch_supported;
+    bool qpu_fallback;
+    bool any_kernel_bound;
+    u32 ready_mask;
+    u32 disabled_mask;
+    u32 ident0;
+    u32 ident1;
+    u32 ident2;
+} PACKED;
+
 /* QPU job control — one per QPU instance */
 struct qpu_job {
     u32 uniform_addr;   /* bus addr of uniforms for this QPU */
@@ -101,3 +113,5 @@ bool qpu_dispatch(const qpu_program_t *prog, struct qpu_job *jobs,
 
 /* ---- Init ---- */
 void tensor_init(void);
+void tensor_status(struct tensor_status *out);
+bool tensor_selftest(void);
