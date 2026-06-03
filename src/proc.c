@@ -1682,6 +1682,27 @@ u32 proc_snapshot(struct proc_ui_entry *out, u32 max_entries)
     u64 total_runtime = 0;
     u64 now = timer_ticks();
 
+    simd_zero(&out[0], sizeof(out[0]));
+    out[0].pid = PROC_UI_KERNEL_PID;
+    out[0].parent_pid = PROC_UI_KERNEL_PARENT_PID;
+    out[0].principal_id = PRINCIPAL_ROOT;
+    out[0].state = PROC_RUNNING;
+    out[0].affinity_core = 0;
+    out[0].priority_class = PROC_PRIO_REALTIME;
+    out[0].runtime_ticks = now;
+    out[0].cpu_percent = 100;
+    out[0].image_path[0] = '[';
+    out[0].image_path[1] = 'k';
+    out[0].image_path[2] = 'e';
+    out[0].image_path[3] = 'r';
+    out[0].image_path[4] = 'n';
+    out[0].image_path[5] = 'e';
+    out[0].image_path[6] = 'l';
+    out[0].image_path[7] = ']';
+    out[0].image_path[8] = 0;
+    if (max_entries == 1)
+        return 1;
+
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
         struct process p = procs[i];
         if (p.state != PROC_READY && p.state != PROC_RUNNING && p.state != PROC_BLOCKED)
@@ -1704,33 +1725,35 @@ u32 proc_snapshot(struct proc_ui_entry *out, u32 max_entries)
     if (total_runtime == 0)
         total_runtime = 1;
 
-    u32 out_n = (n < max_entries) ? n : max_entries;
+    u32 avail = max_entries - 1U;
+    u32 out_n = (n < avail) ? n : avail;
     for (u32 i = 0; i < out_n; i++) {
-        out[i].pid = snap[i].pid;
-        out[i].parent_pid = snap[i].parent_pid;
-        out[i].principal_id = snap[i].principal_id;
-        out[i].state = snap[i].state;
-        out[i].affinity_core = snap[i].affinity_core;
-        out[i].priority_class = snap[i].priority_class;
-        out[i].mem_kib = snap[i].mem_size >> 10;
-        out[i].arena_capacity_kib = snap[i].arena_capacity_bytes >> 10;
+        u32 oi = i + 1U;
+        out[oi].pid = snap[i].pid;
+        out[oi].parent_pid = snap[i].parent_pid;
+        out[oi].principal_id = snap[i].principal_id;
+        out[oi].state = snap[i].state;
+        out[oi].affinity_core = snap[i].affinity_core;
+        out[oi].priority_class = snap[i].priority_class;
+        out[oi].mem_kib = snap[i].mem_size >> 10;
+        out[oi].arena_capacity_kib = snap[i].arena_capacity_bytes >> 10;
         u32 bump = snap_bump[i];
         u64 used = (u64)bump + snap[i].arena_span_bytes;
         if (used > 0xFFFFFFFFULL)
             used = 0xFFFFFFFFULL;
-        out[i].arena_used_kib = (u32)used >> 10;
-        out[i].arena_high_kib = snap[i].arena_high_bytes >> 10;
-        out[i].arena_bump_kib = bump >> 10;
-        out[i].arena_span_kib = snap[i].arena_span_bytes >> 10;
-        out[i].arena_span_count = snap[i].arena_span_count;
-        out[i].cpu_percent = (u32)((snap[i].runtime_ticks * 100ULL) / total_runtime);
-        out[i].preemptions = snap[i].preemptions;
-        out[i].runtime_ticks = snap[i].runtime_ticks;
-        for (u32 j = 0; j < sizeof(out[i].image_path); j++)
-            out[i].image_path[j] = snap[i].image_path[j];
-        out[i].image_path[sizeof(out[i].image_path) - 1] = 0;
+        out[oi].arena_used_kib = (u32)used >> 10;
+        out[oi].arena_high_kib = snap[i].arena_high_bytes >> 10;
+        out[oi].arena_bump_kib = bump >> 10;
+        out[oi].arena_span_kib = snap[i].arena_span_bytes >> 10;
+        out[oi].arena_span_count = snap[i].arena_span_count;
+        out[oi].cpu_percent = (u32)((snap[i].runtime_ticks * 100ULL) / total_runtime);
+        out[oi].preemptions = snap[i].preemptions;
+        out[oi].runtime_ticks = snap[i].runtime_ticks;
+        for (u32 j = 0; j < sizeof(out[oi].image_path); j++)
+            out[oi].image_path[j] = snap[i].image_path[j];
+        out[oi].image_path[sizeof(out[oi].image_path) - 1] = 0;
     }
-    return out_n;
+    return out_n + 1U;
 }
 
 u32 proc_log_snapshot(struct proc_log_ui_entry *out, u32 max_entries)

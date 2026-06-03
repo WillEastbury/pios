@@ -93,6 +93,8 @@ struct appf_service_record {
 } PACKED;
 
 #define MAX_PROCS_PER_CORE  6
+#define PROC_UI_KERNEL_PID 0U
+#define PROC_UI_KERNEL_PARENT_PID 0xFFFFFFFFU
 #define PROC_SLOT_SIZE      (2 * 1024 * 1024)   /* 2MB per process */
 #define PROC_SLOT_OFFSET    0x100000             /* slots start 1MB into core RAM */
 

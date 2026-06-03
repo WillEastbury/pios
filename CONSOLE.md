@@ -201,7 +201,7 @@ http://192.168.218.101:8080/logs?tail=24
 http://192.168.218.101/api/admin/log-stream?tail=24
 ```
 
-`ps`, `/api/terminal?cmd=processes`, HDMI process views, and the Web Admin Processes tab include parent PID (`PPID`) and a simple process graph/tree section.
+`ps`, `/api/terminal?cmd=processes`, HDMI process views, and the Web Admin Processes tab include parent PID (`PPID`) and a simple process graph/tree section. The kernel is exposed as synthetic PID `0` with `PPID=-1`, so root user processes appear under the kernel node.
 
 Process memory columns:
 
