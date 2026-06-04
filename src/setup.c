@@ -170,6 +170,21 @@ static bool setup_run_oobe(void)
     return true;
 }
 
+static bool setup_seed_default_oobe(void)
+{
+    static const char config[] =
+        "locale=en-GB\n"
+        "keyboard=uk\n"
+        "timezone_offset_minutes=0\n";
+    if (picowal_db_put(SETUP_CONFIG_CARD, SETUP_CONFIG_REC,
+                       config, (u32)(sizeof(config) - 1)) < 0) {
+        setup_log("[setup] Default OOBE config persist FAILED.\n");
+        return false;
+    }
+    setup_log("[setup] Default OOBE config persisted (en-GB/uk/UTC).\n");
+    return true;
+}
+
 static u64 setup_next_rand(u64 *state)
 {
     u64 x = *state;
@@ -273,7 +288,8 @@ bool setup_run(bool fb_available, bool net_ready, bool usb_ready)
         return false;
     }
 
-    if (!setup_run_oobe()) {
+    bool oobe_ok = usb_kbd_available() ? setup_run_oobe() : setup_seed_default_oobe();
+    if (!oobe_ok) {
         setup_log("[setup] Setup incomplete: OOBE config not ready.\n");
         return false;
     }

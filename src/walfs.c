@@ -33,6 +33,47 @@ static u32 partition_blocks;
 static u32 walfs_region_blocks;
 static bool legacy_walfs_present;
 
+static bool configure_walfs_region(u32 root_lba, u32 root_blocks, const char *reason)
+{
+    if (root_blocks <= WALFS_BOOT_SLOT_LBAS) {
+        uart_puts("[wal] region too small; WALFS disabled\n");
+        return false;
+    }
+
+    partition_lba = root_lba;
+    base_lba = root_lba + WALFS_BOOT_SLOT_LBAS;
+    partition_blocks = root_blocks;
+    walfs_region_blocks = root_blocks - WALFS_BOOT_SLOT_LBAS;
+    legacy_walfs_present = false;
+
+    uart_puts("[wal] geometry: ");
+    uart_puts(reason ? reason : "reserved");
+    uart_puts(" root LBA=");
+    uart_hex(partition_lba);
+    uart_puts(" walfs LBA=");
+    uart_hex(base_lba);
+    uart_puts(" walfs blocks=");
+    uart_hex(walfs_region_blocks);
+    uart_puts("\n");
+    return true;
+}
+
+static bool discover_partition_fallback(const char *reason)
+{
+    const sd_card_t *card = sd_get_card_info();
+    if (!card || card->capacity <= (u64)WALFS_BOOT_SLOT_LBAS * SD_BLOCK_SIZE) {
+        uart_puts("[wal] no fallback capacity; WALFS disabled\n");
+        return false;
+    }
+
+    u64 total_blocks = card->capacity / SD_BLOCK_SIZE;
+    if (total_blocks <= WALFS_BOOT_SLOT_LBAS) {
+        uart_puts("[wal] fallback card too small; WALFS disabled\n");
+        return false;
+    }
+    return configure_walfs_region(0, (u32)total_blocks, reason ? reason : "whole-disk");
+}
+
 static u32 read_le32(const u8 *p)
 {
     return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
@@ -44,21 +85,31 @@ static bool discover_partition(void)
     static u8 ALIGNED(64) hdr[SD_BLOCK_SIZE];
     if (!sd_read_block(0, mbr)) {
         uart_puts("[wal] MBR read fail\n");
-        return false;
+        return discover_partition_fallback("mbr read fail");
     }
 
     /* Check MBR signature */
     if (mbr[510] != 0x55 || mbr[511] != 0xAA) {
-        uart_puts("[wal] no MBR sig; WALFS disabled\n");
-        return false;
+        uart_puts("[wal] no MBR sig\n");
+        return discover_partition_fallback("no mbr sig");
     }
 
     /* MBR partition table starts at offset 0x1BE, each entry is 16 bytes.
      * Entry fields: [0]=status, [4]=type, [8..11]=start LBA, [12..15]=size */
+    u32 p1_start = read_le32(&mbr[0x1BE + 8]);
+    u32 p1_size  = read_le32(&mbr[0x1BE + 12]);
+    u8  p1_type  = mbr[0x1BE + 4];
     u32 p2_start = read_le32(&mbr[0x1CE + 8]);
     u32 p2_size  = read_le32(&mbr[0x1CE + 12]);
     u8  p2_type  = mbr[0x1CE + 4];
 
+    uart_puts("[wal] MBR p1: t=");
+    uart_hex(p1_type);
+    uart_puts(" s=");
+    uart_hex(p1_start);
+    uart_puts(" sz=");
+    uart_hex(p1_size);
+    uart_puts("\n");
     uart_puts("[wal] MBR p2: t=");
     uart_hex(p2_type);
     uart_puts(" s=");
@@ -68,12 +119,16 @@ static bool discover_partition(void)
     uart_puts("\n");
 
     if (p2_start == 0 || p2_size == 0) {
-        uart_puts("[wal] p2 missing; WALFS disabled\n");
-        return false;
+        uart_puts("[wal] p2 missing\n");
+        if (p1_start != 0 && p1_size > WALFS_BOOT_SLOT_LBAS)
+            return configure_walfs_region(p1_start, p1_size, "single-volume p1");
+        return discover_partition_fallback("p2 missing");
     }
 
     if (p2_size <= WALFS_BOOT_SLOT_LBAS) {
-        uart_puts("[wal] p2 too small for boot slot; WALFS disabled\n");
+        uart_puts("[wal] p2 too small for boot slot\n");
+        if (p1_start != 0 && p1_size > WALFS_BOOT_SLOT_LBAS)
+            return configure_walfs_region(p1_start, p1_size, "single-volume p1");
         return false;
     }
 
@@ -81,11 +136,8 @@ static bool discover_partition(void)
         uart_puts("[wal] partition exceeds u32 LBA\n");
     }
 
-    partition_lba = p2_start;
-    base_lba = p2_start + WALFS_BOOT_SLOT_LBAS;
-    partition_blocks = p2_size;
-    walfs_region_blocks = p2_size - WALFS_BOOT_SLOT_LBAS;
-    legacy_walfs_present = false;
+    if (!configure_walfs_region(p2_start, p2_size, "partition-2"))
+        return false;
 
     if (sd_read_block(partition_lba, hdr)) {
         u32 magic = read_le32(hdr + PIOS_HDR_MAGIC_OFF);
@@ -611,9 +663,32 @@ static bool format_disk(void)
     u64 rp = wal_append(RECORD_INODE, &root, sizeof(root), NULL, 0);
     if (!rp) return false;
     super.tree_root = rp;
+    icache_put(WALFS_ROOT_INODE, rp);
 
     write_super();
     uart_puts("[wal] formatted\n");
+    return true;
+}
+
+static bool repair_root_inode(void)
+{
+    struct walfs_inode root;
+    memset(&root, 0, sizeof(root));
+    root.inode_id  = WALFS_ROOT_INODE;
+    root.parent_id = 0;
+    root.flags     = WALFS_DIR;
+    root.mode      = 0755;
+    root.created   = read_cntvct();
+    root.modified  = root.created;
+    root.name[0]   = '/';
+
+    u64 rp = wal_append(RECORD_INODE, &root, sizeof(root), NULL, 0);
+    if (!rp)
+        return false;
+    super.tree_root = rp;
+    icache_put(WALFS_ROOT_INODE, rp);
+    write_super();
+    uart_puts("[wal] repaired root inode\n");
     return true;
 }
 
@@ -647,8 +722,16 @@ bool walfs_init(void)
             uart_puts("[wal] head OOB\n");
             return false;
         }
-        scan_recovery();
         mounted = true;
+        scan_recovery();
+        struct walfs_inode root;
+        if (!walfs_stat(WALFS_ROOT_INODE, &root)) {
+            if (!repair_root_inode()) {
+                mounted = false;
+                uart_puts("[wal] root repair failed\n");
+                return false;
+            }
+        }
         uart_puts("[wal] mounted rec=");
         uart_hex(super.record_count);
         uart_puts("\n");
@@ -656,11 +739,54 @@ bool walfs_init(void)
     }
 
     if (legacy_walfs_present) {
-        uart_puts("[wal] no WALFS at reserved base, legacy super exists; refusing format\n");
-        return false;
+        uart_puts("[wal] legacy WALFS exists; formatting reserved WALFS base\n");
     }
 
     if (!format_disk()) return false;
+    mounted = true;
+    return true;
+}
+
+void walfs_status(struct walfs_status_snapshot *out)
+{
+    if (!out)
+        return;
+    simd_zero(out, sizeof(*out));
+    out->mounted = mounted;
+    out->legacy_present = legacy_walfs_present;
+    out->partition_lba = partition_lba;
+    out->base_lba = base_lba;
+    out->partition_blocks = partition_blocks;
+    out->region_blocks = walfs_region_blocks;
+    out->super_magic = super.magic;
+    out->super_version = super.version;
+    out->super_records = super.record_count;
+    out->super_head = super.wal_head;
+    out->super_tree_root = super.tree_root;
+    if (super.magic == WALFS_MAGIC && super.version == WALFS_VERSION) {
+        struct walfs_super sb = super;
+        u32 saved = sb.crc32;
+        sb.crc32 = 0;
+        out->super_ok = hw_crc32c(&sb, SD_BLOCK_SIZE) == saved;
+    }
+    if (mounted) {
+        struct walfs_inode root;
+        out->root_ok = walfs_stat(WALFS_ROOT_INODE, &root) &&
+                       (root.flags & WALFS_DIR) != 0;
+    }
+}
+
+bool walfs_format_reserved(void)
+{
+    mounted = false;
+    cached_lba = 0xFFFFFFFF;
+    dindex_reset();
+    lru_init(&inode_cache, NULL, 0);
+    lru_init(&path_cache, NULL, 30000);
+    if (!discover_partition())
+        return false;
+    if (!format_disk())
+        return false;
     mounted = true;
     return true;
 }

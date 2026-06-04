@@ -180,6 +180,22 @@ struct walfs_health {
     u64 scan_end;
 } PACKED;
 
+struct walfs_status_snapshot {
+    bool mounted;
+    bool legacy_present;
+    bool root_ok;
+    bool super_ok;
+    u32 partition_lba;
+    u32 base_lba;
+    u32 partition_blocks;
+    u32 region_blocks;
+    u32 super_magic;
+    u32 super_version;
+    u32 super_records;
+    u64 super_head;
+    u64 super_tree_root;
+} PACKED;
+
 /* ---- API ---- */
 
 /* Init/format filesystem on SD card. If not formatted, creates one. */
@@ -221,3 +237,5 @@ bool walfs_verify(struct walfs_health *out);
 
 /* Flush superblock to disk. */
 void walfs_sync(void);
+void walfs_status(struct walfs_status_snapshot *out);
+bool walfs_format_reserved(void);

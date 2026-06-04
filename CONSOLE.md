@@ -5,7 +5,7 @@ PIOS exposes the same operator command set through several surfaces:
 - **UART serial console** on the Pi 5 GPIO header, `115200 8N1`, no flow control.
 - **HDMI mirror console**, which echoes UART input and command output to the framebuffer.
 - **TCP debug console** on port `2323` after `unlock pios`.
-- **Web Admin Console** on `http://192.168.0.101/`.
+- **Web Admin Console** on `http://192.168.0.200/`.
 - **HTTP operator endpoints** on ports `8080`, `8081`, and `8082`.
 
 ## UART and HDMI console
@@ -146,7 +146,7 @@ The initial implementation intentionally supports only UK/US English options. Mo
 The TCP debug console listens on port `2323`.
 
 ```text
-telnet 192.168.0.101 2323
+telnet 192.168.0.200 2323
 unlock pios
 firewall list
 ```
@@ -158,7 +158,7 @@ Port `2323` is allowed through the default inbound firewall. The unlock step is 
 Open:
 
 ```text
-http://192.168.0.101/
+http://192.168.0.200/
 ```
 
 Tabs render as structured cards/tables and include a manual refresh button plus an auto-refresh checkbox with a millisecond interval control on live data tabs.
@@ -201,9 +201,9 @@ The dashboard keeps the static frame on screen and refreshes only dynamic conten
 Operator log stream:
 
 ```text
-http://192.168.0.101:8080/logs
-http://192.168.0.101:8080/logs?tail=24
-http://192.168.0.101/api/admin/log-stream?tail=24
+http://192.168.0.200:8080/logs
+http://192.168.0.200:8080/logs?tail=24
+http://192.168.0.200/api/admin/log-stream?tail=24
 ```
 
 `ps`, `/api/terminal?cmd=processes`, HDMI process views, and the Web Admin Processes tab include parent PID (`PPID`) and a simple process graph/tree section. The kernel is exposed as synthetic PID `0` with `PPID=-1`, so root user processes appear under the kernel node.
@@ -272,8 +272,8 @@ The confirmation word is required to avoid accidental resets.
 From HTTP:
 
 ```text
-http://192.168.0.101:8081/?confirm=1
-http://192.168.0.101/api/admin/reboot?confirm=1
+http://192.168.0.200:8081/?confirm=1
+http://192.168.0.200/api/admin/reboot?confirm=1
 ```
 
 ## OTA hot-flash
@@ -284,13 +284,13 @@ Host helper:
 
 ```powershell
 Set-Location C:\source\pios
-python tools\pios_ota_update.py real_kernel.img --host 192.168.0.101 --reboot
+python tools\pios_ota_update.py real_kernel.img --host 192.168.0.200 --reboot
 ```
 
 Manual status:
 
 ```text
-http://192.168.0.101:8082/?confirm=1&action=status
+http://192.168.0.200:8082/?confirm=1&action=status
 ```
 
 The FAT `kernel8.img` should be the stable stage0 loader. The second-stage kernel lives in the raw partition-2 slot and is what OTA updates.

@@ -34,7 +34,7 @@ def read_exact(sock: socket.socket, n: int) -> bytes:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Probe PIOS kernel TLS port 443")
-    ap.add_argument("--host", default="192.168.0.101")
+    ap.add_argument("--host", default="192.168.0.200")
     ap.add_argument("--port", type=int, default=443)
     ap.add_argument("--timeout", type=float, default=5.0)
     args = ap.parse_args()

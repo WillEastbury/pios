@@ -106,9 +106,9 @@ u32 pios_strlen(const char *s) {
 
 /* ---- Version + network configuration (static - no ARP/DHCP) ---- */
 
-#define MY_IP       IP4(192, 168, 0, 101)
+#define MY_IP       IP4(192, 168, 0, 200)
 #define MY_GW       IP4(192, 168, 0, 1)
-#define MY_MASK     IP4(255, 255, 255, 0)
+#define MY_MASK     IP4(255, 255, 0, 0)
 
 /* Gateway MAC - MUST be configured (no ARP to discover it) */
 static const u8 MY_GW_MAC[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
@@ -1465,7 +1465,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "mem")) {
             http_append(out, &len, max, "mem analyze\n  Show kernel image, raw-slot, per-core RAM, and process memory layout diagnostics.\n");
         } else if (http_streq(topic, "fs") || http_streq(topic, "ls") || http_streq(topic, "fsinspect")) {
-            http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path]\n  Read-only bounded WALFS listing/stat view for the Web/TCP terminal.\n");
+            http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path] | walfs status | walfs format confirm\n  WALFS listing/status plus confirmed reserved-base format.\n");
         } else if (http_streq(topic, "dma")) {
             http_append(out, &len, max, "dma status | dma selftest\n  Show DMA channel registers, selftest result, selected CB address mode, and retry selftest.\n");
         } else if (http_streq(topic, "addr")) {
@@ -2136,6 +2136,40 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_walfs_list_text(out, &len, max, cmd + 6);
     } else if (http_starts_with(cmd, "fsinspect ")) {
         http_append_walfs_list_text(out, &len, max, cmd + 10);
+    } else if (http_streq(cmd, "walfs") || http_streq(cmd, "walfs status") ||
+               http_streq(cmd, "fs status")) {
+        struct walfs_status_snapshot ws;
+        walfs_status(&ws);
+        http_append(out, &len, max, "walfs mounted=");
+        http_append(out, &len, max, ws.mounted ? "yes" : "no");
+        http_append(out, &len, max, " root=");
+        http_append(out, &len, max, ws.root_ok ? "ok" : "bad");
+        http_append(out, &len, max, " super=");
+        http_append(out, &len, max, ws.super_ok ? "ok" : "bad");
+        http_append(out, &len, max, " legacy=");
+        http_append(out, &len, max, ws.legacy_present ? "yes" : "no");
+        http_append(out, &len, max, " p2_lba=");
+        http_append_u64(out, &len, max, ws.partition_lba);
+        http_append(out, &len, max, " walfs_lba=");
+        http_append_u64(out, &len, max, ws.base_lba);
+        http_append(out, &len, max, " region_blocks=");
+        http_append_u64(out, &len, max, ws.region_blocks);
+        http_append(out, &len, max, "\nsuper magic=");
+        http_append_hex32(out, &len, max, ws.super_magic);
+        http_append(out, &len, max, " version=");
+        http_append_u64(out, &len, max, ws.super_version);
+        http_append(out, &len, max, " records=");
+        http_append_u64(out, &len, max, ws.super_records);
+        http_append(out, &len, max, " head=");
+        http_append_u64(out, &len, max, ws.super_head);
+        http_append(out, &len, max, " tree_root=");
+        http_append_u64(out, &len, max, ws.super_tree_root);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "walfs format confirm")) {
+        bool ok = walfs_format_reserved();
+        http_append(out, &len, max, ok ? "WALFS format OK\n" : "WALFS format FAILED\n");
+        if (ok)
+            http_append_walfs_list_text(out, &len, max, "/");
     } else if (http_streq(cmd, "keystore") || http_streq(cmd, "keystore status")) {
         struct keystore_status st;
         keystore_status(&st);
