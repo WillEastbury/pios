@@ -190,7 +190,10 @@ static u32 skip_name(const u8 *buf, u32 off, u32 len) {
 }
 
 static void parse_response(const u8 *data, u16 len) {
-    if (len < DNS_HDR_SIZE) return;
+    if (len < DNS_HDR_SIZE) {
+        async_status.rx_rejected++;
+        return;
+    }
 
     u16 txid = read_u16_be(data);
     u16 flags = read_u16_be(data + 2);
@@ -198,30 +201,51 @@ static void parse_response(const u8 *data, u16 len) {
     u16 ancount = read_u16_be(data + 6);
 
     /* Strict TXID match */
-    if (txid != expected_txid) return;
+    if (txid != expected_txid) {
+        async_status.rx_rejected++;
+        return;
+    }
 
     /* Must be a response */
-    if (!(flags & DNS_QR)) return;
+    if (!(flags & DNS_QR)) {
+        async_status.rx_rejected++;
+        return;
+    }
 
     /* Reject truncated */
-    if (flags & DNS_TC) return;
+    if (flags & DNS_TC) {
+        async_status.rx_rejected++;
+        return;
+    }
 
     /* Check RCODE == 0 (no error) */
-    if (flags & DNS_RCODE_MASK) return;
+    if (flags & DNS_RCODE_MASK) {
+        async_status.rx_rejected++;
+        return;
+    }
 
     /* Single-question enforcement */
-    if (qdcount != 1) return;
+    if (qdcount != 1) {
+        async_status.rx_rejected++;
+        return;
+    }
 
     /* Skip question section */
     u32 off = DNS_HDR_SIZE;
     off = skip_name(data, off, len);
-    if (off + 4 > len) return;
+    if (off + 4 > len) {
+        async_status.rx_rejected++;
+        return;
+    }
     off += 4; /* QTYPE + QCLASS */
 
     /* Parse answers, find first A record */
     for (u16 i = 0; i < ancount && off < len; i++) {
         off = skip_name(data, off, len);
-        if (off + 10 > len) return;
+        if (off + 10 > len) {
+            async_status.rx_rejected++;
+            return;
+        }
 
         u16 atype = read_u16_be(data + off);
         u16 aclass = read_u16_be(data + off + 2);
@@ -229,7 +253,10 @@ static void parse_response(const u8 *data, u16 len) {
         u16 rdlen = read_u16_be(data + off + 8);
         off += 10;
 
-        if (off + rdlen > len) return;
+        if (off + rdlen > len) {
+            async_status.rx_rejected++;
+            return;
+        }
 
         if (atype == DNS_TYPE_A && aclass == DNS_CLASS_IN && rdlen == 4) {
             resp_ip = read_u32_be(data + off);
@@ -238,10 +265,12 @@ static void parse_response(const u8 *data, u16 len) {
             if (attl > MAX_TTL) attl = MAX_TTL;
             resp_ttl = attl;
             got_response = true;
+            async_status.rx_ok++;
             return;
         }
         off += rdlen;
     }
+    async_status.rx_rejected++;
 }
 
 /* ---- UDP callback ---- */
@@ -250,13 +279,21 @@ static udp_recv_cb prev_callback;
 
 static void dns_udp_handler(u32 src_ip, u16 src_port, u16 dst_port,
                              const u8 *data, u16 len) {
+    async_status.rx_total++;
+    async_status.last_rx_src_ip = src_ip;
+    async_status.last_rx_src_port = src_port;
+    async_status.last_rx_dst_port = dst_port;
+    async_status.last_rx_len = len;
+
     /* Source IP validation: only accept from our DNS server */
     if (src_ip != dns_server || src_port != DNS_PORT) {
+        async_status.rx_ignored++;
         if (prev_callback)
             prev_callback(src_ip, src_port, dst_port, data, len);
         return;
     }
 
+    async_status.rx_server++;
     parse_response(data, len);
 }
 

@@ -26,6 +26,16 @@ struct dns_async_status {
     u32 result_ip;
     u32 attempts;
     u32 last_error;
+    u32 rx_total;
+    u32 rx_server;
+    u32 rx_ignored;
+    u32 rx_rejected;
+    u32 rx_ok;
+    u32 last_rx_src_ip;
+    u16 last_rx_src_port;
+    u16 last_rx_dst_port;
+    u16 last_rx_len;
+    u16 _pad;
     char hostname[DNS_HOST_MAX];
 } PACKED;
 

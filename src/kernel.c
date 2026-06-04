@@ -106,9 +106,9 @@ u32 pios_strlen(const char *s) {
 
 /* ---- Version + network configuration (static - no ARP/DHCP) ---- */
 
-#define MY_IP       IP4(192, 168, 218, 101)
+#define MY_IP       IP4(192, 168, 0, 101)
 #define MY_GW       IP4(192, 168, 0, 1)
-#define MY_MASK     IP4(255, 255, 0, 0)
+#define MY_MASK     IP4(255, 255, 255, 0)
 
 /* Gateway MAC - MUST be configured (no ARP to discover it) */
 static const u8 MY_GW_MAC[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
@@ -1198,7 +1198,9 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append(out, &len, max, PIOS_BUILD_LABEL);
     http_append(out, &len, max, "\",");
     http_append_json_metric(out, &len, max, "uptime", timer_monotonic_ms() / 1000ULL, true);
-    http_append(out, &len, max, "\"ip\":\"192.168.218.101\",");
+    http_append(out, &len, max, "\"ip\":\"");
+    http_append_ip4(out, &len, max, net_get_our_ip());
+    http_append(out, &len, max, "\",");
     http_append(out, &len, max, "\"mode\":\"minimal-json-safe\",");
     http_append(out, &len, max, "\"diag\":{");
     http_append_json_metric(out, &len, max, "event", http_diag.event, true);
@@ -1447,7 +1449,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "dns")) {
             http_append(out, &len, max, "dns resolve <hostname> | dns status | dns flush\n  Start/poll an async A-record resolver job without blocking HTTP service loops.\n");
         } else if (http_streq(topic, "http") || http_streq(topic, "https")) {
-            http_append(out, &len, max, "http get <ip> [path] [port] [timeout_ms]\nhttps get <ip> [path] [port] [timeout_ms]\n  Console-mode HTTP client; https targets the PIOS kernel TLS-wrapper endpoint.\n");
+            http_append(out, &len, max, "http get <ip-or-cached-host> [path] [port] [timeout_ms]\nhttps get <ip-or-cached-host> [path] [port] [timeout_ms]\n  Console-mode HTTP client; hostnames use the DNS cache populated by dns resolve/status.\n");
         } else if (http_streq(topic, "firewall")) {
             http_append(out, &len, max, "firewall list\n  List firewall rules.\nMutations are available from UART/TCP console.\n");
         } else if (http_streq(topic, "reboot")) {
@@ -1563,6 +1565,30 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, rx_drop);
         http_append(out, &len, max, " fw_tx_drop=");
         http_append_u64(out, &len, max, tx_drop);
+        http_append(out, &len, max, " act_syn=");
+        http_append_u64(out, &len, max, td->active_syn_sent);
+        http_append(out, &len, max, " act_synack=");
+        http_append_u64(out, &len, max, td->active_synack_seen);
+        http_append(out, &len, max, " act_est=");
+        http_append_u64(out, &len, max, td->active_established);
+        http_append(out, &len, max, " act_rst=");
+        http_append_u64(out, &len, max, td->active_rst);
+        http_append(out, &len, max, " act_badack=");
+        http_append_u64(out, &len, max, td->active_bad_ack);
+        http_append(out, &len, max, " act_timeout=");
+        http_append_u64(out, &len, max, td->active_timeout);
+        http_append(out, &len, max, "\nactive_last ");
+        http_append_ip4(out, &len, max, td->active_last_local_ip);
+        http_append(out, &len, max, ":");
+        http_append_u64(out, &len, max, td->active_last_local_port);
+        http_append(out, &len, max, " -> ");
+        http_append_ip4(out, &len, max, td->active_last_remote_ip);
+        http_append(out, &len, max, ":");
+        http_append_u64(out, &len, max, td->active_last_remote_port);
+        http_append(out, &len, max, " state=");
+        http_append(out, &len, max, tcp_state_name(td->active_last_state));
+        http_append(out, &len, max, " retries=");
+        http_append_u64(out, &len, max, td->active_last_retries);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "netcfg") || http_streq(cmd, "netcfg routes")) {
         const net_stats_t *st = net_get_stats();
@@ -1601,6 +1627,24 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, ds.attempts);
         http_append(out, &len, max, " error=");
         http_append_u64(out, &len, max, ds.last_error);
+        http_append(out, &len, max, " rx=");
+        http_append_u64(out, &len, max, ds.rx_total);
+        http_append(out, &len, max, " server_rx=");
+        http_append_u64(out, &len, max, ds.rx_server);
+        http_append(out, &len, max, " ignored=");
+        http_append_u64(out, &len, max, ds.rx_ignored);
+        http_append(out, &len, max, " rejected=");
+        http_append_u64(out, &len, max, ds.rx_rejected);
+        http_append(out, &len, max, " ok_rx=");
+        http_append_u64(out, &len, max, ds.rx_ok);
+        http_append(out, &len, max, "\nlast_rx=");
+        http_append_ip4(out, &len, max, ds.last_rx_src_ip);
+        http_append(out, &len, max, ":");
+        http_append_u64(out, &len, max, ds.last_rx_src_port);
+        http_append(out, &len, max, " -> ");
+        http_append_u64(out, &len, max, ds.last_rx_dst_port);
+        http_append(out, &len, max, " len=");
+        http_append_u64(out, &len, max, ds.last_rx_len);
         http_append(out, &len, max, "\nhostname=");
         http_append(out, &len, max, ds.hostname);
         http_append(out, &len, max, "\n");
@@ -1624,8 +1668,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         const char *err = NULL;
         if (!ui_http_client_parse_common(argc, argv, use_tls, &ip, &port, &path, &timeout_ms)) {
             http_append(out, &len, max, use_tls ?
-                "ERR: usage https get <ip> [path] [port] [timeout_ms]\n" :
-                "ERR: usage http get <ip> [path] [port] [timeout_ms]\n");
+                "ERR: usage https get <ip-or-cached-host> [path] [port] [timeout_ms]\n" :
+                "ERR: usage http get <ip-or-cached-host> [path] [port] [timeout_ms]\n");
         } else if (!ui_http_fetch(use_tls, ip, port, argv[2], path, timeout_ms,
                                   body, sizeof(body), &body_len, &err)) {
             http_append(out, &len, max, "ERR: ");
@@ -6399,6 +6443,24 @@ static void ui_print_dns_status(void)
     fb_printf("%u", ds.attempts);
     ui_console_write(" error=");
     fb_printf("%u", ds.last_error);
+    ui_console_write(" rx=");
+    ui_console_u32_dec(ds.rx_total);
+    ui_console_write(" server_rx=");
+    ui_console_u32_dec(ds.rx_server);
+    ui_console_write(" ignored=");
+    ui_console_u32_dec(ds.rx_ignored);
+    ui_console_write(" rejected=");
+    ui_console_u32_dec(ds.rx_rejected);
+    ui_console_write(" ok_rx=");
+    ui_console_u32_dec(ds.rx_ok);
+    ui_console_write("\nlast_rx=");
+    ui_console_ip4(ds.last_rx_src_ip);
+    ui_console_write(":");
+    ui_console_u32_dec(ds.last_rx_src_port);
+    ui_console_write(" -> ");
+    ui_console_u32_dec(ds.last_rx_dst_port);
+    ui_console_write(" len=");
+    ui_console_u32_dec(ds.last_rx_len);
     ui_console_write("\nhostname=");
     ui_console_write(ds.hostname);
     ui_console_write("\n");
@@ -6473,6 +6535,30 @@ static void ui_console_print_netstat(void)
     ui_console_u32_dec((u32)rx_drop);
     ui_console_write(" fw_tx_drop=");
     ui_console_u32_dec((u32)tx_drop);
+    ui_console_write(" act_syn=");
+    ui_console_u32_dec((u32)td->active_syn_sent);
+    ui_console_write(" act_synack=");
+    ui_console_u32_dec((u32)td->active_synack_seen);
+    ui_console_write(" act_est=");
+    ui_console_u32_dec((u32)td->active_established);
+    ui_console_write(" act_rst=");
+    ui_console_u32_dec((u32)td->active_rst);
+    ui_console_write(" act_badack=");
+    ui_console_u32_dec((u32)td->active_bad_ack);
+    ui_console_write(" act_timeout=");
+    ui_console_u32_dec((u32)td->active_timeout);
+    ui_console_write("\nactive_last ");
+    ui_console_ip4(td->active_last_local_ip);
+    ui_console_write(":");
+    ui_console_u32_dec(td->active_last_local_port);
+    ui_console_write(" -> ");
+    ui_console_ip4(td->active_last_remote_ip);
+    ui_console_write(":");
+    ui_console_u32_dec(td->active_last_remote_port);
+    ui_console_write(" state=");
+    ui_console_write(tcp_state_name(td->active_last_state));
+    ui_console_write(" retries=");
+    ui_console_u32_dec(td->active_last_retries);
     ui_console_write("\n");
 }
 
@@ -8247,7 +8333,7 @@ static bool ui_http_client_parse_common(u32 argc, char **argv, bool use_tls,
     u32 to = 3000U;
     if (argc < 3 || !ui_streq(argv[1], "get"))
         return false;
-    if (!ui_parse_ip4(argv[2], ip))
+    if (!ui_parse_ip4(argv[2], ip) && !dns_cache_lookup(argv[2], ip))
         return false;
     *path = (argc >= 4) ? argv[3] : "/";
     if ((*path)[0] != '/')
@@ -8273,8 +8359,8 @@ static void ui_cmd_http_client(u32 argc, char **argv, bool use_tls)
 
     if (!ui_http_client_parse_common(argc, argv, use_tls, &ip, &port, &path, &timeout_ms)) {
         ui_console_write(use_tls ?
-            "ERR: usage https get <ip> [path] [port] [timeout_ms]\n" :
-            "ERR: usage http get <ip> [path] [port] [timeout_ms]\n");
+            "ERR: usage https get <ip-or-cached-host> [path] [port] [timeout_ms]\n" :
+            "ERR: usage http get <ip-or-cached-host> [path] [port] [timeout_ms]\n");
         return;
     }
     if (!ui_http_fetch(use_tls, ip, port, argv[2], path, timeout_ms,
@@ -9602,8 +9688,8 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "mem")) {
         ui_console_write("mem analyze\n  Show kernel image, raw-slot, per-core RAM, and process memory layout diagnostics.\n");
     } else if (ui_streq(topic, "http") || ui_streq(topic, "https")) {
-        ui_console_write("http get <ip> [path] [port] [timeout_ms]\n  Fetch plaintext HTTP over TCP.\n");
-        ui_console_write("https get <ip> [path] [port] [timeout_ms]\n  Fetch through the PIOS kernel TLS-wrapper endpoint, not browser HTTPS.\n");
+        ui_console_write("http get <ip-or-cached-host> [path] [port] [timeout_ms]\n  Fetch plaintext HTTP over TCP; hostnames use DNS cache.\n");
+        ui_console_write("https get <ip-or-cached-host> [path] [port] [timeout_ms]\n  Fetch through the PIOS kernel TLS-wrapper endpoint, not browser HTTPS.\n");
     } else if (ui_streq(topic, "dns")) {
         ui_console_write("dns resolve <hostname>\n  Start async A-record lookup.\n");
         ui_console_write("dns status\n  Poll resolver job status.\n");
@@ -9675,7 +9761,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d>\nnetcfg apply\nnetcfg dhcp <on|off> [timeout_ms]\nnetcfg addnbr <ip> <mac>\nnetcfg routes|neighbors|trace\nnetcfg route add <dst> <mask> <gw> <connected|via>\n");
     } else if (ui_streq(topic, "stream")) {
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
-        ui_console_write("http get <ip> [path] [port] [timeout_ms]\nhttps get <ip> [path] [port] [timeout_ms]\n");
+        ui_console_write("http get <ip-or-cached-host> [path] [port] [timeout_ms]\nhttps get <ip-or-cached-host> [path] [port] [timeout_ms]\n");
     } else if (ui_streq(topic, "svc")) {
         ui_console_write("svc add <name> <path> [dep|-] [target] [1|2|3] [priority] [principal] [restart] [max] [backoff]\n");
         ui_console_write("svc start|stop|restart <name> | svc run|pause | svc target <default|rescue|all> | svc list | svc clear\n");
@@ -9749,7 +9835,7 @@ static void ui_console_exec(char *line)
             ui_console_write("  firewall list|reset|clear|remove <idx>|default in <allow|deny> out <allow|deny>\n");
             ui_console_write("  firewall allow|deny <in|out|both> <tcp|udp|icmp|ip|arp> [port N] [src SPEC] [dst SPEC]\n");
             ui_console_write("  stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
-            ui_console_write("  http get <ip> [path] [port] [timeout_ms] | https get <ip> [path] [port] [timeout_ms]\n");
+            ui_console_write("  http get <ip-or-cached-host> [path] [port] [timeout_ms] | https get <ip-or-cached-host> [path] [port] [timeout_ms]\n");
             ui_console_write("  dns resolve <host> | dns status | dns flush\n");
             ui_console_write("  TCP debug console: port 2323, then 'unlock pios'\n");
         } else if (ui_streq(argv[1], "svc")) {
@@ -11296,6 +11382,7 @@ void kernel_main(void) {
     /* Pin the dev host PC as a static neighbor so we never need ARP
      * resolution to talk back to it, and unsolicited replies are valid. */
     net_add_neighbor(HOST_PC_IP, HOST_PC_MAC);
+    (void)net_route_add(HOST_PC_IP, 0xFFFFFFFFU, 0, NET_ROUTE_F_CONNECTED);
     uart_puts("[net] static neighbor 192.168.218.9 -> 04:bf:1b:e1:d7:78\n");
     ui_cfg_ip = MY_IP;
     ui_cfg_mask = MY_MASK;

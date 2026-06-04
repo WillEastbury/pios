@@ -98,7 +98,7 @@ def fetch_logs(host: str, port: int, since: int, timeout: float) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Upload a PIOS real_kernel.img to the OTA raw slot.")
     ap.add_argument("image", type=pathlib.Path, nargs="?", default=pathlib.Path("real_kernel.img"))
-    ap.add_argument("--host", default="192.168.218.101")
+    ap.add_argument("--host", default="192.168.0.101")
     ap.add_argument("--update-port", type=int, default=8082)
     ap.add_argument("--status-port", type=int, default=8080)
     ap.add_argument("--reboot-port", type=int, default=8081)

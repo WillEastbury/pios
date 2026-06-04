@@ -216,12 +216,12 @@ struct tcb {
 
     /* Retransmit */
     u64 rto_ms;
-    u64 rto_deadline;   /* timer_ticks() when we should retransmit */
+    u64 rto_deadline;   /* monotonic ms when we should retransmit */
     u32 retries;
 
     /* RTT estimation (Jacobson/Karn) */
     u64 rtt_seq;        /* seq# being timed */
-    u64 rtt_start;      /* ticks when that segment was sent */
+    u64 rtt_start;      /* monotonic ms when that segment was sent */
     bool rtt_active;
     i32 srtt;           /* smoothed RTT in ms (fixed-point /8) */
     i32 rttvar;         /* RTT variance in ms (fixed-point /4) */
@@ -254,6 +254,23 @@ static u32 tcp_local_ip;
 static u8  tcp_local_mac[6];
 static u16 tcp_ip_id;
 static tcp_diag_t tcp_diag_counts;
+
+static u64 tcp_now_ms(void)
+{
+    return timer_monotonic_ms();
+}
+
+static void tcp_diag_active_tuple(const struct tcb *t)
+{
+    if (!t)
+        return;
+    tcp_diag_counts.active_last_local_ip = t->local_ip;
+    tcp_diag_counts.active_last_remote_ip = t->remote_ip;
+    tcp_diag_counts.active_last_local_port = t->local_port;
+    tcp_diag_counts.active_last_remote_port = t->remote_port;
+    tcp_diag_counts.active_last_state = t->state;
+    tcp_diag_counts.active_last_retries = t->retries;
+}
 
 /* SYN cookie secret, initialized once */
 static u32 syn_secret;
@@ -342,7 +359,7 @@ static void tcp_log_established(const struct tcb *t, const char *kind)
 static u16 next_ephemeral = 49152;
 static u16 alloc_port(void) {
     u16 p = next_ephemeral++;
-    if (next_ephemeral == 0) next_ephemeral = 49152;
+    if (next_ephemeral < 49152) next_ephemeral = 49152;
     return p;
 }
 
@@ -365,7 +382,7 @@ static u32 generate_isn(u32 local_ip, u16 local_port,
     seed.rip    = remote_ip;
     seed.rp     = remote_port;
     seed.secret = syn_secret;
-    seed.ts     = (u32)timer_ticks();
+    seed.ts     = (u32)tcp_now_ms();
     return hw_crc32c(&seed, sizeof(seed));
 }
 
@@ -735,7 +752,7 @@ static void rtt_update(struct tcb *t, u32 rtt_ms) {
 /* ================================================================== */
 
 static void tcp_arm_rto(struct tcb *t) {
-    t->rto_deadline = timer_ticks() + t->rto_ms;
+    t->rto_deadline = tcp_now_ms() + t->rto_ms;
 }
 
 static void tcp_output(struct tcb *t) {
@@ -761,7 +778,7 @@ static void tcp_output(struct tcb *t) {
 
         if (!t->rtt_active) {
             t->rtt_seq    = t->snd_nxt;
-            t->rtt_start  = timer_ticks();
+            t->rtt_start  = tcp_now_ms();
             t->rtt_active = true;
         }
 
@@ -933,7 +950,7 @@ static void handle_established(struct tcb *t, u32 seg_seq, u32 seg_ack,
 
             /* RTT measurement */
             if (t->rtt_active && seq_le(t->rtt_seq + 1, seg_ack)) {
-                u64 rtt = timer_ticks() - t->rtt_start;
+                u64 rtt = tcp_now_ms() - t->rtt_start;
                 rtt_update(t, (u32)rtt);
                 t->rtt_active = false;
             }
@@ -1080,8 +1097,10 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
 
     /* ---- SYN_SENT state ---- */
     if (t->state == TCP_SYN_SENT) {
+        tcp_diag_active_tuple(t);
         if (flags & TCP_ACK) {
             if (seg_ack != t->iss + 1) {
+                tcp_diag_counts.active_bad_ack++;
                 if (!(flags & TCP_RST))
                     tcp_send_rst(t->local_ip, t->remote_ip,
                                  t->local_port, t->remote_port, seg_ack, 0);
@@ -1089,12 +1108,15 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
             }
         }
         if (flags & TCP_RST) {
+            tcp_diag_counts.active_rst++;
             if (flags & TCP_ACK) {
                 tcb_reset(t);
             }
             return;
         }
         if (flags & TCP_SYN) {
+            if (flags & TCP_ACK)
+                tcp_diag_counts.active_synack_seen++;
             t->irs     = seg_seq;
             t->rcv_nxt = seg_seq + 1;
             t->snd_wnd = seg_wnd;
@@ -1103,6 +1125,8 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
                 t->state   = TCP_ESTABLISHED;
                 tcp_send_ack(t);
                 cc_init(t);
+                tcp_diag_counts.active_established++;
+                tcp_diag_active_tuple(t);
                 tcp_log_established(t, "active");
             } else {
                 /* Simultaneous open */
@@ -1196,7 +1220,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
             tcp_send_ack(t);
             if (t->state == TCP_FIN_WAIT_2) {
                 t->state     = TCP_TIME_WAIT;
-                t->tw_expiry = timer_ticks() + TIME_WAIT_MS;
+                t->tw_expiry = tcp_now_ms() + TIME_WAIT_MS;
             } else {
                 /* Simultaneous close: FIN_WAIT_1 → CLOSING */
                 t->state = TCP_CLOSING;
@@ -1212,7 +1236,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
         if (flags & TCP_FIN) {
             t->rcv_nxt++;
             t->state     = TCP_TIME_WAIT;
-            t->tw_expiry = timer_ticks() + TIME_WAIT_MS;
+            t->tw_expiry = tcp_now_ms() + TIME_WAIT_MS;
             tcp_send_ack(t);
         } else if (data_len > 0) {
             tcp_send_ack(t);
@@ -1235,7 +1259,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
         if (flags & TCP_ACK) {
             if (t->fin_sent && seg_ack == t->fin_seq + 1) {
                 t->state     = TCP_TIME_WAIT;
-                t->tw_expiry = timer_ticks() + TIME_WAIT_MS;
+                t->tw_expiry = tcp_now_ms() + TIME_WAIT_MS;
             }
         }
         break;
@@ -1252,7 +1276,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
         /* Retransmit ACK if FIN received again */
         if (flags & TCP_FIN) {
             tcp_send_ack(t);
-            t->tw_expiry = timer_ticks() + TIME_WAIT_MS;
+            t->tw_expiry = tcp_now_ms() + TIME_WAIT_MS;
         }
         break;
 
@@ -1266,7 +1290,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
 /* ================================================================== */
 
 void tcp_tick(void) {
-    u64 now = timer_ticks();
+    u64 now = tcp_now_ms();
 
     for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         struct tcb *t = &tcbs[i];
@@ -1293,6 +1317,10 @@ void tcp_tick(void) {
             t->retries++;
             if (t->retries > MAX_RETRIES) {
                 /* Connection failed */
+                if (t->state == TCP_SYN_SENT) {
+                    tcp_diag_counts.active_timeout++;
+                    tcp_diag_active_tuple(t);
+                }
 #if TCP_UART_DIAG_VERBOSE
                 uart_puts("[tcp] conn timeout\n");
 #endif
@@ -1339,12 +1367,12 @@ void tcp_init(void) {
     tcp_local_ip = net_get_our_ip();
 
     /* Generate SYN cookie secret from timer jitter */
-    u32 t0 = (u32)timer_ticks();
+    u32 t0 = (u32)tcp_now_ms();
     syn_secret = hw_crc32c(&t0, sizeof(t0));
     syn_secret ^= 0xA5C39E17;  /* mix in constant */
 
     tcp_ip_id = (u16)(syn_secret & 0xFFFF);
-    next_ephemeral = 49152 + (u16)(syn_secret >> 16);
+    next_ephemeral = 49152 + (u16)((syn_secret >> 16) & 0x3FFFU);
 
 #if TCP_UART_DIAG_VERBOSE
     uart_puts("[tcp] init ok\n");
@@ -1374,6 +1402,8 @@ tcp_conn_t tcp_connect(u32 dst_ip, u16 dst_port) {
     /* Send SYN */
     t->state = TCP_SYN_SENT;
     tcp_send_segment(t, TCP_SYN, NULL, 0);
+    tcp_diag_counts.active_syn_sent++;
+    tcp_diag_active_tuple(t);
     t->snd_nxt = t->iss + 1;
     tcp_arm_rto(t);
 
@@ -1466,17 +1496,17 @@ void tcp_close(tcp_conn_t conn) {
     case TCP_ESTABLISHED:
         tcp_send_fin(t);
         t->state = TCP_FIN_WAIT_1;
-        t->tw_expiry = timer_ticks() + CLOSE_STATE_MS;
+        t->tw_expiry = tcp_now_ms() + CLOSE_STATE_MS;
         break;
     case TCP_CLOSE_WAIT:
         tcp_send_fin(t);
         t->state = TCP_LAST_ACK;
-        t->tw_expiry = timer_ticks() + CLOSE_STATE_MS;
+        t->tw_expiry = tcp_now_ms() + CLOSE_STATE_MS;
         break;
     case TCP_SYN_RECEIVED:
         tcp_send_fin(t);
         t->state = TCP_FIN_WAIT_1;
-        t->tw_expiry = timer_ticks() + CLOSE_STATE_MS;
+        t->tw_expiry = tcp_now_ms() + CLOSE_STATE_MS;
         break;
     default:
         break;

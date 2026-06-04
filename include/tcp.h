@@ -117,6 +117,18 @@ typedef struct {
     u64 tx_segments;
     u64 tx_no_mac;
     u64 tx_send_fail;
+    u64 active_syn_sent;
+    u64 active_synack_seen;
+    u64 active_established;
+    u64 active_rst;
+    u64 active_bad_ack;
+    u64 active_timeout;
+    u32 active_last_local_ip;
+    u32 active_last_remote_ip;
+    u16 active_last_local_port;
+    u16 active_last_remote_port;
+    u32 active_last_state;
+    u32 active_last_retries;
 } tcp_diag_t;
 
 const tcp_diag_t *tcp_diag(void);

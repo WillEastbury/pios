@@ -86,7 +86,7 @@ static u8 arp_tx[60] ALIGNED(64);  /* min Ethernet frame */
 /* ---- Helpers ---- */
 
 static u64 now_ms(void) {
-    return timer_ticks();  /* timer_ticks returns ms-resolution ticks at 1kHz */
+    return timer_monotonic_ms();
 }
 
 static bool mac_is_zero(const u8 *m) {
