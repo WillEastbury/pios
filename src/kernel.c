@@ -1389,6 +1389,7 @@ static bool ui_http_client_parse_common(u32 argc, char **argv, bool use_tls,
                                         u32 *timeout_ms);
 static void http_append_mem_analyze(char *out, u32 *len, u32 max);
 static void http_append_walfs_list_text(char *out, u32 *len, u32 max, const char *path);
+static void http_append_bootctrl_status(char *out, u32 *len, u32 max);
 static void http_append_proc_image_validation(char *out, u32 *len, u32 max,
                                               const struct proc_image_validation *v);
 static void http_append_proc_image_validation_json(char *out, u32 *len, u32 max,
@@ -1468,6 +1469,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "mem analyze\n  Show kernel image, raw-slot, per-core RAM, and process memory layout diagnostics.\n");
         } else if (http_streq(topic, "fs") || http_streq(topic, "ls") || http_streq(topic, "fsinspect")) {
             http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path] | walfs status | walfs format confirm\n  WALFS listing/status plus confirmed reserved-base format.\n");
+        } else if (http_streq(topic, "bootctrl")) {
+            http_append(out, &len, max, "bootctrl status\n  Show stage0 A/B boot-control state: active/pending slots, tries, good mask, and generation.\n");
         } else if (http_streq(topic, "dma")) {
             http_append(out, &len, max, "dma status | dma selftest\n  Show DMA channel registers, selftest result, selected CB address mode, and retry selftest.\n");
         } else if (http_streq(topic, "addr")) {
@@ -2172,6 +2175,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, ok ? "WALFS format OK\n" : "WALFS format FAILED\n");
         if (ok)
             http_append_walfs_list_text(out, &len, max, "/");
+    } else if (http_streq(cmd, "bootctrl") || http_streq(cmd, "bootctrl status")) {
+        http_append_bootctrl_status(out, &len, max);
     } else if (http_streq(cmd, "keystore") || http_streq(cmd, "keystore status")) {
         struct keystore_status st;
         keystore_status(&st);
@@ -3119,6 +3124,53 @@ static void pios_bootctrl_mark_success(void)
     pios_write_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF, good);
     pios_write_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF, gen + 1U);
     (void)pios_bootctrl_write(ctl);
+}
+
+static const char *pios_bootctrl_slot_name(u32 slot)
+{
+    if (slot == PIOS_BOOTCTRL_SLOT_A) return "A";
+    if (slot == PIOS_BOOTCTRL_SLOT_B) return "B";
+    if (slot == PIOS_BOOTCTRL_SLOT_NONE) return "none";
+    return "bad";
+}
+
+static void http_append_bootctrl_status(char *out, u32 *len, u32 max)
+{
+    static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
+    bool ok = pios_bootctrl_read(ctl);
+    http_append(out, len, max, "bootctrl ok=");
+    http_append(out, len, max, ok ? "yes" : "no");
+    http_append(out, len, max, " lba=");
+    http_append_u64(out, len, max, walfs_partition_lba() + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE));
+    if (!ok) {
+        http_append(out, len, max, "\n");
+        return;
+    }
+
+    u32 active = pios_read_le32(ctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF);
+    u32 pending = pios_read_le32(ctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF);
+    u32 tries = pios_read_le32(ctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF);
+    u32 last = pios_read_le32(ctl + PIOS_BOOTCTRL_LAST_BOOT_OFF);
+    u32 good = pios_read_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF);
+    u32 gen = pios_read_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF);
+
+    http_append(out, len, max, " active=");
+    http_append(out, len, max, pios_bootctrl_slot_name(active));
+    http_append(out, len, max, " pending=");
+    http_append(out, len, max, pios_bootctrl_slot_name(pending));
+    http_append(out, len, max, " tries=");
+    http_append_u64(out, len, max, tries);
+    http_append(out, len, max, " last=");
+    http_append(out, len, max, pios_bootctrl_slot_name(last));
+    http_append(out, len, max, " good_mask=");
+    http_append_hex32(out, len, max, good);
+    http_append(out, len, max, " generation=");
+    http_append_u64(out, len, max, gen);
+    http_append(out, len, max, "\nslot_lba A=");
+    http_append_u64(out, len, max, walfs_partition_lba() + (PIOS_BOOT_SLOT_A_OFFSET / SD_BLOCK_SIZE));
+    http_append(out, len, max, " B=");
+    http_append_u64(out, len, max, walfs_partition_lba() + (PIOS_BOOT_SLOT_B_OFFSET / SD_BLOCK_SIZE));
+    http_append(out, len, max, "\n");
 }
 
 static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *data, u32 len,
