@@ -18,5 +18,7 @@ void watchdog_set_timeout(u32 timeout_ticks);
 void watchdog_set_reboot(bool reboot_on_trip);
 void watchdog_set_armed(bool armed);
 void watchdog_trip(u32 core, u32 reason);
+void watchdog_hw_arm_seconds(u32 seconds);
+void watchdog_hw_disable(void);
 NORETURN void watchdog_reboot_now(u32 reason);
 void watchdog_status(struct watchdog_status *out);

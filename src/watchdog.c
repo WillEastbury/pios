@@ -9,6 +9,7 @@
 #define PM_WDOG        (PM_BASE + 0x24U)
 #define PM_PASSWORD    0x5A000000U
 #define PM_RSTC_FULL   0x00000020U
+#define PM_RSTC_WRCFG_MASK 0x00000030U
 #define PSCI_SYSTEM_RESET 0x84000009U
 
 static struct watchdog_status g_wdog;
@@ -33,6 +34,25 @@ static NORETURN void watchdog_reboot_best_effort(void)
     mmio_write(PM_WDOG, PM_PASSWORD | 10U);
     mmio_write(PM_RSTC, PM_PASSWORD | PM_RSTC_FULL);
     for (;;) wfe();
+}
+
+void watchdog_hw_arm_seconds(u32 seconds)
+{
+    if (seconds == 0)
+        seconds = 1;
+    if (seconds > 15)
+        seconds = 15;
+    mmio_write(PM_WDOG, PM_PASSWORD | (seconds << 16));
+    mmio_write(PM_RSTC, PM_PASSWORD |
+                         (mmio_read(PM_RSTC) & ~PM_RSTC_WRCFG_MASK) |
+                         PM_RSTC_FULL);
+}
+
+void watchdog_hw_disable(void)
+{
+    mmio_write(PM_WDOG, PM_PASSWORD);
+    mmio_write(PM_RSTC, PM_PASSWORD |
+                         (mmio_read(PM_RSTC) & ~PM_RSTC_WRCFG_MASK));
 }
 
 void watchdog_init(u32 timeout_ticks, bool reboot_on_trip)

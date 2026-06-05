@@ -272,6 +272,8 @@ static struct http_log_entry http_log_ring[HTTP_LOG_RING_SIZE];
 static u32 http_log_seq;
 struct ota_update_state {
     bool active;
+    u32 target_slot;
+    u32 target_slot_offset;
     u32 total;
     u32 received;
     u32 chunks;
@@ -2981,6 +2983,11 @@ static void pios_write_le32(u8 *p, u32 v)
     p[3] = (u8)((v >> 24) & 0xFF);
 }
 
+static u32 pios_read_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
 static void pios_fill_reserved_header(u8 *out, u32 magic, u32 payload_len)
 {
     simd_zero(out, SD_BLOCK_SIZE);
@@ -3004,7 +3011,117 @@ static void pios_fill_reserved_header(u8 *out, u32 magic, u32 payload_len)
     pios_write_le32(out + PIOS_HDR_WALFS_OFF, PIOS_WALFS_OFFSET);
 }
 
-static bool http_write_kernel_slot_range(u32 offset, const u8 *data, u32 len,
+static u32 pios_boot_slot_offset(u32 slot)
+{
+    return slot == PIOS_BOOTCTRL_SLOT_B ? PIOS_BOOT_SLOT_B_OFFSET : PIOS_BOOT_SLOT_A_OFFSET;
+}
+
+static u32 pios_bootctrl_checksum(const u8 *p)
+{
+    u32 sum = 0xB007C0DEU;
+    for (u32 i = 0; i < PIOS_BOOTCTRL_CHECKSUM_OFF; i++)
+        sum = (sum << 5) ^ (sum >> 27) ^ p[i];
+    return sum;
+}
+
+static bool pios_bootctrl_valid(const u8 *p)
+{
+    if (pios_read_le32(p + PIOS_BOOTCTRL_MAGIC_OFF) != PIOS_BOOTCTRL_MAGIC)
+        return false;
+    if (pios_read_le32(p + PIOS_BOOTCTRL_VERSION_OFF) != PIOS_BOOTCTRL_VERSION)
+        return false;
+    return pios_read_le32(p + PIOS_BOOTCTRL_CHECKSUM_OFF) == pios_bootctrl_checksum(p);
+}
+
+static bool pios_bootctrl_read(u8 *out)
+{
+    if (!out)
+        return false;
+    u32 lba = walfs_partition_lba() + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE);
+    return sd_read_block(lba, out) && pios_bootctrl_valid(out);
+}
+
+static bool pios_bootctrl_write_at(u32 root_lba, u8 *p)
+{
+    if (!p)
+        return false;
+    pios_write_le32(p + PIOS_BOOTCTRL_CHECKSUM_OFF, pios_bootctrl_checksum(p));
+    u32 lba = root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE);
+    return sd_write_block(lba, p);
+}
+
+static bool pios_bootctrl_write(u8 *p)
+{
+    return pios_bootctrl_write_at(walfs_partition_lba(), p);
+}
+
+static void pios_bootctrl_init_good_at(u32 root_lba, u32 active_slot)
+{
+    static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
+    if (active_slot > PIOS_BOOTCTRL_SLOT_B)
+        active_slot = PIOS_BOOTCTRL_SLOT_A;
+    simd_zero(ctl, sizeof(ctl));
+    pios_write_le32(ctl + PIOS_BOOTCTRL_MAGIC_OFF, PIOS_BOOTCTRL_MAGIC);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_VERSION_OFF, PIOS_BOOTCTRL_VERSION);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF, active_slot);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF, PIOS_BOOTCTRL_SLOT_NONE);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, 0);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, active_slot);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF, 1U << active_slot);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF, 1);
+    (void)pios_bootctrl_write_at(root_lba, ctl);
+}
+
+static u32 pios_bootctrl_target_slot(void)
+{
+    static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
+    if (!pios_bootctrl_read(ctl))
+        return PIOS_BOOTCTRL_SLOT_B;
+    u32 active = pios_read_le32(ctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF);
+    return active == PIOS_BOOTCTRL_SLOT_B ? PIOS_BOOTCTRL_SLOT_A : PIOS_BOOTCTRL_SLOT_B;
+}
+
+static void pios_bootctrl_mark_pending(u32 pending_slot)
+{
+    static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
+    if (pending_slot > PIOS_BOOTCTRL_SLOT_B)
+        pending_slot = PIOS_BOOTCTRL_SLOT_B;
+    if (!pios_bootctrl_read(ctl)) {
+        simd_zero(ctl, sizeof(ctl));
+        pios_write_le32(ctl + PIOS_BOOTCTRL_MAGIC_OFF, PIOS_BOOTCTRL_MAGIC);
+        pios_write_le32(ctl + PIOS_BOOTCTRL_VERSION_OFF, PIOS_BOOTCTRL_VERSION);
+        pios_write_le32(ctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF, PIOS_BOOTCTRL_SLOT_A);
+        pios_write_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF, 1U << PIOS_BOOTCTRL_SLOT_A);
+    }
+    u32 gen = pios_read_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF, pending_slot);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, PIOS_BOOTCTRL_TRIES_DEFAULT);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, PIOS_BOOTCTRL_SLOT_NONE);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF,
+                    pios_read_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF) & ~(1U << pending_slot));
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF, gen + 1U);
+    (void)pios_bootctrl_write(ctl);
+}
+
+static void pios_bootctrl_mark_success(void)
+{
+    static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
+    if (!pios_bootctrl_read(ctl))
+        return;
+    u32 booted = pios_read_le32(ctl + PIOS_BOOTCTRL_LAST_BOOT_OFF);
+    if (booted > PIOS_BOOTCTRL_SLOT_B)
+        return;
+    u32 good = pios_read_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF) | (1U << booted);
+    u32 gen = pios_read_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF, booted);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF, PIOS_BOOTCTRL_SLOT_NONE);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, 0);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF, good);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF, gen + 1U);
+    (void)pios_bootctrl_write(ctl);
+}
+
+static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *data, u32 len,
                                          u32 *out_written)
 {
     static u8 block[SD_BLOCK_SIZE] ALIGNED(64);
@@ -3014,7 +3131,7 @@ static bool http_write_kernel_slot_range(u32 offset, const u8 *data, u32 len,
     if (offset > HOTPATCH_SLOT_BYTES || len > HOTPATCH_SLOT_BYTES - offset)
         return false;
 
-    u32 base_lba = walfs_partition_lba();
+    u32 base_lba = walfs_partition_lba() + (slot_offset / SD_BLOCK_SIZE);
     u32 pos = offset;
     u32 written = 0;
     while (written < len) {
@@ -3040,39 +3157,39 @@ static bool http_write_kernel_slot_range(u32 offset, const u8 *data, u32 len,
     return true;
 }
 
-static bool http_write_kernel_slot_header(u32 payload_len, bool valid)
+static bool http_write_kernel_slot_header(u32 slot_offset, u32 payload_len, bool valid)
 {
     static u8 header[SD_BLOCK_SIZE] ALIGNED(64);
     u32 written = 0;
     u32 magic = valid ? HOTPATCH_SLOT_MAGIC : 0U;
     pios_fill_reserved_header(header, magic, payload_len);
-    return http_write_kernel_slot_range(0, header, SD_BLOCK_SIZE, &written) &&
+    return http_write_kernel_slot_range(slot_offset, 0, header, SD_BLOCK_SIZE, &written) &&
            written == SD_BLOCK_SIZE;
 }
 
-static bool http_write_kernel_payload_range(u32 offset, const u8 *data, u32 len,
+static bool http_write_kernel_payload_range(u32 slot_offset, u32 offset, const u8 *data, u32 len,
                                             u32 *out_written)
 {
     if (offset > PIOS_STAGE2_ZONE_BYTES ||
         len > PIOS_STAGE2_ZONE_BYTES - offset)
         return false;
-    return http_write_kernel_slot_range(PIOS_STAGE2_OFFSET + offset, data, len,
+    return http_write_kernel_slot_range(slot_offset, PIOS_STAGE2_OFFSET + offset, data, len,
                                         out_written);
 }
 
-static bool http_write_kernel_slot_image(const u8 *data, u32 len, u32 *out_written)
+static bool http_write_kernel_slot_image(u32 slot_offset, const u8 *data, u32 len, u32 *out_written)
 {
     if (out_written) *out_written = 0;
     if (!data || len == 0 || len > PIOS_STAGE2_ZONE_BYTES)
         return false;
     u32 written = 0;
-    if (!http_write_kernel_slot_header(len, false))
+    if (!http_write_kernel_slot_header(slot_offset, len, false))
         return false;
-    if (!http_write_kernel_payload_range(0, data, len, &written))
+    if (!http_write_kernel_payload_range(slot_offset, 0, data, len, &written))
         return false;
     if (written != len)
         return false;
-    if (!http_write_kernel_slot_header(len, true))
+    if (!http_write_kernel_slot_header(slot_offset, len, true))
         return false;
     if (out_written) *out_written = len;
     return true;
@@ -3175,7 +3292,8 @@ static u32 http_build_hotpatch_kernel_response(char *out, u32 max, const u8 *req
         if (image_len == 0 || image_len > PIOS_STAGE2_ZONE_BYTES) {
             error = "image does not fit raw bootstrap slot";
         } else {
-            ok = http_write_kernel_slot_image((const u8 *)(usize)&_start,
+            ok = http_write_kernel_slot_image(PIOS_BOOT_SLOT_A_OFFSET,
+                                              (const u8 *)(usize)&_start,
                                               image_len, &written);
             if (!ok) error = "raw slot write failed";
         }
@@ -3254,7 +3372,8 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
     } else if (http_streq(action, "self")) {
         u32 image_len = http_running_kernel_image_len();
         ok = image_len != 0 &&
-             http_write_kernel_slot_image((const u8 *)(usize)&_start,
+             http_write_kernel_slot_image(PIOS_BOOT_SLOT_A_OFFSET,
+                                          (const u8 *)(usize)&_start,
                                           image_len, &written);
         if (!ok) error = "self-update raw slot write failed";
         else {
@@ -3265,9 +3384,13 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
     } else if (http_streq(action, "begin")) {
         if (total == 0 || total > capacity) {
             error = "invalid total; must fit raw payload slot";
-        } else if (!http_write_kernel_slot_header(total, false)) {
-            error = "failed to invalidate slot header";
         } else {
+            ota_update.target_slot = pios_bootctrl_target_slot();
+            ota_update.target_slot_offset = pios_boot_slot_offset(ota_update.target_slot);
+        }
+        if (!error && !http_write_kernel_slot_header(ota_update.target_slot_offset, total, false)) {
+            error = "failed to invalidate slot header";
+        } else if (!error) {
             ota_update.active = true;
             ota_update.total = total;
             ota_update.received = 0;
@@ -3300,7 +3423,8 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
                 ok = true;
             } else {
                 u32 new_len = body_len - skip;
-                ok = http_write_kernel_payload_range(ota_update.received,
+                ok = http_write_kernel_payload_range(ota_update.target_slot_offset,
+                                                    ota_update.received,
                                                     req + body_off + skip,
                                                     new_len, &written);
                 if (ok && written == new_len) {
@@ -3324,12 +3448,14 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
             error = "total does not match active OTA update";
         } else if (ota_update.received != ota_update.total) {
             error = "OTA image incomplete";
-        } else if (!http_write_kernel_slot_header(ota_update.received, true)) {
+        } else if (!http_write_kernel_slot_header(ota_update.target_slot_offset,
+                                                  ota_update.received, true)) {
             error = "failed to commit slot header";
         } else {
             ok = true;
             ota_update.active = false;
             ota_update.commits++;
+            pios_bootctrl_mark_pending(ota_update.target_slot);
             http_log_event("ota-commit", ota_update.received, ota_update.commits);
             char reboot[8];
             if (http_update_query_value(req, req_len, "reboot", reboot, sizeof(reboot)) &&
@@ -11206,6 +11332,7 @@ static bool provision_write_payload_to_slot(void)
                 return false;
         }
     }
+    pios_bootctrl_init_good_at(lba, PIOS_BOOTCTRL_SLOT_A);
     return true;
 }
 #endif
@@ -11216,6 +11343,8 @@ void kernel_main(void) {
     bool sd_ok = false;
     bool walfs_ok = false;
     bool nic_ok = false;
+
+    watchdog_hw_arm_seconds(15);
 
     /* Stack, NEON, VBAR already set by start.S .Lel1_entry */
 
@@ -11477,6 +11606,8 @@ void kernel_main(void) {
     bp_active(7);
     bp_done(7, true);
     bp_ok("[pios] System ready — serial console active");
+    pios_bootctrl_mark_success();
+    watchdog_hw_disable();
     bp_spin_color = 0x00FF88CC;  /* purple/pink — OS running */
 
     /* System summary in the log area */
