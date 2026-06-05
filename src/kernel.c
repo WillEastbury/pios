@@ -1390,6 +1390,8 @@ static bool ui_http_client_parse_common(u32 argc, char **argv, bool use_tls,
 static void http_append_mem_analyze(char *out, u32 *len, u32 max);
 static void http_append_walfs_list_text(char *out, u32 *len, u32 max, const char *path);
 static void http_append_bootctrl_status(char *out, u32 *len, u32 max);
+static bool pios_bootctrl_clear_pending(void);
+static bool pios_bootctrl_reset_a(void);
 static void http_append_proc_image_validation(char *out, u32 *len, u32 max,
                                               const struct proc_image_validation *v);
 static void http_append_proc_image_validation_json(char *out, u32 *len, u32 max,
@@ -1436,7 +1438,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max,
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
-            "Examples: status | ps | netstat | ls / | firewall list | addr wal:0/3 | reboot confirm\n"
+            "Examples: status | ps | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
             "Command help: help status | help netstat | help firewall | help reboot | help peek\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
     } else if (http_starts_with(cmd, "help ")) {
@@ -1470,7 +1472,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "fs") || http_streq(topic, "ls") || http_streq(topic, "fsinspect")) {
             http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path] | walfs status | walfs format confirm\n  WALFS listing/status plus confirmed reserved-base format.\n");
         } else if (http_streq(topic, "bootctrl")) {
-            http_append(out, &len, max, "bootctrl status\n  Show stage0 A/B boot-control state: active/pending slots, tries, good mask, and generation.\n");
+            http_append(out, &len, max, "bootctrl status | bootctrl clear-pending | bootctrl reset-a confirm\n  Show/repair stage0 A/B boot-control state without host raw-disk access.\n");
         } else if (http_streq(topic, "dma")) {
             http_append(out, &len, max, "dma status | dma selftest\n  Show DMA channel registers, selftest result, selected CB address mode, and retry selftest.\n");
         } else if (http_streq(topic, "addr")) {
@@ -2176,6 +2178,16 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         if (ok)
             http_append_walfs_list_text(out, &len, max, "/");
     } else if (http_streq(cmd, "bootctrl") || http_streq(cmd, "bootctrl status")) {
+        http_append_bootctrl_status(out, &len, max);
+    } else if (http_streq(cmd, "bootctrl clear-pending")) {
+        http_append(out, &len, max,
+                    pios_bootctrl_clear_pending() ? "bootctrl clear-pending OK\n" :
+                                                    "bootctrl clear-pending FAILED\n");
+        http_append_bootctrl_status(out, &len, max);
+    } else if (http_streq(cmd, "bootctrl reset-a confirm")) {
+        http_append(out, &len, max,
+                    pios_bootctrl_reset_a() ? "bootctrl reset-a OK\n" :
+                                             "bootctrl reset-a FAILED\n");
         http_append_bootctrl_status(out, &len, max);
     } else if (http_streq(cmd, "keystore") || http_streq(cmd, "keystore status")) {
         struct keystore_status st;
@@ -3108,6 +3120,33 @@ static void pios_bootctrl_mark_pending(u32 pending_slot)
     (void)pios_bootctrl_write(ctl);
 }
 
+static bool pios_bootctrl_clear_pending(void)
+{
+    static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
+    if (!pios_bootctrl_read(ctl))
+        return false;
+    u32 gen = pios_read_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF, PIOS_BOOTCTRL_SLOT_NONE);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, 0);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF, gen + 1U);
+    return pios_bootctrl_write(ctl);
+}
+
+static bool pios_bootctrl_reset_a(void)
+{
+    static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
+    simd_zero(ctl, sizeof(ctl));
+    pios_write_le32(ctl + PIOS_BOOTCTRL_MAGIC_OFF, PIOS_BOOTCTRL_MAGIC);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_VERSION_OFF, PIOS_BOOTCTRL_VERSION);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF, PIOS_BOOTCTRL_SLOT_A);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF, PIOS_BOOTCTRL_SLOT_NONE);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, 0);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, PIOS_BOOTCTRL_SLOT_A);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF, 1U << PIOS_BOOTCTRL_SLOT_A);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF, 1);
+    return pios_bootctrl_write(ctl);
+}
+
 static void pios_bootctrl_mark_success(void)
 {
     static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
@@ -3171,6 +3210,32 @@ static void http_append_bootctrl_status(char *out, u32 *len, u32 max)
     http_append(out, len, max, " B=");
     http_append_u64(out, len, max, walfs_partition_lba() + (PIOS_BOOT_SLOT_B_OFFSET / SD_BLOCK_SIZE));
     http_append(out, len, max, "\n");
+}
+
+static void ui_cmd_bootctrl(u32 argc, char **argv)
+{
+    static char out[512];
+    u32 len = 0;
+    if (argc < 2 || ui_streq(argv[1], "status")) {
+        http_append_bootctrl_status(out, &len, sizeof(out));
+        ui_console_write(out);
+        return;
+    }
+    if (ui_streq(argv[1], "clear-pending")) {
+        ui_console_write(pios_bootctrl_clear_pending() ? "bootctrl clear-pending OK\n" :
+                                                       "bootctrl clear-pending FAILED\n");
+        http_append_bootctrl_status(out, &len, sizeof(out));
+        ui_console_write(out);
+        return;
+    }
+    if (ui_streq(argv[1], "reset-a") && argc >= 3 && ui_streq(argv[2], "confirm")) {
+        ui_console_write(pios_bootctrl_reset_a() ? "bootctrl reset-a OK\n" :
+                                                   "bootctrl reset-a FAILED\n");
+        http_append_bootctrl_status(out, &len, sizeof(out));
+        ui_console_write(out);
+        return;
+    }
+    ui_console_write("ERR: usage bootctrl status | bootctrl clear-pending | bootctrl reset-a confirm\n");
 }
 
 static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *data, u32 len,
@@ -4523,6 +4588,7 @@ static void ui_cmd_capsule(u32 argc, char **argv);
 static void ui_cmd_obs(u32 argc, char **argv);
 static void ui_cmd_update(u32 argc, char **argv);
 static void ui_cmd_watchdog(u32 argc, char **argv);
+static void ui_cmd_bootctrl(u32 argc, char **argv);
 static void ui_cmd_dma(u32 argc, char **argv);
 static void ui_cmd_addr(u32 argc, char **argv);
 static void ui_cmd_keystore(u32 argc, char **argv);
@@ -9913,6 +9979,8 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("SPEC: any | a.b.c.d | a.b.c.d/prefix | a.b.c.d/mask | a.b.c.d-a.b.c.d\n");
     } else if (ui_streq(topic, "reboot")) {
         ui_console_write("reboot confirm\n  Reboot via PSCI SYSTEM_RESET; confirmation word is required.\n");
+    } else if (ui_streq(topic, "bootctrl")) {
+        ui_console_write("bootctrl status\nbootctrl clear-pending\nbootctrl reset-a confirm\n  Show/repair stage0 A/B boot-control state without host raw-disk access.\n");
     } else if (ui_streq(topic, "watchdog")) {
         ui_console_write("watchdog status\nwatchdog arm|disarm\nwatchdog timeout <ticks>\nwatchdog mode <halt|reboot>\nwatchdog trip\n");
     } else if (ui_streq(topic, "dma")) {
@@ -10021,7 +10089,7 @@ static void ui_console_exec(char *line)
         if (argc < 2) {
             ui_console_write("PIOS help\n");
             ui_console_write("Run commands exactly as shown; category names are help topics, not prefixes.\n");
-            ui_console_write("Examples: status | ps | netstat | addr wal:0/3 | firewall list | reboot confirm\n");
+            ui_console_write("Examples: status | ps | netstat | addr wal:0/3 | firewall list | bootctrl status | reboot confirm\n");
             ui_console_write("Command help: help <command>, e.g. help status, help firewall, help reboot, help tls\n");
             ui_console_write("Category help: help core | help fs | help net | help svc | help dev\n");
         } else if (ui_streq(argv[1], "core")) {
@@ -10032,6 +10100,7 @@ static void ui_console_exec(char *line)
             ui_console_write("  prio <pid> <lazy|low|normal|high|realtime>\n");
             ui_console_write("  affinity <pid> <1|2|3>\n");
             ui_console_write("  watchdog status|arm|disarm|timeout <ticks>|mode <halt|reboot>|trip\n");
+            ui_console_write("  bootctrl status|clear-pending|reset-a confirm\n");
             ui_console_write("  reboot confirm\n");
         } else if (ui_streq(argv[1], "fs")) {
             ui_console_write("Filesystem/storage commands:\n");
@@ -10368,6 +10437,8 @@ static void ui_console_exec(char *line)
         ui_cmd_update(argc, argv);
     } else if (ui_streq(argv[0], "watchdog")) {
         ui_cmd_watchdog(argc, argv);
+    } else if (ui_streq(argv[0], "bootctrl")) {
+        ui_cmd_bootctrl(argc, argv);
     } else if (ui_streq(argv[0], "reboot")) {
         if (argc >= 2 && ui_streq(argv[1], "confirm")) {
             ui_console_write("OK: rebooting via PSCI SYSTEM_RESET...\n");

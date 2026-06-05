@@ -178,6 +178,23 @@ static void bootctrl_write(u32 root_lba, u8 *p)
     (void)sd_write_block(root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE), p);
 }
 
+static void bootctrl_mark_fallback_a(u32 root_lba)
+{
+    u32 ctl_lba = root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE);
+    if (!sd_read_block(ctl_lba, bootctl) || !bootctrl_valid(bootctl))
+        return;
+    u32 good = read_le32(bootctl + PIOS_BOOTCTRL_GOOD_MASK_OFF) |
+               (1U << PIOS_BOOTCTRL_SLOT_A);
+    u32 gen = read_le32(bootctl + PIOS_BOOTCTRL_GENERATION_OFF);
+    write_le32(bootctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF, PIOS_BOOTCTRL_SLOT_A);
+    write_le32(bootctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF, PIOS_BOOTCTRL_SLOT_NONE);
+    write_le32(bootctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, 0);
+    write_le32(bootctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, PIOS_BOOTCTRL_SLOT_A);
+    write_le32(bootctl + PIOS_BOOTCTRL_GOOD_MASK_OFF, good);
+    write_le32(bootctl + PIOS_BOOTCTRL_GENERATION_OFF, gen + 1U);
+    bootctrl_write(root_lba, bootctl);
+}
+
 static u32 select_kernel_slot_lba(u32 root_lba)
 {
     u32 slot = PIOS_BOOTCTRL_SLOT_A;
@@ -255,11 +272,20 @@ NORETURN void kernel_main(void)
     uart_puts("\n");
 
     if (!sd_read_block(slot_lba, hdr)) {
+        if (slot_lba != root_lba) {
+            fb_puts("[stage0] candidate read failed; falling back to A\n");
+            uart_puts("[boot] candidate read failed; fallback A\n");
+            bootctrl_mark_fallback_a(root_lba);
+            slot_lba = root_lba;
+            if (sd_read_block(slot_lba, hdr))
+                goto have_header;
+        }
         fb_set_color(0x00FF0000, 0x00000000);
         fb_puts("[stage0] header read failed\n");
         uart_puts("[boot] header read failed\n");
         for (;;) wfi();
     }
+have_header:
     u32 magic = read_le32(hdr + PIOS_HDR_MAGIC_OFF);
     u32 image_len = read_le32(hdr + PIOS_HDR_STAGE2_LEN_OFF);
     u32 layout_ver = read_le32(hdr + PIOS_HDR_LAYOUT_VERSION_OFF);
@@ -272,6 +298,7 @@ NORETURN void kernel_main(void)
     if (bad_header && slot_lba != root_lba) {
         fb_puts("[stage0] candidate bad; falling back to A\n");
         uart_puts("[boot] candidate bad; fallback A\n");
+        bootctrl_mark_fallback_a(root_lba);
         slot_lba = root_lba;
         if (!sd_read_block(slot_lba, hdr)) {
             fb_set_color(0x00FF0000, 0x00000000);
