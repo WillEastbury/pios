@@ -9380,7 +9380,7 @@ static void ui_cmd_watchdog(u32 argc, char **argv)
         return;
     }
     if (argc < 2 || ui_streq(argv[1], "help")) {
-        ui_console_write("watchdog status | watchdog arm|disarm | watchdog timeout <ticks> | watchdog mode <halt|reboot> | watchdog trip\n");
+        ui_console_write("watchdog status | watchdog arm|disarm | watchdog timeout <ticks> | watchdog mode <halt|reboot> | watchdog trip | watchdog hw-arm <secs> | watchdog hw-pet | watchdog hw-disable | watchdog hw-trip confirm\n");
         return;
     }
     if (ui_streq(argv[1], "status")) {
@@ -9389,7 +9389,59 @@ static void ui_cmd_watchdog(u32 argc, char **argv)
         fb_printf("watchdog armed=%u mode=%s timeout=%u trips=%u last_core=%u\n",
                   st.armed ? 1U : 0U, st.reboot_on_trip ? "reboot" : "halt",
                   st.timeout_ticks, st.trip_count, st.last_trip_core);
+        u32 rem = watchdog_hw_remaining_ticks();
+        u32 rstc = watchdog_hw_rstc();
+        fb_printf("hw remaining_ticks=0x%x (~%ums) rstc=0x%x\n",
+                  rem, (u32)(((u64)rem * 1000ULL) >> 16), rstc);
+        ui_console_write("watchdog armed=");
+        ui_console_u32_dec(st.armed ? 1U : 0U);
+        ui_console_write(" mode=");
+        ui_console_write(st.reboot_on_trip ? "reboot" : "halt");
+        ui_console_write(" timeout=");
+        ui_console_u32_dec(st.timeout_ticks);
+        ui_console_write(" trips=");
+        ui_console_u64_dec(st.trip_count);
+        ui_console_write(" hw_remaining=");
+        ui_console_hex_fixed(rem, 8);
+        ui_console_write(" hw_rstc=");
+        ui_console_hex_fixed(rstc, 8);
+        ui_console_write("\n");
         return;
+    }
+    if (ui_streq(argv[1], "hw-arm")) {
+        u32 s = 15;
+        if (argc >= 3 && !ui_parse_u32(argv[2], &s)) {
+            ui_console_write("ERR: usage watchdog hw-arm <secs 1..15>\n");
+            return;
+        }
+        watchdog_hw_arm_seconds(s);
+        u32 rem = watchdog_hw_remaining_ticks();
+        fb_printf("OK: hw watchdog armed s=%u remaining=0x%x\n", s, rem);
+        ui_console_write("OK: hw watchdog armed s=");
+        ui_console_u32_dec(s);
+        ui_console_write(" remaining=");
+        ui_console_hex_fixed(rem, 8);
+        ui_console_write("\n");
+        return;
+    }
+    if (ui_streq(argv[1], "hw-pet")) {
+        watchdog_hw_pet();
+        u32 rem = watchdog_hw_remaining_ticks();
+        fb_printf("OK: hw watchdog petted remaining=0x%x\n", rem);
+        ui_console_write("OK: hw watchdog petted remaining=");
+        ui_console_hex_fixed(rem, 8);
+        ui_console_write("\n");
+        return;
+    }
+    if (ui_streq(argv[1], "hw-disable")) {
+        watchdog_hw_disable();
+        ui_console_write("OK: hw watchdog disabled\n");
+        return;
+    }
+    if (ui_streq(argv[1], "hw-trip") && argc >= 3 && ui_streq(argv[2], "confirm")) {
+        ui_console_write("OK: arming hw watchdog 2s and looping; expect auto-reset.\n");
+        watchdog_hw_arm_seconds(2);
+        for (;;) { __asm__ volatile("yield"); }
     }
     if (ui_streq(argv[1], "arm")) {
         watchdog_set_armed(true);
@@ -10016,7 +10068,7 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "bootctrl")) {
         ui_console_write("bootctrl status\nbootctrl clear-pending\nbootctrl reset-a confirm\nbootctrl test-invalid-b confirm\n  Show/repair/test stage0 A/B boot-control state without host raw-disk access.\n");
     } else if (ui_streq(topic, "watchdog")) {
-        ui_console_write("watchdog status\nwatchdog arm|disarm\nwatchdog timeout <ticks>\nwatchdog mode <halt|reboot>\nwatchdog trip\n");
+        ui_console_write("watchdog status\nwatchdog arm|disarm\nwatchdog timeout <ticks>\nwatchdog mode <halt|reboot>\nwatchdog trip\nwatchdog hw-arm <secs>\nwatchdog hw-pet\nwatchdog hw-disable\nwatchdog hw-trip confirm\n  Hardware BCM2712 PM watchdog at 0x107D200000 (arms a chip-level auto-reset).\n");
     } else if (ui_streq(topic, "dma")) {
         ui_console_write("dma status\n  Show DMA enable state, CB address mode, selftest counters, and channel registers.\n");
         ui_console_write("dma selftest\n  Re-run the memcpy selftest and auto-select raw/shifted CB address mode if hardware passes.\n");
@@ -11569,6 +11621,7 @@ void kernel_main(void) {
     dma_init();
     bp_ok("[dma] 6-channel engine ready");
     bp_done(1, true);
+    watchdog_hw_pet();
 
     /* ── Phase 2+3: PCIe + RP1 + USB ── */
     bp_active(2);
@@ -11603,6 +11656,7 @@ void kernel_main(void) {
     } else {
         bp_err("[pcie] PCIe init FAILED"); bp_done(2, false); bp_done(3, false);
     }
+    watchdog_hw_pet();
 
     /* IPC */
     bp_log("[fifo] fifo_init_all...");
@@ -11682,6 +11736,7 @@ void kernel_main(void) {
         }
         bp_done(4, sd_ok);
     }
+    watchdog_hw_pet();
 
     /* ── Phase 5: NIC (Cadence MACB/GEM on RP1) ── */
     bp_active(5);
@@ -11715,6 +11770,7 @@ void kernel_main(void) {
     net_services_listen();
     uart_puts("[net] echo UDP:7 TCP:7 HTTP:80 DBG:2323\n");
     bp_ok("[net] IP stack ready");
+    watchdog_hw_pet();
 
     /* GPU + Tensor */
     bp_log("[gpu] tensor_init...");
@@ -11746,6 +11802,7 @@ void kernel_main(void) {
         setup_run(fb_ok, nic_ok, usb_ok);
         bp_ok("[setup] done");
     }
+    watchdog_hw_pet();
 
     /* ── Phase 6: Multicore ── */
     bp_active(6);

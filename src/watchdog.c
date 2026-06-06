@@ -4,13 +4,19 @@
 #include "mmio.h"
 #include "fb.h"
 
-#define PM_BASE        (PERIPH_BASE + 0x00100000UL)
+/* BCM2712 PM block (Linux DT watchdog@7d200000, Circle ARM_PM_BASE
+ * = ARM_IO_BASE + 0x1200000). Pi 4 used PERIPH_BASE + 0x100000; using
+ * the Pi 4 layout on Pi 5 means our writes hit dead address space, so
+ * the hardware watchdog never actually counted before this fix. */
+#define PM_BASE        (PERIPH_BASE + 0x01200000UL)
 #define PM_RSTC        (PM_BASE + 0x1CU)
 #define PM_WDOG        (PM_BASE + 0x24U)
 #define PM_PASSWORD    0x5A000000U
 #define PM_RSTC_FULL   0x00000020U
 #define PM_RSTC_WRCFG_MASK 0x00000030U
 #define PSCI_SYSTEM_RESET 0x84000009U
+/* PM watchdog counter is 20-bit at ~65536 Hz, so max single-shot is ~15s. */
+#define PM_WDOG_MAX_SECS 15U
 
 static struct watchdog_status g_wdog;
 static u64 g_last_poll;
@@ -40,12 +46,27 @@ void watchdog_hw_arm_seconds(u32 seconds)
 {
     if (seconds == 0)
         seconds = 1;
-    if (seconds > 15)
-        seconds = 15;
+    if (seconds > PM_WDOG_MAX_SECS)
+        seconds = PM_WDOG_MAX_SECS;
     mmio_write(PM_WDOG, PM_PASSWORD | (seconds << 16));
     mmio_write(PM_RSTC, PM_PASSWORD |
                          (mmio_read(PM_RSTC) & ~PM_RSTC_WRCFG_MASK) |
                          PM_RSTC_FULL);
+}
+
+void watchdog_hw_pet(void)
+{
+    watchdog_hw_arm_seconds(PM_WDOG_MAX_SECS);
+}
+
+u32 watchdog_hw_remaining_ticks(void)
+{
+    return mmio_read(PM_WDOG) & 0x000FFFFFU;
+}
+
+u32 watchdog_hw_rstc(void)
+{
+    return mmio_read(PM_RSTC);
 }
 
 void watchdog_hw_disable(void)
