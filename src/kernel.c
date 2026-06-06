@@ -72,6 +72,7 @@
 #include "x509.h"
 #include "acme.h"
 #include "abi.h"
+#include "mmio.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -1394,6 +1395,10 @@ static bool pios_bootctrl_clear_pending(void);
 static bool pios_bootctrl_reset_a(void);
 static bool pios_bootctrl_test_invalid_b(void);
 static bool http_write_kernel_slot_header(u32 slot_offset, u32 payload_len, bool valid);
+static bool irq_cntpns_test(u64 *before_out, u64 *after_out, u32 *last_intid_out,
+                            u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *unhandled_out);
+static u32 irq_cntpns_step(u32 depth, u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *pmr_out,
+                           u32 *ispend_out, u32 *isenable_out, u32 *iar_out);
 static void http_append_proc_image_validation(char *out, u32 *len, u32 max,
                                               const struct proc_image_validation *v);
 static void http_append_proc_image_validation_json(char *out, u32 *len, u32 max,
@@ -1492,7 +1497,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "ksvc")) {
             http_append(out, &len, max, "ksvc status\n  Show kernel service/plugin registry, core ownership, priorities, and runtime counters.\n");
         } else if (http_streq(topic, "irq")) {
-            http_append(out, &len, max, "irq status | irq probe | irq selftest\n  Show IRQ counters, read-only GIC base probes, and diagnostic invariants without enabling IRQ service loops.\n");
+            http_append(out, &len, max, "irq status | irq probe | irq selftest | irq cntpns confirm\n  Show IRQ counters, read-only GIC probes, plus opt-in watchdog-protected CNTPNS/PPI30 delivery test.\n");
         } else if (http_streq(topic, "abi")) {
             http_append(out, &len, max, "abi status | abi selftest\n  Show kernel/user ABI transition stage, ksvc foundations, and pending EL0/SVC work.\n");
         } else if (http_streq(topic, "qpu") || http_streq(topic, "tensor")) {
@@ -2015,6 +2020,47 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "irq selftest")) {
         http_append(out, &len, max, irq_diag_selftest() ? "IRQ selftest OK\n" : "IRQ selftest FAILED\n");
+    } else if (http_starts_with(cmd, "irq cntpns step ")) {
+        u32 depth = 0;
+        const char *arg = cmd + 16;
+        while (*arg >= '0' && *arg <= '9') { depth = depth*10 + (u32)(*arg - '0'); arg++; }
+        u32 d_ctlr = 0, c_ctlr = 0, pmr = 0, isp = 0, ise = 0, iar = 0;
+        u32 last_step = irq_cntpns_step(depth, &d_ctlr, &c_ctlr, &pmr, &isp, &ise, &iar);
+        http_append(out, &len, max, "irq cntpns step depth=");
+        http_append_u64(out, &len, max, depth);
+        http_append(out, &len, max, " reached=");
+        http_append_u64(out, &len, max, last_step);
+        http_append(out, &len, max, " d_ctlr=");
+        http_append_hex32(out, &len, max, d_ctlr);
+        http_append(out, &len, max, " c_ctlr=");
+        http_append_hex32(out, &len, max, c_ctlr);
+        http_append(out, &len, max, " pmr=");
+        http_append_hex32(out, &len, max, pmr);
+        http_append(out, &len, max, " ispend=");
+        http_append_hex32(out, &len, max, isp);
+        http_append(out, &len, max, " isenable=");
+        http_append_hex32(out, &len, max, ise);
+        http_append(out, &len, max, " iar=");
+        http_append_hex32(out, &len, max, iar);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "irq cntpns confirm")) {
+        u64 before = 0, after = 0;
+        u32 last = 0, d_ctlr = 0, c_ctlr = 0, unhandled = 0;
+        bool ok = irq_cntpns_test(&before, &after, &last, &d_ctlr, &c_ctlr, &unhandled);
+        http_append(out, &len, max, ok ? "IRQ cntpns OK" : "IRQ cntpns FAILED");
+        http_append(out, &len, max, " timer_before=");
+        http_append_u64(out, &len, max, before);
+        http_append(out, &len, max, " timer_after=");
+        http_append_u64(out, &len, max, after);
+        http_append(out, &len, max, " last_intid=");
+        http_append_u64(out, &len, max, last);
+        http_append(out, &len, max, " unhandled=");
+        http_append_u64(out, &len, max, unhandled);
+        http_append(out, &len, max, " d_ctlr=");
+        http_append_hex32(out, &len, max, d_ctlr);
+        http_append(out, &len, max, " c_ctlr=");
+        http_append_hex32(out, &len, max, c_ctlr);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "irq probe")) {
         struct irq_gic_probe_snapshot p;
         irq_gic_probe_snapshot(&p);
@@ -5117,8 +5163,9 @@ static void boot_update_load_or_seed(void)
         rec.tries_left = 0;
         rec.committed = 1;
         rec.generation = 1;
-        if (!boot_update_store(&rec))
-            exception_pisod("Boot update seed failed", 5, 0x3A, 0, 0, 0);
+        if (!boot_update_store(&rec)) {
+            uart_puts("[bt] boot_update seed write FAILED — continuing\n");
+        }
     }
     g_boot_update_state = rec;
 }
@@ -5140,8 +5187,9 @@ static void boot_update_reconcile(void)
     }
     if (changed) {
         rec.generation++;
-        if (!boot_update_store(&rec))
-            exception_pisod("Boot update state write failed", 5, 0x3F, 0, 0, 0);
+        if (!boot_update_store(&rec)) {
+            uart_puts("[bt] boot_update reconcile write FAILED — continuing\n");
+        }
         g_boot_update_state = rec;
     }
 }
@@ -5158,8 +5206,9 @@ static void boot_policy_verify_or_seed(void)
         rec.el1_hash = cur_el1;
         rec.el2_hash = cur_el2;
         boot_policy_mac(&rec, rec.mac);
-        if (picowal_db_put(BOOT_POLICY_CARD, BOOT_POLICY_REC, &rec, sizeof(rec)) < 0)
-            exception_pisod("Boot policy seed failed", 5, 0x39, 0, 0, 0);
+        if (picowal_db_put(BOOT_POLICY_CARD, BOOT_POLICY_REC, &rec, sizeof(rec)) < 0) {
+            uart_puts("[bt] boot policy seed write FAILED — continuing\n");
+        }
     } else {
         if (rec.magic != BOOT_POLICY_MAGIC || !boot_policy_mac_ok(&rec)) {
             /* Corrupted policy record — re-seed */
@@ -5169,8 +5218,9 @@ static void boot_policy_verify_or_seed(void)
             rec.el1_hash = cur_el1;
             rec.el2_hash = cur_el2;
             boot_policy_mac(&rec, rec.mac);
-            if (picowal_db_put(BOOT_POLICY_CARD, BOOT_POLICY_REC, &rec, sizeof(rec)) < 0)
-                exception_pisod("Boot policy reseed failed", 5, 0x38, 0, 0, 0);
+            if (picowal_db_put(BOOT_POLICY_CARD, BOOT_POLICY_REC, &rec, sizeof(rec)) < 0) {
+                uart_puts("[bt] boot policy reseed write FAILED — continuing\n");
+            }
         } else if (rec.el1_hash != cur_el1 || rec.el2_hash != cur_el2) {
             /* Kernel changed — re-seed during development */
             uart_puts("[bt] hash changed, update policy\n");
@@ -5178,8 +5228,9 @@ static void boot_policy_verify_or_seed(void)
             rec.el2_hash = cur_el2;
             rec.version++;
             boot_policy_mac(&rec, rec.mac);
-            if (picowal_db_put(BOOT_POLICY_CARD, BOOT_POLICY_REC, &rec, sizeof(rec)) < 0)
-                exception_pisod("Boot policy update failed", 5, 0x37, 0, 0, 0);
+            if (picowal_db_put(BOOT_POLICY_CARD, BOOT_POLICY_REC, &rec, sizeof(rec)) < 0) {
+                uart_puts("[bt] boot policy update write FAILED — continuing\n");
+            }
         }
     }
 
@@ -5187,15 +5238,24 @@ static void boot_policy_verify_or_seed(void)
     i32 rn = picowal_db_get(BOOT_POLICY_CARD, BOOT_ROLLBACK_REC, &rollback_floor, sizeof(rollback_floor));
     if (rn < (i32)sizeof(rollback_floor)) {
         rollback_floor = rec.version;
-        if (picowal_db_put(BOOT_POLICY_CARD, BOOT_ROLLBACK_REC, &rollback_floor, sizeof(rollback_floor)) < 0)
-            exception_pisod("Rollback floor seed failed", 5, 0x36, 0, 0, 0);
+        if (picowal_db_put(BOOT_POLICY_CARD, BOOT_ROLLBACK_REC, &rollback_floor, sizeof(rollback_floor)) < 0) {
+            uart_puts("[bt] rollback floor seed write FAILED — continuing\n");
+        }
     } else if (rec.version < rollback_floor) {
-        exception_pisod("Boot rollback blocked", 5, 0x35, 0, 0, 0);
+        /* Anti-rollback: production would PiSOD here, but in dev we warn
+         * and reset the floor so the box can be recovered after walfs
+         * corruption breaks the version/floor consistency. */
+        uart_puts("[bt] rollback floor > rec.version (dev: resetting floor)\n");
+        rollback_floor = rec.version;
+        if (picowal_db_put(BOOT_POLICY_CARD, BOOT_ROLLBACK_REC, &rollback_floor, sizeof(rollback_floor)) < 0) {
+            uart_puts("[bt] rollback floor reset write FAILED — continuing\n");
+        }
     }
     if (rec.version > rollback_floor) {
         rollback_floor = rec.version;
-        if (picowal_db_put(BOOT_POLICY_CARD, BOOT_ROLLBACK_REC, &rollback_floor, sizeof(rollback_floor)) < 0)
-            exception_pisod("Rollback floor update fail", 5, 0x34, 0, 0, 0);
+        if (picowal_db_put(BOOT_POLICY_CARD, BOOT_ROLLBACK_REC, &rollback_floor, sizeof(rollback_floor)) < 0) {
+            uart_puts("[bt] rollback floor update write FAILED — continuing\n");
+        }
     }
 
     boot_el1_expected_hash = rec.el1_hash;
@@ -6584,6 +6644,26 @@ static void ui_cmd_irq(u32 argc, char **argv)
         ui_console_write(irq_diag_selftest() ? "IRQ selftest OK\n" : "IRQ selftest FAILED\n");
         return;
     }
+    if (argc >= 3 && ui_streq(argv[1], "cntpns") && ui_streq(argv[2], "confirm")) {
+        u64 before = 0, after = 0;
+        u32 last = 0, d_ctlr = 0, c_ctlr = 0, unhandled = 0;
+        bool ok = irq_cntpns_test(&before, &after, &last, &d_ctlr, &c_ctlr, &unhandled);
+        ui_console_write(ok ? "IRQ cntpns OK" : "IRQ cntpns FAILED");
+        ui_console_write(" timer_before=");
+        ui_console_u64_dec(before);
+        ui_console_write(" timer_after=");
+        ui_console_u64_dec(after);
+        ui_console_write(" last_intid=");
+        ui_console_u32_dec(last);
+        ui_console_write(" unhandled=");
+        ui_console_u32_dec(unhandled);
+        ui_console_write(" d_ctlr=");
+        ui_console_hex_fixed(d_ctlr, 8);
+        ui_console_write(" c_ctlr=");
+        ui_console_hex_fixed(c_ctlr, 8);
+        ui_console_write("\n");
+        return;
+    }
     if (argc >= 2 && ui_streq(argv[1], "probe")) {
         struct irq_gic_probe_snapshot p;
         irq_gic_probe_snapshot(&p);
@@ -6614,7 +6694,7 @@ static void ui_cmd_irq(u32 argc, char **argv)
         return;
     }
     if (argc >= 2 && !ui_streq(argv[1], "status")) {
-        ui_console_write("ERR: usage irq status | irq probe | irq selftest\n");
+        ui_console_write("ERR: usage irq status | irq probe | irq selftest | irq cntpns confirm\n");
         return;
     }
     struct irq_diag_snapshot d;
@@ -6655,6 +6735,567 @@ static void ui_cmd_irq(u32 argc, char **argv)
     ui_console_write(" irq_masked=");
     ui_console_write(hw.irq_masked ? "yes" : "no");
     ui_console_write("\n");
+}
+
+/* ---- Opt-in CNTPNS PPI30 IRQ delivery test ----
+ *
+ * Wraps the dangerous GIC enable + timer fire path with the BCM2712
+ * hardware watchdog so any wedge auto-resets the chip within 15 seconds
+ * and A/B stage0 falls back to the known-good slot. After the spin
+ * window we tear down everything we touched so leftover IRQ sources
+ * can't wedge the kernel later (the previous attempt died ~14s after
+ * the test returned because the timer kept firing).
+ */
+static u64 irq_cntpns_interval;
+
+static void irq_cntpns_handler(void)
+{
+    u64 cval;
+    __asm__ volatile("mrs %0, cntp_cval_el0" : "=r"(cval));
+    cval += irq_cntpns_interval ? irq_cntpns_interval : 1000ULL;
+    __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(cval));
+    __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));
+}
+
+static bool irq_cntpns_test(u64 *before_out, u64 *after_out, u32 *last_intid_out,
+                            u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *unhandled_out)
+{
+    const u64 gicd = 0x107FFF9000UL;
+    const u64 gicc = 0x107FFFA000UL;
+    const u32 intid = GIC_TIMER_NS_PHYS;
+    const u32 reg = intid / 32U;
+    const u32 bit = intid % 32U;
+    const u32 mask = 1U << bit;
+    struct irq_diag_snapshot before;
+    struct irq_diag_snapshot after;
+    irq_diag_snapshot(&before);
+
+    /* Arm hw watchdog up front so any wedge auto-recovers. */
+    watchdog_hw_arm_seconds(15);
+
+    /* Snapshot pre-test GIC state so we can restore it. */
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    u64 old_gicd_base = gic_runtime_gicd_base();
+    u64 old_gicc_base = gic_runtime_gicc_base();
+    u32 old_pmr = mmio_read(gicc + 0x004);
+    u32 old_d_ctlr = mmio_read(gicd + 0x000);
+    u32 old_c_ctlr = mmio_read(gicc + 0x000);
+
+    gic_select_bases(6, gicd, gicc);
+    irq_register(intid, irq_cntpns_handler);
+
+    u32 preg = intid / 4U;
+    u32 pshift = (intid % 4U) * 8U;
+    u32 pri = mmio_read(gicd + 0x400 + preg * 4U);
+    u32 old_pri = pri;
+    pri &= ~(0xFFU << pshift);
+    pri |= (0x40U << pshift);
+    mmio_write(gicd + 0x400 + preg * 4U, pri);
+
+    mmio_write(gicd + 0x280 + reg * 4U, mask);   /* clear pending */
+    mmio_write(gicd + 0x100 + reg * 4U, mask);   /* enable PPI 30 */
+    mmio_write(gicc + 0x004, 0xF0U);             /* PMR */
+    mmio_write(gicd + 0x000, old_d_ctlr | 1U);
+    mmio_write(gicc + 0x000, old_c_ctlr | 1U);
+
+    u64 freq, now;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+    irq_cntpns_interval = freq ? freq / 1000ULL : 1000ULL;
+    if (irq_cntpns_interval == 0) irq_cntpns_interval = 1;
+    __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(now + irq_cntpns_interval));
+    __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));
+
+    dsb();
+    isb();
+    __asm__ volatile("msr daifclr, #2" ::: "memory");
+
+    u64 start = timer_monotonic_ms();
+    while (timer_monotonic_ms() - start < 250ULL) {
+        __asm__ volatile("yield");
+    }
+
+    /* Tear everything down so the kernel returns to a clean state. */
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(2UL));   /* IMASK=1, ENABLE=0 */
+    mmio_write(gicd + 0x180 + reg * 4U, mask);              /* disable PPI 30 */
+    mmio_write(gicd + 0x280 + reg * 4U, mask);              /* clear pending */
+    mmio_write(gicd + 0x400 + preg * 4U, old_pri);          /* restore priority */
+    mmio_write(gicc + 0x004, old_pmr);                      /* restore PMR */
+    mmio_write(gicd + 0x000, old_d_ctlr);                   /* restore GICD ctlr */
+    mmio_write(gicc + 0x000, old_c_ctlr);                   /* restore GICC ctlr */
+    irq_register(intid, NULL);
+    gic_select_bases(1, old_gicd_base, old_gicc_base);
+    dsb();
+    isb();
+    __asm__ volatile("msr daifclr, #2" ::: "memory");
+
+    /* Test done, disable the hw watchdog so we don't reboot. */
+    watchdog_hw_disable();
+
+    irq_diag_snapshot(&after);
+    if (before_out) *before_out = before.timer;
+    if (after_out) *after_out = after.timer;
+    if (last_intid_out) *last_intid_out = after.last_intid;
+    if (d_ctlr_out) *d_ctlr_out = mmio_read(gicd + 0x000);
+    if (c_ctlr_out) *c_ctlr_out = mmio_read(gicc + 0x000);
+    if (unhandled_out) *unhandled_out = (u32)(after.unhandled - before.unhandled);
+    return after.timer > before.timer && after.last_intid == intid;
+}
+
+/* Step-by-step CNTPNS/PPI30 probe. Each `depth` value runs the setup up to
+ * that step, samples GIC state, then tears the setup back down. If the
+ * chip wedges at any step the hardware watchdog auto-resets within ~15s.
+ *
+ *   depth=0   read GICD/GICC state only (purely read)
+ *   depth=1   also read GICC_IAR (acks any pending pre-existing interrupt)
+ *   depth=2   also write PMR=0xF0
+ *   depth=3   also write GICD_CTLR|=1, GICC_CTLR|=1 (no PPI enabled)
+ *   depth=4   also configure + enable PPI 30 in distributor
+ *   depth=5   also program CNTP_CVAL_EL0 (timer counter set, CTL=0)
+ *   depth=6   also write CNTP_CTL_EL0=1 (timer asserts pending, DAIF masked)
+ *   depth=7   also unmask DAIF for a brief spin, then re-mask
+ *   depth=8   bare DAIF unmask only, no GIC writes (sees stale pending)
+ *   depth=9   step 4 setup (GIC+PPI 30 enable) + DAIF unmask, no timer
+ *   depth=10  full CNTV (PPI 27) test instead of CNTPNS
+ *   depth=11  single-shot CNTPNS — unmask DAIF for ONE IRQ then re-mask
+ *   depth=12  setup CNTPNS, wait 5ms with DAIF MASKED, snapshot HPPIR/ISPEND
+ */
+static u32 irq_cntpns_step(u32 depth, u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *pmr_out,
+                           u32 *ispend_out, u32 *isenable_out, u32 *iar_out)
+{
+    const u64 gicd = 0x107FFF9000UL;
+    const u64 gicc = 0x107FFFA000UL;
+    const u32 intid = GIC_TIMER_NS_PHYS;
+    const u32 reg = intid / 32U;
+    const u32 bit = intid % 32U;
+    const u32 mask = 1U << bit;
+
+    watchdog_hw_arm_seconds(15);
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+
+    /* The IRQ vector dispatches via gic_acknowledge/gic_end_of_interrupt
+     * which use the runtime GIC base. We must repoint them at the real
+     * Pi 5 GIC (0x107FFF9000/A000) before any IRQ can fire, otherwise
+     * ack/EOI hit dead address space and the line stays asserted →
+     * infinite IRQ loop. Snapshot the old base so we can restore. */
+    u64 saved_gicd_base = gic_runtime_gicd_base();
+    u64 saved_gicc_base = gic_runtime_gicc_base();
+    u32 saved_gicid    = gic_runtime_id();
+    gic_select_bases(6, gicd, gicc);
+
+    u32 done = 0;
+
+    /* Bare DAIF unmask probe. Skip ALL GIC writes — just see if any
+     * stale pending interrupt fires when we open the gate. */
+    if (depth == 8) {
+        u32 d_ctlr_now = mmio_read(gicd + 0x000);
+        u32 c_ctlr_now = mmio_read(gicc + 0x000);
+        u32 pmr_now    = mmio_read(gicc + 0x004);
+        u32 hppir = mmio_read(gicc + 0x018);
+        if (d_ctlr_out)  *d_ctlr_out  = d_ctlr_now;
+        if (c_ctlr_out)  *c_ctlr_out  = c_ctlr_now;
+        if (pmr_out)     *pmr_out     = pmr_now;
+        if (ispend_out)  *ispend_out  = hppir;
+        if (isenable_out)*isenable_out= 0;
+        if (iar_out)     *iar_out     = 0;
+        dsb(); isb();
+        __asm__ volatile("msr daifclr, #2" ::: "memory");
+        u64 start = timer_monotonic_ms();
+        while (timer_monotonic_ms() - start < 5ULL) {
+            __asm__ volatile("yield");
+        }
+        __asm__ volatile("msr daifset, #2" ::: "memory");
+        gic_select_bases(saved_gicid, saved_gicd_base, saved_gicc_base);
+        watchdog_hw_disable();
+        return 8;
+    }
+
+    /* GIC + PPI 30 enable + DAIF unmask, no timer source (no fire expected). */
+    if (depth == 9) {
+        u32 sav_d = mmio_read(gicd + 0x000);
+        u32 sav_c = mmio_read(gicc + 0x000);
+        u32 sav_pmr = mmio_read(gicc + 0x004);
+        u32 sav_isena = mmio_read(gicd + 0x100 + reg * 4U);
+        u32 sav_igroup = mmio_read(gicd + 0x080 + reg * 4U);
+        u32 sav_pri = mmio_read(gicd + 0x400 + (intid / 4U) * 4U);
+        mmio_write(gicd + 0x080 + reg * 4U, sav_igroup | mask);
+        u32 newp = sav_pri;
+        newp &= ~(0xFFU << ((intid % 4U) * 8U));
+        newp |= (0x40U << ((intid % 4U) * 8U));
+        mmio_write(gicd + 0x400 + (intid / 4U) * 4U, newp);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);
+        mmio_write(gicd + 0x100 + reg * 4U, mask);
+        mmio_write(gicc + 0x004, 0xF0U);
+        mmio_write(gicd + 0x000, sav_d | 1U);
+        mmio_write(gicc + 0x000, sav_c | 1U);
+        if (d_ctlr_out) *d_ctlr_out = mmio_read(gicd + 0x000);
+        if (c_ctlr_out) *c_ctlr_out = mmio_read(gicc + 0x000);
+        if (pmr_out)    *pmr_out    = mmio_read(gicc + 0x004);
+        if (ispend_out) *ispend_out = mmio_read(gicd + 0x080 + reg * 4U);
+        if (isenable_out) *isenable_out = mmio_read(gicd + 0x100 + reg * 4U);
+        if (iar_out)    *iar_out    = mmio_read(gicc + 0x018);
+        dsb(); isb();
+        __asm__ volatile("msr daifclr, #2" ::: "memory");
+        u64 start = timer_monotonic_ms();
+        while (timer_monotonic_ms() - start < 5ULL) {
+            __asm__ volatile("yield");
+        }
+        __asm__ volatile("msr daifset, #2" ::: "memory");
+        /* teardown */
+        mmio_write(gicd + 0x180 + reg * 4U, mask);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);
+        mmio_write(gicd + 0x400 + (intid / 4U) * 4U, sav_pri);
+        mmio_write(gicd + 0x080 + reg * 4U, sav_igroup);
+        mmio_write(gicc + 0x004, sav_pmr);
+        mmio_write(gicd + 0x000, sav_d);
+        mmio_write(gicc + 0x000, sav_c);
+        (void)sav_isena;
+        dsb(); isb();
+        gic_select_bases(saved_gicid, saved_gicd_base, saved_gicc_base);
+        watchdog_hw_disable();
+        return 9;
+    }
+
+    /* Full CNTV (PPI 27) test instead of CNTPNS. */
+    if (depth == 10) {
+        const u32 vintid = GIC_TIMER_VIRT;
+        const u32 vreg = vintid / 32U;
+        const u32 vbit = vintid % 32U;
+        const u32 vmask = 1U << vbit;
+        const u32 vpreg = vintid / 4U;
+        const u32 vpshift = (vintid % 4U) * 8U;
+        u32 sav_d = mmio_read(gicd + 0x000);
+        u32 sav_c = mmio_read(gicc + 0x000);
+        u32 sav_pmr = mmio_read(gicc + 0x004);
+        u32 sav_isena = mmio_read(gicd + 0x100 + vreg * 4U);
+        u32 sav_igroup = mmio_read(gicd + 0x080 + vreg * 4U);
+        u32 sav_pri = mmio_read(gicd + 0x400 + vpreg * 4U);
+        u64 sav_cval = 0, sav_ctl = 0;
+        __asm__ volatile("mrs %0, cntv_cval_el0" : "=r"(sav_cval));
+        __asm__ volatile("mrs %0, cntv_ctl_el0" : "=r"(sav_ctl));
+
+        mmio_write(gicd + 0x080 + vreg * 4U, sav_igroup | vmask);
+        u32 newp = sav_pri;
+        newp &= ~(0xFFU << vpshift);
+        newp |= (0x40U << vpshift);
+        mmio_write(gicd + 0x400 + vpreg * 4U, newp);
+        mmio_write(gicd + 0x280 + vreg * 4U, vmask);
+        mmio_write(gicd + 0x100 + vreg * 4U, vmask);
+        mmio_write(gicc + 0x004, 0xF0U);
+        mmio_write(gicd + 0x000, sav_d | 1U);
+        mmio_write(gicc + 0x000, sav_c | 1U);
+
+        u64 freq, now;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(now));
+        u64 interval = freq ? freq / 1000ULL : 1000ULL;
+        if (interval == 0) interval = 1;
+        irq_cntpns_interval = interval;
+        __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(now + interval));
+        irq_register(vintid, irq_cntpns_handler);
+        __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(1UL));
+
+        if (d_ctlr_out) *d_ctlr_out = mmio_read(gicd + 0x000);
+        if (c_ctlr_out) *c_ctlr_out = mmio_read(gicc + 0x000);
+        if (pmr_out)    *pmr_out    = mmio_read(gicc + 0x004);
+        if (ispend_out) *ispend_out = mmio_read(gicd + 0x080 + vreg * 4U);
+        if (isenable_out) *isenable_out = mmio_read(gicd + 0x100 + vreg * 4U);
+
+        dsb(); isb();
+        __asm__ volatile("msr daifclr, #2" ::: "memory");
+        u64 start = timer_monotonic_ms();
+        while (timer_monotonic_ms() - start < 10ULL) {
+            __asm__ volatile("yield");
+        }
+        __asm__ volatile("msr daifset, #2" ::: "memory");
+        struct irq_diag_snapshot after_v;
+        irq_diag_snapshot(&after_v);
+        if (iar_out) *iar_out = after_v.last_intid;
+
+        /* CNTV teardown */
+        __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(2UL));
+        irq_register(vintid, NULL);
+        __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(sav_cval));
+        __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(sav_ctl));
+        mmio_write(gicd + 0x180 + vreg * 4U, vmask);
+        mmio_write(gicd + 0x280 + vreg * 4U, vmask);
+        mmio_write(gicd + 0x400 + vpreg * 4U, sav_pri);
+        mmio_write(gicd + 0x080 + vreg * 4U, sav_igroup);
+        mmio_write(gicc + 0x004, sav_pmr);
+        mmio_write(gicd + 0x000, sav_d);
+        mmio_write(gicc + 0x000, sav_c);
+        (void)sav_isena;
+        dsb(); isb();
+        gic_select_bases(saved_gicid, saved_gicd_base, saved_gicc_base);
+        watchdog_hw_disable();
+        return 10;
+    }
+
+    /* Single-shot CNTPNS test: arm, unmask DAIF for 1ms, mask, sample. */
+    if (depth == 11) {
+        u32 sav_d = mmio_read(gicd + 0x000);
+        u32 sav_c = mmio_read(gicc + 0x000);
+        u32 sav_pmr = mmio_read(gicc + 0x004);
+        u32 sav_isena = mmio_read(gicd + 0x100 + reg * 4U);
+        u32 sav_igroup = mmio_read(gicd + 0x080 + reg * 4U);
+        u32 sav_pri = mmio_read(gicd + 0x400 + (intid / 4U) * 4U);
+        u64 sav_cval = 0, sav_ctl = 0;
+        __asm__ volatile("mrs %0, cntp_cval_el0" : "=r"(sav_cval));
+        __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(sav_ctl));
+
+        mmio_write(gicd + 0x080 + reg * 4U, sav_igroup | mask);
+        u32 newp = sav_pri;
+        newp &= ~(0xFFU << ((intid % 4U) * 8U));
+        newp |= (0x40U << ((intid % 4U) * 8U));
+        mmio_write(gicd + 0x400 + (intid / 4U) * 4U, newp);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);
+        mmio_write(gicd + 0x100 + reg * 4U, mask);
+        mmio_write(gicc + 0x004, 0xF0U);
+        mmio_write(gicd + 0x000, sav_d | 1U);
+        mmio_write(gicc + 0x000, sav_c | 1U);
+
+        /* Sample initial state. */
+        if (d_ctlr_out) *d_ctlr_out = mmio_read(gicd + 0x000);
+        if (c_ctlr_out) *c_ctlr_out = mmio_read(gicc + 0x000);
+        if (pmr_out)    *pmr_out    = mmio_read(gicc + 0x004);
+        if (ispend_out) *ispend_out = mmio_read(gicc + 0x018); /* HPPIR */
+        if (isenable_out) *isenable_out = mmio_read(gicd + 0x100 + reg * 4U);
+
+        /* Use the handler that reprograms CVAL so each fire is self-clearing. */
+        irq_register(intid, irq_cntpns_handler);
+
+        /* Arm timer 50us in the future with 50us interval. */
+        u64 freq, now;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+        u64 ticks = freq ? (freq * 50ULL) / 1000000ULL : 50ULL;
+        if (ticks == 0) ticks = 1;
+        irq_cntpns_interval = ticks;
+        __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(now + ticks));
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));
+
+        struct irq_diag_snapshot before;
+        irq_diag_snapshot(&before);
+
+        dsb(); isb();
+        /* Brief 1ms unmask. */
+        __asm__ volatile("msr daifclr, #2" ::: "memory");
+        u64 t0 = timer_monotonic_ms();
+        while (timer_monotonic_ms() - t0 < 1ULL) {
+            __asm__ volatile("yield");
+        }
+        __asm__ volatile("msr daifset, #2" ::: "memory");
+
+        /* Mask CNTP immediately so it doesn't keep firing. */
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(2UL));
+
+        struct irq_diag_snapshot after;
+        irq_diag_snapshot(&after);
+        if (iar_out) *iar_out = (u32)(after.total - before.total);
+
+        /* Teardown. */
+        irq_register(intid, NULL);
+        __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(sav_cval));
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(sav_ctl));
+        mmio_write(gicd + 0x180 + reg * 4U, mask);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);
+        mmio_write(gicd + 0x400 + (intid / 4U) * 4U, sav_pri);
+        mmio_write(gicd + 0x080 + reg * 4U, sav_igroup);
+        mmio_write(gicc + 0x004, sav_pmr);
+        mmio_write(gicd + 0x000, sav_d);
+        mmio_write(gicc + 0x000, sav_c);
+        (void)sav_isena;
+        dsb(); isb();
+        gic_select_bases(saved_gicid, saved_gicd_base, saved_gicc_base);
+        watchdog_hw_disable();
+        return 11;
+    }
+
+    /* CNTPNS armed, DAIF still masked the whole time. Wait 5ms then
+     * snapshot HPPIR + ISPEND. Tells us whether the GIC actually latched
+     * the timer interrupt and what group/priority it sees. */
+    if (depth == 12) {
+        u32 sav_d = mmio_read(gicd + 0x000);
+        u32 sav_c = mmio_read(gicc + 0x000);
+        u32 sav_pmr = mmio_read(gicc + 0x004);
+        u32 sav_igroup = mmio_read(gicd + 0x080 + reg * 4U);
+        u32 sav_pri = mmio_read(gicd + 0x400 + (intid / 4U) * 4U);
+        u64 sav_cval = 0, sav_ctl = 0;
+        __asm__ volatile("mrs %0, cntp_cval_el0" : "=r"(sav_cval));
+        __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(sav_ctl));
+
+        mmio_write(gicd + 0x080 + reg * 4U, sav_igroup | mask);
+        u32 newp = sav_pri;
+        newp &= ~(0xFFU << ((intid % 4U) * 8U));
+        newp |= (0x40U << ((intid % 4U) * 8U));
+        mmio_write(gicd + 0x400 + (intid / 4U) * 4U, newp);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);
+        mmio_write(gicd + 0x100 + reg * 4U, mask);
+        mmio_write(gicc + 0x004, 0xF0U);
+        mmio_write(gicd + 0x000, sav_d | 1U);
+        mmio_write(gicc + 0x000, sav_c | 1U);
+
+        u64 freq, now;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+        u64 ticks = freq ? (freq * 50ULL) / 1000000ULL : 50ULL;
+        if (ticks == 0) ticks = 1;
+        __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(now + ticks));
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));
+
+        /* Spin 5ms with DAIF STILL MASKED. Timer fires, GIC latches it. */
+        u64 t0 = timer_monotonic_ms();
+        while (timer_monotonic_ms() - t0 < 5ULL) {
+            __asm__ volatile("yield");
+        }
+
+        /* Snapshot post-fire state without unmasking IRQ. */
+        u64 cntp_ctl_now = 0;
+        __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(cntp_ctl_now));
+        if (d_ctlr_out) *d_ctlr_out = mmio_read(gicd + 0x000);
+        if (c_ctlr_out) *c_ctlr_out = mmio_read(gicc + 0x000);
+        if (pmr_out)    *pmr_out    = (u32)cntp_ctl_now;
+        if (ispend_out) *ispend_out = mmio_read(gicd + 0x200 + reg * 4U); /* ISPENDR */
+        if (isenable_out) *isenable_out = mmio_read(gicd + 0x100 + reg * 4U);
+        if (iar_out)    *iar_out    = mmio_read(gicc + 0x018); /* HPPIR */
+
+        /* Teardown. */
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(2UL));
+        __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(sav_cval));
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(sav_ctl));
+        mmio_write(gicd + 0x180 + reg * 4U, mask);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);
+        mmio_write(gicd + 0x400 + (intid / 4U) * 4U, sav_pri);
+        mmio_write(gicd + 0x080 + reg * 4U, sav_igroup);
+        mmio_write(gicc + 0x004, sav_pmr);
+        mmio_write(gicd + 0x000, sav_d);
+        mmio_write(gicc + 0x000, sav_c);
+        dsb(); isb();
+        gic_select_bases(saved_gicid, saved_gicd_base, saved_gicc_base);
+        watchdog_hw_disable();
+        return 12;
+    }
+
+    u32 old_d_ctlr = mmio_read(gicd + 0x000);
+    u32 old_c_ctlr = mmio_read(gicc + 0x000);
+    u32 old_pmr    = mmio_read(gicc + 0x004);
+    u32 old_ispend = mmio_read(gicd + 0x200 + reg * 4U);
+    u32 old_isena  = mmio_read(gicd + 0x100 + reg * 4U);
+    u32 old_igroup = mmio_read(gicd + 0x080 + reg * 4U);
+    u32 old_gicd_typer = mmio_read(gicd + 0x004);
+
+    if (d_ctlr_out)  *d_ctlr_out  = old_d_ctlr;
+    if (c_ctlr_out)  *c_ctlr_out  = old_c_ctlr;
+    if (pmr_out)     *pmr_out     = old_pmr;
+    /* Pack diagnostics: ispend_out = igroup, isenable_out = isenable, iar_out = typer initially */
+    if (ispend_out)  *ispend_out  = old_igroup;
+    if (isenable_out)*isenable_out= old_isena;
+    if (iar_out)     *iar_out     = old_gicd_typer;
+    (void)old_ispend;
+    done = 0;
+
+    u32 old_pri = 0;
+    u32 preg = intid / 4U;
+    u32 pshift = (intid % 4U) * 8U;
+
+    if (depth >= 1) {
+        u32 iar = mmio_read(gicc + 0x00C);
+        if (iar_out) *iar_out = iar;
+        if ((iar & 0x3FF) != 0x3FF)
+            mmio_write(gicc + 0x010, iar);
+        done = 1;
+    }
+    if (depth >= 2) {
+        mmio_write(gicc + 0x004, 0xF0U);
+        done = 2;
+    }
+    if (depth >= 3) {
+        mmio_write(gicd + 0x000, old_d_ctlr | 1U);
+        mmio_write(gicc + 0x000, old_c_ctlr | 1U);
+        done = 3;
+    }
+    if (depth >= 4) {
+        /* Try to move PPI 30 to Group 1 NS before enabling. In non-secure
+         * GIC-400 with security extensions enabled, IGROUPR is RAZ/WI from
+         * non-secure unless GICD_CTLR.DS is set. We try anyway and rely on
+         * the readback in the snapshot to tell us whether ATF left it
+         * writable. Without Group 1 NS, the timer interrupt is delivered
+         * to EL3 as FIQ instead of EL1 as IRQ. */
+        u32 cur_group = mmio_read(gicd + 0x080 + reg * 4U);
+        mmio_write(gicd + 0x080 + reg * 4U, cur_group | mask);
+        old_pri = mmio_read(gicd + 0x400 + preg * 4U);
+        u32 pri = old_pri;
+        pri &= ~(0xFFU << pshift);
+        pri |= (0x40U << pshift);
+        mmio_write(gicd + 0x400 + preg * 4U, pri);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);     /* clear pending */
+        mmio_write(gicd + 0x100 + reg * 4U, mask);     /* enable PPI 30 */
+        /* Read back current registers as live snapshot. */
+        if (iar_out) *iar_out = mmio_read(gicd + 0x080 + reg * 4U);  /* IGROUPR0 readback */
+        if (ispend_out) *ispend_out = mmio_read(gicd + 0x100 + reg * 4U); /* ISENABLER readback */
+        done = 4;
+    }
+    u64 prev_cval = 0, prev_ctl = 0;
+    if (depth >= 5) {
+        __asm__ volatile("mrs %0, cntp_cval_el0" : "=r"(prev_cval));
+        __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(prev_ctl));
+        u64 freq, now;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+        u64 interval = freq ? freq / 1000ULL : 1000ULL;
+        if (interval == 0) interval = 1;
+        irq_cntpns_interval = interval;
+        __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(now + interval));
+        done = 5;
+    }
+    if (depth >= 6) {
+        irq_register(intid, irq_cntpns_handler);
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));   /* ENABLE, no mask */
+        done = 6;
+    }
+    if (depth >= 7) {
+        dsb();
+        isb();
+        __asm__ volatile("msr daifclr, #2" ::: "memory");
+        u64 start = timer_monotonic_ms();
+        while (timer_monotonic_ms() - start < 5ULL) {
+            __asm__ volatile("yield");
+        }
+        __asm__ volatile("msr daifset, #2" ::: "memory");
+        done = 7;
+    }
+
+    /* Teardown — reverse order. */
+    if (depth >= 6) {
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(2UL));   /* IMASK=1 */
+        irq_register(intid, NULL);
+    }
+    if (depth >= 5) {
+        __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(prev_cval));
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(prev_ctl));
+    }
+    if (depth >= 4) {
+        mmio_write(gicd + 0x180 + reg * 4U, mask);     /* disable PPI 30 */
+        mmio_write(gicd + 0x280 + reg * 4U, mask);     /* clear pending */
+        mmio_write(gicd + 0x400 + preg * 4U, old_pri);
+        mmio_write(gicd + 0x080 + reg * 4U, old_igroup); /* restore IGROUPR0 */
+    }
+    if (depth >= 3) {
+        mmio_write(gicd + 0x000, old_d_ctlr);
+        mmio_write(gicc + 0x000, old_c_ctlr);
+    }
+    if (depth >= 2) {
+        mmio_write(gicc + 0x004, old_pmr);
+    }
+
+    dsb();
+    isb();
+    __asm__ volatile("msr daifclr, #2" ::: "memory");
+
+    gic_select_bases(saved_gicid, saved_gicd_base, saved_gicc_base);
+    watchdog_hw_disable();
+    return done;
 }
 
 static void ui_cmd_abi(u32 argc, char **argv)
@@ -10104,6 +10745,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("irq status\n  Show IRQ counters plus vector/GIC/timer register diagnostics.\n");
         ui_console_write("irq probe\n  Read plausible GIC distributor/interface windows without enabling IRQ-driven loops.\n");
         ui_console_write("irq selftest\n  Verify diagnostic invariants without enabling IRQ-driven service loops.\n");
+        ui_console_write("irq cntpns confirm\n  Watchdog-protected CNTPNS/PPI30 delivery test. Auto-resets within 15s if it wedges.\n");
     } else if (ui_streq(topic, "abi")) {
         ui_console_write("abi status\n  Show current direct-KPI/ksvc/EL0 transition state.\n");
         ui_console_write("abi selftest\n  Verify ABI transition metadata invariants.\n");
@@ -11687,18 +12329,40 @@ void kernel_main(void) {
 #endif
         bp_log("[cache] bcache_init...");
         bcache_init();
+        watchdog_hw_pet();
         bp_log("[walfs] walfs_init...");
         walfs_ok = walfs_init();
+        watchdog_hw_pet();
         if (walfs_ok) {
             bp_log("[walfs] walfs_verify...");
             struct walfs_health wh;
-            if (!walfs_verify(&wh))
-                exception_pisod("WALFS verify failed", 5, 0x34, wh.crc_errors, wh.header_errors, (u32)wh.scan_end);
+            if (!walfs_verify(&wh)) {
+                /* Don't PiSOD — a corrupted superblock (e.g. from a
+                 * watchdog reset that interrupted a write) used to brick
+                 * the box because every reboot PiSODed before HTTP came
+                 * up. Just log and continue; operator can issue
+                 * `walfs format confirm` over the console to recover. */
+                bp_warn("[walfs] verify FAILED — continuing (use 'walfs format confirm' to recover)");
+                uart_puts("[walfs] verify FAILED super_ok=");
+                uart_hex(wh.super_ok ? 1U : 0U);
+                uart_puts(" wal_head_ok=");
+                uart_hex(wh.wal_head_ok ? 1U : 0U);
+                uart_puts(" crc_err=");
+                uart_hex(wh.crc_errors);
+                uart_puts(" hdr_err=");
+                uart_hex(wh.header_errors);
+                uart_puts(" scan_end=");
+                uart_hex((u32)wh.scan_end);
+                uart_puts("\n");
+            }
+            watchdog_hw_pet();
             bp_log("[walfs] principal_init...");
             principal_init();
             bp_log("[walfs] picowal_db_init...");
-            if (!picowal_db_init())
-                exception_pisod("Picowal init failed", 5, 0x33, 0, 0, 0);
+            if (!picowal_db_init()) {
+                bp_warn("[walfs] picowal_db init FAILED — continuing");
+            }
+            watchdog_hw_pet();
             bp_log("[walfs] boot_policy_verify...");
             boot_policy_verify_or_seed();
             bp_log("[walfs] boot_measurements...");

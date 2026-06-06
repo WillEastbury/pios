@@ -104,7 +104,8 @@ void irq_register(u32 intid, irq_handler_t handler) {
 
 /* Called from vectors.S irq_handler */
 void irq_dispatch(struct irq_frame *frame) {
-    u32 intid = gic_acknowledge();
+    u32 iar = gic_acknowledge();
+    u32 intid = iar & 0x3FFU;
     u32 c = core_id() & 3U;
     irq_diag.total++;
     irq_diag.per_core[c]++;
@@ -125,8 +126,9 @@ void irq_dispatch(struct irq_frame *frame) {
 
     proc_irq_maybe_preempt(frame);
 
+    /* EOI must echo the exact IAR value (incl. CPUID bits) per GIC-400. */
     if (intid != GIC_INTID_SPURIOUS)
-        gic_end_of_interrupt(intid);
+        gic_end_of_interrupt(iar);
 }
 
 void irq_diag_snapshot(struct irq_diag_snapshot *out)
@@ -150,9 +152,9 @@ void irq_hw_diag_snapshot(struct irq_hw_diag_snapshot *out)
     __asm__ volatile("mrs %0, CNTV_CTL_EL0" : "=r"(out->cntv_ctl));
     __asm__ volatile("mrs %0, CNTV_CVAL_EL0" : "=r"(out->cntv_cval));
     __asm__ volatile("mrs %0, CNTVCT_EL0" : "=r"(out->cntvct));
-    out->gicd_ctlr = mmio_read(GICD_CTLR);
-    out->gicc_ctlr = mmio_read(GICC_CTLR);
-    out->gicc_pmr = mmio_read(GICC_PMR);
+    out->gicd_ctlr = mmio_read(gic_runtime_gicd_base() + 0x000);
+    out->gicc_ctlr = mmio_read(gic_runtime_gicc_base() + 0x000);
+    out->gicc_pmr = mmio_read(gic_runtime_gicc_base() + 0x004);
     out->vectors_ready = out->vbar_el1 == (u64)(usize)&vector_table;
     out->gic_ready = (out->gicd_ctlr & 1U) != 0 && (out->gicc_ctlr & 1U) != 0;
     out->timer_enabled = (out->cntv_ctl & 1U) != 0;
@@ -194,7 +196,7 @@ void irq_gic_probe_snapshot(struct irq_gic_probe_snapshot *out)
 {
     if (!out) return;
     out->count = 0;
-    out->current_driver_id = 1;
+    out->current_driver_id = gic_runtime_id();
     for (u32 i = 0; i < sizeof(gic_probe_candidates) / sizeof(gic_probe_candidates[0]) &&
                     out->count < IRQ_GIC_PROBE_MAX; i++) {
         const struct gic_probe_candidate *c = &gic_probe_candidates[i];

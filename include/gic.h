@@ -39,6 +39,11 @@
 #define GIC_MAX_IRQ         256
 
 void gic_init(void);
+void gic_select_bases(u32 id, u64 gicd_base, u64 gicc_base);
+void gic_restore_default_bases(void);
+u32  gic_runtime_id(void);
+u64  gic_runtime_gicd_base(void);
+u64  gic_runtime_gicc_base(void);
 void gic_enable_irq(u32 intid);
 void gic_disable_irq(u32 intid);
 void gic_set_priority(u32 intid, u8 priority);
