@@ -1,6 +1,6 @@
 /*
  * timer.c - ARM Generic Timer driver
- * Uses the virtual timer (CNTV) with GIC IRQ for periodic ticks.
+ * Uses the non-secure physical timer (CNTPNS / PPI 30) with GIC IRQs.
  */
 
 #include "timer.h"
@@ -40,12 +40,12 @@ void timer_irq_handler(void) {
 
     /* Set next compare value */
     u64 cval;
-    __asm__ volatile("mrs %0, cntv_cval_el0" : "=r"(cval));
+    __asm__ volatile("mrs %0, cntp_cval_el0" : "=r"(cval));
     cval += interval;
-    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(cval));
+    __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(cval));
 
     /* Re-enable timer (clear IMASK, set ENABLE) */
-    __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(1UL));
+    __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));
 
     timer_tick_hook_t hook = tick_hooks[cid];
     if (hook)
@@ -68,17 +68,17 @@ void timer_init(u32 hz) {
     timer_interval[cid] = interval;
 
     /* Register IRQ handler */
-    irq_register(GIC_TIMER_VIRT, timer_irq_handler);
-    gic_enable_irq(GIC_TIMER_VIRT);
-    gic_set_priority(GIC_TIMER_VIRT, 0x40);
+    irq_register(GIC_TIMER_NS_PHYS, timer_irq_handler);
+    gic_enable_irq(GIC_TIMER_NS_PHYS);
+    gic_set_priority(GIC_TIMER_NS_PHYS, 0x40);
 
     /* Set initial compare value */
     u64 now;
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(now));
-    __asm__ volatile("msr cntv_cval_el0, %0" :: "r"(now + interval));
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+    __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(now + interval));
 
-    /* Enable virtual timer, unmask */
-    __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(1UL));
+    /* Enable non-secure physical timer, unmask */
+    __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));
 
     uart_puts("[timer] core=");
     uart_hex(cid);

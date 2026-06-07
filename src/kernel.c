@@ -303,17 +303,13 @@ static void admin_services_listen(void);
 static void admin_services_poll(void);
 static void http_log_event(const char *event, u32 a, u32 b);
 static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len);
+static void pios_bootctrl_mark_success(void);
+static void core0_sched_snapshot(u64 *wake, u64 *wfi_count, u64 *idle_ticks,
+                                 u64 *total_ticks, u32 *busy_permille,
+                                 u32 *last_flags);
 static const char *tcp_state_name(u32 state);
 static const char *tcp_owner_label(u16 port);
 static bool http_request_complete(const u8 *req, u32 len);
-
-/* UDP echo: reflect any packet back to sender */
-static void echo_udp_cb(u32 src_ip, u16 src_port, u16 dst_port,
-                         const u8 *data, u16 len) {
-    if (dst_port == ECHO_UDP_PORT) {
-        net_send_udp(src_ip, ECHO_UDP_PORT, src_port, data, len);
-    }
-}
 
 static void debug_tcp_send_len(const char *s, u32 len)
 {
@@ -446,7 +442,7 @@ static void net_services_listen(void)
     debug_tcp_len = 0;
     debug_tcp_iac_skip = 0;
 
-    echo_listen_conn = tcp_listen(ECHO_TCP_PORT);
+    echo_listen_conn = -1;
     http_listen_conn = tcp_listen(HTTP_TCP_PORT);
     https_tls_listen_conn = tcp_listen(HTTPS_TLS_TCP_PORT);
     debug_listen_conn = tcp_listen(DEBUG_TCP_PORT);
@@ -1184,6 +1180,7 @@ static u32 http_core_ram_used_kib(u32 core)
 
 static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len)
 {
+    static bool boot_success_marked_by_health;
     (void)req;
     (void)req_len;
     u32 len = 0;
@@ -1214,10 +1211,23 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "resp", http_resp_len, true);
     http_append_json_metric(out, &len, max, "off", http_resp_off, true);
     http_append_json_metric(out, &len, max, "body", http_diag.body_off, true);
-    http_append_json_metric(out, &len, max, "clen", http_diag.content_len, false);
+    http_append_json_metric(out, &len, max, "clen", http_diag.content_len, true);
+    u64 sched_wake = 0, sched_wfi = 0, sched_idle = 0, sched_total = 0;
+    u32 sched_busy = 0, sched_flags = 0;
+    core0_sched_snapshot(&sched_wake, &sched_wfi, &sched_idle, &sched_total,
+                         &sched_busy, &sched_flags);
+    http_append_json_metric(out, &len, max, "sched_wake", sched_wake, true);
+    http_append_json_metric(out, &len, max, "sched_wfi", sched_wfi, true);
+    http_append_json_metric(out, &len, max, "sched_busy_permille", sched_busy, true);
+    http_append_json_metric(out, &len, max, "sched_flags", sched_flags, false);
     http_append(out, &len, max, "}}");
     http_append(out, &len, max, "\n");
     http_trace(HTTP_EVT_STATUS_EXIT, HTTP_ROUTE_STATUS, len, max);
+    if (!boot_success_marked_by_health) {
+        pios_bootctrl_mark_success();
+        watchdog_hw_pet();
+        boot_success_marked_by_health = true;
+    }
     return len;
 }
 
@@ -1906,6 +1916,61 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "ACME clear OK\n");
     } else if (http_streq(cmd, "acme selftest")) {
         http_append(out, &len, max, acme_selftest() ? "ACME selftest OK\n" : "ACME selftest FAILED\n");
+    } else if (http_streq(cmd, "sched") || http_streq(cmd, "sched status")) {
+        u64 wake = 0, wfi_count = 0, idle_ticks = 0, total_ticks = 0;
+        u32 busy_permille = 0, last_flags = 0;
+        core0_sched_snapshot(&wake, &wfi_count, &idle_ticks, &total_ticks,
+                             &busy_permille, &last_flags);
+        http_append(out, &len, max, "sched core0 wake=");
+        http_append_u64(out, &len, max, wake);
+        http_append(out, &len, max, " wfi=");
+        http_append_u64(out, &len, max, wfi_count);
+        http_append(out, &len, max, " busy_permille=");
+        http_append_u64(out, &len, max, busy_permille);
+        http_append(out, &len, max, " idle_ticks=");
+        http_append_u64(out, &len, max, idle_ticks);
+        http_append(out, &len, max, " total_ticks=");
+        http_append_u64(out, &len, max, total_ticks);
+        http_append(out, &len, max, " last_flags=");
+        http_append_hex32(out, &len, max, last_flags);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "proc sched")) {
+        struct proc_sched_core_snapshot ps[3];
+        u32 pn = proc_sched_snapshot(ps, 3);
+        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT\n");
+        for (u32 i = 0; i < pn; i++) {
+            http_append_u64(out, &len, max, ps[i].core);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].busy_permille);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].idle_count);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wake_count);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].idle_ticks);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].total_ticks);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].preemptions);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "core status")) {
+        struct core_status_entry cs[NUM_CORES];
+        u32 cn = core_status_snapshot(cs, NUM_CORES);
+        http_append(out, &len, max, "CORE PSCI_RET STAGE\n");
+        for (u32 i = 0; i < cn; i++) {
+            http_append_u64(out, &len, max, cs[i].core);
+            http_append(out, &len, max, " ");
+            if (cs[i].psci_ret < 0) {
+                http_append(out, &len, max, "-");
+                http_append_u64(out, &len, max, (u64)(-cs[i].psci_ret));
+            } else {
+                http_append_u64(out, &len, max, (u64)cs[i].psci_ret);
+            }
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, cs[i].stage);
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "ksvc") || http_streq(cmd, "ksvc status")) {
         struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
         u32 kn = ksvc_snapshot(ks, KSVC_MAX_SERVICES);
@@ -2061,6 +2126,60 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " c_ctlr=");
         http_append_hex32(out, &len, max, c_ctlr);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "irq trace")) {
+        u32 ent=0, pre_h=0, post_h=0, pre_e=0, post_e=0, last_iar=0;
+        irq_trace_dump(&ent, &pre_h, &post_h, &pre_e, &post_e, &last_iar);
+        http_append(out, &len, max, "irq trace enter=");
+        http_append_u64(out, &len, max, ent);
+        http_append(out, &len, max, " pre_handler=");
+        http_append_u64(out, &len, max, pre_h);
+        http_append(out, &len, max, " post_handler=");
+        http_append_u64(out, &len, max, post_h);
+        http_append(out, &len, max, " pre_eoi=");
+        http_append_u64(out, &len, max, pre_e);
+        http_append(out, &len, max, " post_eoi=");
+        http_append_u64(out, &len, max, post_e);
+        http_append(out, &len, max, " last_iar=");
+        http_append_hex32(out, &len, max, last_iar);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "irq trace reset")) {
+        irq_trace_reset();
+        http_append(out, &len, max, "irq trace reset OK\n");
+    } else if (http_streq(cmd, "irq sdtrace")) {
+        /* Read back the SD-resident IRQ trace sectors (LBA 15..23). Each
+         * sector is 512 bytes; we render just the first 64 bytes (magic +
+         * counters) as hex. Used after a watchdog-induced reboot to see
+         * how far the IRQ vector got before wedging. */
+        static u8 sd_sec[SD_BLOCK_SIZE] ALIGNED(64);
+        for (u32 lba = 15; lba <= 23; lba++) {
+            http_append(out, &len, max, "LBA ");
+            http_append_u64(out, &len, max, lba);
+            if (!sd_read_block(lba, sd_sec)) {
+                http_append(out, &len, max, " READ_FAIL\n");
+                continue;
+            }
+            http_append(out, &len, max, " magic=");
+            for (u32 i = 0; i < 8; i++) {
+                char c = (char)sd_sec[i];
+                if (c >= 0x20 && c < 0x7F) {
+                    char tmp[2] = { c, 0 };
+                    http_append(out, &len, max, tmp);
+                } else {
+                    http_append(out, &len, max, ".");
+                }
+            }
+            http_append(out, &len, max, " hex=");
+            for (u32 i = 0; i < 40; i++) {
+                http_append_hex32(out, &len, max, sd_sec[i]);
+                if ((i & 3) == 3) http_append(out, &len, max, " ");
+            }
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "irq sdtrace wipe")) {
+        static u8 sd_zero[SD_BLOCK_SIZE] ALIGNED(64);
+        for (u32 i = 0; i < SD_BLOCK_SIZE; i++) sd_zero[i] = 0;
+        for (u32 lba = 15; lba <= 23; lba++) (void)sd_write_block(lba, sd_zero);
+        http_append(out, &len, max, "irq sdtrace wipe OK\n");
     } else if (http_streq(cmd, "irq probe")) {
         struct irq_gic_probe_snapshot p;
         irq_gic_probe_snapshot(&p);
@@ -4346,25 +4465,8 @@ static void http_render_diag(void)
     fb_puts("'                              ");
 }
 
-/* TCP echo + HTTP poll — called from core0 main loop */
+/* HTTP/TLS poll — called from core0 service loop */
 static void echo_tcp_poll(void) {
-    /* TCP echo server on port 7 */
-    if (echo_client_conn < 0 && echo_listen_conn >= 0) {
-        echo_client_conn = tcp_accept(echo_listen_conn);
-    }
-    if (echo_client_conn >= 0) {
-        u32 st = tcp_state(echo_client_conn);
-        if (st == 4 /* ESTABLISHED */) {
-            static u8 echo_buf[1024];
-            u32 n = tcp_read(echo_client_conn, echo_buf, sizeof(echo_buf));
-            if (n > 0)
-                tcp_write(echo_client_conn, echo_buf, n);
-        } else if (st == 0 || st >= 8 /* CLOSED or closing */) {
-            tcp_close(echo_client_conn);
-            echo_client_conn = -1;
-        }
-    }
-
     /* Kernel TLS test server on port 443. This uses PIOS's kernel TLS-style
      * record wrapper, not a browser-compatible X.509 TLS endpoint yet. */
     if (https_tls_tcp_conn < 0 && https_tls_listen_conn >= 0) {
@@ -6747,6 +6849,7 @@ static void ui_cmd_irq(u32 argc, char **argv)
  * the test returned because the timer kept firing).
  */
 static u64 irq_cntpns_interval;
+static volatile u32 irq_cntpns_singleshot_seen;
 
 static void irq_cntpns_handler(void)
 {
@@ -6755,6 +6858,16 @@ static void irq_cntpns_handler(void)
     cval += irq_cntpns_interval ? irq_cntpns_interval : 1000ULL;
     __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(cval));
     __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));
+}
+
+/* Single-shot handler: disables the timer entirely so the line drops and
+ * no further IRQs fire. Bumps a counter we can read after the test.   */
+static void irq_cntpns_singleshot_handler(void)
+{
+    /* IMASK=1 ENABLE=0 — drop the line definitively. */
+    __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(2UL));
+    irq_cntpns_singleshot_seen++;
+    dsb();
 }
 
 static bool irq_cntpns_test(u64 *before_out, u64 *after_out, u32 *last_intid_out,
@@ -6858,8 +6971,10 @@ static bool irq_cntpns_test(u64 *before_out, u64 *after_out, u32 *last_intid_out
  *   depth=8   bare DAIF unmask only, no GIC writes (sees stale pending)
  *   depth=9   step 4 setup (GIC+PPI 30 enable) + DAIF unmask, no timer
  *   depth=10  full CNTV (PPI 27) test instead of CNTPNS
- *   depth=11  single-shot CNTPNS — unmask DAIF for ONE IRQ then re-mask
+ *   depth=11  single-shot CNTPNS - unmask DAIF for ONE IRQ then re-mask
  *   depth=12  setup CNTPNS, wait 5ms with DAIF MASKED, snapshot HPPIR/ISPEND
+ *   depth=13  fire CNTPNS, manually IAR+EOIR with DAIF masked (no vector)
+ *   depth=14  asm-only IRQ vector path: mask CNTP, IAR, EOIR, eret
  */
 static u32 irq_cntpns_step(u32 depth, u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *pmr_out,
                            u32 *ispend_out, u32 *isenable_out, u32 *iar_out)
@@ -7062,8 +7177,11 @@ static u32 irq_cntpns_step(u32 depth, u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *pmr
         if (ispend_out) *ispend_out = mmio_read(gicc + 0x018); /* HPPIR */
         if (isenable_out) *isenable_out = mmio_read(gicd + 0x100 + reg * 4U);
 
-        /* Use the handler that reprograms CVAL so each fire is self-clearing. */
-        irq_register(intid, irq_cntpns_handler);
+        /* True single-shot: handler masks CNTP immediately so the line
+         * drops and only ONE IRQ ever fires. If even this wedges, the
+         * IRQ vector path itself is broken for this GIC base. */
+        irq_register(intid, irq_cntpns_singleshot_handler);
+        irq_cntpns_singleshot_seen = 0;
 
         /* Arm timer 50us in the future with 50us interval. */
         u64 freq, now;
@@ -7175,6 +7293,153 @@ static u32 irq_cntpns_step(u32 depth, u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *pmr
         gic_select_bases(saved_gicid, saved_gicd_base, saved_gicc_base);
         watchdog_hw_disable();
         return 12;
+    }
+
+    /* Fire CNTPNS, then manually IAR + EOIR with DAIF masked. No IRQ
+     * vector involvement. If this clears the interrupt, GIC ack/EOI work
+     * and the wedge is in our vector path. Output:
+     *   ispend = ISPENDR before ack
+     *   iar    = the IAR read (which acks)
+     *   isenable = ISPENDR after EOI (should clear bit 30)
+     *   pmr    = HPPIR after EOI (should return spurious 0x3FF) */
+    if (depth == 13) {
+        u32 sav_d = mmio_read(gicd + 0x000);
+        u32 sav_c = mmio_read(gicc + 0x000);
+        u32 sav_pmr = mmio_read(gicc + 0x004);
+        u32 sav_igroup = mmio_read(gicd + 0x080 + reg * 4U);
+        u32 sav_pri = mmio_read(gicd + 0x400 + (intid / 4U) * 4U);
+        u64 sav_cval = 0, sav_ctl = 0;
+        __asm__ volatile("mrs %0, cntp_cval_el0" : "=r"(sav_cval));
+        __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(sav_ctl));
+
+        mmio_write(gicd + 0x080 + reg * 4U, sav_igroup | mask);
+        u32 newp = sav_pri;
+        newp &= ~(0xFFU << ((intid % 4U) * 8U));
+        newp |= (0x40U << ((intid % 4U) * 8U));
+        mmio_write(gicd + 0x400 + (intid / 4U) * 4U, newp);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);
+        mmio_write(gicd + 0x100 + reg * 4U, mask);
+        mmio_write(gicc + 0x004, 0xF0U);
+        mmio_write(gicd + 0x000, sav_d | 1U);
+        mmio_write(gicc + 0x000, sav_c | 1U);
+
+        u64 freq, now;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+        u64 ticks = freq ? (freq * 50ULL) / 1000000ULL : 50ULL;
+        if (ticks == 0) ticks = 1;
+        __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(now + ticks));
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));
+
+        /* Wait long enough for timer to assert. */
+        u64 t0 = timer_monotonic_ms();
+        while (timer_monotonic_ms() - t0 < 2ULL) {
+            __asm__ volatile("yield");
+        }
+
+        u32 pre_ispend = mmio_read(gicd + 0x200 + reg * 4U);
+        /* Mask CNTP BEFORE ack so it doesn't re-pend. */
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(2UL));
+        u32 ack_iar = mmio_read(gicc + 0x00C);
+        mmio_write(gicc + 0x010, ack_iar); /* EOI */
+        dsb();
+        u32 post_ispend = mmio_read(gicd + 0x200 + reg * 4U);
+        u32 post_hppir = mmio_read(gicc + 0x018);
+
+        if (d_ctlr_out) *d_ctlr_out = mmio_read(gicd + 0x000);
+        if (c_ctlr_out) *c_ctlr_out = mmio_read(gicc + 0x000);
+        if (pmr_out)    *pmr_out    = post_hppir;
+        if (ispend_out) *ispend_out = pre_ispend;
+        if (isenable_out) *isenable_out = post_ispend;
+        if (iar_out)    *iar_out    = ack_iar;
+
+        /* Teardown. */
+        __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(sav_cval));
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(sav_ctl));
+        mmio_write(gicd + 0x180 + reg * 4U, mask);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);
+        mmio_write(gicd + 0x400 + (intid / 4U) * 4U, sav_pri);
+        mmio_write(gicd + 0x080 + reg * 4U, sav_igroup);
+        mmio_write(gicc + 0x004, sav_pmr);
+        mmio_write(gicd + 0x000, sav_d);
+        mmio_write(gicc + 0x000, sav_c);
+        dsb(); isb();
+        gic_select_bases(saved_gicid, saved_gicd_base, saved_gicc_base);
+        watchdog_hw_disable();
+        return 13;
+    }
+
+    /* Asm-only IRQ vector test. The normal irq_handler checks a global flag
+     * before SAVE_CONTEXT; when armed, it masks CNTP, reads IAR, writes EOIR,
+     * increments a counter, and erets without calling C. This isolates vector
+     * entry + GIC CPU-interface delivery from the C save/dispatch path.
+     * Output:
+     *   iar = asm minimal handler count
+     *   pmr = asm minimal handler last IAR
+     *   ispend/isenable = ISPENDR before/after the unmask window */
+    if (depth == 14) {
+        u32 sav_d = mmio_read(gicd + 0x000);
+        u32 sav_c = mmio_read(gicc + 0x000);
+        u32 sav_pmr = mmio_read(gicc + 0x004);
+        u32 sav_igroup = mmio_read(gicd + 0x080 + reg * 4U);
+        u32 sav_pri = mmio_read(gicd + 0x400 + (intid / 4U) * 4U);
+        u64 sav_cval = 0, sav_ctl = 0;
+        __asm__ volatile("mrs %0, cntp_cval_el0" : "=r"(sav_cval));
+        __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(sav_ctl));
+
+        mmio_write(gicd + 0x080 + reg * 4U, sav_igroup | mask);
+        u32 newp = sav_pri;
+        newp &= ~(0xFFU << ((intid % 4U) * 8U));
+        newp |= (0x40U << ((intid % 4U) * 8U));
+        mmio_write(gicd + 0x400 + (intid / 4U) * 4U, newp);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);
+        mmio_write(gicd + 0x100 + reg * 4U, mask);
+        mmio_write(gicc + 0x004, 0xF0U);
+        mmio_write(gicd + 0x000, sav_d | 1U);
+        mmio_write(gicc + 0x000, sav_c | 1U);
+
+        if (d_ctlr_out) *d_ctlr_out = mmio_read(gicd + 0x000);
+        if (c_ctlr_out) *c_ctlr_out = mmio_read(gicc + 0x000);
+
+        irq_vector_minimal_arm(true);
+
+        u64 freq, now;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+        u64 ticks = freq ? (freq * 50ULL) / 1000000ULL : 50ULL;
+        if (ticks == 0) ticks = 1;
+        __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(now + ticks));
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));
+        dsb(); isb();
+
+        if (ispend_out) *ispend_out = mmio_read(gicd + 0x200 + reg * 4U);
+        __asm__ volatile("msr daifclr, #2" ::: "memory");
+        u64 t0 = timer_monotonic_ms();
+        while (timer_monotonic_ms() - t0 < 2ULL) {
+            __asm__ volatile("yield");
+        }
+        __asm__ volatile("msr daifset, #2" ::: "memory");
+        if (isenable_out) *isenable_out = mmio_read(gicd + 0x200 + reg * 4U);
+
+        u32 min_count = 0, min_iar = 0;
+        irq_vector_minimal_snapshot(&min_count, &min_iar);
+        if (pmr_out) *pmr_out = min_iar;
+        if (iar_out) *iar_out = min_count;
+
+        irq_vector_minimal_arm(false);
+        __asm__ volatile("msr cntp_cval_el0, %0" :: "r"(sav_cval));
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(sav_ctl));
+        mmio_write(gicd + 0x180 + reg * 4U, mask);
+        mmio_write(gicd + 0x280 + reg * 4U, mask);
+        mmio_write(gicd + 0x400 + (intid / 4U) * 4U, sav_pri);
+        mmio_write(gicd + 0x080 + reg * 4U, sav_igroup);
+        mmio_write(gicc + 0x004, sav_pmr);
+        mmio_write(gicd + 0x000, sav_d);
+        mmio_write(gicc + 0x000, sav_c);
+        dsb(); isb();
+        gic_select_bases(saved_gicid, saved_gicd_base, saved_gicc_base);
+        watchdog_hw_disable();
+        return depth;
     }
 
     u32 old_d_ctlr = mmio_read(gicd + 0x000);
@@ -11411,6 +11676,15 @@ static void ui_handle_keys(void)
 static u32 spin_color = SPIN_GREEN;
 static u32 spin_counter;
 
+/* Core 0 I/O reactor flags: timer IRQ marks these bits and wakes the
+ * service loop. The HDMI dashboard decodes the last dispatched bitmask. */
+#define CORE0_IO_NET     (1U << 0)
+#define CORE0_IO_TCP     (1U << 1)
+#define CORE0_IO_UART    (1U << 2)
+#define CORE0_IO_USB     (1U << 3)
+#define CORE0_IO_MAINT   (1U << 4)
+#define CORE0_IO_DASH    (1U << 5)
+
 static void spin_update(void) {
     static const char frames[] = "|/-\\";
     fb_set_cursor(126, 0);
@@ -11444,34 +11718,27 @@ static void dash_ip(u32 ip)
               (ip >> 8) & 0xFF, ip & 0xFF);
 }
 
+static void dash_core0_flags(u32 flags)
+{
+    bool any = false;
+    if (flags & CORE0_IO_NET)   { fb_puts("NET");   any = true; }
+    if (flags & CORE0_IO_TCP)   { if (any) fb_puts("|"); fb_puts("TCP");   any = true; }
+    if (flags & CORE0_IO_UART)  { if (any) fb_puts("|"); fb_puts("UART");  any = true; }
+    if (flags & CORE0_IO_USB)   { if (any) fb_puts("|"); fb_puts("USB");   any = true; }
+    if (flags & CORE0_IO_MAINT) { if (any) fb_puts("|"); fb_puts("MAINT"); any = true; }
+    if (flags & CORE0_IO_DASH)  { if (any) fb_puts("|"); fb_puts("DASH");  any = true; }
+    if (!any) fb_puts("none");
+}
+
 static void hdmi_dashboard_render(void)
 {
     static u64 last_ms;
-    static u64 last_ticks[4];
-    static u64 last_poll[4];
-    static u32 last_cpu[4];
     static u32 heartbeat;
     static bool layout_drawn;
     u64 now_ms = timer_monotonic_ms();
     if (now_ms < last_ms + 1000ULL)
         return;
 
-    if (last_ms != 0) {
-        for (u32 i = 0; i < 4; i++) {
-            struct core_env *e = core_env_of(i);
-            u64 dt = timer_ticks_core(i) - last_ticks[i];
-            u64 dp = e->poll_count - last_poll[i];
-            last_cpu[i] = dp ? 100U : (dt ? 1U : 0U);
-            last_ticks[i] = timer_ticks_core(i);
-            last_poll[i] = e->poll_count;
-        }
-    } else {
-        for (u32 i = 0; i < 4; i++) {
-            struct core_env *e = core_env_of(i);
-            last_ticks[i] = timer_ticks_core(i);
-            last_poll[i] = e->poll_count;
-        }
-    }
     last_ms = now_ms;
     heartbeat++;
 
@@ -11484,6 +11751,14 @@ static void hdmi_dashboard_render(void)
             used += (u64)(usize)(e->heap_ptr - e->ram_base);
     }
     u64 total = CORE_PRIV_SIZE * 4ULL;
+    u32 core_mem_kib[4];
+    for (u32 i = 0; i < 4; i++)
+        core_mem_kib[i] = http_core_ram_used_kib(i);
+
+    u64 sched_wake = 0, sched_wfi = 0, sched_idle = 0, sched_total = 0;
+    u32 sched_busy = 0, sched_flags = 0;
+    core0_sched_snapshot(&sched_wake, &sched_wfi, &sched_idle, &sched_total,
+                         &sched_busy, &sched_flags);
 
     nic_packet_counters_t pc;
     nic_packet_counters(&pc);
@@ -11491,6 +11766,10 @@ static void hdmi_dashboard_render(void)
     u32 tcp_n = tcp_snapshot(tcp, TCP_MAX_CONNECTIONS);
     struct proc_ui_entry proc[UI_SNAPSHOT_MAX];
     u32 proc_n = proc_snapshot(proc, UI_SNAPSHOT_MAX);
+    u32 kernel_mem_kib = proc_n ? proc[0].mem_kib : 0;
+    u32 kernel_static_kib = proc_n ? proc[0].arena_span_kib : 0;
+    u32 kernel_core_kib = proc_n ? proc[0].arena_used_kib : 0;
+    u32 kernel_cap_kib = proc_n ? proc[0].arena_capacity_kib : 0;
     u32 ready = 0, running = 0, blocked = 0, dead = 0;
     for (u32 i = 0; i < proc_n; i++) {
         if (proc[i].state == PROC_READY) ready++;
@@ -11539,12 +11818,17 @@ static void hdmi_dashboard_render(void)
     fb_clear_row(8);
     fb_set_cursor(3, 6);
     fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("CPU active: c0=%u%% c1=%u%% c2=%u%% c3=%u%%", last_cpu[0], last_cpu[1], last_cpu[2], last_cpu[3]);
+    fb_printf("CPU0 busy=%u.%u%%  WFI=%u wake=%u flags=0x%x ",
+              sched_busy / 10U, sched_busy % 10U,
+              (u32)sched_wfi, (u32)sched_wake, sched_flags);
+    dash_core0_flags(sched_flags);
     fb_set_cursor(3, 7);
-    fb_printf("RAM used: %uK / %uK", (u32)(used / 1024ULL), (u32)(total / 1024ULL));
+    fb_printf("Kernel mem=%uK static=%uK core_alloc=%uK cap=%uK",
+              kernel_mem_kib, kernel_static_kib, kernel_core_kib, kernel_cap_kib);
     fb_set_cursor(3, 8);
-    fb_printf("Packets: rx=%u tx=%u drop=%u fw=%u", (u32)pc.rx_total, (u32)pc.tx_total,
-              (u32)pc.dropped, (u32)pc.firewalled);
+    fb_printf("RAM %uK/%uK  c0=%uK c1=%uK c2=%uK c3=%uK",
+              (u32)(used / 1024ULL), (u32)(total / 1024ULL),
+              core_mem_kib[0], core_mem_kib[1], core_mem_kib[2], core_mem_kib[3]);
 
     for (u32 r = 12; r < 17; r++) fb_clear_row(r);
     u32 row = 12;
@@ -11608,24 +11892,72 @@ static void hdmi_dashboard_render(void)
 
 /* Core 0 I/O reactor: timer IRQ only marks work due and wakes the service
  * loop. Real I/O stays in thread context so IRQ latency remains bounded. */
-#define CORE0_IO_NET     (1U << 0)
-#define CORE0_IO_TCP     (1U << 1)
-#define CORE0_IO_UART    (1U << 2)
-#define CORE0_IO_USB     (1U << 3)
-#define CORE0_IO_MAINT   (1U << 4)
-
 static volatile u32 core0_io_flags;
+static volatile u64 core0_io_wfi_count;
+static volatile u64 core0_io_wake_count;
+static volatile u64 core0_io_idle_ticks;
+static volatile u64 core0_io_sched_start_ticks;
+static volatile u32 core0_io_last_flags;
+
+static inline u64 sched_counter_ticks(void)
+{
+    u64 cnt;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cnt));
+    return cnt;
+}
 
 static void core0_io_tick_hook(u32 core, u64 tick)
 {
     if (core != CORE_NET)
         return;
 
-    u32 flags = CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART | CORE0_IO_USB;
+    u32 flags = 0;
+    if ((tick & 31U) == 0)
+        flags |= CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART | CORE0_IO_USB;
     if ((tick % 100U) == 0)
         flags |= CORE0_IO_MAINT;
-    core0_io_flags |= flags;
-    sev();
+    if ((tick % 2000U) == 0)
+        flags |= CORE0_IO_DASH;
+    if (flags) {
+        core0_io_flags |= flags;
+        sev();
+    }
+}
+
+static u32 core0_io_take_flags(void)
+{
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    dmb();
+    u32 flags = core0_io_flags;
+    core0_io_flags = 0;
+    dmb();
+    __asm__ volatile("msr daifclr, #2" ::: "memory");
+    return flags;
+}
+
+static void core0_sched_snapshot(u64 *wake, u64 *wfi_count, u64 *idle_ticks,
+                                 u64 *total_ticks, u32 *busy_permille,
+                                 u32 *last_flags)
+{
+    u64 now = sched_counter_ticks();
+    u64 start = core0_io_sched_start_ticks;
+    u64 total = (start != 0 && now >= start) ? (now - start) : 0;
+    u64 idle = core0_io_idle_ticks;
+    if (idle > total)
+        idle = total;
+    u64 busy = total - idle;
+    if (wake) *wake = core0_io_wake_count;
+    if (wfi_count) *wfi_count = core0_io_wfi_count;
+    if (idle_ticks) *idle_ticks = idle;
+    if (total_ticks) *total_ticks = total;
+    if (busy_permille) {
+        while (total > 0x00FFFFFFFFFFFFFFULL) {
+            total >>= 1;
+            busy >>= 1;
+        }
+        *busy_permille = total ? (u32)((busy * 1000ULL) / total) : 0;
+    }
+    if (last_flags) *last_flags = core0_io_last_flags;
 }
 
 static bool ksvc_debug_poll(void *ctx)
@@ -11693,33 +12025,61 @@ NORETURN void core0_main(void) {
     uart_vt_reset();
     ui_console_prompt();
 
-    for (;;) {
-        u64 svc_start;
-        svc_start = ksvc_begin(ksvc_net_id);
-        net_poll();
-        dns_poll();
-        ksvc_end(ksvc_net_id, svc_start, false);
-        svc_start = ksvc_begin(ksvc_tcp_id);
-        echo_tcp_poll();
-        ksvc_end(ksvc_tcp_id, svc_start, false);
-        ksvc_run(ksvc_debug_id);
+    timer_set_tick_hook(core0_io_tick_hook);
+    core0_io_flags = CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART |
+                     CORE0_IO_USB | CORE0_IO_MAINT | CORE0_IO_DASH;
+    core0_io_sched_start_ticks = sched_counter_ticks();
 
-        svc_start = ksvc_begin(ksvc_ui_id);
-        for (u32 i = 0; i < 16; i++) {
-            i32 rx = uart_try_getc();
-            if (rx < 0)
-                break;
-            ui_console_feed_char(rx);
+    for (;;) {
+        u32 flags = core0_io_take_flags();
+        if (flags == 0) {
+            core0_io_wfi_count++;
+            u64 idle_start = sched_counter_ticks();
+            wfi();
+            u64 idle_end = sched_counter_ticks();
+            if (idle_end >= idle_start)
+                core0_io_idle_ticks += idle_end - idle_start;
+            continue;
         }
 
-        ui_handle_keys();
-        ksvc_end(ksvc_ui_id, svc_start, false);
-        if (ui_mode == UI_MODE_NONE)
+        core0_io_wake_count++;
+        core0_io_last_flags = flags;
+
+        if (flags & CORE0_IO_NET) {
+            u64 svc_start = ksvc_begin(ksvc_net_id);
+            net_poll();
+            dns_poll();
+            ksvc_end(ksvc_net_id, svc_start, false);
+        }
+
+        if (flags & CORE0_IO_TCP) {
+            u64 svc_start = ksvc_begin(ksvc_tcp_id);
+            echo_tcp_poll();
+            ksvc_end(ksvc_tcp_id, svc_start, false);
+            ksvc_run(ksvc_debug_id);
+        }
+
+        if (flags & (CORE0_IO_UART | CORE0_IO_USB)) {
+            u64 svc_start = ksvc_begin(ksvc_ui_id);
+            for (u32 i = 0; i < 16; i++) {
+                i32 rx = uart_try_getc();
+                if (rx < 0)
+                    break;
+                ui_console_feed_char(rx);
+            }
+
+            ui_handle_keys();
+            ksvc_end(ksvc_ui_id, svc_start, false);
+        }
+
+        if (flags & CORE0_IO_MAINT) {
+            ksvc_run(ksvc_timer_id);
+        }
+
+        if ((flags & CORE0_IO_DASH) && ui_mode == UI_MODE_NONE)
             ksvc_run(ksvc_dashboard_id);
 
-        if ((env->poll_count & 0x3FFF) == 0)
-            ksvc_run(ksvc_timer_id);
-
+        watchdog_hw_pet();
         env->poll_count++;
     }
 }
@@ -11769,30 +12129,48 @@ static void disk_handle_request(u32 from_core) {
 }
 
 NORETURN void core1_main(void) {
+    core_mark_online(CORE_USERM, 1);
     core_env_init(CORE_USERM);
+    core_mark_online(CORE_USERM, 2);
+    core_mark_online(CORE_USERM, 0x200U + core_id());
     proc_init();
+    core_mark_online(CORE_USERM, 3);
     timer_init(PROC_PREEMPT_TIMER_HZ);
+    core_mark_online(CORE_USERM, 4);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
+    core_mark_online(CORE_USERM, 5);
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }
 
 /* Core 2: User core 0 - process scheduler */
 NORETURN void core2_main(void) {
+    core_mark_online(CORE_USER0, 1);
     core_env_init(CORE_USER0);
+    core_mark_online(CORE_USER0, 2);
+    core_mark_online(CORE_USER0, 0x200U + core_id());
     proc_init();
+    core_mark_online(CORE_USER0, 3);
     timer_init(PROC_PREEMPT_TIMER_HZ);
+    core_mark_online(CORE_USER0, 4);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
+    core_mark_online(CORE_USER0, 5);
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }
 
 /* Core 3: User core 1 - process scheduler */
 NORETURN void core3_main(void) {
+    core_mark_online(CORE_USER1, 1);
     core_env_init(CORE_USER1);
+    core_mark_online(CORE_USER1, 2);
+    core_mark_online(CORE_USER1, 0x200U + core_id());
     proc_init();
+    core_mark_online(CORE_USER1, 3);
     timer_init(PROC_PREEMPT_TIMER_HZ);
+    core_mark_online(CORE_USER1, 4);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
+    core_mark_online(CORE_USER1, 5);
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }
@@ -12429,10 +12807,8 @@ void kernel_main(void) {
     ui_cfg_dns = MY_GW;
     ui_cfg_dhcp = false;
     dns_init(ui_cfg_dns);
-    /* Echo servers */
-    net_udp_subscribe(echo_udp_cb);
     net_services_listen();
-    uart_puts("[net] echo UDP:7 TCP:7 HTTP:80 DBG:2323\n");
+    uart_puts("[net] HTTP:80 HTTPS:443 DBG:2323\n");
     bp_ok("[net] IP stack ready");
     watchdog_hw_pet();
 
@@ -12484,8 +12860,6 @@ void kernel_main(void) {
     bp_active(7);
     bp_done(7, true);
     bp_ok("[pios] System ready — serial console active");
-    pios_bootctrl_mark_success();
-    watchdog_hw_disable();
     bp_spin_color = 0x00FF88CC;  /* purple/pink — OS running */
 
     /* System summary in the log area */

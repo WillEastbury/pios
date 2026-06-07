@@ -49,6 +49,8 @@ u64 gic_runtime_gicc_base(void)
 }
 
 void gic_init(void) {
+    u32 old_c_ctlr = mmio_read(gicc_reg(0x000));
+
     /* Disable distributor during config */
     mmio_write(gicd_reg(0x000), 0);
 
@@ -81,9 +83,11 @@ void gic_init(void) {
     /* Enable distributor */
     mmio_write(gicd_reg(0x000), 1);
 
-    /* CPU Interface */
-    mmio_write(gicc_reg(0x004), 0xFF);    /* Accept all priorities */
-    mmio_write(gicc_reg(0x000), 1);       /* Enable CPU interface */
+    /* CPU Interface. Preserve firmware-programmed bypass/security bits; on
+     * Pi 5 ATF leaves the GICC_CTLR at 0x60, and the validated live path is
+     * old_c_ctlr|1 == 0x61. */
+    mmio_write(gicc_reg(0x004), 0xF0);    /* Accept normal kernel IRQ priority */
+    mmio_write(gicc_reg(0x000), old_c_ctlr | 1U);
 
     uart_puts("[gic] GIC-400 initialised id=");
     uart_hex(gic_runtime_base_id);

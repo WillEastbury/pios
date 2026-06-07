@@ -41,6 +41,11 @@ static volatile bool preempt_armed[3];
 static volatile bool preempt_pending[3];
 static u64 preempt_quantum_ticks[3];
 static u64 preempt_count_core[3];
+static u64 sched_start_ticks_core[3];
+static u64 sched_idle_ticks_core[3];
+static volatile u64 sched_idle_enter_ticks_core[3];
+static u64 sched_idle_count_core[3];
+static u64 sched_wake_count_core[3];
 static u64 svc_call_count;
 static u64 svc_bad_count;
 static struct proc_security_stats proc_sec_stats;
@@ -96,8 +101,17 @@ static void proc_arena_update_high(struct process *p, u32 slot);
 static void proc_span_reset(u32 slot);
 static bool proc_entry_contract_validate(const struct process *p);
 
+static inline u64 proc_sched_counter_ticks(void)
+{
+    u64 cnt;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cnt));
+    return cnt;
+}
+
 extern u8 __text_start;
 extern u8 __text_end;
+extern u8 _start;
+extern u8 __heap_start;
 static u32 proc_el1_integrity_baseline;
 static u64 proc_el1_integrity_next_check_tick;
 
@@ -242,6 +256,29 @@ static u32 proc_arena_bump_bytes(u32 slot)
         return 0;
     u64 used = heap_top[slot] - p->arena_base;
     return used > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (u32)used;
+}
+
+static u64 proc_kernel_static_bytes(void)
+{
+    u64 start = (u64)(usize)&_start;
+    u64 heap = (u64)(usize)&__heap_start;
+    return heap > start ? heap - start : 0;
+}
+
+static u64 proc_kernel_core_private_bytes(void)
+{
+    u64 used = 0;
+    for (u32 i = 0; i < 4; i++) {
+        struct core_env *e = core_env_of(i);
+        if (e->id == i &&
+            e->ram_base == (u8 *)(usize)core_ram_bases[i] &&
+            e->ram_end == e->ram_base + CORE_PRIV_SIZE &&
+            e->heap_ptr >= e->ram_base &&
+            e->heap_ptr <= e->ram_end) {
+            used += (u64)(usize)(e->heap_ptr - e->ram_base);
+        }
+    }
+    return used;
 }
 
 u32 proc_entry_contract_flags(void)
@@ -1332,63 +1369,62 @@ static void proc_preempt_trampoline(void)
 void proc_init(void)
 {
     u32 uc = on_user_core() ? user_core_slot() : 0;
+    if (on_user_core())
+        core_mark_online(core_id(), 0x20);
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
         procs[i].state = PROC_EMPTY;
         procs[i].pid = 0;
     }
+    if (on_user_core())
+        core_mark_online(core_id(), 0x21);
     for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++)
         paged_io_tab[i].used = false;
+    if (on_user_core())
+        core_mark_online(core_id(), 0x22);
     current_proc = 0;
     rr_cursor = 0;
     next_pid = (core_id() << 16) | 1;  /* encode core in upper bits */
+    if (on_user_core())
+        core_mark_online(core_id(), 0x23);
     proc_el1_integrity_baseline = proc_el1_integrity_hash_now();
     proc_el1_integrity_next_check_tick = timer_ticks() + 512ULL;
+    if (on_user_core())
+        core_mark_online(core_id(), 0x24);
     simd_zero(&proc_sec_stats, sizeof(proc_sec_stats));
     initialized = true;
+    if (on_user_core())
+        core_mark_online(core_id(), 0x25);
     if (on_user_core()) {
+        core_mark_online(core_id(), 0x250);
         preempt_enabled[uc] = false;
         preempt_armed[uc] = false;
         preempt_pending[uc] = false;
         preempt_quantum_ticks[uc] = 1;
         preempt_count_core[uc] = 0;
-        launch_req[uc].pending = 0;
-        launch_req[uc].result_pid = -1;
-        launch_req[uc].principal_id = PRINCIPAL_ROOT;
-        launch_req[uc].has_principal = 0;
-        launch_req[uc].priority_class = PROC_PRIO_NORMAL;
-        launch_req[uc].has_priority = 0;
-        launch_req[uc].migrate_keep_pid = 0;
-        launch_req[uc].migrate_pid = 0;
-        launch_req[uc].migrate_parent_pid = 0;
-        launch_req[uc].migrate_runtime_ticks = 0;
-        launch_req[uc].migrate_preemptions = 0;
-        launch_req[uc].migrate_quota_mem_kib = 0;
-        launch_req[uc].migrate_quota_cpu_ms = 0;
-        launch_req[uc].migrate_quota_ipc_objs = 0;
-        launch_req[uc].migrate_quota_fs_write_kib = 0;
-        launch_req[uc].migrate_usage_ipc_objs = 0;
-        launch_req[uc].migrate_usage_fs_write_bytes = 0;
-        launch_req[uc].migrate_heap_used = 0;
-        launch_req[uc].migrate_arena_high_bytes = 0;
-        launch_req[uc].migrate_exec_image_size = 0;
-        launch_req[uc].migrate_exec_hash_baseline = 0;
-        launch_req[uc].migrate_exec_hash_last = 0;
-        launch_req[uc].migrate_exec_hash_next_check_tick = 0;
-        launch_req[uc].migrate_exec_hash_check_nonce = 0;
-        launch_req[uc].has_migrate_state = 0;
-        launch_req[uc].path[0] = 0;
-        simd_zero(&appf_events[uc], sizeof(appf_events[uc]));
-        simd_zero(&appf_logs[uc], sizeof(appf_logs[uc]));
-        simd_zero(&appf_services[uc], sizeof(appf_services[uc]));
-        simd_zero(&appf_hooks[uc], sizeof(appf_hooks[uc]));
-        simd_zero(&ipc_queue_ns[uc], sizeof(ipc_queue_ns[uc]));
-        simd_zero(&ipc_topic_ns[uc], sizeof(ipc_topic_ns[uc]));
-        simd_zero(&appf_event_ns[uc], sizeof(appf_event_ns[uc]));
-        simd_zero(&appf_log_ns[uc], sizeof(appf_log_ns[uc]));
+        core_mark_online(core_id(), 0x251);
+        sched_start_ticks_core[uc] = 0;
+        sched_idle_ticks_core[uc] = 0;
+        sched_idle_enter_ticks_core[uc] = 0;
+        sched_idle_count_core[uc] = 0;
+        sched_wake_count_core[uc] = 0;
+        /* BSS is already cleared by core0 before secondary cores launch.
+         * Do not bulk-clear shared IPC/request namespaces concurrently from
+         * secondary cores during bring-up; keep per-core scheduler counters
+         * local here and let create/open paths initialise entries explicitly. */
+        core_mark_online(core_id(), 0x252);
+        core_mark_online(core_id(), 0x26);
     }
+    if (on_user_core())
+        core_mark_online(core_id(), 0x27);
     ksem_init_core();
+    if (on_user_core())
+        core_mark_online(core_id(), 0x28);
     workq_init_core();
+    if (on_user_core())
+        core_mark_online(core_id(), 0x29);
     mmu_switch_to_kernel();
+    if (on_user_core())
+        core_mark_online(core_id(), 0x2A);
 }
 
 static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affinity_core)
@@ -1607,9 +1643,14 @@ void proc_schedule(void)
     if (!initialized)
         proc_init();
 
-    uart_puts("[proc] scheduler running on core ");
-    uart_hex(core_id());
-    uart_putc('\n');
+    if (user) {
+        core_mark_online(core_id(), 6);
+        sched_start_ticks_core[uc] = proc_sched_counter_ticks();
+    } else {
+        uart_puts("[proc] scheduler running on core ");
+        uart_hex(core_id());
+        uart_putc('\n');
+    }
 
     for (;;) {
         watchdog_touch(core_id());
@@ -1697,7 +1738,21 @@ void proc_schedule(void)
 
         if (!found) {
             workq_drain(8);
-            wfe();
+            if (user) {
+                core_mark_online(core_id(), 0x80);
+                sched_idle_count_core[uc]++;
+                u64 idle_start = proc_sched_counter_ticks();
+                sched_idle_enter_ticks_core[uc] = idle_start;
+                wfe();
+                u64 idle_end = proc_sched_counter_ticks();
+                sched_idle_enter_ticks_core[uc] = 0;
+                if (idle_end >= idle_start)
+                    sched_idle_ticks_core[uc] += idle_end - idle_start;
+                sched_wake_count_core[uc]++;
+                core_mark_online(core_id(), 0x81);
+            } else {
+                wfe();
+            }
         }
     }
 }
@@ -1824,6 +1879,40 @@ u64 proc_preemptions(void)
     return preempt_count_core[user_core_slot()];
 }
 
+u32 proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries)
+{
+    if (!out || max_entries == 0)
+        return 0;
+    u32 n = max_entries < 3U ? max_entries : 3U;
+    u64 now = proc_sched_counter_ticks();
+    for (u32 i = 0; i < n; i++) {
+        u64 start = sched_start_ticks_core[i];
+        u64 total = (start != 0 && now >= start) ? (now - start) : 0;
+        u64 idle = sched_idle_ticks_core[i];
+        u64 idle_enter = sched_idle_enter_ticks_core[i];
+        if (idle_enter != 0 && now >= idle_enter)
+            idle += now - idle_enter;
+        if (idle > total)
+            idle = total;
+        u64 busy = total - idle;
+        u64 t = total;
+        u64 b = busy;
+        while (t > 0x00FFFFFFFFFFFFFFULL) {
+            t >>= 1;
+            b >>= 1;
+        }
+        out[i].core = i + CORE_USERM;
+        out[i].busy_permille = t ? (u32)((b * 1000ULL) / t) : 0;
+        out[i].active_count = 0;
+        out[i].idle_count = sched_idle_count_core[i];
+        out[i].wake_count = sched_wake_count_core[i];
+        out[i].idle_ticks = idle;
+        out[i].total_ticks = total;
+        out[i].preemptions = preempt_count_core[i];
+    }
+    return n;
+}
+
 u32 proc_snapshot(struct proc_ui_entry *out, u32 max_entries)
 {
     if (!out || max_entries == 0)
@@ -1844,6 +1933,16 @@ u32 proc_snapshot(struct proc_ui_entry *out, u32 max_entries)
     out[0].priority_class = PROC_PRIO_REALTIME;
     out[0].runtime_ticks = now;
     out[0].cpu_percent = 100;
+    u64 k_static = proc_kernel_static_bytes();
+    u64 k_core = proc_kernel_core_private_bytes();
+    u64 k_total = k_static + k_core;
+    out[0].mem_kib = (u32)(k_total >> 10);
+    out[0].arena_capacity_kib = (u32)((CORE_PRIV_SIZE * 4ULL) >> 10);
+    out[0].arena_used_kib = (u32)(k_core >> 10);
+    out[0].arena_high_kib = out[0].arena_used_kib;
+    out[0].arena_bump_kib = out[0].arena_used_kib;
+    out[0].arena_span_kib = (u32)(k_static >> 10);
+    out[0].arena_span_count = 4;
     out[0].image_path[0] = '[';
     out[0].image_path[1] = 'k';
     out[0].image_path[2] = 'e';

@@ -9,6 +9,14 @@
 .global _start
 .global secondary_entry
 
+.section .bss
+.balign 4
+.global core_asm_stage
+core_asm_stage:
+    .space 16
+
+.section .text.boot
+
 _start:
     mrs     x0, mpidr_el1
     and     x0, x0, #0x3
@@ -76,8 +84,9 @@ _start:
     movk    x0, #0x30D0, lsl #16
     msr     sctlr_el1, x0
 
-    /* Return to EL1_SP0 (EL1t) */
-    mov     x0, #0x3C4
+    /* Return to EL1h (SP_EL1). Exception handlers use SP_EL1, so keep the
+     * kernel on the same stack selection instead of EL1t/SP_EL0. */
+    mov     x0, #0x3C5
     msr     spsr_el2, x0
     ldr     x0, =.Lel1_entry
     msr     elr_el2, x0
@@ -104,6 +113,9 @@ _start:
 
 /* ── EL1 landing pad ── */
 .Lel1_entry:
+    msr     SPSel, #1
+    isb
+
     /* Stack */
     ldr     x1, =_start
     mov     sp, x1
@@ -217,7 +229,7 @@ _start:
  */
 .balign 0x800
 el2_crash_vectors:
-/* Current EL, SP_EL0 — Synchronous */
+/* Current EL, SP_EL0 - Synchronous */
 .balign 0x80
     b       .Lel2_crash
 .balign 0x80
@@ -226,7 +238,7 @@ el2_crash_vectors:
     b       .Lel2_crash
 .balign 0x80
     b       .Lel2_crash
-/* Current EL, SP_ELx — Synchronous */
+/* Current EL, SP_ELx - Synchronous */
 .balign 0x80
     b       .Lel2_crash
 .balign 0x80
@@ -235,7 +247,7 @@ el2_crash_vectors:
     b       .Lel2_crash
 .balign 0x80
     b       .Lel2_crash
-/* Lower EL, AArch64 — Synchronous */
+/* Lower EL, AArch64 - Synchronous */
 .balign 0x80
     b       .Lel2_crash
 .balign 0x80
@@ -244,7 +256,7 @@ el2_crash_vectors:
     b       .Lel2_crash
 .balign 0x80
     b       .Lel2_crash
-/* Lower EL, AArch32 — Synchronous */
+/* Lower EL, AArch32 - Synchronous */
 .balign 0x80
     b       .Lel2_crash
 .balign 0x80
@@ -268,6 +280,8 @@ el2_crash_vectors:
  * Secondary core entry point.
  */
 secondary_entry:
+    mrs     x0, mpidr_el1
+    ubfx    x0, x0, #8, #8
     cmp     x0, #1
     b.eq    .Lstack1
     cmp     x0, #2
@@ -280,7 +294,13 @@ secondary_entry:
     mov     x19, #\core_id
     ldr     x1, =\stack_sym
     mov     sp, x1
+    ldr     x2, =core_asm_stage
+    mov     w3, #0x10
+    str     w3, [x2, x19, lsl #2]
     bl      el2_to_el1
+    ldr     x2, =core_asm_stage
+    mov     w3, #0x11
+    str     w3, [x2, x19, lsl #2]
     mrs     x1, sctlr_el1
     bic     x1, x1, #(1 << 0)
     bic     x1, x1, #(1 << 2)
@@ -289,17 +309,17 @@ secondary_entry:
     orr     x1, x1, #(1 << 3)
     msr     sctlr_el1, x1
     isb
-    mrs     x1, cpacr_el1
-    orr     x1, x1, #(3 << 20)
-    msr     cpacr_el1, x1
-    isb
+    ldr     x2, =core_asm_stage
+    mov     w3, #0x12
+    str     w3, [x2, x19, lsl #2]
     ldr     x1, =\stack_sym
     mov     sp, x1
-    sub     x1, x1, #0x4000
-    msr     sp_el1, x1
     ldr     x1, =vector_table
     msr     vbar_el1, x1
     isb
+    ldr     x2, =core_asm_stage
+    mov     w3, #0x13
+    str     w3, [x2, x19, lsl #2]
     ldr     x1, =shared_ttbr0
     ldr     x1, [x1]
     msr     ttbr0_el1, x1
@@ -312,12 +332,18 @@ secondary_entry:
     tlbi    vmalle1
     dsb     sy
     isb
+    ldr     x2, =core_asm_stage
+    mov     w3, #0x14
+    str     w3, [x2, x19, lsl #2]
     mrs     x1, sctlr_el1
     orr     x1, x1, #(1 << 0)
     orr     x1, x1, #(1 << 2)
     orr     x1, x1, #(1 << 12)
     msr     sctlr_el1, x1
     isb
+    ldr     x2, =core_asm_stage
+    mov     w3, #0x15
+    str     w3, [x2, x19, lsl #2]
     msr     daifclr, #2
     bl      \entry_fn
     b       .Lhalt

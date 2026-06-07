@@ -32,7 +32,8 @@ static inline void sev(void)  { __asm__ volatile("sev"); }
 static inline u32 core_id(void) {
     u64 mpidr;
     __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
-    return (u32)(mpidr & 0x3);
+    u32 aff1 = (u32)((mpidr >> 8) & 0xFF);
+    return aff1 ? aff1 : (u32)(mpidr & 0x3);
 }
 
 static inline void delay_cycles(u32 n) {

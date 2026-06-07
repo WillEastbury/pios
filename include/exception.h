@@ -101,5 +101,10 @@ void irq_diag_snapshot(struct irq_diag_snapshot *out);
 void irq_hw_diag_snapshot(struct irq_hw_diag_snapshot *out);
 void irq_gic_probe_snapshot(struct irq_gic_probe_snapshot *out);
 bool irq_diag_selftest(void);
+void irq_trace_dump(u32 *enter, u32 *pre_h, u32 *post_h,
+                    u32 *pre_e, u32 *post_e, u32 *last_iar);
+void irq_trace_reset(void);
+void irq_vector_minimal_arm(bool enabled);
+void irq_vector_minimal_snapshot(u32 *count, u32 *last_iar);
 
 NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far);

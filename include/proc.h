@@ -58,6 +58,17 @@ struct proc_security_stats {
     u64 port_claim_denies;
 } PACKED;
 
+struct proc_sched_core_snapshot {
+    u32 core;
+    u32 busy_permille;
+    u32 active_count;
+    u64 idle_count;
+    u64 wake_count;
+    u64 idle_ticks;
+    u64 total_ticks;
+    u64 preemptions;
+} PACKED;
+
 #define PROC_IMAGE_FORMAT_NONE     0U
 #define PROC_IMAGE_FORMAT_FLAT     1U
 #define PROC_IMAGE_FORMAT_PIX      2U
@@ -421,6 +432,7 @@ u64  proc_svc_bad_calls(void);
 void proc_preempt_init(u32 timer_hz, u32 quantum_ms);
 void proc_irq_maybe_preempt(struct irq_frame *frame);
 u64  proc_preemptions(void);
+u32  proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries);
 u32  proc_snapshot(struct proc_ui_entry *out, u32 max_entries);
 void *proc_span_rent(u32 bytes, u32 align, u32 type);
 bool proc_span_release(void *ptr);

@@ -9,52 +9,97 @@
 .extern el2_hvc_trap
 .extern el2_sync_fault_trap
 .extern el2_boot_el_state
+.extern irq_vector_minimal_mode
+.extern irq_vector_minimal_count
+.extern irq_vector_minimal_last_iar
+.extern core_asm_stage
+
+.section .bss
+.balign 4
+.global irq_vector_minimal_mode
+irq_vector_minimal_mode:
+    .word 0
+.global irq_vector_minimal_count
+irq_vector_minimal_count:
+    .word 0
+.global irq_vector_minimal_last_iar
+irq_vector_minimal_last_iar:
+    .word 0
 
 /* ---- EL2 → EL1 transition (called from _start before kernel_main) ---- */
+.section .text
 .global el2_to_el1
 el2_to_el1:
+    mrs     x3, mpidr_el1
+    ubfx    x3, x3, #8, #8
+    ldr     x4, =core_asm_stage
+    mov     w5, #0x30
+    str     w5, [x4, x3, lsl #2]
+
     /* Check current EL */
     mrs     x0, CurrentEL
     lsr     x0, x0, #2
     cmp     x0, #2
     b.ne    .Lfrom_el1
 
+    mov     w5, #0x31
+    str     w5, [x4, x3, lsl #2]
+
     /* Record that we booted at EL2 and install EL2 vectors */
     ldr     x1, =el2_boot_el_state
     mov     w2, #2
     str     w2, [x1]
-    ldr     x1, =el2_vector_table
-    msr     vbar_el2, x1
-    mov     x1, sp
-    msr     sp_el2, x1
+    mov     w5, #0x32
+    str     w5, [x4, x3, lsl #2]
+    /* Secondary cores only need a minimal EL2->EL1 drop here. Avoid
+     * touching VBAR_EL2/SP_EL2 in this shared path; live Pi 5 testing
+     * shows secondary cores can wedge there before the EL1 transition. */
     isb
+    mov     w5, #0x33
+    str     w5, [x4, x3, lsl #2]
 
     /* HCR_EL2: RW=1 (EL1 is AArch64), no trapping */
     mov     x0, #(1 << 31)         /* RW bit */
     msr     hcr_el2, x0
+    mov     w5, #0x34
+    str     w5, [x4, x3, lsl #2]
 
     /* Enable timer access from EL1 */
     mrs     x0, cnthctl_el2
     orr     x0, x0, #3             /* EL1PCTEN + EL1PCEN */
     msr     cnthctl_el2, x0
     msr     cntvoff_el2, xzr       /* no virtual offset */
+    mov     w5, #0x35
+    str     w5, [x4, x3, lsl #2]
 
     /* Enable NEON/FPU at EL2: clear TFP (bit 10) so EL1 SIMD/FP is not trapped.
      * RES1 bits [13:12] and [9:0] must stay set → 0x33BF. */
     mov     x0, #0x33BF
     msr     cptr_el2, x0
+    mov     w5, #0x36
+    str     w5, [x4, x3, lsl #2]
 
     /* SPSR_EL2: return to EL1h with IRQs masked initially */
     mov     x0, #0x3C5             /* EL1h, DAIF masked */
     msr     spsr_el2, x0
+    mov     w5, #0x37
+    str     w5, [x4, x3, lsl #2]
 
     /* ELR_EL2: return address = label after eret */
     adr     x0, .Lel1_entry
     msr     elr_el2, x0
 
+    mov     w5, #0x38
+    str     w5, [x4, x3, lsl #2]
+
     eret
 
 .Lel1_entry:
+    mrs     x3, mpidr_el1
+    ubfx    x3, x3, #8, #8
+    ldr     x4, =core_asm_stage
+    mov     w5, #0x39
+    str     w5, [x4, x3, lsl #2]
     /* Now at EL1 — enable NEON */
     mrs     x0, cpacr_el1
     orr     x0, x0, #(3 << 20)
@@ -63,10 +108,20 @@ el2_to_el1:
     b       .Lret
 
 .Lfrom_el1:
+    mrs     x3, mpidr_el1
+    ubfx    x3, x3, #8, #8
+    ldr     x4, =core_asm_stage
+    mov     w5, #0x3A
+    str     w5, [x4, x3, lsl #2]
     ldr     x1, =el2_boot_el_state
     mov     w2, #1
     str     w2, [x1]
 .Lret:
+    mrs     x3, mpidr_el1
+    ubfx    x3, x3, #8, #8
+    ldr     x4, =core_asm_stage
+    mov     w5, #0x3B
+    str     w5, [x4, x3, lsl #2]
     ret
 
 /* ---- EL2 exception vectors (HVC trap path) ---- */
@@ -233,10 +288,40 @@ vector_table:
 .endm
 
 irq_handler:
+    stp     x16, x17, [sp, #-16]!
+    ldr     x16, =irq_vector_minimal_mode
+    ldr     w17, [x16]
+    cbnz    w17, .Lirq_minimal
+
+    ldp     x16, x17, [sp], #16
     SAVE_CONTEXT
     mov     x0, sp
     bl      irq_dispatch        /* C function */
     RESTORE_CONTEXT
+    eret
+
+.Lirq_minimal:
+    ldr     x16, =irq_vector_minimal_count
+    ldr     w17, [x16]
+    add     w17, w17, #1
+    str     w17, [x16]
+
+    mov     x16, #2
+    msr     cntp_ctl_el0, x16          /* IMASK=1, ENABLE=0 */
+    isb
+
+    ldr     x16, =0x107FFFA000         /* GICC base */
+    ldr     w17, [x16, #0x00C]         /* IAR */
+    ldr     x16, =irq_vector_minimal_last_iar
+    str     w17, [x16]
+    cmp     w17, #0x3ff
+    b.eq    .Lirq_minimal_done
+    ldr     x16, =0x107FFFA000
+    str     w17, [x16, #0x010]         /* EOIR must echo full IAR */
+    dsb     sy
+    isb
+.Lirq_minimal_done:
+    ldp     x16, x17, [sp], #16
     eret
 
 sync_handler:

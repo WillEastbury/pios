@@ -12,6 +12,28 @@
 
 /* External: secondary core entry point in start.S */
 extern void secondary_entry(void);
+static volatile i64 core_psci_ret[NUM_CORES];
+static volatile u32 core_stage[NUM_CORES];
+extern volatile u32 core_asm_stage[NUM_CORES];
+
+void core_mark_online(u32 id, u32 stage)
+{
+    if (id < NUM_CORES)
+        core_stage[id] = stage;
+}
+
+u32 core_status_snapshot(struct core_status_entry *out, u32 max_entries)
+{
+    if (!out || max_entries == 0)
+        return 0;
+    u32 n = max_entries < NUM_CORES ? max_entries : NUM_CORES;
+    for (u32 i = 0; i < n; i++) {
+        out[i].core = i;
+        out[i].psci_ret = core_psci_ret[i];
+        out[i].stage = core_stage[i] ? core_stage[i] : core_asm_stage[i];
+    }
+    return n;
+}
 
 static i64 psci_cpu_on(u64 target_mpidr, u64 entry, u64 context) {
     register u64 x0 __asm__("x0") = PSCI_CPU_ON;
@@ -29,6 +51,8 @@ void core_start_secondary(u32 id, void (*entry)(void)) {
     /* Pi 5 (Cortex-A76): core ID is in MPIDR Aff1, not Aff0.
      * PSCI target_affinity must be (core << 8). */
     i64 ret = psci_cpu_on((u64)id << 8, (u64)(usize)secondary_entry, (u64)id);
+    if (id < NUM_CORES)
+        core_psci_ret[id] = ret;
     if (ret == 0) {
         uart_puts("[core] Started core ");
         uart_putc('0' + (char)id);

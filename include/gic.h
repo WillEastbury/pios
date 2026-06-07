@@ -9,7 +9,7 @@
  * BCM2712 GIC-400 base addresses.
  * Distributor and CPU interface are at fixed offsets from GIC base.
  */
-#define GIC_BASE            (PERIPH_BASE + 0x01840000UL)
+#define GIC_BASE            0x107FFF8000UL
 #define GICD_BASE           (GIC_BASE + 0x1000)
 #define GICC_BASE           (GIC_BASE + 0x2000)
 

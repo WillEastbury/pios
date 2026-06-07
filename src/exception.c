@@ -10,6 +10,24 @@
 #include "proc.h"
 #include "timer.h"
 #include "picowal_db.h"
+#include "sd.h"
+
+/* IRQ trace via raw SD blocks.
+ * We can't rely on DRAM-resident trace (Pi 5 watchdog reset clears RAM) or
+ * on framebuffer markers (HDMI capture is unreliable mid-wedge). Instead
+ * each waypoint in irq_dispatch writes a 512-byte sector to a known LBA
+ * range in the gap between MBR and FAT (LBA 16..23 - well below the
+ * partition table @ LBA 2048). After a wedge the SD is pulled and we
+ * dump those sectors via the host. The highest band with a populated
+ * magic word reveals how far the IRQ vector got. */
+#define IRQ_TRACE_LBA_BASE   16u
+#define IRQ_TRACE_LBA_RESET  15u   /* one sector below the band sectors */
+
+static u8 irq_trace_sd_buf[SD_BLOCK_SIZE] ALIGNED(16);
+
+extern volatile u32 irq_vector_minimal_mode;
+extern volatile u32 irq_vector_minimal_count;
+extern volatile u32 irq_vector_minimal_last_iar;
 
 /* Vector table defined in vectors.S */
 extern void vector_table(void);
@@ -102,9 +120,144 @@ void irq_register(u32 intid, irq_handler_t handler) {
         irq_handlers[intid] = handler;
 }
 
+void irq_vector_minimal_arm(bool enabled)
+{
+    irq_vector_minimal_count = 0;
+    irq_vector_minimal_last_iar = 0;
+    irq_vector_minimal_mode = enabled ? 1U : 0U;
+    dsb();
+    isb();
+}
+
+void irq_vector_minimal_snapshot(u32 *count, u32 *last_iar)
+{
+    if (count) *count = irq_vector_minimal_count;
+    if (last_iar) *last_iar = irq_vector_minimal_last_iar;
+}
+
+/* Trace counters in DRAM at a fixed address outside the kernel image
+ * and core/FIFO/DMA buffer regions. BCM2712 watchdog reset clears this,
+ * so it is only useful for non-resetting probes. */
+#define IRQ_TRACE_MAGIC   0xA1B2C3D4U
+struct irq_trace {
+    u32 magic;
+    u32 enter;
+    u32 ack_done;
+    u32 pre_handler;
+    u32 post_handler;
+    u32 pre_eoi;
+    u32 post_eoi;
+    u32 last_iar;
+    u32 last_intid;
+    u32 reserved[7];
+} ALIGNED(64);
+
+static volatile struct irq_trace * const irq_trace =
+    (volatile struct irq_trace *)0x04800000UL;
+
+void irq_trace_dump(u32 *enter, u32 *pre_h, u32 *post_h,
+                    u32 *pre_e, u32 *post_e, u32 *last_iar)
+{
+    if (irq_trace->magic != IRQ_TRACE_MAGIC) {
+        if (enter)    *enter    = 0xFFFFFFFFU;  /* never initialised */
+        if (pre_h)    *pre_h    = 0;
+        if (post_h)   *post_h   = 0;
+        if (pre_e)    *pre_e    = 0;
+        if (post_e)   *post_e   = 0;
+        if (last_iar) *last_iar = 0;
+        return;
+    }
+    if (enter)    *enter    = irq_trace->enter;
+    if (pre_h)    *pre_h    = irq_trace->pre_handler;
+    if (post_h)   *post_h   = irq_trace->post_handler;
+    if (pre_e)    *pre_e    = irq_trace->pre_eoi;
+    if (post_e)   *post_e   = irq_trace->post_eoi;
+    if (last_iar) *last_iar = irq_trace->last_iar;
+}
+
+void irq_trace_reset(void)
+{
+    irq_trace->magic = IRQ_TRACE_MAGIC;
+    irq_trace->enter = 0;
+    irq_trace->ack_done = 0;
+    irq_trace->pre_handler = 0;
+    irq_trace->post_handler = 0;
+    irq_trace->pre_eoi = 0;
+    irq_trace->post_eoi = 0;
+    irq_trace->last_iar = 0;
+    irq_trace->last_intid = 0;
+    dsb();
+
+    /* Wipe the SD trace sectors (LBA 16..23) so a stale post-handler /
+     * post-eoi marker from a previous test isn't read as a new success. */
+    for (u32 i = 0; i < SD_BLOCK_SIZE; i++) irq_trace_sd_buf[i] = 0;
+    for (u32 b = 0; b < 8U; b++) {
+        (void)sd_write_block(IRQ_TRACE_LBA_BASE + b, irq_trace_sd_buf);
+    }
+    /* Also stamp a "reset" marker at LBA 15 with the current monotonic
+     * tick so the host can tell stale data apart from fresh data. */
+    for (u32 i = 0; i < SD_BLOCK_SIZE; i++) irq_trace_sd_buf[i] = 0;
+    u8 *p = irq_trace_sd_buf;
+    p[0]='I'; p[1]='R'; p[2]='Q'; p[3]='T'; p[4]='R'; p[5]='S'; p[6]='T'; p[7]=0;
+    u64 t;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
+    *(u64*)(irq_trace_sd_buf + 8) = t;
+    (void)sd_write_block(IRQ_TRACE_LBA_RESET, irq_trace_sd_buf);
+}
+
+/* Stamp one SD sector for the given band. Called from inside the IRQ
+ * vector path so it must use only synchronous PIO SD writes (no DMA, no
+ * IRQ-driven completion). Each sector contains a magic header, band
+ * number, IAR, intid, and the current CNTPCT timestamp. */
+static void irq_sd_band(u32 band, u32 iar, u32 intid)
+{
+    if (band > 7U) return;
+    for (u32 i = 0; i < SD_BLOCK_SIZE; i++) irq_trace_sd_buf[i] = 0;
+    u8 *p = irq_trace_sd_buf;
+    /* ASCII magic "IRQBAND" so a hexdump or `findstr` finds it easily. */
+    p[0]='I'; p[1]='R'; p[2]='Q'; p[3]='B'; p[4]='A'; p[5]='N'; p[6]='D'; p[7]=(u8)('0'+band);
+    *(u32*)(p + 8)  = 0xDEADBEEFU;
+    *(u32*)(p + 12) = band;
+    *(u32*)(p + 16) = iar;
+    *(u32*)(p + 20) = intid;
+    u64 t;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
+    *(u64*)(p + 24) = t;
+    /* Stamp the GIC HPPIR (highest priority pending interrupt) so we can
+     * see what interrupt the CPU thought was active at this waypoint. */
+    *(u32*)(p + 32) = mmio_read(0x107FFFA018ULL); /* GICC_HPPIR */
+    *(u32*)(p + 36) = mmio_read(0x107FFF9000ULL + 0x200);  /* GICD_ISPENDR0 */
+    (void)sd_write_block(IRQ_TRACE_LBA_BASE + band, irq_trace_sd_buf);
+}
+
 /* Called from vectors.S irq_handler */
+static inline void irq_fb_band(u32 band, u32 color)
+{
+    /* Paint a fat 30-row x 200-col band at the top of the screen so an HDMI
+     * observer can see how far the IRQ vector got before wedging. */
+    u32 y0 = band * 32U;
+    for (u32 y = y0; y < y0 + 30U; y++)
+        for (u32 x = 0; x < 200U; x++)
+            fb_pixel(x, y, color);
+}
+
 void irq_dispatch(struct irq_frame *frame) {
+    bool trace_enabled = (irq_trace->magic == IRQ_TRACE_MAGIC);
+    if (trace_enabled) {
+        irq_fb_band(0, 0x00FF00FFU);   /* magenta - vector entered */
+        irq_sd_band(0, 0, 0);
+    }
+    if (irq_trace->magic == IRQ_TRACE_MAGIC)
+        irq_trace->enter++;
     u32 iar = gic_acknowledge();
+    if (trace_enabled) {
+        irq_fb_band(1, 0x0000FFFFU);   /* yellow - ack returned */
+        irq_sd_band(1, iar, iar & 0x3FFU);
+    }
+    if (irq_trace->magic == IRQ_TRACE_MAGIC) {
+        irq_trace->last_iar = iar;
+        irq_trace->ack_done++;
+    }
     u32 intid = iar & 0x3FFU;
     u32 c = core_id() & 3U;
     irq_diag.total++;
@@ -112,12 +265,26 @@ void irq_dispatch(struct irq_frame *frame) {
     irq_diag.last_intid = intid;
     irq_diag.last_core = c;
     irq_diag.last_tick = timer_ticks();
+    if (irq_trace->magic == IRQ_TRACE_MAGIC)
+        irq_trace->last_intid = intid;
 
     if (intid < GIC_MAX_IRQ && irq_handlers[intid]) {
         irq_diag.handled++;
         if (intid == GIC_TIMER_VIRT || intid == GIC_TIMER_NS_PHYS)
             irq_diag.timer++;
+        if (irq_trace->magic == IRQ_TRACE_MAGIC)
+            irq_trace->pre_handler++;
+        if (trace_enabled) {
+            irq_fb_band(2, 0x0000FF00U); /* green - about to call handler */
+            irq_sd_band(2, iar, intid);
+        }
         irq_handlers[intid]();
+        if (trace_enabled) {
+            irq_fb_band(3, 0x00FFFFFFU); /* white - handler returned */
+            irq_sd_band(3, iar, intid);
+        }
+        if (irq_trace->magic == IRQ_TRACE_MAGIC)
+            irq_trace->post_handler++;
     } else if (intid == GIC_INTID_SPURIOUS) {
         irq_diag.spurious++;
     } else {
@@ -126,9 +293,21 @@ void irq_dispatch(struct irq_frame *frame) {
 
     proc_irq_maybe_preempt(frame);
 
+    if (irq_trace->magic == IRQ_TRACE_MAGIC)
+        irq_trace->pre_eoi++;
+    if (trace_enabled) {
+        irq_fb_band(4, 0x000080FFU); /* orange - about to EOI */
+        irq_sd_band(4, iar, intid);
+    }
     /* EOI must echo the exact IAR value (incl. CPUID bits) per GIC-400. */
     if (intid != GIC_INTID_SPURIOUS)
         gic_end_of_interrupt(iar);
+    if (trace_enabled) {
+        irq_fb_band(5, 0x0000C0FFU); /* light orange - EOI returned */
+        irq_sd_band(5, iar, intid);
+    }
+    if (irq_trace->magic == IRQ_TRACE_MAGIC)
+        irq_trace->post_eoi++;
 }
 
 void irq_diag_snapshot(struct irq_diag_snapshot *out)
@@ -149,9 +328,9 @@ void irq_hw_diag_snapshot(struct irq_hw_diag_snapshot *out)
     __asm__ volatile("mrs %0, CurrentEL" : "=r"(out->current_el));
     __asm__ volatile("mrs %0, DAIF" : "=r"(out->daif));
     __asm__ volatile("mrs %0, VBAR_EL1" : "=r"(out->vbar_el1));
-    __asm__ volatile("mrs %0, CNTV_CTL_EL0" : "=r"(out->cntv_ctl));
-    __asm__ volatile("mrs %0, CNTV_CVAL_EL0" : "=r"(out->cntv_cval));
-    __asm__ volatile("mrs %0, CNTVCT_EL0" : "=r"(out->cntvct));
+    __asm__ volatile("mrs %0, CNTP_CTL_EL0" : "=r"(out->cntv_ctl));
+    __asm__ volatile("mrs %0, CNTP_CVAL_EL0" : "=r"(out->cntv_cval));
+    __asm__ volatile("mrs %0, CNTPCT_EL0" : "=r"(out->cntvct));
     out->gicd_ctlr = mmio_read(gic_runtime_gicd_base() + 0x000);
     out->gicc_ctlr = mmio_read(gic_runtime_gicc_base() + 0x000);
     out->gicc_pmr = mmio_read(gic_runtime_gicc_base() + 0x004);

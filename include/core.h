@@ -13,8 +13,16 @@
 #define CORE_USER1  3
 #define NUM_CORES   4
 
+struct core_status_entry {
+    u32 core;
+    i64 psci_ret;
+    u32 stage;
+} PACKED;
+
 void core_start_secondary(u32 core_id, void (*entry)(void));
 void core_start_all(void);
+void core_mark_online(u32 core_id, u32 stage);
+u32  core_status_snapshot(struct core_status_entry *out, u32 max_entries);
 
 /* Entry points for each core (called from start.S after stack setup) */
 NORETURN void core0_main(void);   /* Kernel services + Network */
