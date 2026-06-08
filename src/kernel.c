@@ -2638,6 +2638,14 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, b.cross_span_ring_ticks);
         http_append(out, &len, max, " span_all_ticks=");
         http_append_u64(out, &len, max, b.cross_span_all_ticks);
+        http_append(out, &len, max, " rt_base_ticks=");
+        http_append_u64(out, &len, max, b.span_rt_base_ticks);
+        http_append(out, &len, max, " rt_ish_ticks=");
+        http_append_u64(out, &len, max, b.span_rt_ish_ticks);
+        http_append(out, &len, max, " rt_acqrel_ticks=");
+        http_append_u64(out, &len, max, b.span_rt_acqrel_ticks);
+        http_append(out, &len, max, " rt_asm_ticks=");
+        http_append_u64(out, &len, max, b.span_rt_asm_ticks);
         http_append(out, &len, max, " sev_ticks=");
         http_append_u64(out, &len, max, b.sev_ticks);
         if (b.iterations) {
@@ -2669,6 +2677,14 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, b.cross_span_ring_ticks / b.iterations);
             http_append(out, &len, max, " span_all_per=");
             http_append_u64(out, &len, max, b.cross_span_all_ticks / b.iterations);
+            http_append(out, &len, max, " rt_base_per=");
+            http_append_u64(out, &len, max, b.span_rt_base_ticks / b.iterations);
+            http_append(out, &len, max, " rt_ish_per=");
+            http_append_u64(out, &len, max, b.span_rt_ish_ticks / b.iterations);
+            http_append(out, &len, max, " rt_acqrel_per=");
+            http_append_u64(out, &len, max, b.span_rt_acqrel_ticks / b.iterations);
+            http_append(out, &len, max, " rt_asm_per=");
+            http_append_u64(out, &len, max, b.span_rt_asm_ticks / b.iterations);
             http_append(out, &len, max, " sev_per=");
             http_append_u64(out, &len, max, b.sev_ticks / b.iterations);
         }

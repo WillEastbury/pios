@@ -24,6 +24,13 @@ typedef int                 bool;
 /* Memory barriers (Cortex-A76) */
 static inline void dmb(void)  { __asm__ volatile("dmb sy" ::: "memory"); }
 static inline void dsb(void)  { __asm__ volatile("dsb sy" ::: "memory"); }
+/* Inner-shareable scoped barriers — correct (and cheaper) for the 4
+ * inner-shareable A76 cores; SY needlessly orders vs outer-shareable + device. */
+static inline void dmb_ish(void)   { __asm__ volatile("dmb ish"   ::: "memory"); }
+static inline void dmb_ishst(void) { __asm__ volatile("dmb ishst" ::: "memory"); }
+static inline void dmb_ishld(void) { __asm__ volatile("dmb ishld" ::: "memory"); }
+static inline void dsb_ish(void)   { __asm__ volatile("dsb ish"   ::: "memory"); }
+static inline void dsb_ishst(void) { __asm__ volatile("dsb ishst" ::: "memory"); }
 static inline void isb(void)  { __asm__ volatile("isb"    ::: "memory"); }
 static inline void wfe(void)  { __asm__ volatile("wfe"); }
 static inline void wfi(void)  { __asm__ volatile("wfi"); }

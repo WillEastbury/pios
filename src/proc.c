@@ -1989,6 +1989,10 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         out->cross_ring_batch_ticks = 0;
         out->cross_span_ring_ticks = 0;
         out->cross_span_all_ticks = 0;
+        out->span_rt_base_ticks = 0;
+        out->span_rt_ish_ticks = 0;
+        out->span_rt_acqrel_ticks = 0;
+        out->span_rt_asm_ticks = 0;
         out->sev_ticks = 0;
         return false;
     }
@@ -2316,6 +2320,74 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         }
         t1 = proc_sched_counter_ticks();
         out->cross_span_all_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+        /* ── A/B: span-ring descriptor copy + memory-ordering strategy ──
+         * Same-core round-trip on the unused (CORE_NET,CORE_NET) self-ring
+         * isolates raw copy + barrier cost from scheduler/wakeup noise:
+         *   base   = DMB-SY + compiler 32B struct copy   (current production)
+         *   acqrel = LDAR/STLR + DSB ISHST, compiler copy
+         *   asm    = same ordering, hand ldp/stp q (NEON) 32B copy
+         * Each iteration pushes then pops one chunk; per-desc = ticks/iters. */
+        {
+            struct fifo_span_msg rb[16];
+            const u32 ab_chunk = 16U;
+            for (u32 i = 0; i < ab_chunk; i++) {
+                sb[i].addr = (u64)(usize)copy_src;
+                sb[i].tag = 0x5C5C0000ULL | i;
+                sb[i].len = 2048;
+                sb[i].flags = PROC_IPC_SPAN_F_READONLY;
+                sb[i].aux = 0;
+                sb[i]._pad = 0;
+            }
+
+            while (fifo_span_pop_batch(CORE_NET, CORE_NET, rb, 16))
+                ;
+            t0 = proc_sched_counter_ticks();
+            for (u32 done = 0; done < iterations; done += ab_chunk) {
+                if (fifo_span_push_batch(CORE_NET, CORE_NET, sb, ab_chunk) != ab_chunk)
+                    errors++;
+                if (fifo_span_pop_batch(CORE_NET, CORE_NET, rb, ab_chunk) != ab_chunk)
+                    errors++;
+            }
+            t1 = proc_sched_counter_ticks();
+            out->span_rt_base_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+            while (fifo_span_pop_batch(CORE_NET, CORE_NET, rb, 16))
+                ;
+            t0 = proc_sched_counter_ticks();
+            for (u32 done = 0; done < iterations; done += ab_chunk) {
+                if (fifo_span_push_batch_ish(CORE_NET, CORE_NET, sb, ab_chunk) != ab_chunk)
+                    errors++;
+                if (fifo_span_pop_batch_ish(CORE_NET, CORE_NET, rb, ab_chunk) != ab_chunk)
+                    errors++;
+            }
+            t1 = proc_sched_counter_ticks();
+            out->span_rt_ish_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+            while (fifo_span_pop_batch(CORE_NET, CORE_NET, rb, 16))
+                ;
+            t0 = proc_sched_counter_ticks();
+            for (u32 done = 0; done < iterations; done += ab_chunk) {
+                if (fifo_span_push_batch_acqrel(CORE_NET, CORE_NET, sb, ab_chunk) != ab_chunk)
+                    errors++;
+                if (fifo_span_pop_batch_acqrel(CORE_NET, CORE_NET, rb, ab_chunk) != ab_chunk)
+                    errors++;
+            }
+            t1 = proc_sched_counter_ticks();
+            out->span_rt_acqrel_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+            while (fifo_span_pop_batch(CORE_NET, CORE_NET, rb, 16))
+                ;
+            t0 = proc_sched_counter_ticks();
+            for (u32 done = 0; done < iterations; done += ab_chunk) {
+                if (fifo_span_push_batch_asm(CORE_NET, CORE_NET, sb, ab_chunk) != ab_chunk)
+                    errors++;
+                if (fifo_span_pop_batch_asm(CORE_NET, CORE_NET, rb, ab_chunk) != ab_chunk)
+                    errors++;
+            }
+            t1 = proc_sched_counter_ticks();
+            out->span_rt_asm_ticks = t1 >= t0 ? t1 - t0 : 0;
+        }
     }
 
     t0 = proc_sched_counter_ticks();

@@ -15,6 +15,12 @@
 
 #define DMA_ENABLE_OFFSET 0xFF0U
 
+/* Below this transfer size, DMA setup + cache maintenance + completion-wait
+ * costs more than a NEON copy, so dma_memcpy()/dma_zero() shortcut straight to
+ * simd_*(). Conservative initial value; tuned empirically by the IPC
+ * DMA-crossover benchmark (the cross-over point where the engine wins). */
+#define DMA_MIN_EFFECTIVE_BYTES 4096U
+
 static bool dma_cbaddr_shifted;
 static bool dma_direct_mode;
 
@@ -353,6 +359,14 @@ static bool dma_memcpy_hw(u32 channel, void *dst, const void *src, u32 len) {
 }
 
 bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len) {
+    /* Size fast-path: below the effective threshold, DMA setup + cache
+     * maintenance + completion-wait costs more than a NEON copy, so go
+     * straight to simd_memcpy and never touch the engine. Tuned empirically
+     * by the IPC DMA-crossover benchmark. */
+    if (len < DMA_MIN_EFFECTIVE_BYTES) {
+        simd_memcpy(dst, src, len);
+        return len != 0;
+    }
     if (dma_hw_memcpy_enabled && dma_memcpy_hw(channel, dst, src, len))
         return true;
     simd_memcpy(dst, src, len);
@@ -360,6 +374,12 @@ bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len) {
 }
 
 bool dma_zero(u32 channel, void *dst, u32 len) {
+    /* Size fast-path: small fills are cheaper with NEON than DMA setup. */
+    if (len < DMA_MIN_EFFECTIVE_BYTES) {
+        (void)channel;
+        simd_zero(dst, len);
+        return len != 0;
+    }
     if (!dma_hw_memcpy_enabled) {
         (void)channel;
         simd_zero(dst, len);

@@ -143,9 +143,9 @@ u32 fifo_span_push_batch(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32
         pushed++;
     }
     if (pushed) {
-        dmb();
+        dmb_ishst();        /* data stores before head (inner-shareable scope) */
         f->head = head;
-        dsb();
+        dsb_ishst();        /* head visible before SEV */
         sev();
     }
     return pushed;
@@ -158,14 +158,164 @@ u32 fifo_span_pop_batch(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_co
     u32 head = f->head;
     u32 popped = 0;
 
-    dmb();
+    dmb_ishld();            /* head read before data reads (inner-shareable) */
     while (popped < max_count && tail != head) {
         msgs[popped] = f->msgs[tail];
         tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
         popped++;
     }
     if (popped) {
-        dmb();
+        dmb_ish();          /* data reads before tail store */
+        f->tail = tail;
+    }
+    return popped;
+}
+
+/* ------------------------------------------------------------------ */
+/*  A/B span-ring variants: acquire/release + hand-asm descriptor copy */
+/* ------------------------------------------------------------------ */
+
+/* Hand-rolled 32-byte (one fifo_span_msg) copy via a single NEON ldp/stp
+ * q-register pair — 2 instructions, no loop, no memcpy call. */
+static inline void span_copy32_asm(struct fifo_span_msg *d, const struct fifo_span_msg *s) {
+    __asm__ volatile(
+        "ldp q0, q1, [%1]\n\t"
+        "stp q0, q1, [%0]\n\t"
+        :
+        : "r"(d), "r"(s)
+        : "v0", "v1", "memory"
+    );
+}
+
+/* Idiomatic C: acquire/release ordering, compiler-generated 32B struct copy.
+ * Correct SPSC ordering on the 4 inner-shareable A76 cores without DMB-SY:
+ *   producer publishes head with STLR (release) after the data stores;
+ *   producer reads tail with LDAR (acquire) to see consumer-freed slots. */
+u32 fifo_span_push_batch_acqrel(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32 count) {
+    if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
+    struct fifo_span *f = get_span_fifo(src, dst);
+    u32 head = f->head;
+    u32 tail = atomic_load32(&f->tail);
+    u32 pushed = 0;
+
+    while (pushed < count) {
+        u32 next = (head + 1) & (FIFO_SPAN_CAPACITY - 1);
+        if (unlikely(next == tail))
+            break;
+        f->msgs[head] = msgs[pushed];
+        head = next;
+        pushed++;
+    }
+    if (pushed) {
+        atomic_store32(&f->head, head);              /* release: data before head */
+        __asm__ volatile("dsb ishst" ::: "memory");  /* head visible before SEV */
+        sev();
+    }
+    return pushed;
+}
+
+u32 fifo_span_pop_batch_acqrel(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_count) {
+    if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
+    struct fifo_span *f = get_span_fifo(src, dst);
+    u32 tail = f->tail;
+    u32 head = atomic_load32(&f->head);              /* acquire: see published data */
+    u32 popped = 0;
+
+    while (popped < max_count && tail != head) {
+        msgs[popped] = f->msgs[tail];
+        tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
+        popped++;
+    }
+    if (popped)
+        atomic_store32(&f->tail, tail);              /* release: reads before tail */
+    return popped;
+}
+
+/* Hand-tuned: identical ordering to _acqrel, but the descriptor copy is the
+ * explicit ldp/stp q NEON pair instead of compiler struct assignment. */
+u32 fifo_span_push_batch_asm(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32 count) {
+    if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
+    struct fifo_span *f = get_span_fifo(src, dst);
+    u32 head = f->head;
+    u32 tail = atomic_load32(&f->tail);
+    u32 pushed = 0;
+
+    while (pushed < count) {
+        u32 next = (head + 1) & (FIFO_SPAN_CAPACITY - 1);
+        if (unlikely(next == tail))
+            break;
+        span_copy32_asm(&f->msgs[head], &msgs[pushed]);
+        head = next;
+        pushed++;
+    }
+    if (pushed) {
+        atomic_store32(&f->head, head);
+        __asm__ volatile("dsb ishst" ::: "memory");
+        sev();
+    }
+    return pushed;
+}
+
+u32 fifo_span_pop_batch_asm(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_count) {
+    if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
+    struct fifo_span *f = get_span_fifo(src, dst);
+    u32 tail = f->tail;
+    u32 head = atomic_load32(&f->head);
+    u32 popped = 0;
+
+    while (popped < max_count && tail != head) {
+        span_copy32_asm(&msgs[popped], &f->msgs[tail]);
+        tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
+        popped++;
+    }
+    if (popped)
+        atomic_store32(&f->tail, tail);
+    return popped;
+}
+
+/* Inner-shareable DMB scope — same structure as the DMB-SY baseline but with
+ * the minimal correct barrier scope for inner-shareable cores:
+ *   producer DMB ISHST (data before head) + DSB ISHST (head before SEV)
+ *   consumer DMB ISHLD (head before data reads) + DMB ISH (reads before tail) */
+u32 fifo_span_push_batch_ish(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32 count) {
+    if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
+    struct fifo_span *f = get_span_fifo(src, dst);
+    u32 head = f->head;
+    u32 tail = f->tail;
+    u32 pushed = 0;
+
+    while (pushed < count) {
+        u32 next = (head + 1) & (FIFO_SPAN_CAPACITY - 1);
+        if (unlikely(next == tail))
+            break;
+        f->msgs[head] = msgs[pushed];
+        head = next;
+        pushed++;
+    }
+    if (pushed) {
+        dmb_ishst();
+        f->head = head;
+        dsb_ishst();
+        sev();
+    }
+    return pushed;
+}
+
+u32 fifo_span_pop_batch_ish(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_count) {
+    if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
+    struct fifo_span *f = get_span_fifo(src, dst);
+    u32 tail = f->tail;
+    u32 head = f->head;
+    u32 popped = 0;
+
+    dmb_ishld();
+    while (popped < max_count && tail != head) {
+        msgs[popped] = f->msgs[tail];
+        tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
+        popped++;
+    }
+    if (popped) {
+        dmb_ish();
         f->tail = tail;
     }
     return popped;
