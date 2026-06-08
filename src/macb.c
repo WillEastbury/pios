@@ -880,9 +880,16 @@ void macb_irq_enable_rx(void)
 u32 macb_irq_ack_rx(void)
 {
     u32 rsr = mr(RSR);
-    u32 isr = mr(ISR);
     if (rsr)
         mw(RSR, rsr);
+    dsb();
+    u32 isr = mr(ISR);
+    dsb();
+    rsr = mr(RSR);
+    if (rsr)
+        mw(RSR, rsr);
+    dsb();
+    isr |= mr(ISR);
     return isr;
 }
 
