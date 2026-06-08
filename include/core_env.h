@@ -15,6 +15,7 @@
  *   0x04900000 - 0x04AFFFFF  DMA NET buffers (2MB)
  *   0x04B00000 - 0x04CFFFFF  DMA DISK buffers (2MB)
  *   0x04D00000 - 0x04DFFFFF  Shared process IPC SHM pool (1MB)
+ *   0x05000000 - 0x05FFFFFF  HDMI double-buffer back buffer (16MB)
  */
 
 #pragma once
@@ -38,6 +39,12 @@
 
 #define IPC_SHM_BASE        0x04D00000UL
 #define IPC_SHM_SIZE        0x00100000UL  /* 1MB */
+
+/* HDMI double-buffer: rendering goes to this cached back buffer, then a DMA
+ * blit pushes dirty rows to the VideoCore scanout buffer. Sized for 1080p32
+ * (1920*1080*4 = 8.29MB) with headroom for pitch padding. */
+#define FB_BACK_BASE        0x05000000UL
+#define FB_BACK_SIZE        0x01000000UL  /* 16MB */
 
 static const u64 core_ram_bases[4] = {
     CORE0_RAM_BASE, CORE1_RAM_BASE, CORE2_RAM_BASE, CORE3_RAM_BASE

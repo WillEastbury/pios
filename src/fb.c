@@ -8,6 +8,8 @@
 #include "mailbox.h"
 #include "mmio.h"
 #include "dma.h"
+#include "mmu.h"
+#include "core_env.h"
 
 /* Framebuffer state */
 static u32 *fb_ptr;
@@ -15,6 +17,12 @@ static u32  fb_width;
 static u32  fb_height;
 static u32  fb_pitch;   /* bytes per row */
 static u32  fb_size;    /* total framebuffer bytes (from VideoCore) */
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+static u32 *fb_back;    /* cached back buffer (rendering target when double-buffered) */
+static bool fb_db;      /* double-buffering enabled */
+static u32  fb_dirty_y0;/* dirty pixel-row range [y0,y1); y0>=y1 == clean */
+static u32  fb_dirty_y1;
+#endif
 static u32  fb_fg = 0x00FF9900;  /* amber */
 static u32  fb_bg = 0x00000000;  /* black */
 
@@ -25,6 +33,26 @@ static u32  cols;
 static u32  rows;
 static u32  reserved_rows;
 static bool console_wrapped;
+
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+/* Render target: the cached back buffer when double-buffered, else the
+ * VideoCore scanout buffer directly. */
+static inline u32 *fb_rt(void) { return fb_db ? fb_back : fb_ptr; }
+
+/* Expand the dirty pixel-row range [y0,y1) that fb_present() will blit. */
+static inline void fb_mark_dirty(u32 y0, u32 y1) {
+    if (!fb_db) return;
+    if (y1 > fb_height) y1 = fb_height;
+    if (y0 >= y1) return;
+    if (y0 < fb_dirty_y0) fb_dirty_y0 = y0;
+    if (y1 > fb_dirty_y1) fb_dirty_y1 = y1;
+}
+#else
+/* Double-buffering disabled (e.g. the tiny stage0 bootstrap): render straight
+ * to the scanout buffer and treat present/dirty as no-ops. */
+static inline u32 *fb_rt(void) { return fb_ptr; }
+static inline void fb_mark_dirty(u32 y0, u32 y1) { (void)y0; (void)y1; }
+#endif
 
 /* Mailbox buffer - must be 16-byte aligned */
 static volatile u32 __attribute__((aligned(16))) mbox_fb[36];
@@ -284,25 +312,39 @@ bool fb_init(u32 width, u32 height) {
     if (fb_size == 0)
         fb_size = fb_pitch * height;
 
-    fb_clear(fb_bg);
+    /* Set up the cached back buffer for double-buffered rendering. All fb_*
+     * drawing targets this buffer; fb_present() DMA-blits dirty rows to the
+     * VideoCore scanout buffer (fb_ptr). */
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+    fb_back = (u32 *)(usize)FB_BACK_BASE;
+    fb_db   = (fb_back != 0) && (fb_size != 0) && (fb_size <= FB_BACK_SIZE);
+    fb_dirty_y0 = fb_height;
+    fb_dirty_y1 = 0;
+#endif
+
+    fb_clear(fb_bg);   /* clears the render target and marks the full frame dirty */
+    fb_present();      /* push the cleared frame to the scanout buffer (no-op if DB off) */
     return true;
 }
 
 void fb_clear(u32 color) {
     /* Use VideoCore-reported size to cover the entire allocation */
+    u32 *dst = fb_rt();
     u32 total = fb_size / 4;
     if (!total) total = (fb_pitch / 4) * fb_height;
     for (u32 i = 0; i < total; i++)
-        fb_ptr[i] = color;
+        dst[i] = color;
     cursor_x = 0;
     cursor_y = 0;
     console_wrapped = false;
+    fb_mark_dirty(0, fb_height);
 }
 
 void fb_pixel(u32 x, u32 y, u32 color) {
     if (x < fb_width && y < fb_height) {
-        u32 *row = (u32 *)((u8 *)fb_ptr + y * fb_pitch);
+        u32 *row = (u32 *)((u8 *)fb_rt() + y * fb_pitch);
         row[x] = color;
+        fb_mark_dirty(y, y + 1);
     }
 }
 
@@ -335,7 +377,7 @@ void fb_status_block(u32 color) {
      * with the new line of indicators. */
     if (fb_stat_x == 0) {
         for (u32 dy = 0; dy < FB_STAT_BLOCK; dy++) {
-            u32 *row = (u32 *)((u8 *)fb_ptr + (y_base + dy) * fb_pitch);
+            u32 *row = (u32 *)((u8 *)fb_rt() + (y_base + dy) * fb_pitch);
             for (u32 dx = 0; dx < fb_width; dx++)
                 row[dx] = 0x00000000;
         }
@@ -343,10 +385,11 @@ void fb_status_block(u32 color) {
 
     u32 x_base = fb_stat_x * step;
     for (u32 dy = 0; dy < FB_STAT_BLOCK; dy++) {
-        u32 *row = (u32 *)((u8 *)fb_ptr + (y_base + dy) * fb_pitch);
+        u32 *row = (u32 *)((u8 *)fb_rt() + (y_base + dy) * fb_pitch);
         for (u32 dx = 0; dx < FB_STAT_BLOCK; dx++)
             row[x_base + dx] = color;
     }
+    fb_mark_dirty(y_base, y_base + FB_STAT_BLOCK);
 
     fb_stat_x++;
     if (fb_stat_x >= cols) {
@@ -387,10 +430,11 @@ static void fb_clear_text_row(u32 cy) {
     if (!fb_ptr || cy >= rows) return;
     u32 py = cy * 8;
     for (u32 row = 0; row < 8; row++) {
-        u32 *scanline = (u32 *)((u8 *)fb_ptr + (py + row) * fb_pitch);
+        u32 *scanline = (u32 *)((u8 *)fb_rt() + (py + row) * fb_pitch);
         for (u32 x = 0; x < fb_width; x++)
             scanline[x] = fb_bg;
     }
+    fb_mark_dirty(py, py + 8);
 }
 
 void fb_clear_row(u32 row) {
@@ -439,12 +483,13 @@ static void fb_draw_codepoint(u32 cx, u32 cy, u32 code) {
     u32 py = cy * 8;
 
     for (u32 row = 0; row < 8; row++) {
-        u32 *scanline = (u32 *)((u8 *)fb_ptr + (py + row) * fb_pitch);
+        u32 *scanline = (u32 *)((u8 *)fb_rt() + (py + row) * fb_pitch);
         u8 bits = glyph[row];
         for (u32 col = 0; col < 8; col++) {
             scanline[px + col] = (bits & (1 << col)) ? fb_fg : fb_bg;
         }
     }
+    fb_mark_dirty(py, py + 8);
 }
 
 static void fb_put_codepoint(u32 code) {
@@ -589,3 +634,44 @@ void fb_printf(const char *fmt, ...) {
 u64 fb_get_phys_addr(void) {
     return (u64)(usize)fb_ptr;
 }
+
+/* ── Double-buffer present ──
+ * Blit the dirty pixel-row band from the cached back buffer to the VideoCore
+ * scanout buffer. The back slice is cleaned to RAM so the DMA engine (or NEON
+ * fallback before dma_init) reads current pixels; the front slice is then
+ * cleaned to RAM so the scanout sees the result. Per the transfer rule, a
+ * multi-row band is "bulk" and goes through DMA; a tiny band falls to NEON. */
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+static void fb_blit(u32 off, u32 bytes) {
+    u8 *src = (u8 *)fb_back + off;
+    u8 *dst = (u8 *)fb_ptr  + off;
+    dcache_clean_range((u64)(usize)src, bytes);   /* back slice → RAM */
+    dsb();
+    dma_memcpy(DMA_CHAN_MEMCPY, dst, src, bytes); /* DMA bulk, NEON fallback */
+    dcache_clean_range((u64)(usize)dst, bytes);   /* front slice → RAM for scanout */
+    dsb();
+}
+
+void fb_present(void) {
+    if (!fb_db)
+        return;
+    if (fb_dirty_y1 <= fb_dirty_y0)
+        return;                       /* nothing changed */
+
+    u32 y0 = fb_dirty_y0;
+    u32 y1 = fb_dirty_y1;
+    fb_dirty_y0 = fb_height;          /* reset to clean before blitting */
+    fb_dirty_y1 = 0;
+
+    u32 off = y0 * fb_pitch;
+    if (off >= fb_size)
+        return;
+    u32 bytes = (y1 - y0) * fb_pitch;
+    if (off + bytes > fb_size)
+        bytes = fb_size - off;
+    if (bytes)
+        fb_blit(off, bytes);
+}
+#else
+void fb_present(void) { }
+#endif

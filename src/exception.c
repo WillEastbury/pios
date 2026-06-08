@@ -96,6 +96,8 @@ static NORETURN void pisod_halt(const char *title, u32 kind, u32 ec, u64 esr, u6
     fb_printf("far=0x%x\n", far);
     fb_printf("last crash persisted to deck0/record3\n");
 
+    fb_present();   /* force the panic frame to the scanout before halting */
+
     for (;;) wfi();
 }
 

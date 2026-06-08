@@ -28,3 +28,7 @@ void fb_status_block(u32 color);
 
 /* Get framebuffer physical address (for MMU mapping) */
 u64 fb_get_phys_addr(void);
+
+/* Push dirty rows from the cached back buffer to the VideoCore scanout buffer
+ * (DMA blit). Cheap no-op when nothing changed or double-buffering is off. */
+void fb_present(void);

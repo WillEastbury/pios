@@ -5551,6 +5551,7 @@ static void bp_active(u32 phase) {
     fb_set_color(BOOT_FG_WHITE, BOOT_BLACK);
     fb_puts("[..]");
     bp_uart_phase(phase, "active");
+    fb_present();
 }
 
 /* Mark a phase as done: show [OK] or [!!] */
@@ -5566,6 +5567,7 @@ static void bp_done(u32 phase, bool ok) {
         fb_puts("[!!]");
     }
     bp_uart_phase(phase, ok ? "ok" : "failed");
+    fb_present();
 }
 
 /* Update PC in register panel (col 65, row 2) — shows caller's address */
@@ -5585,6 +5587,7 @@ static void bp_spin(void) {
     fb_set_color(bp_spin_color, 0x00000000);
     fb_putc(spin[bp_spin_idx & 3]);
     bp_spin_idx++;
+    fb_present();
 }
 
 /* Print uptime prefix: [  0.123] */
@@ -5603,6 +5606,7 @@ static void bp_log(const char *msg) {
     fb_puts(msg);
     bp_log_y++;
     bp_uart_line("[diag] ", msg);
+    fb_present();
 }
 
 /* Green log — success */
@@ -5612,6 +5616,7 @@ static void bp_ok(const char *msg) {
     fb_puts(msg);
     bp_log_y++;
     bp_uart_line("[ok] ", msg);
+    fb_present();
 }
 
 /* Red log — error */
@@ -5621,6 +5626,7 @@ static void bp_err(const char *msg) {
     fb_puts(msg);
     bp_log_y++;
     bp_uart_line("[err] ", msg);
+    fb_present();
 }
 
 /* Yellow log — warning */
@@ -5630,6 +5636,7 @@ static void bp_warn(const char *msg) {
     fb_puts(msg);
     bp_log_y++;
     bp_uart_line("[warn] ", msg);
+    fb_present();
 }
 
 void early_boot_hdmi_mark(u32 code)
@@ -12561,6 +12568,7 @@ NORETURN void core0_main(void) {
         if ((flags & CORE0_IO_DASH) && ui_mode == UI_MODE_NONE)
             ksvc_run(ksvc_dashboard_id);
 
+        fb_present();   /* flush any dirty back-buffer rows to the scanout */
         watchdog_hw_pet();
         env->poll_count++;
     }
@@ -12803,6 +12811,8 @@ void kernel_el2_crash(u64 esr, u64 elr, u64 far, u64 spsr) {
     fb_putc('\n');
     fb_set_color(BOOT_FG_PINK, BOOT_PURPLE);
     fb_puts("System halted. Power cycle to reboot.\n");
+
+    fb_present();   /* force the crash frame to the scanout before halting */
 
     for (;;) __asm__ volatile("wfe");
 }
