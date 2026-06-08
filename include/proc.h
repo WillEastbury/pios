@@ -73,6 +73,7 @@ struct proc_sched_core_snapshot {
 } PACKED;
 
 #define PROC_SOFT_EVENT_IPC_FIFO  1U
+#define PROC_SW_INT_F_BOOST       0x00000001U
 
 #define PROC_IMAGE_FORMAT_NONE     0U
 #define PROC_IMAGE_FORMAT_FLAT     1U
@@ -394,6 +395,7 @@ struct kernel_api {
     i32 (*ipc_shm_open)(const char *name, u32 want_acl);
     i32 (*ipc_shm_map)(i32 region_id, u32 flags, void **addr_out, u32 *size_out);
     i32 (*ipc_shm_unmap)(i32 map_handle);
+    i32 (*sw_int_kernel)(i32 channel_id, u32 event_type, u32 flags);
 
     /* ---- Tensor / GPU compute ---- */
     i32 (*tensor_alloc)(void *t, u32 rows, u32 cols, u32 elem_size);

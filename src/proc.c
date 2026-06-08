@@ -1051,6 +1051,7 @@ static i32   sys_ipc_shm_create(const char *name, u32 peer_principal, u32 owner_
 static i32   sys_ipc_shm_open(const char *name, u32 want_acl);
 static i32   sys_ipc_shm_map(i32 region_id, u32 flags, void **addr_out, u32 *size_out);
 static i32   sys_ipc_shm_unmap(i32 map_handle);
+static i32   sys_sw_int_kernel(i32 channel_id, u32 event_type, u32 flags);
 static i32   sys_tensor_alloc(void *t, u32 rows, u32 cols, u32 elem_size);
 static void  sys_tensor_free(void *t);
 static void  sys_tensor_upload(void *t, const void *data);
@@ -1318,6 +1319,7 @@ static struct kernel_api kernel_api_tab = {
     .ipc_shm_open    = sys_ipc_shm_open,
     .ipc_shm_map     = sys_ipc_shm_map,
     .ipc_shm_unmap   = sys_ipc_shm_unmap,
+    .sw_int_kernel   = sys_sw_int_kernel,
     /* Tensor */
     .tensor_alloc    = sys_tensor_alloc,
     .tensor_free     = sys_tensor_free,
@@ -3877,6 +3879,18 @@ static i32 sys_ipc_shm_unmap(i32 map_handle)
             (void)mmu_user_ipc_shm_window(core_id(), current_proc, false);
     }
     return PROC_IPC_OK;
+}
+
+static i32 sys_sw_int_kernel(i32 channel_id, u32 event_type, u32 flags)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    if ((flags & ~PROC_SW_INT_F_BOOST) != 0) return PROC_IPC_ERR_INVAL;
+    u32 target_pid = ipc_proc_fifo_owner_pid(channel_id);
+    if (target_pid == 0) return PROC_IPC_ERR_NOENT;
+    if (event_type == 0) event_type = PROC_SOFT_EVENT_IPC_FIFO;
+    return proc_soft_event(target_pid, event_type,
+                           (flags & PROC_SW_INT_F_BOOST) != 0) ?
+           PROC_IPC_OK : PROC_IPC_ERR_NOENT;
 }
 
 /* ---- Tensor / GPU compute ---- */

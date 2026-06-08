@@ -151,6 +151,21 @@ Fence semantics:
 - FIFO dequeue: metadata observe (`dmb()`) → payload read → `dmb()` → head/count advance.
 - SHM map/unmap paths use `dmb()` so handle publication/release is ordered with shared-memory visibility.
 
+### Zero-copy span descriptors + software wake
+
+For subsystem and driver paths that already place data in a shared arena, a FIFO can carry a small `proc_ipc_span_desc` instead of copying the payload:
+
+```c
+struct proc_ipc_span_desc {
+    u64 addr;   // span address in process slot or shared IPC/DMA arena
+    u32 len;    // bytes available at addr
+    u32 flags;  // PROC_IPC_SPAN_F_*
+    u64 tag;    // caller correlation id
+};
+```
+
+`ipc_fifo_send_span()` enqueues the descriptor and raises a kernel-owned software event for the FIFO owner. For lower-level flows, the producer may enqueue a descriptor and then call `sw_int_kernel(channel_id, event_type, PROC_SW_INT_F_BOOST)` explicitly. The scheduler treats this as a wake/boost hint for a sleeping/runnable owner process, not as a syscall-style transition.
+
 Current scope and MMU integration:
 
 - SHM regions come from a bounded kernel-managed 1MB pool at `IPC_SHM_BASE` (`0x04D00000`).
