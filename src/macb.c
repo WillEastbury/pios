@@ -859,6 +859,24 @@ bool macb_recv(u8 *frame, u32 *len) {
     return true;
 }
 
+void macb_irq_snapshot(struct macb_irq_snapshot *out, bool read_clear_isr)
+{
+    if (!out)
+        return;
+    out->imr = mr(IMR);
+    out->rsr = mr(RSR);
+    out->tsr = mr(TSR);
+    out->ncr = mr(NCR);
+    out->isr_clear = read_clear_isr ? mr(ISR) : 0;
+}
+
+void macb_irq_enable_rx(void)
+{
+    mw(RSR, 0xFFFFFFFFU);
+    (void)mr(ISR);
+    mw(IER, INT_RCOMP);
+}
+
 /* Snapshot of full MAC state for stall diagnosis (host-side polling). */
 void macb_dump_full_state(const char *tag) {
     uart_puts("[mac] ");

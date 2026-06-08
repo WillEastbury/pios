@@ -21,6 +21,7 @@
 #include "fifo.h"
 #include "sd.h"
 #include "nic.h"
+#include "macb.h"
 #include "net.h"
 #include "arp.h"
 #include "tcp.h"
@@ -289,6 +290,9 @@ static bool debug_tcp_unlocked;
 static char debug_tcp_line[DEBUG_TCP_LINE_MAX];
 static u32 debug_tcp_len;
 static u32 debug_tcp_iac_skip;
+static volatile u64 core0_eth_irq_count;
+static volatile u32 core0_eth_irq_last_mip;
+static volatile u32 core0_eth_irq_last_macb_isr;
 
 static bool ui_streq(const char *a, const char *b);
 static const char *ui_proc_state_str(u32 s);
@@ -307,6 +311,7 @@ static void pios_bootctrl_mark_success(void);
 static void core0_sched_snapshot(u64 *wake, u64 *wfi_count, u64 *idle_ticks,
                                  u64 *total_ticks, u32 *busy_permille,
                                  u32 *last_flags);
+static void core0_eth_irq_handler(void);
 static const char *tcp_state_name(u32 state);
 static const char *tcp_owner_label(u16 port);
 static bool http_request_complete(const u8 *req, u32 len);
@@ -1077,6 +1082,59 @@ static bool http_parse_u32(const char *s, u32 *out)
     }
     *out = v;
     return true;
+}
+
+static bool http_parse_u64(const char *s, u64 *out)
+{
+    if (!s || !*s || !out) return false;
+    u32 base = 10;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        base = 16;
+        s += 2;
+        if (!*s) return false;
+    }
+    u64 v = 0;
+    while (*s) {
+        u32 d;
+        char c = *s++;
+        if (c >= '0' && c <= '9') d = (u32)(c - '0');
+        else if (base == 16 && c >= 'a' && c <= 'f') d = (u32)(c - 'a' + 10);
+        else if (base == 16 && c >= 'A' && c <= 'F') d = (u32)(c - 'A' + 10);
+        else return false;
+        if (d >= base) return false;
+        v = v * (u64)base + (u64)d;
+    }
+    *out = v;
+    return true;
+}
+
+static bool http_mem_width(const char *s, u32 *out)
+{
+    u32 w = 0;
+    if (!http_parse_u32(s, &w))
+        return false;
+    if (w != 1 && w != 2 && w != 4 && w != 8)
+        return false;
+    *out = w;
+    return true;
+}
+
+static u64 http_mem_read(u64 addr, u32 width)
+{
+    if (width == 1) return *(volatile u8 *)(usize)addr;
+    if (width == 2) return *(volatile u16 *)(usize)addr;
+    if (width == 8) return *(volatile u64 *)(usize)addr;
+    return *(volatile u32 *)(usize)addr;
+}
+
+static void http_mem_write(u64 addr, u64 value, u32 width)
+{
+    if (width == 1) *(volatile u8 *)(usize)addr = (u8)value;
+    else if (width == 2) *(volatile u16 *)(usize)addr = (u16)value;
+    else if (width == 8) *(volatile u64 *)(usize)addr = value;
+    else *(volatile u32 *)(usize)addr = (u32)value;
+    dsb();
+    isb();
 }
 
 static void http_append_json_string(char *out, u32 *len, u32 max, const char *s)
@@ -1916,6 +1974,53 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "ACME clear OK\n");
     } else if (http_streq(cmd, "acme selftest")) {
         http_append(out, &len, max, acme_selftest() ? "ACME selftest OK\n" : "ACME selftest FAILED\n");
+    } else if (http_streq(cmd, "peek") || http_starts_with(cmd, "peek ")) {
+        char *argv[4];
+        u32 argc = http_split_args(cmd, argv, 4);
+        u64 addr = 0;
+        u32 width = 4;
+        if (argc < 2 || !http_parse_u64(argv[1], &addr) ||
+            (argc >= 3 && !http_mem_width(argv[2], &width))) {
+            http_append(out, &len, max, "ERR: usage peek <addr> [1|2|4|8]\n");
+        } else {
+            u64 v = http_mem_read(addr, width);
+            http_append(out, &len, max, "0x");
+            http_append_hex64(out, &len, max, addr);
+            http_append(out, &len, max, " = 0x");
+            if (width == 8) http_append_hex64(out, &len, max, v);
+            else if (width == 4) http_append_hex32(out, &len, max, (u32)v);
+            else if (width == 2) {
+                http_append_hex8(out, &len, max, (u8)(v >> 8));
+                http_append_hex8(out, &len, max, (u8)v);
+            } else {
+                http_append_hex8(out, &len, max, (u8)v);
+            }
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "poke") || http_starts_with(cmd, "poke ")) {
+        char *argv[5];
+        u32 argc = http_split_args(cmd, argv, 5);
+        u64 addr = 0, value = 0;
+        u32 width = 4;
+        if (argc < 3 || !http_parse_u64(argv[1], &addr) ||
+            !http_parse_u64(argv[2], &value) ||
+            (argc >= 4 && !http_mem_width(argv[3], &width))) {
+            http_append(out, &len, max, "ERR: usage poke <addr> <value> [1|2|4|8]\n");
+        } else {
+            http_mem_write(addr, value, width);
+            http_append(out, &len, max, "OK: 0x");
+            http_append_hex64(out, &len, max, addr);
+            http_append(out, &len, max, " <= 0x");
+            if (width == 8) http_append_hex64(out, &len, max, value);
+            else if (width == 4) http_append_hex32(out, &len, max, (u32)value);
+            else if (width == 2) {
+                http_append_hex8(out, &len, max, (u8)(value >> 8));
+                http_append_hex8(out, &len, max, (u8)value);
+            } else {
+                http_append_hex8(out, &len, max, (u8)value);
+            }
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "sched") || http_streq(cmd, "sched status")) {
         u64 wake = 0, wfi_count = 0, idle_ticks = 0, total_ticks = 0;
         u32 busy_permille = 0, last_flags = 0;
@@ -1970,6 +2075,148 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, cs[i].stage);
             http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "rp1 irq") || http_streq(cmd, "rp1 irq clear") ||
+               http_streq(cmd, "rp1 irq arm-eth") || http_streq(cmd, "rp1 irq raise-eth") ||
+               http_streq(cmd, "rp1 irq pend-gic")) {
+        if (http_streq(cmd, "rp1 irq arm-eth")) {
+            __asm__ volatile("msr daifset, #2" ::: "memory");
+            irq_register(GIC_RP1_ETH_MSI, core0_eth_irq_handler);
+            gic_set_group1(GIC_RP1_ETH_MSI);
+            gic_set_priority(GIC_RP1_ETH_MSI, 0x40);
+            gic_set_target(GIC_RP1_ETH_MSI, 1);
+            gic_enable_irq(GIC_RP1_ETH_MSI);
+            rp1_eth_irq_arm();
+            macb_irq_enable_rx();
+            dsb();
+            isb();
+            __asm__ volatile("msr daifclr, #2" ::: "memory");
+            http_append(out, &len, max, "rp1 eth irq armed\n");
+        } else if (http_streq(cmd, "rp1 irq raise-eth")) {
+            rp1_eth_irq_raise_test();
+            http_append(out, &len, max, "rp1 eth mip raise sent\n");
+        } else if (http_streq(cmd, "rp1 irq pend-gic")) {
+            u64 before = core0_eth_irq_count;
+            __asm__ volatile("msr daifset, #2" ::: "memory");
+            irq_register(GIC_RP1_ETH_MSI, core0_eth_irq_handler);
+            gic_set_group1(GIC_RP1_ETH_MSI);
+            gic_set_priority(GIC_RP1_ETH_MSI, 0x40);
+            gic_set_target(GIC_RP1_ETH_MSI, 1);
+            gic_enable_irq(GIC_RP1_ETH_MSI);
+            dsb();
+            isb();
+            mmio_write(gic_runtime_gicd_base() + 0x200U + ((GIC_RP1_ETH_MSI / 32U) * 4U),
+                       1U << (GIC_RP1_ETH_MSI % 32U));
+            dsb();
+            isb();
+            __asm__ volatile("msr daifclr, #2" ::: "memory");
+            for (u32 spin = 0; spin < 100000U && core0_eth_irq_count == before; spin++)
+                __asm__ volatile("yield");
+            http_append(out, &len, max, "rp1 eth gic pend before=");
+            http_append_u64(out, &len, max, before);
+            http_append(out, &len, max, " after=");
+            http_append_u64(out, &len, max, core0_eth_irq_count);
+            http_append(out, &len, max, "\n");
+        }
+        struct rp1_irq_snapshot r;
+        struct macb_irq_snapshot m;
+        bool clear = http_streq(cmd, "rp1 irq clear");
+        rp1_irq_snapshot(&r);
+        macb_irq_snapshot(&m, clear);
+        http_append(out, &len, max, "rp1 irq eth=6 intstat_l=");
+        http_append_hex32(out, &len, max, r.intstat_l);
+        http_append(out, &len, max, " intstat_h=");
+        http_append_hex32(out, &len, max, r.intstat_h);
+        http_append(out, &len, max, " mip_status_l=");
+        http_append_hex32(out, &len, max, r.mip_status_l);
+        http_append(out, &len, max, " mip_mask_l=");
+        http_append_hex32(out, &len, max, r.mip_mask_l);
+        http_append(out, &len, max, " eth_msix_cfg=");
+        http_append_hex32(out, &len, max, r.eth_msix_cfg);
+        http_append(out, &len, max, " count=");
+        http_append_u64(out, &len, max, core0_eth_irq_count);
+        http_append(out, &len, max, " last_mip=");
+        http_append_hex32(out, &len, max, core0_eth_irq_last_mip);
+        http_append(out, &len, max, " last_isr=");
+        http_append_hex32(out, &len, max, core0_eth_irq_last_macb_isr);
+        http_append(out, &len, max, "\neth_vec addr=");
+        http_append_hex32(out, &len, max, r.eth_msix_addr_hi);
+        http_append(out, &len, max, ":");
+        http_append_hex32(out, &len, max, r.eth_msix_addr_lo);
+        http_append(out, &len, max, " data=");
+        http_append_hex32(out, &len, max, r.eth_msix_data);
+        http_append(out, &len, max, " vctrl=");
+        http_append_hex32(out, &len, max, r.eth_msix_vector_ctrl);
+        http_append(out, &len, max, " pba=");
+        http_append_hex32(out, &len, max, r.eth_msix_pba);
+        http_append(out, &len, max, "\nmacb imr=");
+        http_append_hex32(out, &len, max, m.imr);
+        http_append(out, &len, max, " rsr=");
+        http_append_hex32(out, &len, max, m.rsr);
+        http_append(out, &len, max, " tsr=");
+        http_append_hex32(out, &len, max, m.tsr);
+        http_append(out, &len, max, " ncr=");
+        http_append_hex32(out, &len, max, m.ncr);
+        http_append(out, &len, max, " isr");
+        http_append(out, &len, max, clear ? "_clear=" : "_clear=skipped");
+        if (clear)
+            http_append_hex32(out, &len, max, m.isr_clear);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "rp1 pci")) {
+        u32 id = pcie_cfg_read(1, 0, 0, 0x00);
+        u32 cmdstat = pcie_cfg_read(1, 0, 0, 0x04);
+        u32 bar0 = pcie_cfg_read(1, 0, 0, 0x10);
+        u32 bar1 = pcie_cfg_read(1, 0, 0, 0x14);
+        u32 cap = pcie_cfg_read(1, 0, 0, 0x34) & 0xFFU;
+        http_append(out, &len, max, "rp1 pci id=");
+        http_append_hex32(out, &len, max, id);
+        http_append(out, &len, max, " cmdstat=");
+        http_append_hex32(out, &len, max, cmdstat);
+        http_append(out, &len, max, " bar0=");
+        http_append_hex32(out, &len, max, bar0);
+        http_append(out, &len, max, " bar1=");
+        http_append_hex32(out, &len, max, bar1);
+        http_append(out, &len, max, " cap=");
+        http_append_hex32(out, &len, max, cap);
+        http_append(out, &len, max, "\nCAP OFF ID NEXT RAW0 RAW4 RAW8\n");
+        for (u32 i = 0; i < 16 && cap >= 0x40 && cap < 0x100; i++) {
+            u32 raw0 = pcie_cfg_read(1, 0, 0, cap);
+            u32 raw4 = pcie_cfg_read(1, 0, 0, cap + 4);
+            u32 raw8 = pcie_cfg_read(1, 0, 0, cap + 8);
+            u32 cid = raw0 & 0xFFU;
+            u32 next = (raw0 >> 8) & 0xFFU;
+            http_append_hex32(out, &len, max, cap);
+            http_append(out, &len, max, " ");
+            http_append_hex32(out, &len, max, cid);
+            http_append(out, &len, max, " ");
+            http_append_hex32(out, &len, max, next);
+            http_append(out, &len, max, " ");
+            http_append_hex32(out, &len, max, raw0);
+            http_append(out, &len, max, " ");
+            http_append_hex32(out, &len, max, raw4);
+            http_append(out, &len, max, " ");
+            http_append_hex32(out, &len, max, raw8);
+            if (cid == 0x11U) {
+                u32 msgctl = (raw0 >> 16) & 0xFFFFU;
+                u32 bir = raw4 & 7U;
+                u32 table = raw4 & ~7U;
+                u32 pba_bir = raw8 & 7U;
+                u32 pba = raw8 & ~7U;
+                http_append(out, &len, max, " msix_ctl=");
+                http_append_hex32(out, &len, max, msgctl);
+                http_append(out, &len, max, " table_bir=");
+                http_append_u64(out, &len, max, bir);
+                http_append(out, &len, max, " table_off=");
+                http_append_hex32(out, &len, max, table);
+                http_append(out, &len, max, " pba_bir=");
+                http_append_u64(out, &len, max, pba_bir);
+                http_append(out, &len, max, " pba_off=");
+                http_append_hex32(out, &len, max, pba);
+            }
+            http_append(out, &len, max, "\n");
+            if (next == 0 || next == cap)
+                break;
+            cap = next;
         }
     } else if (http_streq(cmd, "ksvc") || http_streq(cmd, "ksvc status")) {
         struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
@@ -11922,6 +12169,17 @@ static void core0_io_tick_hook(u32 core, u64 tick)
         core0_io_flags |= flags;
         sev();
     }
+}
+
+static void core0_eth_irq_handler(void)
+{
+    struct macb_irq_snapshot m;
+    core0_eth_irq_last_mip = rp1_eth_irq_ack();
+    macb_irq_snapshot(&m, true);
+    core0_eth_irq_last_macb_isr = m.isr_clear;
+    core0_eth_irq_count++;
+    core0_io_flags |= CORE0_IO_NET | CORE0_IO_TCP;
+    sev();
 }
 
 static u32 core0_io_take_flags(void)

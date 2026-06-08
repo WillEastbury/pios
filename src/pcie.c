@@ -35,7 +35,7 @@
 #define MISC_CPU_2_PCIE_WIN0_LH     0x4084  /* limit upper bits */
 #define MISC_UBUS_CTRL              0x40A4
 #define MISC_UBUS_TIMEOUT           0x40A8
-#define MISC_RC_CFG_RETRY_TIMEOUT   0x40AC
+#define MISC_RC_CFG_RETRY_TIMEOUT   0x405C
 #define MISC_AXI_READ_ERROR_DATA    0x4170
 #define HARD_DEBUG                  0x4304
 
@@ -43,8 +43,13 @@
 #define MISC_RC_BAR2_CONFIG_LO      0x4034
 #define MISC_RC_BAR2_CONFIG_HI      0x4038
 #define MISC_RC_BAR3_CONFIG_LO      0x403C
+#define MISC_RC_BAR3_CONFIG_HI      0x4040
+#define MISC_UBUS_BAR1_CONFIG_REMAP    0x40AC
+#define MISC_UBUS_BAR1_CONFIG_REMAP_HI 0x40B0
 #define MISC_UBUS_BAR2_CONFIG_REMAP    0x40B4
-#define MISC_UBUS_BAR2_CONFIG_REMAP_HI 0x40B0
+#define MISC_UBUS_BAR2_CONFIG_REMAP_HI 0x40B8
+#define MISC_UBUS_BAR3_CONFIG_REMAP    0x40BC
+#define MISC_UBUS_BAR3_CONFIG_REMAP_HI 0x40C0
 
 /* Vendor-specific config: BAR2 endian mode */
 #define RC_CFG_VENDOR_SPECIFIC_REG1 0x0188
@@ -250,7 +255,15 @@ bool pcie_init(void) {
     pw(MISC_MISC_CTRL, tmp);
     dmb();
 
-    /* 5. BAR2 inbound: 64GB at PCIe 0x10 → CPU 0x00 */
+    /* 5a. BAR1 inbound: 4MiB at PCIe 0x00 -> CPU RP1 aperture
+     * 0x1f_00000000. This mirrors the first pcie2 dma-range in Linux. */
+    pw(0x402C, 0x00000007U);  /* size encoding 7 => 4MiB, offset=0 */
+    pw(0x4030, 0x00000000U);
+    pw(MISC_UBUS_BAR1_CONFIG_REMAP, 0x00000001U);
+    pw(MISC_UBUS_BAR1_CONFIG_REMAP_HI, 0x0000001FU);
+    dmb();
+
+    /* 5b. BAR2 inbound: 64GB at PCIe 0x10 -> CPU 0x00 */
     pw(MISC_RC_BAR2_CONFIG_LO, 0x15);  /* size=21, offset_lo=0 */
     pw(MISC_RC_BAR2_CONFIG_HI, 0x10);
     dmb();
@@ -260,6 +273,17 @@ bool pcie_init(void) {
     tmp |= 1;  /* ACCESS_ENABLE */
     pw(MISC_UBUS_BAR2_CONFIG_REMAP, tmp);
     pw(MISC_UBUS_BAR2_CONFIG_REMAP_HI, 0x00);
+    dmb();
+
+    /* 6b. BAR3 inbound: 4KB at PCIe 0xff_ffff_f000 -> CPU MIP0
+     * 0x10_00130000. This is required for RP1 MSI-X writes to reach the
+     * BCM2712 MIP0 MSI controller. Linux describes this as the pcie2
+     * dma-range `<0x03000000 0xff 0xfffff000 0x10 0x00130000 ...>`.
+     * BAR size encoding 0x1c means 4KB. */
+    pw(MISC_RC_BAR3_CONFIG_LO, 0xFFFFF01CU);
+    pw(MISC_RC_BAR3_CONFIG_HI, 0x000000FFU);
+    pw(MISC_UBUS_BAR3_CONFIG_REMAP, 0x00130001U);     /* low + access enable */
+    pw(MISC_UBUS_BAR3_CONFIG_REMAP_HI, 0x00000010U);
     dmb();
 
     /* 7. SCB0_SIZE = 21 */
@@ -277,9 +301,7 @@ bool pcie_init(void) {
     pw(MISC_UBUS_TIMEOUT, 0x0B2D0000);
     pw(MISC_RC_CFG_RETRY_TIMEOUT, 0x0ABA0000);
 
-    /* 9. Disable BAR1, BAR3 */
-    pw(0x402C, 0);
-    pw(MISC_RC_BAR3_CONFIG_LO, 0);
+    /* 9. BAR1/BAR2/BAR3 are the pcie2 inbound DMA/MSI windows. */
 
     /* 10. Class code */
     tmp = pr(RC_CFG_PRIV1_ID_VAL3);

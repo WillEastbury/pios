@@ -120,6 +120,13 @@ void gic_set_priority(u32 intid, u8 priority) {
     mmio_write(gicd_reg(0x400 + reg * 4), val);
 }
 
+void gic_set_group1(u32 intid) {
+    if (intid >= 1020) return;
+    u32 reg = intid / 32;
+    u32 bit = intid % 32;
+    mmio_write(gicd_reg(0x080 + reg * 4), 1U << bit);
+}
+
 void gic_set_target(u32 intid, u8 cpu_mask) {
     if (intid >= 1020) return;
     u32 reg = intid / 4;

@@ -27,6 +27,7 @@
 /* PCI config space offsets (Type 0 header) */
 #define PCICFG_ID           0x00    /* Vendor/Device ID */
 #define PCICFG_CMD          0x04    /* Command/Status */
+#define PCICFG_BAR0         0x10    /* BAR0: RP1 MSI-X table/PBA window */
 #define PCICFG_BAR1         0x14    /* BAR1: RP1 peripheral register window */
 
 /* PCI command bits */
@@ -37,6 +38,32 @@
 #define SYSINFO_CHIP_ID     0x00
 #define SYSINFO_PLATFORM    0x04
 
+#define RP1_REG_SET         0x800
+#define RP1_REG_CLR         0xC00
+#define RP1_MSIX_CFG(n)     (0x8 + (4U * (n)))
+#define RP1_MSIX_CFG_ENABLE (1U << 0)
+#define RP1_MSIX_CFG_IACK   (1U << 2)
+#define RP1_MSIX_CFG_IACK_EN (1U << 3)
+#define RP1_INTSTATL        0x108
+#define RP1_INTSTATH        0x10C
+
+#define BCM2712_MIP0_BASE       0x1000130000UL
+#define MIP_INT_RAISE           0x00
+#define MIP_INT_CLEAR           0x10
+#define MIP_INT_CFGL_HOST       0x20
+#define MIP_INT_CFGH_HOST       0x30
+#define MIP_INT_MASKL_HOST      0x40
+#define MIP_INT_MASKH_HOST      0x50
+#define MIP_INT_MASKL_VPU       0x60
+#define MIP_INT_MASKH_VPU       0x70
+#define MIP_INT_STATUSL_HOST    0x80
+
+/* Keep BAR1 at PCIE_TARGET_ADDR for the RP1 peripheral aperture. Map BAR0
+ * near the end of the existing 8MB outbound window for the MSI-X table/PBA
+ * (MSI-X capability reports table BIR0 offset 0, PBA offset 0x2000). */
+#define RP1_MSIX_TARGET_ADDR    (PCIE_TARGET_ADDR + 0x00700000U)
+#define RP1_MSIX_CPU_BASE       (RP1_BAR_BASE + 0x00700000UL)
+
 /* ---- Public API ---- */
 
 u32 rp1_read32(u64 offset) {
@@ -45,6 +72,74 @@ u32 rp1_read32(u64 offset) {
 
 void rp1_write32(u64 offset, u32 val) {
     mmio_write(RP1_BAR_BASE + offset, val);
+}
+
+void rp1_irq_snapshot(struct rp1_irq_snapshot *out)
+{
+    if (!out)
+        return;
+    out->intstat_l = rp1_read32(RP1_PCIE_APBS + RP1_INTSTATL);
+    out->intstat_h = rp1_read32(RP1_PCIE_APBS + RP1_INTSTATH);
+    out->mip_status_l = mmio_read(BCM2712_MIP0_BASE + MIP_INT_STATUSL_HOST);
+    out->mip_mask_l = mmio_read(BCM2712_MIP0_BASE + MIP_INT_MASKL_HOST);
+    out->eth_msix_cfg = rp1_read32(RP1_PCIE_APBS + RP1_MSIX_CFG(RP1_INT_ETH));
+    u64 eth_vec = RP1_MSIX_CPU_BASE + (RP1_INT_ETH * 16U);
+    out->eth_msix_addr_lo = mmio_read(eth_vec + 0x0);
+    out->eth_msix_addr_hi = mmio_read(eth_vec + 0x4);
+    out->eth_msix_data = mmio_read(eth_vec + 0x8);
+    out->eth_msix_vector_ctrl = mmio_read(eth_vec + 0xC);
+    out->eth_msix_pba = mmio_read(RP1_MSIX_CPU_BASE + 0x2000U + ((RP1_INT_ETH / 32U) * 4U));
+}
+
+void rp1_eth_irq_arm(void)
+{
+    const u32 eth_bit = 1U << RP1_INT_ETH;
+    const u64 mip_msg = 0x000000FFFFFFF000ULL;
+    u64 eth_vec = RP1_MSIX_CPU_BASE + (RP1_INT_ETH * 16U);
+    u32 msix_cap = pcie_cfg_read(RP1_BUS, RP1_DEV, RP1_FN, 0xB0);
+
+    /* MIP0 routes MSI data N to GIC SPI 128+N. Unmask host delivery,
+     * mask VPU delivery, set edge-triggered host config, and clear stale
+     * ETH vector state before unmasking the endpoint. */
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKL_HOST, 0);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKH_HOST, 0);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKL_VPU, 0xFFFFFFFFU);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKH_VPU, 0xFFFFFFFFU);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_CFGL_HOST, 0xFFFFFFFFU);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_CFGH_HOST, 0xFFFFFFFFU);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
+
+    /* Program RP1 MSI-X vector 6 (ETH): address = MIP0 message window,
+     * data = vector number. Clear vector mask. */
+    mmio_write(eth_vec + 0x0, (u32)mip_msg);
+    mmio_write(eth_vec + 0x4, (u32)(mip_msg >> 32));
+    mmio_write(eth_vec + 0x8, RP1_INT_ETH);
+    mmio_write(eth_vec + 0xC, 0);
+
+    /* Enable MSI-X globally in RP1's PCI capability (cap 0xB0, control
+     * bits in upper halfword). Table size is already advertised there. */
+    pcie_cfg_write(RP1_BUS, RP1_DEV, RP1_FN, 0xB0, msix_cap | (1U << 31));
+
+    /* RP1 wrapper: enable the ETH MSI-X source and IACK for level source. */
+    rp1_write32(RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(RP1_INT_ETH),
+                RP1_MSIX_CFG_ENABLE | RP1_MSIX_CFG_IACK_EN);
+}
+
+u32 rp1_eth_irq_ack(void)
+{
+    const u32 eth_bit = 1U << RP1_INT_ETH;
+    u32 st = mmio_read(BCM2712_MIP0_BASE + MIP_INT_STATUSL_HOST);
+    if (st & eth_bit) {
+        mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
+        rp1_write32(RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(RP1_INT_ETH),
+                    RP1_MSIX_CFG_IACK);
+    }
+    return st;
+}
+
+void rp1_eth_irq_raise_test(void)
+{
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_RAISE, 1U << RP1_INT_ETH);
 }
 
 bool rp1_init(void) {
@@ -69,10 +164,13 @@ bool rp1_init(void) {
     }
 
     /*
-     * Program BAR1 to the PCIe target address.
+     * Program BAR0/BAR1 to PCIe target addresses in our outbound window.
+     * BAR0 hosts the MSI-X table/PBA. BAR1 hosts RP1 peripheral registers.
      * The outbound ATU maps CPU RP1_BAR_BASE → PCIe PCIE_TARGET_ADDR,
      * so BAR1 must be at PCIE_TARGET_ADDR for the addresses to line up.
      */
+    pcie_cfg_write(RP1_BUS, RP1_DEV, RP1_FN, PCICFG_BAR0,
+                   (u32)RP1_MSIX_TARGET_ADDR);
     pcie_cfg_write(RP1_BUS, RP1_DEV, RP1_FN, PCICFG_BAR1,
                    (u32)PCIE_TARGET_ADDR);
     dmb();

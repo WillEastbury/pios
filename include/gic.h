@@ -34,6 +34,7 @@
 #define GIC_INTID_SPURIOUS  1023
 #define GIC_TIMER_NS_PHYS   30      /* Non-secure physical timer PPI */
 #define GIC_TIMER_VIRT      27      /* Virtual timer PPI */
+#define GIC_RP1_ETH_MSI     166     /* GIC_SPI 128 => INTID 160, plus RP1_INT_ETH(6) */
 
 /* Max interrupts */
 #define GIC_MAX_IRQ         256
@@ -48,5 +49,6 @@ void gic_enable_irq(u32 intid);
 void gic_disable_irq(u32 intid);
 void gic_set_priority(u32 intid, u8 priority);
 void gic_set_target(u32 intid, u8 cpu_mask);
+void gic_set_group1(u32 intid);
 u32  gic_acknowledge(void);
 void gic_end_of_interrupt(u32 intid);
