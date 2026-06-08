@@ -255,12 +255,13 @@ bool pcie_init(void) {
     pw(MISC_MISC_CTRL, tmp);
     dmb();
 
-    /* 5a. BAR1 inbound: 4MiB at PCIe 0x00 -> CPU RP1 aperture
-     * 0x1f_00000000. This mirrors the first pcie2 dma-range in Linux. */
-    pw(0x402C, 0x00000007U);  /* size encoding 7 => 4MiB, offset=0 */
-    pw(0x4030, 0x00000000U);
-    pw(MISC_UBUS_BAR1_CONFIG_REMAP, 0x00000001U);
-    pw(MISC_UBUS_BAR1_CONFIG_REMAP_HI, 0x0000001FU);
+    /* 5a. BAR1 inbound: 4KB at PCIe 0xff_ffff_f000 -> CPU MIP0
+     * 0x10_00130000. Circle uses RC_BAR1 for this MIP access path, and
+     * Linux describes the same pcie2 dma-range for the MIP0 message page. */
+    pw(0x402C, 0xFFFFF01CU);  /* size encoding 0x1c => 4KB */
+    pw(0x4030, 0x000000FFU);
+    pw(MISC_UBUS_BAR1_CONFIG_REMAP, 0x00130001U);
+    pw(MISC_UBUS_BAR1_CONFIG_REMAP_HI, 0x00000010U);
     dmb();
 
     /* 5b. BAR2 inbound: 64GB at PCIe 0x10 -> CPU 0x00 */
@@ -275,15 +276,11 @@ bool pcie_init(void) {
     pw(MISC_UBUS_BAR2_CONFIG_REMAP_HI, 0x00);
     dmb();
 
-    /* 6b. BAR3 inbound: 4KB at PCIe 0xff_ffff_f000 -> CPU MIP0
-     * 0x10_00130000. This is required for RP1 MSI-X writes to reach the
-     * BCM2712 MIP0 MSI controller. Linux describes this as the pcie2
-     * dma-range `<0x03000000 0xff 0xfffff000 0x10 0x00130000 ...>`.
-     * BAR size encoding 0x1c means 4KB. */
-    pw(MISC_RC_BAR3_CONFIG_LO, 0xFFFFF01CU);
-    pw(MISC_RC_BAR3_CONFIG_HI, 0x000000FFU);
-    pw(MISC_UBUS_BAR3_CONFIG_REMAP, 0x00130001U);     /* low + access enable */
-    pw(MISC_UBUS_BAR3_CONFIG_REMAP_HI, 0x00000010U);
+    /* 6b. BAR3 disabled; BAR1 is the MIP0 MSI inbound window. */
+    pw(MISC_RC_BAR3_CONFIG_LO, 0);
+    pw(MISC_RC_BAR3_CONFIG_HI, 0);
+    pw(MISC_UBUS_BAR3_CONFIG_REMAP, 0);
+    pw(MISC_UBUS_BAR3_CONFIG_REMAP_HI, 0);
     dmb();
 
     /* 7. SCB0_SIZE = 21 */
