@@ -29,6 +29,12 @@ There are no tests or linters. Verification is: **it compiles with zero errors a
 
 This is a **bare-metal OS** for the Raspberry Pi 5 (BCM2712 / Cortex-A76). No Linux, no libc, no POSIX. Every line runs directly on hardware.
 
+### Hardware Debugging Strategy
+
+PIOS hardware bring-up is expected to fail iteratively before it works. Do not stop at the first wedge, timeout, or interrupt storm. Use the automatic reboot path, A/B rollback, remote diagnostics, remote console, remote debugger node, and serial console to keep narrowing the root cause with fail-closed probes.
+
+For risky hardware paths, prefer guarded harness commands over boot-time enablement: bound interrupt counts/rates, auto-disable lines before storms, snapshot pre/post MMIO state in one response, and leave the live board on a health-stable image before committing. Treat every failed probe as data for the next narrower probe.
+
 ### Core Assignment (fixed, not scheduled)
 
 | Core | Role | Hot loop | Source |
