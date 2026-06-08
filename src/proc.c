@@ -1067,6 +1067,7 @@ static i32   sys_tensor_bind_kernel_blob(u32 kernel_id, const void *uniform_data
                                          const u64 *shader_code, u32 shader_insts);
 static void  proc_tick_hook(u32 core, u64 tick);
 static void  proc_preempt_trampoline(void);
+static void  proc_handle_bench_echo(void);
 
 #define APPF_EVENT_RING_SIZE    64U
 #define APPF_LOG_RING_SIZE      64U
@@ -1372,6 +1373,20 @@ static void proc_preempt_trampoline(void)
     proc_yield();
 }
 
+static void proc_handle_bench_echo(void)
+{
+    if (!on_user_core())
+        return;
+    struct fifo_msg msg;
+    while (fifo_peek(core_id(), CORE_NET, &msg) && msg.type == MSG_BENCH_ECHO) {
+        if (!fifo_pop(core_id(), CORE_NET, &msg))
+            break;
+        msg.type = MSG_ACK;
+        msg.status = 0;
+        fifo_push(core_id(), CORE_NET, &msg);
+    }
+}
+
 void proc_init(void)
 {
     u32 uc = on_user_core() ? user_core_slot() : 0;
@@ -1663,6 +1678,7 @@ void proc_schedule(void)
     for (;;) {
         watchdog_touch(core_id());
         workq_drain(8);
+        proc_handle_bench_echo();
         proc_handle_launch_request();
         bool found = false;
         for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
@@ -1913,12 +1929,16 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
 bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
 {
     static u64 bench_payload ALIGNED(64);
+    static u8 copy_src[2048] ALIGNED(64);
+    static u8 copy_dst[2048] ALIGNED(64);
     static const char name[] = "bench.span";
+    static const char copy_name[] = "bench.copy";
     struct proc_ipc_span_desc desc;
     struct proc_ipc_span_desc recv_desc;
     struct irq_frame frame;
     u32 len = 0;
     i32 h;
+    i32 hc;
     u32 errors = 0;
     u64 t0, t1;
 
@@ -1945,9 +1965,24 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         out->svc_ticks = 0;
         out->span_ticks = 0;
         out->span_fast_ticks = 0;
+        out->copy64_ticks = 0;
+        out->copy512_ticks = 0;
+        out->memcpy2048_ticks = 0;
+        out->span2048_ticks = 0;
+        out->cross_fifo_ticks = 0;
         out->sev_ticks = 0;
         return false;
     }
+
+    hc = ipc_proc_fifo_create(PRINCIPAL_ROOT, 1, copy_name, PROC_IPC_PEER_ANY,
+                              PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV,
+                              PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV,
+                              PROC_IPC_FIFO_DEPTH_MAX, 512);
+    if (hc == PROC_IPC_ERR_EXISTS)
+        hc = ipc_proc_fifo_open(PRINCIPAL_ROOT, 1, copy_name,
+                                PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV);
+    if (hc < 0)
+        errors++;
 
     while (ipc_proc_fifo_recv(PRINCIPAL_ROOT, h, &recv_desc, sizeof(recv_desc), &len) == PROC_IPC_OK)
         ;
@@ -1991,6 +2026,84 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
     }
     t1 = proc_sched_counter_ticks();
     out->span_fast_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+    for (u32 i = 0; i < sizeof(copy_src); i++) {
+        copy_src[i] = (u8)(i ^ (i >> 3) ^ 0x5AU);
+        copy_dst[i] = 0;
+    }
+
+    if (hc >= 0) {
+        while (ipc_proc_fifo_recv(PRINCIPAL_ROOT, hc, copy_dst, sizeof(copy_dst), &len) == PROC_IPC_OK)
+            ;
+        t0 = proc_sched_counter_ticks();
+        for (u32 i = 0; i < iterations; i++) {
+            if (ipc_proc_fifo_send(PRINCIPAL_ROOT, hc, copy_src, 64) != PROC_IPC_OK ||
+                ipc_proc_fifo_recv(PRINCIPAL_ROOT, hc, copy_dst, 64, &len) != PROC_IPC_OK ||
+                len != 64)
+                errors++;
+        }
+        t1 = proc_sched_counter_ticks();
+        out->copy64_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+        t0 = proc_sched_counter_ticks();
+        for (u32 i = 0; i < iterations; i++) {
+            if (ipc_proc_fifo_send(PRINCIPAL_ROOT, hc, copy_src, 512) != PROC_IPC_OK ||
+                ipc_proc_fifo_recv(PRINCIPAL_ROOT, hc, copy_dst, 512, &len) != PROC_IPC_OK ||
+                len != 512)
+                errors++;
+        }
+        t1 = proc_sched_counter_ticks();
+        out->copy512_ticks = t1 >= t0 ? t1 - t0 : 0;
+    }
+
+    t0 = proc_sched_counter_ticks();
+    for (u32 i = 0; i < iterations; i++)
+        simd_memcpy(copy_dst, copy_src, 2048);
+    t1 = proc_sched_counter_ticks();
+    out->memcpy2048_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+    desc.addr = (u64)(usize)copy_src;
+    desc.len = 2048;
+    desc.flags = PROC_IPC_SPAN_F_READONLY;
+    t0 = proc_sched_counter_ticks();
+    for (u32 i = 0; i < iterations; i++) {
+        desc.tag = 0xF2048000ULL | i;
+        if (ipc_proc_fifo_send_span(PRINCIPAL_ROOT, h, &desc) != PROC_IPC_OK ||
+            ipc_proc_fifo_recv_span(PRINCIPAL_ROOT, h, &recv_desc) != PROC_IPC_OK ||
+            recv_desc.tag != desc.tag || recv_desc.len != 2048)
+            errors++;
+    }
+    t1 = proc_sched_counter_ticks();
+    out->span2048_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+    if (core_id() == CORE_NET) {
+        struct fifo_msg m;
+        struct fifo_msg r;
+        while (fifo_pop(CORE_NET, CORE_USERM, &r))
+            ;
+        t0 = proc_sched_counter_ticks();
+        for (u32 i = 0; i < iterations; i++) {
+            m.type = MSG_BENCH_ECHO;
+            m.param = sizeof(desc);
+            m.buffer = (u64)(usize)&bench_payload;
+            m.length = sizeof(bench_payload);
+            m.status = 0;
+            m.tag = 0xC0550000ULL | i;
+            m.timestamp = t0;
+            m._reserved = 0;
+            if (!fifo_push(CORE_NET, CORE_USERM, &m)) {
+                errors++;
+                continue;
+            }
+            u32 spins = 1000000U;
+            while (!fifo_pop(CORE_NET, CORE_USERM, &r) && spins--)
+                ;
+            if (spins == 0 || r.type != MSG_ACK || r.tag != m.tag)
+                errors++;
+        }
+        t1 = proc_sched_counter_ticks();
+        out->cross_fifo_ticks = t1 >= t0 ? t1 - t0 : 0;
+    }
 
     t0 = proc_sched_counter_ticks();
     for (u32 i = 0; i < iterations; i++)

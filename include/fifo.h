@@ -30,6 +30,7 @@
 #define MSG_NET_LINK_DOWN   15
 
 /* Generic */
+#define MSG_BENCH_ECHO      253
 #define MSG_PING            254
 #define MSG_ACK             255
 
@@ -53,6 +54,7 @@ struct fifo {
 
 void  fifo_init_all(void);
 bool  fifo_push(u32 src_core, u32 dst_core, const struct fifo_msg *msg);
+bool  fifo_peek(u32 dst_core, u32 src_core, struct fifo_msg *msg);
 bool  fifo_pop(u32 dst_core, u32 src_core, struct fifo_msg *msg);
 bool  fifo_empty(u32 dst_core, u32 src_core);
 u32   fifo_count(u32 dst_core, u32 src_core);

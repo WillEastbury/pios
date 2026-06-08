@@ -83,6 +83,11 @@ struct proc_ipc_bench_result {
     u64 svc_ticks;
     u64 span_ticks;
     u64 span_fast_ticks;
+    u64 copy64_ticks;
+    u64 copy512_ticks;
+    u64 memcpy2048_ticks;
+    u64 span2048_ticks;
+    u64 cross_fifo_ticks;
     u64 sev_ticks;
 } PACKED;
 

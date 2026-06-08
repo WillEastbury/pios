@@ -2616,6 +2616,16 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, b.span_ticks);
         http_append(out, &len, max, " span_fast_ticks=");
         http_append_u64(out, &len, max, b.span_fast_ticks);
+        http_append(out, &len, max, " copy64_ticks=");
+        http_append_u64(out, &len, max, b.copy64_ticks);
+        http_append(out, &len, max, " copy512_ticks=");
+        http_append_u64(out, &len, max, b.copy512_ticks);
+        http_append(out, &len, max, " memcpy2048_ticks=");
+        http_append_u64(out, &len, max, b.memcpy2048_ticks);
+        http_append(out, &len, max, " span2048_ticks=");
+        http_append_u64(out, &len, max, b.span2048_ticks);
+        http_append(out, &len, max, " cross_fifo_ticks=");
+        http_append_u64(out, &len, max, b.cross_fifo_ticks);
         http_append(out, &len, max, " sev_ticks=");
         http_append_u64(out, &len, max, b.sev_ticks);
         if (b.iterations) {
@@ -2625,6 +2635,16 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, b.span_ticks / b.iterations);
             http_append(out, &len, max, " span_fast_per=");
             http_append_u64(out, &len, max, b.span_fast_ticks / b.iterations);
+            http_append(out, &len, max, " copy64_per=");
+            http_append_u64(out, &len, max, b.copy64_ticks / b.iterations);
+            http_append(out, &len, max, " copy512_per=");
+            http_append_u64(out, &len, max, b.copy512_ticks / b.iterations);
+            http_append(out, &len, max, " memcpy2048_per=");
+            http_append_u64(out, &len, max, b.memcpy2048_ticks / b.iterations);
+            http_append(out, &len, max, " span2048_per=");
+            http_append_u64(out, &len, max, b.span2048_ticks / b.iterations);
+            http_append(out, &len, max, " cross_fifo_per=");
+            http_append_u64(out, &len, max, b.cross_fifo_ticks / b.iterations);
             http_append(out, &len, max, " sev_per=");
             http_append_u64(out, &len, max, b.sev_ticks / b.iterations);
         }

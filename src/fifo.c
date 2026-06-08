@@ -53,6 +53,17 @@ bool fifo_pop(u32 dst, u32 src, struct fifo_msg *msg) {
     return true;
 }
 
+bool fifo_peek(u32 dst, u32 src, struct fifo_msg *msg) {
+    if (src >= 4 || dst >= 4 || !msg) return false;
+    struct fifo *f = get_fifo(src, dst);
+    u32 tail = f->tail;
+    if (unlikely(tail == f->head))
+        return false;
+    dmb();
+    simd_memcpy(msg, &f->msgs[tail], sizeof(struct fifo_msg));
+    return true;
+}
+
 bool fifo_empty(u32 dst, u32 src) {
     struct fifo *f = get_fifo(src, dst);
     return (f->tail == f->head);
