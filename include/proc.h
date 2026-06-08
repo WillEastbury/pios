@@ -93,6 +93,7 @@ struct proc_ipc_bench_result {
     u64 cross_micro_partial_ticks;
     u64 cross_ring_batch_ticks;
     u64 cross_span_ring_ticks;
+    u64 cross_span_all_ticks;
     u64 sev_ticks;
 } PACKED;
 
