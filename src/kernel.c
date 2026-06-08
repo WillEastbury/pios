@@ -2131,6 +2131,12 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_hex32(out, &len, max, r.mip_status_l);
         http_append(out, &len, max, " mip_mask_l=");
         http_append_hex32(out, &len, max, r.mip_mask_l);
+        http_append(out, &len, max, " vpu_status_l=");
+        http_append_hex32(out, &len, max, r.mip_vpu_status_l);
+        http_append(out, &len, max, " vpu_mask_l=");
+        http_append_hex32(out, &len, max, r.mip_vpu_mask_l);
+        http_append(out, &len, max, " cfgl=");
+        http_append_hex32(out, &len, max, r.mip_cfgl_host);
         http_append(out, &len, max, " eth_msix_cfg=");
         http_append_hex32(out, &len, max, r.eth_msix_cfg);
         http_append(out, &len, max, " count=");
@@ -2218,6 +2224,25 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
                 break;
             cap = next;
         }
+    } else if (http_streq(cmd, "pcie aer") || http_streq(cmd, "pcie aer clear")) {
+        struct pcie_aer_snapshot a;
+        bool clear = http_streq(cmd, "pcie aer clear");
+        pcie_aer_snapshot(&a, clear);
+        http_append(out, &len, max, "pcie aer off=");
+        http_append_hex32(out, &len, max, a.aer_offset);
+        http_append(out, &len, max, " uncorr=");
+        http_append_hex32(out, &len, max, a.uncorr);
+        http_append(out, &len, max, " corr=");
+        http_append_hex32(out, &len, max, a.corr);
+        http_append(out, &len, max, " hdr=");
+        http_append_hex32(out, &len, max, a.hdr0);
+        http_append(out, &len, max, " ");
+        http_append_hex32(out, &len, max, a.hdr1);
+        http_append(out, &len, max, " ");
+        http_append_hex32(out, &len, max, a.hdr2);
+        http_append(out, &len, max, " ");
+        http_append_hex32(out, &len, max, a.hdr3);
+        http_append(out, &len, max, clear ? " cleared\n" : "\n");
     } else if (http_streq(cmd, "ksvc") || http_streq(cmd, "ksvc status")) {
         struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
         u32 kn = ksvc_snapshot(ks, KSVC_MAX_SERVICES);
@@ -12181,6 +12206,8 @@ static void core0_eth_irq_handler(void)
     core0_io_flags |= CORE0_IO_NET | CORE0_IO_TCP;
     sev();
 }
+
+
 
 static u32 core0_io_take_flags(void)
 {

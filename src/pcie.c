@@ -460,3 +460,28 @@ void pcie_aer_dump(const char *tag) {
     }
     uart_puts("\n");
 }
+
+void pcie_aer_snapshot(struct pcie_aer_snapshot *out, bool clear)
+{
+    if (!out)
+        return;
+    out->aer_offset = aer_offset_rc;
+    out->uncorr = 0;
+    out->corr = 0;
+    out->hdr0 = 0;
+    out->hdr1 = 0;
+    out->hdr2 = 0;
+    out->hdr3 = 0;
+    if (!aer_offset_rc)
+        return;
+    out->uncorr = pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_UNCORR_ERR);
+    out->corr   = pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_CORR_ERR);
+    out->hdr0   = pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_HDR_LOG0);
+    out->hdr1   = pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_HDR_LOG1);
+    out->hdr2   = pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_HDR_LOG2);
+    out->hdr3   = pcie_cfg_read(0, 0, 0, aer_offset_rc + AER_HDR_LOG3);
+    if (clear) {
+        pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_UNCORR_ERR, 0xFFFFFFFF);
+        pcie_cfg_write(0, 0, 0, aer_offset_rc + AER_CORR_ERR, 0xFFFFFFFF);
+    }
+}

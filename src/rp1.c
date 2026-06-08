@@ -57,6 +57,9 @@
 #define MIP_INT_MASKL_VPU       0x60
 #define MIP_INT_MASKH_VPU       0x70
 #define MIP_INT_STATUSL_HOST    0x80
+#define MIP_INT_STATUSH_HOST    0x90
+#define MIP_INT_STATUSL_VPU     0xA0
+#define MIP_INT_STATUSH_VPU     0xB0
 
 /* Keep BAR1 at PCIE_TARGET_ADDR for the RP1 peripheral aperture. Map BAR0
  * near the end of the existing 8MB outbound window for the MSI-X table/PBA
@@ -82,6 +85,9 @@ void rp1_irq_snapshot(struct rp1_irq_snapshot *out)
     out->intstat_h = rp1_read32(RP1_PCIE_APBS + RP1_INTSTATH);
     out->mip_status_l = mmio_read(BCM2712_MIP0_BASE + MIP_INT_STATUSL_HOST);
     out->mip_mask_l = mmio_read(BCM2712_MIP0_BASE + MIP_INT_MASKL_HOST);
+    out->mip_vpu_status_l = mmio_read(BCM2712_MIP0_BASE + MIP_INT_STATUSL_VPU);
+    out->mip_vpu_mask_l = mmio_read(BCM2712_MIP0_BASE + MIP_INT_MASKL_VPU);
+    out->mip_cfgl_host = mmio_read(BCM2712_MIP0_BASE + MIP_INT_CFGL_HOST);
     out->eth_msix_cfg = rp1_read32(RP1_PCIE_APBS + RP1_MSIX_CFG(RP1_INT_ETH));
     u64 eth_vec = RP1_MSIX_CPU_BASE + (RP1_INT_ETH * 16U);
     out->eth_msix_addr_lo = mmio_read(eth_vec + 0x0);
@@ -135,6 +141,17 @@ u32 rp1_eth_irq_ack(void)
                     RP1_MSIX_CFG_IACK);
     }
     return st;
+}
+
+u32 rp1_irq_status_l(void)
+{
+    return rp1_read32(RP1_PCIE_APBS + RP1_INTSTATL);
+}
+
+void rp1_eth_level_ack(void)
+{
+    rp1_write32(RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(RP1_INT_ETH),
+                RP1_MSIX_CFG_IACK);
 }
 
 void rp1_eth_irq_raise_test(void)

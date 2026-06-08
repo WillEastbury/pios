@@ -34,6 +34,9 @@ struct rp1_irq_snapshot {
     u32 intstat_h;
     u32 mip_status_l;
     u32 mip_mask_l;
+    u32 mip_vpu_status_l;
+    u32 mip_vpu_mask_l;
+    u32 mip_cfgl_host;
     u32 eth_msix_cfg;
     u32 eth_msix_addr_lo;
     u32 eth_msix_addr_hi;
@@ -48,4 +51,6 @@ void rp1_write32(u64 offset, u32 val);
 void rp1_irq_snapshot(struct rp1_irq_snapshot *out);
 void rp1_eth_irq_arm(void);
 u32  rp1_eth_irq_ack(void);
+u32  rp1_irq_status_l(void);
+void rp1_eth_level_ack(void);
 void rp1_eth_irq_raise_test(void);

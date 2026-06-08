@@ -37,7 +37,7 @@
 #define GIC_RP1_ETH_MSI     166     /* GIC_SPI 128 => INTID 160, plus RP1_INT_ETH(6) */
 
 /* Max interrupts */
-#define GIC_MAX_IRQ         256
+#define GIC_MAX_IRQ         320
 
 void gic_init(void);
 void gic_select_bases(u32 id, u64 gicd_base, u64 gicc_base);

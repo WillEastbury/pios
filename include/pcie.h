@@ -28,5 +28,16 @@ u32  pcie_cfg_read(u32 bus, u32 dev, u32 func, u32 reg);
 void pcie_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val);
 
 /* AER diagnostics */
+struct pcie_aer_snapshot {
+    u32 aer_offset;
+    u32 uncorr;
+    u32 corr;
+    u32 hdr0;
+    u32 hdr1;
+    u32 hdr2;
+    u32 hdr3;
+} PACKED;
+
 void pcie_aer_init(void);
 void pcie_aer_dump(const char *tag);
+void pcie_aer_snapshot(struct pcie_aer_snapshot *out, bool clear);
