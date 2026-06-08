@@ -75,6 +75,16 @@ struct proc_sched_core_snapshot {
 #define PROC_SOFT_EVENT_IPC_FIFO  1U
 #define PROC_SW_INT_F_BOOST       0x00000001U
 
+struct proc_ipc_bench_result {
+    u32 iterations;
+    u32 desc_size;
+    i32 fifo_handle;
+    u32 errors;
+    u64 svc_ticks;
+    u64 span_ticks;
+    u64 sev_ticks;
+} PACKED;
+
 #define PROC_IMAGE_FORMAT_NONE     0U
 #define PROC_IMAGE_FORMAT_FLAT     1U
 #define PROC_IMAGE_FORMAT_PIX      2U
@@ -442,6 +452,7 @@ void proc_irq_maybe_preempt(struct irq_frame *frame);
 u64  proc_preemptions(void);
 u32  proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries);
 bool proc_soft_event(u32 target_pid, u32 event_type, bool boost);
+bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out);
 u32  proc_snapshot(struct proc_ui_entry *out, u32 max_entries);
 void *proc_span_rent(u32 bytes, u32 align, u32 type);
 bool proc_span_release(void *ptr);

@@ -2592,6 +2592,39 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "abi selftest")) {
         http_append(out, &len, max, abi_selftest() ? "ABI selftest OK\n" : "ABI selftest FAILED\n");
+    } else if (http_streq(cmd, "ipc bench") || http_starts_with(cmd, "ipc bench ")) {
+        u32 iters = 10000;
+        if (http_starts_with(cmd, "ipc bench ")) {
+            u32 parsed = 0;
+            if (http_parse_u32(cmd + 10, &parsed) && parsed > 0)
+                iters = parsed;
+        }
+        struct proc_ipc_bench_result b;
+        bool ok = proc_ipc_bench(iters, &b);
+        http_append(out, &len, max, ok ? "ipc bench OK" : "ipc bench ERR");
+        http_append(out, &len, max, " n=");
+        http_append_u64(out, &len, max, b.iterations);
+        http_append(out, &len, max, " desc=");
+        http_append_u64(out, &len, max, b.desc_size);
+        http_append(out, &len, max, " h=");
+        http_append_u64(out, &len, max, (u64)(u32)b.fifo_handle);
+        http_append(out, &len, max, " errors=");
+        http_append_u64(out, &len, max, b.errors);
+        http_append(out, &len, max, " svc_ticks=");
+        http_append_u64(out, &len, max, b.svc_ticks);
+        http_append(out, &len, max, " span_ticks=");
+        http_append_u64(out, &len, max, b.span_ticks);
+        http_append(out, &len, max, " sev_ticks=");
+        http_append_u64(out, &len, max, b.sev_ticks);
+        if (b.iterations) {
+            http_append(out, &len, max, " svc_per=");
+            http_append_u64(out, &len, max, b.svc_ticks / b.iterations);
+            http_append(out, &len, max, " span_per=");
+            http_append_u64(out, &len, max, b.span_ticks / b.iterations);
+            http_append(out, &len, max, " sev_per=");
+            http_append_u64(out, &len, max, b.sev_ticks / b.iterations);
+        }
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "qpu") || http_streq(cmd, "qpu status") ||
                http_streq(cmd, "tensor") || http_streq(cmd, "tensor status")) {
         struct tensor_status ts;

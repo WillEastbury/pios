@@ -1910,6 +1910,86 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
     return true;
 }
 
+bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
+{
+    static u64 bench_payload ALIGNED(64);
+    static const char name[] = "bench.span";
+    struct proc_ipc_span_desc desc;
+    struct proc_ipc_span_desc recv_desc;
+    struct irq_frame frame;
+    u32 len = 0;
+    i32 h;
+    u32 errors = 0;
+    u64 t0, t1;
+
+    if (!out)
+        return false;
+    if (iterations == 0)
+        iterations = 1;
+    if (iterations > 100000U)
+        iterations = 100000U;
+
+    h = ipc_proc_fifo_create(PRINCIPAL_ROOT, 1, name, PROC_IPC_PEER_ANY,
+                             PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV,
+                             PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV,
+                             PROC_IPC_FIFO_DEPTH_MAX,
+                             sizeof(struct proc_ipc_span_desc));
+    if (h == PROC_IPC_ERR_EXISTS)
+        h = ipc_proc_fifo_open(PRINCIPAL_ROOT, 1, name,
+                               PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV);
+    if (h < 0) {
+        out->iterations = iterations;
+        out->desc_size = sizeof(struct proc_ipc_span_desc);
+        out->fifo_handle = h;
+        out->errors = 1;
+        out->svc_ticks = 0;
+        out->span_ticks = 0;
+        out->sev_ticks = 0;
+        return false;
+    }
+
+    while (ipc_proc_fifo_recv(PRINCIPAL_ROOT, h, &recv_desc, sizeof(recv_desc), &len) == PROC_IPC_OK)
+        ;
+
+    simd_zero(&frame, sizeof(frame));
+    t0 = proc_sched_counter_ticks();
+    for (u32 i = 0; i < iterations; i++) {
+        if (!proc_handle_svc_inner(&frame, ((u64)EC_SVC64 << ESR_EC_SHIFT) | PROC_SVC_GETPID, false))
+            errors++;
+    }
+    t1 = proc_sched_counter_ticks();
+    out->svc_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+    bench_payload = 0x50494F5300000000ULL | iterations;
+    desc.addr = (u64)(usize)&bench_payload;
+    desc.len = sizeof(bench_payload);
+    desc.flags = PROC_IPC_SPAN_F_READONLY;
+    desc.tag = 0xBEE00000ULL;
+
+    t0 = proc_sched_counter_ticks();
+    for (u32 i = 0; i < iterations; i++) {
+        desc.tag = 0xBEE00000ULL | i;
+        if (ipc_proc_fifo_send(PRINCIPAL_ROOT, h, &desc, sizeof(desc)) != PROC_IPC_OK ||
+            ipc_proc_fifo_recv(PRINCIPAL_ROOT, h, &recv_desc, sizeof(recv_desc), &len) != PROC_IPC_OK ||
+            len != sizeof(recv_desc) || recv_desc.tag != desc.tag)
+            errors++;
+    }
+    t1 = proc_sched_counter_ticks();
+    out->span_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+    t0 = proc_sched_counter_ticks();
+    for (u32 i = 0; i < iterations; i++)
+        sev();
+    t1 = proc_sched_counter_ticks();
+    out->sev_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+    out->iterations = iterations;
+    out->desc_size = sizeof(struct proc_ipc_span_desc);
+    out->fifo_handle = h;
+    out->errors = errors;
+    return errors == 0;
+}
+
 u32 proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries)
 {
     if (!out || max_entries == 0)
