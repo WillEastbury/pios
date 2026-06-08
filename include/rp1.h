@@ -53,7 +53,6 @@ void rp1_eth_irq_arm(void);
 u32  rp1_mip_host_status_l(void);
 u32  rp1_eth_irq_ack(void);
 void rp1_eth_host_arm(void);
-u32  rp1_eth_host_ack(void);
 u32  rp1_irq_status_l(void);
 void rp1_eth_level_ack(void);
 void rp1_eth_irq_raise_test(void);

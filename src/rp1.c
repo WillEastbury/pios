@@ -157,34 +157,27 @@ u32 rp1_mip_host_status_l(void)
     return mmio_read(BCM2712_MIP0_BASE + MIP_INT_STATUSL_HOST);
 }
 
-u32 rp1_eth_host_ack(void)
-{
-    const u32 eth_bit = 1U << RP1_INT_ETH;
-    u32 st = mmio_read(BCM2712_MIP0_BASE + MIP_INT_STATUSL_HOST);
-    if (st & (1U | eth_bit)) {
-        mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
-        dsb();
-        rp1_write32(RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(RP1_INT_ETH),
-                    RP1_MSIX_CFG_IACK);
-        dsb();
-        mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
-        dsb();
-    }
-    return st;
-}
-
 u32 rp1_eth_irq_ack(void)
 {
     const u32 eth_bit = 1U << RP1_INT_ETH;
     u32 st = mmio_read(BCM2712_MIP0_BASE + MIP_INT_STATUSL_HOST);
     if (st & eth_bit) {
+        bool raw_low = (rp1_read32(RP1_PCIE_APBS + RP1_INTSTATL) & eth_bit) == 0;
+        if (raw_low && mmio_read(BCM2712_MIP0_BASE + MIP_INT_CFGL_HOST) == 0) {
+            mmio_write(BCM2712_MIP0_BASE + MIP_INT_CFGL_HOST, 0xFFFFFFFFU);
+            mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
+            dsb();
+            mmio_write(BCM2712_MIP0_BASE + MIP_INT_CFGL_HOST, 0);
+        }
         mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
         dsb();
         rp1_write32(RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(RP1_INT_ETH),
                     RP1_MSIX_CFG_IACK);
         dsb();
-        mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
-        dsb();
+        if (raw_low) {
+            mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
+            dsb();
+        }
     }
     return st;
 }

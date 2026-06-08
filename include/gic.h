@@ -34,7 +34,6 @@
 #define GIC_INTID_SPURIOUS  1023
 #define GIC_TIMER_NS_PHYS   30      /* Non-secure physical timer PPI */
 #define GIC_TIMER_VIRT      27      /* Virtual timer PPI */
-#define GIC_RP1_ETH_HOST    160     /* MIP0 HOST bit0: GIC_SPI 128 => INTID 160 */
 #define GIC_RP1_ETH_MSI     166     /* GIC_SPI 128 => INTID 160, plus RP1_INT_ETH(6) */
 
 /* Max interrupts */

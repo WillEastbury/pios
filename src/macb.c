@@ -880,17 +880,20 @@ void macb_irq_enable_rx(void)
 u32 macb_irq_ack_rx(void)
 {
     u32 rsr = mr(RSR);
+    u32 isr = mr(ISR);
     if (rsr)
         mw(RSR, rsr);
-    dsb();
-    u32 isr = mr(ISR);
+    if (isr)
+        mw(ISR, isr);
     dsb();
     rsr = mr(RSR);
+    u32 isr2 = mr(ISR);
     if (rsr)
         mw(RSR, rsr);
+    if (isr2)
+        mw(ISR, isr2);
     dsb();
-    isr |= mr(ISR);
-    return isr;
+    return isr | isr2;
 }
 
 /* Snapshot of full MAC state for stall diagnosis (host-side polling). */

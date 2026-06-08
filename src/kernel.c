@@ -296,10 +296,8 @@ static volatile u32 core0_eth_irq_last_macb_isr;
 static volatile bool core0_eth_irq_oneshot;
 static volatile bool core0_eth_irq_deferred_quench;
 static volatile u32 core0_eth_irq_quench_passes;
-static volatile u64 core0_eth_host_irq_count;
-static volatile u32 core0_eth_host_last_status;
-static volatile bool core0_eth_host_oneshot;
-static volatile bool core0_eth_host_deferred_quench;
+static u32 core0_eth_source_diag[24];
+static volatile u32 core0_eth_source_diag_seq;
 
 static bool ui_streq(const char *a, const char *b);
 static const char *ui_proc_state_str(u32 s);
@@ -319,8 +317,7 @@ static void core0_sched_snapshot(u64 *wake, u64 *wfi_count, u64 *idle_ticks,
                                  u64 *total_ticks, u32 *busy_permille,
                                  u32 *last_flags);
 static void core0_eth_irq_handler(void);
-static void core0_eth_host_irq_handler(void);
-static void core0_eth_irq_drain_and_quench(bool host_route);
+static bool core0_eth_irq_drain_and_quench(bool host_route);
 static const char *tcp_state_name(u32 state);
 static const char *tcp_owner_label(u16 port);
 static bool http_request_complete(const u8 *req, u32 len);
@@ -2087,13 +2084,36 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         }
     } else if (http_streq(cmd, "rp1 irq") || http_streq(cmd, "rp1 irq clear") ||
                http_streq(cmd, "rp1 irq arm-eth") || http_streq(cmd, "rp1 irq raise-eth") ||
-               http_streq(cmd, "rp1 irq pend-gic") || http_streq(cmd, "rp1 irq arm-host") ||
-               http_streq(cmd, "rp1 irq arm-host1") || http_streq(cmd, "rp1 irq arm-host6") ||
-               http_streq(cmd, "rp1 irq arm-host6-1")) {
+               http_streq(cmd, "rp1 irq pend-gic") || http_streq(cmd, "rp1 irq arm-host6") ||
+               http_streq(cmd, "rp1 irq arm-host6-1") || http_streq(cmd, "rp1 irq source-diag")) {
         if (http_streq(cmd, "rp1 irq clear")) {
             core0_eth_irq_drain_and_quench(false);
-            core0_eth_irq_drain_and_quench(true);
             http_append(out, &len, max, "rp1 eth irq quench\n");
+        } else if (http_streq(cmd, "rp1 irq source-diag")) {
+            u32 old_ncr = mmio_read(MACB_BASE + 0x00);
+            u32 old_imr = mmio_read(MACB_BASE + 0x30);
+            for (u32 step = 0; step < 4; step++) {
+                if (step == 1) {
+                    mmio_write(MACB_BASE + 0x2C, 0xFFFFFFFFU);
+                    mmio_write(MACB_BASE + 0x20, 0xFFFFFFFFU);
+                    mmio_write(MACB_BASE + 0x24, 0xFFFFFFFFU);
+                } else if (step == 2) {
+                    mmio_write(MACB_BASE + 0x00, 0);
+                } else if (step == 3) {
+                    mmio_write(MACB_BASE + 0x00, old_ncr);
+                    if ((old_imr & 2U) == 0)
+                        mmio_write(MACB_BASE + 0x28, 2U);
+                }
+                dsb();
+                core0_eth_source_diag[(step * 6U) + 0] = rp1_mip_host_status_l();
+                core0_eth_source_diag[(step * 6U) + 1] = rp1_irq_status_l();
+                core0_eth_source_diag[(step * 6U) + 2] = mmio_read(MACB_BASE + 0x20);
+                core0_eth_source_diag[(step * 6U) + 3] = mmio_read(MACB_BASE + 0x24);
+                core0_eth_source_diag[(step * 6U) + 4] = mmio_read(MACB_BASE + 0x00);
+                core0_eth_source_diag[(step * 6U) + 5] = mmio_read(MACB_BASE + 0x30);
+            }
+            core0_eth_source_diag_seq++;
+            http_append(out, &len, max, "source-diag stored\n");
         } else if (http_streq(cmd, "rp1 irq arm-eth")) {
             __asm__ volatile("msr daifset, #2" ::: "memory");
             irq_register(GIC_RP1_ETH_MSI, core0_eth_irq_handler);
@@ -2102,12 +2122,13 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             gic_set_target(GIC_RP1_ETH_MSI, 1);
             gic_set_edge_triggered(GIC_RP1_ETH_MSI);
             gic_clear_pending(GIC_RP1_ETH_MSI);
-            gic_enable_irq(GIC_RP1_ETH_MSI);
             core0_eth_irq_oneshot = false;
+            macb_irq_ack_rx();
             rp1_eth_irq_arm();
             macb_irq_enable_rx();
             dsb();
             isb();
+            gic_enable_irq(GIC_RP1_ETH_MSI);
             __asm__ volatile("msr daifclr, #2" ::: "memory");
             http_append(out, &len, max, "rp1 eth irq armed\n");
         } else if (http_streq(cmd, "rp1 irq raise-eth")) {
@@ -2137,23 +2158,6 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, " after=");
             http_append_u64(out, &len, max, core0_eth_irq_count);
             http_append(out, &len, max, "\n");
-        } else if (http_streq(cmd, "rp1 irq arm-host") || http_streq(cmd, "rp1 irq arm-host1")) {
-            __asm__ volatile("msr daifset, #2" ::: "memory");
-            core0_eth_host_oneshot = http_streq(cmd, "rp1 irq arm-host1");
-            irq_register(GIC_RP1_ETH_HOST, core0_eth_host_irq_handler);
-            gic_set_group1(GIC_RP1_ETH_HOST);
-            gic_set_priority(GIC_RP1_ETH_HOST, 0x40);
-            gic_set_target(GIC_RP1_ETH_HOST, 1);
-            gic_set_edge_triggered(GIC_RP1_ETH_HOST);
-            gic_clear_pending(GIC_RP1_ETH_HOST);
-            gic_enable_irq(GIC_RP1_ETH_HOST);
-            rp1_eth_host_arm();
-            macb_irq_enable_rx();
-            dsb();
-            isb();
-            __asm__ volatile("msr daifclr, #2" ::: "memory");
-            http_append(out, &len, max, core0_eth_host_oneshot ?
-                        "rp1 eth HOST one-shot armed\n" : "rp1 eth HOST armed\n");
         } else if (http_streq(cmd, "rp1 irq arm-host6") || http_streq(cmd, "rp1 irq arm-host6-1")) {
             __asm__ volatile("msr daifset, #2" ::: "memory");
             core0_eth_irq_oneshot = http_streq(cmd, "rp1 irq arm-host6-1");
@@ -2163,11 +2167,12 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             gic_set_target(GIC_RP1_ETH_MSI, 1);
             gic_set_edge_triggered(GIC_RP1_ETH_MSI);
             gic_clear_pending(GIC_RP1_ETH_MSI);
-            gic_enable_irq(GIC_RP1_ETH_MSI);
+            macb_irq_ack_rx();
             rp1_eth_host_arm();
             macb_irq_enable_rx();
             dsb();
             isb();
+            gic_enable_irq(GIC_RP1_ETH_MSI);
             __asm__ volatile("msr daifclr, #2" ::: "memory");
             http_append(out, &len, max, core0_eth_irq_oneshot ?
                         "rp1 eth HOST6 one-shot armed\n" : "rp1 eth HOST6 armed\n");
@@ -2194,16 +2199,14 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_hex32(out, &len, max, r.eth_msix_cfg);
         http_append(out, &len, max, " count=");
         http_append_u64(out, &len, max, core0_eth_irq_count);
-        http_append(out, &len, max, " host_count=");
-        http_append_u64(out, &len, max, core0_eth_host_irq_count);
-        http_append(out, &len, max, " host_last=");
-        http_append_hex32(out, &len, max, core0_eth_host_last_status);
         http_append(out, &len, max, " last_mip=");
         http_append_hex32(out, &len, max, core0_eth_irq_last_mip);
         http_append(out, &len, max, " last_isr=");
         http_append_hex32(out, &len, max, core0_eth_irq_last_macb_isr);
         http_append(out, &len, max, " quench_passes=");
         http_append_u64(out, &len, max, core0_eth_irq_quench_passes);
+        http_append(out, &len, max, " srcseq=");
+        http_append_u64(out, &len, max, core0_eth_source_diag_seq);
         http_append(out, &len, max, "\neth_vec addr=");
         http_append_hex32(out, &len, max, r.eth_msix_addr_hi);
         http_append(out, &len, max, ":");
@@ -2225,6 +2228,17 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " isr_clear=");
         http_append_hex32(out, &len, max, m.isr_clear);
         http_append(out, &len, max, "\n");
+        if (core0_eth_source_diag_seq) {
+            http_append(out, &len, max, "source h/i/rsr/isr/ncr/imr:");
+            for (u32 i = 0; i < 24U; i++) {
+                if ((i % 6U) == 0)
+                    http_append(out, &len, max, "\n");
+                else
+                    http_append(out, &len, max, " ");
+                http_append_hex32(out, &len, max, core0_eth_source_diag[i]);
+            }
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "rp1 pci")) {
         u32 id = pcie_cfg_read(1, 0, 0, 0x00);
         u32 cmdstat = pcie_cfg_read(1, 0, 0, 0x04);
@@ -12264,37 +12278,27 @@ static void core0_eth_irq_handler(void)
     sev();
 }
 
-static void core0_eth_host_irq_handler(void)
-{
-    if (core0_eth_host_oneshot)
-        gic_disable_irq(GIC_RP1_ETH_HOST);
-    core0_eth_host_last_status = rp1_mip_host_status_l();
-    core0_eth_host_deferred_quench = true;
-    core0_eth_host_irq_count++;
-    core0_io_flags |= CORE0_IO_NET | CORE0_IO_TCP;
-    sev();
-}
-
-static void core0_eth_irq_drain_and_quench(bool host_route)
+static bool core0_eth_irq_drain_and_quench(bool host_route)
 {
     const u32 eth_bit = 1U << RP1_INT_ETH;
     u32 passes = 0;
+    bool clear = false;
     for (; passes < 8U; passes++) {
         net_poll();
         core0_eth_irq_last_macb_isr = macb_irq_ack_rx();
-        if (host_route) {
-            core0_eth_host_last_status = rp1_eth_host_ack();
-            gic_clear_pending(GIC_RP1_ETH_HOST);
-        } else {
+        if (!host_route) {
             core0_eth_irq_last_mip = rp1_eth_irq_ack();
             gic_clear_pending(GIC_RP1_ETH_MSI);
         }
         dsb();
         if ((rp1_irq_status_l() & eth_bit) == 0 &&
-            (rp1_mip_host_status_l() & eth_bit) == 0)
+            (rp1_mip_host_status_l() & eth_bit) == 0) {
+            clear = true;
             break;
+        }
     }
     core0_eth_irq_quench_passes = passes < 8U ? passes + 1U : passes;
+    return clear;
 }
 
 static u32 core0_io_take_flags(void)
@@ -12425,10 +12429,6 @@ NORETURN void core0_main(void) {
             if (core0_eth_irq_deferred_quench) {
                 core0_eth_irq_drain_and_quench(false);
                 core0_eth_irq_deferred_quench = false;
-            }
-            if (core0_eth_host_deferred_quench) {
-                core0_eth_irq_drain_and_quench(true);
-                core0_eth_host_deferred_quench = false;
             }
             ksvc_end(ksvc_net_id, svc_start, false);
         }
