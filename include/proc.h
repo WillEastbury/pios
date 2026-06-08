@@ -82,6 +82,7 @@ struct proc_ipc_bench_result {
     u32 errors;
     u64 svc_ticks;
     u64 span_ticks;
+    u64 span_fast_ticks;
     u64 sev_ticks;
 } PACKED;
 

@@ -229,6 +229,54 @@ i32 ipc_proc_fifo_recv(u32 principal, i32 channel_id, void *out, u32 out_max, u3
     return PROC_IPC_OK;
 }
 
+static struct proc_fifo_channel *fifo_for_access(u32 principal, i32 channel_id, u32 perm)
+{
+    if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX)
+        return NULL;
+    struct proc_fifo_channel *ch = &g_fifos[channel_id];
+    if (!ch->used || ch->owner_core != core_id())
+        return NULL;
+    u32 acl = principal_acl(principal, ch->owner_principal, ch->peer_principal,
+                            ch->owner_acl, ch->peer_acl);
+    if ((acl & perm) == 0)
+        return NULL;
+    if ((ch->flags & PROC_IPC_FIFO_F_SPAN_DESC) == 0)
+        return NULL;
+    return ch;
+}
+
+i32 ipc_proc_fifo_send_span(u32 principal, i32 channel_id, const struct proc_ipc_span_desc *desc)
+{
+    if (!desc) return PROC_IPC_ERR_INVAL;
+    struct proc_fifo_channel *ch = fifo_for_access(principal, channel_id, PROC_IPC_PERM_SEND);
+    if (!ch) return PROC_IPC_ERR_ACCESS;
+    if (ch->count == ch->depth) return PROC_IPC_ERR_FULL;
+    u32 idx = (ch->head + ch->count) % ch->depth;
+    *((struct proc_ipc_span_desc *)ch->frames[idx]) = *desc;
+    ch->lens[idx] = (u16)sizeof(*desc);
+    dmb();
+    ch->count++;
+    sev();
+    return PROC_IPC_OK;
+}
+
+i32 ipc_proc_fifo_recv_span(u32 principal, i32 channel_id, struct proc_ipc_span_desc *out)
+{
+    if (!out) return PROC_IPC_ERR_INVAL;
+    struct proc_fifo_channel *ch = fifo_for_access(principal, channel_id, PROC_IPC_PERM_RECV);
+    if (!ch) return PROC_IPC_ERR_ACCESS;
+    if (ch->count == 0) return PROC_IPC_ERR_EMPTY;
+    dmb();
+    u32 idx = ch->head;
+    if (ch->lens[idx] != sizeof(*out))
+        return PROC_IPC_ERR_INVAL;
+    *out = *((const struct proc_ipc_span_desc *)ch->frames[idx]);
+    dmb();
+    ch->head = (ch->head + 1) % ch->depth;
+    ch->count--;
+    return PROC_IPC_OK;
+}
+
 u32 ipc_proc_fifo_owner_pid(i32 channel_id)
 {
     if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX)

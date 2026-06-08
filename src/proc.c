@@ -1944,6 +1944,7 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         out->errors = 1;
         out->svc_ticks = 0;
         out->span_ticks = 0;
+        out->span_fast_ticks = 0;
         out->sev_ticks = 0;
         return false;
     }
@@ -1976,6 +1977,20 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
     }
     t1 = proc_sched_counter_ticks();
     out->span_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+    while (ipc_proc_fifo_recv_span(PRINCIPAL_ROOT, h, &recv_desc) == PROC_IPC_OK)
+        ;
+
+    t0 = proc_sched_counter_ticks();
+    for (u32 i = 0; i < iterations; i++) {
+        desc.tag = 0xFA570000ULL | i;
+        if (ipc_proc_fifo_send_span(PRINCIPAL_ROOT, h, &desc) != PROC_IPC_OK ||
+            ipc_proc_fifo_recv_span(PRINCIPAL_ROOT, h, &recv_desc) != PROC_IPC_OK ||
+            recv_desc.tag != desc.tag)
+            errors++;
+    }
+    t1 = proc_sched_counter_ticks();
+    out->span_fast_ticks = t1 >= t0 ? t1 - t0 : 0;
 
     t0 = proc_sched_counter_ticks();
     for (u32 i = 0; i < iterations; i++)
@@ -3885,7 +3900,7 @@ static i32 sys_ipc_fifo_send_span(i32 channel_id, const void *addr, u32 len, u32
         .flags = flags,
         .tag = tag,
     };
-    i32 r = ipc_proc_fifo_send(principal_current(), channel_id, &d, sizeof(d));
+    i32 r = ipc_proc_fifo_send_span(principal_current(), channel_id, &d);
     if (r == PROC_IPC_OK)
         (void)proc_soft_event(ipc_proc_fifo_owner_pid(channel_id), PROC_SOFT_EVENT_IPC_FIFO, true);
     return r;
