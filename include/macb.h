@@ -31,6 +31,7 @@ struct macb_irq_snapshot {
 
 void macb_irq_snapshot(struct macb_irq_snapshot *out, bool read_clear_isr);
 void macb_irq_enable_rx(void);
+u32  macb_irq_ack_rx(void);
 
 /* Try to recover a stalled MAC: clear latched status bits, halt+restart TX,
  * dump ETH_CFG_STAT for AXI bus errors. Returns true if it did anything. */

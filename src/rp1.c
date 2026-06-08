@@ -42,6 +42,7 @@
 #define RP1_REG_CLR         0xC00
 #define RP1_MSIX_CFG(n)     (0x8 + (4U * (n)))
 #define RP1_MSIX_CFG_ENABLE (1U << 0)
+#define RP1_MSIX_CFG_TEST   (1U << 1)
 #define RP1_MSIX_CFG_IACK   (1U << 2)
 #define RP1_MSIX_CFG_IACK_EN (1U << 3)
 #define RP1_INTSTATL        0x108
@@ -131,14 +132,59 @@ void rp1_eth_irq_arm(void)
                 RP1_MSIX_CFG_ENABLE | RP1_MSIX_CFG_IACK_EN);
 }
 
+void rp1_eth_host_arm(void)
+{
+    const u32 eth_bit = 1U << RP1_INT_ETH;
+    /* Empirical BCM2712 MIP semantics on the current bare-metal route:
+     * CFGL_HOST=0 moves the RP1 ETH MSI-X write into HOST status bit6
+     * / GIC INTID166, while the Linux-style CFGL_HOST=~0 stays VPU-only. */
+    rp1_eth_irq_arm();
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKL_HOST, 0);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKH_HOST, 0);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKL_VPU, 0xFFFFFFFFU);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKH_VPU, 0xFFFFFFFFU);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_CFGL_HOST, 0);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_CFGH_HOST, 0);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
+    rp1_write32(RP1_PCIE_APBS + RP1_REG_CLR + RP1_MSIX_CFG(RP1_INT_ETH),
+                RP1_MSIX_CFG_TEST | RP1_MSIX_CFG_IACK);
+    rp1_write32(RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(RP1_INT_ETH),
+                RP1_MSIX_CFG_ENABLE | RP1_MSIX_CFG_IACK_EN);
+}
+
+u32 rp1_mip_host_status_l(void)
+{
+    return mmio_read(BCM2712_MIP0_BASE + MIP_INT_STATUSL_HOST);
+}
+
+u32 rp1_eth_host_ack(void)
+{
+    const u32 eth_bit = 1U << RP1_INT_ETH;
+    u32 st = mmio_read(BCM2712_MIP0_BASE + MIP_INT_STATUSL_HOST);
+    if (st & (1U | eth_bit)) {
+        mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
+        dsb();
+        rp1_write32(RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(RP1_INT_ETH),
+                    RP1_MSIX_CFG_IACK);
+        dsb();
+        mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
+        dsb();
+    }
+    return st;
+}
+
 u32 rp1_eth_irq_ack(void)
 {
     const u32 eth_bit = 1U << RP1_INT_ETH;
     u32 st = mmio_read(BCM2712_MIP0_BASE + MIP_INT_STATUSL_HOST);
     if (st & eth_bit) {
         mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
+        dsb();
         rp1_write32(RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(RP1_INT_ETH),
                     RP1_MSIX_CFG_IACK);
+        dsb();
+        mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
+        dsb();
     }
     return st;
 }

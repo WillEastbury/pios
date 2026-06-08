@@ -877,6 +877,15 @@ void macb_irq_enable_rx(void)
     mw(IER, INT_RCOMP);
 }
 
+u32 macb_irq_ack_rx(void)
+{
+    u32 rsr = mr(RSR);
+    u32 isr = mr(ISR);
+    if (rsr)
+        mw(RSR, rsr);
+    return isr;
+}
+
 /* Snapshot of full MAC state for stall diagnosis (host-side polling). */
 void macb_dump_full_state(const char *tag) {
     uart_puts("[mac] ");
