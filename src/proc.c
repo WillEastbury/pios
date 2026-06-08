@@ -46,6 +46,8 @@ static u64 sched_idle_ticks_core[3];
 static volatile u64 sched_idle_enter_ticks_core[3];
 static u64 sched_idle_count_core[3];
 static u64 sched_wake_count_core[3];
+static u64 soft_event_count_core[3];
+static u64 soft_boost_count_core[3];
 static u64 svc_call_count;
 static u64 svc_bad_count;
 static struct proc_security_stats proc_sec_stats;
@@ -1042,6 +1044,7 @@ static i32   sys_ipc_fifo_create(const char *name, u32 peer_principal, u32 owner
                                  u32 peer_acl, u32 depth, u32 msg_max);
 static i32   sys_ipc_fifo_open(const char *name, u32 want_acl);
 static i32   sys_ipc_fifo_send(i32 channel_id, const void *data, u32 len);
+static i32   sys_ipc_fifo_send_span(i32 channel_id, const void *addr, u32 len, u32 flags, u64 tag);
 static i32   sys_ipc_fifo_recv(i32 channel_id, void *out, u32 out_max);
 static i32   sys_ipc_shm_create(const char *name, u32 peer_principal, u32 owner_acl,
                                 u32 peer_acl, u32 size);
@@ -1309,6 +1312,7 @@ static struct kernel_api kernel_api_tab = {
     .ipc_fifo_create = sys_ipc_fifo_create,
     .ipc_fifo_open   = sys_ipc_fifo_open,
     .ipc_fifo_send   = sys_ipc_fifo_send,
+    .ipc_fifo_send_span = sys_ipc_fifo_send_span,
     .ipc_fifo_recv   = sys_ipc_fifo_recv,
     .ipc_shm_create  = sys_ipc_shm_create,
     .ipc_shm_open    = sys_ipc_shm_open,
@@ -1407,6 +1411,8 @@ void proc_init(void)
         sched_idle_enter_ticks_core[uc] = 0;
         sched_idle_count_core[uc] = 0;
         sched_wake_count_core[uc] = 0;
+        soft_event_count_core[uc] = 0;
+        soft_boost_count_core[uc] = 0;
         /* BSS is already cleared by core0 before secondary cores launch.
          * Do not bulk-clear shared IPC/request namespaces concurrently from
          * secondary cores during bring-up; keep per-core scheduler counters
@@ -1879,6 +1885,29 @@ u64 proc_preemptions(void)
     return preempt_count_core[user_core_slot()];
 }
 
+bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
+{
+    if (!initialized || !on_user_core() || target_pid == 0)
+        return false;
+    u32 uc = user_core_slot();
+    soft_event_count_core[uc]++;
+    (void)event_type;
+
+    i32 slot = proc_find_slot_by_pid(target_pid);
+    if (slot < 0)
+        return false;
+
+    struct process *p = &procs[(u32)slot];
+    if (p->state == PROC_BLOCKED)
+        p->state = PROC_READY;
+    if (boost && (p->state == PROC_READY || p->state == PROC_RUNNING)) {
+        rr_cursor = ((u32)slot + MAX_PROCS_PER_CORE - 1U) % MAX_PROCS_PER_CORE;
+        soft_boost_count_core[uc]++;
+    }
+    sev();
+    return true;
+}
+
 u32 proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries)
 {
     if (!out || max_entries == 0)
@@ -1909,6 +1938,8 @@ u32 proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries)
         out[i].idle_ticks = idle;
         out[i].total_ticks = total;
         out[i].preemptions = preempt_count_core[i];
+        out[i].soft_events = soft_event_count_core[i];
+        out[i].soft_boosts = soft_boost_count_core[i];
     }
     return n;
 }
@@ -3753,7 +3784,29 @@ static i32 sys_ipc_fifo_send(i32 channel_id, const void *data, u32 len)
 {
     if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
     if (!ptr_valid(data, len)) return PROC_IPC_ERR_INVAL;
-    return ipc_proc_fifo_send(principal_current(), channel_id, data, len);
+    i32 r = ipc_proc_fifo_send(principal_current(), channel_id, data, len);
+    if (r == PROC_IPC_OK)
+        (void)proc_soft_event(ipc_proc_fifo_owner_pid(channel_id), PROC_SOFT_EVENT_IPC_FIFO, true);
+    return r;
+}
+
+static i32 sys_ipc_fifo_send_span(i32 channel_id, const void *addr, u32 len, u32 flags, u64 tag)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    if ((flags & ~(PROC_IPC_SPAN_F_SHARED | PROC_IPC_SPAN_F_READONLY | PROC_IPC_SPAN_F_DMA)) != 0)
+        return PROC_IPC_ERR_INVAL;
+    if (!ipc_proc_fifo_is_span_desc(channel_id)) return PROC_IPC_ERR_INVAL;
+    if (!ptr_valid(addr, len)) return PROC_IPC_ERR_INVAL;
+    struct proc_ipc_span_desc d = {
+        .addr = (u64)(usize)addr,
+        .len = len,
+        .flags = flags,
+        .tag = tag,
+    };
+    i32 r = ipc_proc_fifo_send(principal_current(), channel_id, &d, sizeof(d));
+    if (r == PROC_IPC_OK)
+        (void)proc_soft_event(ipc_proc_fifo_owner_pid(channel_id), PROC_SOFT_EVENT_IPC_FIFO, true);
+    return r;
 }
 
 static i32 sys_ipc_fifo_recv(i32 channel_id, void *out, u32 out_max)

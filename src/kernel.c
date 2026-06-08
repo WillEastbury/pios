@@ -2048,7 +2048,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     } else if (http_streq(cmd, "proc sched")) {
         struct proc_sched_core_snapshot ps[3];
         u32 pn = proc_sched_snapshot(ps, 3);
-        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT\n");
+        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST\n");
         for (u32 i = 0; i < pn; i++) {
             http_append_u64(out, &len, max, ps[i].core);
             http_append(out, &len, max, " ");
@@ -2063,6 +2063,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, ps[i].total_ticks);
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, ps[i].preemptions);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].soft_events);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].soft_boosts);
             http_append(out, &len, max, "\n");
         }
     } else if (http_streq(cmd, "core status")) {

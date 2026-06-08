@@ -5,6 +5,7 @@
 #include "pix.h"
 #include "uart.h"
 #include "simd.h"
+#include "core_env.h"
 
 /* ---- Hook table ---- */
 
@@ -24,7 +25,7 @@ static u32 hook_count;
 
 #define MODULE_MAX_SLOTS    4
 #define MODULE_SLOT_SIZE    (256 * 1024)    /* 256 KB per module */
-#define MODULE_POOL_BASE    0x04700000UL    /* after DMA buffers */
+#define MODULE_POOL_BASE    (IPC_SHM_BASE + IPC_SHM_SIZE)
 
 struct module_slot {
     bool    used;

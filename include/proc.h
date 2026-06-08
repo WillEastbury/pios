@@ -10,6 +10,7 @@
 #include "types.h"
 #include "pipe.h"
 #include "mem_arena.h"
+#include "ipc_proc.h"
 struct irq_frame;
 
 struct paged_io_stat {
@@ -67,7 +68,11 @@ struct proc_sched_core_snapshot {
     u64 idle_ticks;
     u64 total_ticks;
     u64 preemptions;
+    u64 soft_events;
+    u64 soft_boosts;
 } PACKED;
+
+#define PROC_SOFT_EVENT_IPC_FIFO  1U
 
 #define PROC_IMAGE_FORMAT_NONE     0U
 #define PROC_IMAGE_FORMAT_FLAT     1U
@@ -382,6 +387,7 @@ struct kernel_api {
                            u32 peer_acl, u32 depth, u32 msg_max);
     i32 (*ipc_fifo_open)(const char *name, u32 want_acl);
     i32 (*ipc_fifo_send)(i32 channel_id, const void *data, u32 len);
+    i32 (*ipc_fifo_send_span)(i32 channel_id, const void *addr, u32 len, u32 flags, u64 tag);
     i32 (*ipc_fifo_recv)(i32 channel_id, void *out, u32 out_max); /* returns msg len */
     i32 (*ipc_shm_create)(const char *name, u32 peer_principal, u32 owner_acl,
                           u32 peer_acl, u32 size);
@@ -433,6 +439,7 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms);
 void proc_irq_maybe_preempt(struct irq_frame *frame);
 u64  proc_preemptions(void);
 u32  proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries);
+bool proc_soft_event(u32 target_pid, u32 event_type, bool boost);
 u32  proc_snapshot(struct proc_ui_entry *out, u32 max_entries);
 void *proc_span_rent(u32 bytes, u32 align, u32 type);
 bool proc_span_release(void *ptr);

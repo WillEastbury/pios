@@ -18,7 +18,7 @@ SECTIONS
     .data      : { *(.data*) } :data
 
     . = ALIGN(16);
-    .bss (NOLOAD) : {
+    .bss . (NOLOAD) : {
         __bss_start = .;
         *(.bss*)
         *(COMMON)

@@ -8,7 +8,7 @@ There are 16 FIFO channels arranged in a 4×4 grid (`fifo[src][dst]`). The diago
 
 ## FIFO Location
 
-FIFOs live in shared memory at `SHARED_FIFO_BASE` (0x04200000), outside any core's private RAM. Total: 1MB.
+FIFOs live in shared memory at `SHARED_FIFO_BASE` (0x04800000), outside any core's private RAM. Total: 1MB.
 
 ## Message Format
 
@@ -153,7 +153,7 @@ Fence semantics:
 
 Current scope and MMU integration:
 
-- SHM regions come from a bounded kernel-managed 1MB pool at `IPC_SHM_BASE` (`0x04700000`).
+- SHM regions come from a bounded kernel-managed 1MB pool at `IPC_SHM_BASE` (`0x04D00000`).
 - User process tables map this window alongside existing FIFO/DMA shared windows.
 - Mapping granularity is region-level via handles (no user page-table edits from userspace).
 - FIFO/SHM objects are core-local in this milestone; cross-core open/send/map attempts return `PROC_IPC_ERR_UNSUPPORTED`.

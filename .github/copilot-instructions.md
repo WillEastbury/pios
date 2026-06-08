@@ -50,13 +50,14 @@ Cores communicate **only** through lock-free SPSC FIFOs (`fifo.h`). No shared mu
 
 ```
 0x00080000          Kernel image (loaded by GPU firmware)
-0x00200000 +16MB    Core 0 private RAM
-0x01200000 +16MB    Core 1 private RAM
-0x02200000 +16MB    Core 2 private RAM
-0x03200000 +16MB    Core 3 private RAM
-0x04200000 +1MB     Shared FIFO rings
-0x04300000 +2MB     DMA NET buffers
-0x04500000 +2MB     DMA DISK buffers
+0x00800000 +16MB    Core 0 private RAM
+0x01800000 +16MB    Core 1 private RAM
+0x02800000 +16MB    Core 2 private RAM
+0x03800000 +16MB    Core 3 private RAM
+0x04800000 +1MB     Shared FIFO rings
+0x04900000 +2MB     DMA NET buffers
+0x04B00000 +2MB     DMA DISK buffers
+0x04D00000 +1MB     Shared process IPC SHM pool
 0x107C000000        BCM2712 peripherals (device memory)
 0x1F00000000        RP1 southbridge (PCIe BAR, device memory)
 ```

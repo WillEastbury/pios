@@ -6,15 +6,15 @@
  * User cores additionally apply per-process MMU slot windows at runtime.
  *
  * Memory Map (Pi 5, assuming ≥1GB RAM):
- *   0x00080000 - 0x001FFFFF  Kernel image + BSS + stacks (~1.5MB)
- *   0x00200000 - 0x011FFFFF  Core 0 private (16MB) - Network
- *   0x01200000 - 0x021FFFFF  Core 1 private (16MB) - Disk I/O
- *   0x02200000 - 0x031FFFFF  Core 2 private (16MB) - User 0
- *   0x03200000 - 0x041FFFFF  Core 3 private (16MB) - User 1
- *   0x04200000 - 0x042FFFFF  Shared FIFO ring (1MB)
- *   0x04300000 - 0x044FFFFF  DMA NET buffers (2MB)
- *   0x04500000 - 0x046FFFFF  DMA DISK buffers (2MB)
- *   0x04700000 - 0x047FFFFF  Shared process IPC SHM pool (1MB)
+ *   0x00080000 - <__heap_start> Kernel image + BSS + stacks/static reservations
+ *   0x00800000 - 0x017FFFFF  Core 0 private (16MB) - Network
+ *   0x01800000 - 0x027FFFFF  Core 1 private (16MB) - Disk I/O
+ *   0x02800000 - 0x037FFFFF  Core 2 private (16MB) - User 0
+ *   0x03800000 - 0x047FFFFF  Core 3 private (16MB) - User 1
+ *   0x04800000 - 0x048FFFFF  Shared FIFO ring (1MB)
+ *   0x04900000 - 0x04AFFFFF  DMA NET buffers (2MB)
+ *   0x04B00000 - 0x04CFFFFF  DMA DISK buffers (2MB)
+ *   0x04D00000 - 0x04DFFFFF  Shared process IPC SHM pool (1MB)
  */
 
 #pragma once
@@ -22,21 +22,21 @@
 
 #define CORE_PRIV_SIZE      0x01000000UL  /* 16MB per core */
 
-#define CORE0_RAM_BASE      0x00200000UL
-#define CORE1_RAM_BASE      0x01200000UL
-#define CORE2_RAM_BASE      0x02200000UL
-#define CORE3_RAM_BASE      0x03200000UL
+#define CORE0_RAM_BASE      0x00800000UL
+#define CORE1_RAM_BASE      0x01800000UL
+#define CORE2_RAM_BASE      0x02800000UL
+#define CORE3_RAM_BASE      0x03800000UL
 
-#define SHARED_FIFO_BASE    0x04200000UL
+#define SHARED_FIFO_BASE    0x04800000UL
 #define SHARED_FIFO_SIZE    0x00100000UL  /* 1MB */
 
-#define DMA_NET_BASE        0x04300000UL
+#define DMA_NET_BASE        0x04900000UL
 #define DMA_NET_SIZE        0x00200000UL  /* 2MB */
 
-#define DMA_DISK_BASE       0x04500000UL
+#define DMA_DISK_BASE       0x04B00000UL
 #define DMA_DISK_SIZE       0x00200000UL  /* 2MB */
 
-#define IPC_SHM_BASE        0x04700000UL
+#define IPC_SHM_BASE        0x04D00000UL
 #define IPC_SHM_SIZE        0x00100000UL  /* 1MB */
 
 static const u64 core_ram_bases[4] = {

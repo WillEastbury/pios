@@ -14,6 +14,7 @@ struct proc_fifo_channel {
     u32 peer_acl;
     u32 depth;
     u32 msg_max;
+    u32 flags;
     u32 head;
     u32 count;
     u16 lens[PROC_IPC_FIFO_DEPTH_MAX];
@@ -137,6 +138,7 @@ i32 ipc_proc_fifo_create(u32 owner_principal, u32 owner_pid, const char *name,
         return PROC_IPC_ERR_INVAL;
     if (depth == 0 || depth > PROC_IPC_FIFO_DEPTH_MAX) return PROC_IPC_ERR_INVAL;
     if (msg_max == 0 || msg_max > PROC_IPC_FIFO_MSG_MAX) return PROC_IPC_ERR_INVAL;
+    u32 flags = (msg_max == sizeof(struct proc_ipc_span_desc)) ? PROC_IPC_FIFO_F_SPAN_DESC : 0;
     if (fifo_find_by_name(name) >= 0) return PROC_IPC_ERR_EXISTS;
     if ((owner_acl & (PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV)) == 0)
         return PROC_IPC_ERR_INVAL;
@@ -157,6 +159,7 @@ i32 ipc_proc_fifo_create(u32 owner_principal, u32 owner_pid, const char *name,
         ch->peer_acl = peer_acl;
         ch->depth = depth;
         ch->msg_max = msg_max;
+        ch->flags = flags;
         copy_bytes(ch->name, name, PROC_IPC_NAME_MAX + 1);
         dmb();
         return (i32)i;
@@ -224,6 +227,25 @@ i32 ipc_proc_fifo_recv(u32 principal, i32 channel_id, void *out, u32 out_max, u3
     ch->count--;
     *len_out = len;
     return PROC_IPC_OK;
+}
+
+u32 ipc_proc_fifo_owner_pid(i32 channel_id)
+{
+    if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX)
+        return 0;
+    struct proc_fifo_channel *ch = &g_fifos[channel_id];
+    if (!ch->used || ch->owner_core != core_id())
+        return 0;
+    return ch->owner_pid;
+}
+
+bool ipc_proc_fifo_is_span_desc(i32 channel_id)
+{
+    if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX)
+        return false;
+    struct proc_fifo_channel *ch = &g_fifos[channel_id];
+    return ch->used && ch->owner_core == core_id() &&
+           ((ch->flags & PROC_IPC_FIFO_F_SPAN_DESC) != 0);
 }
 
 i32 ipc_proc_shm_create(u32 owner_principal, u32 owner_pid, const char *name,

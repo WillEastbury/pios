@@ -78,7 +78,7 @@ IPS   = 2      36-bit PA
   - kernel low 2MB (kernel image + scheduler data/stack)
   - current process 2MB slot
   - shared FIFO + DMA windows
-  - shared process IPC SHM pool (`0x04700000-0x047FFFFF`)
+  - shared process IPC SHM pool (`0x04D00000-0x04DFFFFF`)
   - peripheral MMIO windows required by current kernel API ABI
 
 This blocks direct access to other process slots and other cores' private 16MB regions.

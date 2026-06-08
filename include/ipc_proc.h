@@ -28,6 +28,19 @@
 #define PROC_IPC_PERM_MAP_READ     0x04U
 #define PROC_IPC_PERM_MAP_WRITE    0x08U
 
+#define PROC_IPC_FIFO_F_SPAN_DESC  0x00000001U
+
+#define PROC_IPC_SPAN_F_SHARED     0x00000001U
+#define PROC_IPC_SPAN_F_READONLY   0x00000002U
+#define PROC_IPC_SPAN_F_DMA        0x00000004U
+
+struct proc_ipc_span_desc {
+    u64 addr;
+    u32 len;
+    u32 flags;
+    u64 tag;
+} PACKED;
+
 #define PROC_IPC_MAP_READ          0x01U
 #define PROC_IPC_MAP_WRITE         0x02U
 #define PROC_IPC_MAP_EXEC          0x04U /* Explicitly unsupported for this milestone. */
@@ -40,6 +53,8 @@ i32 ipc_proc_fifo_create(u32 owner_principal, u32 owner_pid, const char *name,
 i32 ipc_proc_fifo_open(u32 principal, u32 pid, const char *name, u32 want_acl);
 i32 ipc_proc_fifo_send(u32 principal, i32 channel_id, const void *data, u32 len);
 i32 ipc_proc_fifo_recv(u32 principal, i32 channel_id, void *out, u32 out_max, u32 *len_out);
+u32 ipc_proc_fifo_owner_pid(i32 channel_id);
+bool ipc_proc_fifo_is_span_desc(i32 channel_id);
 
 i32 ipc_proc_shm_create(u32 owner_principal, u32 owner_pid, const char *name,
                         u32 peer_principal, u32 owner_acl, u32 peer_acl,
