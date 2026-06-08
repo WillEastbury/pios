@@ -1381,12 +1381,10 @@ static void proc_handle_bench_echo(void)
         return;
     u32 sn = fifo_span_pop_batch(core_id(), CORE_NET, spans, 16);
     if (sn) {
-        struct fifo_msg ack = {0};
-        ack.type = MSG_ACK;
-        ack.status = 0;
-        ack.length = sn;
-        ack.tag = spans[sn - 1].tag;
-        fifo_push(core_id(), CORE_NET, &ack);
+        struct fifo_span_msg done = spans[sn - 1];
+        done.len = sn;
+        done.aux = PROC_IPC_OK;
+        fifo_span_push_batch(core_id(), CORE_NET, &done, 1);
     }
     struct fifo_msg msg;
     while (fifo_peek(core_id(), CORE_NET, &msg) &&
@@ -1990,6 +1988,7 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         out->cross_batch_ticks = 0;
         out->cross_ring_batch_ticks = 0;
         out->cross_span_ring_ticks = 0;
+        out->cross_span_all_ticks = 0;
         out->sev_ticks = 0;
         return false;
     }
@@ -2244,9 +2243,11 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         t1 = proc_sched_counter_ticks();
         out->cross_ring_batch_ticks = t1 >= t0 ? t1 - t0 : 0;
 
+        struct fifo_span_msg sb[16];
         while (fifo_pop(CORE_NET, CORE_USERM, &r))
             ;
-        struct fifo_span_msg sb[16];
+        while (fifo_span_pop_batch(CORE_NET, CORE_USERM, sb, 16))
+            ;
         sent = 0;
         t0 = proc_sched_counter_ticks();
         while (sent < iterations) {
@@ -2263,14 +2264,58 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
             if (fifo_span_push_batch(CORE_NET, CORE_USERM, sb, n) != n)
                 errors++;
             u32 spins = 1000000U;
-            while (!fifo_pop(CORE_NET, CORE_USERM, &r) && spins--)
+            u32 got = 0;
+            while (got == 0 && spins--) {
+                got = fifo_span_pop_batch(CORE_NET, CORE_USERM, sb, 16);
                 ;
-            if (spins == 0 || r.type != MSG_ACK)
+            }
+            if (spins == 0 || got == 0 || got > n)
                 errors++;
             sent += n;
         }
         t1 = proc_sched_counter_ticks();
         out->cross_span_ring_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+        const u32 targets[3] = { CORE_USERM, CORE_USER0, CORE_USER1 };
+        for (u32 ti = 0; ti < 3; ti++) {
+            while (fifo_pop(CORE_NET, targets[ti], &r))
+                ;
+            while (fifo_span_pop_batch(CORE_NET, targets[ti], sb, 16))
+                ;
+        }
+        sent = 0;
+        t0 = proc_sched_counter_ticks();
+        while (sent < iterations) {
+            u32 pending[3] = {0, 0, 0};
+            for (u32 ti = 0; ti < 3 && sent < iterations; ti++) {
+                u32 n = iterations - sent;
+                if (n > micro_full) n = micro_full;
+                for (u32 i = 0; i < n; i++) {
+                    sb[i].addr = (u64)(usize)copy_src;
+                    sb[i].tag = 0xA1100000ULL | (sent + i);
+                    sb[i].len = 2048;
+                    sb[i].flags = PROC_IPC_SPAN_F_READONLY;
+                    sb[i].aux = ti;
+                    sb[i]._pad = 0;
+                }
+                if (fifo_span_push_batch(CORE_NET, targets[ti], sb, n) != n)
+                    errors++;
+                pending[ti] = n;
+                sent += n;
+            }
+            for (u32 ti = 0; ti < 3; ti++) {
+                if (!pending[ti])
+                    continue;
+                u32 spins = 1000000U;
+                u32 got = 0;
+                while (got == 0 && spins--)
+                    got = fifo_span_pop_batch(CORE_NET, targets[ti], sb, 16);
+                if (spins == 0 || got == 0 || got > pending[ti])
+                    errors++;
+            }
+        }
+        t1 = proc_sched_counter_ticks();
+        out->cross_span_all_ticks = t1 >= t0 ? t1 - t0 : 0;
     }
 
     t0 = proc_sched_counter_ticks();
