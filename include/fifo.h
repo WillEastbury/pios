@@ -55,7 +55,9 @@ struct fifo {
 
 void  fifo_init_all(void);
 bool  fifo_push(u32 src_core, u32 dst_core, const struct fifo_msg *msg);
+u32   fifo_push_batch(u32 src_core, u32 dst_core, const struct fifo_msg *msgs, u32 count);
 bool  fifo_peek(u32 dst_core, u32 src_core, struct fifo_msg *msg);
 bool  fifo_pop(u32 dst_core, u32 src_core, struct fifo_msg *msg);
+u32   fifo_pop_batch(u32 dst_core, u32 src_core, struct fifo_msg *msgs, u32 max_count);
 bool  fifo_empty(u32 dst_core, u32 src_core);
 u32   fifo_count(u32 dst_core, u32 src_core);

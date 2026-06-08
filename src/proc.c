@@ -1375,6 +1375,7 @@ static void proc_preempt_trampoline(void)
 
 static void proc_handle_bench_echo(void)
 {
+    struct fifo_msg batch[16];
     if (!on_user_core())
         return;
     struct fifo_msg msg;
@@ -1383,12 +1384,9 @@ static void proc_handle_bench_echo(void)
         if (!fifo_pop(core_id(), CORE_NET, &msg))
             break;
         if (msg.type == MSG_BENCH_BATCH) {
-            for (u32 i = 1; i < msg.length; i++) {
-                struct fifo_msg extra;
-                if (!fifo_peek(core_id(), CORE_NET, &extra) || extra.type != MSG_BENCH_BATCH)
-                    break;
-                (void)fifo_pop(core_id(), CORE_NET, &extra);
-            }
+            u32 want = msg.length > 16U ? 16U : msg.length;
+            if (want > 1)
+                (void)fifo_pop_batch(core_id(), CORE_NET, batch, want - 1U);
         }
         msg.type = MSG_ACK;
         msg.status = 0;
@@ -1980,6 +1978,7 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         out->span2048_ticks = 0;
         out->cross_fifo_ticks = 0;
         out->cross_batch_ticks = 0;
+        out->cross_ring_batch_ticks = 0;
         out->sev_ticks = 0;
         return false;
     }
@@ -2203,6 +2202,36 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         }
         t1 = proc_sched_counter_ticks();
         out->cross_micro_partial_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+        while (fifo_pop(CORE_NET, CORE_USERM, &r))
+            ;
+        struct fifo_msg mb[16];
+        sent = 0;
+        t0 = proc_sched_counter_ticks();
+        while (sent < iterations) {
+            u32 n = iterations - sent;
+            if (n > micro_full) n = micro_full;
+            for (u32 i = 0; i < n; i++) {
+                mb[i].type = MSG_BENCH_BATCH;
+                mb[i].param = sizeof(desc);
+                mb[i].buffer = (u64)(usize)&bench_payload;
+                mb[i].length = n;
+                mb[i].status = 0;
+                mb[i].tag = 0xF1F00000ULL | (sent + i);
+                mb[i].timestamp = t0;
+                mb[i]._reserved = 0;
+            }
+            if (fifo_push_batch(CORE_NET, CORE_USERM, mb, n) != n)
+                errors++;
+            u32 spins = 1000000U;
+            while (!fifo_pop(CORE_NET, CORE_USERM, &r) && spins--)
+                ;
+            if (spins == 0 || r.type != MSG_ACK)
+                errors++;
+            sent += n;
+        }
+        t1 = proc_sched_counter_ticks();
+        out->cross_ring_batch_ticks = t1 >= t0 ? t1 - t0 : 0;
     }
 
     t0 = proc_sched_counter_ticks();
