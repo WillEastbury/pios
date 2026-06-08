@@ -10,6 +10,7 @@
 
 #define FIFO_CAPACITY   512
 #define FIFO_MSG_SIZE   64
+#define FIFO_SPAN_CAPACITY 512
 
 /* ---- Message types ---- */
 
@@ -53,6 +54,22 @@ struct fifo {
     struct fifo_msg msgs[FIFO_CAPACITY] ALIGNED(64);
 };
 
+struct fifo_span_msg {
+    u64 addr;
+    u64 tag;
+    u32 len;
+    u32 flags;
+    u32 aux;
+    u32 _pad;
+} ALIGNED(32);
+
+struct fifo_span {
+    volatile u32 head ALIGNED(64);
+    volatile u32 tail ALIGNED(64);
+    u8 _pad[128 - 2*64];
+    struct fifo_span_msg msgs[FIFO_SPAN_CAPACITY] ALIGNED(64);
+};
+
 void  fifo_init_all(void);
 bool  fifo_push(u32 src_core, u32 dst_core, const struct fifo_msg *msg);
 u32   fifo_push_batch(u32 src_core, u32 dst_core, const struct fifo_msg *msgs, u32 count);
@@ -61,3 +78,5 @@ bool  fifo_pop(u32 dst_core, u32 src_core, struct fifo_msg *msg);
 u32   fifo_pop_batch(u32 dst_core, u32 src_core, struct fifo_msg *msgs, u32 max_count);
 bool  fifo_empty(u32 dst_core, u32 src_core);
 u32   fifo_count(u32 dst_core, u32 src_core);
+u32   fifo_span_push_batch(u32 src_core, u32 dst_core, const struct fifo_span_msg *msgs, u32 count);
+u32   fifo_span_pop_batch(u32 dst_core, u32 src_core, struct fifo_span_msg *msgs, u32 max_count);

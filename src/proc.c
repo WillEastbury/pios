@@ -1376,8 +1376,18 @@ static void proc_preempt_trampoline(void)
 static void proc_handle_bench_echo(void)
 {
     struct fifo_msg batch[16];
+    struct fifo_span_msg spans[16];
     if (!on_user_core())
         return;
+    u32 sn = fifo_span_pop_batch(core_id(), CORE_NET, spans, 16);
+    if (sn) {
+        struct fifo_msg ack = {0};
+        ack.type = MSG_ACK;
+        ack.status = 0;
+        ack.length = sn;
+        ack.tag = spans[sn - 1].tag;
+        fifo_push(core_id(), CORE_NET, &ack);
+    }
     struct fifo_msg msg;
     while (fifo_peek(core_id(), CORE_NET, &msg) &&
            (msg.type == MSG_BENCH_ECHO || msg.type == MSG_BENCH_BATCH)) {
@@ -1979,6 +1989,7 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         out->cross_fifo_ticks = 0;
         out->cross_batch_ticks = 0;
         out->cross_ring_batch_ticks = 0;
+        out->cross_span_ring_ticks = 0;
         out->sev_ticks = 0;
         return false;
     }
@@ -2232,6 +2243,34 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         }
         t1 = proc_sched_counter_ticks();
         out->cross_ring_batch_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+        while (fifo_pop(CORE_NET, CORE_USERM, &r))
+            ;
+        struct fifo_span_msg sb[16];
+        sent = 0;
+        t0 = proc_sched_counter_ticks();
+        while (sent < iterations) {
+            u32 n = iterations - sent;
+            if (n > micro_full) n = micro_full;
+            for (u32 i = 0; i < n; i++) {
+                sb[i].addr = (u64)(usize)copy_src;
+                sb[i].tag = 0x5A5A0000ULL | (sent + i);
+                sb[i].len = 2048;
+                sb[i].flags = PROC_IPC_SPAN_F_READONLY;
+                sb[i].aux = 0;
+                sb[i]._pad = 0;
+            }
+            if (fifo_span_push_batch(CORE_NET, CORE_USERM, sb, n) != n)
+                errors++;
+            u32 spins = 1000000U;
+            while (!fifo_pop(CORE_NET, CORE_USERM, &r) && spins--)
+                ;
+            if (spins == 0 || r.type != MSG_ACK)
+                errors++;
+            sent += n;
+        }
+        t1 = proc_sched_counter_ticks();
+        out->cross_span_ring_ticks = t1 >= t0 ? t1 - t0 : 0;
     }
 
     t0 = proc_sched_counter_ticks();

@@ -15,6 +15,12 @@ static inline struct fifo *get_fifo(u32 src, u32 dst) {
                            ((usize)src * 4 + dst) * sizeof(struct fifo));
 }
 
+static inline struct fifo_span *get_span_fifo(u32 src, u32 dst) {
+    return (struct fifo_span *)(SHARED_FIFO_BASE +
+                                (16U * sizeof(struct fifo)) +
+                                ((usize)src * 4 + dst) * sizeof(struct fifo_span));
+}
+
 void fifo_init_all(void) {
     /* Zero the entire shared FIFO region with NEON */
     simd_zero((void *)SHARED_FIFO_BASE, SHARED_FIFO_SIZE);
@@ -34,6 +40,7 @@ bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {
     simd_memcpy(&f->msgs[head], msg, sizeof(struct fifo_msg));
     dmb();              /* msg visible before head update */
     f->head = next;
+    dsb();              /* head visible before event signal */
     sev();              /* wake sleeping cores */
     return true;
 }
@@ -56,6 +63,7 @@ u32 fifo_push_batch(u32 src, u32 dst, const struct fifo_msg *msgs, u32 count) {
     if (pushed) {
         dmb();
         f->head = head;
+        dsb();
         sev();
     }
     return pushed;
@@ -117,4 +125,48 @@ u32 fifo_count(u32 dst, u32 src) {
     u32 h = f->head;
     u32 t = f->tail;
     return (h - t) & (FIFO_CAPACITY - 1);
+}
+
+u32 fifo_span_push_batch(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32 count) {
+    if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
+    struct fifo_span *f = get_span_fifo(src, dst);
+    u32 head = f->head;
+    u32 tail = f->tail;
+    u32 pushed = 0;
+
+    while (pushed < count) {
+        u32 next = (head + 1) & (FIFO_SPAN_CAPACITY - 1);
+        if (unlikely(next == tail))
+            break;
+        f->msgs[head] = msgs[pushed];
+        head = next;
+        pushed++;
+    }
+    if (pushed) {
+        dmb();
+        f->head = head;
+        dsb();
+        sev();
+    }
+    return pushed;
+}
+
+u32 fifo_span_pop_batch(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_count) {
+    if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
+    struct fifo_span *f = get_span_fifo(src, dst);
+    u32 tail = f->tail;
+    u32 head = f->head;
+    u32 popped = 0;
+
+    dmb();
+    while (popped < max_count && tail != head) {
+        msgs[popped] = f->msgs[tail];
+        tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
+        popped++;
+    }
+    if (popped) {
+        dmb();
+        f->tail = tail;
+    }
+    return popped;
 }
