@@ -370,11 +370,9 @@ i32 sock_recv_nb(i32 fd, void *buf, u32 len) {
 /*  Core 0 side: process socket FIFO requests from user cores          */
 /* ================================================================== */
 
-void socket_handle_fifo(u32 from_core) {
-    struct fifo_msg msg;
-    if (!fifo_pop(CORE_NET, from_core, &msg))
-        return;
-
+static void socket_handle_msg(u32 from_core, const struct fifo_msg *req)
+{
+    struct fifo_msg msg = *req;
     struct fifo_msg reply = {0};
     reply.tag = msg.tag;
     reply.type = MSG_SOCK_RESULT;
@@ -493,6 +491,13 @@ void socket_handle_fifo(u32 from_core) {
     default:
         break;
     }
+}
+
+void socket_handle_fifo(u32 from_core) {
+    struct fifo_msg msgs[16];
+    u32 n = fifo_pop_batch(CORE_NET, from_core, msgs, 16);
+    for (u32 i = 0; i < n; i++)
+        socket_handle_msg(from_core, &msgs[i]);
 }
 
 void socket_init(void) {
