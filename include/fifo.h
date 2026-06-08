@@ -30,6 +30,7 @@
 #define MSG_NET_LINK_DOWN   15
 
 /* Generic */
+#define MSG_BENCH_BATCH     252
 #define MSG_BENCH_ECHO      253
 #define MSG_PING            254
 #define MSG_ACK             255
