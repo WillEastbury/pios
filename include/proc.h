@@ -89,6 +89,8 @@ struct proc_ipc_bench_result {
     u64 span2048_ticks;
     u64 cross_fifo_ticks;
     u64 cross_batch_ticks;
+    u64 cross_micro_full_ticks;
+    u64 cross_micro_partial_ticks;
     u64 sev_ticks;
 } PACKED;
 

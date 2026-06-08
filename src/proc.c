@@ -2143,6 +2143,66 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         }
         t1 = proc_sched_counter_ticks();
         out->cross_batch_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+        while (fifo_pop(CORE_NET, CORE_USERM, &r))
+            ;
+        const u32 micro_full = 16U;
+        const u32 micro_partial = 4U;
+        sent = 0;
+        t0 = proc_sched_counter_ticks();
+        while (sent < iterations) {
+            u32 n = iterations - sent;
+            if (n > micro_full) n = micro_full;
+            for (u32 i = 0; i < n; i++) {
+                m.type = MSG_BENCH_BATCH;
+                m.param = sizeof(desc);
+                m.buffer = (u64)(usize)&bench_payload;
+                m.length = n;
+                m.status = 0;
+                m.tag = 0xF0110000ULL | (sent + i);
+                m.timestamp = t0;
+                m._reserved = 0;
+                if (!fifo_push(CORE_NET, CORE_USERM, &m))
+                    errors++;
+            }
+            u32 spins = 1000000U;
+            while (!fifo_pop(CORE_NET, CORE_USERM, &r) && spins--)
+                ;
+            if (spins == 0 || r.type != MSG_ACK)
+                errors++;
+            sent += n;
+        }
+        t1 = proc_sched_counter_ticks();
+        out->cross_micro_full_ticks = t1 >= t0 ? t1 - t0 : 0;
+
+        while (fifo_pop(CORE_NET, CORE_USERM, &r))
+            ;
+        sent = 0;
+        t0 = proc_sched_counter_ticks();
+        while (sent < iterations) {
+            u32 n = iterations - sent;
+            if (n > micro_partial) n = micro_partial;
+            for (u32 i = 0; i < n; i++) {
+                m.type = MSG_BENCH_BATCH;
+                m.param = sizeof(desc);
+                m.buffer = (u64)(usize)&bench_payload;
+                m.length = n;
+                m.status = 0;
+                m.tag = 0xF0040000ULL | (sent + i);
+                m.timestamp = t0;
+                m._reserved = 0;
+                if (!fifo_push(CORE_NET, CORE_USERM, &m))
+                    errors++;
+            }
+            u32 spins = 1000000U;
+            while (!fifo_pop(CORE_NET, CORE_USERM, &r) && spins--)
+                ;
+            if (spins == 0 || r.type != MSG_ACK)
+                errors++;
+            sent += n;
+        }
+        t1 = proc_sched_counter_ticks();
+        out->cross_micro_partial_ticks = t1 >= t0 ? t1 - t0 : 0;
     }
 
     t0 = proc_sched_counter_ticks();

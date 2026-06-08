@@ -2628,6 +2628,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, b.cross_fifo_ticks);
         http_append(out, &len, max, " cross_batch_ticks=");
         http_append_u64(out, &len, max, b.cross_batch_ticks);
+        http_append(out, &len, max, " micro_full_ticks=");
+        http_append_u64(out, &len, max, b.cross_micro_full_ticks);
+        http_append(out, &len, max, " micro_part_ticks=");
+        http_append_u64(out, &len, max, b.cross_micro_partial_ticks);
         http_append(out, &len, max, " sev_ticks=");
         http_append_u64(out, &len, max, b.sev_ticks);
         if (b.iterations) {
@@ -2649,6 +2653,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, b.cross_fifo_ticks / b.iterations);
             http_append(out, &len, max, " cross_batch_per=");
             http_append_u64(out, &len, max, b.cross_batch_ticks / b.iterations);
+            http_append(out, &len, max, " micro_full_per=");
+            http_append_u64(out, &len, max, b.cross_micro_full_ticks / b.iterations);
+            http_append(out, &len, max, " micro_part_per=");
+            http_append_u64(out, &len, max, b.cross_micro_partial_ticks / b.iterations);
             http_append(out, &len, max, " sev_per=");
             http_append_u64(out, &len, max, b.sev_ticks / b.iterations);
         }
