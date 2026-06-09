@@ -36,6 +36,17 @@ static u32  rows;
 static u32  reserved_rows;
 static bool console_wrapped;
 
+/* ── C64-style screen border ──
+ * A gradient frame is painted around the whole panel and the text console +
+ * status bars are inset inside it (an homage to Commodore loading screens).
+ * The gradient sweeps green→blue→green around the perimeter, seamlessly.
+ * Inset stays 0 on the tiny stage0 bootstrap (full-bleed, unchanged). */
+#define FB_BORDER_PX 32u   /* thickness of the gradient frame */
+#define FB_INSET_PX  40u   /* where content starts (border + ~8px gap) */
+static u32 fb_inset_x;     /* content origin x; 0 = border disabled */
+static u32 fb_inset_y;     /* content origin y; 0 = border disabled */
+static void fb_draw_border(void);
+
 #ifndef PIOS_FB_NO_DOUBLE_BUFFER
 /* Render target: the cached back buffer when double-buffered, else the
  * VideoCore scanout buffer directly. */
@@ -357,8 +368,20 @@ bool fb_init(u32 width, u32 height) {
     fb_size   = raw_size;
     cursor_x  = 0;
     cursor_y  = 0;
-    cols      = width / 8;
-    rows      = height / 8;
+    /* Inset the console inside the gradient border when the panel is large
+     * enough to host it. Disabled (inset 0) on the stage0 bootstrap so the
+     * boot-critical early console keeps its exact full-bleed behaviour. */
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+    if (width > 2u * FB_INSET_PX + 64u && height > 2u * FB_INSET_PX + 64u) {
+        fb_inset_x = FB_INSET_PX;
+        fb_inset_y = FB_INSET_PX;
+    } else {
+        fb_inset_x = 0;
+        fb_inset_y = 0;
+    }
+#endif
+    cols      = (width  - 2u * fb_inset_x) / 8;
+    rows      = (height - 2u * fb_inset_y) / 8;
 
     /* Fallback if pitch wasn't returned */
     if (fb_pitch == 0)
@@ -383,6 +406,53 @@ bool fb_init(u32 width, u32 height) {
     return true;
 }
 
+/* Perimeter gradient colour for clockwise arc-length s (0..P, P=2*(W+H)).
+ * Green at the top-left corner (s=0 and s=P), blue at the bottom-right
+ * (s=P/2); the triangle blend makes adjacent edges meet seamlessly. */
+static inline u32 fb_border_color(u32 s) {
+    u32 P = 2u * (fb_width + fb_height);
+    if (P == 0) return 0;
+    u32 half = P / 2u;
+    if (half == 0) return 0;
+    u32 d = (s <= half) ? s : (P - s);              /* 0..half */
+    u32 t = (u32)(((u64)d * 256u) / half);          /* 0..256, 0=green 256=blue */
+    if (t > 256u) t = 256u;
+    u32 g = (0xC0u * (256u - t) + 0x20u * t) >> 8;  /* green 0xC0→0x20 */
+    u32 b = (0x10u * (256u - t) + 0xF0u * t) >> 8;  /* blue  0x10→0xF0 */
+    return (g << 8) | b;                            /* 0x00RRGGBB, R=0 */
+}
+
+/* Paint the gradient frame around the panel edges. Drawn by fb_clear; the
+ * console and status bars never write into the border band, so it persists. */
+static void fb_draw_border(void) {
+    if (!fb_ptr || (fb_inset_x == 0 && fb_inset_y == 0))
+        return;
+    u32 W = fb_width, H = fb_height, B = FB_BORDER_PX;
+    if (W < 2u * B || H < 2u * B)
+        return;
+    u32 *base = fb_rt();
+    /* Top & bottom bands span the full width; colour depends on column x. */
+    for (u32 x = 0; x < W; x++) {
+        u32 ctop = fb_border_color(x);
+        u32 cbot = fb_border_color(W + H + (W - 1 - x));
+        for (u32 y = 0; y < B; y++) {
+            *(u32 *)((u8 *)base + y * fb_pitch + x * 4) = ctop;
+            *(u32 *)((u8 *)base + (H - 1 - y) * fb_pitch + x * 4) = cbot;
+        }
+    }
+    /* Left & right bands fill between the corners; colour depends on row y. */
+    for (u32 y = B; y < H - B; y++) {
+        u32 cl = fb_border_color(2u * W + H + (H - 1 - y));
+        u32 cr = fb_border_color(W + y);
+        u32 *row = (u32 *)((u8 *)base + y * fb_pitch);
+        for (u32 x = 0; x < B; x++) {
+            row[x] = cl;
+            row[W - 1 - x] = cr;
+        }
+    }
+    fb_mark_dirty(0, H);
+}
+
 void fb_clear(u32 color) {
     /* Use VideoCore-reported size to cover the entire allocation */
     u32 *dst = fb_rt();
@@ -393,6 +463,7 @@ void fb_clear(u32 color) {
     cursor_x = 0;
     cursor_y = 0;
     console_wrapped = false;
+    fb_draw_border();              /* repaint the frame over the cleared field */
     fb_mark_dirty(0, fb_height);
 }
 
@@ -417,29 +488,33 @@ void fb_status_block(u32 color) {
     if (!fb_ptr || fb_width == 0 || fb_height == 0) return;
 
     u32 step = FB_STAT_STEP;
-    u32 cols = fb_width / step;
+    u32 cx0  = fb_inset_x;                       /* stay inside the L/R border */
+    u32 cw   = fb_width - 2u * fb_inset_x;        /* content width */
+    u32 cols = cw / step;
     if (cols == 0) return;
 
-    u32 y_base = fb_height - step - fb_stat_y_off * step;
-    /* If we've climbed past the top quarter of the screen, wrap back to bottom. */
-    if (y_base < fb_height / 4) {
+    u32 bottom = fb_height - fb_inset_y;          /* just above the bottom border */
+    u32 ceil_y = fb_inset_y + (fb_height - 2u * fb_inset_y) / 4u;
+    u32 y_base = bottom - step - fb_stat_y_off * step;
+    /* If we've climbed past the upper quarter of the content, wrap to bottom. */
+    if (y_base < ceil_y) {
         fb_stat_y_off = 0;
         fb_stat_x = 0;
-        y_base = fb_height - step;
+        y_base = bottom - step;
     }
 
     /* When starting a new horizontal line (first slot in the row), wipe the
-     * whole strip-row to black so old blocks from previous wraps don't smear
-     * with the new line of indicators. */
+     * content-width strip-row to black so old blocks from previous wraps don't
+     * smear with the new line of indicators (the border band is left intact). */
     if (fb_stat_x == 0) {
         for (u32 dy = 0; dy < FB_STAT_BLOCK; dy++) {
             u32 *row = (u32 *)((u8 *)fb_rt() + (y_base + dy) * fb_pitch);
-            for (u32 dx = 0; dx < fb_width; dx++)
-                row[dx] = 0x00000000;
+            for (u32 dx = 0; dx < cw; dx++)
+                row[cx0 + dx] = 0x00000000;
         }
     }
 
-    u32 x_base = fb_stat_x * step;
+    u32 x_base = cx0 + fb_stat_x * step;
     for (u32 dy = 0; dy < FB_STAT_BLOCK; dy++) {
         u32 *row = (u32 *)((u8 *)fb_rt() + (y_base + dy) * fb_pitch);
         for (u32 dx = 0; dx < FB_STAT_BLOCK; dx++)
@@ -484,10 +559,12 @@ u32 fb_reserved_rows(void) {
 
 static void fb_clear_text_row(u32 cy) {
     if (!fb_ptr || cy >= rows) return;
-    u32 py = cy * 8;
+    u32 py = fb_inset_y + cy * 8;
+    u32 x0 = fb_inset_x;
+    u32 x1 = fb_inset_x + cols * 8;
     for (u32 row = 0; row < 8; row++) {
         u32 *scanline = (u32 *)((u8 *)fb_rt() + (py + row) * fb_pitch);
-        for (u32 x = 0; x < fb_width; x++)
+        for (u32 x = x0; x < x1; x++)
             scanline[x] = fb_bg;
     }
     fb_mark_dirty(py, py + 8);
@@ -535,8 +612,8 @@ static const u8 *fb_glyph_for_code(u32 code)
 /* Draw one 8x8 glyph at text position (cx, cy) */
 static void fb_draw_codepoint(u32 cx, u32 cy, u32 code) {
     const u8 *glyph = fb_glyph_for_code(code);
-    u32 px = cx * 8;
-    u32 py = cy * 8;
+    u32 px = fb_inset_x + cx * 8;
+    u32 py = fb_inset_y + cy * 8;
 
     for (u32 row = 0; row < 8; row++) {
         u32 *scanline = (u32 *)((u8 *)fb_rt() + (py + row) * fb_pitch);
