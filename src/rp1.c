@@ -135,21 +135,36 @@ void rp1_eth_irq_arm(void)
 void rp1_eth_host_arm(void)
 {
     const u32 eth_bit = 1U << RP1_INT_ETH;
-    /* Empirical BCM2712 MIP semantics on the current bare-metal route:
-     * CFGL_HOST=0 moves the RP1 ETH MSI-X write into HOST status bit6
-     * / GIC INTID166, while the Linux-style CFGL_HOST=~0 stays VPU-only. */
+    /* Linux-aligned MIP config (drivers/irqchip/irq-bcm2712-mip.c): host
+     * unmasked, VPU masked, and CFG*_HOST = ~0 = EDGE. The MIP delivers a
+     * momentary edge per MSI-X to the GIC; completion is the GIC EOI, not a
+     * MIP status clear. (An earlier PIOS note claimed CFGL=0 was needed for
+     * host delivery, but that mis-read the non-latching edge status register —
+     * the true signal is the GIC IRQ count, and edge mode is what sustains.) */
     rp1_eth_irq_arm();
     mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKL_HOST, 0);
     mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKH_HOST, 0);
     mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKL_VPU, 0xFFFFFFFFU);
     mmio_write(BCM2712_MIP0_BASE + MIP_INT_MASKH_VPU, 0xFFFFFFFFU);
-    mmio_write(BCM2712_MIP0_BASE + MIP_INT_CFGL_HOST, 0);
-    mmio_write(BCM2712_MIP0_BASE + MIP_INT_CFGH_HOST, 0);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_CFGL_HOST, 0xFFFFFFFFU);
+    mmio_write(BCM2712_MIP0_BASE + MIP_INT_CFGH_HOST, 0xFFFFFFFFU);
     mmio_write(BCM2712_MIP0_BASE + MIP_INT_CLEAR, eth_bit);
     rp1_write32(RP1_PCIE_APBS + RP1_REG_CLR + RP1_MSIX_CFG(RP1_INT_ETH),
                 RP1_MSIX_CFG_TEST | RP1_MSIX_CFG_IACK);
     rp1_write32(RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(RP1_INT_ETH),
                 RP1_MSIX_CFG_ENABLE | RP1_MSIX_CFG_IACK_EN);
+}
+
+/* Re-arm the RP1 ETH MSI-X after a drain: with IACK_EN set the RP1 endpoint
+ * holds off re-sending until acked, so this is what lets the next received
+ * frame generate a fresh edge into the MIP/GIC. Gating the IACK behind the
+ * RX drain (rather than firing it in the handler) bounds the interrupt rate
+ * to the packet rate and prevents the level-mode storm. */
+void rp1_eth_irq_rearm(void)
+{
+    rp1_write32(RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(RP1_INT_ETH),
+                RP1_MSIX_CFG_IACK);
+    dsb();
 }
 
 u32 rp1_mip_host_status_l(void)

@@ -12399,24 +12399,28 @@ static void core0_eth_irq_arm_host(bool oneshot)
 
 static bool core0_eth_irq_drain_and_quench(bool host_route)
 {
+    (void)host_route;
     const u32 eth_bit = 1U << RP1_INT_ETH;
     u32 passes = 0;
     bool clear = false;
+    /* Edge model: drain RX until the RP1 raw ETH source de-asserts (MACB has
+     * no more received frames), clearing the MACB ISR/RSR each pass. The MIP
+     * host status is non-latching in edge mode, so we no longer try to clear
+     * it; the GIC edge was already completed by EOI in irq_dispatch. */
     for (; passes < 8U; passes++) {
         net_poll();
         core0_eth_irq_last_macb_isr = macb_irq_ack_rx();
-        if (!host_route) {
-            core0_eth_irq_last_mip = rp1_eth_irq_ack();
-            gic_clear_pending(GIC_RP1_ETH_MSI);
-        }
         dsb();
-        if ((rp1_irq_status_l() & eth_bit) == 0 &&
-            (rp1_mip_host_status_l() & eth_bit) == 0) {
+        core0_eth_irq_last_mip = rp1_mip_host_status_l();
+        if ((rp1_irq_status_l() & eth_bit) == 0) {
             clear = true;
             break;
         }
     }
     core0_eth_irq_quench_passes = passes < 8U ? passes + 1U : passes;
+    /* Re-arm the RP1 endpoint so the next received frame produces a fresh
+     * edge. Gating this behind the drain bounds the rate to the packet rate. */
+    rp1_eth_irq_rearm();
     return clear;
 }
 
