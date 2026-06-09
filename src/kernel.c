@@ -41,6 +41,7 @@
 #include "bcache.h"
 #include "principal.h"
 #include "proc.h"
+#include "uhttp_bridge.h"
 #include "pix.h"
 #include "pcie.h"
 #include "rp1.h"
@@ -461,6 +462,7 @@ static void net_services_listen(void)
     https_tls_listen_conn = tcp_listen(HTTPS_TLS_TCP_PORT);
     debug_listen_conn = tcp_listen(DEBUG_TCP_PORT);
     admin_services_listen();
+    uhttp_bridge_init();   /* userland HTTP on :81 (kernel-terminated TCP) */
     http_log_event("net-listen", HTTP_TCP_PORT, ADMIN_STATUS_TCP_PORT);
 }
 
@@ -1523,7 +1525,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
             "Examples: status | ps | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
-            "Command help: help status | help netstat | help firewall | help reboot | help peek\n"
+            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | cachestats\n"
+            "Command help: help status | help netstat | help firewall | help reboot | help peek | help walfs | help cachestats\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
     } else if (http_starts_with(cmd, "help ")) {
         const char *topic = cmd + 5;
@@ -1554,7 +1557,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "mem")) {
             http_append(out, &len, max, "mem analyze\n  Show kernel image, raw-slot, per-core RAM, and process memory layout diagnostics.\n");
         } else if (http_streq(topic, "fs") || http_streq(topic, "ls") || http_streq(topic, "fsinspect")) {
-            http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path] | walfs status | walfs format confirm\n  WALFS listing/status plus confirmed reserved-base format.\n");
+            http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path] | walfs status | walfs verify | walfs compact | walfs format confirm\n  WALFS listing/status, integrity verify, non-destructive compact, plus confirmed reserved-base format.\n");
         } else if (http_streq(topic, "bootctrl")) {
             http_append(out, &len, max, "bootctrl status | bootctrl clear-pending | bootctrl reset-a confirm | bootctrl test-invalid-b confirm\n  Show/repair/test stage0 A/B boot-control state without host raw-disk access.\n");
         } else if (http_streq(topic, "dma")) {
@@ -1579,8 +1582,20 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "abi status | abi selftest\n  Show kernel/user ABI transition stage, ksvc foundations, and pending EL0/SVC work.\n");
         } else if (http_streq(topic, "qpu") || http_streq(topic, "tensor")) {
             http_append(out, &len, max, "qpu status | tensor selftest\n  Show V3D/QPU tensor dispatch diagnostics and verify safe NEON fallback kernels.\n");
+        } else if (http_streq(topic, "walfs") || http_streq(topic, "disk")) {
+            http_append(out, &len, max, "walfs verify | walfs compact | walfs status | walfs format confirm\n  Verify WAL metadata/record-chain integrity, compact the WAL (non-destructive), or status.\n");
+        } else if (http_streq(topic, "crypto")) {
+            http_append(out, &len, max, "crypto selftest\n  Run AES-GCM + nibble-table GHASH crypto selftest.\n");
+        } else if (http_streq(topic, "cachestats")) {
+            http_append(out, &len, max, "cachestats\n  Show WAL inode/path, DNS, and ARP LRU cache hit/miss/evict telemetry.\n");
+        } else if (http_streq(topic, "watchdog")) {
+            http_append(out, &len, max, "watchdog | watchdog status\n  Show watchdog armed/mode/timeout, trip count, last trip core, and hw remaining ticks.\n");
+        } else if (http_streq(topic, "arp")) {
+            http_append(out, &len, max, "arp probe\n  Send a gratuitous ARP (TX-path test) and report request/learn/conflict counters.\n");
+        } else if (http_streq(topic, "nic")) {
+            http_append(out, &len, max, "nic dump <on|off> | nic counters\n  Toggle raw packet dump or show processed/dropped/firewalled/rate-limited counters.\n");
         } else {
-            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls, help brotli\n");
+            http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls, help brotli, help walfs, help cachestats\n");
         }
     }
     else if (http_streq(cmd, "status")) {
@@ -2288,6 +2303,80 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else {
             http_append(out, &len, max, "usage membench <addr> [count]\n");
         }
+    } else if (http_streq(cmd, "uhttp")) {
+        i32 lc = 0; u32 st = 0, rq = 0, rs = 0, reqs = 0, magic = 0, pid = 0;
+        uhttp_bridge_state(&lc, &st, &rq, &rs, &reqs, &magic, &pid);
+        http_append(out, &len, max, "uhttp listen=");
+        http_append_u64(out, &len, max, (u64)(u32)lc);
+        http_append(out, &len, max, " state=");
+        http_append_u64(out, &len, max, st);
+        http_append(out, &len, max, " req_seq=");
+        http_append_u64(out, &len, max, rq);
+        http_append(out, &len, max, " resp_seq=");
+        http_append_u64(out, &len, max, rs);
+        http_append(out, &len, max, " reqs_total=");
+        http_append_u64(out, &len, max, reqs);
+        http_append(out, &len, max, " magic=0x");
+        http_append_hex32(out, &len, max, magic);
+        http_append(out, &len, max, " httpd_pid=");
+        http_append_u64(out, &len, max, pid);
+        u32 wp = 0, wd = 0, wf = 0;
+        proc_rwake_stats(&wp, &wd, &wf);
+        http_append(out, &len, max, " wake_posted=");
+        http_append_u64(out, &len, max, wp);
+        http_append(out, &len, max, " wake_drained=");
+        http_append_u64(out, &len, max, wd);
+        http_append(out, &len, max, " wake_full=");
+        http_append_u64(out, &len, max, wf);
+        http_append(out, &len, max, " dbg_loops=");
+        http_append_u64(out, &len, max, uhttp_bridge()->dbg_loops);
+        http_append(out, &len, max, " dbg_phase=");
+        http_append_u64(out, &len, max, uhttp_bridge()->dbg_phase);
+        http_append(out, &len, max, " hb_core2=");
+        http_append_u64(out, &len, max, proc_sched_loops(CORE_USER0));
+        http_append(out, &len, max, " hb_core3=");
+        http_append_u64(out, &len, max, proc_sched_loops(CORE_USER1));
+        {
+            u32 ce = 0, cx = 0, lp = 0;
+            proc_sched_ctx_stats(CORE_USER0, &ce, &cx, &lp);
+            http_append(out, &len, max, " c2_ctxin=");
+            http_append_u64(out, &len, max, ce);
+            http_append(out, &len, max, " c2_ctxout=");
+            http_append_u64(out, &len, max, cx);
+            http_append(out, &len, max, " c2_lastpid=");
+            http_append_u64(out, &len, max, lp);
+            http_append(out, &len, max, " c2_stage=");
+            http_append_u64(out, &len, max, proc_sched_stage_get(CORE_USER0));
+        }
+        {
+            u32 di = 0, dp = 0, dz = 0, dc = 0, dn = 0, ds = 0;
+            proc_rwake_dbg(&di, &dp, &dz, &dc, &dn, &ds);
+            http_append(out, &len, max, " d_iters=");
+            http_append_u64(out, &len, max, di);
+            http_append(out, &len, max, " d_pid=");
+            http_append_u64(out, &len, max, dp);
+            http_append(out, &len, max, " d_zero=");
+            http_append_u64(out, &len, max, dz);
+            http_append(out, &len, max, " d_calls=");
+            http_append_u64(out, &len, max, dc);
+            http_append(out, &len, max, " d_noslot=");
+            http_append_u64(out, &len, max, dn);
+            http_append(out, &len, max, " d_state=");
+            http_append_u64(out, &len, max, ds);
+        }
+        {
+            u32 ls = 0, lp = 0, dn = 0, wf = 0;
+            proc_rwake_live(CORE_USER0, &ls, &lp, &dn, &wf);
+            http_append(out, &len, max, " c2_curstate=");
+            http_append_u64(out, &len, max, ls);
+            http_append(out, &len, max, " c2_curpid=");
+            http_append_u64(out, &len, max, lp);
+            http_append(out, &len, max, " c2_disp=");
+            http_append_u64(out, &len, max, dn);
+            http_append(out, &len, max, " c2_wfe=");
+            http_append_u64(out, &len, max, wf);
+        }
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "fb info")) {
         u32 db = 0, size = 0, pitch = 0;
         fb_debug_info(&db, &size, &pitch);
@@ -3088,6 +3177,111 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "kill failed\n");
     } else if (http_starts_with(cmd, "restart ")) {
         http_append(out, &len, max, "restart blocked: process launch/restart is disabled on HTTP console until non-crashing harness exists\n");
+    } else if (http_streq(cmd, "walfs verify") || http_streq(cmd, "disk verify") ||
+               http_streq(cmd, "fs verify")) {
+        struct walfs_health h;
+        bool ok = walfs_verify(&h);
+        http_append(out, &len, max, "walfs verify ok=");
+        http_append(out, &len, max, ok ? "yes" : "no");
+        http_append(out, &len, max, " super=");
+        http_append(out, &len, max, h.super_ok ? "ok" : "bad");
+        http_append(out, &len, max, " wal_head=");
+        http_append(out, &len, max, h.wal_head_ok ? "ok" : "bad");
+        http_append(out, &len, max, " valid_records=");
+        http_append_u64(out, &len, max, h.valid_records);
+        http_append(out, &len, max, " crc_errors=");
+        http_append_u64(out, &len, max, h.crc_errors);
+        http_append(out, &len, max, " header_errors=");
+        http_append_u64(out, &len, max, h.header_errors);
+        http_append(out, &len, max, " open_tx=");
+        http_append(out, &len, max, h.open_tx ? "yes" : "no");
+        http_append(out, &len, max, " scan_end=");
+        http_append_u64(out, &len, max, h.scan_end);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "walfs compact") || http_streq(cmd, "disk compact")) {
+        bool ok = walfs_compact();
+        http_append(out, &len, max, ok ? "walfs compact OK\n" : "walfs compact FAILED\n");
+        if (ok) {
+            struct walfs_status_snapshot ws;
+            walfs_status(&ws);
+            http_append(out, &len, max, "new head=");
+            http_append_u64(out, &len, max, ws.super_head);
+            http_append(out, &len, max, " records=");
+            http_append_u64(out, &len, max, ws.super_records);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "watchdog") || http_streq(cmd, "watchdog status")) {
+        struct watchdog_status st;
+        watchdog_status(&st);
+        http_append(out, &len, max, "watchdog armed=");
+        http_append(out, &len, max, st.armed ? "yes" : "no");
+        http_append(out, &len, max, " mode=");
+        http_append(out, &len, max, st.reboot_on_trip ? "reboot" : "halt");
+        http_append(out, &len, max, " timeout_ticks=");
+        http_append_u64(out, &len, max, st.timeout_ticks);
+        http_append(out, &len, max, " trips=");
+        http_append_u64(out, &len, max, st.trip_count);
+        http_append(out, &len, max, " last_core=");
+        http_append_u64(out, &len, max, st.last_trip_core);
+        http_append(out, &len, max, " hw_remaining_ticks=");
+        http_append_u64(out, &len, max, watchdog_hw_remaining_ticks());
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "crypto selftest") || http_streq(cmd, "crypto")) {
+        bool ok = crypto_selftest();
+        http_append(out, &len, max, ok ? "crypto selftest OK (AES-GCM + GHASH nibble table)\n"
+                                       : "crypto selftest FAILED\n");
+    } else if (http_streq(cmd, "arp probe")) {
+        arp_probe();
+        const arp_stats_t *ast = arp_get_stats();
+        http_append(out, &len, max, "arp probe sent requests_sent=");
+        http_append_u64(out, &len, max, ast->requests_sent);
+        http_append(out, &len, max, " learned=");
+        http_append_u64(out, &len, max, ast->learned);
+        http_append(out, &len, max, " conflicts=");
+        http_append_u64(out, &len, max, ast->conflicts);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "nic dump on") || http_streq(cmd, "nic dump off")) {
+        bool on = http_streq(cmd, "nic dump on");
+        nic_set_packet_dump(on);
+        http_append(out, &len, max, on ? "nic packet dump ENABLED\n" : "nic packet dump disabled\n");
+    } else if (http_streq(cmd, "nic counters")) {
+        nic_packet_counters_t c;
+        nic_packet_counters(&c);
+        http_append(out, &len, max, "nic processed=");
+        http_append_u64(out, &len, max, c.processed);
+        http_append(out, &len, max, " dropped=");
+        http_append_u64(out, &len, max, c.dropped);
+        http_append(out, &len, max, " firewalled=");
+        http_append_u64(out, &len, max, c.firewalled);
+        http_append(out, &len, max, " rate_limited=");
+        http_append_u64(out, &len, max, c.rate_limited);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "cachestats")) {
+        u64 ih = 0, im = 0, ph = 0, pm = 0, dh = 0, dm = 0, dev = 0, ah = 0, am = 0, aev = 0;
+        walfs_cache_stats(&ih, &im, &ph, &pm);
+        dns_cache_stats(&dh, &dm, &dev);
+        arp_cache_stats(&ah, &am, &aev);
+        http_append(out, &len, max, "cache walfs inode_hit=");
+        http_append_u64(out, &len, max, ih);
+        http_append(out, &len, max, " inode_miss=");
+        http_append_u64(out, &len, max, im);
+        http_append(out, &len, max, " path_hit=");
+        http_append_u64(out, &len, max, ph);
+        http_append(out, &len, max, " path_miss=");
+        http_append_u64(out, &len, max, pm);
+        http_append(out, &len, max, "\ncache dns hit=");
+        http_append_u64(out, &len, max, dh);
+        http_append(out, &len, max, " miss=");
+        http_append_u64(out, &len, max, dm);
+        http_append(out, &len, max, " evict=");
+        http_append_u64(out, &len, max, dev);
+        http_append(out, &len, max, "\ncache arp hit=");
+        http_append_u64(out, &len, max, ah);
+        http_append(out, &len, max, " miss=");
+        http_append_u64(out, &len, max, am);
+        http_append(out, &len, max, " evict=");
+        http_append_u64(out, &len, max, aev);
+        http_append(out, &len, max, "\n");
     } else {
         http_append(out, &len, max, "unknown command\n");
     }
@@ -11598,6 +11792,90 @@ static bool ui_console_help_topic(const char *topic)
     return true;
 }
 
+static void ui_cmd_crypto(u32 argc, char **argv)
+{
+    if (argc >= 2 && ui_streq(argv[1], "selftest")) {
+        bool ok = crypto_selftest();
+        ui_console_write(ok ? "OK: crypto selftest passed (AES-GCM + GHASH nibble table)\n"
+                            : "ERR: crypto selftest FAILED\n");
+        return;
+    }
+    ui_console_write("usage: crypto selftest\n");
+}
+
+static void ui_cmd_arp(u32 argc, char **argv)
+{
+    if (argc >= 2 && ui_streq(argv[1], "probe")) {
+        arp_probe();
+        const arp_stats_t *st = arp_get_stats();
+        ui_console_write("OK: arp probe sent requests_sent=");
+        ui_console_u64_dec(st->requests_sent);
+        ui_console_write(" learned=");
+        ui_console_u64_dec(st->learned);
+        ui_console_write(" conflicts=");
+        ui_console_u64_dec(st->conflicts);
+        ui_console_write("\n");
+        return;
+    }
+    ui_console_write("usage: arp probe\n");
+}
+
+static void ui_cmd_nic(u32 argc, char **argv)
+{
+    if (argc >= 3 && ui_streq(argv[1], "dump")) {
+        bool on = ui_streq(argv[2], "on") || ui_streq(argv[2], "1");
+        nic_set_packet_dump(on);
+        ui_console_write(on ? "OK: nic packet dump ENABLED\n"
+                            : "OK: nic packet dump disabled\n");
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "counters")) {
+        nic_packet_counters_t c;
+        nic_packet_counters(&c);
+        ui_console_write("nic processed=");
+        ui_console_u64_dec(c.processed);
+        ui_console_write(" dropped=");
+        ui_console_u64_dec(c.dropped);
+        ui_console_write(" firewalled=");
+        ui_console_u64_dec(c.firewalled);
+        ui_console_write(" rate_limited=");
+        ui_console_u64_dec(c.rate_limited);
+        ui_console_write("\n");
+        return;
+    }
+    ui_console_write("usage: nic dump <on|off> | nic counters\n");
+}
+
+static void ui_cmd_cachestats(u32 argc, char **argv)
+{
+    (void)argc; (void)argv;
+    u64 ih = 0, im = 0, ph = 0, pm = 0, dh = 0, dm = 0, dev = 0, ah = 0, am = 0, aev = 0;
+    walfs_cache_stats(&ih, &im, &ph, &pm);
+    dns_cache_stats(&dh, &dm, &dev);
+    arp_cache_stats(&ah, &am, &aev);
+    ui_console_write("cache walfs inode_hit=");
+    ui_console_u64_dec(ih);
+    ui_console_write(" inode_miss=");
+    ui_console_u64_dec(im);
+    ui_console_write(" path_hit=");
+    ui_console_u64_dec(ph);
+    ui_console_write(" path_miss=");
+    ui_console_u64_dec(pm);
+    ui_console_write("\ncache dns hit=");
+    ui_console_u64_dec(dh);
+    ui_console_write(" miss=");
+    ui_console_u64_dec(dm);
+    ui_console_write(" evict=");
+    ui_console_u64_dec(dev);
+    ui_console_write("\ncache arp hit=");
+    ui_console_u64_dec(ah);
+    ui_console_write(" miss=");
+    ui_console_u64_dec(am);
+    ui_console_write(" evict=");
+    ui_console_u64_dec(aev);
+    ui_console_write("\n");
+}
+
 static void ui_console_exec(char *line)
 {
     char *argv[UI_CONSOLE_ARGV_MAX];
@@ -11658,6 +11936,7 @@ static void ui_console_exec(char *line)
             ui_console_write("  dma status|selftest  usb status|reinit|poll  wifi disabled\n");
             ui_console_write("  capsule ...  obs ...  hexsec <lba>\n");
             ui_console_write("  keystore status|derive <label>  edit|edit.pix <path>  clear echo\n");
+            ui_console_write("  crypto selftest  arp probe  nic dump <on|off>|counters  cachestats\n");
             ui_console_write("  addr <kind:pack/card[/tail]>\n");
         } else if (!ui_console_help_topic(argv[1])) {
             ui_console_write("ERR: unknown help topic. Try: help, help core, help status, help firewall\n");
@@ -11967,6 +12246,14 @@ static void ui_console_exec(char *line)
         ui_cmd_watchdog(argc, argv);
     } else if (ui_streq(argv[0], "bootctrl")) {
         ui_cmd_bootctrl(argc, argv);
+    } else if (ui_streq(argv[0], "crypto")) {
+        ui_cmd_crypto(argc, argv);
+    } else if (ui_streq(argv[0], "arp")) {
+        ui_cmd_arp(argc, argv);
+    } else if (ui_streq(argv[0], "nic")) {
+        ui_cmd_nic(argc, argv);
+    } else if (ui_streq(argv[0], "cachestats")) {
+        ui_cmd_cachestats(argc, argv);
     } else if (ui_streq(argv[0], "reboot")) {
         if (argc >= 2 && ui_streq(argv[1], "confirm")) {
             ui_console_write("OK: rebooting via PSCI SYSTEM_RESET...\n");
@@ -12275,7 +12562,10 @@ static void hdmi_dashboard_render(void)
     static u32 heartbeat;
     static bool layout_drawn;
     u64 now_ms = timer_monotonic_ms();
-    if (now_ms < last_ms + 1000ULL)
+    /* Self-throttle floor (900ms) sits just under the 1Hz core0_io_tick_hook
+     * DASH cadence so sub-ms beat between tick-count and monotonic-ms never
+     * skips a second, while still preventing pathological back-to-back renders. */
+    if (now_ms < last_ms + 900ULL)
         return;
 
     last_ms = now_ms;
@@ -12457,14 +12747,16 @@ static void core0_io_tick_hook(u32 core, u64 tick)
     u32 flags = 0;
     /* UART/USB stay responsive (~31Hz, cheap polls). NET/TCP drop to ~8Hz as a
      * safety net now that RX is interrupt-driven. DASH (the expensive HDMI
-     * render) drops to ~0.17Hz — it dominates core0 idle. */
+     * render) fires at 1Hz so the uptime/heartbeat tick second-by-second; the
+     * render itself self-throttles (see hdmi_dashboard_render). Timer is 1000Hz
+     * (timer_init(1000)), so 1000 ticks == 1 second. */
     if ((tick & 31U) == 0)
         flags |= CORE0_IO_UART | CORE0_IO_USB;
     if ((tick & 127U) == 0)
         flags |= CORE0_IO_NET | CORE0_IO_TCP;
     if ((tick % 100U) == 0)
         flags |= CORE0_IO_MAINT;
-    if ((tick % 8000U) == 0)
+    if ((tick % 1000U) == 0)
         flags |= CORE0_IO_DASH;
     if (flags) {
         core0_io_flags |= flags;
@@ -12674,6 +12966,7 @@ NORETURN void core0_main(void) {
         if (flags & CORE0_IO_TCP) {
             u64 svc_start = ksvc_begin(ksvc_tcp_id);
             echo_tcp_poll();
+            uhttp_bridge_poll();   /* userland :81 request/response pump */
             ksvc_end(ksvc_tcp_id, svc_start, false);
             ksvc_run(ksvc_debug_id);
         }
@@ -12764,6 +13057,9 @@ NORETURN void core1_main(void) {
 }
 
 /* Core 2: User core 0 - process scheduler */
+/* Embedded userland HTTP server flat binary (src/user_httpd_payload.S). */
+extern const u8 user_httpd_start[];
+extern const u8 user_httpd_end[];
 NORETURN void core2_main(void) {
     core_mark_online(CORE_USER0, 1);
     core_env_init(CORE_USER0);
@@ -12775,6 +13071,11 @@ NORETURN void core2_main(void) {
     core_mark_online(CORE_USER0, 4);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     core_mark_online(CORE_USER0, 5);
+    /* Launch the embedded userland HTTP server (port 81) at EL1 (direct-KPI).
+     * Failure is non-fatal: fall through to the scheduler regardless. */
+    proc_exec_from_mem("user/httpd", user_httpd_start,
+                       (u32)(usize)(user_httpd_end - user_httpd_start),
+                       PROC_PRIO_NORMAL, core_id());
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }
@@ -13238,6 +13539,25 @@ void kernel_main(void) {
         shared_tcr   = 0x200803519UL;
         bp_ok("[mmu] ON (start.S asm)");
 
+        /* Phase 1 cache-coherency cleanup: make per-core RAM + HDMI back
+         * buffer WB cacheable + Inner-Shareable (DSU-coherent); keep DMA /
+         * FIFO / IPC / scanout NC. Must run before core_start_all() so
+         * secondaries inherit the rebuilt l1_table via shared_ttbr0.
+         *
+         * TEMPORARILY GATED (PIOS_ENABLE_CACHE_REMAP=0): the live block->table
+         * remap of the first 1GB is a break-before-make hazard suspected of
+         * PiSOD-ing at boot. Gated to isolate the port-81 504 wake-path bug on
+         * a bootable kernel; re-enable once the remap is made BBM-compliant. */
+#ifndef PIOS_ENABLE_CACHE_REMAP
+#define PIOS_ENABLE_CACHE_REMAP 0
+#endif
+#if PIOS_ENABLE_CACHE_REMAP
+        mmu_enable_caching();
+        bp_ok("[mmu] cache map: core-RAM+FB WB-IS, DMA/FIFO/IPC NC");
+#else
+        bp_warn("[mmu] cache remap GATED (PIOS_ENABLE_CACHE_REMAP=0)");
+#endif
+
         bp_log("[exc] exception_init...");
         exception_init();
         bp_ok("[exc] vectors installed");
@@ -13473,6 +13793,10 @@ void kernel_main(void) {
     /* ── Phase 6: Multicore ── */
     bp_active(6);
     if (at_el1) {
+        /* Initialise the single-instance shared process tables on core 0 BEFORE
+         * launching the secondaries, so cores 1-3 never race to zero procs[] and
+         * a late core cannot wipe a process another core just created. */
+        proc_init_shared();
         bp_log("[smp] core_start_all (PSCI)...");
         core_start_all();
         bp_ok("[smp] cores 0-3 active");

@@ -5,20 +5,34 @@ set LD=%TC%\aarch64-none-elf-ld.exe
 set OC=%TC%\aarch64-none-elf-objcopy.exe
 set FULL_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2
 set BOOT_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -DPIOS_FB_NO_DOUBLE_BUFFER
+set USER_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -fno-builtin
 set ASFLAGS=-march=armv8.2-a+simd+crc+crypto
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyyyMMdd.HHmmss'"') do set BUILD_STAMP=%%i
 > include\build_version.h echo #pragma once
 >> include\build_version.h echo #define PIOS_BUILD_STAMP "%BUILD_STAMP%"
 >> include\build_version.h echo #define PIOS_VERSION "v%BUILD_STAMP%"
->> include\build_version.h echo #define PIOS_BUILD_NAME "SECOND STAGE LOADER"
->> include\build_version.h echo #define PIOS_BUILD_LABEL "SECOND STAGE LOADER v%BUILD_STAMP%"
-echo Build version: SECOND STAGE LOADER v%BUILD_STAMP%
+>> include\build_version.h echo #define PIOS_BUILD_NAME "PIOS Kernel"
+>> include\build_version.h echo #define PIOS_BUILD_LABEL "PIOS Kernel Booted and Running -> Version v%BUILD_STAMP%"
+echo Build version: PIOS Kernel v%BUILD_STAMP%
 
 if exist build rmdir /S /Q build
 if exist build_boot rmdir /S /Q build_boot
+if exist build_user rmdir /S /Q build_user
 mkdir build
 mkdir build_boot
+mkdir build_user
+
+echo Building embedded userland binaries...
+"%CC%" %ASFLAGS% -c user\ustart.S -o build_user\ustart.o
+if errorlevel 1 exit /b 1
+"%CC%" %USER_CFLAGS% -c user\httpd.c -o build_user\httpd.o
+if errorlevel 1 exit /b 1
+"%LD%" -T user\user.ld -nostdlib -o build_user\user_httpd.elf build_user\ustart.o build_user\httpd.o
+if errorlevel 1 exit /b 1
+"%OC%" -O binary build_user\user_httpd.elf user_httpd.img
+if errorlevel 1 exit /b 1
+for %%f in (user_httpd.img) do echo user_httpd.img size: %%~zf bytes
 
 echo Building full kernel as real_kernel.img...
 if not exist build mkdir build

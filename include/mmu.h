@@ -40,6 +40,13 @@
  * Call from each core after setting up page tables. */
 void mmu_init(void);
 
+/* Phase 1 cache-coherency cleanup: rebuild the live first-1GB mapping from a
+ * single NC block into a 2MB-granular L2 table, making per-core RAM and the
+ * HDMI back buffer Write-Back cacheable + Inner Shareable while keeping DMA /
+ * FIFO / IPC / VideoCore-scanout regions Non-Cacheable. Call once on core 0
+ * after the start.S MMU handoff, before secondaries launch. */
+void mmu_enable_caching(void);
+
 /* L1 page table (populated by start.S for early boot) */
 extern u64 l1_table[512];
 

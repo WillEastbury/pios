@@ -189,6 +189,8 @@ void net_firewall_install_defaults(void) {
 
     rule.tcp_port_to = 443;
     (void)nic_filter_add(&rule);
+    rule.tcp_port_to = 81;          /* userland HTTP (uhttp bridge) */
+    (void)nic_filter_add(&rule);
     rule.tcp_port_to = 8080;
     (void)nic_filter_add(&rule);
     rule.tcp_port_to = 8081;

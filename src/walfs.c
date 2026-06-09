@@ -1506,3 +1506,14 @@ void walfs_sync(void)
 {
     write_super();
 }
+
+void walfs_cache_stats(u64 *inode_hits, u64 *inode_misses, u64 *path_hits, u64 *path_misses)
+{
+    u64 ih = 0, im = 0, iev = 0, iex = 0, ph = 0, pm = 0, pev = 0, pex = 0;
+    lru_stats(&inode_cache, &ih, &im, &iev, &iex);
+    lru_stats(&path_cache, &ph, &pm, &pev, &pex);
+    if (inode_hits) *inode_hits = ih;
+    if (inode_misses) *inode_misses = im;
+    if (path_hits) *path_hits = ph;
+    if (path_misses) *path_misses = pm;
+}

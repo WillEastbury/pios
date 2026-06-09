@@ -1558,6 +1558,14 @@ u32 tcp_writable(tcp_conn_t conn) {
     return n;
 }
 
+u32 tcp_tx_pending(tcp_conn_t conn) {
+    if (!tcb_valid(conn)) return 0;
+    dmb();
+    u32 n = ring_used(&tcbs[conn].tx_buf);
+    dmb();
+    return n;
+}
+
 u32 tcp_active_count(void)
 {
     u32 n = 0;

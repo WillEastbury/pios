@@ -180,6 +180,12 @@ struct appf_service_record {
 #define PROC_SLOT_SIZE      (2 * 1024 * 1024)   /* 2MB per process */
 #define PROC_SLOT_OFFSET    0x100000             /* slots start 1MB into core RAM */
 
+/* Fixed load address for kernel-embedded flat userland binaries: core 2
+ * (CORE_USER0) RAM base 0x02800000 + PROC_SLOT_OFFSET, i.e. slot 0. Must match
+ * the link address in user/user.ld. proc_exec_from_mem refuses any other slot
+ * so absolute relocations in the flat image always resolve correctly. */
+#define PROC_EMBED_BASE     0x02900000UL
+
 /* Process states */
 #define PROC_EMPTY    0
 #define PROC_READY    1
@@ -284,6 +290,7 @@ struct kernel_api {
     i32 (*yield)(void);
     i32 (*exit)(u32 code);
     u32 (*getpid)(void);
+    i32 (*park)(void);              /* block until woken by a soft event */
 
     /* ---- Console I/O ---- */
     void (*print)(const char *msg);
@@ -449,6 +456,7 @@ typedef struct kernel_api pikee_api;
 extern void ctx_switch(struct proc_context *old, struct proc_context *new_ctx);
 
 void proc_init(void);              /* init scheduler on this core */
+void proc_init_shared(void);       /* init single-instance shared proc tables once (core 0, pre-SMP) */
 i32  proc_exec(const char *path);  /* load + start process from WALFS */
 void proc_yield(void);             /* cooperative context switch */
 NORETURN void proc_exit(u32 code); /* terminate current process */
@@ -483,6 +491,22 @@ i32  proc_restart_pid(u32 pid, u32 code);
 i32  proc_launch_on_core(u32 target_core, const char *path);
 i32  proc_launch_on_core_as(u32 target_core, const char *path, u32 principal_id);
 i32  proc_launch_on_core_as_prio(u32 target_core, const char *path, u32 principal_id, u32 priority_class);
+/* Launch a flat binary embedded in the kernel image (no WALFS). Must be called
+ * on the target core; the blob must be linked at PROC_EMBED_BASE. */
+i32  proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
+                        u32 priority_class, u32 affinity_core);
+/* Block the current process until woken (BLOCKED + yield to scheduler). */
+void proc_park(void);
+/* Post a wake for `pid` onto `target_core`'s wake ring and SEV. Safe to call
+ * from any core (including core 0); the target core's scheduler delivers it. */
+bool proc_post_remote_wake(u32 target_core, u32 pid);
+/* Diagnostics for the cross-core wake ring. */
+void proc_rwake_stats(u32 *posted, u32 *drained, u32 *full);
+u32  proc_sched_loops(u32 core);
+void proc_sched_ctx_stats(u32 core, u32 *enter, u32 *exit, u32 *last_pid);
+u32  proc_sched_stage_get(u32 core);
+void proc_rwake_dbg(u32 *iters, u32 *pid, u32 *zero, u32 *calls, u32 *noslot, u32 *state);
+void proc_rwake_live(u32 core, u32 *live_state, u32 *live_pid, u32 *disp, u32 *wfe);
 bool proc_set_priority(u32 pid, u32 priority_class);
 bool proc_set_affinity(u32 pid, u32 core);
 bool proc_validate_image_path(const char *path, struct proc_image_validation *out);

@@ -497,10 +497,14 @@ dns resolve <hostname>
 dns status
 http get <ip-or-cached-host> [path] [port] [timeout_ms]
 https get <ip-or-cached-host> [path] [port] [timeout_ms]
+arp probe
+nic dump on|off
+nic counters
 ```
 
 `netcfg routes` shows the bounded route table used by outbound TCP/UDP. `netcfg neighbors` shows the dynamic/static ARP neighbor snapshot with state, retry, consistency, and age fields. `netcfg trace` shows the last outbound route lookup, next hop, MAC source, UDP send result, and counters for missing routes/MACs. Use it after `dns resolve`, `http get`, or `https get` attempts to separate routing/ARP/firewall/TX issues from remote timeout behavior.
 `http get` and `https get` accept raw IPv4 addresses or hostnames that are already in the DNS cache. Use `dns resolve <hostname>` and wait for `dns status` to show `state=2` before fetching by hostname.
+`arp probe` sends a gratuitous ARP (a TX-path liveness test) and reports `requests_sent`, `learned`, and `conflicts`. `nic dump on|off` toggles a raw pre-dispatch packet dump; `nic counters` reports `processed`, `dropped`, `firewalled`, and `rate_limited`.
 
 ## Firewall command
 
@@ -538,6 +542,39 @@ firewall deny in tcp port 80 src 192.168.218.0/24
 firewall allow out udp toport 53 dst 192.168.218.1
 firewall deny both ip src 192.168.1.10-192.168.1.50
 ```
+
+## Storage integrity and cache statistics
+
+WALFS integrity and LRU cache telemetry are available from both the UART/TCP
+console and the HTTP terminal:
+
+```text
+walfs status            mount/root/super state, record count, WAL head
+walfs verify            verify WAL metadata + record-chain integrity
+walfs compact           non-destructive WAL compaction (rewrite live records)
+walfs format confirm    DESTRUCTIVE reserved-base reformat (wipes WALFS)
+cachestats              WAL inode/path, DNS, and ARP LRU hit/miss/evict
+```
+
+`disk verify` and `disk compact` are aliases for `walfs verify` / `walfs
+compact`. `walfs verify` reports `super`, `wal_head`, `valid_records`,
+`crc_errors`, `header_errors`, `open_tx`, and `scan_end`; use it to decide
+between a non-destructive `walfs compact` (WAL bloat / stale records) and a
+`walfs format confirm` (structural corruption). The keystore root-of-trust lives
+in a separate partition area and is not touched by `walfs format`.
+
+`cachestats` surfaces the WAL inode/path cache, the DNS resolver cache, and the
+ARP index cache hit/miss/eviction counters (`lru_stats`) for tuning and leak
+diagnosis.
+
+## Crypto self-test
+
+```text
+crypto selftest
+```
+
+Runs the AES-GCM encrypt/decrypt round trip plus the nibble-table GHASH
+validation (the same self-test wired into `tls selftest`).
 
 ## Build/version display
 

@@ -329,6 +329,14 @@ void dns_cache_flush(void) {
     lru_flush(&dns_cache);
 }
 
+void dns_cache_stats(u64 *hits, u64 *misses, u64 *evictions) {
+    u64 h = 0, m = 0, ev = 0, ex = 0;
+    lru_stats(&dns_cache, &h, &m, &ev, &ex);
+    if (hits) *hits = h;
+    if (misses) *misses = m;
+    if (evictions) *evictions = ev;
+}
+
 bool dns_cache_lookup(const char *hostname, u32 *ip_out)
 {
     if (!hostname || !ip_out)

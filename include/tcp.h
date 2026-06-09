@@ -83,6 +83,11 @@ u32 tcp_readable(tcp_conn_t conn);
 /* Check how much space is in send buffer */
 u32 tcp_writable(tcp_conn_t conn);
 
+/* Bytes still queued in the send buffer (unsent + unacknowledged). 0 means all
+ * written data has been transmitted AND acknowledged by the peer — safe to FIN
+ * without truncating the tail. */
+u32 tcp_tx_pending(tcp_conn_t conn);
+
 /* Count non-listener active TCP control blocks. */
 u32 tcp_active_count(void);
 

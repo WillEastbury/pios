@@ -73,3 +73,6 @@ void arp_tick(void);
 /* Get ARP stats */
 const arp_stats_t *arp_get_stats(void);
 u32 arp_snapshot(struct arp_snapshot_entry *out, u32 max_entries);
+
+/* LRU index cache hit/miss/eviction telemetry. */
+void arp_cache_stats(u64 *hits, u64 *misses, u64 *evictions);

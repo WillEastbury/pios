@@ -735,7 +735,6 @@ static void macb_dump_tx_state(const char *tag)
 
 bool macb_send(const u8 *frame, u32 len) {
     if (len > BUF_SIZE || len < 14) {
-        uart_putc('?');
         return false;
     }
 

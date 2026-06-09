@@ -441,6 +441,14 @@ const arp_stats_t *arp_get_stats(void) {
     return &arp_stats;
 }
 
+void arp_cache_stats(u64 *hits, u64 *misses, u64 *evictions) {
+    u64 h = 0, m = 0, ev = 0, ex = 0;
+    lru_stats(&arp_index, &h, &m, &ev, &ex);
+    if (hits) *hits = h;
+    if (misses) *misses = m;
+    if (evictions) *evictions = ev;
+}
+
 u32 arp_snapshot(struct arp_snapshot_entry *out, u32 max_entries)
 {
     u32 n = 0;

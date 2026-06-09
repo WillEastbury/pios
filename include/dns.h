@@ -53,3 +53,4 @@ void dns_async_status(struct dns_async_status *out);
 
 /* Flush the entire cache */
 void dns_cache_flush(void);
+void dns_cache_stats(u64 *hits, u64 *misses, u64 *evictions);

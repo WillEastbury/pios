@@ -30,6 +30,7 @@
 /* Page tables — 4KB aligned (l1_table used by start.S for early MMU) */
 u64 l1_table[512] ALIGNED(4096);
 static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
+static u64 l3_block0[512] ALIGNED(4096);     /* block 0 (0-2MB) split to 4KB pages */
 
 /* Per-process user tables for user cores. Process slots are 1MiB-misaligned,
  * so each 2MiB slot can straddle two L2 entries and needs two L3 tables. */
@@ -95,6 +96,14 @@ static inline u64 dev_block_1g(u64 addr) {
 static inline u64 ram_block_2m(u64 addr) {
     return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
            PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+}
+
+/* Helper: create a 2MB L2 block entry for Normal Non-Cacheable RAM.
+ * Bit pattern (addr | 0x705) is identical to the NC block start.S installs
+ * at l1_table[0], so NC regions keep their exact current attributes. */
+static inline u64 ram_block_2m_nc(u64 addr) {
+    return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1;
 }
 
 /* Helper: create a 2MB L2 block entry for device MMIO */
@@ -257,6 +266,97 @@ void mmu_init(void) {
     fb_puts("  [mmu] MMU + caches ON!\n");
 }
 
+/*
+ * mmu_enable_caching() — Phase 1 cache-coherency cleanup.
+ *
+ * start.S brings the MMU up with l1_table[0] as a single 1GB Normal
+ * Non-Cacheable block (0x705), so the entire first 1GB (kernel, all RAM,
+ * FIFO, DMA, IPC, framebuffers) runs uncached: ~118ns/write and fragile
+ * cross-core sharing. This converts the first 1GB into a 2MB-granular L2
+ * table and makes the single-owner / DSU-coherent RAM regions Write-Back
+ * cacheable + Inner Shareable (0x709), while keeping Non-Cacheable every
+ * region a non-coherent DMA master or the VideoCore scanout can touch:
+ *
+ *   block 0       0x00000000-0x001FFFFF  split to 4KB pages (L3):
+ *                  [__text_start,__bss_start) kernel code/.rodata/.data -> WB IS
+ *                  (cached so instruction fetch + font/const reads are fast)
+ *                  rest of block 0 (low 512KB + .bss head)              -> NC
+ *   blocks 1-3    0x00200000-0x007FFFFF  .bss/stacks/heap/page-tables -> NC
+ *                  (active NIC=MACB, USB/xHCI, DMA engine all keep their DMA
+ *                   rings/buffers here but already do dcache clean/invalidate;
+ *                   caching these is Phase 2b, gated on per-driver review)
+ *   blocks 4-35   0x00800000-0x047FFFFF  per-core private RAM        -> WB IS
+ *   blocks 36-39  0x04800000-0x04FFFFFF  FIFO/DMA_NET/DMA_DISK/IPC   -> NC
+ *   blocks 40-47  0x05000000-0x05FFFFFF  HDMI back buffer           -> WB IS
+ *   blocks 48-511 0x06000000-0x3FFFFFFF  high RAM + VideoCore scanout-> NC
+ *
+ * Safe because: dma.c already cleans/invalidates its DMA targets, the HDMI
+ * blit is NEON (CPU), SD is PIO, and the process loader cleans D-cache to
+ * PoC + invalidates I-cache after copying images. Call once on core 0 after
+ * the start.S MMU handoff and before secondaries launch (they pick up the
+ * rebuilt l1_table via shared_ttbr0).
+ */
+void mmu_enable_caching(void) {
+    const u64 cache_lo_base = CORE0_RAM_BASE;                /* 0x00800000 */
+    const u64 cache_lo_end  = SHARED_FIFO_BASE;              /* 0x04800000 */
+    const u64 cache_fb_base = FB_BACK_BASE;                  /* 0x05000000 */
+    const u64 cache_fb_end  = FB_BACK_BASE + FB_BACK_SIZE;   /* 0x06000000 */
+
+    /* Phase 2a: split block 0 (0x0-0x1FFFFF) into 4KB pages so the kernel's
+     * code + read-only data + initialised data window [__text_start,__bss_start)
+     * becomes Write-Back cacheable + Inner Shareable. Instruction fetch and
+     * .rodata reads (font glyph bitmaps, const tables) then hit the L1/L2 caches
+     * instead of stalling ~250ns/line on NC DRAM — this is what makes the HDMI
+     * dashboard render (instruction-fetch bound) fast. Everything else in block
+     * 0 — the low 512KB below the kernel and all of .bss (DMA descriptor
+     * rings/buffers, page tables, stacks) — stays Non-Cacheable, so no DMA
+     * master loses coherency and the page-table walker keeps reading NC tables. */
+    extern char __text_start[];
+    extern char __bss_start[];
+    const u64 code_lo = (u64)(usize)__text_start & ~(L3_PAGE_SIZE - 1);
+    const u64 code_hi = (u64)(usize)__bss_start  & ~(L3_PAGE_SIZE - 1);
+    for (u32 i = 0; i < 512; i++) {
+        u64 addr = (u64)i * L3_PAGE_SIZE;
+        u64 attr = (addr >= code_lo && addr < code_hi)
+                       ? PTE_ATTR(MT_NORMAL) : PTE_ATTR(MT_NORMAL_NC);
+        l3_block0[i] = addr | PTE_VALID | PTE_PAGE | PTE_AF |
+                       PTE_SH_INNER | attr | PTE_AP_RW_EL1;
+    }
+
+    for (u32 i = 0; i < 512; i++) {
+        if (i == 0) {
+            /* block 0 is now fine-grained via l3_block0 (cached code window). */
+            l2_table_low[0] = (u64)(usize)l3_block0 | PTE_VALID | PTE_TABLE;
+            continue;
+        }
+        u64 addr = (u64)i * L2_BLOCK_SIZE;
+        bool cache = (addr >= cache_lo_base && addr < cache_lo_end) ||
+                     (addr >= cache_fb_base && addr < cache_fb_end);
+        l2_table_low[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);
+    }
+
+    /* l2_table_low and l3_block0 live in NC-mapped .bss, so the stores above
+     * land directly in DRAM. Push to PoC and drop any stray cached lines so the
+     * cacheable table walker (TCR IRGN0/ORGN0=WB) cannot read a stale copy. */
+    dsb();
+    dcache_clean_invalidate_range((u64)(usize)l3_block0, sizeof(l3_block0));
+    dcache_clean_invalidate_range((u64)(usize)l2_table_low, sizeof(l2_table_low));
+
+    /* Atomically replace the 1GB NC block with a table descriptor. The old
+     * block translation stays live in the TLB until the tlbi below, so there
+     * is no unmapped window for the kernel executing this code. */
+    l1_table[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
+    dsb();
+
+    /* The walker had cached the old l1_table[0] block descriptor. Invalidate
+     * (never clean) that line so the walk re-fetches the new table descriptor
+     * from DRAM; the line is clean, so invalidate-only cannot write back and
+     * clobber the value just stored via the NC mapping. */
+    dcache_invalidate_range((u64)(usize)&l1_table[0], sizeof(u64));
+
+    __asm__ volatile("tlbi vmalle1; dsb sy; isb" ::: "memory");
+}
+
 void mmu_invalidate_tlb(void) {
     __asm__ volatile("tlbi vmalle1" ::: "memory");
     dsb();
@@ -282,9 +382,15 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
 
     l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
 
-    /* Keep only minimum low RAM: kernel image/BSS/stacks (first 2MB). */
+    /* Map ALL kernel RAM [0, CORE0_RAM_BASE) privileged (AP_RW_EL1, EL0 no
+     * access). The scheduler keeps executing kernel code with TTBR0 pointing at
+     * this user table between mmu_switch_to_user() and ctx_switch(), so it must
+     * be able to reach its own stack, procs[], scheduler_ctx and preempt state
+     * (all live well above the old 2MB window, up to ~5.6MB). These blocks are
+     * EL0-inaccessible, so the user process gains nothing: isolation preserved. */
     const u64 ram_attrs = user_ram_attrs();
-    map_user_low_2m(l2, 0, 0, ram_attrs);
+    for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++)
+        map_user_low_2m(l2, b, (u64)b * L2_BLOCK_SIZE, ram_attrs);
 
     /* Map this process slot and shared FIFO window (kernel ABI FIFO path). */
     if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, 0, false))
@@ -316,8 +422,12 @@ bool mmu_user_table_build_split(u32 core, u32 slot, u64 slot_base, u64 slot_size
 
     l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
 
+    /* Map ALL kernel RAM [0, CORE0_RAM_BASE) privileged (see mmu_user_table_build).
+     * Required so the scheduler can run its dispatch tail + ctx_switch on its own
+     * (high) kernel stack while TTBR0 points at this user table. EL0-inaccessible. */
     const u64 ram_attrs = user_ram_attrs();
-    map_user_low_2m(l2, 0, 0, ram_attrs);
+    for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++)
+        map_user_low_2m(l2, b, (u64)b * L2_BLOCK_SIZE, ram_attrs);
     if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, code_bytes, true))
         return false;
     map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);

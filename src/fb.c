@@ -415,11 +415,12 @@ static inline u32 fb_border_color(u32 s) {
     u32 half = P / 2u;
     if (half == 0) return 0;
     u32 d = (s <= half) ? s : (P - s);              /* 0..half */
-    u32 t = (u32)(((u64)d * 256u) / half);          /* 0..256, 0=green 256=blue */
+    u32 t = (u32)(((u64)d * 256u) / half);          /* 0..256, 0=purple 256=blue */
     if (t > 256u) t = 256u;
-    u32 g = (0xC0u * (256u - t) + 0x20u * t) >> 8;  /* green 0xC0→0x20 */
-    u32 b = (0x10u * (256u - t) + 0xF0u * t) >> 8;  /* blue  0x10→0xF0 */
-    return (g << 8) | b;                            /* 0x00RRGGBB, R=0 */
+    u32 r = (0xA0u * (256u - t) + 0x10u * t) >> 8;  /* red   0xA0→0x10 */
+    u32 g = (0x10u * (256u - t) + 0x40u * t) >> 8;  /* green 0x10→0x40 */
+    u32 b = (0xE0u * (256u - t) + 0xF0u * t) >> 8;  /* blue  0xE0→0xF0 */
+    return (r << 16) | (g << 8) | b;                /* 0x00RRGGBB: purple→blue */
 }
 
 /* Paint the gradient frame around the panel edges. Drawn by fb_clear; the

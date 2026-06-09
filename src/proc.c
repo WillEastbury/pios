@@ -97,7 +97,14 @@ static u64 proc_span_floor[MAX_PROCS_PER_CORE];
 static inline bool on_user_core(void);
 static inline u32 user_core_slot(void);
 static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affinity_core);
+static void proc_drain_remote_wakes(void);
+static void proc_sched_heartbeat(void);
+static void proc_sched_note_ctx_enter(u32 pid);
+static void proc_sched_note_ctx_exit(void);
+static void proc_sched_stage(u32 s);
 static void proc_account_runtime(struct process *p);
+static void proc_diag_note_dispatch(void);
+static void proc_diag_note_wfe(void);
 static u32 proc_arena_bump_bytes(u32 slot);
 static void proc_arena_update_high(struct process *p, u32 slot);
 static void proc_span_reset(u32 slot);
@@ -940,6 +947,7 @@ static bool capsule_manifest_load(struct process *p, const char *path)
 
 /* ---- Forward declarations ---- */
 static i32   sys_yield(void);
+static i32   sys_park(void);
 static i32   sys_exit(u32 code);
 static u32   sys_getpid(void);
 static void  sys_print(const char *msg);
@@ -1200,6 +1208,7 @@ static struct kernel_api kernel_api_tab = {
     .yield           = sys_yield,
     .exit            = sys_exit,
     .getpid          = sys_getpid,
+    .park            = sys_park,
     /* Console I/O */
     .print           = sys_print,
     .putc            = sys_putc,
@@ -1402,32 +1411,41 @@ static void proc_handle_bench_echo(void)
     }
 }
 
+/* Initialise single-instance shared process-table state exactly once. Called by
+ * core 0 before it launches the secondary cores so there is no race; the guard
+ * makes a later proc_init() from a secondary a no-op for shared state. */
+void proc_init_shared(void)
+{
+    if (initialized)
+        return;
+    for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+        procs[i].state = PROC_EMPTY;
+        procs[i].pid = 0;
+    }
+    for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++)
+        paged_io_tab[i].used = false;
+    current_proc = 0;
+    rr_cursor = 0;
+    next_pid = (core_id() << 16) | 1;  /* encode core in upper bits */
+    proc_el1_integrity_baseline = proc_el1_integrity_hash_now();
+    proc_el1_integrity_next_check_tick = timer_ticks() + 512ULL;
+    simd_zero(&proc_sec_stats, sizeof(proc_sec_stats));
+    dmb_ish();
+    initialized = true;
+}
+
 void proc_init(void)
 {
     u32 uc = on_user_core() ? user_core_slot() : 0;
     if (on_user_core())
         core_mark_online(core_id(), 0x20);
-    for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
-        procs[i].state = PROC_EMPTY;
-        procs[i].pid = 0;
-    }
-    if (on_user_core())
-        core_mark_online(core_id(), 0x21);
-    for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++)
-        paged_io_tab[i].used = false;
-    if (on_user_core())
-        core_mark_online(core_id(), 0x22);
-    current_proc = 0;
-    rr_cursor = 0;
-    next_pid = (core_id() << 16) | 1;  /* encode core in upper bits */
-    if (on_user_core())
-        core_mark_online(core_id(), 0x23);
-    proc_el1_integrity_baseline = proc_el1_integrity_hash_now();
-    proc_el1_integrity_next_check_tick = timer_ticks() + 512ULL;
-    if (on_user_core())
-        core_mark_online(core_id(), 0x24);
-    simd_zero(&proc_sec_stats, sizeof(proc_sec_stats));
-    initialized = true;
+    /* Shared process-table state is single-instance (procs[], current_proc,
+     * rr_cursor, next_pid, paged IO, integrity baseline). It MUST be initialised
+     * exactly once. Core 0 runs proc_init_shared() before launching the secondary
+     * cores, so `initialized` is already true by the time cores 1-3 arrive here;
+     * without this guard each secondary re-zeroed procs[] and a late core (e.g.
+     * core 3) wiped a process another core (core 2 / httpd) had just created. */
+    proc_init_shared();
     if (on_user_core())
         core_mark_online(core_id(), 0x25);
     if (on_user_core()) {
@@ -1636,6 +1654,125 @@ i32 proc_exec(const char *path)
     return proc_exec_with_policy(path, PROC_PRIO_NORMAL, core_id());
 }
 
+/* Launch a flat binary from an in-memory buffer (no WALFS). Used for userland
+ * apps embedded in the kernel image. The blob must be a flat binary linked at
+ * slot_base() for the chosen slot; runs as PRINCIPAL_ROOT (trusted kernel
+ * launch). Must be called on the target core. Returns pid or -1. */
+i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
+                       u32 priority_class, u32 affinity_core)
+{
+    if (!initialized)
+        return -1;
+    if (!proc_prio_valid(priority_class))
+        return -1;
+    if (affinity_core != core_id())
+        return -1;
+    if (!blob || blob_len == 0 || blob_len > PROC_SLOT_SIZE - 64U)
+        return -1;
+
+    i32 slot = find_empty_slot();
+    if (slot < 0) {
+        uart_puts("[proc] mem-exec: no free slot\n");
+        return -1;
+    }
+
+    u8 *base = slot_base((u32)slot);
+    /* The blob is linked at a fixed slot base; refuse if this slot doesn't
+     * match (would mean absolute relocations land at the wrong address). */
+    if ((u64)(usize)base != PROC_EMBED_BASE) {
+        uart_puts("[proc] mem-exec: slot base mismatch\n");
+        return -1;
+    }
+    dma_zero(5, base, PROC_SLOT_SIZE);
+    simd_memcpy(base, blob, blob_len);
+    u32 loaded = blob_len;
+    u32 exec_hash = hw_crc32c(base, loaded);
+
+    struct process *p = &procs[slot];
+    p->pid = next_pid++;
+    p->parent_pid = 0;
+    p->state = PROC_READY;
+    p->principal_id = PRINCIPAL_ROOT;   /* trusted: embedded in kernel image */
+    p->affinity_core = affinity_core;
+    p->priority_class = priority_class;
+    p->quantum_ticks = proc_quantum_for_prio(priority_class);
+    p->base = base;
+    p->mem_size = PROC_SLOT_SIZE;
+    p->ticks = timer_ticks();
+    p->runtime_ticks = 0;
+    p->exit_code = 0;
+    p->preemptions = 0;
+    p->ipc_shm_map_refs = 0;
+    p->capsule_id = PROC_CAPSULE_ID_NONE;
+    p->exec_image_size = loaded;
+    p->exec_hash_baseline = exec_hash;
+    p->exec_hash_last = exec_hash;
+    p->exec_hash_check_nonce = 1;
+    p->exec_hash_next_check_tick = proc_integrity_next_tick(p->pid, p->exec_hash_check_nonce);
+    p->entry_pc = (u64)(usize)base;
+    p->arena_base = ((u64)(usize)base + loaded + L3_PAGE_SIZE - 1) & ~(L3_PAGE_SIZE - 1);
+    p->arena_limit = (u64)(usize)base + PROC_SLOT_SIZE - 65536ULL;
+    if (p->arena_base >= p->arena_limit) {
+        uart_puts("[proc] mem-exec: no data arena\n");
+        p->state = PROC_EMPTY;
+        p->pid = 0;
+        return -1;
+    }
+    p->arena_capacity_bytes = (u32)(p->arena_limit - p->arena_base);
+    p->arena_high_bytes = 0;
+    p->arena_span_bytes = 0;
+    p->arena_span_high_bytes = 0;
+    p->arena_span_count = 0;
+    p->arena_span_high_count = 0;
+    p->image_path[0] = 0;
+    for (u32 pi = 0; name && pi + 1 < sizeof(p->image_path) && name[pi]; pi++) {
+        p->image_path[pi] = name[pi];
+        p->image_path[pi + 1] = 0;
+    }
+    p->capsule_enabled = false;
+    p->capsule_manifest_hash = 0;
+
+    heap_top[(u32)slot] = p->arena_base;
+    proc_span_reset((u32)slot);
+    dcache_clean_range((u64)(usize)base, loaded);
+    icache_invalidate_range((u64)(usize)base, loaded);
+
+    p->entry_sp = (u64)(usize)(base + PROC_SLOT_SIZE - 16);
+    p->entry_spsr = PROC_ENTRY_SPSR_EL0_DAIF;
+    p->entry_flags = proc_entry_contract_flags();
+    if (!proc_entry_contract_validate(p)) {
+        uart_puts("[proc] mem-exec: bad entry contract\n");
+        p->state = PROC_EMPTY;
+        p->pid = 0;
+        return -1;
+    }
+
+    simd_zero(&p->ctx, sizeof(p->ctx));
+    p->ctx.x19_x30[0] = (u64)(usize)&kernel_api_tab;  /* x19 */
+    p->ctx.x19_x30[1] = p->entry_pc;                  /* x20 */
+    p->ctx.x19_x30[11] = (u64)(usize)proc_trampoline; /* x30 = LR */
+    p->ctx.sp = p->entry_sp;
+
+    if (!mmu_user_table_build_split(core_id(), (u32)slot, (u64)(usize)base,
+                                    PROC_SLOT_SIZE, loaded)) {
+        p->state = PROC_EMPTY;
+        p->pid = 0;
+        return -1;
+    }
+    /* Map the shared IPC_SHM window so the process can reach the kernel<->user
+     * HTTP bridge (and any other shared-memory IPC) at IPC_SHM_BASE. */
+    (void)mmu_user_ipc_shm_window(core_id(), (u32)slot, true);
+
+    uart_puts("[proc] mem-exec pid=");
+    uart_hex(p->pid);
+    uart_puts(" name=");
+    uart_puts(name ? name : "?");
+    uart_putc('\n');
+
+    return (i32)p->pid;
+}
+
+
 void proc_yield(void)
 {
     bool user = on_user_core();
@@ -1693,10 +1830,20 @@ void proc_schedule(void)
     for (;;) {
         watchdog_touch(core_id());
         workq_drain(8);
+        proc_drain_remote_wakes();
+        proc_sched_heartbeat();
+        proc_sched_stage(10);
         proc_handle_bench_echo();
+        proc_sched_stage(11);
         proc_handle_launch_request();
+        proc_sched_stage(12);
         bool found = false;
         for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+            /* Only reap processes homed to this core. procs[] is shared across
+             * the per-core schedulers; without this gate one core could reap a
+             * DEAD slot another core still owns. */
+            if (procs[i].affinity_core != core_id())
+                continue;
             if (procs[i].state == PROC_DEAD) {
                 if (procs[i].pid != 0) {
                     u64 out = 0;
@@ -1706,9 +1853,12 @@ void proc_schedule(void)
                 procs[i].pid = 0;
             }
         }
+        proc_sched_stage(13);
 
         bool has_non_lazy_ready = false;
         for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+            if (procs[i].affinity_core != core_id())
+                continue;
             if (procs[i].state == PROC_READY && procs[i].priority_class != PROC_PRIO_LAZY) {
                 has_non_lazy_ready = true;
                 break;
@@ -1721,6 +1871,12 @@ void proc_schedule(void)
             u32 i = (rr_cursor + 1 + step) % MAX_PROCS_PER_CORE;
             if (procs[i].state != PROC_READY)
                 continue;
+            /* Dispatch only processes homed to this core. Each core builds its
+             * OWN per-core user page table for a slot (mmu_user_table_build_split
+             * runs on the creating core); a non-owner core would fail
+             * mmu_switch_to_user and wrongly mark the process DEAD. */
+            if (procs[i].affinity_core != core_id())
+                continue;
             if (has_non_lazy_ready && procs[i].priority_class == PROC_PRIO_LAZY)
                 continue;
             if (chosen == 0xFFFFFFFFU || procs[i].priority_class > best_prio) {
@@ -1728,16 +1884,21 @@ void proc_schedule(void)
                 best_prio = procs[i].priority_class;
             }
         }
+        proc_sched_stage(14);
 
         if (chosen != 0xFFFFFFFFU) {
             found = true;
+            proc_sched_stage(20);
             if (!proc_integrity_maybe_check(chosen))
                 continue;
+            proc_sched_stage(30);
             rr_cursor = chosen;
             current_proc = chosen;
             procs[chosen].state = PROC_RUNNING;
+            proc_diag_note_dispatch();
             procs[chosen].ticks = timer_ticks();
             principal_set_current(procs[chosen].principal_id);
+            proc_sched_stage(35);
             if (procs[chosen].capsule_id != PROC_CAPSULE_ID_NONE) {
                 if (el2_stage2_activate(procs[chosen].capsule_id) != 0) {
                     procs[chosen].state = PROC_DEAD;
@@ -1753,6 +1914,7 @@ void proc_schedule(void)
                     continue;
                 }
             }
+            proc_sched_stage(40);
             if (!mmu_switch_to_user(core_id(), chosen)) {
                 procs[chosen].state = PROC_DEAD;
                 procs[chosen].exit_code = 0xFFFF0002U;
@@ -1760,18 +1922,24 @@ void proc_schedule(void)
                 principal_set_current(PRINCIPAL_ROOT);
                 (void)el2_stage2_activate(PROC_CAPSULE_ID_NONE);
             } else {
+                proc_sched_stage(50);
                 if (user && preempt_enabled[uc]) {
                     preempt_pending[uc] = false;
                     preempt_armed[uc] = true;
                 }
+                proc_sched_note_ctx_enter(procs[chosen].pid);
                 ctx_switch(&scheduler_ctx, &procs[chosen].ctx);
+                proc_sched_note_ctx_exit();
+                proc_sched_stage(51);
                 if (user) {
                     preempt_armed[uc] = false;
                     preempt_pending[uc] = false;
                 }
                 mmu_switch_to_kernel();
+                proc_sched_stage(52);
                 principal_set_current(PRINCIPAL_ROOT);
                 (void)el2_stage2_activate(PROC_CAPSULE_ID_NONE);
+                proc_sched_stage(53);
             }
         }
 
@@ -1780,9 +1948,12 @@ void proc_schedule(void)
             if (user) {
                 core_mark_online(core_id(), 0x80);
                 sched_idle_count_core[uc]++;
+                proc_diag_note_wfe();
                 u64 idle_start = proc_sched_counter_ticks();
                 sched_idle_enter_ticks_core[uc] = idle_start;
+                proc_sched_stage(60);
                 wfe();
+                proc_sched_stage(61);
                 u64 idle_end = proc_sched_counter_ticks();
                 sched_idle_enter_ticks_core[uc] = 0;
                 if (idle_end >= idle_start)
@@ -1862,6 +2033,25 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
     preempt_enabled[uc] = true;
     timer_set_tick_hook(proc_tick_hook);
 
+    /* Self-waking idle scheduler: enable the architected timer event stream so
+     * WFE on this core wakes at a bounded rate (~every 2^EVNTI counter ticks)
+     * even when no interrupt or cross-core SEV arrives. The A76 cluster runs
+     * with SMPEN unset, so a remote SEV from core 0 (the network core posting a
+     * process wake) does NOT reliably wake a user core parked in WFE — the
+     * parked process would sleep forever. With the event stream on, the idle
+     * loop re-drains the remote wake ring and re-checks runnable processes on
+     * every event tick; SEV remains a best-effort fast-path wake when it lands.
+     * EVNTI=8 selects CNTVCT bit 8 → an event roughly every 256 ticks. */
+    {
+        u64 cntkctl;
+        __asm__ volatile("mrs %0, cntkctl_el1" : "=r"(cntkctl));
+        cntkctl &= ~((0xFULL << 4) | (1ULL << 3)); /* clear EVNTI[7:4], EVNTDIR */
+        cntkctl |= (8ULL << 4);                    /* EVNTI = CNTVCT bit 8 */
+        cntkctl |= (1ULL << 2);                    /* EVNTEN = 1 */
+        __asm__ volatile("msr cntkctl_el1, %0" :: "r"(cntkctl));
+        isb();
+    }
+
     uart_puts("[proc] preempt core=");
     uart_hex(core_id());
     uart_puts(" quantum_ticks=");
@@ -1918,6 +2108,9 @@ u64 proc_preemptions(void)
     return preempt_count_core[user_core_slot()];
 }
 
+/* Coherent wake-path diagnostics (defined after PROC_RWAKE_SHARED below). */
+static void proc_rwake_note_soft(u32 pid, i32 slot, u32 state_before);
+
 bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
 {
     if (!initialized || !on_user_core() || target_pid == 0)
@@ -1927,6 +2120,8 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
     (void)event_type;
 
     i32 slot = proc_find_slot_by_pid(target_pid);
+    proc_rwake_note_soft(target_pid, slot,
+                         (slot >= 0) ? procs[(u32)slot].state : 0xFFFFFFFFU);
     if (slot < 0)
         return false;
 
@@ -1939,6 +2134,309 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
     }
     sev();
     return true;
+}
+
+/* ── Cross-core process wake ──
+ * Any core (notably core 0, the network core, which is NOT a user core and so
+ * cannot call proc_soft_event) posts a target pid onto the target user core's
+ * wake ring and signals SEV. The target core's scheduler drains the ring and
+ * runs proc_soft_event locally, flipping the parked process READY. The wake is
+ * queued (not delivered inline), so there is no lost-wakeup window: the
+ * scheduler always drains the ring after a process parks and before it WFEs. */
+#define PROC_RWAKE_DEPTH 64U
+struct proc_rwake_ring {
+    volatile u32 head;             /* posting core writes; target core reads */
+    u32 _pad_head[15];             /* isolate head on its own 64-byte line */
+    volatile u32 tail;             /* target core writes; posting core reads */
+    u32 _pad_tail[15];             /* isolate tail on its own line */
+    u32 pids[PROC_RWAKE_DEPTH];    /* posting core writes; target core reads */
+};
+
+/* The wake rings + counters MUST live in cross-core-coherent shared RAM, NOT in
+ * kernel .bss. The A76 cluster runs with SMPEN unset (no CPUECTLR setup in
+ * start.S), so plain cacheable .bss writes by core 0 are not reliably visible to
+ * a user core's drain — the posted wake is silently lost and the parked process
+ * never runs (observed: wake_posted=1, wake_drained=0, httpd stuck blocked). The
+ * SHARED_FIFO region is the proven-coherent inter-core channel (the lock-free
+ * FIFOs and the uhttp bridge cross cores from there with only barriers). Park the
+ * rings in its top page, which fifo_init_all() zero-clears at boot before any
+ * secondary core launches. */
+struct proc_rwake_shared {
+    struct proc_rwake_ring ring[4];
+    /* core0-written counters (one line). */
+    volatile u32 posted;
+    volatile u32 full;
+    u32 _pad_c0[14];
+    /* target-core-written counter, isolated so core0 can dc-ivac it for an
+     * accurate read without discarding a posted/full it owns. */
+    volatile u32 drained;
+    u32 _pad_c1[15];
+    volatile u32 loops[4];     /* per-core scheduler-loop heartbeat (liveness probe) */
+    volatile u32 ctx_enter[4]; /* per-core: count of ctx_switch INTO a process */
+    volatile u32 ctx_exit[4];  /* per-core: count of ctx_switch returns FROM a process */
+    volatile u32 last_pid[4];  /* per-core: pid of the most recent ctx_switch target */
+    volatile u32 stage[4];     /* per-core: last scheduler dispatch stage reached */
+    /* one-off firehose wake-path debug: written by the user core's drain /
+     * soft_event, read by core 0. NC memory, single-writer-per-field. */
+    volatile u32 dbg_iters;    /* drain loop bodies executed (== drained) */
+    volatile u32 dbg_pid;      /* last pid value read from pids[] in drain */
+    volatile u32 dbg_zero;     /* drain reads where pid == 0 */
+    volatile u32 dbg_calls;    /* soft_event entries reaching find_slot */
+    volatile u32 dbg_noslot;   /* soft_event find_slot < 0 count */
+    volatile u32 dbg_state;    /* p->state soft_event last saw for the slot */
+    volatile u32 live_state[4];/* per-core: procs[current_proc].state, published each sched loop */
+    volatile u32 live_pid[4];  /* per-core: procs[current_proc].pid, published each sched loop */
+    volatile u32 disp_cnt[4];  /* per-core: count of dispatches (RUNNING set, proc.c:1895) */
+    volatile u32 wfe_cnt[4];   /* per-core: scheduler WFE sleeps taken (found==false idle path) */
+    u32 _pad_dbg[10];
+};
+#define PROC_RWAKE_SHARED \
+    ((volatile struct proc_rwake_shared *)(SHARED_FIFO_BASE + SHARED_FIFO_SIZE - 0x1000UL))
+
+_Static_assert((SHARED_FIFO_SIZE - 0x1000UL) >=
+                   (16UL * sizeof(struct fifo) + 16UL * sizeof(struct fifo_span)),
+               "proc_rwake shared page overlaps the FIFO pool");
+_Static_assert(sizeof(struct proc_rwake_shared) <= 0x1000UL,
+               "proc_rwake shared struct exceeds its page");
+
+static inline u64 proc_irq_save(void) {
+    u64 daif;
+    __asm__ volatile("mrs %0, daif" : "=r"(daif));
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    return daif;
+}
+static inline void proc_irq_restore(u64 daif) {
+    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+}
+
+bool proc_post_remote_wake(u32 target_core, u32 pid) {
+    if (target_core >= 4U || pid == 0)
+        return false;
+    volatile struct proc_rwake_ring *r = &PROC_RWAKE_SHARED->ring[target_core];
+    u64 daif = proc_irq_save();
+    u32 head = r->head;        /* this core's own prior store: cached read is fine */
+    /* tail is advanced by the target core; refresh before the ring-full check. */
+    dcache_invalidate_range((u64)(usize)&r->tail, sizeof(r->tail));
+    u32 next = (head + 1U) & (PROC_RWAKE_DEPTH - 1U);
+    if (next == r->tail) {
+        PROC_RWAKE_SHARED->full++;
+        proc_irq_restore(daif);
+        return false;          /* ring full: receiver will catch up on next poll */
+    }
+    r->pids[head] = pid;
+    dcache_clean_range((u64)(usize)&r->pids[head], sizeof(r->pids[head]));
+    r->head = next;
+    dcache_clean_range((u64)(usize)&r->head, sizeof(r->head));
+    PROC_RWAKE_SHARED->posted++;
+    dsb_ishst();               /* head globally visible before the wake event */
+    proc_irq_restore(daif);
+    sev();
+    return true;
+}
+
+void proc_rwake_stats(u32 *posted, u32 *drained, u32 *full)
+{
+    /* drained is written by target cores; refresh core 0's copy before reading. */
+    dcache_invalidate_range((u64)(usize)&PROC_RWAKE_SHARED->drained, sizeof(u32));
+    if (posted)  *posted  = PROC_RWAKE_SHARED->posted;
+    if (drained) *drained = PROC_RWAKE_SHARED->drained;
+    if (full)    *full    = PROC_RWAKE_SHARED->full;
+}
+
+/* NC-coherent single-writer store for the wake-path debug counters. */
+static inline void rwake_dbg_push(volatile u32 *p, u32 v) {
+    *p = v;
+    __asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+static void proc_rwake_note_soft(u32 pid, i32 slot, u32 state_before) {
+    (void)pid;
+    rwake_dbg_push(&PROC_RWAKE_SHARED->dbg_calls, PROC_RWAKE_SHARED->dbg_calls + 1U);
+    if (slot < 0)
+        rwake_dbg_push(&PROC_RWAKE_SHARED->dbg_noslot, PROC_RWAKE_SHARED->dbg_noslot + 1U);
+    else
+        rwake_dbg_push(&PROC_RWAKE_SHARED->dbg_state, state_before);
+}
+
+static void proc_drain_remote_wakes(void) {
+    if (!on_user_core())
+        return;
+    volatile struct proc_rwake_ring *r = &PROC_RWAKE_SHARED->ring[core_id() & 3U];
+    /* head + pids are written by the posting core; drop our stale copies so a
+     * single low-frequency post by an otherwise-idle core 0 is observed. */
+    dcache_invalidate_range((u64)(usize)&r->head, sizeof(r->head));
+    while (r->tail != r->head) {
+        dcache_invalidate_range((u64)(usize)&r->pids[r->tail], sizeof(r->pids[0]));
+        u32 pid = r->pids[r->tail];
+        rwake_dbg_push(&PROC_RWAKE_SHARED->dbg_pid, pid);
+        rwake_dbg_push(&PROC_RWAKE_SHARED->dbg_iters, PROC_RWAKE_SHARED->dbg_iters + 1U);
+        if (pid == 0)
+            rwake_dbg_push(&PROC_RWAKE_SHARED->dbg_zero, PROC_RWAKE_SHARED->dbg_zero + 1U);
+        r->tail = (r->tail + 1U) & (PROC_RWAKE_DEPTH - 1U);
+        dcache_clean_range((u64)(usize)&r->tail, sizeof(r->tail));  /* tail -> PoC */
+        PROC_RWAKE_SHARED->drained++;
+        dcache_clean_range((u64)(usize)&PROC_RWAKE_SHARED->drained, sizeof(u32));
+        (void)proc_soft_event(pid, PROC_SOFT_EVENT_IPC_FIFO, true);
+        dcache_invalidate_range((u64)(usize)&r->head, sizeof(r->head)); /* re-check head */
+    }
+}
+
+static void proc_diag_note_dispatch(void) {
+    u32 c = core_id() & 3U;
+    PROC_RWAKE_SHARED->disp_cnt[c]++;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->disp_cnt[c]) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+static void proc_diag_note_wfe(void) {
+    u32 c = core_id() & 3U;
+    PROC_RWAKE_SHARED->wfe_cnt[c]++;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->wfe_cnt[c]) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+/* Per-core scheduler-loop heartbeat, in coherent shared RAM so any core can read
+ * another core's liveness. A stalled counter means that core is wedged (e.g.
+ * parked in WFE with no wake source) rather than merely not seeing a wake. */
+static void proc_sched_heartbeat(void) {
+    u32 c = core_id() & 3U;
+    PROC_RWAKE_SHARED->loops[c]++;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->loops[c]) : "memory");
+    /* Publish the LIVE state/pid of this core's current process (cleaned to PoC)
+     * so core 0 reads the real scheduler state, not the soft_event snapshot. */
+    {
+        u32 slot = current_proc;
+        u32 st = 0, pid = 0;
+        if (slot < MAX_PROCS_PER_CORE) {
+            st = procs[slot].state;
+            pid = procs[slot].pid;
+        }
+        PROC_RWAKE_SHARED->live_state[c] = st;
+        PROC_RWAKE_SHARED->live_pid[c] = pid;
+        __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->live_state[c]) : "memory");
+        __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->live_pid[c]) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+/* Record entry into a process context switch (before ctx_switch) and exit
+ * (after it returns). If, for some core, ctx_enter advances but ctx_exit does
+ * not, that core is wedged INSIDE the switched-to process — not idle, not in the
+ * scheduler. last_pid identifies which process it dived into. */
+static void proc_sched_note_ctx_enter(u32 pid) {
+    u32 c = core_id() & 3U;
+    PROC_RWAKE_SHARED->last_pid[c] = pid;
+    PROC_RWAKE_SHARED->ctx_enter[c]++;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->ctx_enter[c]) : "memory");
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->last_pid[c]) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+static void proc_sched_note_ctx_exit(void) {
+    u32 c = core_id() & 3U;
+    PROC_RWAKE_SHARED->ctx_exit[c]++;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->ctx_exit[c]) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+static void proc_sched_stage(u32 s) {
+    u32 c = core_id() & 3U;
+    PROC_RWAKE_SHARED->stage[c] = s;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->stage[c]) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+/* Reader-side coherency: these diagnostic fields are written ONLY by user cores
+ * (never by core 0). Invalidate core 0's possibly-stale cached copy to PoC before
+ * reading so a single write by a now-sleeping core is observed even if snoop
+ * coherency is not active. Safe because core 0 holds no dirty data here. */
+static inline void diag_inval_word(volatile void *p) {
+    __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
+u32 proc_sched_loops(u32 core) {
+    if (core >= 4U)
+        return 0;
+    diag_inval_word(&PROC_RWAKE_SHARED->loops[core]);
+    return PROC_RWAKE_SHARED->loops[core];
+}
+
+void proc_sched_ctx_stats(u32 core, u32 *enter, u32 *exit, u32 *last_pid) {
+    if (core >= 4U) {
+        if (enter) *enter = 0;
+        if (exit) *exit = 0;
+        if (last_pid) *last_pid = 0;
+        return;
+    }
+    diag_inval_word(&PROC_RWAKE_SHARED->ctx_enter[core]);
+    diag_inval_word(&PROC_RWAKE_SHARED->ctx_exit[core]);
+    diag_inval_word(&PROC_RWAKE_SHARED->last_pid[core]);
+    if (enter) *enter = PROC_RWAKE_SHARED->ctx_enter[core];
+    if (exit) *exit = PROC_RWAKE_SHARED->ctx_exit[core];
+    if (last_pid) *last_pid = PROC_RWAKE_SHARED->last_pid[core];
+}
+
+u32 proc_sched_stage_get(u32 core) {
+    if (core >= 4U)
+        return 0;
+    diag_inval_word(&PROC_RWAKE_SHARED->stage[core]);
+    return PROC_RWAKE_SHARED->stage[core];
+}
+
+void proc_rwake_dbg(u32 *iters, u32 *pid, u32 *zero, u32 *calls, u32 *noslot, u32 *state) {
+    diag_inval_word(&PROC_RWAKE_SHARED->dbg_iters);
+    diag_inval_word(&PROC_RWAKE_SHARED->dbg_pid);
+    diag_inval_word(&PROC_RWAKE_SHARED->dbg_zero);
+    diag_inval_word(&PROC_RWAKE_SHARED->dbg_calls);
+    diag_inval_word(&PROC_RWAKE_SHARED->dbg_noslot);
+    diag_inval_word(&PROC_RWAKE_SHARED->dbg_state);
+    if (iters)  *iters  = PROC_RWAKE_SHARED->dbg_iters;
+    if (pid)    *pid    = PROC_RWAKE_SHARED->dbg_pid;
+    if (zero)   *zero   = PROC_RWAKE_SHARED->dbg_zero;
+    if (calls)  *calls  = PROC_RWAKE_SHARED->dbg_calls;
+    if (noslot) *noslot = PROC_RWAKE_SHARED->dbg_noslot;
+    if (state)  *state  = PROC_RWAKE_SHARED->dbg_state;
+}
+
+/* Live per-core scheduler state, published every scheduler loop and cleaned to
+ * PoC (unlike the soft_event d_state SNAPSHOT). Lets core 0 read the REAL
+ * current process state, dispatch count, and WFE-sleep count for a user core. */
+void proc_rwake_live(u32 core, u32 *live_state, u32 *live_pid, u32 *disp, u32 *wfe) {
+    if (core >= 4U) {
+        if (live_state) *live_state = 0;
+        if (live_pid)   *live_pid   = 0;
+        if (disp)       *disp       = 0;
+        if (wfe)        *wfe        = 0;
+        return;
+    }
+    diag_inval_word(&PROC_RWAKE_SHARED->live_state[core]);
+    diag_inval_word(&PROC_RWAKE_SHARED->live_pid[core]);
+    diag_inval_word(&PROC_RWAKE_SHARED->disp_cnt[core]);
+    diag_inval_word(&PROC_RWAKE_SHARED->wfe_cnt[core]);
+    if (live_state) *live_state = PROC_RWAKE_SHARED->live_state[core];
+    if (live_pid)   *live_pid   = PROC_RWAKE_SHARED->live_pid[core];
+    if (disp)       *disp       = PROC_RWAKE_SHARED->disp_cnt[core];
+    if (wfe)        *wfe        = PROC_RWAKE_SHARED->wfe_cnt[core];
+}
+
+/* Block the current process until a soft event (e.g. a remote wake) flips it
+ * READY. Mirrors proc_yield but parks the process as BLOCKED so the scheduler
+ * runs others / idles in WFE until woken. */
+void proc_park(void) {
+    bool user = on_user_core();
+    u32 uc = user ? user_core_slot() : 0;
+    struct process *p = &procs[current_proc];
+    if (user) {
+        preempt_armed[uc] = false;
+        preempt_pending[uc] = false;
+    }
+    proc_account_runtime(p);
+    p->state = PROC_BLOCKED;
+    ctx_switch(&p->ctx, &scheduler_ctx);
+    if (user && preempt_enabled[uc] && p->state == PROC_RUNNING)
+        preempt_armed[uc] = true;
 }
 
 bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
@@ -2960,6 +3458,12 @@ bool proc_set_affinity(u32 pid, u32 core)
 static i32 sys_yield(void)
 {
     proc_yield();
+    return 0;
+}
+
+static i32 sys_park(void)
+{
+    proc_park();
     return 0;
 }
 

@@ -258,3 +258,6 @@ bool walfs_verify(struct walfs_health *out);
 void walfs_sync(void);
 void walfs_status(struct walfs_status_snapshot *out);
 bool walfs_format_reserved(void);
+
+/* WAL inode/path LRU cache hit/miss telemetry. */
+void walfs_cache_stats(u64 *inode_hits, u64 *inode_misses, u64 *path_hits, u64 *path_misses);
