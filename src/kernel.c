@@ -2259,6 +2259,13 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             u64 t5; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t5));
             __asm__ volatile("" : : "r"(x));   /* keep x live */
             u64 cdt = t5 - t4;
+            /* Resolve the EFFECTIVE memory attribute the CPU uses for this
+             * address: AT S1E1R does a stage-1 EL1 read translation, PAR_EL1
+             * bits [63:56] = MAIR attribute byte (0xFF=WB cacheable,
+             * 0x44=Normal non-cacheable, 0x00=Device), [9:8]=shareability. */
+            u64 par = 0;
+            __asm__ volatile("at s1e1r, %1; isb; mrs %0, par_el1"
+                             : "=r"(par) : "r"(addr) : "memory");
             http_append(out, &len, max, "membench addr=0x");
             http_append_hex64(out, &len, max, addr);
             http_append(out, &len, max, " count=");
@@ -2271,6 +2278,12 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, count ? (cdt * 18518ULL) / count : 0);
             http_append(out, &len, max, " acc=");
             http_append_u64(out, &len, max, acc + x);
+            http_append(out, &len, max, " par=0x");
+            http_append_hex64(out, &len, max, par);
+            http_append(out, &len, max, " attr=0x");
+            http_append_hex32(out, &len, max, (u32)((par >> 56) & 0xFFU));
+            http_append(out, &len, max, " sh=");
+            http_append_u64(out, &len, max, (par >> 8) & 3U);
             http_append(out, &len, max, "\n");
         } else {
             http_append(out, &len, max, "usage membench <addr> [count]\n");
