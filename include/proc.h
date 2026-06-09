@@ -506,6 +506,8 @@ u32  proc_sched_loops(u32 core);
 void proc_sched_ctx_stats(u32 core, u32 *enter, u32 *exit, u32 *last_pid);
 u32  proc_sched_stage_get(u32 core);
 void proc_rwake_dbg(u32 *iters, u32 *pid, u32 *zero, u32 *calls, u32 *noslot, u32 *state);
+void proc_rwake_park_dbg(u32 core, u32 *rescued, u32 *reason,
+                         u32 *p_enter, u32 *p_early, u32 *p_block, u32 *p_resume);
 void proc_rwake_live(u32 core, u32 *live_state, u32 *live_pid, u32 *disp, u32 *wfe);
 bool proc_set_priority(u32 pid, u32 priority_class);
 bool proc_set_affinity(u32 pid, u32 core);

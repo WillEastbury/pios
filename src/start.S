@@ -305,8 +305,8 @@ secondary_entry:
     bic     x1, x1, #(1 << 0)
     bic     x1, x1, #(1 << 2)
     bic     x1, x1, #(1 << 12)
-    orr     x1, x1, #(1 << 1)
-    orr     x1, x1, #(1 << 3)
+    bic     x1, x1, #(1 << 1)   /* no A  (match core 0: allow unaligned Normal accesses) */
+    bic     x1, x1, #(1 << 3)   /* no SA (match core 0) */
     msr     sctlr_el1, x1
     isb
     ldr     x2, =core_asm_stage
@@ -339,6 +339,8 @@ secondary_entry:
     orr     x1, x1, #(1 << 0)
     orr     x1, x1, #(1 << 2)
     orr     x1, x1, #(1 << 12)
+    bic     x1, x1, #(1 << 1)   /* no A  (match core 0) */
+    bic     x1, x1, #(1 << 3)   /* no SA (match core 0) */
     msr     sctlr_el1, x1
     isb
     ldr     x2, =core_asm_stage

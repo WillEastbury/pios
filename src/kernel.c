@@ -2376,6 +2376,22 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, " c2_wfe=");
             http_append_u64(out, &len, max, wf);
         }
+        {
+            u32 resc = 0, rsn = 0, pe = 0, pel = 0, pb = 0, pr = 0;
+            proc_rwake_park_dbg(CORE_USER0, &resc, &rsn, &pe, &pel, &pb, &pr);
+            http_append(out, &len, max, " rescued=");
+            http_append_u64(out, &len, max, resc);
+            http_append(out, &len, max, " c2_desched=");
+            http_append_u64(out, &len, max, rsn);
+            http_append(out, &len, max, " park_enter=");
+            http_append_u64(out, &len, max, pe);
+            http_append(out, &len, max, " park_early=");
+            http_append_u64(out, &len, max, pel);
+            http_append(out, &len, max, " park_block=");
+            http_append_u64(out, &len, max, pb);
+            http_append(out, &len, max, " park_resume=");
+            http_append_u64(out, &len, max, pr);
+        }
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "fb info")) {
         u32 db = 0, size = 0, pitch = 0;

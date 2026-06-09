@@ -6,6 +6,8 @@
 #include "core.h"
 #include "uart.h"
 #include "fb.h"
+#include "timer.h"
+#include "watchdog.h"
 
 /* PSCI function IDs (SMC64 convention) */
 #define PSCI_CPU_ON         0xC4000003
@@ -66,14 +68,38 @@ void core_start_secondary(u32 id, void (*entry)(void)) {
     }
 }
 
+/* Wait (bounded) for a freshly-started secondary to reach its scheduler loop
+ * before bringing up the next one. core_stage[id] reaches 6 when proc_schedule()
+ * starts (0x80/0x81 once it idles). Serialising bring-up removes the concurrent
+ * boot race where multiple secondaries hammer shared resources — DMA channel,
+ * per-core MMU table build, the shared procs[] table — at the same time. That
+ * race is timing-sensitive (kernel .text is non-cacheable, so instruction-fetch
+ * latency, and thus boot timing, shifts with code layout), which is why any
+ * unrelated code change could strand core 2 inside its httpd launch. The wait is
+ * bounded and pets the hardware watchdog so a dead candidate can never brick
+ * boot — core 0 proceeds after the timeout and A/B rollback still applies. */
+static void core_wait_online(u32 id) {
+    if (id >= NUM_CORES)
+        return;
+    for (u32 ms = 0; ms < 750U; ms++) {
+        if (core_stage[id] >= 6U)
+            return;
+        watchdog_hw_pet();
+        timer_delay_ms(1);
+    }
+}
+
 void core_start_all(void) {
     dsb();
     isb();
     fb_puts("  [core] Starting core 1 (PSCI CPU_ON)\n");
     core_start_secondary(1, NULL);
+    core_wait_online(1);
     fb_puts("  [core] Starting core 2 (PSCI CPU_ON)\n");
     core_start_secondary(2, NULL);
+    core_wait_online(2);
     fb_puts("  [core] Starting core 3 (PSCI CPU_ON)\n");
     core_start_secondary(3, NULL);
+    core_wait_online(3);
     fb_puts("  [core] All secondary cores started\n");
 }

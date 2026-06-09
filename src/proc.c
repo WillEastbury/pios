@@ -36,6 +36,12 @@ static u32 rr_cursor;
 static u32 next_pid;
 static bool initialized;
 static u64 heap_top[MAX_PROCS_PER_CORE];
+/* Sticky per-slot soft-event wake latch (semaphore semantics). Kept OUT of
+ * struct process so the process-table element stride / .bss layout stays
+ * byte-identical. proc_soft_event() sets it; proc_park() consumes it and
+ * refuses to block while it is set, closing the lost-wakeup race that stranded
+ * the port-81 httpd after its first request (504 on every subsequent one). */
+static volatile u32 proc_wake_pending[MAX_PROCS_PER_CORE];
 static volatile bool preempt_enabled[3];
 static volatile bool preempt_armed[3];
 static volatile bool preempt_pending[3];
@@ -1076,6 +1082,8 @@ static i32   sys_tensor_bind_kernel_blob(u32 kernel_id, const void *uniform_data
 static void  proc_tick_hook(u32 core, u64 tick);
 static void  proc_preempt_trampoline(void);
 static void  proc_handle_bench_echo(void);
+static void  proc_note_desched(u32 reason);
+static void  proc_park_note(u32 which);
 
 #define APPF_EVENT_RING_SIZE    64U
 #define APPF_LOG_RING_SIZE      64U
@@ -1556,6 +1564,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->pid = next_pid++;
     p->parent_pid = 0;
     p->state = PROC_READY;
+    proc_wake_pending[slot] = 0;
     p->principal_id = principal_current();
     p->affinity_core = affinity_core;
     p->priority_class = priority_class;
@@ -1692,6 +1701,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     p->pid = next_pid++;
     p->parent_pid = 0;
     p->state = PROC_READY;
+    proc_wake_pending[slot] = 0;
     p->principal_id = PRINCIPAL_ROOT;   /* trusted: embedded in kernel image */
     p->affinity_core = affinity_core;
     p->priority_class = priority_class;
@@ -1785,6 +1795,7 @@ void proc_yield(void)
     proc_account_runtime(p);
     if (p->state == PROC_RUNNING)
         p->state = PROC_READY;
+    proc_note_desched(2U);
     ctx_switch(&p->ctx, &scheduler_ctx);
     if (user && preempt_enabled[uc] && p->state == PROC_RUNNING)
         preempt_armed[uc] = true;
@@ -1807,6 +1818,7 @@ NORETURN void proc_exit(u32 code)
     uart_puts(" exit=");
     uart_hex(code);
     uart_putc('\n');
+    proc_note_desched(4U);
     ctx_switch(&p->ctx, &scheduler_ctx);
     __builtin_unreachable();
 }
@@ -2097,6 +2109,7 @@ void proc_irq_maybe_preempt(struct irq_frame *frame)
     p->state = PROC_READY;
     p->preemptions++;
     preempt_count_core[uc]++;
+    proc_note_desched(3U);
     frame->x[30] = frame->elr;
     frame->elr = (u64)(usize)proc_preempt_trampoline;
 }
@@ -2126,6 +2139,12 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
         return false;
 
     struct process *p = &procs[(u32)slot];
+    /* Latch the wake STICKILY before touching state. The old code only flipped
+     * BLOCKED->READY, dropping the wake whenever the target had not yet committed
+     * to BLOCKED (still RUNNING/READY mid park-transition) — the port-81 504
+     * strand. proc_park() consumes this latch and refuses to block while it is
+     * set, so a wake can never be lost regardless of the park/wake interleaving. */
+    proc_wake_pending[(u32)slot] = 1U;
     if (p->state == PROC_BLOCKED)
         p->state = PROC_READY;
     if (boost && (p->state == PROC_READY || p->state == PROC_RUNNING)) {
@@ -2188,7 +2207,17 @@ struct proc_rwake_shared {
     volatile u32 live_pid[4];  /* per-core: procs[current_proc].pid, published each sched loop */
     volatile u32 disp_cnt[4];  /* per-core: count of dispatches (RUNNING set, proc.c:1895) */
     volatile u32 wfe_cnt[4];   /* per-core: scheduler WFE sleeps taken (found==false idle path) */
-    u32 _pad_dbg[10];
+    /* port-81 504 root-cause trace. desched_reason[c] records HOW the last
+     * process left core c (1=park-block, 2=yield, 3=preempt, 4=exit). The drain
+     * re-readies any target found off-core in RUNNING and counts it in
+     * dbg_rescued. park_* break down proc_park's path selection. */
+    volatile u32 dbg_rescued;
+    volatile u32 desched_reason[4];
+    volatile u32 park_enter;
+    volatile u32 park_early;
+    volatile u32 park_block;
+    volatile u32 park_resume;
+    u32 _pad_dbg[1];
 };
 #define PROC_RWAKE_SHARED \
     ((volatile struct proc_rwake_shared *)(SHARED_FIFO_BASE + SHARED_FIFO_SIZE - 0x1000UL))
@@ -2259,6 +2288,27 @@ static void proc_rwake_note_soft(u32 pid, i32 slot, u32 state_before) {
         rwake_dbg_push(&PROC_RWAKE_SHARED->dbg_state, state_before);
 }
 
+/* Publish the reason the current process last left its core (port-81 504 trace).
+ * NC single-writer per core, so core 0 can read it without a coherency race. */
+static void proc_note_desched(u32 reason) {
+    u32 c = core_id() & 3U;
+    rwake_dbg_push(&PROC_RWAKE_SHARED->desched_reason[c], reason);
+}
+
+/* proc_park() path counters. which: 0=enter, 1=early-return, 2=block, 3=resume. */
+static void proc_park_note(u32 which) {
+    switch (which) {
+    case 0U: rwake_dbg_push(&PROC_RWAKE_SHARED->park_enter,
+                            PROC_RWAKE_SHARED->park_enter + 1U); break;
+    case 1U: rwake_dbg_push(&PROC_RWAKE_SHARED->park_early,
+                            PROC_RWAKE_SHARED->park_early + 1U); break;
+    case 2U: rwake_dbg_push(&PROC_RWAKE_SHARED->park_block,
+                            PROC_RWAKE_SHARED->park_block + 1U); break;
+    default: rwake_dbg_push(&PROC_RWAKE_SHARED->park_resume,
+                            PROC_RWAKE_SHARED->park_resume + 1U); break;
+    }
+}
+
 static void proc_drain_remote_wakes(void) {
     if (!on_user_core())
         return;
@@ -2278,6 +2328,23 @@ static void proc_drain_remote_wakes(void) {
         PROC_RWAKE_SHARED->drained++;
         dcache_clean_range((u64)(usize)&PROC_RWAKE_SHARED->drained, sizeof(u32));
         (void)proc_soft_event(pid, PROC_SOFT_EVENT_IPC_FIFO, true);
+        /* ROOT-CAUSE FIX for the port-81 504: proc_soft_event() only re-readies a
+         * BLOCKED target. A process that descheduled while still marked RUNNING
+         * (the off-core RUNNING state proven by d_state=2) is otherwise skipped by
+         * the READY-only dispatch scan forever, so httpd serves req#1 then never
+         * wakes again. We run here in the scheduler loop with NO user process
+         * on-core (documented proc_soft_event invariant: it never runs while the
+         * target is on-core), so a RUNNING reading is provably stale/stuck and is
+         * safe to force back to READY for re-dispatch. */
+        {
+            i32 rs = proc_find_slot_by_pid(pid);
+            if (rs >= 0 && procs[(u32)rs].state == PROC_RUNNING) {
+                procs[(u32)rs].state = PROC_READY;
+                rr_cursor = ((u32)rs + MAX_PROCS_PER_CORE - 1U) % MAX_PROCS_PER_CORE;
+                rwake_dbg_push(&PROC_RWAKE_SHARED->dbg_rescued,
+                               PROC_RWAKE_SHARED->dbg_rescued + 1U);
+            }
+        }
         dcache_invalidate_range((u64)(usize)&r->head, sizeof(r->head)); /* re-check head */
     }
 }
@@ -2400,6 +2467,26 @@ void proc_rwake_dbg(u32 *iters, u32 *pid, u32 *zero, u32 *calls, u32 *noslot, u3
     if (state)  *state  = PROC_RWAKE_SHARED->dbg_state;
 }
 
+/* port-81 504 trace readout: rescued count + per-core last-deschedule reason +
+ * proc_park path counters. Core 0 invalidates before reading the NC fields. */
+void proc_rwake_park_dbg(u32 core, u32 *rescued, u32 *reason,
+                         u32 *p_enter, u32 *p_early, u32 *p_block, u32 *p_resume) {
+    if (core >= 4U)
+        core = 0U;
+    diag_inval_word(&PROC_RWAKE_SHARED->dbg_rescued);
+    diag_inval_word(&PROC_RWAKE_SHARED->desched_reason[core]);
+    diag_inval_word(&PROC_RWAKE_SHARED->park_enter);
+    diag_inval_word(&PROC_RWAKE_SHARED->park_early);
+    diag_inval_word(&PROC_RWAKE_SHARED->park_block);
+    diag_inval_word(&PROC_RWAKE_SHARED->park_resume);
+    if (rescued)  *rescued  = PROC_RWAKE_SHARED->dbg_rescued;
+    if (reason)   *reason   = PROC_RWAKE_SHARED->desched_reason[core];
+    if (p_enter)  *p_enter  = PROC_RWAKE_SHARED->park_enter;
+    if (p_early)  *p_early  = PROC_RWAKE_SHARED->park_early;
+    if (p_block)  *p_block  = PROC_RWAKE_SHARED->park_block;
+    if (p_resume) *p_resume = PROC_RWAKE_SHARED->park_resume;
+}
+
 /* Live per-core scheduler state, published every scheduler loop and cleaned to
  * PoC (unlike the soft_event d_state SNAPSHOT). Lets core 0 read the REAL
  * current process state, dispatch count, and WFE-sleep count for a user core. */
@@ -2428,13 +2515,34 @@ void proc_park(void) {
     bool user = on_user_core();
     u32 uc = user ? user_core_slot() : 0;
     struct process *p = &procs[current_proc];
+    proc_park_note(0U); /* park_enter++ */
+    /* Disarm preemption FIRST so no timer-preempt can fire between the sticky-wake
+     * test and the BLOCKED commit. proc_soft_event() only runs on this same
+     * (affinity) core from the wake-ring drain and never while this process is
+     * on-core, so disarming preemption makes the test-and-block atomic w.r.t.
+     * wake_pending without masking IRQs. */
     if (user) {
         preempt_armed[uc] = false;
         preempt_pending[uc] = false;
     }
+    /* A wake delivered after our caller decided "no work" but before we parked
+     * leaves wake_pending set even though our state was never BLOCKED. Consume it
+     * and return WITHOUT blocking; the caller re-loops and re-checks its work
+     * source. This closes the lost-wakeup race behind the port-81 504 strand. */
+    if (proc_wake_pending[current_proc]) {
+        proc_wake_pending[current_proc] = 0;
+        if (user && preempt_enabled[uc])
+            preempt_armed[uc] = true;
+        proc_park_note(1U); /* park_early++ */
+        return;
+    }
     proc_account_runtime(p);
     p->state = PROC_BLOCKED;
+    proc_park_note(2U); /* park_block++ */
+    proc_note_desched(1U);
     ctx_switch(&p->ctx, &scheduler_ctx);
+    proc_park_note(3U); /* park_resume++ */
+    proc_wake_pending[current_proc] = 0;   /* consume the wake that dispatched us */
     if (user && preempt_enabled[uc] && p->state == PROC_RUNNING)
         preempt_armed[uc] = true;
 }
