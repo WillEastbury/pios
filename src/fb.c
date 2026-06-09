@@ -10,6 +10,7 @@
 #include "dma.h"
 #include "mmu.h"
 #include "core_env.h"
+#include "simd.h"
 
 /* Framebuffer state */
 static u32 *fb_ptr;
@@ -645,10 +646,15 @@ u64 fb_get_phys_addr(void) {
 static void fb_blit(u32 off, u32 bytes) {
     u8 *src = (u8 *)fb_back + off;
     u8 *dst = (u8 *)fb_ptr  + off;
-    dcache_clean_range((u64)(usize)src, bytes);   /* back slice → RAM */
-    dsb();
-    dma_memcpy(DMA_CHAN_MEMCPY, dst, src, bytes); /* DMA bulk, NEON fallback */
-    dcache_clean_range((u64)(usize)dst, bytes);   /* front slice → RAM for scanout */
+    /* Blit via CPU/NEON. This is the proven write path to the VideoCore
+     * scanout buffer: the dma32 engine's view of the firmware framebuffer
+     * address does not land on the scanned-out buffer, so a DMA blit leaves
+     * the display frozen. The win is the cached back buffer (fast rendering);
+     * the front copy is one bulk sequential NEON pass over only the dirty
+     * rows. The clean pushes the band to RAM so the scanout sees it whether
+     * the FB is mapped cacheable or not. */
+    simd_memcpy(dst, src, bytes);
+    dcache_clean_range((u64)(usize)dst, bytes);
     dsb();
 }
 

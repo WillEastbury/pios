@@ -317,6 +317,7 @@ static void core0_sched_snapshot(u64 *wake, u64 *wfi_count, u64 *idle_ticks,
                                  u64 *total_ticks, u32 *busy_permille,
                                  u32 *last_flags);
 static void core0_eth_irq_handler(void);
+static void core0_eth_irq_arm_host(bool oneshot);
 static bool core0_eth_irq_drain_and_quench(bool host_route);
 static const char *tcp_state_name(u32 state);
 static const char *tcp_owner_label(u16 port);
@@ -2163,21 +2164,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, core0_eth_irq_count);
             http_append(out, &len, max, "\n");
         } else if (http_streq(cmd, "rp1 irq arm-host6") || http_streq(cmd, "rp1 irq arm-host6-1")) {
-            __asm__ volatile("msr daifset, #2" ::: "memory");
-            core0_eth_irq_oneshot = http_streq(cmd, "rp1 irq arm-host6-1");
-            irq_register(GIC_RP1_ETH_MSI, core0_eth_irq_handler);
-            gic_set_group1(GIC_RP1_ETH_MSI);
-            gic_set_priority(GIC_RP1_ETH_MSI, 0x40);
-            gic_set_target(GIC_RP1_ETH_MSI, 1);
-            gic_set_edge_triggered(GIC_RP1_ETH_MSI);
-            gic_clear_pending(GIC_RP1_ETH_MSI);
-            macb_irq_ack_rx();
-            rp1_eth_host_arm();
-            macb_irq_enable_rx();
-            dsb();
-            isb();
-            gic_enable_irq(GIC_RP1_ETH_MSI);
-            __asm__ volatile("msr daifclr, #2" ::: "memory");
+            core0_eth_irq_arm_host(http_streq(cmd, "rp1 irq arm-host6-1"));
             http_append(out, &len, max, core0_eth_irq_oneshot ?
                         "rp1 eth HOST6 one-shot armed\n" : "rp1 eth HOST6 armed\n");
         }
@@ -12386,6 +12373,30 @@ static void core0_eth_irq_handler(void)
     sev();
 }
 
+/* Arm RP1 Ethernet RX → GIC HOST6 delivery to core 0 (the proven sequence,
+ * shared by the boot auto-arm and the `rp1 irq arm-host6` console command).
+ * Continuous mode (oneshot=false) leaves the GIC line enabled; the handler
+ * defers a drain+quench that W1C-clears MACB ISR.RCOMP so the next packet
+ * re-triggers without storming. */
+static void core0_eth_irq_arm_host(bool oneshot)
+{
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    core0_eth_irq_oneshot = oneshot;
+    irq_register(GIC_RP1_ETH_MSI, core0_eth_irq_handler);
+    gic_set_group1(GIC_RP1_ETH_MSI);
+    gic_set_priority(GIC_RP1_ETH_MSI, 0x40);
+    gic_set_target(GIC_RP1_ETH_MSI, 1);   /* CPU0 bitmask = CORE_NET */
+    gic_set_edge_triggered(GIC_RP1_ETH_MSI);
+    gic_clear_pending(GIC_RP1_ETH_MSI);
+    macb_irq_ack_rx();
+    rp1_eth_host_arm();
+    macb_irq_enable_rx();
+    dsb();
+    isb();
+    gic_enable_irq(GIC_RP1_ETH_MSI);
+    __asm__ volatile("msr daifclr, #2" ::: "memory");
+}
+
 static bool core0_eth_irq_drain_and_quench(bool host_route)
 {
     const u32 eth_bit = 1U << RP1_INT_ETH;
@@ -12514,6 +12525,11 @@ NORETURN void core0_main(void) {
     core0_io_flags = CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART |
                      CORE0_IO_USB | CORE0_IO_MAINT | CORE0_IO_DASH;
     core0_io_sched_start_ticks = sched_counter_ticks();
+
+    /* Auto-arm RP1 Ethernet RX → GIC HOST6 so inbound packets wake core 0 via
+     * interrupt instead of relying solely on the periodic poll. The 31 Hz NET
+     * poll is retained as a safety net until IRQ delivery is proven under load. */
+    core0_eth_irq_arm_host(false);
 
     for (;;) {
         u32 flags = core0_io_take_flags();
