@@ -318,6 +318,8 @@ static void core0_sched_snapshot(u64 *wake, u64 *wfi_count, u64 *idle_ticks,
                                  u32 *last_flags);
 static void core0_eth_irq_handler(void);
 static void core0_eth_irq_arm_host(bool oneshot);
+static volatile u64 g_dash_snap_ticks;
+static volatile u64 g_dash_render_ticks;
 static bool core0_eth_irq_drain_and_quench(bool host_route);
 static const char *tcp_state_name(u32 state);
 static const char *tcp_owner_label(u16 port);
@@ -2230,6 +2232,68 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             }
             http_append(out, &len, max, "\n");
         }
+    } else if (http_starts_with(cmd, "membench ")) {
+        char *argv[3];
+        u32 argc = http_split_args(cmd, argv, 3);
+        u64 addr = 0;
+        u32 count = 1000000U;
+        if (argc >= 2 && http_parse_u64(argv[1], &addr) &&
+            (argc < 3 || http_parse_u32(argv[2], &count))) {
+            volatile u32 *p = (volatile u32 *)(usize)addr;
+            u64 t0; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
+            for (u32 i = 0; i < count; i++)
+                p[i & 1023U] = i;            /* 4KB window: cache-resident if cacheable */
+            u64 t1; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t1));
+            u64 dt = t1 - t0;
+            http_append(out, &len, max, "membench addr=0x");
+            http_append_hex64(out, &len, max, addr);
+            http_append(out, &len, max, " count=");
+            http_append_u64(out, &len, max, count);
+            http_append(out, &len, max, " ticks=");
+            http_append_u64(out, &len, max, dt);
+            http_append(out, &len, max, " ps_per_write=");
+            http_append_u64(out, &len, max, count ? (dt * 18518ULL) / count : 0); /* ~ps at 54MHz */
+            http_append(out, &len, max, "\n");
+        } else {
+            http_append(out, &len, max, "usage membench <addr> [count]\n");
+        }
+    } else if (http_streq(cmd, "fb info")) {
+        u32 db = 0, size = 0, pitch = 0;
+        fb_debug_info(&db, &size, &pitch);
+        u64 cntfrq; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
+        http_append(out, &len, max, "fb double_buffer=");
+        http_append_u64(out, &len, max, db);
+        http_append(out, &len, max, " size=");
+        http_append_u64(out, &len, max, size);
+        http_append(out, &len, max, " back_size=");
+        http_append_u64(out, &len, max, (u64)FB_BACK_SIZE);
+        http_append(out, &len, max, " pitch=");
+        http_append_u64(out, &len, max, pitch);
+        http_append(out, &len, max, " cntfrq=");
+        http_append_u64(out, &len, max, cntfrq);
+        http_append(out, &len, max, " dash_snap_ticks=");
+        http_append_u64(out, &len, max, g_dash_snap_ticks);
+        http_append(out, &len, max, " dash_render_ticks=");
+        http_append_u64(out, &len, max, g_dash_render_ticks);
+        http_append(out, &len, max, " blit_ticks=");
+        http_append_u64(out, &len, max, fb_last_blit_ticks());
+        u64 sctlr, tcr, cel;
+        __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+        __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr));
+        __asm__ volatile("mrs %0, currentel" : "=r"(cel));
+        http_append(out, &len, max, " sctlr=0x");
+        http_append_hex64(out, &len, max, sctlr);
+        http_append(out, &len, max, " (M=");
+        http_append_u64(out, &len, max, sctlr & 1U);
+        http_append(out, &len, max, " C=");
+        http_append_u64(out, &len, max, (sctlr >> 2) & 1U);
+        http_append(out, &len, max, " I=");
+        http_append_u64(out, &len, max, (sctlr >> 12) & 1U);
+        http_append(out, &len, max, ") tcr=0x");
+        http_append_hex64(out, &len, max, tcr);
+        http_append(out, &len, max, " EL=");
+        http_append_u64(out, &len, max, (cel >> 2) & 3U);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "rp1 pci")) {
         u32 id = pcie_cfg_read(1, 0, 0, 0x00);
         u32 cmdstat = pcie_cfg_read(1, 0, 0, 0x04);
@@ -12168,6 +12232,10 @@ static void dash_core0_flags(u32 flags)
     if (!any) fb_puts("none");
 }
 
+static volatile u64 g_dash_snap_ticks;
+static volatile u64 g_dash_render_ticks;
+static inline u64 dash_now_ticks(void) { u64 c; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(c)); return c; }
+
 static void hdmi_dashboard_render(void)
 {
     static u64 last_ms;
@@ -12179,6 +12247,7 @@ static void hdmi_dashboard_render(void)
 
     last_ms = now_ms;
     heartbeat++;
+    u64 t_dash0 = dash_now_ticks();
 
     u64 used = 0;
     for (u32 i = 0; i < 4; i++) {
@@ -12217,6 +12286,8 @@ static void hdmi_dashboard_render(void)
     }
 
     u32 log_top = fb_rows() > 10 ? fb_rows() - 9 : 28;
+    u64 t_dash1 = dash_now_ticks();
+    g_dash_snap_ticks = t_dash1 - t_dash0;
     if (!layout_drawn) {
         fb_clear(0x00000000);
         fb_set_color(0x0000FF80, 0x00000000);
@@ -12326,6 +12397,7 @@ static void hdmi_dashboard_render(void)
         fb_set_color(0x0000FF80, 0x00000000);
         fb_puts("No warnings or errors in the hot log ring.");
     }
+    g_dash_render_ticks = dash_now_ticks() - t_dash1;
 }
 
 /* Core 0 I/O reactor: timer IRQ only marks work due and wakes the service
@@ -12350,11 +12422,16 @@ static void core0_io_tick_hook(u32 core, u64 tick)
         return;
 
     u32 flags = 0;
+    /* UART/USB stay responsive (~31Hz, cheap polls). NET/TCP drop to ~8Hz as a
+     * safety net now that RX is interrupt-driven. DASH (the expensive HDMI
+     * render) drops to ~0.17Hz — it dominates core0 idle. */
     if ((tick & 31U) == 0)
-        flags |= CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART | CORE0_IO_USB;
+        flags |= CORE0_IO_UART | CORE0_IO_USB;
+    if ((tick & 127U) == 0)
+        flags |= CORE0_IO_NET | CORE0_IO_TCP;
     if ((tick % 100U) == 0)
         flags |= CORE0_IO_MAINT;
-    if ((tick % 2000U) == 0)
+    if ((tick % 6000U) == 0)
         flags |= CORE0_IO_DASH;
     if (flags) {
         core0_io_flags |= flags;

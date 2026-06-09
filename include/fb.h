@@ -32,3 +32,9 @@ u64 fb_get_phys_addr(void);
 /* Push dirty rows from the cached back buffer to the VideoCore scanout buffer
  * (DMA blit). Cheap no-op when nothing changed or double-buffering is off. */
 void fb_present(void);
+
+/* Report whether double-buffering is active plus FB byte-size and pitch. */
+void fb_debug_info(u32 *db, u32 *size, u32 *pitch);
+
+/* CNTPCT ticks taken by the most recent back→front blit. */
+u64 fb_last_blit_ticks(void);

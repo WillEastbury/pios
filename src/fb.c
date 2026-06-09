@@ -23,6 +23,7 @@ static u32 *fb_back;    /* cached back buffer (rendering target when double-buff
 static bool fb_db;      /* double-buffering enabled */
 static u32  fb_dirty_y0;/* dirty pixel-row range [y0,y1); y0>=y1 == clean */
 static u32  fb_dirty_y1;
+static volatile u64 g_fb_blit_ticks; /* CNTPCT ticks of the last blit */
 #endif
 static u32  fb_fg = 0x00FF9900;  /* amber */
 static u32  fb_bg = 0x00000000;  /* black */
@@ -636,6 +637,25 @@ u64 fb_get_phys_addr(void) {
     return (u64)(usize)fb_ptr;
 }
 
+/* Diagnostics: is double-buffering actually active, and the FB geometry. */
+void fb_debug_info(u32 *db, u32 *size, u32 *pitch) {
+    if (size)  *size = fb_size;
+    if (pitch) *pitch = fb_pitch;
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+    if (db) *db = fb_db ? 1U : 0U;
+#else
+    if (db) *db = 0U;
+#endif
+}
+
+u64 fb_last_blit_ticks(void) {
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+    return g_fb_blit_ticks;
+#else
+    return 0;
+#endif
+}
+
 /* ── Double-buffer present ──
  * Blit the dirty pixel-row band from the cached back buffer to the VideoCore
  * scanout buffer. The back slice is cleaned to RAM so the DMA engine (or NEON
@@ -644,6 +664,7 @@ u64 fb_get_phys_addr(void) {
  * multi-row band is "bulk" and goes through DMA; a tiny band falls to NEON. */
 #ifndef PIOS_FB_NO_DOUBLE_BUFFER
 static void fb_blit(u32 off, u32 bytes) {
+    u64 t0; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
     u8 *src = (u8 *)fb_back + off;
     u8 *dst = (u8 *)fb_ptr  + off;
     /* Blit via CPU/NEON. This is the proven write path to the VideoCore
@@ -656,6 +677,8 @@ static void fb_blit(u32 off, u32 bytes) {
     simd_memcpy(dst, src, bytes);
     dcache_clean_range((u64)(usize)dst, bytes);
     dsb();
+    u64 t1; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t1));
+    g_fb_blit_ticks = t1 - t0;
 }
 
 void fb_present(void) {
