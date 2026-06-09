@@ -236,6 +236,60 @@ static int fb_mbox_call(void) {
     }
 }
 
+/* Ask the firmware for the ARM clock's maximum rate and set the ARM clock to
+ * it. Bare-metal Pi 5 otherwise leaves the A76 at a low firmware default
+ * frequency (no DVFS governor requests a higher one), which makes the whole
+ * system run ~10-100x slower than it should. Returns the rate the firmware
+ * reports it set (Hz), or 0 on failure. */
+u32 fb_set_arm_clock_max(void) {
+    int i = 0;
+    fb_mbox[i++] = 0;            /* [0] total size */
+    fb_mbox[i++] = 0;            /* [1] request */
+    fb_mbox[i++] = 0x00030004;   /* GET_MAX_CLOCK_RATE */
+    fb_mbox[i++] = 8;            /* value buffer size */
+    fb_mbox[i++] = 4;            /* request size */
+    fb_mbox[i++] = 3;            /* clock id: ARM */
+    fb_mbox[i++] = 0;            /* [6] response: max rate */
+    fb_mbox[i++] = 0;            /* end tag */
+    fb_mbox[0] = (u32)(i * 4);
+    if (!fb_mbox_call())
+        return 0;
+    u32 max_rate = fb_mbox[6];
+    if (!max_rate)
+        return 0;
+
+    i = 0;
+    fb_mbox[i++] = 0;            /* [0] total size */
+    fb_mbox[i++] = 0;            /* [1] request */
+    fb_mbox[i++] = 0x00038002;   /* SET_CLOCK_RATE */
+    fb_mbox[i++] = 12;           /* value buffer size */
+    fb_mbox[i++] = 8;            /* request size */
+    fb_mbox[i++] = 3;            /* clock id: ARM */
+    fb_mbox[i++] = max_rate;     /* [6] desired rate (response: actual) */
+    fb_mbox[i++] = 0;            /* skip setting turbo = 0 */
+    fb_mbox[i++] = 0;            /* end tag */
+    fb_mbox[0] = (u32)(i * 4);
+    if (!fb_mbox_call())
+        return 0;
+    return fb_mbox[6];
+}
+
+u32 fb_get_arm_clock(void) {
+    int i = 0;
+    fb_mbox[i++] = 0;
+    fb_mbox[i++] = 0;
+    fb_mbox[i++] = 0x00030002;   /* GET_CLOCK_RATE */
+    fb_mbox[i++] = 8;
+    fb_mbox[i++] = 4;
+    fb_mbox[i++] = 3;            /* clock id: ARM */
+    fb_mbox[i++] = 0;            /* [6] response: rate */
+    fb_mbox[i++] = 0;
+    fb_mbox[0] = (u32)(i * 4);
+    if (!fb_mbox_call())
+        return 0;
+    return fb_mbox[6];
+}
+
 bool fb_init(u32 width, u32 height) {
     /* Build tag buffer — matching canary_main.c exactly */
     int i = 0;

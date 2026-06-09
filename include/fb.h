@@ -38,3 +38,9 @@ void fb_debug_info(u32 *db, u32 *size, u32 *pitch);
 
 /* CNTPCT ticks taken by the most recent back→front blit. */
 u64 fb_last_blit_ticks(void);
+
+/* Set the ARM (A76) clock to the firmware's max rate; returns the rate set (Hz)
+ * or 0 on failure. Bare-metal Pi 5 otherwise runs the CPU at a low default. */
+u32 fb_set_arm_clock_max(void);
+/* Read the current ARM clock rate (Hz). */
+u32 fb_get_arm_clock(void);

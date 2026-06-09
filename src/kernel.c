@@ -2244,15 +2244,33 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             for (u32 i = 0; i < count; i++)
                 p[i & 1023U] = i;            /* 4KB window: cache-resident if cacheable */
             u64 t1; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t1));
-            u64 dt = t1 - t0;
+            u32 acc = 0;
+            u64 t2; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t2));
+            for (u32 i = 0; i < count; i++)
+                acc += p[i & 1023U];         /* read pass over the same window */
+            u64 t3; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t3));
+            u64 wdt = t1 - t0, rdt = t3 - t2;
+            /* Pure-compute loop (no memory) to separate CPU clock from memory
+             * latency: if this is also ~100ns/iter the CPU is slow-clocked. */
+            u32 x = count | 1U;
+            u64 t4; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t4));
+            for (u32 i = 0; i < count; i++)
+                x = x * 1664525U + 1013904223U;
+            u64 t5; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t5));
+            __asm__ volatile("" : : "r"(x));   /* keep x live */
+            u64 cdt = t5 - t4;
             http_append(out, &len, max, "membench addr=0x");
             http_append_hex64(out, &len, max, addr);
             http_append(out, &len, max, " count=");
             http_append_u64(out, &len, max, count);
-            http_append(out, &len, max, " ticks=");
-            http_append_u64(out, &len, max, dt);
-            http_append(out, &len, max, " ps_per_write=");
-            http_append_u64(out, &len, max, count ? (dt * 18518ULL) / count : 0); /* ~ps at 54MHz */
+            http_append(out, &len, max, " write_ps=");
+            http_append_u64(out, &len, max, count ? (wdt * 18518ULL) / count : 0);
+            http_append(out, &len, max, " read_ps=");
+            http_append_u64(out, &len, max, count ? (rdt * 18518ULL) / count : 0);
+            http_append(out, &len, max, " compute_ps=");
+            http_append_u64(out, &len, max, count ? (cdt * 18518ULL) / count : 0);
+            http_append(out, &len, max, " acc=");
+            http_append_u64(out, &len, max, acc + x);
             http_append(out, &len, max, "\n");
         } else {
             http_append(out, &len, max, "usage membench <addr> [count]\n");
@@ -2293,6 +2311,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_hex64(out, &len, max, tcr);
         http_append(out, &len, max, " EL=");
         http_append_u64(out, &len, max, (cel >> 2) & 3U);
+        http_append(out, &len, max, " arm_clock=");
+        http_append_u64(out, &len, max, fb_get_arm_clock());
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "rp1 pci")) {
         u32 id = pcie_cfg_read(1, 0, 0, 0x00);
@@ -12431,7 +12451,7 @@ static void core0_io_tick_hook(u32 core, u64 tick)
         flags |= CORE0_IO_NET | CORE0_IO_TCP;
     if ((tick % 100U) == 0)
         flags |= CORE0_IO_MAINT;
-    if ((tick % 6000U) == 0)
+    if ((tick % 8000U) == 0)
         flags |= CORE0_IO_DASH;
     if (flags) {
         core0_io_flags |= flags;
@@ -12836,6 +12856,10 @@ static void boot_diag(bool sd_ok, bool walfs_ok, bool nic_ok, bool usb_ok) {
  * No macros, no helper functions, no optimisation surprises.
  */
 void kernel_fb_early(void) {
+    /* Ramp the A76 to the firmware's max clock before anything else — bare-metal
+     * Pi 5 otherwise runs at a low default, making the whole system ~10-100x
+     * slower (slow FB/IPC/HTTP, high idle). */
+    fb_set_arm_clock_max();
     if (!fb_init(1920, 1080) && !fb_init(1280, 720) && !fb_init(1024, 768))
         return;
 
