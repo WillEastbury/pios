@@ -30,9 +30,23 @@
 #include "watchdog.h"
 
 static struct process  procs[MAX_PROCS_PER_CORE];
-static struct proc_context scheduler_ctx;
-static u32 current_proc;   /* index into procs[] */
-static u32 rr_cursor;
+/* rc-percore-sched: the scheduler's saved context, the current-process index,
+ * and the round-robin cursor are PER-CORE. procs[] stays shared (each core
+ * filters by affinity_core), but a single global scheduler_ctx would let two
+ * active user cores clobber each other's ctx_switch save slot, and a single
+ * current_proc/rr_cursor would cross-dispatch between cores. Index by core_id()
+ * (0..3) so every site -- including core 0 -- resolves to its own slot. The
+ * macros expand the existing token at all use sites; lvalue and address-of uses
+ * keep working (e.g. `current_proc = chosen`, `&scheduler_ctx`). core_id() reads
+ * MPIDR_EL1 (pure/side-effect-free), so resolving per reference is correct and
+ * cheap. Behaviour is identical for today's single-user-core topology (core 2 ->
+ * slot 2; core 0 -> slot 0, value 0 as before). */
+static struct proc_context scheduler_ctx_arr[4];
+static u32 current_proc_arr[4];   /* per-core index into procs[] */
+static u32 rr_cursor_arr[4];
+#define scheduler_ctx (scheduler_ctx_arr[core_id()])
+#define current_proc  (current_proc_arr[core_id()])
+#define rr_cursor     (rr_cursor_arr[core_id()])
 static u32 next_pid;
 static bool initialized;
 static u64 heap_top[MAX_PROCS_PER_CORE];
@@ -1460,8 +1474,14 @@ void proc_init_shared(void)
     }
     for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++)
         paged_io_tab[i].used = false;
-    current_proc = 0;
-    rr_cursor = 0;
+    /* rc-percore-sched: current_proc/rr_cursor are per-core arrays now. This
+     * runs exactly once (on core 0, before the secondaries start), so zero every
+     * core's slot explicitly rather than relying on the macro (which would only
+     * touch core 0's slot via core_id()). */
+    for (u32 c = 0; c < 4; c++) {
+        current_proc_arr[c] = 0;
+        rr_cursor_arr[c] = 0;
+    }
     next_pid = (core_id() << 16) | 1;  /* encode core in upper bits */
     proc_el1_integrity_baseline = proc_el1_integrity_hash_now();
     proc_el1_integrity_next_check_tick = timer_ticks() + 512ULL;
@@ -1475,8 +1495,9 @@ void proc_init(void)
     u32 uc = on_user_core() ? user_core_slot() : 0;
     if (on_user_core())
         core_mark_online(core_id(), 0x20);
-    /* Shared process-table state is single-instance (procs[], current_proc,
-     * rr_cursor, next_pid, paged IO, integrity baseline). It MUST be initialised
+    /* Shared process-table state is single-instance (procs[], next_pid, paged IO,
+     * integrity baseline; current_proc/rr_cursor are now PER-CORE arrays). It MUST
+     * be initialised
      * exactly once. Core 0 runs proc_init_shared() before launching the secondary
      * cores, so `initialized` is already true by the time cores 1-3 arrive here;
      * without this guard each secondary re-zeroed procs[] and a late core (e.g.
