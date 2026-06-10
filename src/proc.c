@@ -417,8 +417,17 @@ bool proc_entry_contract_selftest(void)
     return proc_entry_contract_validate(&p);
 }
 
-#define PROC_SVC_NOP     0U
-#define PROC_SVC_GETPID  1U
+#define PROC_SVC_NOP       0U
+#define PROC_SVC_GETPID    1U
+#define PROC_SVC_EL0_PROBE 2U
+#define PROC_SVC_EXIT      3U
+
+static volatile u32 el0_probe_seen;
+static volatile u32 el0_probe_pid;
+static volatile u32 el0_probe_spsr;
+static volatile u64 el0_probe_arg;
+static volatile u64 el0_probe_elr;
+static volatile u32 el0_probe_exits;
 
 u64 proc_svc_calls(void)
 {
@@ -453,6 +462,18 @@ static bool proc_handle_svc_inner(struct irq_frame *frame, u64 esr, bool account
     case PROC_SVC_GETPID:
         frame->x[0] = proc_current_pid_for_svc();
         return true;
+    case PROC_SVC_EL0_PROBE:
+        el0_probe_seen = ((frame->spsr & 0xFU) == 0U) ? 1U : 0xBAD00000U;
+        el0_probe_pid = proc_current_pid_for_svc();
+        el0_probe_spsr = (u32)frame->spsr;
+        el0_probe_arg = frame->x[0];
+        el0_probe_elr = frame->elr;
+        frame->x[0] = 0;
+        return true;
+    case PROC_SVC_EXIT:
+        el0_probe_exits++;
+        proc_exit((u32)frame->x[0]);
+        __builtin_unreachable();
     default:
         if (account)
             svc_bad_count++;
@@ -477,6 +498,16 @@ bool proc_svc_selftest(void)
     if (!proc_handle_svc_inner(&f, ((u64)EC_SVC64 << ESR_EC_SHIFT) | 0xFFFFU, false))
         return false;
     return f.x[0] == (u64)-38;
+}
+
+void proc_el0_probe_snapshot(u32 *seen, u32 *pid, u32 *spsr, u64 *arg, u64 *elr, u32 *exits)
+{
+    if (seen)  *seen  = el0_probe_seen;
+    if (pid)   *pid   = el0_probe_pid;
+    if (spsr)  *spsr  = el0_probe_spsr;
+    if (arg)   *arg   = el0_probe_arg;
+    if (elr)   *elr   = el0_probe_elr;
+    if (exits) *exits = el0_probe_exits;
 }
 
 static void proc_arena_update_high(struct process *p, u32 slot)
@@ -1452,6 +1483,15 @@ static NORETURN void proc_trampoline(void)
     __builtin_unreachable();
 }
 
+extern void proc_el0_enter(u64 entry_pc, u64 entry_sp) NORETURN;
+
+static NORETURN void proc_el0_trampoline(void)
+{
+    struct process *p = &procs[current_proc];
+    proc_el0_enter(p->entry_pc, p->entry_sp);
+    __builtin_unreachable();
+}
+
 static void proc_preempt_trampoline(void)
 {
     proc_yield();
@@ -1658,6 +1698,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->exec_hash_check_nonce = 1;
     p->exec_hash_next_check_tick = proc_integrity_next_tick(p->pid, p->exec_hash_check_nonce);
     p->entry_pc = (u64)(usize)base;
+    p->run_at_el0 = false;
     p->arena_base = ((u64)(usize)base + loaded + L3_PAGE_SIZE - 1) & ~(L3_PAGE_SIZE - 1);
     p->arena_limit = (u64)(usize)base + PROC_SLOT_SIZE - 65536ULL;
     if (p->arena_base >= p->arena_limit) {
@@ -1816,6 +1857,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     }
     p->capsule_enabled = false;
     p->capsule_manifest_hash = 0;
+    p->run_at_el0 = false;
 
     heap_top[(u32)slot] = p->arena_base;
     proc_span_reset((u32)slot);
@@ -1849,6 +1891,113 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     (void)mmu_user_ipc_shm_window(core_id(), (u32)slot, true);
 
     uart_puts("[proc] mem-exec pid=");
+    uart_hex(p->pid);
+    uart_puts(" name=");
+    uart_puts(name ? name : "?");
+    uart_putc('\n');
+
+    return (i32)p->pid;
+}
+
+i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
+                           u64 linked_base, u32 priority_class, u32 affinity_core)
+{
+    if (!initialized)
+        return -1;
+    if (!proc_prio_valid(priority_class))
+        return -1;
+    if (affinity_core != core_id())
+        return -1;
+    if (!blob || blob_len == 0 || blob_len > PROC_SLOT_SIZE - 64U)
+        return -1;
+
+    i32 slot = find_empty_slot();
+    if (slot < 0) {
+        uart_puts("[proc] el0 mem-exec: no free slot\n");
+        return -1;
+    }
+
+    u8 *base = slot_base((u32)slot);
+    if ((u64)(usize)base != linked_base) {
+        uart_puts("[proc] el0 mem-exec: slot base mismatch\n");
+        return -1;
+    }
+    dma_zero(5, base, PROC_SLOT_SIZE);
+    simd_memcpy(base, blob, blob_len);
+    u32 loaded = blob_len;
+    u32 exec_hash = hw_crc32c(base, loaded);
+
+    struct process *p = &procs[slot];
+    p->pid = next_pid++;
+    p->parent_pid = 0;
+    p->state = PROC_READY;
+    proc_wake_pending[slot] = 0;
+    p->principal_id = PRINCIPAL_ROOT;
+    p->affinity_core = affinity_core;
+    p->priority_class = priority_class;
+    p->quantum_ticks = proc_quantum_for_prio(priority_class);
+    p->base = base;
+    p->mem_size = PROC_SLOT_SIZE;
+    p->ticks = timer_ticks();
+    p->runtime_ticks = 0;
+    p->exit_code = 0;
+    p->preemptions = 0;
+    p->ipc_shm_map_refs = 0;
+    p->capsule_id = PROC_CAPSULE_ID_NONE;
+    p->exec_image_size = loaded;
+    p->exec_hash_baseline = exec_hash;
+    p->exec_hash_last = exec_hash;
+    p->exec_hash_check_nonce = 1;
+    p->exec_hash_next_check_tick = proc_integrity_next_tick(p->pid, p->exec_hash_check_nonce);
+    p->entry_pc = (u64)(usize)base;
+    p->run_at_el0 = true;
+    p->arena_base = ((u64)(usize)base + loaded + L3_PAGE_SIZE - 1) & ~(L3_PAGE_SIZE - 1);
+    p->arena_limit = (u64)(usize)base + PROC_SLOT_SIZE - 65536ULL;
+    if (p->arena_base >= p->arena_limit) {
+        p->state = PROC_EMPTY;
+        p->pid = 0;
+        return -1;
+    }
+    p->arena_capacity_bytes = (u32)(p->arena_limit - p->arena_base);
+    p->arena_high_bytes = 0;
+    p->arena_span_bytes = 0;
+    p->arena_span_high_bytes = 0;
+    p->arena_span_count = 0;
+    p->arena_span_high_count = 0;
+    p->image_path[0] = 0;
+    for (u32 pi = 0; name && pi + 1 < sizeof(p->image_path) && name[pi]; pi++) {
+        p->image_path[pi] = name[pi];
+        p->image_path[pi + 1] = 0;
+    }
+    p->capsule_enabled = false;
+    p->capsule_manifest_hash = 0;
+
+    heap_top[(u32)slot] = p->arena_base;
+    proc_span_reset((u32)slot);
+    dcache_clean_range((u64)(usize)base, loaded);
+    icache_invalidate_range((u64)(usize)base, loaded);
+
+    p->entry_sp = (u64)(usize)(base + PROC_SLOT_SIZE - 16);
+    p->entry_spsr = PROC_ENTRY_SPSR_EL0_DAIF;
+    p->entry_flags = proc_entry_contract_flags();
+    if (!proc_entry_contract_validate(p)) {
+        p->state = PROC_EMPTY;
+        p->pid = 0;
+        return -1;
+    }
+
+    simd_zero(&p->ctx, sizeof(p->ctx));
+    p->ctx.x19_x30[11] = (u64)(usize)proc_el0_trampoline;
+    p->ctx.sp = p->entry_sp;
+
+    if (!mmu_user_table_build_split_el0(core_id(), (u32)slot, (u64)(usize)base,
+                                        PROC_SLOT_SIZE, loaded)) {
+        p->state = PROC_EMPTY;
+        p->pid = 0;
+        return -1;
+    }
+
+    uart_puts("[proc] el0 mem-exec pid=");
     uart_hex(p->pid);
     uart_puts(" name=");
     uart_puts(name ? name : "?");

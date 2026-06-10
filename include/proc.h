@@ -298,6 +298,7 @@ struct process {
     u64 entry_sp;
     u64 entry_spsr;
     u32 entry_flags;
+    bool run_at_el0;
     u64 arena_base;
     u64 arena_limit;
     u32 arena_capacity_bytes;
@@ -523,6 +524,9 @@ i32  proc_launch_on_core_as_prio(u32 target_core, const char *path, u32 principa
  * on the target core; the blob must be linked at PROC_EMBED_BASE. */
 i32  proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
                         u32 priority_class, u32 affinity_core);
+i32  proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
+                            u64 linked_base, u32 priority_class, u32 affinity_core);
+void proc_el0_probe_snapshot(u32 *seen, u32 *pid, u32 *spsr, u64 *arg, u64 *elr, u32 *exits);
 /* Block the current process until woken (BLOCKED + yield to scheduler). */
 void proc_park(void);
 /* Post a wake for `pid` onto `target_core`'s wake ring and SEV. Safe to call

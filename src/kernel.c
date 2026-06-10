@@ -3138,6 +3138,23 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "abi selftest")) {
         http_append(out, &len, max, abi_selftest() ? "ABI selftest OK\n" : "ABI selftest FAILED\n");
+    } else if (http_streq(cmd, "el0") || http_streq(cmd, "el0 probe")) {
+        u32 seen = 0, pid = 0, spsr = 0, exits = 0;
+        u64 arg = 0, elr = 0;
+        proc_el0_probe_snapshot(&seen, &pid, &spsr, &arg, &elr, &exits);
+        http_append(out, &len, max, "el0 probe seen=");
+        http_append_u64(out, &len, max, seen);
+        http_append(out, &len, max, " pid=");
+        http_append_u64(out, &len, max, pid);
+        http_append(out, &len, max, " spsr=0x");
+        http_append_hex32(out, &len, max, spsr);
+        http_append(out, &len, max, " arg=0x");
+        http_append_hex64(out, &len, max, arg);
+        http_append(out, &len, max, " elr=0x");
+        http_append_hex64(out, &len, max, elr);
+        http_append(out, &len, max, " exits=");
+        http_append_u64(out, &len, max, exits);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "ipc bench") || http_starts_with(cmd, "ipc bench ")) {
         u32 iters = 10000;
         if (http_starts_with(cmd, "ipc bench ")) {
@@ -13532,6 +13549,8 @@ NORETURN void core1_main(void) {
 /* Embedded userland HTTP server flat binary (src/user_httpd_payload.S). */
 extern const u8 user_httpd_start[];
 extern const u8 user_httpd_end[];
+extern const u8 user_el0_probe_start[];
+extern const u8 user_el0_probe_end[];
 NORETURN void core2_main(void) {
     core_mark_online(CORE_USER0, 1);
     core_env_init(CORE_USER0);
@@ -13564,6 +13583,9 @@ NORETURN void core3_main(void) {
     core_mark_online(CORE_USER1, 4);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     core_mark_online(CORE_USER1, 5);
+    proc_exec_from_mem_el0("user/el0probe", user_el0_probe_start,
+                           (u32)(usize)(user_el0_probe_end - user_el0_probe_start),
+                           0x03B00000ULL, PROC_PRIO_NORMAL, core_id());
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }

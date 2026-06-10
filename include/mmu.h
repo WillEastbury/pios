@@ -26,7 +26,9 @@
 #define PTE_SH_INNER        (3UL << 8)   /* Inner shareable */
 #define PTE_SH_OUTER        (2UL << 8)   /* Outer shareable */
 #define PTE_AP_RW_EL1       (0UL << 6)   /* EL1 read/write */
+#define PTE_AP_RW_EL0       (1UL << 6)   /* EL1/EL0 read/write */
 #define PTE_AP_RO_EL1       (2UL << 6)   /* EL1 read-only */
+#define PTE_AP_RO_EL0       (3UL << 6)   /* EL1/EL0 read-only */
 #define PTE_UXN             (1UL << 54)  /* Unprivileged Execute Never */
 #define PTE_PXN             (1UL << 53)  /* Privileged Execute Never */
 #define PTE_ATTR(idx)       ((u64)(idx) << 2)
@@ -66,6 +68,9 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size);
 
 /* Build a split process table: loaded image pages RX/RO, arena+stack RW/XN. */
 bool mmu_user_table_build_split(u32 core, u32 slot, u64 slot_base, u64 slot_size, u32 code_bytes);
+
+/* Build split process table with EL0-accessible code/data permissions. */
+bool mmu_user_table_build_split_el0(u32 core, u32 slot, u64 slot_base, u64 slot_size, u32 code_bytes);
 
 /* Switch active TTBR0 to a process table on core 2/3 */
 bool mmu_switch_to_user(u32 core, u32 slot);

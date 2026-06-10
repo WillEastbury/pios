@@ -35,6 +35,13 @@ if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_httpd.elf user_httpd.img
 if errorlevel 1 exit /b 1
 for %%f in (user_httpd.img) do echo user_httpd.img size: %%~zf bytes
+"%CC%" %ASFLAGS% -c user\el0_probe.S -o build_user\el0_probe.o
+if errorlevel 1 exit /b 1
+"%LD%" -T user\el0_probe.ld -nostdlib -o build_user\user_el0_probe.elf build_user\el0_probe.o
+if errorlevel 1 exit /b 1
+"%OC%" -O binary build_user\user_el0_probe.elf user_el0_probe.img
+if errorlevel 1 exit /b 1
+for %%f in (user_el0_probe.img) do echo user_el0_probe.img size: %%~zf bytes
 
 echo Building full kernel as real_kernel.img...
 if not exist build mkdir build
