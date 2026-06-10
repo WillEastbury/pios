@@ -25,6 +25,7 @@
 #include "exception.h"
 #include "ksem.h"
 #include "workq.h"
+#include "gic.h"
 #include "picowal_db.h"
 #include "pix.h"
 #include "watchdog.h"
@@ -2004,10 +2005,25 @@ void proc_schedule(void)
                 }
             }
             proc_sched_stage(40);
+            /* Mask IRQs for the ENTIRE user-TTBR0 window. ctx_switch is
+             * cooperative and does NOT alter DAIF, so without this the process
+             * runs with IRQs unmasked (inherited from the scheduler); a timer or
+             * SGI taken while TTBR0 points at the per-process table runs the C
+             * handler under a mapping that only covers kernel RAM below
+             * CORE0_RAM_BASE -- any per-core handler state above that faults, and
+             * the fault itself recurs under the same table, wedging the core at
+             * 100% (observed: core 2/httpd). Interrupts are NOT lost, only
+             * deferred a few microseconds until mmu_switch_to_kernel() restores
+             * the kernel table below, where the idle/dispatch path services them
+             * safely. Cores with no runnable process never reach this block. */
+            u64 sched_daif;
+            __asm__ volatile("mrs %0, daif" : "=r"(sched_daif));
+            __asm__ volatile("msr daifset, #2" ::: "memory");
             if (!mmu_switch_to_user(core_id(), chosen)) {
                 procs[chosen].state = PROC_DEAD;
                 procs[chosen].exit_code = 0xFFFF0002U;
                 mmu_switch_to_kernel();
+                __asm__ volatile("msr daif, %0" :: "r"(sched_daif) : "memory");
                 principal_set_current(PRINCIPAL_ROOT);
                 (void)el2_stage2_activate(PROC_CAPSULE_ID_NONE);
             } else {
@@ -2025,6 +2041,7 @@ void proc_schedule(void)
                     preempt_pending[uc] = false;
                 }
                 mmu_switch_to_kernel();
+                __asm__ volatile("msr daif, %0" :: "r"(sched_daif) : "memory");
                 proc_sched_stage(52);
                 principal_set_current(PRINCIPAL_ROOT);
                 (void)el2_stage2_activate(PROC_CAPSULE_ID_NONE);
@@ -2106,10 +2123,69 @@ u32 proc_count(void)
     return n;
 }
 
+/* ----------------------------------------------------------------------------
+ * GIC SGI inter-core wake doorbell.
+ * The event-stream WFE poll (EVNTI) is a crutch for unreliable cross-core SEV.
+ * The real model is an interrupt doorbell: a producer (e.g. core 0) posts work
+ * to a user core's wake ring, then fires SGI GIC_SGI_WAKE at that core, waking
+ * it from WFI without periodic polling. The handler does no work beyond a
+ * delivery counter -- returning from the IRQ unblocks WFI/WFE and the scheduler
+ * loop re-drains the ring and re-checks the runnable set.
+ *
+ * The per-core delivery counter is isolated to its own 64-byte cache line (this
+ * bring-up does not retain remotely-written shared lines coherently) and the
+ * handler cleans it to PoC so a remote core (core 0 diagnostics) can read it.
+ * ------------------------------------------------------------------------- */
+struct sgi_wake_stat {
+    volatile u32 recv;
+    u32 _pad[15];
+} __attribute__((aligned(64)));
+static struct sgi_wake_stat sgi_wake_stat[4];
+
+static void proc_sgi_wake_handler(void)
+{
+    u32 c = core_id() & 3U;
+    sgi_wake_stat[c].recv++;
+    diag_clean_word(&sgi_wake_stat[c]);
+}
+
+/* Enable SGI doorbell receipt on the calling core. SGI enable/priority live in
+ * banked GICD registers (intid < 32), so this MUST run on each receiving core.
+ * irq_register targets the shared handler table and is idempotent. */
+static void proc_sgi_wake_setup(void)
+{
+    irq_register(GIC_SGI_WAKE, proc_sgi_wake_handler);
+    gic_set_priority(GIC_SGI_WAKE, 0x40);   /* match timer PPI; below PMR 0xF0 */
+    gic_enable_irq(GIC_SGI_WAKE);
+}
+
 void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
 {
     if (!on_user_core())
         return;
+
+    /* The hypervisor-hosting core dispatches a process, so its park->wake->
+     * re-dispatch loop performs a per-dispatch EL2 stage-2 cage toggle
+     * (el2_stage2_activate, the sole isolation boundary for EL1 processes).
+     * Enabling THIS core's GIC CPU interface lets a timer PPI / SGI land across
+     * that EL2 round-trip, which wedges re-dispatch (httpd 504) and freezes the
+     * per-core timer. Cores that never dispatch a process (CORE_USERM/CORE_USER1)
+     * never touch EL2, so interrupt-driven idle is both safe and efficient there.
+     *
+     * Therefore split the idle strategy per core:
+     *   - hosts_process core: PROVEN cooperative idle (no GIC interface), woken by
+     *     SEV (proc_post_remote_wake) for real work, with the architected timer
+     *     event stream as a slow missed-SEV safety net (see EVNTI below).
+     *   - non-hosting cores: interrupt-driven doorbell/WFI idle -- GIC interface
+     *     up, event stream off, timer PPI + SGI doorbell wake WFE directly.
+     * Removing the EL2 cage to make the hosting core interrupt-driven is NOT an
+     * option: while processes still run at EL1 (the EL0 migration is scaffolded
+     * but inactive -- abi el0_ready=false), stage-2 is the only thing isolating
+     * them. Once processes run at EL0, stage-1 EL0 perms isolate and this whole
+     * per-core split can go away. */
+    bool hosts_process = (core_id() == CORE_USER0);
+    if (!hosts_process)
+        gic_cpu_init();
 
     if (timer_hz == 0)
         timer_hz = 1;
@@ -2124,44 +2200,46 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
     preempt_quantum_ticks[uc] = q;
     preempt_pending[uc] = false;
     preempt_armed[uc] = false;
-    preempt_enabled[uc] = true;
+    /* Preemption stays OFF: the timer PPI never reached user cores before the
+     * CPU-interface fix, so the scheduler has always run cooperatively. Now that
+     * the timer fires, leaving preemption enabled would activate the (untested)
+     * IRQ descheduling trampoline and corrupt a running process (observed: httpd
+     * on core 2 wedged). Cooperative behaviour is unchanged from the baseline;
+     * re-enabling preemption is a separate task that must validate the trampoline. */
+    preempt_enabled[uc] = false;
     timer_set_tick_hook(proc_tick_hook);
 
-    /* Self-waking idle scheduler: enable the architected timer event stream so
-     * WFE on this core wakes at a bounded rate (~every 2^(EVNTI+1) counter ticks)
-     * even when no interrupt or cross-core SEV arrives. Empirically, on this
-     * bring-up a remote SEV from core 0 (the network core posting a process
-     * wake) does NOT reliably wake a user core parked in WFE — the wake can be
-     * missed and the parked process would sleep forever. (NOTE: this is NOT the
-     * A76 "SMPEN" bit — SMPEN is a no-op on A76, which is always coherent for
-     * inner-shareable accesses. The true cause is the same unresolved cross-core
-     * cacheable-visibility issue documented at the wake-ring struct below and in
-     * uhttp_bridge.h — under investigation.) With the event stream on, the idle
-     * loop re-drains the remote wake ring and re-checks runnable processes on
-     * every event tick; SEV remains a best-effort fast-path wake when it lands.
-     *
-     * INTERIM STOP-GAP: this whole event-stream poll is a crutch for the
-     * unreliable cross-core SEV. The correct model is a FIFO doorbell IPI
-     * (GIC SGI / FIRE_SW_IRQ) that wakes ONLY the owner core when work is
-     * posted, so idle cores park in WFI at ~0%. Until that lands, EVNTI bounds
-     * the worst-case missed-SEV wake latency. EVNTI selects CNTVCT bit N; an
-     * event fires once per 2^(N+1) ticks. At cntfrq=54MHz:
-     *   EVNTI=8  -> 2^9 =512 ticks  ~9.5us  (~105.6K/s)  — burned idle cores ~45%
-     *   EVNTI=11 -> 2^12=4096 ticks ~75.9us (~13.2K/s, 8x fewer wakes)
-     * EVNTI=11 cuts the idle-poll burn ~8x for only ~66us extra worst-case
-     * cold-wake latency on a MISSED SEV (the SEV fast-path is unchanged). */
+    /* Idle wake source, split by core role (see top-of-function rationale):
+     *   - hosts_process core (cooperative): keep the architected timer EVENT
+     *     STREAM as a SLOW missed-SEV safety net. Real wakes arrive immediately
+     *     via SEV (proc_post_remote_wake); the event stream only bounds worst-
+     *     case missed-SEV latency. EVNTI=15 (vs the legacy 11) is the slowest the
+     *     4-bit field allows: ~824 WFE wakes/s (vs ~13.2K) => idle well under 1%.
+     *   - non-hosting cores (interrupt-driven): DISABLE the event stream
+     *     (EVNTEN=0); the timer PPI (PROC_PREEMPT_TIMER_HZ) gives the bounded
+     *     safety-net wake and the SGI doorbell the on-demand wake. */
     {
         u64 cntkctl;
         __asm__ volatile("mrs %0, cntkctl_el1" : "=r"(cntkctl));
-        cntkctl &= ~((0xFULL << 4) | (1ULL << 3)); /* clear EVNTI[7:4], EVNTDIR */
-        cntkctl |= (11ULL << 4);                   /* EVNTI = CNTVCT bit 11 */
-        cntkctl |= (1ULL << 2);                    /* EVNTEN = 1 */
+        if (hosts_process) {
+            cntkctl &= ~((0xFULL << 4) | (1ULL << 3)); /* clear EVNTI[7:4], EVNTDIR */
+            cntkctl |= (15ULL << 4);                   /* EVNTI = CNTVCT bit 15 */
+            cntkctl |= (1ULL << 2);                    /* EVNTEN = 1 */
+        } else {
+            cntkctl &= ~((0xFULL << 4) | (1ULL << 3) | (1ULL << 2)); /* EVNTI/DIR/EN=0 */
+        }
         __asm__ volatile("msr cntkctl_el1, %0" :: "r"(cntkctl));
         isb();
     }
 
+    /* The SGI doorbell only wakes interrupt-driven cores; the hosting core has no
+     * GIC CPU interface up, so skip arming it there (it would never be delivered). */
+    if (!hosts_process)
+        proc_sgi_wake_setup();
+
     uart_puts("[proc] preempt core=");
     uart_hex(core_id());
+    uart_puts(hosts_process ? " mode=coop+evtstream" : " mode=irq-doorbell");
     uart_puts(" quantum_ticks=");
     uart_hex(q);
     uart_putc('\n');
@@ -2390,6 +2468,11 @@ bool proc_post_remote_wake(u32 target_core, u32 pid) {
     dsb_ishst();               /* head globally visible before the wake event */
     proc_irq_restore(daif);
     sev();
+    /* Ring the GIC SGI doorbell: a latched interrupt reliably wakes the target
+     * core's WFE (and would wake WFI) even when cross-core SEV is missed. The
+     * handler does no work beyond a counter; the wake re-runs the scheduler loop
+     * which drains this ring. target_core is 0..3 -> CPUTargetList bit. */
+    gic_send_sgi((u8)(1U << target_core), GIC_SGI_WAKE);
     return true;
 }
 
@@ -2551,6 +2634,14 @@ static void proc_sched_stage(u32 s) {
 static inline void diag_inval_word(volatile void *p) {
     __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory");
     __asm__ volatile("dsb ish" ::: "memory");
+}
+
+u32 proc_sgi_wake_count(u32 core)
+{
+    if (core >= 4U)
+        return 0;
+    diag_inval_word(&sgi_wake_stat[core]);
+    return sgi_wake_stat[core].recv;
 }
 
 u32 proc_sched_loops(u32 core) {

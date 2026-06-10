@@ -528,6 +528,8 @@ void proc_park(void);
 /* Post a wake for `pid` onto `target_core`'s wake ring and SEV. Safe to call
  * from any core (including core 0); the target core's scheduler delivers it. */
 bool proc_post_remote_wake(u32 target_core, u32 pid);
+/* Delivery counter for the GIC SGI wake doorbell on `core` (0-3). */
+u32  proc_sgi_wake_count(u32 core);
 /* Diagnostics for the cross-core wake ring. */
 void proc_rwake_stats(u32 *posted, u32 *drained, u32 *full);
 u32  proc_sched_loops(u32 core);

@@ -2322,6 +2322,46 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             }
             http_append(out, &len, max, "\n");
         }
+    } else if (http_starts_with(cmd, "sgi ")) {
+        /* GIC SGI inter-core wake doorbell probe (Phase 1: prove delivery).
+         *   sgi test <core0-3> [n]  fire n SGIs at target core, report recv delta
+         *   sgi stat                report per-core delivery counters */
+        char *argv[4];
+        u32 argc = http_split_args(cmd, argv, 4);
+        if (argc >= 2 && http_streq(argv[1], "test")) {
+            u32 tgt = 1U, n = 1U;
+            if (argc >= 3) (void)http_parse_u32(argv[2], &tgt);
+            if (argc >= 4) (void)http_parse_u32(argv[3], &n);
+            if (tgt > 3U) tgt = 3U;
+            if (n == 0U) n = 1U;
+            if (n > 100000U) n = 100000U;
+            u32 before = proc_sgi_wake_count(tgt);
+            for (u32 i = 0; i < n; i++) {
+                gic_send_sgi((u8)(1U << tgt), GIC_SGI_WAKE);
+                timer_delay_us(20);
+            }
+            timer_delay_us(1000);
+            u32 after = proc_sgi_wake_count(tgt);
+            http_append(out, &len, max, "sgi test core=");
+            http_append_u64(out, &len, max, tgt);
+            http_append(out, &len, max, " sent=");
+            http_append_u64(out, &len, max, n);
+            http_append(out, &len, max, " recv_before=");
+            http_append_u64(out, &len, max, before);
+            http_append(out, &len, max, " recv_after=");
+            http_append_u64(out, &len, max, after);
+            http_append(out, &len, max, " delta=");
+            http_append_u64(out, &len, max, after - before);
+            http_append(out, &len, max, "\n");
+        } else if (argc >= 2 && http_streq(argv[1], "stat")) {
+            http_append(out, &len, max, "sgi recv[0..3]=");
+            for (u32 c = 0; c < 4U; c++) {
+                http_append_u64(out, &len, max, proc_sgi_wake_count(c));
+                http_append(out, &len, max, c < 3U ? "," : "\n");
+            }
+        } else {
+            http_append(out, &len, max, "usage: sgi test <core0-3> [n] | sgi stat\n");
+        }
     } else if (http_starts_with(cmd, "membench ")) {
         char *argv[3];
         u32 argc = http_split_args(cmd, argv, 3);

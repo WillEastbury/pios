@@ -167,3 +167,27 @@ u32 gic_acknowledge(void) {
 void gic_end_of_interrupt(u32 iar_value) {
     mmio_write(gicc_reg(0x010), iar_value);
 }
+
+void gic_send_sgi(u8 target_mask, u32 sgi_id) {
+    if (sgi_id > 15U)
+        return;
+    /* Ensure any work posted to memory before the doorbell is globally visible
+     * before the target core takes the SGI and re-scans its wake ring. */
+    __asm__ volatile("dsb ish" ::: "memory");
+    /* GICD_SGIR @ 0xF00: TargetListFilter[25:24]=00 (use explicit list),
+     * CPUTargetList[23:16]=target_mask, SGIINTID[3:0]=sgi_id. From non-secure
+     * EL1 the SGI is forced Group1-NS (same deliverable path as the timer PPI). */
+    mmio_write(gicd_reg(0xF00), ((u32)target_mask << 16) | (sgi_id & 0xFU));
+}
+
+/* Enable the CALLING core's GIC CPU interface (banked GICC_CTLR/PMR). gic_init()
+ * runs only on core 0 and enables only core 0's interface, so the secondary
+ * cores never receive ANY interrupt (timer PPI, SGI, ...) until they call this.
+ * Mirrors gic_init()'s CPU-interface bring-up: preserve firmware bypass/security
+ * bits (ATF leaves GICC_CTLR ~0x60 on Pi 5; the validated enable is old|1). */
+void gic_cpu_init(void) {
+    u32 old_c_ctlr = mmio_read(gicc_reg(0x000));
+    mmio_write(gicc_reg(0x004), 0xF0);          /* PMR: accept normal priorities */
+    mmio_write(gicc_reg(0x000), old_c_ctlr | 1U);
+    __asm__ volatile("dsb sy; isb" ::: "memory");
+}

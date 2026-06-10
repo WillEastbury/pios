@@ -35,6 +35,7 @@
 #define GIC_TIMER_NS_PHYS   30      /* Non-secure physical timer PPI */
 #define GIC_TIMER_VIRT      27      /* Virtual timer PPI */
 #define GIC_RP1_ETH_MSI     166     /* GIC_SPI 128 => INTID 160, plus RP1_INT_ETH(6) */
+#define GIC_SGI_WAKE        9       /* SW-generated inter-core wake doorbell (SGI) */
 
 /* Max interrupts */
 #define GIC_MAX_IRQ         320
@@ -54,3 +55,11 @@ void gic_set_edge_triggered(u32 intid);
 void gic_clear_pending(u32 intid);
 u32  gic_acknowledge(void);
 void gic_end_of_interrupt(u32 intid);
+/* Send a software-generated interrupt (SGI 0-15) to the cores in target_mask
+ * (bit N = core N). Inter-core doorbell IPI; from non-secure EL1 it is
+ * delivered Group1-NS. A dsb ish before the trigger orders prior memory
+ * writes ahead of the doorbell so the target observes posted work first. */
+void gic_send_sgi(u8 target_mask, u32 sgi_id);
+/* Enable the calling core's GIC CPU interface (banked). MUST be called on each
+ * secondary core or it will never receive any interrupt. */
+void gic_cpu_init(void);
