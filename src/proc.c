@@ -2176,8 +2176,14 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
      *   - hosts_process core: PROVEN cooperative idle (no GIC interface), woken by
      *     SEV (proc_post_remote_wake) for real work, with the architected timer
      *     event stream as a slow missed-SEV safety net (see EVNTI below).
-     *   - non-hosting cores: interrupt-driven doorbell/WFI idle -- GIC interface
-     *     up, event stream off, timer PPI + SGI doorbell wake WFE directly.
+     *   - non-hosting cores: SGI-doorbell/WFI idle -- GIC interface up so the SGI
+     *     doorbell can deliver an on-demand wake when a process is assigned. The
+     *     periodic CNTP timer PPI is DISABLED here: with no process to run and
+     *     preemption off, a 1 kHz timer IRQ would just wake the core to run a
+     *     no-op tick (a full GIC entry/exit/eret round-trip 1000x/s ~= 0.7% --
+     *     ironically MORE overhead than the worker core's real load). A slow
+     *     event stream (EVNTI below) is the missed-doorbell backstop, matching
+     *     the worker's idle cost (~0.1%).
      * Removing the EL2 cage to make the hosting core interrupt-driven is NOT an
      * option: while processes still run at EL1 (the EL0 migration is scaffolded
      * but inactive -- abi el0_ready=false), stage-2 is the only thing isolating
@@ -2209,27 +2215,38 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
     preempt_enabled[uc] = false;
     timer_set_tick_hook(proc_tick_hook);
 
-    /* Idle wake source, split by core role (see top-of-function rationale):
-     *   - hosts_process core (cooperative): keep the architected timer EVENT
-     *     STREAM as a SLOW missed-SEV safety net. Real wakes arrive immediately
-     *     via SEV (proc_post_remote_wake); the event stream only bounds worst-
-     *     case missed-SEV latency. EVNTI=15 (vs the legacy 11) is the slowest the
-     *     4-bit field allows: ~824 WFE wakes/s (vs ~13.2K) => idle well under 1%.
-     *   - non-hosting cores (interrupt-driven): DISABLE the event stream
-     *     (EVNTEN=0); the timer PPI (PROC_PREEMPT_TIMER_HZ) gives the bounded
-     *     safety-net wake and the SGI doorbell the on-demand wake. */
+    /* Idle wake source: BOTH core roles now use the architected timer EVENT
+     * STREAM as a slow safety-net wake. EVNTI=15 (CNTVCT bit 15) is the slowest
+     * the 4-bit field allows: ~824 WFE wakes/s (vs the legacy EVNTI=11 ~13.2K/s).
+     * Each event-stream wake is a cheap WFE return (no IRQ entry/exit), so idle
+     * cost stays ~0.1%.
+     *   - hosts_process core (cooperative): real wakes arrive immediately via SEV
+     *     (proc_post_remote_wake); the event stream only bounds missed-SEV latency.
+     *   - non-hosting cores (SGI-doorbell): on-demand wakes arrive via the SGI
+     *     doorbell once a process is assigned; the event stream is the missed-
+     *     doorbell backstop. Their periodic CNTP timer PPI is disabled below so an
+     *     idle core no longer pays a 1 kHz no-op-tick IRQ. */
     {
         u64 cntkctl;
         __asm__ volatile("mrs %0, cntkctl_el1" : "=r"(cntkctl));
-        if (hosts_process) {
-            cntkctl &= ~((0xFULL << 4) | (1ULL << 3)); /* clear EVNTI[7:4], EVNTDIR */
-            cntkctl |= (15ULL << 4);                   /* EVNTI = CNTVCT bit 15 */
-            cntkctl |= (1ULL << 2);                    /* EVNTEN = 1 */
-        } else {
-            cntkctl &= ~((0xFULL << 4) | (1ULL << 3) | (1ULL << 2)); /* EVNTI/DIR/EN=0 */
-        }
+        cntkctl &= ~((0xFULL << 4) | (1ULL << 3)); /* clear EVNTI[7:4], EVNTDIR */
+        cntkctl |= (15ULL << 4);                   /* EVNTI = CNTVCT bit 15 */
+        cntkctl |= (1ULL << 2);                    /* EVNTEN = 1 */
         __asm__ volatile("msr cntkctl_el1, %0" :: "r"(cntkctl));
         isb();
+    }
+
+    /* Non-hosting cores: stop the periodic CNTP timer that timer_init() armed
+     * just before this call. With preemption disabled and no process to run, the
+     * 1 kHz timer PPI only wakes the core to run a no-op proc_tick_hook -- a full
+     * GIC IRQ round-trip 1000x/s (~0.7%), more than the worker core's real load.
+     * On-demand wakes come from the SGI doorbell; the event stream above is the
+     * backstop. (The hosting core never enabled its GIC interface, so its timer
+     * PPI is generated but never delivered -- left free-running, harmless.) */
+    if (!hosts_process) {
+        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(2UL)); /* IMASK=1, ENABLE=0 */
+        isb();
+        gic_disable_irq(GIC_TIMER_NS_PHYS);
     }
 
     /* The SGI doorbell only wakes interrupt-driven cores; the hosting core has no
@@ -2239,7 +2256,7 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
 
     uart_puts("[proc] preempt core=");
     uart_hex(core_id());
-    uart_puts(hosts_process ? " mode=coop+evtstream" : " mode=irq-doorbell");
+    uart_puts(hosts_process ? " mode=coop+evtstream" : " mode=sgi-doorbell+evtstream");
     uart_puts(" quantum_ticks=");
     uart_hex(q);
     uart_putc('\n');
