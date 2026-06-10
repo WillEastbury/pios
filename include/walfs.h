@@ -226,6 +226,9 @@ u64 walfs_create(u64 parent_id, const char *name, u32 flags, u32 mode);
 /* Write data to a file (appends at offset). */
 bool walfs_write(u64 inode_id, u64 offset, const void *data, u32 len);
 
+/* Replace file content exactly with data[0..len). */
+bool walfs_replace(u64 inode_id, const void *data, u32 len);
+
 /* Read file content into buffer. Returns bytes read. */
 u32 walfs_read(u64 inode_id, u64 offset, void *buf, u32 len);
 

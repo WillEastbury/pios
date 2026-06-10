@@ -93,14 +93,14 @@ static const u32 picoweb_default_program[] = {
     0x02017044u, /* Span.Get(R0, R1, R2) */
     0x48800069u, /* Math.Add(R8, R8, 'i') */
     0xA2810007u, /* Flow.Branch(NE, R2, R8, :static) */
-    0x44400001u, /* Math.Add(R4, R4, 1) */
-    0x455003EAu, /* Math.Add(R5, R5, 1002) */
+    0x4440019Au, /* Math.Add(R4, R4, 410) */
+    0x45500002u, /* Math.Add(R5, R5, 2) */
     0x06457066u, /* Storage.ReadCard(R4, R5, R6) */
     0x00607071u, /* Io.Write(R6) */
     0x000080C8u, /* Net.Status(200) */
     0xC0000000u, /* Flow.Return() */
-    0x44400001u, /* :static Math.Add(R4, R4, 1) */
-    0x455003E9u, /* Math.Add(R5, R5, 1001) */
+    0x4440019Au, /* :static Math.Add(R4, R4, 410) */
+    0x45500001u, /* Math.Add(R5, R5, 1) */
     0x06457066u, /* Storage.ReadCard(R4, R5, R6) */
     0x00607071u, /* Io.Write(R6) */
     0x000080C8u, /* Net.Status(200) */
@@ -200,7 +200,7 @@ static int pico_read_card_span(struct picoweb_host *h, u32 card, u32 record)
             return pico_alloc_span(h, h->bridge->pico_api, n);
     }
     if (card == UHTTP_PICOWEB_CARD && record == UHTTP_PICO_API_RECORD) {
-        const char *s = "{\"ok\":true,\"handler\":\"picoscript\",\"source\":\"fallback-card\",\"card\":1,\"record\":1002}\n";
+        const char *s = "{\"ok\":true,\"handler\":\"picoscript\",\"source\":\"fallback-card\",\"card\":410,\"record\":2}\n";
         return pico_alloc_span(h, (const u8 *)s, u_strlen(s));
     }
     const char *s =
@@ -210,8 +210,8 @@ static int pico_read_card_span(struct picoweb_host *h, u32 card, u32 record)
         "border:1px solid #474747;border-radius:16px;padding:24px;margin:16px 0}h1{color:#fd8ea1}"
         ".muted{color:#919191}</style></head><body><div class='wrap'><div class='card'>"
         "<h1>PIOS PicoScript webserver</h1><p class='muted'>Port 81 is served by a user process "
-        "running upstream picovm bytecode. Core0 preloads program/static/API records from card 1 "
-        "before waking this process; this fallback appears when record 1:1001 is empty.</p>"
+        "running upstream picovm bytecode. Core0 preloads program/static/API records from card 410 "
+        "before waking this process; this fallback appears when record 410:1 is empty.</p>"
         "<p>Try <a href='/api'>/api</a> for the JSON card route.</p></div></div></body></html>";
     return pico_alloc_span(h, (const u8 *)s, u_strlen(s));
 }

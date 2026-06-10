@@ -37,10 +37,10 @@
 #define UHTTP_REQ_MAX        8192U
 #define UHTTP_RESP_MAX       24576U
 #define UHTTP_PICO_MAX       4096U
-#define UHTTP_PICOWEB_CARD   1U
-#define UHTTP_PICO_PROGRAM_RECORD 1000U
-#define UHTTP_PICO_STATIC_RECORD  1001U
-#define UHTTP_PICO_API_RECORD     1002U
+#define UHTTP_PICOWEB_CARD   410U
+#define UHTTP_PICO_PROGRAM_RECORD 0U
+#define UHTTP_PICO_STATIC_RECORD  1U
+#define UHTTP_PICO_API_RECORD     2U
 /* Must equal IPC_SHM_BASE (core_env.h); verified by _Static_assert in the .c. */
 #define UHTTP_BRIDGE_ADDR    0x04D00000UL
 

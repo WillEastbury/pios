@@ -886,6 +886,49 @@ bool walfs_write(u64 inode_id, u64 offset, const void *data, u32 len)
     return true;
 }
 
+bool walfs_replace(u64 inode_id, const void *data, u32 len)
+{
+    if (!mounted || (len > 0 && !data)) return false;
+    const u8 *src = (const u8 *)data;
+    u64 cur = 0;
+    u32 rem = len;
+
+    u64 tx_id = next_seq;
+    if (!wal_append(RECORD_TX_BEGIN, &tx_id, sizeof(tx_id), NULL, 0))
+        return false;
+
+    while (rem > 0) {
+        u32 chunk = rem > WALFS_DATA_MAX ? WALFS_DATA_MAX : rem;
+        struct walfs_data dh;
+        dh.inode_id = inode_id;
+        dh.offset   = cur;
+        dh.length   = chunk;
+
+        u64 data_pos = wal_append(RECORD_DATA, &dh, sizeof(dh), src, chunk);
+        if (!data_pos)
+            return false;
+        dindex_add(inode_id, cur, chunk,
+                   data_pos + sizeof(struct wal_record) + sizeof(struct walfs_data),
+                   next_seq - 1U);
+        src += chunk;
+        cur += chunk;
+        rem -= chunk;
+    }
+
+    struct walfs_inode ino;
+    if (!walfs_stat(inode_id, &ino)) return false;
+    ino.size = len;
+    ino.modified = read_cntvct();
+    u64 ino_pos = wal_append(RECORD_INODE, &ino, sizeof(ino), NULL, 0);
+    if (!ino_pos) return false;
+    icache_put(inode_id, ino_pos);
+
+    if (!wal_append(RECORD_TX_COMMIT, &tx_id, sizeof(tx_id), NULL, 0))
+        return false;
+    write_super();
+    return true;
+}
+
 static u32 walfs_read_linear(u64 inode_id, u64 offset, void *buf, u32 len)
 {
     if (!mounted) return 0;

@@ -316,7 +316,7 @@ i32 picowal_db_put(u16 card, u32 record, const void *data, u32 len)
     if (!fs_find(path, &rid)) {
         if (!fs_create(path, &rid) || rid == 0) return -1;
     }
-    return fs_write(rid, data, len);
+    return walfs_replace(rid, data, len) ? (i32)len : -1;
 }
 
 i32 picowal_db_get(u16 card, u32 record, void *out, u32 out_len)
