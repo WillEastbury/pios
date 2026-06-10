@@ -2047,10 +2047,14 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
 
     /* Self-waking idle scheduler: enable the architected timer event stream so
      * WFE on this core wakes at a bounded rate (~every 2^EVNTI counter ticks)
-     * even when no interrupt or cross-core SEV arrives. The A76 cluster runs
-     * with SMPEN unset, so a remote SEV from core 0 (the network core posting a
-     * process wake) does NOT reliably wake a user core parked in WFE — the
-     * parked process would sleep forever. With the event stream on, the idle
+     * even when no interrupt or cross-core SEV arrives. Empirically, on this
+     * bring-up a remote SEV from core 0 (the network core posting a process
+     * wake) does NOT reliably wake a user core parked in WFE — the wake can be
+     * missed and the parked process would sleep forever. (NOTE: this is NOT the
+     * A76 "SMPEN" bit — SMPEN is a no-op on A76, which is always coherent for
+     * inner-shareable accesses. The true cause is the same unresolved cross-core
+     * cacheable-visibility issue documented at the wake-ring struct below and in
+     * uhttp_bridge.h — under investigation.) With the event stream on, the idle
      * loop re-drains the remote wake ring and re-checks runnable processes on
      * every event tick; SEV remains a best-effort fast-path wake when it lands.
      * EVNTI=8 selects CNTVCT bit 8 → an event roughly every 256 ticks. */
@@ -2171,14 +2175,23 @@ struct proc_rwake_ring {
     u32 pids[PROC_RWAKE_DEPTH];    /* posting core writes; target core reads */
 };
 
-/* The wake rings + counters MUST live in cross-core-coherent shared RAM, NOT in
- * kernel .bss. The A76 cluster runs with SMPEN unset (no CPUECTLR setup in
- * start.S), so plain cacheable .bss writes by core 0 are not reliably visible to
- * a user core's drain — the posted wake is silently lost and the parked process
- * never runs (observed: wake_posted=1, wake_drained=0, httpd stuck blocked). The
- * SHARED_FIFO region is the proven-coherent inter-core channel (the lock-free
- * FIFOs and the uhttp bridge cross cores from there with only barriers). Park the
- * rings in its top page, which fifo_init_all() zero-clears at boot before any
+/* The wake rings + counters MUST live in the SHARED_FIFO region with EXPLICIT
+ * cache maintenance, NOT in plain kernel .bss. Empirically, a single low-rate
+ * cacheable .bss write by core 0 is not reliably visible to a user core's drain —
+ * the posted wake is silently lost and the parked process never runs (observed:
+ * wake_posted=1, wake_drained=0, httpd stuck blocked). NOTE: despite EVERY core
+ * sharing identical kernel mappings (shared_ttbr0/shared_mair/shared_tcr in
+ * mmu.c, Inner-Shareable WB PTEs), cross-core cacheable visibility does NOT behave
+ * coherently on this bring-up. This is NOT the A76 "SMPEN" bit (a no-op on A76 —
+ * the core is always coherent for inner-shareable accesses); the real cause is
+ * unresolved and under investigation — it is also NOT EL2 stage-2 (HCR_EL2.VM is
+ * cleared for non-capsule processes, so httpd/core-0 run with stage-1 only), and
+ * it is NOT an attribute mismatch (every core shares shared_ttbr0/shared_mair/
+ * shared_tcr). It correlates with anomalously slow ~118ns cacheable writes
+ * (membench), hinting the data cache may not be retaining/snooping these lines as
+ * expected. The proven mitigation is the SHARED_FIFO region with explicit dc cvac/civac + barriers
+ * (the lock-free FIFOs and the uhttp bridge cross cores from there reliably). Park
+ * the rings in its top page, which fifo_init_all() zero-clears at boot before any
  * secondary core launches. */
 struct proc_rwake_shared {
     struct proc_rwake_ring ring[4];

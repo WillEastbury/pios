@@ -10,15 +10,18 @@
  * mapped IPC_SHM window.
  *
  * Cross-core coherency: the bridge RAM is mapped Normal cacheable inner-shareable
- * on both cores. The A76 cluster (no CPUECTLR/SMPEN setup in start.S) does NOT
- * reliably propagate a single low-frequency write by an otherwise-idle core to
- * another core's cache via snoop alone — the writer's value sits in its L1 and is
- * never evicted (high-throughput FIFOs work only because continuous writes force
- * eviction). So every cross-core control field is explicitly cleaned to PoC by
- * its writer and invalidated before each read by the reader (uhttp_clean /
- * uhttp_inval below). To make that safe against dc-op write-back clobber, the two
- * traffic directions are split onto SEPARATE 64-byte cache lines so each line has
- * exactly one writer:
+ * on both cores, yet on this bring-up a single low-frequency write by an
+ * otherwise-idle core is NOT reliably propagated to another core's cache via
+ * snoop alone — the writer's value sits in its L1 and is never evicted
+ * (high-throughput FIFOs work only because continuous writes force eviction).
+ * NOTE: this is NOT the A76 "SMPEN" bit (a no-op on A76 — the cluster is always
+ * coherent for inner-shareable accesses) and it is NOT an attribute mismatch
+ * (every core shares shared_ttbr0/shared_mair/shared_tcr). Root cause is
+ * unresolved and under investigation. So every cross-core control field is
+ * explicitly cleaned to PoC by its writer and invalidated before each read by the
+ * reader (uhttp_clean / uhttp_inval below). To make that safe against dc-op
+ * write-back clobber, the two traffic directions are split onto SEPARATE 64-byte
+ * cache lines so each line has exactly one writer:
  *   Zone B (offset 0,  one line): userland(core2) -> core0  [httpd writes]
  *   Zone A (offset 64, one line): core0 -> userland(core2)  [core0 writes]
  * The req[]/resp[] buffers are line-aligned and multiples of 64 bytes, so a line
