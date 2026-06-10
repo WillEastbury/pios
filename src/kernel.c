@@ -13006,6 +13006,16 @@ static void hdmi_dashboard_render(void)
     u32 sched_busy = 0, sched_flags = 0;
     core0_sched_snapshot(&sched_wake, &sched_wfi, &sched_idle, &sched_total,
                          &sched_busy, &sched_flags);
+    /* Per-core busy% (cores 1-3 from the coherent scheduler snapshot) plus the
+     * 4-core average for the HDMI dashboard. cbusy[] is in permille. */
+    struct proc_sched_core_snapshot pcs[3];
+    u32 pcs_n = proc_sched_snapshot(pcs, 3);
+    u32 cbusy[4];
+    cbusy[0] = sched_busy;
+    cbusy[1] = (pcs_n > 0) ? pcs[0].busy_permille : 0;
+    cbusy[2] = (pcs_n > 1) ? pcs[1].busy_permille : 0;
+    cbusy[3] = (pcs_n > 2) ? pcs[2].busy_permille : 0;
+    u32 cpu_avg = (cbusy[0] + cbusy[1] + cbusy[2] + cbusy[3]) / 4U;
 
     nic_packet_counters_t pc;
     nic_packet_counters(&pc);
@@ -13067,9 +13077,13 @@ static void hdmi_dashboard_render(void)
     fb_clear_row(8);
     fb_set_cursor(3, 6);
     fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("CPU0 busy=%u.%u%%  WFI=%u wake=%u flags=0x%x ",
-              sched_busy / 10U, sched_busy % 10U,
-              (u32)sched_wfi, (u32)sched_wake, sched_flags);
+    fb_printf("CPU avg=%u.%u%% c0=%u.%u%% c1=%u.%u%% c2=%u.%u%% c3=%u.%u%% fl=0x%x ",
+              cpu_avg / 10U, cpu_avg % 10U,
+              cbusy[0] / 10U, cbusy[0] % 10U,
+              cbusy[1] / 10U, cbusy[1] % 10U,
+              cbusy[2] / 10U, cbusy[2] % 10U,
+              cbusy[3] / 10U, cbusy[3] % 10U,
+              sched_flags);
     dash_core0_flags(sched_flags);
     fb_set_cursor(3, 7);
     fb_printf("Kernel mem=%uK static=%uK core_alloc=%uK cap=%uK",

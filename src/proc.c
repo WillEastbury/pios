@@ -60,17 +60,41 @@ static volatile bool preempt_enabled[3];
 static volatile bool preempt_armed[3];
 static volatile bool preempt_pending[3];
 static u64 preempt_quantum_ticks[3];
-static u64 preempt_count_core[3];
-static u64 sched_start_ticks_core[3];
-static u64 sched_idle_ticks_core[3];
-static volatile u64 sched_idle_enter_ticks_core[3];
-static u64 sched_idle_count_core[3];
-static u64 sched_wake_count_core[3];
-static u64 soft_event_count_core[3];
-static u64 soft_boost_count_core[3];
+/* Per-user-core scheduler diagnostics. Each core's counters occupy a PRIVATE,
+ * 64-byte-aligned cache line so a writer core's `dc cvac` (clean-to-PoC, needed
+ * because inter-core snoop coherency is inactive on this A76) only ever writes
+ * back ITS OWN line. The previous packed u64[3] arrays interleaved all three
+ * user cores within shared cache lines, so the busiest idler (core 2 / httpd,
+ * ~4.3M idles/s) clobbered cores 1 & 3's counters every time it cleaned a line
+ * it shared with them — surfacing as bogus c1=99.9% / c3=0.0% on the dashboard.
+ * One clean of any field publishes the whole line; core 0 invalidates the line
+ * before reading and never writes it, so the reader-side dc ivac is safe. */
+struct sched_diag_percore {
+    u64 start_ticks;
+    u64 idle_ticks;
+    volatile u64 idle_enter_ticks;
+    u64 idle_count;
+    u64 wake_count;
+    u64 preempt_count;
+    u64 soft_event_count;
+    u64 soft_boost_count;
+} __attribute__((aligned(64)));
+static struct sched_diag_percore sched_diag[3];
 static u64 svc_call_count;
 static u64 svc_bad_count;
 static struct proc_security_stats proc_sec_stats;
+
+/* Writer-side coherency for the per-user-core scheduler diagnostics above
+ * (the sched_diag[] per-core counters). Each core writes ONLY its own
+ * cache-line-isolated slot; clean it to PoC after each update so core 0's
+ * proc_sched_snapshot reader observes it even though inter-core snoop coherency
+ * is not active on this A76 (mirrors the PROC_RWAKE dc cvac / dc ivac pattern).
+ * dc cvac operates at cache-line granularity, so one clean of &sched_diag[uc]
+ * publishes every field in that core's line at once. */
+static inline void diag_clean_word(volatile void *p) {
+    __asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+}
 
 /* ----------------------------------------------------------------------------
  * cohdiag - cross-core cache-coherency / memory-attribute diagnostic.
@@ -1511,15 +1535,16 @@ void proc_init(void)
         preempt_armed[uc] = false;
         preempt_pending[uc] = false;
         preempt_quantum_ticks[uc] = 1;
-        preempt_count_core[uc] = 0;
+        sched_diag[uc].preempt_count = 0;
         core_mark_online(core_id(), 0x251);
-        sched_start_ticks_core[uc] = 0;
-        sched_idle_ticks_core[uc] = 0;
-        sched_idle_enter_ticks_core[uc] = 0;
-        sched_idle_count_core[uc] = 0;
-        sched_wake_count_core[uc] = 0;
-        soft_event_count_core[uc] = 0;
-        soft_boost_count_core[uc] = 0;
+        sched_diag[uc].start_ticks = 0;
+        sched_diag[uc].idle_ticks = 0;
+        sched_diag[uc].idle_enter_ticks = 0;
+        sched_diag[uc].idle_count = 0;
+        sched_diag[uc].wake_count = 0;
+        sched_diag[uc].soft_event_count = 0;
+        sched_diag[uc].soft_boost_count = 0;
+        diag_clean_word(&sched_diag[uc]); /* one clean publishes the whole line */
         /* BSS is already cleared by core0 before secondary cores launch.
          * Do not bulk-clear shared IPC/request namespaces concurrently from
          * secondary cores during bring-up; keep per-core scheduler counters
@@ -1881,7 +1906,8 @@ void proc_schedule(void)
 
     if (user) {
         core_mark_online(core_id(), 6);
-        sched_start_ticks_core[uc] = proc_sched_counter_ticks();
+        sched_diag[uc].start_ticks = proc_sched_counter_ticks();
+        diag_clean_word(&sched_diag[uc]);
     } else {
         uart_puts("[proc] scheduler running on core ");
         uart_hex(core_id());
@@ -2010,18 +2036,23 @@ void proc_schedule(void)
             workq_drain(8);
             if (user) {
                 core_mark_online(core_id(), 0x80);
-                sched_idle_count_core[uc]++;
+                sched_diag[uc].idle_count++;
                 proc_diag_note_wfe();
                 u64 idle_start = proc_sched_counter_ticks();
-                sched_idle_enter_ticks_core[uc] = idle_start;
+                sched_diag[uc].idle_enter_ticks = idle_start;
+                /* Publish idle-entry to PoC BEFORE sleeping so core 0's snapshot
+                 * counts the in-progress idle interval rather than reading busy.
+                 * One clean covers the whole per-core line (idle_count + enter). */
+                diag_clean_word(&sched_diag[uc]);
                 proc_sched_stage(60);
                 wfe();
                 proc_sched_stage(61);
                 u64 idle_end = proc_sched_counter_ticks();
-                sched_idle_enter_ticks_core[uc] = 0;
+                sched_diag[uc].idle_enter_ticks = 0;
                 if (idle_end >= idle_start)
-                    sched_idle_ticks_core[uc] += idle_end - idle_start;
-                sched_wake_count_core[uc]++;
+                    sched_diag[uc].idle_ticks += idle_end - idle_start;
+                sched_diag[uc].wake_count++;
+                diag_clean_word(&sched_diag[uc]);
                 core_mark_online(core_id(), 0x81);
             } else {
                 wfe();
@@ -2097,7 +2128,7 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
     timer_set_tick_hook(proc_tick_hook);
 
     /* Self-waking idle scheduler: enable the architected timer event stream so
-     * WFE on this core wakes at a bounded rate (~every 2^EVNTI counter ticks)
+     * WFE on this core wakes at a bounded rate (~every 2^(EVNTI+1) counter ticks)
      * even when no interrupt or cross-core SEV arrives. Empirically, on this
      * bring-up a remote SEV from core 0 (the network core posting a process
      * wake) does NOT reliably wake a user core parked in WFE — the wake can be
@@ -2108,12 +2139,22 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
      * uhttp_bridge.h — under investigation.) With the event stream on, the idle
      * loop re-drains the remote wake ring and re-checks runnable processes on
      * every event tick; SEV remains a best-effort fast-path wake when it lands.
-     * EVNTI=8 selects CNTVCT bit 8 → an event roughly every 256 ticks. */
+     *
+     * INTERIM STOP-GAP: this whole event-stream poll is a crutch for the
+     * unreliable cross-core SEV. The correct model is a FIFO doorbell IPI
+     * (GIC SGI / FIRE_SW_IRQ) that wakes ONLY the owner core when work is
+     * posted, so idle cores park in WFI at ~0%. Until that lands, EVNTI bounds
+     * the worst-case missed-SEV wake latency. EVNTI selects CNTVCT bit N; an
+     * event fires once per 2^(N+1) ticks. At cntfrq=54MHz:
+     *   EVNTI=8  -> 2^9 =512 ticks  ~9.5us  (~105.6K/s)  — burned idle cores ~45%
+     *   EVNTI=11 -> 2^12=4096 ticks ~75.9us (~13.2K/s, 8x fewer wakes)
+     * EVNTI=11 cuts the idle-poll burn ~8x for only ~66us extra worst-case
+     * cold-wake latency on a MISSED SEV (the SEV fast-path is unchanged). */
     {
         u64 cntkctl;
         __asm__ volatile("mrs %0, cntkctl_el1" : "=r"(cntkctl));
         cntkctl &= ~((0xFULL << 4) | (1ULL << 3)); /* clear EVNTI[7:4], EVNTDIR */
-        cntkctl |= (8ULL << 4);                    /* EVNTI = CNTVCT bit 8 */
+        cntkctl |= (11ULL << 4);                   /* EVNTI = CNTVCT bit 11 */
         cntkctl |= (1ULL << 2);                    /* EVNTEN = 1 */
         __asm__ volatile("msr cntkctl_el1, %0" :: "r"(cntkctl));
         isb();
@@ -2163,7 +2204,8 @@ void proc_irq_maybe_preempt(struct irq_frame *frame)
     proc_account_runtime(p);
     p->state = PROC_READY;
     p->preemptions++;
-    preempt_count_core[uc]++;
+    sched_diag[uc].preempt_count++;
+    diag_clean_word(&sched_diag[uc]);
     proc_note_desched(3U);
     frame->x[30] = frame->elr;
     frame->elr = (u64)(usize)proc_preempt_trampoline;
@@ -2173,7 +2215,7 @@ u64 proc_preemptions(void)
 {
     if (!on_user_core())
         return 0;
-    return preempt_count_core[user_core_slot()];
+    return sched_diag[user_core_slot()].preempt_count;
 }
 
 /* Coherent wake-path diagnostics (defined after PROC_RWAKE_SHARED below). */
@@ -2184,7 +2226,8 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
     if (!initialized || !on_user_core() || target_pid == 0)
         return false;
     u32 uc = user_core_slot();
-    soft_event_count_core[uc]++;
+    sched_diag[uc].soft_event_count++;
+    diag_clean_word(&sched_diag[uc]);
     (void)event_type;
 
     i32 slot = proc_find_slot_by_pid(target_pid);
@@ -2204,7 +2247,8 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
         p->state = PROC_READY;
     if (boost && (p->state == PROC_READY || p->state == PROC_RUNNING)) {
         rr_cursor = ((u32)slot + MAX_PROCS_PER_CORE - 1U) % MAX_PROCS_PER_CORE;
-        soft_boost_count_core[uc]++;
+        sched_diag[uc].soft_boost_count++;
+        diag_clean_word(&sched_diag[uc]);
     }
     sev();
     return true;
@@ -2244,6 +2288,32 @@ struct proc_rwake_ring {
  * (the lock-free FIFOs and the uhttp bridge cross cores from there reliably). Park
  * the rings in its top page, which fifo_init_all() zero-clears at boot before any
  * secondary core launches. */
+
+/* Per-core scheduler diagnostics, each core isolated in its OWN 64-byte cache
+ * line so a writer core's `dc cvac` (clean-to-PoC; inter-core snoop coherency is
+ * inactive on this A76, see the note above) only ever writes back ITS OWN line.
+ * The previous packed u32[4] arrays (loops[4]/stage[4]/live_*[4]/wfe_cnt[4]/...)
+ * interleaved all four cores within shared lines, so every per-loop clean wrote
+ * back the neighbours' words too. Because the three user cores wake in LOCKSTEP
+ * on the shared timer event stream, they ping-ponged those lines through slow
+ * ~118ns PoC accesses on every scheduler iteration. That contention — not real
+ * work — is why the two EMPTY idle cores (1 & 3, in perfect lockstep) burned
+ * ~3.7x MORE CPU per wake than the core actually running httpd (core 2, partly
+ * de-phased by ctx_switch). Isolation removes the cross-core collision. */
+struct proc_rwake_percore {
+    volatile u32 loops;          /* scheduler-loop heartbeat (liveness probe) */
+    volatile u32 ctx_enter;      /* ctx_switch INTO a process */
+    volatile u32 ctx_exit;       /* ctx_switch returns FROM a process */
+    volatile u32 last_pid;       /* pid of the most recent ctx_switch target */
+    volatile u32 stage;          /* last scheduler dispatch stage reached */
+    volatile u32 live_state;     /* procs[current_proc].state, published each loop */
+    volatile u32 live_pid;       /* procs[current_proc].pid, published each loop */
+    volatile u32 disp_cnt;       /* count of dispatches (RUNNING set) */
+    volatile u32 wfe_cnt;        /* scheduler WFE sleeps taken (idle path) */
+    volatile u32 desched_reason; /* how last proc left (1=park,2=yield,3=preempt,4=exit) */
+    u32 _pad[6];                 /* fill out the 64-byte line */
+} __attribute__((aligned(64)));
+
 struct proc_rwake_shared {
     struct proc_rwake_ring ring[4];
     /* core0-written counters (one line). */
@@ -2254,11 +2324,13 @@ struct proc_rwake_shared {
      * accurate read without discarding a posted/full it owns. */
     volatile u32 drained;
     u32 _pad_c1[15];
-    volatile u32 loops[4];     /* per-core scheduler-loop heartbeat (liveness probe) */
-    volatile u32 ctx_enter[4]; /* per-core: count of ctx_switch INTO a process */
-    volatile u32 ctx_exit[4];  /* per-core: count of ctx_switch returns FROM a process */
-    volatile u32 last_pid[4];  /* per-core: pid of the most recent ctx_switch target */
-    volatile u32 stage[4];     /* per-core: last scheduler dispatch stage reached */
+    /* Per-core scheduler diagnostics: each core occupies its OWN 64-byte cache
+     * line (struct proc_rwake_percore, above) so a per-loop `dc cvac` on one
+     * core's counter never writes back another core's words. Replaces the old
+     * packed loops[4]/ctx_*[4]/last_pid[4]/stage[4]/live_*[4]/disp_cnt[4]/
+     * wfe_cnt[4]/desched_reason[4] arrays whose false sharing made the
+     * lockstep-idle empty cores burn ~3.7x more CPU per wake than the httpd core. */
+    struct proc_rwake_percore percore[4];
     /* one-off firehose wake-path debug: written by the user core's drain /
      * soft_event, read by core 0. NC memory, single-writer-per-field. */
     volatile u32 dbg_iters;    /* drain loop bodies executed (== drained) */
@@ -2267,21 +2339,15 @@ struct proc_rwake_shared {
     volatile u32 dbg_calls;    /* soft_event entries reaching find_slot */
     volatile u32 dbg_noslot;   /* soft_event find_slot < 0 count */
     volatile u32 dbg_state;    /* p->state soft_event last saw for the slot */
-    volatile u32 live_state[4];/* per-core: procs[current_proc].state, published each sched loop */
-    volatile u32 live_pid[4];  /* per-core: procs[current_proc].pid, published each sched loop */
-    volatile u32 disp_cnt[4];  /* per-core: count of dispatches (RUNNING set, proc.c:1895) */
-    volatile u32 wfe_cnt[4];   /* per-core: scheduler WFE sleeps taken (found==false idle path) */
-    /* port-81 504 root-cause trace. desched_reason[c] records HOW the last
-     * process left core c (1=park-block, 2=yield, 3=preempt, 4=exit). The drain
-     * re-readies any target found off-core in RUNNING and counts it in
-     * dbg_rescued. park_* break down proc_park's path selection. */
+    /* port-81 504 root-cause trace. desched_reason now lives per-core in
+     * percore[].desched_reason. The drain re-readies any target found off-core in
+     * RUNNING and counts it in dbg_rescued; park_* break down proc_park's path. */
     volatile u32 dbg_rescued;
-    volatile u32 desched_reason[4];
     volatile u32 park_enter;
     volatile u32 park_early;
     volatile u32 park_block;
     volatile u32 park_resume;
-    u32 _pad_dbg[1];
+    u32 _pad_dbg[2];
 };
 #define PROC_RWAKE_SHARED \
     ((volatile struct proc_rwake_shared *)(SHARED_FIFO_BASE + SHARED_FIFO_SIZE - 0x1000UL))
@@ -2356,7 +2422,7 @@ static void proc_rwake_note_soft(u32 pid, i32 slot, u32 state_before) {
  * NC single-writer per core, so core 0 can read it without a coherency race. */
 static void proc_note_desched(u32 reason) {
     u32 c = core_id() & 3U;
-    rwake_dbg_push(&PROC_RWAKE_SHARED->desched_reason[c], reason);
+    rwake_dbg_push(&PROC_RWAKE_SHARED->percore[c].desched_reason, reason);
 }
 
 /* proc_park() path counters. which: 0=enter, 1=early-return, 2=block, 3=resume. */
@@ -2415,15 +2481,15 @@ static void proc_drain_remote_wakes(void) {
 
 static void proc_diag_note_dispatch(void) {
     u32 c = core_id() & 3U;
-    PROC_RWAKE_SHARED->disp_cnt[c]++;
-    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->disp_cnt[c]) : "memory");
+    PROC_RWAKE_SHARED->percore[c].disp_cnt++;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->percore[c].disp_cnt) : "memory");
     __asm__ volatile("dsb ish" ::: "memory");
 }
 
 static void proc_diag_note_wfe(void) {
     u32 c = core_id() & 3U;
-    PROC_RWAKE_SHARED->wfe_cnt[c]++;
-    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->wfe_cnt[c]) : "memory");
+    PROC_RWAKE_SHARED->percore[c].wfe_cnt++;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->percore[c].wfe_cnt) : "memory");
     __asm__ volatile("dsb ish" ::: "memory");
 }
 
@@ -2432,8 +2498,8 @@ static void proc_diag_note_wfe(void) {
  * parked in WFE with no wake source) rather than merely not seeing a wake. */
 static void proc_sched_heartbeat(void) {
     u32 c = core_id() & 3U;
-    PROC_RWAKE_SHARED->loops[c]++;
-    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->loops[c]) : "memory");
+    PROC_RWAKE_SHARED->percore[c].loops++;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->percore[c].loops) : "memory");
     /* Publish the LIVE state/pid of this core's current process (cleaned to PoC)
      * so core 0 reads the real scheduler state, not the soft_event snapshot. */
     {
@@ -2443,10 +2509,10 @@ static void proc_sched_heartbeat(void) {
             st = procs[slot].state;
             pid = procs[slot].pid;
         }
-        PROC_RWAKE_SHARED->live_state[c] = st;
-        PROC_RWAKE_SHARED->live_pid[c] = pid;
-        __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->live_state[c]) : "memory");
-        __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->live_pid[c]) : "memory");
+        PROC_RWAKE_SHARED->percore[c].live_state = st;
+        PROC_RWAKE_SHARED->percore[c].live_pid = pid;
+        __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->percore[c].live_state) : "memory");
+        __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->percore[c].live_pid) : "memory");
     }
     __asm__ volatile("dsb ish" ::: "memory");
 }
@@ -2457,24 +2523,24 @@ static void proc_sched_heartbeat(void) {
  * scheduler. last_pid identifies which process it dived into. */
 static void proc_sched_note_ctx_enter(u32 pid) {
     u32 c = core_id() & 3U;
-    PROC_RWAKE_SHARED->last_pid[c] = pid;
-    PROC_RWAKE_SHARED->ctx_enter[c]++;
-    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->ctx_enter[c]) : "memory");
-    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->last_pid[c]) : "memory");
+    PROC_RWAKE_SHARED->percore[c].last_pid = pid;
+    PROC_RWAKE_SHARED->percore[c].ctx_enter++;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->percore[c].ctx_enter) : "memory");
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->percore[c].last_pid) : "memory");
     __asm__ volatile("dsb ish" ::: "memory");
 }
 
 static void proc_sched_note_ctx_exit(void) {
     u32 c = core_id() & 3U;
-    PROC_RWAKE_SHARED->ctx_exit[c]++;
-    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->ctx_exit[c]) : "memory");
+    PROC_RWAKE_SHARED->percore[c].ctx_exit++;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->percore[c].ctx_exit) : "memory");
     __asm__ volatile("dsb ish" ::: "memory");
 }
 
 static void proc_sched_stage(u32 s) {
     u32 c = core_id() & 3U;
-    PROC_RWAKE_SHARED->stage[c] = s;
-    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->stage[c]) : "memory");
+    PROC_RWAKE_SHARED->percore[c].stage = s;
+    __asm__ volatile("dc cvac, %0" :: "r"(&PROC_RWAKE_SHARED->percore[c].stage) : "memory");
     __asm__ volatile("dsb ish" ::: "memory");
 }
 
@@ -2490,8 +2556,8 @@ static inline void diag_inval_word(volatile void *p) {
 u32 proc_sched_loops(u32 core) {
     if (core >= 4U)
         return 0;
-    diag_inval_word(&PROC_RWAKE_SHARED->loops[core]);
-    return PROC_RWAKE_SHARED->loops[core];
+    diag_inval_word(&PROC_RWAKE_SHARED->percore[core].loops);
+    return PROC_RWAKE_SHARED->percore[core].loops;
 }
 
 void proc_sched_ctx_stats(u32 core, u32 *enter, u32 *exit, u32 *last_pid) {
@@ -2501,19 +2567,19 @@ void proc_sched_ctx_stats(u32 core, u32 *enter, u32 *exit, u32 *last_pid) {
         if (last_pid) *last_pid = 0;
         return;
     }
-    diag_inval_word(&PROC_RWAKE_SHARED->ctx_enter[core]);
-    diag_inval_word(&PROC_RWAKE_SHARED->ctx_exit[core]);
-    diag_inval_word(&PROC_RWAKE_SHARED->last_pid[core]);
-    if (enter) *enter = PROC_RWAKE_SHARED->ctx_enter[core];
-    if (exit) *exit = PROC_RWAKE_SHARED->ctx_exit[core];
-    if (last_pid) *last_pid = PROC_RWAKE_SHARED->last_pid[core];
+    diag_inval_word(&PROC_RWAKE_SHARED->percore[core].ctx_enter);
+    diag_inval_word(&PROC_RWAKE_SHARED->percore[core].ctx_exit);
+    diag_inval_word(&PROC_RWAKE_SHARED->percore[core].last_pid);
+    if (enter) *enter = PROC_RWAKE_SHARED->percore[core].ctx_enter;
+    if (exit) *exit = PROC_RWAKE_SHARED->percore[core].ctx_exit;
+    if (last_pid) *last_pid = PROC_RWAKE_SHARED->percore[core].last_pid;
 }
 
 u32 proc_sched_stage_get(u32 core) {
     if (core >= 4U)
         return 0;
-    diag_inval_word(&PROC_RWAKE_SHARED->stage[core]);
-    return PROC_RWAKE_SHARED->stage[core];
+    diag_inval_word(&PROC_RWAKE_SHARED->percore[core].stage);
+    return PROC_RWAKE_SHARED->percore[core].stage;
 }
 
 void proc_rwake_dbg(u32 *iters, u32 *pid, u32 *zero, u32 *calls, u32 *noslot, u32 *state) {
@@ -2538,13 +2604,13 @@ void proc_rwake_park_dbg(u32 core, u32 *rescued, u32 *reason,
     if (core >= 4U)
         core = 0U;
     diag_inval_word(&PROC_RWAKE_SHARED->dbg_rescued);
-    diag_inval_word(&PROC_RWAKE_SHARED->desched_reason[core]);
+    diag_inval_word(&PROC_RWAKE_SHARED->percore[core].desched_reason);
     diag_inval_word(&PROC_RWAKE_SHARED->park_enter);
     diag_inval_word(&PROC_RWAKE_SHARED->park_early);
     diag_inval_word(&PROC_RWAKE_SHARED->park_block);
     diag_inval_word(&PROC_RWAKE_SHARED->park_resume);
     if (rescued)  *rescued  = PROC_RWAKE_SHARED->dbg_rescued;
-    if (reason)   *reason   = PROC_RWAKE_SHARED->desched_reason[core];
+    if (reason)   *reason   = PROC_RWAKE_SHARED->percore[core].desched_reason;
     if (p_enter)  *p_enter  = PROC_RWAKE_SHARED->park_enter;
     if (p_early)  *p_early  = PROC_RWAKE_SHARED->park_early;
     if (p_block)  *p_block  = PROC_RWAKE_SHARED->park_block;
@@ -2562,14 +2628,14 @@ void proc_rwake_live(u32 core, u32 *live_state, u32 *live_pid, u32 *disp, u32 *w
         if (wfe)        *wfe        = 0;
         return;
     }
-    diag_inval_word(&PROC_RWAKE_SHARED->live_state[core]);
-    diag_inval_word(&PROC_RWAKE_SHARED->live_pid[core]);
-    diag_inval_word(&PROC_RWAKE_SHARED->disp_cnt[core]);
-    diag_inval_word(&PROC_RWAKE_SHARED->wfe_cnt[core]);
-    if (live_state) *live_state = PROC_RWAKE_SHARED->live_state[core];
-    if (live_pid)   *live_pid   = PROC_RWAKE_SHARED->live_pid[core];
-    if (disp)       *disp       = PROC_RWAKE_SHARED->disp_cnt[core];
-    if (wfe)        *wfe        = PROC_RWAKE_SHARED->wfe_cnt[core];
+    diag_inval_word(&PROC_RWAKE_SHARED->percore[core].live_state);
+    diag_inval_word(&PROC_RWAKE_SHARED->percore[core].live_pid);
+    diag_inval_word(&PROC_RWAKE_SHARED->percore[core].disp_cnt);
+    diag_inval_word(&PROC_RWAKE_SHARED->percore[core].wfe_cnt);
+    if (live_state) *live_state = PROC_RWAKE_SHARED->percore[core].live_state;
+    if (live_pid)   *live_pid   = PROC_RWAKE_SHARED->percore[core].live_pid;
+    if (disp)       *disp       = PROC_RWAKE_SHARED->percore[core].disp_cnt;
+    if (wfe)        *wfe        = PROC_RWAKE_SHARED->percore[core].wfe_cnt;
 }
 
 /* Block the current process until a soft event (e.g. a remote wake) flips it
@@ -3319,10 +3385,11 @@ u32 proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries)
     u32 n = max_entries < 3U ? max_entries : 3U;
     u64 now = proc_sched_counter_ticks();
     for (u32 i = 0; i < n; i++) {
-        u64 start = sched_start_ticks_core[i];
+        diag_inval_word(&sched_diag[i]); /* one inval refreshes the whole line */
+        u64 start = sched_diag[i].start_ticks;
         u64 total = (start != 0 && now >= start) ? (now - start) : 0;
-        u64 idle = sched_idle_ticks_core[i];
-        u64 idle_enter = sched_idle_enter_ticks_core[i];
+        u64 idle = sched_diag[i].idle_ticks;
+        u64 idle_enter = sched_diag[i].idle_enter_ticks;
         if (idle_enter != 0 && now >= idle_enter)
             idle += now - idle_enter;
         if (idle > total)
@@ -3337,13 +3404,13 @@ u32 proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries)
         out[i].core = i + CORE_USERM;
         out[i].busy_permille = t ? (u32)((b * 1000ULL) / t) : 0;
         out[i].active_count = 0;
-        out[i].idle_count = sched_idle_count_core[i];
-        out[i].wake_count = sched_wake_count_core[i];
+        out[i].idle_count = sched_diag[i].idle_count;
+        out[i].wake_count = sched_diag[i].wake_count;
         out[i].idle_ticks = idle;
         out[i].total_ticks = total;
-        out[i].preemptions = preempt_count_core[i];
-        out[i].soft_events = soft_event_count_core[i];
-        out[i].soft_boosts = soft_boost_count_core[i];
+        out[i].preemptions = sched_diag[i].preempt_count;
+        out[i].soft_events = sched_diag[i].soft_event_count;
+        out[i].soft_boosts = sched_diag[i].soft_boost_count;
     }
     return n;
 }
