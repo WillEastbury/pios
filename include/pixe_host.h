@@ -1,10 +1,12 @@
 /*
- * pixe_host.h - EL0 "PIKEE / pix endpoint" host runtime for the PIOS web pipeline.
+ * pixe_host.h - EL0-target "PIKEE / pix endpoint" host runtime for PIOS.
  *
- * This is the EL0 half of the EL1<->EL0 decomposition (see pixe_request.h). The
- * EL1 protocol component builds a sealed `struct pixe_request_context`; this host
- * runtime lets a compiled PicoScript program (run on the freestanding picovm)
- * read that bound context and emit a response:
+ * This is the endpoint half of the intended EL1<->EL0 decomposition (see
+ * pixe_request.h). Today it is still exercised by the legacy EL1 direct-KPI path;
+ * once the eret-to-EL0/SVC ABI lands, the same freestanding picovm host contract
+ * is the EL0 payload boundary. The EL1 protocol component builds a sealed
+ * `struct pixe_request_context`; this host runtime lets a compiled PicoScript
+ * program read that bound context and emit a response:
  *
  *   - Context.*  hooks read the request fields from the bound context. String
  *     fields (verb/path/host/query/headers/body) are materialized into the VM
@@ -69,8 +71,9 @@ u32 pixe_host_seal(struct pixe_host *h, struct pixe_request_context *rc,
                    u8 *resp_buf, u32 resp_cap);
 
 /* Build the canned request context, run the embedded echo endpoint, and render a
- * human-readable dump (status/out/regs/sealed response). Proves the EL0 endpoint
- * core on hardware. Returns bytes written. */
+ * human-readable dump (status/out/regs/sealed response). Proves the endpoint
+ * contract on hardware; actual EL0 execution is gated on the pending eret/SVC
+ * scheduler path. Returns bytes written. */
 u32 pixe_host_selftest(char *out, u32 max);
 
 /* Run a caller-supplied program against the canned request context and render the

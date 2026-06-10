@@ -2474,7 +2474,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
                             (int)(sizeof(pixe_sum_program) / sizeof(pixe_sum_program[0])));
     } else if (http_streq(cmd, "pixe req")) {
         /* EL1 protocol component proof: decode a canned HTTP request, split it
-         * into the EL1<->EL0 request-context spans, bind the principal, and dump
+         * into endpoint request-context spans, bind the principal, and dump
          * the result. This is the kernel-side half of the web pipeline. */
         static char pixe_req_buf[1024];
         u32 rn = pixe_request_selftest(pixe_req_buf, sizeof(pixe_req_buf));
@@ -2482,10 +2482,11 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         pixe_req_buf[rn] = 0;
         http_append(out, &len, max, pixe_req_buf);
     } else if (http_streq(cmd, "pixe endpoint")) {
-        /* EL0 endpoint proof: build the canned request context (EL1 side), then
-         * run the embedded echo endpoint (Context.GetVerb/GetBody -> Io.Write)
-         * against it and seal the response. Verifies the EL0 read+emit+seal path
-         * (bound context -> picovm host hooks -> response) byte-for-byte on HW. */
+        /* Endpoint-contract proof: build the canned request context (EL1 side),
+         * then run the embedded echo endpoint (Context.GetVerb/GetBody -> Io.Write)
+         * against it and seal the response. Verifies the read+emit+seal contract
+         * (bound context -> picovm host hooks -> response) byte-for-byte on HW.
+         * Actual EL0 entry remains gated on the pending eret/SVC scheduler path. */
         static char pixe_ep_buf[1024];
         u32 rn = pixe_host_selftest(pixe_ep_buf, sizeof(pixe_ep_buf));
         if (rn >= sizeof(pixe_ep_buf)) rn = sizeof(pixe_ep_buf) - 1;

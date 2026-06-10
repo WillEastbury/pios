@@ -1,10 +1,12 @@
 /*
- * pixe_host.c - EL0 "PIKEE / pix endpoint" host runtime.
+ * pixe_host.c - EL0-target "PIKEE / pix endpoint" host runtime.
  *
- * Implements the Context.* / Io.* / Span.* host hooks the EL0 endpoint needs to
- * read a sealed pixe_request_context and emit a response on the freestanding
- * picovm. Semantics mirror picoscript_vm.HostApi so register handles + output
- * bytes are byte-identical to the off-board reference VM.
+ * Implements the Context.* / Io.* / Span.* host hooks the endpoint needs to read
+ * a sealed pixe_request_context and emit a response on the freestanding picovm.
+ * This is the contract intended for EL0; current live execution still uses the
+ * legacy EL1 direct-KPI path until the eret/SVC scheduler path lands. Semantics
+ * mirror picoscript_vm.HostApi so register handles + output bytes are
+ * byte-identical to the off-board reference VM.
  *
  * The host state embeds pv_ctx as its first member; the picovm host callback
  * recovers the host by casting the pv_ctx* back. This needs no edit to the
@@ -167,7 +169,7 @@ u32 pixe_host_seal(struct pixe_host *h, struct pixe_request_context *rc,
     return n;
 }
 
-/* ---- selftest / report (proves the EL0 endpoint on hardware) ---------- */
+/* ---- selftest / report (proves the endpoint contract on hardware) ----- */
 
 /* The canned request mirrors pixe_request_selftest so the EL1->EL0 story is one
  * coherent example: EL1 builds this context, EL0 reads verb+body from it. */

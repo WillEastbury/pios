@@ -1,5 +1,5 @@
 /*
- * pixe_request.h - EL1<->EL0 request-context contract for the PIOS web pipeline.
+ * pixe_request.h - EL1<->EL0-target request-context contract for the PIOS web pipeline.
  *
  * This is the interface between the two components of the PicoScript web model:
  *
@@ -7,10 +7,10 @@
  *     - owns HTTP stream decode + framing validation
  *     - interns/splits the request into spans
  *     - builds this request context
- *     - attaches principal/capsule bindings (kernel-established, EL0-immutable)
+ *     - attaches principal/capsule bindings (kernel-established, endpoint-immutable)
  *     - pushes the context descriptor down a FIFO to the endpoint
  *
- *   EL0 "PIKEE / pix endpoint" (compiled PicoScript binary)
+ *   EL0-target "PIKEE / pix endpoint" (compiled PicoScript binary)
  *     - receives this bound context
  *     - reads the spans (zero-copy, read-only)
  *     - runs PicoScript behaviour (picovm)
@@ -19,16 +19,17 @@
  *
  * SPAN MODEL: every span is an (offset, length) into the request byte buffer,
  * NOT an absolute pointer. The request bytes live in a shared buffer that the
- * kernel sees via the identity map and the EL0 endpoint sees via its mapped
- * window at a different virtual address, so offsets (not addresses) are the only
- * portable reference. A consumer resolves a span as `base + off` for `len` bytes,
- * where `base` is that consumer's view of the request buffer. This realises the
+ * kernel sees via the identity map and the endpoint sees via its mapped window
+ * at a different virtual address, so offsets (not addresses) are the only portable
+ * reference. A consumer resolves a span as `base + off` for `len` bytes, where
+ * `base` is that consumer's view of the request buffer. This realises the
  * "lease on a type hint + span/pointer(offset+length)" access model: the field
  * identity is the type hint, the (off,len) is the span.
  *
  * IMMUTABILITY: the kernel fills and seals this context (PIXE_REQ_F_SEALED). When
- * it is published to the endpoint it must live in a page mapped read-only to EL0
- * (EL1-write / EL0-read) so a capsule cannot forge its own principal/permissions.
+ * true EL0 lands and it is published to the endpoint, it must live in a page
+ * mapped read-only to EL0 (EL1-write / EL0-read) so a capsule cannot forge its
+ * own principal/permissions.
  */
 #pragma once
 #include "types.h"
@@ -42,7 +43,7 @@
 #define PIXE_REQ_ERROR     -1
 
 /* Context flags. */
-#define PIXE_REQ_F_SEALED   0x00000001U  /* kernel finalised; EL0 read-only */
+#define PIXE_REQ_F_SEALED   0x00000001U  /* kernel finalised; future EL0 read-only */
 #define PIXE_REQ_F_HAS_BODY 0x00000002U  /* body span is non-empty */
 #define PIXE_REQ_F_TLS      0x00000004U  /* arrived over kernel TLS */
 
@@ -59,8 +60,8 @@ struct pixe_span {
     u32 len;
 } PACKED;
 
-/* The bound request context handed EL1 -> EL0. Fixed-size, pointer-free, so it
- * can live in shared memory and be mapped read-only into the EL0 endpoint. */
+/* The bound request context handed EL1 -> endpoint. Fixed-size, pointer-free, so
+ * it can live in shared memory and later be mapped read-only into the EL0 endpoint. */
 struct pixe_request_context {
     u32 magic;        /* PIXE_REQ_MAGIC once built */
     u32 version;      /* PIXE_REQ_VERSION */
@@ -80,14 +81,14 @@ struct pixe_request_context {
     u16 remote_port;  /* client TCP port */
     u16 local_port;   /* server TCP port the request arrived on */
 
-    /* Kernel-established bindings (EL0-immutable). */
+    /* Kernel-established bindings (endpoint-immutable). */
     u32 principal_id; /* authenticated user principal (Context.GetUser) */
     u32 capsule_id;   /* bound capsule working-group, 0 = none */
     u32 permissions;  /* effective caps = capsule ∪ delegated-user, minus deny
                        *                  (Context.GetPermissions) */
     u32 request_id;   /* monotonic per-build id (Context.GetRequestId) */
 
-    /* Response area, written by the EL0 endpoint and sealed by the kernel. */
+    /* Response area, written by the endpoint and sealed by the kernel. */
     i32 resp_status;            /* HTTP status the endpoint set, -1 until set */
     struct pixe_span resp_body; /* span (into a response buffer) the endpoint produced */
 } PACKED;
