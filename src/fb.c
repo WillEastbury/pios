@@ -21,12 +21,36 @@ static u32  fb_size;    /* total framebuffer bytes (from VideoCore) */
 #ifndef PIOS_FB_NO_DOUBLE_BUFFER
 static u32 *fb_back;    /* cached back buffer (rendering target when double-buffered) */
 static bool fb_db;      /* double-buffering enabled */
-static u32  fb_dirty_y0;/* dirty pixel-row range [y0,y1); y0>=y1 == clean */
-static u32  fb_dirty_y1;
+/* Dirty tracking is per 8px row-band: fb_present() blits only the bands actually
+ * touched since the last present, so a render that changes a few scattered text
+ * rows no longer forces one big contiguous span through the (slow) scanout. */
+#define FB_BAND_PX   8u
+#define FB_MAX_BANDS 256u                       /* covers up to 2048px height */
+static u64 fb_dirty_band[FB_MAX_BANDS / 64u];   /* 1 bit per band, set == dirty */
 static volatile u64 g_fb_blit_ticks; /* CNTPCT ticks of the last blit */
 #endif
 static u32  fb_fg = 0x00FF9900;  /* amber */
 static u32  fb_bg = 0x00000000;  /* black */
+
+/* ── Text-cell shadow cache ──
+ * Records the (code,fg,bg) last drawn at each text cell so re-rendering identical
+ * content (e.g. the 1Hz HDMI dashboard, whose fields are mostly static) skips the
+ * pixel writes and dirty marking. Display-only: a stale entry can affect nothing
+ * but the diagnostic surface, and any direct-pixel write invalidates the cells it
+ * touches. Sized to bound RAM; enabled only when the panel fits and DB is on. */
+#define FB_SH_COLS 240u
+#define FB_SH_ROWS 136u
+#define FB_CELL_INVALID 0xFFFFFFFFu
+struct fb_cell { u32 code; u32 fg; u32 bg; };
+static struct fb_cell fb_shadow[FB_SH_ROWS * FB_SH_COLS];
+static bool fb_shadow_on;
+/* Deferred-clear state: fb_clear_text_row() marks cells to-be-blanked rather than
+ * writing them, so a clear immediately followed by an identical redraw (static
+ * dashboard rows) costs zero pixel writes; fb_present() flushes any cell not
+ * redrawn this frame. */
+static u8  fb_cell_pending[FB_SH_ROWS * FB_SH_COLS]; /* 1 = blank at flush unless redrawn */
+static u8  fb_row_pending[FB_SH_ROWS];               /* 1 = row has >=1 pending cell */
+static u32 fb_row_clear_bg[FB_SH_ROWS];              /* bg captured at clear time */
 
 /* Text cursor */
 static u32  cursor_x;
@@ -52,13 +76,16 @@ static void fb_draw_border(void);
  * VideoCore scanout buffer directly. */
 static inline u32 *fb_rt(void) { return fb_db ? fb_back : fb_ptr; }
 
-/* Expand the dirty pixel-row range [y0,y1) that fb_present() will blit. */
+/* Mark the dirty bands overlapping pixel-row range [y0,y1) for the next blit. */
 static inline void fb_mark_dirty(u32 y0, u32 y1) {
     if (!fb_db) return;
     if (y1 > fb_height) y1 = fb_height;
     if (y0 >= y1) return;
-    if (y0 < fb_dirty_y0) fb_dirty_y0 = y0;
-    if (y1 > fb_dirty_y1) fb_dirty_y1 = y1;
+    u32 b0 = y0 / FB_BAND_PX;
+    u32 b1 = (y1 - 1u) / FB_BAND_PX;
+    if (b1 >= FB_MAX_BANDS) b1 = FB_MAX_BANDS - 1u;
+    for (u32 b = b0; b <= b1; b++)
+        fb_dirty_band[b >> 6] |= (1ULL << (b & 63u));
 }
 #else
 /* Double-buffering disabled (e.g. the tiny stage0 bootstrap): render straight
@@ -66,6 +93,29 @@ static inline void fb_mark_dirty(u32 y0, u32 y1) {
 static inline u32 *fb_rt(void) { return fb_ptr; }
 static inline void fb_mark_dirty(u32 y0, u32 y1) { (void)y0; (void)y1; }
 #endif
+
+/* Shadow cell at text position (cx,cy), or NULL when caching is off/out of range
+ * (callers fall back to drawing unconditionally). */
+static inline struct fb_cell *fb_shadow_at(u32 cx, u32 cy) {
+    if (!fb_shadow_on || cx >= FB_SH_COLS || cy >= FB_SH_ROWS)
+        return (struct fb_cell *)0;
+    return &fb_shadow[cy * FB_SH_COLS + cx];
+}
+
+/* Invalidate cached cells overlapping pixel rows [py0,py1) so a later identical
+ * glyph there is redrawn. Used after direct-pixel writes that bypass the cell
+ * path (fb_pixel, fb_status_block). Over-invalidating only costs a redraw. */
+static void fb_shadow_invalidate_px(u32 py0, u32 py1) {
+    if (!fb_shadow_on) return;
+    u32 r0 = (py0 > fb_inset_y) ? (py0 - fb_inset_y) / 8u : 0;
+    u32 r1 = (py1 > fb_inset_y) ? (py1 - fb_inset_y + 7u) / 8u : 0;
+    if (r1 > FB_SH_ROWS) r1 = FB_SH_ROWS;
+    for (u32 cy = r0; cy < r1; cy++)
+        for (u32 cx = 0; cx < FB_SH_COLS; cx++) {
+            fb_shadow[cy * FB_SH_COLS + cx].code = FB_CELL_INVALID;
+            fb_cell_pending[cy * FB_SH_COLS + cx] = 0;  /* direct pixels own this cell now */
+        }
+}
 
 /* Mailbox buffer - must be 16-byte aligned */
 static volatile u32 __attribute__((aligned(16))) mbox_fb[36];
@@ -449,8 +499,11 @@ bool fb_init(u32 width, u32 height) {
 #ifndef PIOS_FB_NO_DOUBLE_BUFFER
     fb_back = (u32 *)(usize)FB_BACK_BASE;
     fb_db   = (fb_back != 0) && (fb_size != 0) && (fb_size <= FB_BACK_SIZE);
-    fb_dirty_y0 = fb_height;
-    fb_dirty_y1 = 0;
+    for (u32 k = 0; k < FB_MAX_BANDS / 64u; k++)
+        fb_dirty_band[k] = 0;
+    /* Enable the text-cell shadow cache when the panel fits the fixed cache
+     * dimensions; the upcoming fb_clear(fb_bg) seeds every cell to blank. */
+    fb_shadow_on = (cols <= FB_SH_COLS && rows <= FB_SH_ROWS);
 #endif
 
     fb_clear(fb_bg);   /* clears the render target and marks the full frame dirty */
@@ -518,6 +571,18 @@ void fb_clear(u32 color) {
     console_wrapped = false;
     fb_draw_border();              /* repaint the frame over the cleared field */
     fb_mark_dirty(0, fb_height);
+    /* The whole field now shows `color`; reset the shadow so identical content
+     * drawn next can be skipped (and a real glyph differs in code -> redraws). */
+    if (fb_shadow_on) {
+        for (u32 k = 0; k < FB_SH_ROWS * FB_SH_COLS; k++) {
+            fb_shadow[k].code = ' ';
+            fb_shadow[k].fg = color;
+            fb_shadow[k].bg = color;
+            fb_cell_pending[k] = 0;     /* full repaint supersedes any deferred blank */
+        }
+        for (u32 r = 0; r < FB_SH_ROWS; r++)
+            fb_row_pending[r] = 0;
+    }
 }
 
 void fb_pixel(u32 x, u32 y, u32 color) {
@@ -525,6 +590,7 @@ void fb_pixel(u32 x, u32 y, u32 color) {
         u32 *row = (u32 *)((u8 *)fb_rt() + y * fb_pitch);
         row[x] = color;
         fb_mark_dirty(y, y + 1);
+        fb_shadow_invalidate_px(y, y + 1);
     }
 }
 
@@ -574,6 +640,7 @@ void fb_status_block(u32 color) {
             row[x_base + dx] = color;
     }
     fb_mark_dirty(y_base, y_base + FB_STAT_BLOCK);
+    fb_shadow_invalidate_px(y_base, y_base + FB_STAT_BLOCK);
 
     fb_stat_x++;
     if (fb_stat_x >= cols) {
@@ -613,6 +680,29 @@ u32 fb_reserved_rows(void) {
 static void fb_clear_text_row(u32 cy) {
     if (!fb_ptr || cy >= rows) return;
     u32 py = fb_inset_y + cy * 8;
+    /* Cell-aware clear: repaint only cells not already blank with this bg, so
+     * clearing an already-blank row (the common dashboard case) costs nothing.
+     * Safe because shadow_on implies cols <= FB_SH_COLS and cy < FB_SH_ROWS. */
+    if (fb_shadow_on && cy < FB_SH_ROWS) {
+        /* Deferred clear: glyphs are opaque (fb_draw_codepoint paints fg AND bg
+         * for the whole 8x8 cell), so clearing a row then redrawing it writes
+         * every cell twice. Instead, mark each non-blank cell pending-blank and
+         * let fb_present() blank only those NOT redrawn this frame (the shrinking
+         * tail). A static row redrawn identically then costs zero pixel writes. */
+        bool any = false;
+        for (u32 cx = 0; cx < cols; cx++) {
+            struct fb_cell *sc = &fb_shadow[cy * FB_SH_COLS + cx];
+            if (sc->code == ' ' && sc->fg == fb_bg && sc->bg == fb_bg)
+                continue;                 /* already blank with this bg */
+            fb_cell_pending[cy * FB_SH_COLS + cx] = 1;
+            any = true;
+        }
+        if (any) {
+            fb_row_clear_bg[cy] = fb_bg;
+            fb_row_pending[cy] = 1;
+        }
+        return;
+    }
     u32 x0 = fb_inset_x;
     u32 x1 = fb_inset_x + cols * 8;
     for (u32 row = 0; row < 8; row++) {
@@ -664,6 +754,11 @@ static const u8 *fb_glyph_for_code(u32 code)
 
 /* Draw one 8x8 glyph at text position (cx, cy) */
 static void fb_draw_codepoint(u32 cx, u32 cy, u32 code) {
+    struct fb_cell *sc = fb_shadow_at(cx, cy);
+    if (sc)
+        fb_cell_pending[cy * FB_SH_COLS + cx] = 0;  /* (re)drawn: cancel deferred blank */
+    if (sc && sc->code == code && sc->fg == fb_fg && sc->bg == fb_bg)
+        return;                       /* identical to what's already on screen */
     const u8 *glyph = fb_glyph_for_code(code);
     u32 px = fb_inset_x + cx * 8;
     u32 py = fb_inset_y + cy * 8;
@@ -675,6 +770,7 @@ static void fb_draw_codepoint(u32 cx, u32 cy, u32 code) {
             scanline[px + col] = (bits & (1 << col)) ? fb_fg : fb_bg;
         }
     }
+    if (sc) { sc->code = code; sc->fg = fb_fg; sc->bg = fb_bg; }
     fb_mark_dirty(py, py + 8);
 }
 
@@ -865,25 +961,66 @@ static void fb_blit(u32 off, u32 bytes) {
     g_fb_blit_ticks = t1 - t0;
 }
 
+/* Blank cells that were cleared (deferred) but not redrawn this frame — the
+ * shrinking tail of shortened text — then mark their rows dirty for the blit.
+ * Glyphs are opaque, so a redrawn cell already overwrote its old content and
+ * cleared its pending flag in fb_draw_codepoint(); only true leftovers remain. */
+static void fb_flush_pending(void) {
+    if (!fb_shadow_on) return;
+    for (u32 cy = 0; cy < FB_SH_ROWS; cy++) {
+        if (!fb_row_pending[cy]) continue;
+        fb_row_pending[cy] = 0;
+        u32 py = fb_inset_y + cy * 8;
+        u32 bg = fb_row_clear_bg[cy];
+        bool any = false;
+        for (u32 cx = 0; cx < FB_SH_COLS; cx++) {
+            u32 idx = cy * FB_SH_COLS + cx;
+            if (!fb_cell_pending[idx]) continue;
+            fb_cell_pending[idx] = 0;
+            u32 px = fb_inset_x + cx * 8;
+            for (u32 r = 0; r < 8; r++) {
+                u32 *scanline = (u32 *)((u8 *)fb_rt() + (py + r) * fb_pitch);
+                for (u32 c = 0; c < 8; c++)
+                    scanline[px + c] = bg;
+            }
+            struct fb_cell *sc = &fb_shadow[idx];
+            sc->code = ' '; sc->fg = bg; sc->bg = bg;
+            any = true;
+        }
+        if (any) fb_mark_dirty(py, py + 8);
+    }
+}
+
 void fb_present(void) {
     if (!fb_db)
         return;
-    if (fb_dirty_y1 <= fb_dirty_y0)
-        return;                       /* nothing changed */
 
-    u32 y0 = fb_dirty_y0;
-    u32 y1 = fb_dirty_y1;
-    fb_dirty_y0 = fb_height;          /* reset to clean before blitting */
-    fb_dirty_y1 = 0;
+    fb_flush_pending();
 
-    u32 off = y0 * fb_pitch;
-    if (off >= fb_size)
-        return;
-    u32 bytes = (y1 - y0) * fb_pitch;
-    if (off + bytes > fb_size)
-        bytes = fb_size - off;
-    if (bytes)
-        fb_blit(off, bytes);
+    /* Blit each maximal run of consecutive dirty bands as one sequential pass,
+     * clearing the bits as we go. With the cell cache, a typical dashboard tick
+     * dirties only a few scattered rows, so this replaces one ~33-row span with
+     * a handful of small blits. */
+    u32 nbands = (fb_height + FB_BAND_PX - 1u) / FB_BAND_PX;
+    if (nbands > FB_MAX_BANDS) nbands = FB_MAX_BANDS;
+    u32 b = 0;
+    while (b < nbands) {
+        if (!(fb_dirty_band[b >> 6] & (1ULL << (b & 63u)))) { b++; continue; }
+        u32 run0 = b;
+        while (b < nbands && (fb_dirty_band[b >> 6] & (1ULL << (b & 63u)))) {
+            fb_dirty_band[b >> 6] &= ~(1ULL << (b & 63u));
+            b++;
+        }
+        u32 y0 = run0 * FB_BAND_PX;
+        u32 y1 = b * FB_BAND_PX;
+        if (y1 > fb_height) y1 = fb_height;
+        u32 off = y0 * fb_pitch;
+        if (off >= fb_size) break;
+        u32 bytes = (y1 - y0) * fb_pitch;
+        if (off + bytes > fb_size) bytes = fb_size - off;
+        if (bytes)
+            fb_blit(off, bytes);
+    }
 }
 #else
 void fb_present(void) { }
