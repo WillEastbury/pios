@@ -68,6 +68,9 @@
 #include "fat32.h"
 #include "pios_addr.h"
 #include "picoscript.h"
+#include "picovm.h"
+#include "pixe_request.h"
+#include "pixe_host.h"
 #include "keystore.h"
 #include "tls.h"
 #include "brotli.h"
@@ -1508,6 +1511,78 @@ static bool http_parse_db_ref(u32 argc, char **argv, u32 start, u32 *card_out, u
     return true;
 }
 
+/* ---- PicoScript bytecode VM (picovm) -------------------------------------
+ * Vendored from willeastbury/picoscript vm/picovm.c: the freestanding 16-opcode
+ * VM that is byte-identical to the Python/JS reference VMs. This is the on-board
+ * execution engine for compiled PicoScript "pixe" capsules. The `pixe` command
+ * runs a bytecode program and reports steps/status/regs/out, so on-board
+ * execution can be verified bit-for-bit against the off-board reference VM. */
+static void pixe_append_i32(char *out, u32 *len, u32 max, i32 v)
+{
+    if (v < 0) {
+        http_append(out, len, max, "-");
+        http_append_u64(out, len, max, (u64)(-(i64)v));
+    } else {
+        http_append_u64(out, len, max, (u64)(u32)v);
+    }
+}
+
+static int pixe_parse_hex32(const char *s, u32 *out)
+{
+    if (!s || !*s) return 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    u32 v = 0;
+    int any = 0;
+    while (*s) {
+        char c = *s++;
+        u32 d;
+        if (c >= '0' && c <= '9') d = (u32)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (u32)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (u32)(c - 'A' + 10);
+        else return 0;
+        v = (v << 4) | d;
+        any = 1;
+    }
+    if (!any) return 0;
+    *out = v;
+    return 1;
+}
+
+/* examples/sum.pc compiled with picoscript_build.py emit --as bytecode.
+ * Reference VM result: 55 steps, status=200, regs=[1,10,55,11,55,0...], out empty. */
+static const u32 pixe_sum_program[] = {
+    0x50010000u, 0x4000000au, 0x41000000u, 0x50010000u, 0x40000000u,
+    0x42000000u, 0x50010000u, 0x40000001u, 0x43000000u, 0xa3130004u,
+    0x42210003u, 0x83000000u, 0x90000009u, 0x000080c8u, 0x0000a002u,
+    0x20200001u, 0x44200000u, 0xc0000000u, 0xc0000000u
+};
+
+static void pixe_run_and_report(char *out, u32 *len, u32 max, const u32 *prog, int n)
+{
+    static pv_ctx vmctx;
+    pv_init(&vmctx);
+    long steps = pv_vm_run(&vmctx, prog, n);
+    http_append(out, len, max, "pixe words=");
+    http_append_u64(out, len, max, (u64)(u32)n);
+    http_append(out, len, max, " steps=");
+    http_append_u64(out, len, max, (u64)steps);
+    http_append(out, len, max, " status=");
+    pixe_append_i32(out, len, max, vmctx.http_status);
+    http_append(out, len, max, " regs=");
+    for (int i = 0; i < PV_NUM_REGS; i++) {
+        if (i) http_append(out, len, max, ",");
+        pixe_append_i32(out, len, max, vmctx.regs[i]);
+    }
+    http_append(out, len, max, " out=");
+    if (vmctx.out_len == 0) {
+        http_append(out, len, max, "(empty)");
+    } else {
+        for (int i = 0; i < vmctx.out_len; i++)
+            http_append_hex8(out, len, max, vmctx.out[i]);
+    }
+    http_append(out, len, max, "\n");
+}
+
 static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     u32 len = 0;
@@ -2303,6 +2378,247 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else {
             http_append(out, &len, max, "usage membench <addr> [count]\n");
         }
+    } else if (http_streq(cmd, "clockdiag")) {
+        /* Directly measure the effective CPU clock with the PMU cycle counter
+         * against the architected timer (no instruction-timing inference), read
+         * the firmware throttle/temperature status (rules out under-voltage /
+         * thermal as the cause), then RE-ASSERT the max ARM clock at runtime and
+         * re-measure (a real fix attempt — tells us if the boot-time set was too
+         * early to stick). */
+        u64 cf; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cf));
+        if (!cf) cf = 54000000ULL;
+        u64 pmcr; __asm__ volatile("mrs %0, pmcr_el0" : "=r"(pmcr));
+        __asm__ volatile("msr pmcr_el0, %0" :: "r"(pmcr | 0x45ULL)); /* E|C|LC */
+        __asm__ volatile("msr pmcntenset_el0, %0" :: "r"(1ULL << 31));
+        __asm__ volatile("isb");
+        u64 win = cf / 200ULL;   /* ~5ms measurement window */
+        u64 c0, t0, c1, t1, now;
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
+        __asm__ volatile("mrs %0, pmccntr_el0" : "=r"(c0));
+        do { __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now)); } while (now - t0 < win);
+        __asm__ volatile("mrs %0, pmccntr_el0" : "=r"(c1));
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t1));
+        u64 cpu_hz1 = (t1 > t0) ? ((c1 - c0) * cf) / (t1 - t0) : 0;
+        u32 thr = fb_get_throttled();
+        u32 tmc = fb_get_temperature_mc();
+        u32 arm = fb_get_arm_clock();
+        u32 core = fb_get_clock_rate_id(4);
+        u32 reassert = fb_set_arm_clock_max();
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
+        __asm__ volatile("mrs %0, pmccntr_el0" : "=r"(c0));
+        do { __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now)); } while (now - t0 < win);
+        __asm__ volatile("mrs %0, pmccntr_el0" : "=r"(c1));
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t1));
+        u64 cpu_hz2 = (t1 > t0) ? ((c1 - c0) * cf) / (t1 - t0) : 0;
+        http_append(out, &len, max, "clockdiag cpu_hz=");
+        http_append_u64(out, &len, max, cpu_hz1);
+        http_append(out, &len, max, " cpu_hz_after_reassert=");
+        http_append_u64(out, &len, max, cpu_hz2);
+        http_append(out, &len, max, " fw_arm_hz=");
+        http_append_u64(out, &len, max, arm);
+        http_append(out, &len, max, " fw_core_hz=");
+        http_append_u64(out, &len, max, core);
+        http_append(out, &len, max, " reassert_hz=");
+        http_append_u64(out, &len, max, reassert);
+        http_append(out, &len, max, " throttled=0x");
+        http_append_hex32(out, &len, max, thr);
+        http_append(out, &len, max, " temp_mC=");
+        http_append_u64(out, &len, max, tmc);
+        http_append(out, &len, max, " cntfrq=");
+        http_append_u64(out, &len, max, cf);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "pixe") || http_streq(cmd, "pixe selftest")) {
+        /* Run the embedded compiled sum.pc and report VM state; verifies the
+         * on-board picovm is byte-identical to the off-board reference VM. */
+        pixe_run_and_report(out, &len, max, pixe_sum_program,
+                            (int)(sizeof(pixe_sum_program) / sizeof(pixe_sum_program[0])));
+    } else if (http_streq(cmd, "pixe req")) {
+        /* EL1 protocol component proof: decode a canned HTTP request, split it
+         * into the EL1<->EL0 request-context spans, bind the principal, and dump
+         * the result. This is the kernel-side half of the web pipeline. */
+        static char pixe_req_buf[1024];
+        u32 rn = pixe_request_selftest(pixe_req_buf, sizeof(pixe_req_buf));
+        if (rn >= sizeof(pixe_req_buf)) rn = sizeof(pixe_req_buf) - 1;
+        pixe_req_buf[rn] = 0;
+        http_append(out, &len, max, pixe_req_buf);
+    } else if (http_streq(cmd, "pixe endpoint")) {
+        /* EL0 endpoint proof: build the canned request context (EL1 side), then
+         * run the embedded echo endpoint (Context.GetVerb/GetBody -> Io.Write)
+         * against it and seal the response. Verifies the EL0 read+emit+seal path
+         * (bound context -> picovm host hooks -> response) byte-for-byte on HW. */
+        static char pixe_ep_buf[1024];
+        u32 rn = pixe_host_selftest(pixe_ep_buf, sizeof(pixe_ep_buf));
+        if (rn >= sizeof(pixe_ep_buf)) rn = sizeof(pixe_ep_buf) - 1;
+        pixe_ep_buf[rn] = 0;
+        http_append(out, &len, max, pixe_ep_buf);
+    } else if (http_starts_with(cmd, "pixe endpoint ")) {
+        /* Run a card-loaded endpoint program against the canned request context:
+         * pixe endpoint <card> <record>. Ties the card pipeline to the EL0 host so
+         * a compiled endpoint persisted as a picowal card runs against a bound
+         * request context. */
+        char *pargv[6];
+        u32 pargc = http_split_args(cmd, pargv, 6);
+        u32 card = 0, rec = 0;
+        if (pargc >= 4 && http_parse_u32(pargv[2], &card) && http_parse_u32(pargv[3], &rec) &&
+            card <= PICOWAL_CARD_MAX && rec <= PICOWAL_RECORD_MAX) {
+            static u8 pixe_ep_blob[PICOWAL_DATA_MAX];
+            i32 n = picowal_db_get((u16)card, rec, pixe_ep_blob, PICOWAL_DATA_MAX);
+            if (n < 0) {
+                http_append(out, &len, max, "ERR: pixe endpoint card get failed\n");
+            } else if ((n & 3) != 0) {
+                http_append(out, &len, max, "ERR: card payload not a multiple of 4 bytes\n");
+            } else {
+                static u32 pixe_ep_prog[PICOWAL_DATA_MAX / 4];
+                static char pixe_ep_buf2[1024];
+                int nwords = n / 4;
+                for (int i = 0; i < nwords; i++)
+                    pixe_ep_prog[i] = (u32)pixe_ep_blob[i * 4 + 0] |
+                                      ((u32)pixe_ep_blob[i * 4 + 1] << 8) |
+                                      ((u32)pixe_ep_blob[i * 4 + 2] << 16) |
+                                      ((u32)pixe_ep_blob[i * 4 + 3] << 24);
+                u32 rn2 = pixe_host_run_report(pixe_ep_buf2, sizeof(pixe_ep_buf2),
+                                               pixe_ep_prog, nwords);
+                if (rn2 >= sizeof(pixe_ep_buf2)) rn2 = sizeof(pixe_ep_buf2) - 1;
+                pixe_ep_buf2[rn2] = 0;
+                http_append(out, &len, max, pixe_ep_buf2);
+            }
+        } else {
+            http_append(out, &len, max, "usage pixe endpoint <card> <record>\n");
+        }
+    } else if (http_starts_with(cmd, "pixe run ")) {
+        /* Run an inline bytecode program: pixe run <hexword> [hexword...] */
+        static u32 pixe_prog[64];
+        char *pargv[34];
+        u32 pargc = http_split_args(cmd, pargv, 34);
+        int n = 0;
+        bool ok = true;
+        for (u32 i = 2; i < pargc && n < 64; i++) {
+            if (!pixe_parse_hex32(pargv[i], &pixe_prog[n])) { ok = false; break; }
+            n++;
+        }
+        if (ok && n > 0)
+            pixe_run_and_report(out, &len, max, pixe_prog, n);
+        else
+            http_append(out, &len, max, "usage pixe run <hexword> [hexword...]\n");
+    } else if (http_starts_with(cmd, "pixe save ")) {
+        /* Persist the embedded sum program to a picowal card as raw little-endian
+         * bytecode, proving the capsule persist->load->execute round-trip. */
+        char *pargv[6];
+        u32 pargc = http_split_args(cmd, pargv, 6);
+        u32 card = 0, rec = 0;
+        if (pargc >= 4 && http_parse_u32(pargv[2], &card) && http_parse_u32(pargv[3], &rec) &&
+            card <= PICOWAL_CARD_MAX && rec <= PICOWAL_RECORD_MAX) {
+            static u8 pixe_save_blob[sizeof(pixe_sum_program)];
+            u32 nwords = (u32)(sizeof(pixe_sum_program) / sizeof(pixe_sum_program[0]));
+            for (u32 i = 0; i < nwords; i++) {
+                u32 w = pixe_sum_program[i];
+                pixe_save_blob[i * 4 + 0] = (u8)(w & 0xFFU);
+                pixe_save_blob[i * 4 + 1] = (u8)((w >> 8) & 0xFFU);
+                pixe_save_blob[i * 4 + 2] = (u8)((w >> 16) & 0xFFU);
+                pixe_save_blob[i * 4 + 3] = (u8)((w >> 24) & 0xFFU);
+            }
+            i32 n = picowal_db_put((u16)card, rec, pixe_save_blob, nwords * 4U);
+            if (n < 0) {
+                http_append(out, &len, max, "ERR: pixe save put failed\n");
+            } else {
+                http_append(out, &len, max, "pixe saved card=");
+                http_append_u64(out, &len, max, card);
+                http_append(out, &len, max, " record=");
+                http_append_u64(out, &len, max, rec);
+                http_append(out, &len, max, " bytes=");
+                http_append_u64(out, &len, max, (u32)n);
+                http_append(out, &len, max, "\n");
+            }
+        } else {
+            http_append(out, &len, max, "usage pixe save <card> <record>\n");
+        }
+    } else if (http_starts_with(cmd, "pixe card ")) {
+        /* Load raw little-endian bytecode from a picowal card and execute it.
+         * This is the capsule-as-card execution path. */
+        char *pargv[6];
+        u32 pargc = http_split_args(cmd, pargv, 6);
+        u32 card = 0, rec = 0;
+        if (pargc >= 4 && http_parse_u32(pargv[2], &card) && http_parse_u32(pargv[3], &rec) &&
+            card <= PICOWAL_CARD_MAX && rec <= PICOWAL_RECORD_MAX) {
+            static u8 pixe_card_blob[PICOWAL_DATA_MAX];
+            i32 n = picowal_db_get((u16)card, rec, pixe_card_blob, PICOWAL_DATA_MAX);
+            if (n < 0) {
+                http_append(out, &len, max, "ERR: pixe card get failed\n");
+            } else if ((n & 3) != 0) {
+                http_append(out, &len, max, "ERR: card payload not a multiple of 4 bytes\n");
+            } else {
+                static u32 pixe_card_prog[PICOWAL_DATA_MAX / 4];
+                int nwords = n / 4;
+                for (int i = 0; i < nwords; i++)
+                    pixe_card_prog[i] = (u32)pixe_card_blob[i * 4 + 0] |
+                                        ((u32)pixe_card_blob[i * 4 + 1] << 8) |
+                                        ((u32)pixe_card_blob[i * 4 + 2] << 16) |
+                                        ((u32)pixe_card_blob[i * 4 + 3] << 24);
+                pixe_run_and_report(out, &len, max, pixe_card_prog, nwords);
+            }
+        } else {
+            http_append(out, &len, max, "usage pixe card <card> <record>\n");
+        }
+    } else if (http_starts_with(cmd, "pixe put ")) {
+        /* Chunked host upload of compiled bytecode into a picowal card via
+         * read-modify-write: pixe put <card> <record> <wordoffset> <hexword>...
+         * wordoffset 0 starts a fresh program (truncates any existing record);
+         * subsequent ascending chunks extend it. Self-contained and retry-safe so
+         * the host tool can stream a program larger than the 128B command buffer. */
+        char *pargv[34];
+        u32 pargc = http_split_args(cmd, pargv, 34);
+        u32 card = 0, rec = 0, woff = 0;
+        if (pargc >= 5 && http_parse_u32(pargv[2], &card) && http_parse_u32(pargv[3], &rec) &&
+            http_parse_u32(pargv[4], &woff) && card <= PICOWAL_CARD_MAX &&
+            rec <= PICOWAL_RECORD_MAX && woff < (PICOWAL_DATA_MAX / 4)) {
+            static u8 pixe_put_buf[PICOWAL_DATA_MAX];
+            u32 old_len = 0;
+            if (woff != 0) {
+                i32 g = picowal_db_get((u16)card, rec, pixe_put_buf, PICOWAL_DATA_MAX);
+                if (g > 0) old_len = (u32)g;
+            }
+            /* Zero-fill any gap between the existing content and this chunk. */
+            for (u32 z = old_len; z < woff * 4U; z++) pixe_put_buf[z] = 0;
+            u32 count = 0;
+            bool ok = true;
+            for (u32 i = 5; i < pargc; i++) {
+                u32 w;
+                if (!pixe_parse_hex32(pargv[i], &w)) { ok = false; break; }
+                u32 byte_off = (woff + count) * 4U;
+                if (byte_off + 4U > PICOWAL_DATA_MAX) { ok = false; break; }
+                pixe_put_buf[byte_off + 0] = (u8)(w & 0xFFU);
+                pixe_put_buf[byte_off + 1] = (u8)((w >> 8) & 0xFFU);
+                pixe_put_buf[byte_off + 2] = (u8)((w >> 16) & 0xFFU);
+                pixe_put_buf[byte_off + 3] = (u8)((w >> 24) & 0xFFU);
+                count++;
+            }
+            if (!ok || count == 0) {
+                http_append(out, &len, max, "usage pixe put <card> <record> <wordoffset> <hexword>...\n");
+            } else {
+                u32 new_len = (woff + count) * 4U;
+                if (new_len < old_len) new_len = old_len;
+                i32 n = picowal_db_put((u16)card, rec, pixe_put_buf, new_len);
+                if (n < 0) {
+                    http_append(out, &len, max, "ERR: pixe put failed\n");
+                } else {
+                    http_append(out, &len, max, "pixe put card=");
+                    http_append_u64(out, &len, max, card);
+                    http_append(out, &len, max, " record=");
+                    http_append_u64(out, &len, max, rec);
+                    http_append(out, &len, max, " offset=");
+                    http_append_u64(out, &len, max, woff);
+                    http_append(out, &len, max, " count=");
+                    http_append_u64(out, &len, max, count);
+                    http_append(out, &len, max, " total_words=");
+                    http_append_u64(out, &len, max, (u32)n / 4U);
+                    http_append(out, &len, max, " total_bytes=");
+                    http_append_u64(out, &len, max, (u32)n);
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        } else {
+            http_append(out, &len, max, "usage pixe put <card> <record> <wordoffset> <hexword>...\n");
+        }
     } else if (http_streq(cmd, "uhttp")) {
         i32 lc = 0; u32 st = 0, rq = 0, rs = 0, reqs = 0, magic = 0, pid = 0;
         uhttp_bridge_state(&lc, &st, &rq, &rs, &reqs, &magic, &pid);
@@ -2878,6 +3194,91 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, b.sev_ticks / b.iterations);
         }
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "cohdiag") || http_starts_with(cmd, "cohdiag ")) {
+        u32 iters = 2000;
+        u32 ccore = CORE_USER1;
+        if (http_starts_with(cmd, "cohdiag ")) {
+            const char *p = cmd + 8;
+            u32 v = 0;
+            if (http_parse_u32(p, &v) && v > 0) iters = v;
+            while (*p == ' ') p++;
+            while (*p && *p != ' ') p++;
+            while (*p == ' ') p++;
+            if (*p) {
+                u32 c = 0;
+                if (http_parse_u32(p, &c)) ccore = c;
+            }
+        }
+        struct proc_cohdiag_result r;
+        bool ok = proc_cohdiag(iters, ccore, &r);
+        http_append(out, &len, max, ok ? "cohdiag OK" : "cohdiag ERR");
+        http_append(out, &len, max, " consumer_core=");
+        http_append_u64(out, &len, max, r.consumer_core);
+        http_append(out, &len, max, " seqs=");
+        http_append_u64(out, &len, max, r.producer_seqs);
+        http_append(out, &len, max, " wb_safe=");
+        http_append_u64(out, &len, max, r.wb_safe);
+        http_append(out, &len, max, " | B attr fifo=0x");
+        http_append_hex32(out, &len, max, r.attr_fifo);
+        http_append(out, &len, max, "/sh");
+        http_append_u64(out, &len, max, r.sh_fifo);
+        http_append(out, &len, max, " dma_net=0x");
+        http_append_hex32(out, &len, max, r.attr_dma_net);
+        http_append(out, &len, max, "/sh");
+        http_append_u64(out, &len, max, r.sh_dma_net);
+        http_append(out, &len, max, " ipc=0x");
+        http_append_hex32(out, &len, max, r.attr_ipc);
+        http_append(out, &len, max, "/sh");
+        http_append_u64(out, &len, max, r.sh_ipc);
+        http_append(out, &len, max, " wb=0x");
+        http_append_hex32(out, &len, max, r.attr_wb);
+        http_append(out, &len, max, "/sh");
+        http_append_u64(out, &len, max, r.sh_wb);
+        http_append(out, &len, max, " nc=0x");
+        http_append_hex32(out, &len, max, r.attr_nc);
+        http_append(out, &len, max, "/sh");
+        http_append_u64(out, &len, max, r.sh_nc);
+        http_append(out, &len, max, " code=0x");
+        http_append_hex32(out, &len, max, r.attr_code);
+        http_append(out, &len, max, "/sh");
+        http_append_u64(out, &len, max, r.sh_code);
+        http_append(out, &len, max, " par_fault=");
+        http_append_u64(out, &len, max, r.par_fault);
+        http_append(out, &len, max, " | A wb_acq[chk=");
+        http_append_u64(out, &len, max, r.wb_checks);
+        http_append(out, &len, max, " mis=");
+        http_append_u64(out, &len, max, r.wb_mismatch);
+        http_append(out, &len, max, " tear=");
+        http_append_u64(out, &len, max, r.wb_tears);
+        http_append(out, &len, max, " to=");
+        http_append_u64(out, &len, max, r.wb_timeout);
+        http_append(out, &len, max, "] wb_noacq[chk=");
+        http_append_u64(out, &len, max, r.wb_noacq_checks);
+        http_append(out, &len, max, " mis=");
+        http_append_u64(out, &len, max, r.wb_noacq_mismatch);
+        http_append(out, &len, max, " tear=");
+        http_append_u64(out, &len, max, r.wb_noacq_tears);
+        http_append(out, &len, max, " to=");
+        http_append_u64(out, &len, max, r.wb_noacq_timeout);
+        http_append(out, &len, max, "] nc[chk=");
+        http_append_u64(out, &len, max, r.nc_checks);
+        http_append(out, &len, max, " mis=");
+        http_append_u64(out, &len, max, r.nc_mismatch);
+        http_append(out, &len, max, " tear=");
+        http_append_u64(out, &len, max, r.nc_tears);
+        http_append(out, &len, max, " to=");
+        http_append_u64(out, &len, max, r.nc_timeout);
+        http_append(out, &len, max, "] | C nc_seq=");
+        http_append_u64(out, &len, max, r.nc_seq_ps);
+        http_append(out, &len, max, "ps nc_scat=");
+        http_append_u64(out, &len, max, r.nc_scatter_ps);
+        http_append(out, &len, max, "ps wb_seq=");
+        http_append_u64(out, &len, max, r.wb_seq_ps);
+        http_append(out, &len, max, "ps wb_scat=");
+        http_append_u64(out, &len, max, r.wb_scatter_ps);
+        http_append(out, &len, max, "ps wb_hot=");
+        http_append_u64(out, &len, max, r.wb_hot_ps);
+        http_append(out, &len, max, "ps\n");
     } else if (http_streq(cmd, "qpu") || http_streq(cmd, "qpu status") ||
                http_streq(cmd, "tensor") || http_streq(cmd, "tensor status")) {
         struct tensor_status ts;
@@ -13560,12 +13961,14 @@ void kernel_main(void) {
          * FIFO / IPC / scanout NC. Must run before core_start_all() so
          * secondaries inherit the rebuilt l1_table via shared_ttbr0.
          *
-         * TEMPORARILY GATED (PIOS_ENABLE_CACHE_REMAP=0): the live block->table
-         * remap of the first 1GB is a break-before-make hazard suspected of
-         * PiSOD-ing at boot. Gated to isolate the port-81 504 wake-path bug on
-         * a bootable kernel; re-enable once the remap is made BBM-compliant. */
+         * RE-ENABLED (PIOS_ENABLE_CACHE_REMAP=1): the first-1GB remap is now
+         * break-before-make compliant — mmu_enable_caching() builds a fresh
+         * l1_table_cached off to the side and installs it via a single atomic
+         * TTBR0_EL1 swap + full TLB flush (no in-place block->table edit of the
+         * live table), eliminating the TLB-conflict PiSOD. A/B health-gated OTA
+         * still backstops a bad boot. */
 #ifndef PIOS_ENABLE_CACHE_REMAP
-#define PIOS_ENABLE_CACHE_REMAP 0
+#define PIOS_ENABLE_CACHE_REMAP 1
 #endif
 #if PIOS_ENABLE_CACHE_REMAP
         mmu_enable_caching();

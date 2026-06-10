@@ -101,6 +101,32 @@ struct proc_ipc_bench_result {
     u64 sev_ticks;
 } PACKED;
 
+struct proc_cohdiag_result {
+    /* Part B - effective stage-1 attributes (PAR_EL1[63:56]=MAIR byte,
+     * [9:8]=shareability). attr 0xFF=Normal WB cacheable, 0x44=Normal-NC,
+     * 0x00=Device-nGnRnE. sh 3=inner, 2=outer, 0=non-shareable. */
+    u32 attr_fifo;     u32 sh_fifo;      /* 0x04800000 shared FIFO ring   */
+    u32 attr_dma_net;  u32 sh_dma_net;   /* 0x04900000 DMA_NET (stays NC)  */
+    u32 attr_ipc;      u32 sh_ipc;       /* 0x04D00000 IPC SHM / bridge    */
+    u32 attr_wb;       u32 sh_wb;        /* WB-IS core-0 RAM scratch       */
+    u32 attr_nc;       u32 sh_nc;        /* .bss NC scratch                */
+    u32 attr_code;     u32 sh_code;      /* kernel text (expect WB)        */
+    u32 par_fault;                       /* 1 if any AT S1E1R faulted      */
+
+    /* Part C - write cost in picoseconds/write (ticks*18518/count). */
+    u64 nc_seq_ps;     u64 nc_scatter_ps;
+    u64 wb_seq_ps;     u64 wb_scatter_ps;   u64 wb_hot_ps;
+
+    /* Part A - cross-core publish/observe. mismatch>0 with a stable seq is a
+     * real ordering/coherency failure; tears (seq moved mid-read) are benign. */
+    u32 consumer_core;
+    u32 producer_seqs;
+    u32 wb_safe;                          /* WB scratch validated WB+free  */
+    u32 wb_checks;       u32 wb_mismatch;       u32 wb_tears;       u32 wb_timeout;
+    u32 wb_noacq_checks; u32 wb_noacq_mismatch; u32 wb_noacq_tears; u32 wb_noacq_timeout;
+    u32 nc_checks;       u32 nc_mismatch;       u32 nc_tears;       u32 nc_timeout;
+};
+
 #define PROC_IMAGE_FORMAT_NONE     0U
 #define PROC_IMAGE_FORMAT_FLAT     1U
 #define PROC_IMAGE_FORMAT_PIX      2U
@@ -477,6 +503,8 @@ u64  proc_preemptions(void);
 u32  proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries);
 bool proc_soft_event(u32 target_pid, u32 event_type, bool boost);
 bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out);
+bool proc_cohdiag(u32 iters, u32 consumer_core, struct proc_cohdiag_result *out);
+void proc_cohdiag_consumer_tick(void);
 u32  proc_snapshot(struct proc_ui_entry *out, u32 max_entries);
 void *proc_span_rent(u32 bytes, u32 align, u32 type);
 bool proc_span_release(void *ptr);

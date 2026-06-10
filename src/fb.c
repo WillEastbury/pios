@@ -301,6 +301,58 @@ u32 fb_get_arm_clock(void) {
     return fb_mbox[6];
 }
 
+/* GET_CLOCK_RATE for any clock id (3=ARM, 4=CORE, etc.). */
+u32 fb_get_clock_rate_id(u32 clock_id) {
+    int i = 0;
+    fb_mbox[i++] = 0;
+    fb_mbox[i++] = 0;
+    fb_mbox[i++] = 0x00030002;   /* GET_CLOCK_RATE */
+    fb_mbox[i++] = 8;
+    fb_mbox[i++] = 4;
+    fb_mbox[i++] = clock_id;
+    fb_mbox[i++] = 0;            /* [6] response: rate */
+    fb_mbox[i++] = 0;
+    fb_mbox[0] = (u32)(i * 4);
+    if (!fb_mbox_call())
+        return 0;
+    return fb_mbox[6];
+}
+
+/* GET_THROTTLED (0x00030046): firmware power/thermal status bitmap.
+ * bit0=under-voltage now, bit1=arm freq capped now, bit2=currently throttled,
+ * bit3=soft-temp-limit now; bits16..19 = same flags "occurred since boot". */
+u32 fb_get_throttled(void) {
+    int i = 0;
+    fb_mbox[i++] = 0;
+    fb_mbox[i++] = 0;
+    fb_mbox[i++] = 0x00030046;   /* GET_THROTTLED */
+    fb_mbox[i++] = 4;
+    fb_mbox[i++] = 4;
+    fb_mbox[i++] = 0;            /* [5] response: throttled bits */
+    fb_mbox[i++] = 0;
+    fb_mbox[0] = (u32)(i * 4);
+    if (!fb_mbox_call())
+        return 0xFFFFFFFFU;
+    return fb_mbox[5];
+}
+
+/* GET_TEMPERATURE (0x00030006): SoC temperature in millidegrees Celsius. */
+u32 fb_get_temperature_mc(void) {
+    int i = 0;
+    fb_mbox[i++] = 0;
+    fb_mbox[i++] = 0;
+    fb_mbox[i++] = 0x00030006;   /* GET_TEMPERATURE */
+    fb_mbox[i++] = 8;
+    fb_mbox[i++] = 4;
+    fb_mbox[i++] = 0;            /* [5] temperature id (input) */
+    fb_mbox[i++] = 0;            /* [6] response: milli-Celsius */
+    fb_mbox[i++] = 0;
+    fb_mbox[0] = (u32)(i * 4);
+    if (!fb_mbox_call())
+        return 0xFFFFFFFFU;
+    return fb_mbox[6];
+}
+
 bool fb_init(u32 width, u32 height) {
     /* Build tag buffer — matching canary_main.c exactly */
     int i = 0;

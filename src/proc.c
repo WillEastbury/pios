@@ -58,6 +58,34 @@ static u64 svc_call_count;
 static u64 svc_bad_count;
 static struct proc_security_stats proc_sec_stats;
 
+/* ----------------------------------------------------------------------------
+ * cohdiag - cross-core cache-coherency / memory-attribute diagnostic.
+ *
+ * Settles, on real BCM2712 hardware, whether the cross-core "doorbell data
+ * visibility" problem is a coherency gap (it is not - the A76/DynamIQ DSU is
+ * always coherent for Normal-WB-Inner-Shareable) or a software issue: arenas
+ * mapped Normal-NC plus a kernel/user attribute mismatch. Producer runs on
+ * CORE_NET (0); the consumer runs as a hook inside the target user core's
+ * proc_schedule() loop, woken from WFE by SEV.
+ * -------------------------------------------------------------------------- */
+#define COHDIAG_WB_SCRATCH  (CORE0_RAM_BASE + 0x00C00000UL)  /* 12MB into core0's 16MB WB-IS region */
+
+struct cohdiag_a {
+    volatile u64 seq;
+    volatile u64 payload[7];
+    volatile u32 producer_done;
+    volatile u32 consumer_started;
+    volatile u32 consumer_done;
+    volatile u32 checks;
+    volatile u32 mismatch;
+    volatile u32 tears;
+    volatile u32 use_acquire;
+};
+static volatile struct cohdiag_a *cohdiag_target;   /* struct under test          */
+static volatile u32 cohdiag_consumer_arm;           /* 0=idle else (consumer+1)   */
+static volatile struct cohdiag_a cohdiag_nc_a;      /* .bss => Normal-NC alias    */
+static u8 cohdiag_nc_buf[8192] ALIGNED(64);         /* .bss => Normal-NC scratch  */
+
 #define PROC_IMAGE_VALIDATE_HEADER_MAX 4096U
 static u8 proc_image_validate_scratch[PROC_IMAGE_VALIDATE_HEADER_MAX];
 
@@ -1842,6 +1870,8 @@ void proc_schedule(void)
     for (;;) {
         watchdog_touch(core_id());
         workq_drain(8);
+        if (cohdiag_consumer_arm)
+            proc_cohdiag_consumer_tick();
         proc_drain_remote_wakes();
         proc_sched_heartbeat();
         proc_sched_stage(10);
@@ -2558,6 +2588,245 @@ void proc_park(void) {
     proc_wake_pending[current_proc] = 0;   /* consume the wake that dispatched us */
     if (user && preempt_enabled[uc] && p->state == PROC_RUNNING)
         preempt_armed[uc] = true;
+}
+
+/* Deterministic, seq+index-dependent payload pattern. */
+static inline u64 cohdiag_pat(u64 seq, u32 k)
+{
+    u64 a = (seq + 1ULL) * 0x9E3779B97F4A7C15ULL;
+    u64 b = ((u64)k + 1ULL) * 0xD1B54A32D192ED03ULL;
+    return a ^ b ^ (seq << (k & 7U)) ^ (seq >> ((64U - (k & 7U)) & 63U));
+}
+
+/* Probe the effective stage-1 attributes of a VA via AT S1E1R + PAR_EL1. */
+static void cohdiag_probe_attr(u64 addr, u32 *attr, u32 *sh, u32 *fault)
+{
+    u64 par = 0;
+    __asm__ volatile("at s1e1r, %1\n\tisb\n\tmrs %0, par_el1"
+                     : "=r"(par) : "r"(addr) : "memory");
+    if (par & 1ULL) {                 /* PAR_EL1.F == 1 -> translation fault */
+        *fault = 1;
+        *attr = 0;
+        *sh = 0;
+        return;
+    }
+    *attr = (u32)((par >> 56) & 0xFFULL);
+    *sh   = (u32)((par >> 8) & 0x3ULL);
+}
+
+/* Consumer body: spin observing seq, acquire-order the payload read, verify. */
+static void cohdiag_consumer_run(volatile struct cohdiag_a *a)
+{
+    u64 last = 0;
+    u64 spins = 0;
+    u32 use_acq = a->use_acquire;
+    a->consumer_started = 1;
+    dsb_ish();
+    for (;;) {
+        u64 s1 = a->seq;
+        if (s1 != last) {
+            u64 tmp[7];
+            u32 k;
+            if (use_acq) dmb_ish();   /* acquire: seq-read before payload read */
+            for (k = 0; k < 7U; k++) tmp[k] = a->payload[k];
+            if (use_acq) dmb_ish();
+            if (a->seq == s1) {       /* stable snapshot */
+                a->checks++;
+                for (k = 0; k < 7U; k++) {
+                    if (tmp[k] != cohdiag_pat(s1, k)) { a->mismatch++; break; }
+                }
+                last = s1;
+            } else {
+                a->tears++;           /* seq moved mid-read; retry */
+            }
+        }
+        if (a->producer_done && a->seq == last)
+            break;
+        if ((++spins & 0xFFFFULL) == 0) watchdog_touch(core_id());
+        if (spins > 400000000ULL) break;  /* hard safety cap */
+    }
+    dsb_ish();
+    a->consumer_done = 1;
+    dsb_ish();
+}
+
+/* Scheduler-loop hook: runs the consumer body on the armed consumer core only. */
+void proc_cohdiag_consumer_tick(void)
+{
+    u32 arm = cohdiag_consumer_arm;
+    volatile struct cohdiag_a *a;
+    if (arm == 0)
+        return;
+    if ((arm - 1U) != core_id())
+        return;
+    a = cohdiag_target;
+    if (a)
+        cohdiag_consumer_run(a);
+    cohdiag_consumer_arm = 0;
+    dsb_ish();
+}
+
+/* Producer/orchestrator for one publish/observe pass against struct *a. */
+static void cohdiag_run_one(volatile struct cohdiag_a *a, u32 use_acquire, u32 iters,
+                            u32 consumer_core, u32 *checks, u32 *mismatch,
+                            u32 *tears, u32 *timeout)
+{
+    u32 k, s;
+    u64 spins;
+
+    a->seq = 0;
+    for (k = 0; k < 7U; k++) a->payload[k] = 0;
+    a->producer_done = 0;
+    a->consumer_started = 0;
+    a->consumer_done = 0;
+    a->checks = 0;
+    a->mismatch = 0;
+    a->tears = 0;
+    a->use_acquire = use_acquire;
+    dsb_ish();
+
+    cohdiag_target = a;
+    dsb_ish();
+    cohdiag_consumer_arm = consumer_core + 1U;
+    dsb_ish();
+    sev();                            /* wake target core from WFE */
+
+    spins = 0;
+    while (!a->consumer_started) {
+        sev();
+        if ((++spins & 0xFFFFULL) == 0) watchdog_touch(core_id());
+        if (spins > 200000000ULL) {
+            *timeout = 1;
+            cohdiag_consumer_arm = 0;
+            dsb_ish();
+            *checks = a->checks; *mismatch = a->mismatch; *tears = a->tears;
+            return;
+        }
+    }
+
+    for (s = 1; s <= iters; s++) {
+        for (k = 0; k < 7U; k++) a->payload[k] = cohdiag_pat(s, k);
+        dmb_ish();                    /* release: payload stores before seq store */
+        a->seq = s;
+        dsb_ish();
+        sev();
+        for (volatile u32 d = 0; d < 32U; d++) { }  /* light pacing for coverage */
+        if ((s & 0x3FFU) == 0) watchdog_touch(core_id());
+    }
+    a->producer_done = 1;
+    dsb_ish();
+    sev();
+
+    spins = 0;
+    while (!a->consumer_done) {
+        sev();
+        if ((++spins & 0xFFFFULL) == 0) watchdog_touch(core_id());
+        if (spins > 200000000ULL) { *timeout = 1; break; }
+    }
+    cohdiag_consumer_arm = 0;
+    dsb_ish();
+    *checks = a->checks;
+    *mismatch = a->mismatch;
+    *tears = a->tears;
+}
+
+/* Write-cost microbench: stride across cache lines (or prime-scatter) on *buf. */
+static u64 cohdiag_write_cost_ps(volatile u8 *buf, u32 nlines, u32 count, bool scatter)
+{
+    u64 t0, t1, dt;
+    u32 i, idx = 0;
+    for (i = 0; i < nlines; i++) buf[(u64)i * 64ULL] = (u8)i;   /* warm/populate */
+    dsb_ish();
+    t0 = proc_sched_counter_ticks();
+    if (scatter) {
+        for (i = 0; i < count; i++) {
+            idx += 53U;               /* prime stride */
+            if (idx >= nlines) idx -= nlines;
+            buf[(u64)idx * 64ULL] = (u8)i;
+        }
+    } else {
+        for (i = 0; i < count; i++) {
+            buf[(u64)idx * 64ULL] = (u8)i;
+            if (++idx >= nlines) idx = 0;
+        }
+    }
+    t1 = proc_sched_counter_ticks();
+    dt = t1 >= t0 ? t1 - t0 : 0;
+    return count ? (dt * 18518ULL) / count : 0;
+}
+
+/* Same-line repeated write (stays hot in L1 on a cacheable buffer). */
+static u64 cohdiag_write_hot_ps(volatile u8 *buf, u32 count)
+{
+    u64 t0, t1, dt;
+    u32 i;
+    buf[0] = 1;
+    dsb_ish();
+    t0 = proc_sched_counter_ticks();
+    for (i = 0; i < count; i++) buf[0] = (u8)i;
+    t1 = proc_sched_counter_ticks();
+    dt = t1 >= t0 ? t1 - t0 : 0;
+    return count ? (dt * 18518ULL) / count : 0;
+}
+
+bool proc_cohdiag(u32 iters, u32 consumer_core, struct proc_cohdiag_result *out)
+{
+    struct core_env *e0;
+    u64 hp;
+
+    if (!out)
+        return false;
+    if (core_id() != CORE_NET)        /* producer must own core 0 */
+        return false;
+    if (iters == 0) iters = 2000;
+    if (iters > 20000U) iters = 20000U;
+    if (consumer_core != CORE_USERM && consumer_core != CORE_USER0 &&
+        consumer_core != CORE_USER1)
+        consumer_core = CORE_USER1;   /* default: idle user core 3 */
+
+    simd_zero(out, sizeof(*out));
+    out->consumer_core = consumer_core;
+    out->producer_seqs = iters;
+
+    /* Part B - effective memory attributes of the live arenas. */
+    cohdiag_probe_attr(SHARED_FIFO_BASE, &out->attr_fifo, &out->sh_fifo, &out->par_fault);
+    cohdiag_probe_attr(DMA_NET_BASE, &out->attr_dma_net, &out->sh_dma_net, &out->par_fault);
+    cohdiag_probe_attr(IPC_SHM_BASE, &out->attr_ipc, &out->sh_ipc, &out->par_fault);
+    cohdiag_probe_attr(COHDIAG_WB_SCRATCH, &out->attr_wb, &out->sh_wb, &out->par_fault);
+    cohdiag_probe_attr((u64)(usize)cohdiag_nc_buf, &out->attr_nc, &out->sh_nc, &out->par_fault);
+    cohdiag_probe_attr((u64)(usize)&__text_start, &out->attr_code, &out->sh_code, &out->par_fault);
+
+    /* Only touch the WB scratch if it really is Normal-WB and clears core0's heap. */
+    e0 = core_env_of(CORE_NET);
+    hp = (u64)(usize)e0->heap_ptr;
+    out->wb_safe = (out->attr_wb == 0xFFU &&
+                    COHDIAG_WB_SCRATCH > hp + 0x10000ULL) ? 1U : 0U;
+
+    /* Part C - write cost. NC scratch always; WB scratch only when safe. */
+    out->nc_seq_ps     = cohdiag_write_cost_ps(cohdiag_nc_buf, 128U, 4096U, false);
+    out->nc_scatter_ps = cohdiag_write_cost_ps(cohdiag_nc_buf, 128U, 4096U, true);
+    if (out->wb_safe) {
+        volatile u8 *wbuf = (volatile u8 *)(usize)(COHDIAG_WB_SCRATCH + 0x1000UL);
+        out->wb_seq_ps     = cohdiag_write_cost_ps(wbuf, 128U, 4096U, false);
+        out->wb_scatter_ps = cohdiag_write_cost_ps(wbuf, 128U, 4096U, true);
+        out->wb_hot_ps     = cohdiag_write_hot_ps(wbuf, 4096U);
+    }
+
+    /* Part A - cross-core publish/observe. */
+    if (out->wb_safe) {
+        volatile struct cohdiag_a *wb = (volatile struct cohdiag_a *)(usize)COHDIAG_WB_SCRATCH;
+        cohdiag_run_one(wb, 1U, iters, consumer_core,
+                        &out->wb_checks, &out->wb_mismatch,
+                        &out->wb_tears, &out->wb_timeout);
+        cohdiag_run_one(wb, 0U, iters, consumer_core,
+                        &out->wb_noacq_checks, &out->wb_noacq_mismatch,
+                        &out->wb_noacq_tears, &out->wb_noacq_timeout);
+    }
+    cohdiag_run_one(&cohdiag_nc_a, 1U, iters, consumer_core,
+                    &out->nc_checks, &out->nc_mismatch,
+                    &out->nc_tears, &out->nc_timeout);
+
+    return true;
 }
 
 bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)

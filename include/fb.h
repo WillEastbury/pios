@@ -44,3 +44,9 @@ u64 fb_last_blit_ticks(void);
 u32 fb_set_arm_clock_max(void);
 /* Read the current ARM clock rate (Hz). */
 u32 fb_get_arm_clock(void);
+/* GET_CLOCK_RATE for any clock id (3=ARM, 4=CORE). */
+u32 fb_get_clock_rate_id(u32 clock_id);
+/* GET_THROTTLED bitmap (under-voltage / freq-capped / throttled / temp-limit). */
+u32 fb_get_throttled(void);
+/* SoC temperature in millidegrees Celsius. */
+u32 fb_get_temperature_mc(void);

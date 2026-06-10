@@ -29,6 +29,7 @@
 
 /* Page tables — 4KB aligned (l1_table used by start.S for early MMU) */
 u64 l1_table[512] ALIGNED(4096);
+static u64 l1_table_cached[512] ALIGNED(4096); /* BBM-safe target: fresh root for cache enable */
 static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
 static u64 l3_block0[512] ALIGNED(4096);     /* block 0 (0-2MB) split to 4KB pages */
 
@@ -267,7 +268,7 @@ void mmu_init(void) {
 }
 
 /*
- * mmu_enable_caching() — Phase 1 cache-coherency cleanup.
+ * mmu_enable_caching() — Phase 1 cache-coherency cleanup (BBM-safe).
  *
  * start.S brings the MMU up with l1_table[0] as a single 1GB Normal
  * Non-Cacheable block (0x705), so the entire first 1GB (kernel, all RAM,
@@ -290,11 +291,21 @@ void mmu_init(void) {
  *   blocks 40-47  0x05000000-0x05FFFFFF  HDMI back buffer           -> WB IS
  *   blocks 48-511 0x06000000-0x3FFFFFFF  high RAM + VideoCore scanout-> NC
  *
- * Safe because: dma.c already cleans/invalidates its DMA targets, the HDMI
- * blit is NEON (CPU), SD is PIO, and the process loader cleans D-cache to
- * PoC + invalidates I-cache after copying images. Call once on core 0 after
- * the start.S MMU handoff and before secondaries launch (they pick up the
- * rebuilt l1_table via shared_ttbr0).
+ * Break-before-make is honoured at the TRANSLATION ROOT rather than by an
+ * in-place edit of the live l1_table[0] descriptor (block->table in place lets
+ * the walker hold the old 1GB block and a freshly-walked table for the same VA
+ * at once -> TLB conflict abort / PiSOD). The fine-grained hierarchy is built
+ * off to the side in l1_table_cached (entry 0 -> L2 split; entries 1..511
+ * copied verbatim) and installed with a single atomic TTBR0_EL1 swap + full
+ * TLB flush; the new table is VA==PA identical for all executing kernel code
+ * (attributes only tighten NC->WB), so there is no unmapped/conflicting window.
+ *
+ * Safe because: the system is fully NC until this runs (no dirty D-cache RAM
+ * lines), dma.c already cleans/invalidates its DMA targets, the HDMI blit is
+ * NEON (CPU), SD is PIO, and the process loader cleans D-cache to PoC +
+ * invalidates I-cache after copying images. Call once on core 0 after the
+ * start.S MMU handoff and before secondaries launch — it republishes
+ * shared_ttbr0 to l1_table_cached so they inherit the cached mapping.
  */
 void mmu_enable_caching(void) {
     const u64 cache_lo_base = CORE0_RAM_BASE;                /* 0x00800000 */
@@ -335,26 +346,55 @@ void mmu_enable_caching(void) {
         l2_table_low[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);
     }
 
-    /* l2_table_low and l3_block0 live in NC-mapped .bss, so the stores above
-     * land directly in DRAM. Push to PoC and drop any stray cached lines so the
-     * cacheable table walker (TCR IRGN0/ORGN0=WB) cannot read a stale copy. */
+    /* l2_table_low and l3_block0 were written through the still-active NC
+     * mapping, so the stores already sit in DRAM. Build the fresh top-level
+     * table beside the live one: entry 0 -> the fine-grained L2 above; entries
+     * 1..511 copied verbatim from l1_table so every other VA (high RAM WB
+     * blocks, BCM2712 + RP1 device windows) keeps its exact mapping. */
+    l1_table_cached[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
+    for (u32 i = 1; i < 512; i++)
+        l1_table_cached[i] = l1_table[i];
+
+    /* Push all three tables to PoC and drop any stray cached lines so the
+     * cacheable table walker (TCR IRGN0/ORGN0=WB) reads the fresh descriptors. */
     dsb();
-    dcache_clean_invalidate_range((u64)(usize)l3_block0, sizeof(l3_block0));
-    dcache_clean_invalidate_range((u64)(usize)l2_table_low, sizeof(l2_table_low));
+    dcache_clean_invalidate_range((u64)(usize)l3_block0,       sizeof(l3_block0));
+    dcache_clean_invalidate_range((u64)(usize)l2_table_low,    sizeof(l2_table_low));
+    dcache_clean_invalidate_range((u64)(usize)l1_table_cached, sizeof(l1_table_cached));
 
-    /* Atomically replace the 1GB NC block with a table descriptor. The old
-     * block translation stays live in the TLB until the tlbi below, so there
-     * is no unmapped window for the kernel executing this code. */
-    l1_table[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
+    /* Publish the cached root so secondaries (launched later by core_start_all)
+     * pick it up via shared_ttbr0 when they program their own TTBR0_EL1. */
+    shared_ttbr0 = (u64)(usize)l1_table_cached;
     dsb();
+    dcache_clean_invalidate_range((u64)(usize)&shared_ttbr0, sizeof(shared_ttbr0));
 
-    /* The walker had cached the old l1_table[0] block descriptor. Invalidate
-     * (never clean) that line so the walk re-fetches the new table descriptor
-     * from DRAM; the line is clean, so invalidate-only cannot write back and
-     * clobber the value just stored via the NC mapping. */
-    dcache_invalidate_range((u64)(usize)&l1_table[0], sizeof(u64));
-
-    __asm__ volatile("tlbi vmalle1; dsb sy; isb" ::: "memory");
+    /* Break-before-make at the TRANSLATION ROOT, not by an in-place l1_table[0]
+     * block->table edit (which lets the walker hold the old 1GB block and a new
+     * table for the same VA at once -> TLB conflict abort / PiSOD). Switch TTBR0
+     * to the fresh table and flush the whole stage-1 TLB in one shot (no ASIDs,
+     * so vmalle1 drops every stale block/page; kernel mappings are global, so an
+     * ASID bump would not help anyway). This mirrors the proven
+     * mmu_switch_to_user/_kernel pattern (msr ttbr0; tlbi vmalle1; dsb; isb) that
+     * already does live same-ASID block<->table swaps every scheduler tick on
+     * this A76. No `isb` between msr and tlbi: that would make the new context
+     * observable while the stale global 1GB NC entry still lingers, widening the
+     * alias window; instead the old entry stays a TLB hit for the identity-mapped
+     * code (no conflicting walk, and the swap asm does no data accesses here)
+     * until tlbi drops it. The new table is VA==PA identical for all executing
+     * kernel code (attributes only tighten NC->WB); the system was fully NC until
+     * now so the D-cache holds no dirty RAM lines; ic iallu drops any NC
+     * instruction fetches so they refetch from the now-WB code window. */
+    u64 ttbr = (u64)(usize)l1_table_cached;
+    __asm__ volatile(
+        "dsb    sy            \n"
+        "msr    ttbr0_el1, %0 \n"
+        "tlbi   vmalle1       \n"
+        "dsb    sy            \n"
+        "ic     iallu         \n"
+        "dsb    sy            \n"
+        "isb                  \n"
+        :: "r"(ttbr) : "memory"
+    );
 }
 
 void mmu_invalidate_tlb(void) {
