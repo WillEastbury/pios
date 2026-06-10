@@ -860,8 +860,12 @@ bool walfs_write(u64 inode_id, u64 offset, const void *data, u32 len)
         dh.offset   = cur;
         dh.length   = chunk;
 
-        if (!wal_append(RECORD_DATA, &dh, sizeof(dh), src, chunk))
+        u64 data_pos = wal_append(RECORD_DATA, &dh, sizeof(dh), src, chunk);
+        if (!data_pos)
             return false;
+        dindex_add(inode_id, cur, chunk,
+                   data_pos + sizeof(struct wal_record) + sizeof(struct walfs_data),
+                   next_seq - 1U);
         src += chunk;
         cur += chunk;
         rem -= chunk;

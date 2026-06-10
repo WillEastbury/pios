@@ -138,6 +138,8 @@ void pixe_host_init(struct pixe_host *h, const struct pixe_request_context *req,
 {
     pv_init(&h->vm);
     h->vm.host = pixe_host_hook;
+    h->vm.mem = h->mem;
+    h->vm.mem_size = PIXE_ARENA_SIZE;
     h->arena_top = 0;
     h->span_count = 1;            /* spans[0] reserved/empty => first alloc is 1 */
     h->spans[0].ptr = 0;

@@ -36,6 +36,11 @@
 #define UHTTP_PORT           81U
 #define UHTTP_REQ_MAX        8192U
 #define UHTTP_RESP_MAX       24576U
+#define UHTTP_PICO_MAX       4096U
+#define UHTTP_PICOWEB_CARD   1U
+#define UHTTP_PICO_PROGRAM_RECORD 1000U
+#define UHTTP_PICO_STATIC_RECORD  1001U
+#define UHTTP_PICO_API_RECORD     1002U
 /* Must equal IPC_SHM_BASE (core_env.h); verified by _Static_assert in the .c. */
 #define UHTTP_BRIDGE_ADDR    0x04D00000UL
 
@@ -57,6 +62,18 @@ struct uhttp_bridge {
     u8 _padA[UHTTP_LINE - 3U * 4U];
     /* ── Bulk buffers: each line-aligned, length a multiple of 64 bytes. */
     u8 req[UHTTP_REQ_MAX];    /* Zone A data: core0 -> httpd */
+    /* Optional PicoScript web assets, preloaded by core0 from WALFS/picowal
+     * before waking the user process. This keeps the live request path non-
+     * blocking in userland while still serving bytecode/static/API data from
+     * cards. Metadata is core0->userland and sits on its own line. */
+    volatile u32 pico_prog_len;
+    volatile u32 pico_static_len;
+    volatile u32 pico_api_len;
+    volatile u32 pico_flags;
+    u8 _padP[UHTTP_LINE - 4U * 4U];
+    u8 pico_prog[UHTTP_PICO_MAX];
+    u8 pico_static[UHTTP_PICO_MAX];
+    u8 pico_api[UHTTP_PICO_MAX];
     u8 resp[UHTTP_RESP_MAX];  /* Zone B data: httpd -> core0 */
 };
 

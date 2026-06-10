@@ -15,6 +15,8 @@
 #include "types.h"
 #include "proc.h"          /* struct kernel_api */
 #include "uhttp_bridge.h"  /* struct uhttp_bridge, UHTTP_BRIDGE_ADDR */
+#include "picovm.h"
+#include "pico_hooks.h"
 
 /* Minimal freestanding mem primitives (also satisfy implicit compiler calls). */
 void *memcpy(void *d, const void *s, unsigned long n)
@@ -58,50 +60,294 @@ static void u_append_u32(char *dst, u32 *off, u32 cap, u32 v)
     u_append(dst, off, cap, rev);
 }
 
-static u32 build_body(struct kernel_api *api, char *buf, u32 cap, u32 reqs)
+#define PICOWEB_MEM_SIZE        8192U
+#define PICOWEB_MAX_SPANS       64U
+
+struct pico_span {
+    u32 ptr;
+    u32 len;
+};
+
+struct picoweb_host {
+    pv_ctx vm;                 /* first: pv_host callback receives &vm */
+    struct uhttp_bridge *bridge;
+    u32 reqs;
+    u8 mem[PICOWEB_MEM_SIZE];
+    u32 arena_top;
+    struct pico_span spans[PICOWEB_MAX_SPANS];
+    int span_count;
+    int oom;
+};
+
+static const u32 picoweb_default_program[] = {
+    0x000070E1u, /* Context.GetPath(R0) */
+    0x41100001u, /* Math.Add(R1, R1, 1) */
+    0x02017044u, /* Span.Get(R0, R1, R2) */
+    0x43300061u, /* Math.Add(R3, R3, 'a') */
+    0xA231000Fu, /* Flow.Branch(NE, R2, R3, :static) */
+    0x41100001u, /* Math.Add(R1, R1, 1) */
+    0x02017044u, /* Span.Get(R0, R1, R2) */
+    0x47700070u, /* Math.Add(R7, R7, 'p') */
+    0xA271000Bu, /* Flow.Branch(NE, R2, R7, :static) */
+    0x41100001u, /* Math.Add(R1, R1, 1) */
+    0x02017044u, /* Span.Get(R0, R1, R2) */
+    0x48800069u, /* Math.Add(R8, R8, 'i') */
+    0xA2810007u, /* Flow.Branch(NE, R2, R8, :static) */
+    0x44400001u, /* Math.Add(R4, R4, 1) */
+    0x455003EAu, /* Math.Add(R5, R5, 1002) */
+    0x06457066u, /* Storage.ReadCard(R4, R5, R6) */
+    0x00607071u, /* Io.Write(R6) */
+    0x000080C8u, /* Net.Status(200) */
+    0xC0000000u, /* Flow.Return() */
+    0x44400001u, /* :static Math.Add(R4, R4, 1) */
+    0x455003E9u, /* Math.Add(R5, R5, 1001) */
+    0x06457066u, /* Storage.ReadCard(R4, R5, R6) */
+    0x00607071u, /* Io.Write(R6) */
+    0x000080C8u, /* Net.Status(200) */
+    0xC0000000u, /* Flow.Return() */
+};
+
+static int pico_alloc_span(struct picoweb_host *h, const u8 *src, u32 n)
 {
-    u32 off = 0;
-    u32 pid = api->getpid();
-    u32 up_s = (u32)(api->monotonic_ms() / 1000ULL);
+    if (h->span_count >= (int)PICOWEB_MAX_SPANS) { h->oom = 1; return 0; }
+    if (n > PICOWEB_MEM_SIZE - h->arena_top) { h->oom = 1; n = PICOWEB_MEM_SIZE - h->arena_top; }
+    u32 ptr = h->arena_top;
+    for (u32 i = 0; i < n; i++) h->mem[ptr + i] = src[i];
+    h->arena_top += n;
+    int handle = h->span_count++;
+    h->spans[handle].ptr = ptr;
+    h->spans[handle].len = n;
+    return handle;
+}
 
-    u_append(buf, &off, cap,
-        "<!doctype html><html data-theme='dark'><head><meta charset='utf-8'>"
-        "<title>PIOS userland httpd</title><style>"
-        ":root{--bg:#3d3b3a;--surface:#292929;--border:#474747;--text:#dedede;"
-        "--muted:#919191;--accent:#fd8ea1}"
-        "body{margin:0;background:var(--bg);color:var(--text);"
-        "font-family:'Segoe UI',Aptos,Calibri,-apple-system,sans-serif}"
-        ".wrap{max-width:760px;margin:0 auto;padding:32px}"
-        ".card{background:var(--surface);border:1px solid var(--border);"
-        "border-radius:16px;padding:24px;margin:16px 0}"
-        "h1{color:var(--accent);margin:0 0 4px}"
-        ".muted{color:var(--muted)}.pill{display:inline-block;border:1px solid "
-        "var(--border);border-radius:.625rem;padding:2px 10px;"
-        "background:rgba(253,142,161,.14);color:var(--accent)}"
-        "table{width:100%;border-collapse:collapse}td{border-bottom:1px solid "
-        "var(--border);padding:8px;vertical-align:top}td:first-child{"
-        "color:var(--muted);width:46%}</style></head><body><div class='wrap'>");
+static void pico_write_span(struct picoweb_host *h, i32 handle)
+{
+    if (handle <= 0 || handle >= h->span_count) return;
+    struct pico_span s = h->spans[handle];
+    for (u32 i = 0; i < s.len && h->vm.out_len < PV_MAX_OUT; i++)
+        h->vm.out[h->vm.out_len++] = h->mem[s.ptr + i];
+}
 
-    u_append(buf, &off, cap, "<div class='card'><h1>PIOS userland httpd</h1>"
-        "<p class='muted'>Kernel terminates TCP; this userland process owns "
-        "HTTP. It sleeps between requests and is woken by a cross-core software "
-        "interrupt &mdash; no syscall spin.</p><span class='pill'>port 81 "
-        "&middot; userspace &middot; firehose</span></div>");
+static bool pico_text_ok(const u8 *p, u32 n, u8 first)
+{
+    if (!p || n == 0 || p[0] != first)
+        return false;
+    for (u32 i = 0; i < n; i++) {
+        u8 c = p[i];
+        if (c == '\r' || c == '\n' || c == '\t')
+            continue;
+        if (c < 0x20U || c > 0x7EU)
+            return false;
+    }
+    return true;
+}
 
-    u_append(buf, &off, cap, "<div class='card'><table>");
-    u_append(buf, &off, cap, "<tr><td>Handler</td><td>userland process (core 2)"
-        "</td></tr><tr><td>Process PID</td><td>");
-    u_append_u32(buf, &off, cap, pid);
-    u_append(buf, &off, cap, "</td></tr><tr><td>Kernel uptime</td><td>");
-    u_append_u32(buf, &off, cap, up_s);
-    u_append(buf, &off, cap, " s</td></tr><tr><td>Requests served</td><td>");
-    u_append_u32(buf, &off, cap, reqs);
-    u_append(buf, &off, cap, "</td></tr><tr><td>Transport</td><td>shared span "
-        "bridge + SW-int wake</td></tr></table></div>");
+static void req_bounds(struct uhttp_bridge *b, u32 *method_s, u32 *method_n,
+                       u32 *path_s, u32 *path_n, u32 *query_s, u32 *query_n,
+                       u32 *body_s, u32 *body_n)
+{
+    u32 n = b->req_len;
+    if (n > UHTTP_REQ_MAX) n = UHTTP_REQ_MAX;
+    u32 i = 0;
+    while (i < n && b->req[i] != ' ') i++;
+    *method_s = 0; *method_n = i;
+    u32 ps = (i < n) ? i + 1U : n;
+    u32 pe = ps;
+    while (pe < n && b->req[pe] != ' ') pe++;
+    u32 qs = pe, qe = pe;
+    for (u32 j = ps; j < pe; j++) {
+        if (b->req[j] == '?') { qs = j + 1U; qe = pe; pe = j; break; }
+    }
+    *path_s = ps; *path_n = (pe >= ps) ? pe - ps : 0;
+    *query_s = qs; *query_n = (qe >= qs) ? qe - qs : 0;
+    *body_s = n; *body_n = 0;
+    for (u32 j = 3; j < n; j++) {
+        if (b->req[j - 3] == '\r' && b->req[j - 2] == '\n' &&
+            b->req[j - 1] == '\r' && b->req[j] == '\n') {
+            *body_s = j + 1U;
+            *body_n = n - *body_s;
+            break;
+        }
+    }
+}
 
-    u_append(buf, &off, cap, "<p class='muted'>PIOS &middot; bare-metal "
-        "Raspberry Pi 5</p></div></body></html>");
-    return off;
+static int pico_req_span(struct picoweb_host *h, int which)
+{
+    u32 ms, mn, ps, pn, qs, qn, bs, bn;
+    req_bounds(h->bridge, &ms, &mn, &ps, &pn, &qs, &qn, &bs, &bn);
+    if (which == PV_HOOK_CONTEXT_GETVERB) return pico_alloc_span(h, h->bridge->req + ms, mn);
+    if (which == PV_HOOK_CONTEXT_GETPATH) return pico_alloc_span(h, h->bridge->req + ps, pn);
+    if (which == PV_HOOK_CONTEXT_GETQUERYSTRING) return pico_alloc_span(h, h->bridge->req + qs, qn);
+    if (which == PV_HOOK_CONTEXT_GETBODY) return pico_alloc_span(h, h->bridge->req + bs, bn);
+    return pico_alloc_span(h, (const u8 *)"", 0);
+}
+
+static int pico_read_card_span(struct picoweb_host *h, u32 card, u32 record)
+{
+    uhttp_inval(&h->bridge->pico_prog_len, UHTTP_LINE);
+    if (card == UHTTP_PICOWEB_CARD && record == UHTTP_PICO_STATIC_RECORD && h->bridge->pico_static_len > 0) {
+        u32 n = h->bridge->pico_static_len;
+        if (n > UHTTP_PICO_MAX) n = UHTTP_PICO_MAX;
+        uhttp_inval(h->bridge->pico_static, n);
+        if (pico_text_ok(h->bridge->pico_static, n, '<'))
+            return pico_alloc_span(h, h->bridge->pico_static, n);
+    }
+    if (card == UHTTP_PICOWEB_CARD && record == UHTTP_PICO_API_RECORD && h->bridge->pico_api_len > 0) {
+        u32 n = h->bridge->pico_api_len;
+        if (n > UHTTP_PICO_MAX) n = UHTTP_PICO_MAX;
+        uhttp_inval(h->bridge->pico_api, n);
+        if (pico_text_ok(h->bridge->pico_api, n, '{'))
+            return pico_alloc_span(h, h->bridge->pico_api, n);
+    }
+    if (card == UHTTP_PICOWEB_CARD && record == UHTTP_PICO_API_RECORD) {
+        const char *s = "{\"ok\":true,\"handler\":\"picoscript\",\"source\":\"fallback-card\",\"card\":1,\"record\":1002}\n";
+        return pico_alloc_span(h, (const u8 *)s, u_strlen(s));
+    }
+    const char *s =
+        "<!doctype html><html><head><meta charset='utf-8'><title>PIOS PicoScript web</title>"
+        "<style>body{font-family:'Segoe UI',Aptos,Calibri,sans-serif;background:#3d3b3a;color:#dedede;"
+        "margin:0}.wrap{max-width:760px;margin:0 auto;padding:32px}.card{background:#292929;"
+        "border:1px solid #474747;border-radius:16px;padding:24px;margin:16px 0}h1{color:#fd8ea1}"
+        ".muted{color:#919191}</style></head><body><div class='wrap'><div class='card'>"
+        "<h1>PIOS PicoScript webserver</h1><p class='muted'>Port 81 is served by a user process "
+        "running upstream picovm bytecode. Core0 preloads program/static/API records from card 1 "
+        "before waking this process; this fallback appears when record 1:1001 is empty.</p>"
+        "<p>Try <a href='/api'>/api</a> for the JSON card route.</p></div></div></body></html>";
+    return pico_alloc_span(h, (const u8 *)s, u_strlen(s));
+}
+
+static void picoweb_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
+{
+    struct picoweb_host *h = (struct picoweb_host *)ctx;
+    (void)imm16;
+    switch (hook) {
+    case PV_HOOK_CONTEXT_GETVERB:
+    case PV_HOOK_CONTEXT_GETPATH:
+    case PV_HOOK_CONTEXT_GETQUERYSTRING:
+    case PV_HOOK_CONTEXT_GETBODY:
+    case PV_HOOK_CONTEXT_GETHOST:
+    case PV_HOOK_CONTEXT_GETHEADERS:
+    case PV_HOOK_CONTEXT_GETREMOTEADDR:
+        ctx->regs[rd] = pico_req_span(h, hook);
+        return;
+    case PV_HOOK_CONTEXT_GETPORT:
+        ctx->regs[rd] = UHTTP_PORT;
+        return;
+    case PV_HOOK_CONTEXT_GETUSER:
+        ctx->regs[rd] = 0;
+        return;
+    case PV_HOOK_CONTEXT_GETPERMISSIONS:
+        ctx->regs[rd] = 0x1F;
+        return;
+    case PV_HOOK_CONTEXT_GETREQUESTID:
+        ctx->regs[rd] = (i32)h->reqs;
+        return;
+    case PV_HOOK_STORAGE_READCARD:
+        ctx->regs[rd] = pico_read_card_span(h, (u32)ctx->regs[rs1], (u32)ctx->regs[rs2]);
+        return;
+    case PV_HOOK_IO_WRITE:
+        pico_write_span(h, ctx->regs[rs1]);
+        return;
+    case PV_HOOK_IO_WRITEBYTE:
+        if (ctx->out_len < PV_MAX_OUT) ctx->out[ctx->out_len++] = (u8)(ctx->regs[rs1] & 0xFF);
+        return;
+    case PV_HOOK_SPAN_LEN: {
+        i32 hd = ctx->regs[rs1];
+        ctx->regs[rd] = (hd > 0 && hd < h->span_count) ? (i32)h->spans[hd].len : 0;
+        return;
+    }
+    case PV_HOOK_SPAN_GET: {
+        i32 hd = ctx->regs[rs1], idx = ctx->regs[rs2];
+        ctx->regs[rd] = (hd > 0 && hd < h->span_count && idx >= 0 && (u32)idx < h->spans[hd].len)
+                            ? h->mem[h->spans[hd].ptr + (u32)idx] : 0;
+        return;
+    }
+    case PV_HOOK_SPAN_SLICE: {
+        i32 hd = ctx->regs[rs1], off = ctx->regs[rs2];
+        struct pico_span s = (hd > 0 && hd < h->span_count) ? h->spans[hd] : (struct pico_span){0, 0};
+        if (off < 0) off = 0;
+        if ((u32)off > s.len) off = (i32)s.len;
+        if (h->span_count >= (int)PICOWEB_MAX_SPANS) { h->oom = 1; ctx->regs[rd] = 0; return; }
+        int handle = h->span_count++;
+        h->spans[handle].ptr = s.ptr + (u32)off;
+        h->spans[handle].len = s.len - (u32)off;
+        ctx->regs[rd] = handle;
+        return;
+    }
+    default:
+        pv_default_host(ctx, hook, rd, rs1, rs2, imm16);
+        return;
+    }
+}
+
+static void picoweb_init(struct picoweb_host *h, struct uhttp_bridge *b, u32 reqs)
+{
+    pv_init(&h->vm);
+    h->vm.host = picoweb_hook;
+    h->vm.mem = h->mem;
+    h->vm.mem_size = PICOWEB_MEM_SIZE;
+    h->bridge = b;
+    h->reqs = reqs;
+    h->arena_top = 0;
+    h->span_count = 1;
+    h->spans[0].ptr = 0;
+    h->spans[0].len = 0;
+    h->oom = 0;
+}
+
+static bool req_is_api(struct uhttp_bridge *b)
+{
+    u32 ms, mn, ps, pn, qs, qn, bs, bn;
+    req_bounds(b, &ms, &mn, &ps, &pn, &qs, &qn, &bs, &bn);
+    (void)ms; (void)mn; (void)qs; (void)qn; (void)bs; (void)bn;
+    return pn >= 4 && b->req[ps + 0] == '/' && b->req[ps + 1] == 'a' &&
+           b->req[ps + 2] == 'p' && b->req[ps + 3] == 'i';
+}
+
+static u32 load_program(struct uhttp_bridge *b, u32 *words, u32 max_words)
+{
+    uhttp_inval(&b->pico_prog_len, UHTTP_LINE);
+    u32 n = b->pico_prog_len;
+    if (n == 0 || n > UHTTP_PICO_MAX || (n & 3U) != 0)
+        return 0;
+    uhttp_inval(b->pico_prog, n);
+    u32 first = (u32)b->pico_prog[0] |
+                ((u32)b->pico_prog[1] << 8) |
+                ((u32)b->pico_prog[2] << 16) |
+                ((u32)b->pico_prog[3] << 24);
+    if (first != 0x000070E1U)
+        return 0;
+    u32 nw = (u32)n / 4U;
+    if (nw > max_words) nw = max_words;
+    for (u32 i = 0; i < nw; i++)
+        words[i] = (u32)b->pico_prog[i * 4 + 0] |
+                   ((u32)b->pico_prog[i * 4 + 1] << 8) |
+                   ((u32)b->pico_prog[i * 4 + 2] << 16) |
+                   ((u32)b->pico_prog[i * 4 + 3] << 24);
+    return nw;
+}
+
+static u32 build_body(struct uhttp_bridge *b, char *buf, u32 cap, u32 reqs, u32 *status_out)
+{
+    struct picoweb_host h;
+    u32 program_words[UHTTP_PICO_MAX / 4U];
+    const u32 *program = picoweb_default_program;
+    u32 nwords = (u32)(sizeof(picoweb_default_program) / sizeof(picoweb_default_program[0]));
+    u32 loaded = load_program(b, program_words, UHTTP_PICO_MAX / 4U);
+    if (loaded > 0) {
+        program = program_words;
+        nwords = loaded;
+    }
+
+    picoweb_init(&h, b, reqs);
+    (void)pv_vm_run(&h.vm, program, (int)nwords);
+    u32 st = (h.vm.http_status >= 100 && h.vm.http_status <= 599) ? (u32)h.vm.http_status : 200U;
+    if (status_out) *status_out = st;
+    u32 n = (u32)h.vm.out_len;
+    if (n >= cap) n = cap - 1U;
+    for (u32 i = 0; i < n; i++) buf[i] = (char)h.vm.out[i];
+    buf[n] = 0;
+    return n;
 }
 
 void user_main(struct kernel_api *api)
@@ -143,14 +389,19 @@ void user_main(struct kernel_api *api)
         uhttp_clean(&b->magic, UHTTP_LINE);
         u32 reqs = b->reqs_total + 1U;
         char body[3072];
-        u32 blen = build_body(api, body, sizeof(body), reqs);
+        u32 status = 200U;
+        bool is_api = req_is_api(b);
+        u32 blen = build_body(b, body, sizeof(body), reqs, &status);
 
         b->dbg_phase = 21U;                     /* body built: writing response */
         uhttp_clean(&b->magic, UHTTP_LINE);
         char *r = (char *)b->resp;
         u32 off = 0;
-        u_append(r, &off, UHTTP_RESP_MAX,
-            "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: ");
+        u_append(r, &off, UHTTP_RESP_MAX, "HTTP/1.0 ");
+        u_append_u32(r, &off, UHTTP_RESP_MAX, status);
+        u_append(r, &off, UHTTP_RESP_MAX, " OK\r\nContent-Type: ");
+        u_append(r, &off, UHTTP_RESP_MAX, is_api ? "application/json" : "text/html");
+        u_append(r, &off, UHTTP_RESP_MAX, "\r\nX-PIOS-Handler: PicoScript\r\nContent-Length: ");
         u_append_u32(r, &off, UHTTP_RESP_MAX, blen);
         u_append(r, &off, UHTTP_RESP_MAX, "\r\nConnection: close\r\n\r\n");
         for (u32 i = 0; i < blen && off < UHTTP_RESP_MAX - 1U; i++)

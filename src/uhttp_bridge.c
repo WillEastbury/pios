@@ -16,6 +16,7 @@
 #include "timer.h"
 #include "proc.h"
 #include "types.h"
+#include "picowal_db.h"
 
 _Static_assert(UHTTP_BRIDGE_ADDR == IPC_SHM_BASE,
                "uhttp bridge must live at IPC_SHM_BASE");
@@ -25,6 +26,11 @@ _Static_assert(__builtin_offsetof(struct uhttp_bridge, magic) == 0, "zoneB line"
 _Static_assert(__builtin_offsetof(struct uhttp_bridge, req_seq) == 64, "zoneA line");
 _Static_assert(__builtin_offsetof(struct uhttp_bridge, req) == 128, "req aligned");
 _Static_assert((UHTTP_REQ_MAX % 64U) == 0U, "req multiple of line");
+_Static_assert((__builtin_offsetof(struct uhttp_bridge, pico_prog_len) % 64U) == 0U, "pico metadata aligned");
+_Static_assert((__builtin_offsetof(struct uhttp_bridge, pico_prog) % 64U) == 0U, "pico prog aligned");
+_Static_assert((__builtin_offsetof(struct uhttp_bridge, pico_static) % 64U) == 0U, "pico static aligned");
+_Static_assert((__builtin_offsetof(struct uhttp_bridge, pico_api) % 64U) == 0U, "pico api aligned");
+_Static_assert((__builtin_offsetof(struct uhttp_bridge, resp) % 64U) == 0U, "resp aligned");
 _Static_assert((UHTTP_RESP_MAX % 64U) == 0U, "resp multiple of line");
 
 enum { U_IDLE = 0, U_READING, U_DISPATCHED, U_SENDING };
@@ -47,6 +53,10 @@ void uhttp_bridge_init(void)
     b->req_len = 0;
     b->resp_len = 0;
     b->reqs_total = 0;
+    b->pico_prog_len = 0;
+    b->pico_static_len = 0;
+    b->pico_api_len = 0;
+    b->pico_flags = 0;
     /* Push the zeroed control lines to PoC so no dirty core-0 copy can later be
      * evicted over the userland httpd's magic/pid/resp writes. */
     uhttp_clean(&b->magic, 128);
@@ -54,6 +64,49 @@ void uhttp_bridge_init(void)
     listen_conn = tcp_listen((u16)UHTTP_PORT);
     cur_conn = -1;
     cur_state = U_IDLE;
+}
+
+static u32 uhttp_load_card(u32 record, u8 *dst)
+{
+    i32 n = picowal_db_get((u16)UHTTP_PICOWEB_CARD, record, dst, UHTTP_PICO_MAX);
+    return n > 0 ? (u32)n : 0;
+}
+
+static bool uhttp_card_text_ok(const u8 *p, u32 n, u8 first)
+{
+    if (!p || n == 0 || p[0] != first)
+        return false;
+    for (u32 i = 0; i < n; i++) {
+        u8 c = p[i];
+        if (c == '\r' || c == '\n' || c == '\t')
+            continue;
+        if (c < 0x20U || c > 0x7EU)
+            return false;
+    }
+    return true;
+}
+
+static void uhttp_preload_picoweb(struct uhttp_bridge *b)
+{
+    b->pico_prog_len = uhttp_load_card(UHTTP_PICO_PROGRAM_RECORD, b->pico_prog);
+    b->pico_static_len = uhttp_load_card(UHTTP_PICO_STATIC_RECORD, b->pico_static);
+    b->pico_api_len = uhttp_load_card(UHTTP_PICO_API_RECORD, b->pico_api);
+    if ((b->pico_prog_len & 3U) != 0)
+        b->pico_prog_len = 0;
+    if (!uhttp_card_text_ok(b->pico_static, b->pico_static_len, '<'))
+        b->pico_static_len = 0;
+    if (!uhttp_card_text_ok(b->pico_api, b->pico_api_len, '{'))
+        b->pico_api_len = 0;
+    b->pico_flags = ((b->pico_prog_len ? 1U : 0U) |
+                     (b->pico_static_len ? 2U : 0U) |
+                     (b->pico_api_len ? 4U : 0U));
+    if (b->pico_prog_len)
+        uhttp_clean(b->pico_prog, b->pico_prog_len);
+    if (b->pico_static_len)
+        uhttp_clean(b->pico_static, b->pico_static_len);
+    if (b->pico_api_len)
+        uhttp_clean(b->pico_api, b->pico_api_len);
+    uhttp_clean(&b->pico_prog_len, UHTTP_LINE);
 }
 
 bool uhttp_bridge_ready(void)
@@ -143,6 +196,7 @@ void uhttp_bridge_poll(void)
              * reads them coherently. */
             if (b->req_len)
                 uhttp_clean(b->req, b->req_len);
+            uhttp_preload_picoweb(b);
             b->req_seq = b->req_seq + 1U;
             dispatch_seq = b->req_seq;
             uhttp_clean(&b->req_seq, UHTTP_LINE);

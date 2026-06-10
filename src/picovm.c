@@ -6,6 +6,13 @@
 #include "picovm.h"
 #include "pico_hooks.h"
 
+#if defined(__ARM_FEATURE_DOTPROD) && defined(__aarch64__)
+#include <arm_neon.h>        /* AArch64 NEON SDOT (Armv8.2 dotprod) */
+#endif
+#if defined(__ARM_FEATURE_SIMD32) && !defined(__aarch64__)
+#include <arm_acle.h>        /* Cortex-M33 __smlad (DSP / SIMD32 extension) */
+#endif
+
 #define MASK32 0xFFFFFFFFu
 
 /* Freestanding-friendly zero-fill (no <string.h> dependency for bare metal). */
@@ -83,11 +90,41 @@ int64_t pv_dsp(pv_ctx *ctx, int subop, int64_t a, int64_t b)
 
 int pv_cond(pv_ctx *ctx, int mode) { (void)ctx; (void)mode; return 0; }
 
+/* ---- Dot8: HW-accelerated signed int8 span dot product --------------- */
+
+void pv_dot8_setlen(pv_ctx *ctx, int n) { ctx->dot_len = n; }
+
+int32_t pv_dot8(pv_ctx *ctx, uint32_t wptr, uint32_t aptr)
+{
+    int n = ctx->dot_len;
+    int32_t s = 0;
+    int i = 0;
+    if (!ctx->mem || ctx->mem_size <= 0) return 0;
+    {
+        const int8_t *w = (const int8_t *)(ctx->mem + (wptr % (uint32_t)ctx->mem_size));
+        const int8_t *a = (const int8_t *)(ctx->mem + (aptr % (uint32_t)ctx->mem_size));
+#if defined(__ARM_FEATURE_DOTPROD) && defined(__aarch64__)
+        int32x4_t acc = vdupq_n_s32(0);
+        for (; i + 16 <= n; i += 16)
+            acc = vdotq_s32(acc, vld1q_s8(w + i), vld1q_s8(a + i));  /* 16 int8 MACs */
+        s = vaddvq_s32(acc);
+#elif defined(__ARM_FEATURE_SIMD32) && !defined(__aarch64__)
+        for (; i + 2 <= n; i += 2) {
+            uint32_t wp = (uint32_t)(uint16_t)(int16_t)w[i] | ((uint32_t)(uint16_t)(int16_t)w[i + 1] << 16);
+            uint32_t ap = (uint32_t)(uint16_t)(int16_t)a[i] | ((uint32_t)(uint16_t)(int16_t)a[i + 1] << 16);
+            s = (int32_t)__smlad(wp, ap, (uint32_t)s);   /* dual 16x16 MAC */
+        }
+#endif
+        for (; i < n; i++) s += (int32_t)w[i] * (int32_t)a[i];
+    }
+    return s;
+}
+
 /* ---- default host: Random.U32 + Queue.* (mirrors HostApi) ------------- */
 
 void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
 {
-    (void)rs2; (void)imm16;
+    (void)imm16;
     if (hook == PV_HOOK_RANDOM_U32) {
         uint64_t x = ctx->rng_state;
         x ^= (x << 13) & MASK32;
@@ -115,6 +152,54 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
     }
     if (hook == PV_HOOK_QUEUE_DEPTH) {
         ctx->regs[rd] = ctx->qdepth[rs1 & 7];
+        return;
+    }
+    if (hook == PV_HOOK_BITS_AND) {
+        ctx->regs[rd] = (int32_t)((uint32_t)ctx->regs[rs1] & (uint32_t)ctx->regs[rs2]);
+        return;
+    }
+    if (hook == PV_HOOK_BITS_OR) {
+        ctx->regs[rd] = (int32_t)((uint32_t)ctx->regs[rs1] | (uint32_t)ctx->regs[rs2]);
+        return;
+    }
+    if (hook == PV_HOOK_BITS_XOR) {
+        ctx->regs[rd] = (int32_t)((uint32_t)ctx->regs[rs1] ^ (uint32_t)ctx->regs[rs2]);
+        return;
+    }
+    if (hook == PV_HOOK_BITS_SHL) {
+        ctx->regs[rd] = (int32_t)(((uint32_t)ctx->regs[rs1] << ((uint32_t)ctx->regs[rs2] & 31)) & MASK32);
+        return;
+    }
+    if (hook == PV_HOOK_BITS_SHR) {
+        ctx->regs[rd] = (int32_t)((uint32_t)ctx->regs[rs1] >> ((uint32_t)ctx->regs[rs2] & 31));
+        return;
+    }
+    if (hook == PV_HOOK_BITS_SAR) {
+        ctx->regs[rd] = (int32_t)((int32_t)ctx->regs[rs1] >> ((uint32_t)ctx->regs[rs2] & 31));
+        return;
+    }
+    if (hook == PV_HOOK_BITS_NOT) {
+        ctx->regs[rd] = (int32_t)(~(uint32_t)ctx->regs[rs1]);
+        return;
+    }
+    if (hook == PV_HOOK_DOT8_LEN) {
+        ctx->dot_len = ctx->regs[rs1];
+        return;
+    }
+    if (hook == PV_HOOK_DOT8_OF) {
+        ctx->regs[rd] = pv_dot8(ctx, (uint32_t)ctx->regs[rs1], (uint32_t)ctx->regs[rs2]);
+        return;
+    }
+    if (hook == PV_HOOK_MEMORY_GET) {
+        ctx->regs[rd] = pv_mem_get(ctx, (uint32_t)ctx->regs[rs1]);
+        return;
+    }
+    if (hook == PV_HOOK_MEMORY_SET) {
+        pv_mem_set(ctx, (uint32_t)ctx->regs[rs1], ctx->regs[rs2]);
+        return;
+    }
+    if (hook == PV_HOOK_IO_WRITEBYTE) {
+        pv_io_write(ctx, ctx->regs[rs1]);
         return;
     }
     /* unknown host-fillable primitive: ignore (host supplies on real target) */

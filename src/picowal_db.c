@@ -313,10 +313,9 @@ i32 picowal_db_put(u16 card, u32 record, const void *data, u32 len)
     if (!ensure_dir(card_dir)) return -1;
 
     u64 rid = 0;
-    if (fs_find(path, &rid)) {
-        if (!fs_delete_path(path)) return -1;
+    if (!fs_find(path, &rid)) {
+        if (!fs_create(path, &rid) || rid == 0) return -1;
     }
-    if (!fs_create(path, &rid) || rid == 0) return -1;
     return fs_write(rid, data, len);
 }
 
