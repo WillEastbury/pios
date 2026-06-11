@@ -13166,6 +13166,31 @@ static volatile u64 g_dash_snap_ticks;
 static volatile u64 g_dash_render_ticks;
 static inline u64 dash_now_ticks(void) { u64 c; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(c)); return c; }
 
+static void dash_blank_line(u32 col, u32 row, u32 width)
+{
+    if (width == 0)
+        return;
+    fb_set_cursor(col, row);
+    for (u32 i = 0; i < width; i++)
+        fb_putc(' ');
+}
+
+static void dash_clear_body(u32 col, u32 row, u32 width, u32 height)
+{
+    if (width < 3 || height < 3)
+        return;
+    for (u32 r = row + 1; r + 1 < row + height; r++)
+        dash_blank_line(col + 1, r, width - 2);
+}
+
+static void dash_draw_window(u32 col, u32 row, u32 width, u32 height,
+                             const char *title, u32 color)
+{
+    fb_set_color(color, 0x00000000);
+    fb_set_cursor(col, row);
+    fb_box(width, height, title);
+}
+
 static void hdmi_dashboard_render(void)
 {
     static u64 last_ms;
@@ -13228,36 +13253,48 @@ static void hdmi_dashboard_render(void)
         else if (proc[i].state == PROC_DEAD) dead++;
     }
 
-    u32 log_top = fb_rows() > 10 ? fb_rows() - 9 : 28;
+    u32 screen_cols = fb_cols();
+    u32 screen_rows = fb_rows();
+    bool wide = screen_cols >= 180U;
+    u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 4U;
+    u32 sys_col = 0, sys_row = 5, sys_w = wide ? 58U : 78U, sys_h = wide ? 8U : 5U;
+    u32 ports_col = wide ? (sys_col + sys_w + 2U) : 0U;
+    u32 ports_row = wide ? 5U : 11U;
+    u32 ports_w = wide ? 58U : 78U;
+    u32 ports_h = wide ? 8U : 7U;
+    u32 proc_col = wide ? (ports_col + ports_w + 2U) : 0U;
+    u32 proc_row = wide ? 5U : 19U;
+    u32 proc_w = wide ? ((screen_cols > proc_col + 2U) ? (screen_cols - proc_col - 1U) : 44U) : 78U;
+    u32 proc_h = wide ? 8U : 7U;
+    u32 log_col = 0;
+    u32 log_top = wide ? 14U : (screen_rows > 10U ? screen_rows - 9U : 28U);
+    u32 log_w = header_w;
+    u32 log_h = 8U;
+    if (log_top + log_h >= screen_rows && screen_rows > log_h + 1U)
+        log_top = screen_rows - log_h - 1U;
+
     u64 t_dash1 = dash_now_ticks();
     g_dash_snap_ticks = t_dash1 - t_dash0;
     if (!layout_drawn) {
         fb_clear(0x00000000);
-        fb_set_color(0x0000FF80, 0x00000000);
-        fb_set_cursor(0, 0);
-        fb_box(78, 4, "PIOS>");
-        fb_set_color(0x0000CCFF, 0x00000000);
-        fb_set_cursor(0, 5);
-        fb_box(78, 5, "SYSTEM");
-        fb_set_color(0x00FFAA00, 0x00000000);
-        fb_set_cursor(0, 11);
-        fb_box(78, 7, "LISTENING PORTS");
-        fb_set_color(0x0080FF80, 0x00000000);
-        fb_set_cursor(0, 19);
-        fb_box(78, 7, "PROCESSES");
-        fb_set_color(0x00FF4040, 0x00000000);
-        fb_set_cursor(0, log_top);
-        fb_box(78, 8, "WARNINGS / ERRORS");
+        dash_draw_window(header_col, header_row, header_w, header_h, "PIOS WORKBENCH", 0x0000FF80);
+        dash_draw_window(sys_col, sys_row, sys_w, sys_h, "SYSTEM", 0x0000CCFF);
+        dash_draw_window(ports_col, ports_row, ports_w, ports_h, "LISTENING PORTS", 0x00FFAA00);
+        dash_draw_window(proc_col, proc_row, proc_w, proc_h, "PROCESSES", 0x0080FF80);
+        dash_draw_window(log_col, log_top, log_w, log_h, "WARNINGS / ERRORS", 0x00FF4040);
         layout_drawn = true;
     }
 
-    fb_clear_row(1);
-    fb_clear_row(2);
-    fb_set_cursor(3, 1);
+    dash_clear_body(header_col, header_row, header_w, header_h);
+    fb_set_cursor(header_col + 3, header_row + 1);
     fb_set_color(0x00FF80FF, 0x00000000);
     fb_puts(PIOS_BUILD_LABEL);
-    fb_set_cursor(3, 2);
+    fb_set_cursor(header_col + 3, header_row + 2);
     fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_set_color(0x0000FF80, 0x00003310);
+    fb_puts(" ONLINE ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts("  ");
     fb_puts("uptime=");
     fb_printf("%u", (u32)(now_ms / 1000ULL));
     fb_puts("s hb=");
@@ -13265,10 +13302,8 @@ static void hdmi_dashboard_render(void)
     fb_puts(" ip=");
     dash_ip(net_get_our_ip());
 
-    fb_clear_row(6);
-    fb_clear_row(7);
-    fb_clear_row(8);
-    fb_set_cursor(3, 6);
+    dash_clear_body(sys_col, sys_row, sys_w, sys_h);
+    fb_set_cursor(sys_col + 3, sys_row + 1);
     fb_set_color(0x00FFFFFF, 0x00000000);
     fb_printf("CPU avg=%u.%u%% c0=%u.%u%% c1=%u.%u%% c2=%u.%u%% c3=%u.%u%% fl=0x%x ",
               cpu_avg / 10U, cpu_avg % 10U,
@@ -13278,20 +13313,20 @@ static void hdmi_dashboard_render(void)
               cbusy[3] / 10U, cbusy[3] % 10U,
               sched_flags);
     dash_core0_flags(sched_flags);
-    fb_set_cursor(3, 7);
+    fb_set_cursor(sys_col + 3, sys_row + 2);
     fb_printf("Kernel mem=%uK static=%uK core_alloc=%uK cap=%uK",
               kernel_mem_kib, kernel_static_kib, kernel_core_kib, kernel_cap_kib);
-    fb_set_cursor(3, 8);
+    fb_set_cursor(sys_col + 3, sys_row + 3);
     fb_printf("RAM %uK/%uK  c0=%uK c1=%uK c2=%uK c3=%uK",
               (u32)(used / 1024ULL), (u32)(total / 1024ULL),
               core_mem_kib[0], core_mem_kib[1], core_mem_kib[2], core_mem_kib[3]);
 
-    for (u32 r = 12; r < 17; r++) fb_clear_row(r);
-    u32 row = 12;
-    for (u32 i = 0; i < tcp_n && row < 17; i++) {
+    dash_clear_body(ports_col, ports_row, ports_w, ports_h);
+    u32 row = ports_row + 1U;
+    for (u32 i = 0; i < tcp_n && row + 1U < ports_row + ports_h; i++) {
         if (tcp[i].state != TCP_LISTEN)
             continue;
-        fb_set_cursor(3, row++);
+        fb_set_cursor(ports_col + 3U, row++);
         fb_puts("tcp/");
         fb_printf("%u", tcp[i].local_port);
         fb_puts("  ");
@@ -13299,14 +13334,19 @@ static void hdmi_dashboard_render(void)
         fb_puts("  pending=");
         fb_printf("%u", tcp[i].pending_count);
     }
+    if (row == ports_row + 1U) {
+        fb_set_cursor(ports_col + 3U, row);
+        fb_set_color(0x00AAAAAA, 0x00000000);
+        fb_puts("No listening sockets yet.");
+    }
 
-    for (u32 r = 20; r < 25; r++) fb_clear_row(r);
-    fb_set_cursor(3, 20);
+    dash_clear_body(proc_col, proc_row, proc_w, proc_h);
+    fb_set_cursor(proc_col + 3U, proc_row + 1U);
     fb_set_color(0x00FFFFFF, 0x00000000);
     fb_printf("total=%u ready=%u running=%u blocked=%u dead=%u", proc_n, ready, running, blocked, dead);
-    row = 21;
-    for (u32 i = 0; i < proc_n && row < 25; i++) {
-        fb_set_cursor(3, row++);
+    row = proc_row + 2U;
+    for (u32 i = 0; i < proc_n && row + 1U < proc_row + proc_h; i++) {
+        fb_set_cursor(proc_col + 3U, row++);
         if (proc[i].parent_pid == PROC_UI_KERNEL_PARENT_PID) {
             fb_printf("pid=0x%x ppid=-1 core=%u cpu=%u%% mem=%uK arena=%u/%uK %s %s",
                       proc[i].pid, proc[i].affinity_core,
@@ -13322,11 +13362,11 @@ static void hdmi_dashboard_render(void)
         }
     }
 
-    for (u32 r = log_top + 1; r < log_top + 7; r++) fb_clear_row(r);
+    dash_clear_body(log_col, log_top, log_w, log_h);
     row = log_top + 1;
     u32 shown = 0;
     u32 max_back = http_log_seq < HTTP_LOG_RING_SIZE ? http_log_seq : HTTP_LOG_RING_SIZE;
-    for (u32 back = 0; back < max_back && shown < 6; back++) {
+    for (u32 back = 0; back < max_back && shown + 2U < log_h; back++) {
         u32 seq = http_log_seq - 1U - back;
         struct http_log_entry *e = &http_log_ring[seq % HTTP_LOG_RING_SIZE];
         if (e->seq != seq || !e->event)
@@ -13335,12 +13375,12 @@ static void hdmi_dashboard_render(void)
             !dash_contains(e->event, "fail") &&
             !dash_contains(e->event, "warn"))
             continue;
-        fb_set_cursor(3, row++);
+        fb_set_cursor(log_col + 3U, row++);
         fb_printf("%u t=%u %s a=%u b=%u", e->seq, e->tick_ms, e->event, e->a, e->b);
         shown++;
     }
     if (shown == 0) {
-        fb_set_cursor(3, row);
+        fb_set_cursor(log_col + 3U, row);
         fb_set_color(0x0000FF80, 0x00000000);
         fb_puts("No warnings or errors in the hot log ring.");
     }
