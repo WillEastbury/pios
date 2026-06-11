@@ -17,7 +17,7 @@
 #define WALFS_VERSION       1
 #define WALFS_BLOCK_SIZE    512
 #define WALFS_NAME_MAX      127
-#define WALFS_DATA_MAX      4096
+#define WALFS_DATA_MAX      16384
 
 /*
  * Partition-2 reserved layout. WALFS starts after this 10 MiB region; all
@@ -148,7 +148,7 @@ struct walfs_super {
     u32 record_count;
     u32 crc32;
     u8  label[32];
-    u8  _reserved[448];
+    u8  _reserved[440];
 } PACKED;
 
 struct wal_record {

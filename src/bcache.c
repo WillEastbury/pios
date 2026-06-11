@@ -1,7 +1,7 @@
 /*
  * bcache.c — Write-back block cache with LRU-2 eviction and sequential prefetch
  *
- * 256 cache entries, each holding one 512-byte SD block.
+ * 64 cache entries, each holding one 512-byte SD block.
  * Designed for single-core use on Core 1 (disk I/O path).
  */
 
@@ -11,7 +11,7 @@
 #include "timer.h"
 #include "uart.h"
 
-#define BCACHE_ENTRIES  256
+#define BCACHE_ENTRIES  64
 #define PREFETCH_WINDOW 4
 
 /* Entry flags */
@@ -31,14 +31,14 @@ typedef struct {
 static bcache_entry_t cache[BCACHE_ENTRIES] ALIGNED(64);
 static bcache_stats_t stats;
 
-/* Hash index: LBA → cache entry index for O(1) lookup.
- * 128 buckets, open addressing with linear probe. */
-#define HASH_BUCKETS 128
+/* Hash index: LBA -> cache entry index for O(1) lookup. */
+#define HASH_BITS    7
+#define HASH_BUCKETS (1U << HASH_BITS)
 #define HASH_EMPTY     (-1)  /* slot never used — stop search */
 #define HASH_TOMBSTONE (-2)  /* deleted — continue search */
 static i32 hash_index[HASH_BUCKETS];
 
-static inline u32 lba_hash(u32 lba) { return (lba * 2654435761U) >> 25; } /* Knuth mult hash → 7 bits */
+static inline u32 lba_hash(u32 lba) { return (lba * 2654435761U) >> (32U - HASH_BITS); }
 
 static void hash_insert(u32 lba, u32 idx) {
     u32 bucket = lba_hash(lba);
@@ -222,8 +222,10 @@ static void try_prefetch(u32 lba)
                 if ((e->flags & FLAG_PREFETCH) && !(e->flags & FLAG_DIRTY) &&
                     !(e->flags & FLAG_PINNED)) {
                     slot = e;
-                    if (slot->flags & FLAG_VALID)
+                    if (slot->flags & FLAG_VALID) {
+                        hash_remove(slot->lba);
                         stats.valid_count--;
+                    }
                     break;
                 }
             }
@@ -236,6 +238,7 @@ static void try_prefetch(u32 lba)
             slot->flags = FLAG_VALID | FLAG_PREFETCH;
             slot->last_access = timer_ticks();
             slot->access_count = 0;
+            hash_insert(pf_lba, (u32)(slot - cache));
             stats.prefetches++;
             stats.valid_count++;
         }

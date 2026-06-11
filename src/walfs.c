@@ -21,6 +21,8 @@
 #include "principal.h"
 #include "fb.h"
 
+typedef char walfs_super_must_be_one_block[(sizeof(struct walfs_super) == SD_BLOCK_SIZE) ? 1 : -1];
+
 #define WAL_START  SD_BLOCK_SIZE
 #define WAL_REC_MIN  sizeof(struct wal_record)
 #define WAL_REC_MAX  (WALFS_DATA_MAX + 256)
@@ -268,11 +270,12 @@ static inline bool is_uncommitted(u64 seq) {
 static u8 ALIGNED(64) iobuf[SD_BLOCK_SIZE];
 static u8 ALIGNED(64) rec_buf[sizeof(struct wal_record) +
                                sizeof(struct walfs_data) + WALFS_DATA_MAX];
+static u8 ALIGNED(64) super_iobuf[SD_BLOCK_SIZE];
 static u32 cached_lba = 0xFFFFFFFF;
 
 /*
  * Inode cache: inode_id → latest WAL byte offset of its RECORD_INODE.
- * Avoids full WAL scan on walfs_stat() and is_deleted().
+ * Avoids full WAL scan on walfs_stat().
  * Populated during scan_recovery() at mount and on every write.
  */
 static struct lru_cache inode_cache;
@@ -287,7 +290,7 @@ static struct lru_cache path_cache;
  * Append-ordered RECORD_DATA index for faster reads.
  * Falls back to linear scan if index capacity is exceeded.
  */
-#define WAL_DATA_INDEX_MAX 2048
+#define WAL_DATA_INDEX_MAX 8192
 struct wal_data_index_entry {
     u64 inode_id;
     u64 data_off;
@@ -443,6 +446,20 @@ static bool wal_write(u64 off, const void *buf, u32 len)
 
 /* ---- superblock I/O ---- */
 
+static bool super_crc_ok(const struct walfs_super *sb)
+{
+    if (!sb || sb->magic != WALFS_MAGIC || sb->version != WALFS_VERSION)
+        return false;
+    simd_zero(super_iobuf, sizeof(super_iobuf));
+    u32 n = (u32)sizeof(*sb);
+    if (n > SD_BLOCK_SIZE) n = SD_BLOCK_SIZE;
+    simd_memcpy(super_iobuf, sb, n);
+    struct walfs_super *disk = (struct walfs_super *)super_iobuf;
+    u32 saved = disk->crc32;
+    disk->crc32 = 0;
+    return hw_crc32c(super_iobuf, SD_BLOCK_SIZE) == saved;
+}
+
 static void write_super(void)
 {
     /* CRITICAL: flush WAL data blocks to SD BEFORE updating superblock.
@@ -451,13 +468,19 @@ static void write_super(void)
      * WAL data write causes unrecoverable data loss. */
     bcache_flush();
 
-    super.crc32 = 0;
-    super.crc32 = hw_crc32c(&super, SD_BLOCK_SIZE);
+    simd_zero(super_iobuf, sizeof(super_iobuf));
+    u32 n = (u32)sizeof(super);
+    if (n > SD_BLOCK_SIZE) n = SD_BLOCK_SIZE;
+    simd_memcpy(super_iobuf, &super, n);
+    struct walfs_super *disk = (struct walfs_super *)super_iobuf;
+    disk->crc32 = 0;
+    disk->crc32 = hw_crc32c(super_iobuf, SD_BLOCK_SIZE);
+    super.crc32 = disk->crc32;
     cached_lba = 0xFFFFFFFF;
 
     /* Write superblock directly to SD, bypassing cache, to ensure
      * it hits disk AFTER all WAL data blocks are persisted. */
-    sd_write_block((u32)abs_lba64(0), (const u8 *)&super);
+    sd_write_block((u32)abs_lba64(0), super_iobuf);
     bcache_invalidate((u32)abs_lba64(0)); /* keep cache consistent */
 }
 
@@ -505,55 +528,7 @@ static u64 wal_append(u32 type, const void *meta, u32 meta_len,
     return pos;
 }
 
-/* ---- scan helpers ---- */
-
-static bool is_deleted(u64 inode_id)
-{
-    /* Fast path: check inode_cache for last known record position */
-    u64 cached_pos;
-    if (icache_get(inode_id, &cached_pos)) {
-        struct wal_record hdr;
-        if (wal_read(cached_pos, &hdr, sizeof(hdr)) && wal_rec_valid(&hdr) &&
-            !is_uncommitted(hdr.seq)) {
-            if (hdr.type == RECORD_DELETE) return true;
-            if (hdr.type == RECORD_INODE) {
-                struct walfs_inode ino;
-                if (wal_read(cached_pos + sizeof(hdr), &ino, sizeof(ino)))
-                    if (ino.inode_id == inode_id)
-                        return (ino.flags & WALFS_DELETED) != 0;
-            }
-        }
-    }
-
-    /* Slow path: full scan, updating cache as we go */
-    bool del = false;
-    u64 pos = WAL_START;
-    u64 last_pos = 0;
-    struct wal_record hdr;
-
-    while (pos < super.wal_head) {
-        if (!wal_read(pos, &hdr, sizeof(hdr))) break;
-        if (!wal_rec_valid(&hdr)) break;
-        if (is_uncommitted(hdr.seq)) { pos += hdr.length; continue; }
-        if (hdr.type == RECORD_DELETE) {
-            struct walfs_delete d;
-            if (wal_read(pos + sizeof(hdr), &d, sizeof(d)))
-                if (d.inode_id == inode_id) { del = true; last_pos = pos; }
-        } else if (hdr.type == RECORD_INODE) {
-            struct walfs_inode ino;
-            if (wal_read(pos + sizeof(hdr), &ino, sizeof(ino)))
-                if (ino.inode_id == inode_id) {
-                    del = (ino.flags & WALFS_DELETED) != 0;
-                    last_pos = pos;
-                }
-        }
-        pos += hdr.length;
-    }
-    if (last_pos) icache_put(inode_id, last_pos);
-    return del;
-}
-
-static void scan_recovery(void)
+static bool scan_recovery(void)
 {
     dindex_reset();
     next_inode = WALFS_ROOT_INODE + 1;
@@ -621,7 +596,8 @@ static void scan_recovery(void)
     }
 
     /* Repair wal_head if it's inconsistent with actual data */
-    if (last_valid_pos != super.wal_head) {
+    bool head_changed = last_valid_pos != super.wal_head;
+    if (head_changed) {
         uart_puts("[wal] fix head: ");
         uart_hex((u32)(super.wal_head >> 32));
         uart_hex((u32)super.wal_head);
@@ -631,6 +607,7 @@ static void scan_recovery(void)
         uart_puts("\n");
         super.wal_head = last_valid_pos;
     }
+    return head_changed;
 }
 
 /* ---- init / format ---- */
@@ -703,27 +680,34 @@ bool walfs_init(void)
     /* Discover partition 2 from MBR before any WALFS I/O */
     if (!discover_partition()) return false;
 
-    if (!bcache_read((u32)abs_lba64(0), (u8 *)&super)) return false;
+    if (!bcache_read((u32)abs_lba64(0), super_iobuf)) return false;
+    simd_zero(&super, sizeof(super));
+    u32 super_n = (u32)sizeof(super);
+    if (super_n > SD_BLOCK_SIZE) super_n = SD_BLOCK_SIZE;
+    simd_memcpy(&super, super_iobuf, super_n);
 
     if (super.magic == WALFS_MAGIC && super.version == WALFS_VERSION) {
-        u32 saved = super.crc32;
-        super.crc32 = 0;
-        u32 crc = hw_crc32c(&super, SD_BLOCK_SIZE);
-        super.crc32 = saved;
-        if (crc != saved) {
-            uart_puts("[wal] bad super crc\n");
-            return false;
-        }
+        bool crc_ok = super_crc_ok(&super);
+        if (!crc_ok)
+            uart_puts("[wal] bad super crc; attempting WAL-chain recovery\n");
+
         /* Validate wal_head is within sane bounds */
-        if (super.total_blocks == 0 || super.total_blocks > walfs_region_blocks)
+        bool repaired_meta = false;
+        if (super.total_blocks == 0 || super.total_blocks > walfs_region_blocks) {
             super.total_blocks = walfs_region_blocks;
+            repaired_meta = true;
+        }
         if (super.wal_head < WAL_START ||
             super.wal_head > walfs_capacity_bytes()) {
             uart_puts("[wal] head OOB\n");
             return false;
         }
         mounted = true;
-        scan_recovery();
+        bool repaired_head = scan_recovery();
+        if (!crc_ok || repaired_head || repaired_meta || !super_crc_ok(&super)) {
+            write_super();
+            uart_puts("[wal] repaired super\n");
+        }
         struct walfs_inode root;
         if (!walfs_stat(WALFS_ROOT_INODE, &root)) {
             if (!repair_root_inode()) {
@@ -764,10 +748,11 @@ void walfs_status(struct walfs_status_snapshot *out)
     out->super_head = super.wal_head;
     out->super_tree_root = super.tree_root;
     if (super.magic == WALFS_MAGIC && super.version == WALFS_VERSION) {
-        struct walfs_super sb = super;
-        u32 saved = sb.crc32;
-        sb.crc32 = 0;
-        out->super_ok = hw_crc32c(&sb, SD_BLOCK_SIZE) == saved;
+        out->super_ok = super_crc_ok(&super);
+        if (!out->super_ok && mounted) {
+            write_super();
+            out->super_ok = super_crc_ok(&super);
+        }
     }
     if (mounted) {
         struct walfs_inode root;
@@ -1084,44 +1069,89 @@ u64 walfs_find(const char *path)
     if (pcache_get(path, &cached_id) && cached_id != 0)
         return cached_id;
 
-    u64 cur = WALFS_ROOT_INODE;
+    #define FIND_MAX_COMPONENTS 16
+    char comps[FIND_MAX_COMPONENTS][WALFS_NAME_MAX + 1];
+    u32 comp_count = 0;
     const char *p = path + 1;
-
     while (*p) {
-        char comp[128];
         u32 ci = 0;
-        while (*p && *p != '/' && ci < WALFS_NAME_MAX)
-            comp[ci++] = *p++;
-        comp[ci] = '\0';
-        if (*p == '/') p++;
-        if (ci == 0) continue;
-        /* Block path traversal */
-        if (comp[0] == '.' && (ci == 1 || (ci == 2 && comp[1] == '.')))
+        if (comp_count >= FIND_MAX_COMPONENTS)
             return 0;
-
-        u64 found = 0;
-        u64 pos = WAL_START;
-        struct wal_record hdr;
-        while (pos < super.wal_head) {
-            if (!wal_read(pos, &hdr, sizeof(hdr))) break;
-            if (!wal_rec_valid(&hdr)) break;
-            if (is_uncommitted(hdr.seq)) { pos += hdr.length; continue; }
-            if (hdr.type == RECORD_DIRENT) {
-                struct walfs_dirent de;
-                if (wal_read(pos + sizeof(hdr), &de, sizeof(de)) &&
-                    de.parent_id == cur && name_eq(de.name, comp))
-                    found = de.child_id;
-            }
-            pos += hdr.length;
+        while (*p && *p != '/') {
+            if (ci >= WALFS_NAME_MAX)
+                return 0;
+            comps[comp_count][ci++] = *p++;
         }
-        if (!found || is_deleted(found)) return 0;
-        cur = found;
+        comps[comp_count][ci] = '\0';
+        if (*p == '/') p++;
+        if (ci == 0)
+            return 0;
+        if (comps[comp_count][0] == '.' &&
+            (ci == 1 || (ci == 2 && comps[comp_count][1] == '.')))
+            return 0;
+        comp_count++;
     }
+
+    u64 ids[FIND_MAX_COMPONENTS + 1];
+    for (u32 i = 0; i <= FIND_MAX_COMPONENTS; i++)
+        ids[i] = 0;
+    ids[0] = WALFS_ROOT_INODE;
+
+    u64 pos = WAL_START;
+    struct wal_record hdr;
+    while (pos < super.wal_head) {
+        if (!wal_read(pos, &hdr, sizeof(hdr))) break;
+        if (!wal_rec_valid(&hdr)) break;
+        if (is_uncommitted(hdr.seq)) { pos += hdr.length; continue; }
+        if (hdr.type == RECORD_DIRENT) {
+            struct walfs_dirent de;
+            if (wal_read(pos + sizeof(hdr), &de, sizeof(de))) {
+                for (u32 depth = 0; depth < comp_count; depth++) {
+                    if (ids[depth] && de.parent_id == ids[depth] &&
+                        name_eq(de.name, comps[depth])) {
+                        if (ids[depth + 1U] != de.child_id) {
+                            ids[depth + 1U] = de.child_id;
+                            for (u32 j = depth + 2U; j <= comp_count; j++)
+                                ids[j] = 0;
+                        }
+                    }
+                }
+            }
+        } else if (hdr.type == RECORD_DELETE) {
+            struct walfs_delete d;
+            if (wal_read(pos + sizeof(hdr), &d, sizeof(d))) {
+                for (u32 depth = 1; depth <= comp_count; depth++) {
+                    if (ids[depth] == d.inode_id) {
+                        for (u32 j = depth; j <= comp_count; j++)
+                            ids[j] = 0;
+                        break;
+                    }
+                }
+            }
+        } else if (hdr.type == RECORD_INODE) {
+            struct walfs_inode ino;
+            if (wal_read(pos + sizeof(hdr), &ino, sizeof(ino)) &&
+                (ino.flags & WALFS_DELETED)) {
+                for (u32 depth = 1; depth <= comp_count; depth++) {
+                    if (ids[depth] == ino.inode_id) {
+                        for (u32 j = depth; j <= comp_count; j++)
+                            ids[j] = 0;
+                        break;
+                    }
+                }
+            }
+        }
+        pos += hdr.length;
+    }
+
+    u64 cur = ids[comp_count];
+    if (!cur) return 0;
 
     /* Cache the result */
     pcache_put(path, cur);
     return cur;
 }
+#undef FIND_MAX_COMPONENTS
 
 void walfs_readdir(u64 parent_id, walfs_readdir_cb cb)
 {
@@ -1487,12 +1517,10 @@ bool walfs_verify(struct walfs_health *out)
     if (!mounted)
         return false;
 
-    struct walfs_super sb = super;
-    if (sb.magic == WALFS_MAGIC && sb.version == WALFS_VERSION) {
-        u32 saved = sb.crc32;
-        sb.crc32 = 0;
-        tmp.super_ok = (hw_crc32c(&sb, SD_BLOCK_SIZE) == saved);
-        sb.crc32 = saved;
+    tmp.super_ok = super_crc_ok(&super);
+    if (!tmp.super_ok && mounted) {
+        write_super();
+        tmp.super_ok = super_crc_ok(&super);
     }
     if (!tmp.super_ok) {
         if (out) simd_memcpy(out, &tmp, sizeof(tmp));

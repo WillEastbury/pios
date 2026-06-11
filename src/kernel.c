@@ -147,10 +147,11 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HOTPATCH_SLOT_BYTES (PIOS_STAGE2_END_OFFSET + 1U)
 #define HOTPATCH_SLOT_MAGIC PIOS_RESERVED_HEADER_MAGIC
 #define HTTP_LOG_RING_SIZE 64
-#define ADMIN_HTTP_REQ_MAX 8192
+#define ADMIN_HTTP_REQ_MAX 24576
 #define ADMIN_HTTP_RESP_MAX 4096
 #define ADMIN_SERVICE_WATCHDOG_MS 180000ULL
 #define ADMIN_CLIENT_STALL_MS 10000ULL
+#define HTTP_TX_CHUNK_MAX TCP_MSS
 
 #define HTTP_EVT_LISTEN       1U
 #define HTTP_EVT_ACCEPT       2U
@@ -276,7 +277,7 @@ static u32 http_static_off;
 static u64 http_file_id;
 static u32 http_file_len;
 static u32 http_file_off;
-static u8 http_file_chunk[512];
+static u8 http_file_chunk[HTTP_TX_CHUNK_MAX];
 static u32 http_last_state;
 static u32 http_last_readable;
 static u32 http_last_writable;
@@ -4378,6 +4379,19 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " scan_end=");
         http_append_u64(out, &len, max, h.scan_end);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "walfs sync") || http_streq(cmd, "disk sync")) {
+        walfs_sync();
+        struct walfs_health h;
+        bool ok = walfs_verify(&h);
+        http_append(out, &len, max, "walfs sync ok=");
+        http_append(out, &len, max, ok ? "yes" : "no");
+        http_append(out, &len, max, " super=");
+        http_append(out, &len, max, h.super_ok ? "ok" : "bad");
+        http_append(out, &len, max, " wal_head=");
+        http_append(out, &len, max, h.wal_head_ok ? "ok" : "bad");
+        http_append(out, &len, max, " valid_records=");
+        http_append_u64(out, &len, max, h.valid_records);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "walfs compact") || http_streq(cmd, "disk compact")) {
         bool ok = walfs_compact();
         http_append(out, &len, max, ok ? "walfs compact OK\n" : "walfs compact FAILED\n");
@@ -6311,6 +6325,34 @@ static bool http_walfs_ensure_file(const char *path, u64 *id_out)
     return true;
 }
 
+static bool http_walfs_recreate_file(const char *path, u64 *id_out)
+{
+    char parent[256], leaf[128];
+    if (id_out) *id_out = 0;
+    if (!http_walfs_static_path_safe(path) ||
+        !http_walfs_parent_leaf(path, parent, sizeof(parent), leaf, sizeof(leaf)) ||
+        !http_walfs_ensure_dir_path(parent))
+        return false;
+
+    u64 old_id = walfs_find(path);
+    if (old_id) {
+        struct walfs_inode ino;
+        if (!walfs_stat(old_id, &ino) || (ino.flags & WALFS_DIR))
+            return false;
+        if (!walfs_delete(old_id))
+            return false;
+    }
+
+    u64 parent_id = walfs_find(parent);
+    if (!parent_id)
+        return false;
+    u64 id = walfs_create(parent_id, leaf, WALFS_FILE, 0644);
+    if (!id)
+        return false;
+    if (id_out) *id_out = id;
+    return true;
+}
+
 static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     u32 len = 0;
@@ -6336,15 +6378,23 @@ static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, 
     if (!http_streq(confirm, "1")) error = "requires confirm=1";
     else if (!path[0] || !http_walfs_static_path_safe(path)) error = "bad static path";
     else if (!has_content_len || body_len != content_len) error = "incomplete body";
+    else if (body_len > WALFS_DATA_MAX) error = "chunk too large";
     else if (total != 0 && (offset > total || body_len > total - offset)) error = "chunk exceeds total";
-    else if (!http_walfs_ensure_file(path, &id)) error = "create/find failed";
     else {
-        if (offset == 0 && !walfs_replace(id, NULL, 0)) {
-            error = "truncate failed";
-        } else if (!walfs_write(id, offset, req + body_off, body_len)) {
-            error = "write failed";
+        if (offset == 0) {
+            if (!http_walfs_recreate_file(path, &id)) {
+                error = "recreate failed";
+            } else {
+                ok = walfs_replace(id, req + body_off, body_len);
+                if (!ok) error = "replace failed";
+            }
         } else {
-            ok = true;
+            if (!http_walfs_ensure_file(path, &id)) {
+                error = "create/find failed";
+            } else {
+                ok = walfs_write(id, offset, req + body_off, body_len);
+                if (!ok) error = "write failed";
+            }
         }
     }
 
@@ -6606,7 +6656,7 @@ static void admin_service_poll(struct admin_http_service *svc)
         if (writable > 0) {
             u32 remain = svc->resp_len - svc->resp_off;
             u32 chunk = remain < writable ? remain : writable;
-            if (chunk > 512) chunk = 512;
+            if (chunk > HTTP_TX_CHUNK_MAX) chunk = HTTP_TX_CHUNK_MAX;
             u32 n = tcp_write(svc->client_conn, svc->resp + svc->resp_off, chunk);
             if (svc->resp_off == 0)
                 http_trace(HTTP_EVT_TX, http_route_id(svc->req, svc->req_len), svc->port, svc->resp_len);
@@ -6883,7 +6933,7 @@ static void echo_tcp_poll(void) {
                 u32 remain = http_resp_len - http_resp_off;
                 if (writable > 0) {
                     u32 chunk = remain < writable ? remain : writable;
-                    if (chunk > 512) chunk = 512;
+                    if (chunk > HTTP_TX_CHUNK_MAX) chunk = HTTP_TX_CHUNK_MAX;
                     if (!http_prefix_dumped) {
                         http_prefix_dumped = true;
                         http_save_ascii_prefix(http_last_resp_prefix, http_resp_buf, http_resp_len);
@@ -6946,15 +6996,19 @@ static void echo_tcp_poll(void) {
             if (http_resp_len > 0 && http_resp_off >= http_resp_len &&
                 (!http_static_body || http_static_off >= http_static_len) &&
                 (!http_file_id || http_file_off >= http_file_len)) {
-                http_diag.closes++;
-                http_complete_tick++;
-                http_trace(HTTP_EVT_CLOSE, http_diag.route, http_resp_len, http_resp_off);
-                if (HTTP_DIAG_VERBOSE) uart_puts("[http] close complete\n");
-                if (http_reboot_pending) {
-                    timer_delay_ms(250);
-                    watchdog_reboot_now(0x48545450U);
+                if (tcp_tx_pending(http_client_conn) == 0) {
+                    http_diag.closes++;
+                    http_complete_tick++;
+                    http_trace(HTTP_EVT_CLOSE, http_diag.route, http_resp_len, http_resp_off);
+                    if (HTTP_DIAG_VERBOSE) uart_puts("[http] close complete\n");
+                    if (http_reboot_pending) {
+                        timer_delay_ms(250);
+                        watchdog_reboot_now(0x48545450U);
+                    }
+                    http_reset_client(true);
+                } else {
+                    http_last_activity_ms = timer_monotonic_ms();
                 }
-                http_reset_client(true);
             } else if (http_resp_len > 0 && (timer_monotonic_ms() - http_last_activity_ms) > 15000ULL) {
                 http_diag.aborts++;
                 http_diag.error = HTTP_ERR_RESP_TIMEOUT;
