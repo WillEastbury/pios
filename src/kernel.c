@@ -1250,6 +1250,87 @@ static u32 http_core_ram_used_kib(u32 core)
     return 0;
 }
 
+struct perf_counter_snapshot {
+    u32 cpu_permille[4];
+    u32 cpu_total_permille;
+    u64 sched_wake;
+    u64 sched_wfi;
+    u64 sched_idle_ticks;
+    u64 sched_total_ticks;
+    u32 sched_flags;
+    u32 ram_total_kib;
+    u32 ram_used_kib;
+    u32 ram_kernel_kib;
+    u32 ram_user_kib;
+    u32 core_alloc_kib[4];
+    u32 kernel_mem_kib;
+    u32 kernel_static_kib;
+    u32 kernel_core_kib;
+    u32 kernel_cap_kib;
+    u32 proc_total;
+    u32 proc_ready;
+    u32 proc_running;
+    u32 proc_blocked;
+    u32 proc_dead;
+    u32 net_listen_count;
+    u32 net_listen_pending;
+    u64 dash_snap_ticks;
+    u64 dash_render_ticks;
+    u64 fb_blit_ticks;
+};
+
+static void perf_counter_snapshot(struct perf_counter_snapshot *p)
+{
+    if (!p)
+        return;
+    simd_zero(p, sizeof(*p));
+    p->ram_total_kib = (u32)((CORE_PRIV_SIZE * 4ULL) >> 10);
+    for (u32 i = 0; i < 4; i++)
+        p->core_alloc_kib[i] = http_core_ram_used_kib(i);
+
+    core0_sched_snapshot(&p->sched_wake, &p->sched_wfi,
+                         &p->sched_idle_ticks, &p->sched_total_ticks,
+                         &p->cpu_permille[0], &p->sched_flags);
+    struct proc_sched_core_snapshot pcs[3];
+    u32 pcs_n = proc_sched_snapshot(pcs, 3);
+    p->cpu_permille[1] = (pcs_n > 0) ? pcs[0].busy_permille : 0;
+    p->cpu_permille[2] = (pcs_n > 1) ? pcs[1].busy_permille : 0;
+    p->cpu_permille[3] = (pcs_n > 2) ? pcs[2].busy_permille : 0;
+    p->cpu_total_permille = (p->cpu_permille[0] + p->cpu_permille[1] +
+                             p->cpu_permille[2] + p->cpu_permille[3]) / 4U;
+
+    struct proc_ui_entry proc[MAX_PROCS_PER_CORE + 1U];
+    u32 proc_n = proc_snapshot(proc, MAX_PROCS_PER_CORE + 1U);
+    p->proc_total = proc_n;
+    if (proc_n > 0) {
+        p->kernel_mem_kib = proc[0].mem_kib;
+        p->kernel_static_kib = proc[0].arena_span_kib;
+        p->kernel_core_kib = proc[0].arena_used_kib;
+        p->kernel_cap_kib = proc[0].arena_capacity_kib;
+        p->ram_kernel_kib = proc[0].mem_kib;
+    }
+    for (u32 i = 0; i < proc_n; i++) {
+        if (i > 0)
+            p->ram_user_kib += proc[i].mem_kib;
+        if (proc[i].state == PROC_READY) p->proc_ready++;
+        else if (proc[i].state == PROC_RUNNING) p->proc_running++;
+        else if (proc[i].state == PROC_BLOCKED) p->proc_blocked++;
+        else if (proc[i].state == PROC_DEAD) p->proc_dead++;
+    }
+    p->ram_used_kib = p->ram_kernel_kib + p->ram_user_kib;
+    tcp_snapshot_entry_t tcp[TCP_MAX_CONNECTIONS];
+    u32 tcp_n = tcp_snapshot(tcp, TCP_MAX_CONNECTIONS);
+    for (u32 i = 0; i < tcp_n; i++) {
+        if (tcp[i].state == TCP_LISTEN) {
+            p->net_listen_count++;
+            p->net_listen_pending += tcp[i].pending_count;
+        }
+    }
+    p->dash_snap_ticks = g_dash_snap_ticks;
+    p->dash_render_ticks = g_dash_render_ticks;
+    p->fb_blit_ticks = fb_last_blit_ticks();
+}
+
 static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len)
 {
     static bool boot_success_marked_by_health;
@@ -1284,14 +1365,31 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "off", http_resp_off, true);
     http_append_json_metric(out, &len, max, "body", http_diag.body_off, true);
     http_append_json_metric(out, &len, max, "clen", http_diag.content_len, true);
-    u64 sched_wake = 0, sched_wfi = 0, sched_idle = 0, sched_total = 0;
-    u32 sched_busy = 0, sched_flags = 0;
-    core0_sched_snapshot(&sched_wake, &sched_wfi, &sched_idle, &sched_total,
-                         &sched_busy, &sched_flags);
-    http_append_json_metric(out, &len, max, "sched_wake", sched_wake, true);
-    http_append_json_metric(out, &len, max, "sched_wfi", sched_wfi, true);
-    http_append_json_metric(out, &len, max, "sched_busy_permille", sched_busy, true);
-    http_append_json_metric(out, &len, max, "sched_flags", sched_flags, false);
+    struct perf_counter_snapshot perf;
+    perf_counter_snapshot(&perf);
+    http_append_json_metric(out, &len, max, "sched_wake", perf.sched_wake, true);
+    http_append_json_metric(out, &len, max, "sched_wfi", perf.sched_wfi, true);
+    http_append_json_metric(out, &len, max, "sched_busy_permille", perf.cpu_permille[0], true);
+    http_append_json_metric(out, &len, max, "sched_flags", perf.sched_flags, false);
+    http_append(out, &len, max, "},\"perf\":{");
+    http_append_json_metric(out, &len, max, "cpu_total_permille", perf.cpu_total_permille, true);
+    http_append_json_metric(out, &len, max, "cpu0_permille", perf.cpu_permille[0], true);
+    http_append_json_metric(out, &len, max, "cpu1_permille", perf.cpu_permille[1], true);
+    http_append_json_metric(out, &len, max, "cpu2_permille", perf.cpu_permille[2], true);
+    http_append_json_metric(out, &len, max, "cpu3_permille", perf.cpu_permille[3], true);
+    http_append_json_metric(out, &len, max, "ram_total_kib", perf.ram_total_kib, true);
+    http_append_json_metric(out, &len, max, "ram_used_kib", perf.ram_used_kib, true);
+    http_append_json_metric(out, &len, max, "ram_kernel_kib", perf.ram_kernel_kib, true);
+    http_append_json_metric(out, &len, max, "ram_user_kib", perf.ram_user_kib, true);
+    http_append_json_metric(out, &len, max, "kernel_mem_kib", perf.kernel_mem_kib, true);
+    http_append_json_metric(out, &len, max, "kernel_static_kib", perf.kernel_static_kib, true);
+    http_append_json_metric(out, &len, max, "kernel_core_kib", perf.kernel_core_kib, true);
+    http_append_json_metric(out, &len, max, "kernel_cap_kib", perf.kernel_cap_kib, true);
+    http_append_json_metric(out, &len, max, "net_listen_count", perf.net_listen_count, true);
+    http_append_json_metric(out, &len, max, "net_listen_pending", perf.net_listen_pending, true);
+    http_append_json_metric(out, &len, max, "dash_snap_ticks", perf.dash_snap_ticks, true);
+    http_append_json_metric(out, &len, max, "dash_render_ticks", perf.dash_render_ticks, true);
+    http_append_json_metric(out, &len, max, "fb_blit_ticks", perf.fb_blit_ticks, false);
     http_append(out, &len, max, "}}");
     http_append(out, &len, max, "\n");
     http_trace(HTTP_EVT_STATUS_EXIT, HTTP_ROUTE_STATUS, len, max);
@@ -13162,8 +13260,6 @@ static void dash_core0_flags(u32 flags)
     if (!any) fb_puts("none");
 }
 
-static volatile u64 g_dash_snap_ticks;
-static volatile u64 g_dash_render_ticks;
 static inline u64 dash_now_ticks(void) { u64 c; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(c)); return c; }
 
 static void dash_blank_line(u32 col, u32 row, u32 width)
@@ -13186,9 +13282,87 @@ static void dash_clear_body(u32 col, u32 row, u32 width, u32 height)
 static void dash_draw_window(u32 col, u32 row, u32 width, u32 height,
                              const char *title, u32 color)
 {
+    u32 max_cols = fb_cols();
+    u32 max_rows = fb_rows();
+    if (col >= max_cols || row >= max_rows)
+        return;
+    if (col + width > max_cols)
+        width = max_cols - col;
+    if (row + height > max_rows)
+        height = max_rows - row;
+    if (width < 4 || height < 2)
+        return;
+
     fb_set_color(color, 0x00000000);
     fb_set_cursor(col, row);
-    fb_box(width, height, title);
+    fb_putc('+');
+    for (u32 i = 0; i < width - 2U; i++)
+        fb_putc('=');
+    fb_putc('+');
+
+    if (title) {
+        fb_set_cursor(col + 2U, row);
+        fb_putc(' ');
+        for (u32 i = 0; title[i] && i + 5U < width; i++)
+            fb_putc(title[i]);
+        fb_putc(' ');
+    }
+
+    for (u32 r = row + 1U; r + 1U < row + height; r++) {
+        fb_set_cursor(col, r);
+        fb_putc('|');
+        fb_set_cursor(col + width - 1U, r);
+        fb_putc('|');
+    }
+
+    fb_set_cursor(col, row + height - 1U);
+    fb_putc('+');
+    for (u32 i = 0; i < width - 2U; i++)
+        fb_putc('-');
+    fb_putc('+');
+}
+
+static void dash_put_permille_pct(u32 permille)
+{
+    u32 whole = permille / 10U;
+    u32 frac = permille % 10U;
+    if (frac)
+        fb_printf("%u.%u%%", whole, frac);
+    else
+        fb_printf("%u%%", whole);
+}
+
+static bool dash_proc_for_pid(const struct proc_ui_entry *proc, u32 proc_n,
+                              u32 pid, u32 *core_out, const char **image_out)
+{
+    for (u32 i = 0; i < proc_n; i++) {
+        if (proc[i].pid != pid)
+            continue;
+        if (core_out) *core_out = proc[i].affinity_core;
+        if (image_out) *image_out = proc[i].image_path;
+        return true;
+    }
+    return false;
+}
+
+static bool dash_bridge_for_port(u16 port, u32 *bridge_out, u32 *pid_out)
+{
+    u32 idx = 0xFFFFFFFFU;
+    if (port == UHTTP_PORT)
+        idx = 0U;
+#if UHTTP_BRIDGE_COUNT > 1
+    else if (port == UHTTP_NATIVE_PORT)
+        idx = 1U;
+#endif
+    if (idx >= UHTTP_BRIDGE_COUNT)
+        return false;
+    i32 listen = 0;
+    u32 state = 0, req = 0, resp = 0, total = 0, magic = 0, pid = 0;
+    uhttp_bridge_state_idx(idx, &listen, &state, &req, &resp, &total, &magic, &pid);
+    (void)listen; (void)state; (void)req; (void)resp; (void)total; (void)magic;
+    if (bridge_out) *bridge_out = idx;
+    if (pid_out) *pid_out = pid;
+    return true;
 }
 
 static void hdmi_dashboard_render(void)
@@ -13207,33 +13381,8 @@ static void hdmi_dashboard_render(void)
     heartbeat++;
     u64 t_dash0 = dash_now_ticks();
 
-    u64 used = 0;
-    for (u32 i = 0; i < 4; i++) {
-        struct core_env *e = core_env_of(i);
-        if (e->id == i && e->ram_base == (u8 *)(usize)core_ram_bases[i] &&
-            e->ram_end == e->ram_base + CORE_PRIV_SIZE &&
-            e->heap_ptr >= e->ram_base && e->heap_ptr <= e->ram_end)
-            used += (u64)(usize)(e->heap_ptr - e->ram_base);
-    }
-    u64 total = CORE_PRIV_SIZE * 4ULL;
-    u32 core_mem_kib[4];
-    for (u32 i = 0; i < 4; i++)
-        core_mem_kib[i] = http_core_ram_used_kib(i);
-
-    u64 sched_wake = 0, sched_wfi = 0, sched_idle = 0, sched_total = 0;
-    u32 sched_busy = 0, sched_flags = 0;
-    core0_sched_snapshot(&sched_wake, &sched_wfi, &sched_idle, &sched_total,
-                         &sched_busy, &sched_flags);
-    /* Per-core busy% (cores 1-3 from the coherent scheduler snapshot) plus the
-     * 4-core average for the HDMI dashboard. cbusy[] is in permille. */
-    struct proc_sched_core_snapshot pcs[3];
-    u32 pcs_n = proc_sched_snapshot(pcs, 3);
-    u32 cbusy[4];
-    cbusy[0] = sched_busy;
-    cbusy[1] = (pcs_n > 0) ? pcs[0].busy_permille : 0;
-    cbusy[2] = (pcs_n > 1) ? pcs[1].busy_permille : 0;
-    cbusy[3] = (pcs_n > 2) ? pcs[2].busy_permille : 0;
-    u32 cpu_avg = (cbusy[0] + cbusy[1] + cbusy[2] + cbusy[3]) / 4U;
+    struct perf_counter_snapshot perf;
+    perf_counter_snapshot(&perf);
 
     nic_packet_counters_t pc;
     nic_packet_counters(&pc);
@@ -13241,31 +13390,15 @@ static void hdmi_dashboard_render(void)
     u32 tcp_n = tcp_snapshot(tcp, TCP_MAX_CONNECTIONS);
     struct proc_ui_entry proc[UI_SNAPSHOT_MAX];
     u32 proc_n = proc_snapshot(proc, UI_SNAPSHOT_MAX);
-    u32 kernel_mem_kib = proc_n ? proc[0].mem_kib : 0;
-    u32 kernel_static_kib = proc_n ? proc[0].arena_span_kib : 0;
-    u32 kernel_core_kib = proc_n ? proc[0].arena_used_kib : 0;
-    u32 kernel_cap_kib = proc_n ? proc[0].arena_capacity_kib : 0;
-    u32 ready = 0, running = 0, blocked = 0, dead = 0;
-    for (u32 i = 0; i < proc_n; i++) {
-        if (proc[i].state == PROC_READY) ready++;
-        else if (proc[i].state == PROC_RUNNING) running++;
-        else if (proc[i].state == PROC_BLOCKED) blocked++;
-        else if (proc[i].state == PROC_DEAD) dead++;
-    }
-
     u32 screen_cols = fb_cols();
     u32 screen_rows = fb_rows();
     bool wide = screen_cols >= 180U;
     u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 4U;
     u32 sys_col = 0, sys_row = 5, sys_w = wide ? 58U : 78U, sys_h = wide ? 8U : 5U;
-    u32 ports_col = wide ? (sys_col + sys_w + 2U) : 0U;
-    u32 ports_row = wide ? 5U : 11U;
-    u32 ports_w = wide ? 58U : 78U;
-    u32 ports_h = wide ? 8U : 7U;
-    u32 proc_col = wide ? (ports_col + ports_w + 2U) : 0U;
-    u32 proc_row = wide ? 5U : 19U;
-    u32 proc_w = wide ? ((screen_cols > proc_col + 2U) ? (screen_cols - proc_col - 1U) : 44U) : 78U;
-    u32 proc_h = wide ? 8U : 7U;
+    u32 map_col = wide ? (sys_col + sys_w + 2U) : 0U;
+    u32 map_row = wide ? 5U : 11U;
+    u32 map_w = wide ? ((screen_cols > map_col + 2U) ? (screen_cols - map_col - 1U) : 78U) : 78U;
+    u32 map_h = wide ? 8U : 13U;
     u32 log_col = 0;
     u32 log_top = wide ? 14U : (screen_rows > 10U ? screen_rows - 9U : 28U);
     u32 log_w = header_w;
@@ -13279,8 +13412,7 @@ static void hdmi_dashboard_render(void)
         fb_clear(0x00000000);
         dash_draw_window(header_col, header_row, header_w, header_h, "PIOS WORKBENCH", 0x0000FF80);
         dash_draw_window(sys_col, sys_row, sys_w, sys_h, "SYSTEM", 0x0000CCFF);
-        dash_draw_window(ports_col, ports_row, ports_w, ports_h, "LISTENING PORTS", 0x00FFAA00);
-        dash_draw_window(proc_col, proc_row, proc_w, proc_h, "PROCESSES", 0x0080FF80);
+        dash_draw_window(map_col, map_row, map_w, map_h, "NETWORK / PROCESS MAP", 0x00FFAA00);
         dash_draw_window(log_col, log_top, log_w, log_h, "WARNINGS / ERRORS", 0x00FF4040);
         layout_drawn = true;
     }
@@ -13289,6 +13421,23 @@ static void hdmi_dashboard_render(void)
     fb_set_cursor(header_col + 3, header_row + 1);
     fb_set_color(0x00FF80FF, 0x00000000);
     fb_puts(PIOS_BUILD_LABEL);
+    if (header_w > 78U) {
+        u32 cpu_col = header_col + header_w - 58U;
+        fb_set_cursor(cpu_col, header_row + 1);
+        fb_set_color(0x0000FF80, 0x00000000);
+        fb_puts("CPU: ");
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_puts("Total=");
+        dash_put_permille_pct(perf.cpu_total_permille);
+        fb_puts(" 0=");
+        dash_put_permille_pct(perf.cpu_permille[0]);
+        fb_puts(" 1=");
+        dash_put_permille_pct(perf.cpu_permille[1]);
+        fb_puts(" 2=");
+        dash_put_permille_pct(perf.cpu_permille[2]);
+        fb_puts(" 3=");
+        dash_put_permille_pct(perf.cpu_permille[3]);
+    }
     fb_set_cursor(header_col + 3, header_row + 2);
     fb_set_color(0x00FFFFFF, 0x00000000);
     fb_set_color(0x0000FF80, 0x00003310);
@@ -13301,65 +13450,79 @@ static void hdmi_dashboard_render(void)
     fb_printf("%u", heartbeat);
     fb_puts(" ip=");
     dash_ip(net_get_our_ip());
+    if (header_w > 78U) {
+        u32 ram_col = header_col + header_w - 58U;
+        fb_set_cursor(ram_col, header_row + 2);
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_puts("RAM: ");
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_puts("Total=");
+        fb_printf("%uMB", perf.ram_total_kib >> 10);
+        fb_puts(" Used=");
+        fb_printf("%uMB", perf.ram_used_kib >> 10);
+        fb_puts(" Kernel=");
+        fb_printf("%uMB", perf.ram_kernel_kib >> 10);
+        fb_puts(" User=");
+        fb_printf("%uMB", perf.ram_user_kib >> 10);
+    }
 
     dash_clear_body(sys_col, sys_row, sys_w, sys_h);
     fb_set_cursor(sys_col + 3, sys_row + 1);
     fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("CPU avg=%u.%u%% c0=%u.%u%% c1=%u.%u%% c2=%u.%u%% c3=%u.%u%% fl=0x%x ",
-              cpu_avg / 10U, cpu_avg % 10U,
-              cbusy[0] / 10U, cbusy[0] % 10U,
-              cbusy[1] / 10U, cbusy[1] % 10U,
-              cbusy[2] / 10U, cbusy[2] % 10U,
-              cbusy[3] / 10U, cbusy[3] % 10U,
-              sched_flags);
-    dash_core0_flags(sched_flags);
+    fb_printf("sched wake=%u wfi=%u flags=0x%x ", (u32)perf.sched_wake, (u32)perf.sched_wfi, perf.sched_flags);
+    dash_core0_flags(perf.sched_flags);
     fb_set_cursor(sys_col + 3, sys_row + 2);
     fb_printf("Kernel mem=%uK static=%uK core_alloc=%uK cap=%uK",
-              kernel_mem_kib, kernel_static_kib, kernel_core_kib, kernel_cap_kib);
+              perf.kernel_mem_kib, perf.kernel_static_kib, perf.kernel_core_kib, perf.kernel_cap_kib);
     fb_set_cursor(sys_col + 3, sys_row + 3);
-    fb_printf("RAM %uK/%uK  c0=%uK c1=%uK c2=%uK c3=%uK",
-              (u32)(used / 1024ULL), (u32)(total / 1024ULL),
-              core_mem_kib[0], core_mem_kib[1], core_mem_kib[2], core_mem_kib[3]);
+    fb_printf("Core RAM c0=%uK c1=%uK c2=%uK c3=%uK",
+              perf.core_alloc_kib[0], perf.core_alloc_kib[1], perf.core_alloc_kib[2], perf.core_alloc_kib[3]);
 
-    dash_clear_body(ports_col, ports_row, ports_w, ports_h);
-    u32 row = ports_row + 1U;
-    for (u32 i = 0; i < tcp_n && row + 1U < ports_row + ports_h; i++) {
+    dash_clear_body(map_col, map_row, map_w, map_h);
+    u32 row = map_row + 1U;
+    fb_set_cursor(map_col + 3U, row++);
+    fb_set_color(0x00AAAAAA, 0x00000000);
+    fb_puts("PORT     FIFO/BRIDGE          PID/CORE       PROCESS");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    u32 shown_listeners = 0;
+    for (u32 i = 0; i < tcp_n && row + 1U < map_row + map_h; i++) {
         if (tcp[i].state != TCP_LISTEN)
             continue;
-        fb_set_cursor(ports_col + 3U, row++);
+        shown_listeners++;
+        fb_set_cursor(map_col + 3U, row++);
+        u32 bridge = 0, pid = 0, pcore = 0;
+        const char *image = "-";
+        bool has_bridge = dash_bridge_for_port(tcp[i].local_port, &bridge, &pid);
+        bool has_proc = pid && dash_proc_for_pid(proc, proc_n, pid, &pcore, &image);
         fb_puts("tcp/");
         fb_printf("%u", tcp[i].local_port);
         fb_puts("  ");
-        fb_puts(tcp_owner_label(tcp[i].local_port));
-        fb_puts("  pending=");
+        if (has_bridge) {
+            fb_puts("uhttp bridge");
+            fb_printf("%u", bridge);
+            fb_puts(" fifo-wake ");
+        } else {
+            fb_puts(tcp_owner_label(tcp[i].local_port));
+            fb_puts(" kernel     ");
+        }
+        if (has_proc) {
+            fb_puts("pid=");
+            fb_printf("%u", pid);
+            fb_puts(" core=");
+            fb_printf("%u", pcore);
+            fb_puts("  ");
+            fb_puts(image);
+        } else {
+            fb_puts("pid=- core=0  ");
+            fb_puts(tcp_owner_label(tcp[i].local_port));
+        }
+        fb_puts(" pend=");
         fb_printf("%u", tcp[i].pending_count);
     }
-    if (row == ports_row + 1U) {
-        fb_set_cursor(ports_col + 3U, row);
+    if (shown_listeners == 0) {
+        fb_set_cursor(map_col + 3U, row);
         fb_set_color(0x00AAAAAA, 0x00000000);
         fb_puts("No listening sockets yet.");
-    }
-
-    dash_clear_body(proc_col, proc_row, proc_w, proc_h);
-    fb_set_cursor(proc_col + 3U, proc_row + 1U);
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("total=%u ready=%u running=%u blocked=%u dead=%u", proc_n, ready, running, blocked, dead);
-    row = proc_row + 2U;
-    for (u32 i = 0; i < proc_n && row + 1U < proc_row + proc_h; i++) {
-        fb_set_cursor(proc_col + 3U, row++);
-        if (proc[i].parent_pid == PROC_UI_KERNEL_PARENT_PID) {
-            fb_printf("pid=0x%x ppid=-1 core=%u cpu=%u%% mem=%uK arena=%u/%uK %s %s",
-                      proc[i].pid, proc[i].affinity_core,
-                      proc[i].cpu_percent, proc[i].mem_kib, proc[i].arena_used_kib,
-                      proc[i].arena_high_kib,
-                      ui_proc_state_str(proc[i].state), proc[i].image_path);
-        } else {
-            fb_printf("pid=0x%x ppid=0x%x core=%u cpu=%u%% mem=%uK arena=%u/%uK %s %s",
-                      proc[i].pid, proc[i].parent_pid, proc[i].affinity_core,
-                      proc[i].cpu_percent, proc[i].mem_kib, proc[i].arena_used_kib,
-                      proc[i].arena_high_kib,
-                      ui_proc_state_str(proc[i].state), proc[i].image_path);
-        }
     }
 
     dash_clear_body(log_col, log_top, log_w, log_h);
