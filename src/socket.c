@@ -26,6 +26,7 @@
 
 struct socket_desc {
     bool    used;
+    u32     generation;
     u32     type;           /* SOCK_STREAM or SOCK_DGRAM */
     u32     state;          /* 0=new, 1=bound, 2=listening, 3=connected, 4=closed */
     struct  sockaddr_in local;
@@ -37,7 +38,8 @@ struct socket_desc {
     u32     udp_src_ip;
     u16     udp_src_port;
     bool    udp_pending;
-};
+    u64     _pad[6];
+} ALIGNED(64);
 
 #define SOCK_STATE_NEW      0
 #define SOCK_STATE_BOUND    1
@@ -47,6 +49,30 @@ struct socket_desc {
 
 /* Per-core socket tables (cores 2 and 3) */
 static struct socket_desc sockets[2][SOCKET_MAX];
+_Static_assert((sizeof(struct socket_desc) & 63U) == 0U,
+               "socket descriptors must have cache-line stride");
+
+#define SOCKET_POISON_U32 0xDEAD50C0U
+#define SOCKET_POISON_I32 ((i32)-0x50C)
+
+static u32 socket_bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void socket_poison(struct socket_desc *s)
+{
+    if (!s)
+        return;
+    u32 gen = socket_bump_generation(s->generation);
+    simd_zero(s, sizeof(*s));
+    s->used = false;
+    s->generation = gen;
+    s->type = SOCKET_POISON_U32;
+    s->state = SOCK_STATE_CLOSED;
+    s->tcp_conn = SOCKET_POISON_I32;
+}
 
 u32 socket_udp_active_count(void)
 {
@@ -95,8 +121,10 @@ i32 sock_socket(u32 type) {
     for (i32 i = 0; i < SOCKET_MAX; i++) {
         if (!sockets[ci][i].used) {
             struct socket_desc *s = &sockets[ci][i];
+            u32 gen = socket_bump_generation(s->generation);
             simd_zero(s, sizeof(*s));
             s->used = true;
+            s->generation = gen;
             s->type = type;
             s->state = SOCK_STATE_NEW;
             s->tcp_conn = -1;
@@ -314,8 +342,7 @@ i32 sock_close(i32 fd) {
         wait_reply(&reply);
     }
 
-    s->used = false;
-    s->state = SOCK_STATE_CLOSED;
+    socket_poison(s);
     return SOCK_OK;
 }
 
@@ -503,5 +530,5 @@ void socket_handle_fifo(u32 from_core) {
 void socket_init(void) {
     for (u32 c = 0; c < 2; c++)
         for (u32 i = 0; i < SOCKET_MAX; i++)
-            sockets[c][i].used = false;
+            socket_poison(&sockets[c][i]);
 }
