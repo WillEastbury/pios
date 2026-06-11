@@ -29,20 +29,48 @@ static u32 hook_count;
 
 struct module_slot {
     bool    used;
+    u32     generation;
     u64     base;
     u64     entry;
     u32     hook_type;
     cleanup_fn cleanup;
-};
+    u64     _pad[3];
+} ALIGNED(64);
 
 static struct module_slot slots[MODULE_MAX_SLOTS];
+_Static_assert(sizeof(struct module_slot) == 64,
+               "module slots must be one cache line");
+
+#define MODULE_SLOT_POISON_U32 0xDEAD0D00U
+#define MODULE_SLOT_POISON_U64 0xDEAD0D00DEAD0D00ULL
+
+static u32 module_bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void module_slot_poison(struct module_slot *s)
+{
+    if (!s)
+        return;
+    u32 gen = module_bump_generation(s->generation);
+    simd_zero(s, sizeof(*s));
+    s->used = false;
+    s->generation = gen;
+    s->base = MODULE_SLOT_POISON_U64;
+    s->entry = MODULE_SLOT_POISON_U64;
+    s->hook_type = MODULE_SLOT_POISON_U32;
+    s->cleanup = NULL;
+}
 
 /* ---- Init ---- */
 
 void module_init(void)
 {
     memset(hooks, 0, sizeof(hooks));
-    memset(slots, 0, sizeof(slots));
+    for (u32 i = 0; i < MODULE_MAX_SLOTS; i++)
+        module_slot_poison(&slots[i]);
     hook_count = 0;
 }
 
@@ -102,7 +130,10 @@ bool module_load(const u8 *file, u32 file_size)
     }
 
     /* Record slot info */
+    u32 gen = module_bump_generation(slots[slot_idx].generation);
+    simd_zero(&slots[slot_idx], sizeof(slots[slot_idx]));
     slots[slot_idx].used = true;
+    slots[slot_idx].generation = gen;
     slots[slot_idx].base = (u64)base;
     slots[slot_idx].entry = entry;
     slots[slot_idx].hook_type = info->hook_type;
@@ -115,7 +146,7 @@ bool module_load(const u8 *file, u32 file_size)
         hook_fn hfn = (hook_fn)((u64)base + info->init_offset);
         if (!register_hook(info->hook_type, hfn)) {
             uart_puts("mod: hook table full\n");
-            slots[slot_idx].used = false;
+            module_slot_poison(&slots[slot_idx]);
             return false;
         }
     }
