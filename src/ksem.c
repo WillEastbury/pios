@@ -3,11 +3,31 @@
 
 struct ksem_obj {
     bool used;
+    u32 generation;
     i32 count;
     i32 max_count;
-};
+    u32 _pad[12];
+} ALIGNED(64);
 
 static struct ksem_obj sem_table[NUM_CORES][KSEM_MAX_PER_CORE];
+_Static_assert(sizeof(struct ksem_obj) == 64, "kernel semaphore descriptors must be one cache line");
+
+static u32 ksem_bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void ksem_poison(struct ksem_obj *s)
+{
+    if (!s)
+        return;
+    u32 g = ksem_bump_generation(s->generation);
+    s->used = false;
+    s->generation = g;
+    s->count = -0x1EC;
+    s->max_count = -0x1EC;
+}
 
 static inline u32 sem_owner(i32 sem_id)
 {
@@ -32,11 +52,8 @@ static struct ksem_obj *ksem_get_local(i32 sem_id)
 void ksem_init_core(void)
 {
     u32 owner = core_id() & 3U;
-    for (u32 i = 0; i < KSEM_MAX_PER_CORE; i++) {
-        sem_table[owner][i].used = false;
-        sem_table[owner][i].count = 0;
-        sem_table[owner][i].max_count = 0;
-    }
+    for (u32 i = 0; i < KSEM_MAX_PER_CORE; i++)
+        ksem_poison(&sem_table[owner][i]);
 }
 
 i32 ksem_create(u32 initial, u32 max_count)
@@ -48,7 +65,10 @@ i32 ksem_create(u32 initial, u32 max_count)
     for (u32 i = 0; i < KSEM_MAX_PER_CORE; i++) {
         struct ksem_obj *s = &sem_table[owner][i];
         if (!s->used) {
+            u32 gen = ksem_bump_generation(s->generation);
+            memset(s, 0, sizeof(*s));
             s->used = true;
+            s->generation = gen;
             s->count = (i32)initial;
             s->max_count = (i32)max_count;
             dmb();
