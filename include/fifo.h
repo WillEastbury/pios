@@ -92,3 +92,4 @@ u32   fifo_span_push_batch_asm(u32 src_core, u32 dst_core, const struct fifo_spa
 u32   fifo_span_pop_batch_asm(u32 dst_core, u32 src_core, struct fifo_span_msg *msgs, u32 max_count);
 u32   fifo_span_push_batch_ish(u32 src_core, u32 dst_core, const struct fifo_span_msg *msgs, u32 count);
 u32   fifo_span_pop_batch_ish(u32 dst_core, u32 src_core, struct fifo_span_msg *msgs, u32 max_count);
+u32   fifo_last_sequence(u32 core);

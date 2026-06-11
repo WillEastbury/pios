@@ -8,6 +8,7 @@
 #include "fb.h"
 #include "mmio.h"
 #include "proc.h"
+#include "fifo.h"
 #include "timer.h"
 #include "picowal_db.h"
 #include "sd.h"
@@ -87,7 +88,7 @@ static void crash_persist(u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
     r.descriptor_id = pid;
     r.descriptor_generation = generation;
     r.descriptor_owner = owner;
-    r.last_fifo_seq = 0;
+    r.last_fifo_seq = fifo_last_sequence(r.core);
     r.esr = esr;
     r.elr = elr;
     r.far = far;

@@ -9,6 +9,31 @@
 #include "core_env.h"
 #include "fb.h"
 
+struct fifo_core_seq {
+    volatile u32 seq;
+    u32 _pad[15];
+} ALIGNED(64);
+static struct fifo_core_seq fifo_seq[4];
+_Static_assert(sizeof(struct fifo_core_seq) == 64,
+               "FIFO sequence records must be one cache line");
+
+static inline void fifo_note_activity(u32 count)
+{
+    if (count == 0)
+        return;
+    u32 c = core_id() & 3U;
+    fifo_seq[c].seq += count;
+    dmb_ishst();
+}
+
+u32 fifo_last_sequence(u32 core)
+{
+    if (core >= 4U)
+        return 0;
+    dmb_ishld();
+    return fifo_seq[core].seq;
+}
+
 /* FIFO pool in shared memory: 4×4 = 16 fifo structs */
 static inline struct fifo *get_fifo(u32 src, u32 dst) {
     return (struct fifo *)(SHARED_FIFO_BASE +
@@ -24,6 +49,7 @@ static inline struct fifo_span *get_span_fifo(u32 src, u32 dst) {
 void fifo_init_all(void) {
     /* Zero the entire shared FIFO region with NEON */
     simd_zero((void *)SHARED_FIFO_BASE, SHARED_FIFO_SIZE);
+    simd_zero(fifo_seq, sizeof(fifo_seq));
     dsb();
 }
 
@@ -41,6 +67,7 @@ bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {
     dmb();              /* msg visible before head update */
     f->head = next;
     dsb();              /* head visible before event signal */
+    fifo_note_activity(1);
     sev();              /* wake sleeping cores */
     return true;
 }
@@ -64,6 +91,7 @@ u32 fifo_push_batch(u32 src, u32 dst, const struct fifo_msg *msgs, u32 count) {
         dmb();
         f->head = head;
         dsb();
+        fifo_note_activity(pushed);
         sev();
     }
     return pushed;
@@ -81,6 +109,7 @@ bool fifo_pop(u32 dst, u32 src, struct fifo_msg *msg) {
     simd_memcpy(msg, &f->msgs[tail], sizeof(struct fifo_msg));
     dmb();              /* msg consumed before tail advance */
     f->tail = (tail + 1) & (FIFO_CAPACITY - 1);
+    fifo_note_activity(1);
     return true;
 }
 
@@ -100,6 +129,7 @@ u32 fifo_pop_batch(u32 dst, u32 src, struct fifo_msg *msgs, u32 max_count) {
     if (popped) {
         dmb();
         f->tail = tail;
+        fifo_note_activity(popped);
     }
     return popped;
 }
@@ -146,6 +176,7 @@ u32 fifo_span_push_batch(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32
         dmb_ishst();        /* data stores before head (inner-shareable scope) */
         f->head = head;
         dsb_ishst();        /* head visible before SEV */
+        fifo_note_activity(pushed);
         sev();
     }
     return pushed;
@@ -167,6 +198,7 @@ u32 fifo_span_pop_batch(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_co
     if (popped) {
         dmb_ish();          /* data reads before tail store */
         f->tail = tail;
+        fifo_note_activity(popped);
     }
     return popped;
 }
@@ -209,6 +241,7 @@ u32 fifo_span_push_batch_acqrel(u32 src, u32 dst, const struct fifo_span_msg *ms
     if (pushed) {
         atomic_store32(&f->head, head);              /* release: data before head */
         __asm__ volatile("dsb ishst" ::: "memory");  /* head visible before SEV */
+        fifo_note_activity(pushed);
         sev();
     }
     return pushed;
@@ -226,8 +259,10 @@ u32 fifo_span_pop_batch_acqrel(u32 dst, u32 src, struct fifo_span_msg *msgs, u32
         tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
         popped++;
     }
-    if (popped)
+    if (popped) {
         atomic_store32(&f->tail, tail);              /* release: reads before tail */
+        fifo_note_activity(popped);
+    }
     return popped;
 }
 
@@ -251,6 +286,7 @@ u32 fifo_span_push_batch_asm(u32 src, u32 dst, const struct fifo_span_msg *msgs,
     if (pushed) {
         atomic_store32(&f->head, head);
         __asm__ volatile("dsb ishst" ::: "memory");
+        fifo_note_activity(pushed);
         sev();
     }
     return pushed;
@@ -268,8 +304,10 @@ u32 fifo_span_pop_batch_asm(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 ma
         tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
         popped++;
     }
-    if (popped)
+    if (popped) {
         atomic_store32(&f->tail, tail);
+        fifo_note_activity(popped);
+    }
     return popped;
 }
 
@@ -296,6 +334,7 @@ u32 fifo_span_push_batch_ish(u32 src, u32 dst, const struct fifo_span_msg *msgs,
         dmb_ishst();
         f->head = head;
         dsb_ishst();
+        fifo_note_activity(pushed);
         sev();
     }
     return pushed;
@@ -317,6 +356,7 @@ u32 fifo_span_pop_batch_ish(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 ma
     if (popped) {
         dmb_ish();
         f->tail = tail;
+        fifo_note_activity(popped);
     }
     return popped;
 }
