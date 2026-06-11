@@ -955,6 +955,10 @@ u32 net_get_our_ip(void) {
     return our_ip;
 }
 
+u32 net_get_netmask(void) {
+    return our_mask;
+}
+
 const net_stats_t *net_get_stats(void) {
     return &stats;
 }

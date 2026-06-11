@@ -13749,6 +13749,18 @@ static void dash_put_mbps(u32 mbps_x1000)
     }
 }
 
+static u32 dash_prefix_len_from_mask(u32 mask)
+{
+    u32 n = 0;
+    for (i32 bit = 31; bit >= 0; bit--) {
+        if (mask & (1U << (u32)bit))
+            n++;
+        else
+            break;
+    }
+    return n;
+}
+
 static void dash_draw_listener_row(u32 row, u32 c_pid, u32 c_core, u32 c_user,
                                    u32 c_cpu, u32 c_mem, u32 c_proc,
                                    u32 c_fifo, u32 proc_width, u32 fifo_width,
@@ -13792,7 +13804,6 @@ static void dash_draw_listener_row(u32 row, u32 c_pid, u32 c_core, u32 c_user,
 static void hdmi_dashboard_render(void)
 {
     static u64 last_ms;
-    static u32 heartbeat;
     static bool layout_drawn;
     u64 now_ms = timer_monotonic_ms();
     /* Self-throttle floor (900ms) sits just under the 1Hz core0_io_tick_hook
@@ -13800,9 +13811,7 @@ static void hdmi_dashboard_render(void)
      * skips a second, while still preventing pathological back-to-back renders. */
     if (now_ms < last_ms + 900ULL)
         return;
-
     last_ms = now_ms;
-    heartbeat++;
     u64 t_dash0 = dash_now_ticks();
 
     struct perf_counter_snapshot perf;
@@ -13819,12 +13828,12 @@ static void hdmi_dashboard_render(void)
     u32 screen_cols = fb_cols();
     u32 screen_rows = fb_rows();
     bool wide = screen_cols >= 180U;
-    u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 6U;
+    u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 5U;
     u32 map_col = 0U;
     u32 map_row = header_row + header_h + 1U;
     u32 map_w = wide ? header_w : 78U;
     u32 log_col = 0;
-    u32 log_h = wide ? 6U : 8U;
+    u32 log_h = wide ? 11U : 12U;
     u32 log_top = screen_rows > log_h + map_row + 5U ? screen_rows - log_h - 1U :
                   (wide ? 28U : (screen_rows > 10U ? screen_rows - 9U : 28U));
     u32 log_w = header_w;
@@ -13843,56 +13852,65 @@ static void hdmi_dashboard_render(void)
     }
 
     dash_clear_body(header_col, header_row, header_w, header_h);
-    fb_set_cursor(header_col + 3, header_row + 1);
+    u32 h0 = header_col + 3U;
+    u32 h1 = header_col + (header_w / 3U) + 2U;
+    u32 h2 = header_col + ((header_w * 2U) / 3U) + 1U;
+    u32 ip = net_get_our_ip();
+    u32 mask = net_get_netmask();
+
+    fb_set_cursor(h0, header_row + 1);
     fb_set_color(0x00FF80FF, 0x00000000);
-    fb_puts(PIOS_BUILD_LABEL);
-    if (header_w > 78U) {
-        u32 cpu_col = header_col + header_w - 58U;
-        fb_set_cursor(cpu_col, header_row + 1);
-        fb_set_color(0x0000FF80, 0x00000000);
-        fb_puts("CPU: ");
-        fb_set_color(0x00FFFFFF, 0x00000000);
-        fb_puts("Total=");
-        dash_put_permille_pct(perf.cpu_total_permille);
-        fb_puts(" 0=");
-        dash_put_permille_pct(perf.cpu_permille[0]);
-        fb_puts(" 1=");
-        dash_put_permille_pct(perf.cpu_permille[1]);
-        fb_puts(" 2=");
-        dash_put_permille_pct(perf.cpu_permille[2]);
-        fb_puts(" 3=");
-        dash_put_permille_pct(perf.cpu_permille[3]);
-    }
-    fb_set_cursor(header_col + 3, header_row + 2);
+    fb_puts("VERSION: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_set_color(0x0000FF80, 0x00003310);
-    fb_puts(" ONLINE ");
+    fb_puts(PIOS_VERSION);
+    fb_set_cursor(h1, header_row + 1);
+    fb_set_color(0x0000FF80, 0x00000000);
+    fb_puts("UPTIME: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_puts("  ");
-    fb_puts("uptime=");
     fb_printf("%u", (u32)(now_ms / 1000ULL));
-    fb_puts("s hb=");
-    fb_printf("%u", heartbeat);
-    fb_puts(" ip=");
-    dash_ip(net_get_our_ip());
-    if (header_w > 78U) {
-        u32 ram_col = header_col + header_w - 58U;
-        fb_set_cursor(ram_col, header_row + 2);
-        fb_set_color(0x0000CCFF, 0x00000000);
-        fb_puts("RAM: ");
-        fb_set_color(0x00FFFFFF, 0x00000000);
-        fb_puts("Phys=");
-        dash_put_bytes_mb(perf.physical_ram_bytes);
-        fb_puts(" Pool=");
-        fb_printf("%uMB", perf.ram_total_kib >> 10);
-        fb_puts(" Used=");
-        fb_printf("%uMB", perf.ram_used_kib >> 10);
-        fb_puts(" K=");
-        fb_printf("%uMB", perf.ram_kernel_kib >> 10);
-        fb_puts(" U=");
-        fb_printf("%uMB", perf.ram_user_kib >> 10);
-    }
-    fb_set_cursor(header_col + 3, header_row + 3);
+    fb_puts("s");
+    fb_set_cursor(h2, header_row + 1);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("IP: ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    dash_ip(ip);
+    fb_puts("/");
+    fb_printf("%u", dash_prefix_len_from_mask(mask));
+
+    fb_set_cursor(h0, header_row + 2);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("CPU: ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts("Total=");
+    dash_put_permille_pct(perf.cpu_total_permille);
+    fb_puts(" 0=");
+    dash_put_permille_pct(perf.cpu_permille[0]);
+    fb_puts(" 1=");
+    dash_put_permille_pct(perf.cpu_permille[1]);
+    fb_puts(" 2=");
+    dash_put_permille_pct(perf.cpu_permille[2]);
+    fb_puts(" 3=");
+    dash_put_permille_pct(perf.cpu_permille[3]);
+    fb_set_cursor(h1, header_row + 2);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("RAM: ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts("Phys=");
+    dash_put_bytes_mb(perf.physical_ram_bytes);
+    fb_puts(" Pool=");
+    fb_printf("%uMB", perf.ram_total_kib >> 10);
+    fb_puts(" Used=");
+    fb_printf("%uMB", perf.ram_used_kib >> 10);
+    fb_set_cursor(h2, header_row + 2);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("RAM SPLIT: ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts("K=");
+    fb_printf("%uMB", perf.ram_kernel_kib >> 10);
+    fb_puts(" U=");
+    fb_printf("%uMB", perf.ram_user_kib >> 10);
+
+    fb_set_cursor(h0, header_row + 3);
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts("NET: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
@@ -13904,7 +13922,19 @@ static void hdmi_dashboard_render(void)
     dash_put_mbps(perf.nic_tx_mbps_x1000);
     fb_puts("/");
     dash_put_mbps(perf.nic_tx_peak_mbps_x1000);
-    fb_puts(" Mb/s   ");
+    fb_puts(" Mb/s");
+    fb_set_cursor(h1, header_row + 3);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("WALFS: ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts(perf.walfs_mounted ? "mount " : "down ");
+    fb_puts("reg=");
+    dash_put_bytes_mb(perf.walfs_region_bytes);
+    fb_puts(" used=");
+    dash_put_bytes_mb(perf.walfs_used_bytes);
+    fb_puts(" rec=");
+    fb_printf("%u", perf.walfs_records);
+    fb_set_cursor(h2, header_row + 3);
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts("SD: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
@@ -13917,25 +13947,6 @@ static void hdmi_dashboard_render(void)
     fb_puts("/");
     dash_put_mbps(perf.sd_write_peak_mbps_x1000);
     fb_puts(" Mb/s");
-    fb_set_cursor(header_col + 3, header_row + 4);
-    fb_set_color(0x0000CCFF, 0x00000000);
-    fb_puts("WALFS: ");
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_puts(perf.walfs_mounted ? "mounted " : "unmounted ");
-    fb_puts("part=");
-    dash_put_bytes_mb(perf.walfs_partition_bytes);
-    fb_puts(" region=");
-    dash_put_bytes_mb(perf.walfs_region_bytes);
-    fb_puts(" used=");
-    dash_put_bytes_mb(perf.walfs_used_bytes);
-    fb_puts(" free=");
-    dash_put_bytes_mb(perf.walfs_free_bytes);
-    fb_puts(" rec=");
-    fb_printf("%u", perf.walfs_records);
-    fb_puts(" super=");
-    fb_puts(perf.walfs_super_ok ? "ok" : "bad");
-    fb_puts(" root=");
-    fb_puts(perf.walfs_root_ok ? "ok" : "bad");
 
     dash_clear_body(map_col, map_row, map_w, map_h);
     u32 row = map_row + 1U;
@@ -14078,9 +14089,8 @@ static void core0_io_tick_hook(u32 core, u64 tick)
     u32 flags = 0;
     /* UART/USB stay responsive (~31Hz, cheap polls). NET/TCP drop to ~8Hz as a
      * safety net now that RX is interrupt-driven. DASH (the expensive HDMI
-     * render) fires at 1Hz so the uptime/heartbeat tick second-by-second; the
-     * render itself self-throttles (see hdmi_dashboard_render). Timer is 1000Hz
-     * (timer_init(1000)), so 1000 ticks == 1 second. */
+     * render) fires at 1Hz; the render itself self-throttles (see
+     * hdmi_dashboard_render). Timer is 1000Hz, so 1000 ticks == 1 second. */
     if ((tick & 31U) == 0)
         flags |= CORE0_IO_UART | CORE0_IO_USB;
     if ((tick & 127U) == 0)

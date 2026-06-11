@@ -196,3 +196,4 @@ const net_stats_t *net_get_stats(void);
 
 /* Get our configured IP address (for use by TCP, etc.) */
 u32 net_get_our_ip(void);
+u32 net_get_netmask(void);
