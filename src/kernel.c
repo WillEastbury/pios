@@ -179,6 +179,7 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HTTP_ROUTE_NETSTAT    9U
 #define HTTP_ROUTE_ACME       10U
 #define HTTP_ROUTE_PICOSCRIPT 11U
+#define HTTP_ROUTE_FAVICON    12U
 
 #define HTTP_ERR_NONE         0U
 #define HTTP_ERR_RESP_TIMEOUT 1U
@@ -222,6 +223,7 @@ static const char *http_route_name(u32 route)
     case HTTP_ROUTE_NETSTAT: return "netstat";
     case HTTP_ROUTE_ACME: return "acme";
     case HTTP_ROUTE_PICOSCRIPT: return "picoscript";
+    case HTTP_ROUTE_FAVICON: return "favicon";
     default: return "?";
     }
 }
@@ -374,6 +376,7 @@ static void net_services_listen(void);
 static void admin_services_listen(void);
 static void admin_services_poll(void);
 static void http_log_event(const char *event, u32 a, u32 b);
+static u32 http_build_no_content_response(char *out, u32 max);
 static u32 http_build_picoscript_response(char *out, u32 max);
 static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len);
 static void pios_bootctrl_mark_success(void);
@@ -1045,6 +1048,9 @@ static u32 http_route_id(const u8 *req, u32 len)
         http_request_path_is(req, len, "/picoscript/") ||
         http_request_path_is(req, len, "/picoscript/playground.html"))
         return HTTP_ROUTE_PICOSCRIPT;
+    if (http_request_path_is(req, len, "/favicon.ico") ||
+        http_request_path_is(req, len, "/picoscript/favicon.ico"))
+        return HTTP_ROUTE_FAVICON;
     if (http_request_path_is(req, len, "/api/admin/reboot"))
         return HTTP_ROUTE_REBOOT;
     if (http_request_path_is(req, len, "/api/admin/log-stream") ||
@@ -5690,6 +5696,12 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
         http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
         return len;
     }
+    if (route == HTTP_ROUTE_FAVICON) {
+        len = http_build_no_content_response(out, max);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 204);
+        return len;
+    }
     if (HTTP_AUTH_ENABLED && !http_admin_authorized(req, req_len)) {
         http_diag.unauthorized++;
         len = http_build_unauthorized(out, max);
@@ -5921,6 +5933,17 @@ static u32 http_build_header_too_large(char *out, u32 max)
         "Content-Type: text/plain\r\n"
         "Connection: close\r\n\r\n"
         "PIOS admin request headers too large.\n");
+    return len;
+}
+
+static u32 http_build_no_content_response(char *out, u32 max)
+{
+    u32 len = 0;
+    http_append(out, &len, max,
+        "HTTP/1.0 204 No Content\r\n"
+        "Cache-Control: max-age=86400\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n");
     return len;
 }
 
