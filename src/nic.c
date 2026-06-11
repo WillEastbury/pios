@@ -496,11 +496,18 @@ static u32 pct_u64(u64 part, u64 total)
 static void nic_render_system_panel(void)
 {
 #if NIC_HDMI_TEXT_PANELS
+    struct nic_panel_core_sample {
+        u64 last_ticks;
+        u64 last_poll;
+        u32 last_cpu;
+        u32 _pad0;
+        u64 _pad[4];
+    } ALIGNED(64);
     static u64 last_ms;
-    static u64 last_ticks[4];
-    static u64 last_poll[4];
-    static u32 last_cpu[4];
+    static struct nic_panel_core_sample samples[4];
     static u32 heartbeat;
+    _Static_assert(sizeof(struct nic_panel_core_sample) == 64,
+                   "NIC panel per-core samples must be one cache line");
 
     u64 now_ms = timer_monotonic_ms();
     if (now_ms < last_ms + 1000ULL)
@@ -509,17 +516,17 @@ static void nic_render_system_panel(void)
     if (last_ms != 0) {
         for (u32 i = 0; i < 4; i++) {
             struct core_env *e = core_env_of(i);
-            u64 dt = timer_ticks_core(i) - last_ticks[i];
-            u64 dp = e->poll_count - last_poll[i];
-            last_cpu[i] = dp ? 100 : (dt ? 1 : 0);
-            last_ticks[i] = timer_ticks_core(i);
-            last_poll[i] = e->poll_count;
+            u64 dt = timer_ticks_core(i) - samples[i].last_ticks;
+            u64 dp = e->poll_count - samples[i].last_poll;
+            samples[i].last_cpu = dp ? 100 : (dt ? 1 : 0);
+            samples[i].last_ticks = timer_ticks_core(i);
+            samples[i].last_poll = e->poll_count;
         }
     } else {
         for (u32 i = 0; i < 4; i++) {
             struct core_env *e = core_env_of(i);
-            last_ticks[i] = timer_ticks_core(i);
-            last_poll[i] = e->poll_count;
+            samples[i].last_ticks = timer_ticks_core(i);
+            samples[i].last_poll = e->poll_count;
         }
     }
     last_ms = now_ms;
@@ -546,13 +553,13 @@ static void nic_render_system_panel(void)
     fb_puts(" udp=");
     fb_count32(socket_udp_active_count());
     fb_puts(" ACT% c0=");
-    fb_count32(last_cpu[0]);
+    fb_count32(samples[0].last_cpu);
     fb_puts(" c1=");
-    fb_count32(last_cpu[1]);
+    fb_count32(samples[1].last_cpu);
     fb_puts(" c2=");
-    fb_count32(last_cpu[2]);
+    fb_count32(samples[2].last_cpu);
     fb_puts(" c3=");
-    fb_count32(last_cpu[3]);
+    fb_count32(samples[3].last_cpu);
     fb_puts(" RAM=");
     fb_count32(used / 1024ULL);
     fb_puts("K/");
