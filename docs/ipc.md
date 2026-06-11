@@ -6,6 +6,31 @@ All inter-core communication uses **lock-free SPSC (Single-Producer Single-Consu
 
 There are 16 FIFO channels arranged in a 4×4 grid (`fifo[src][dst]`). The diagonal (`fifo[i][i]`) is unused. This gives 12 active unidirectional channels.
 
+## Inter-Core Correctness Invariants
+
+These are hard invariants for FIFO, wake-ring, scheduler, descriptor, IPC, and DMA work. Treat violations as correctness bugs before investigating higher-level behavior.
+
+1. **Single writer per cache line** — any FIFO head/tail/counter/state word written by different cores must live on separate 64-byte cache lines. No packed per-core arrays for mutable scheduler/FIFO state.
+2. **SPSC ownership only** — each FIFO direction has exactly one producer core and one consumer core. MPSC/MPMC behavior requires a different primitive.
+3. **Publish-before-doorbell** — producer writes payload, publishes payload/control with the primitive's release barrier/cache-maintenance contract, updates the visible head/sequence, then signals with `sev`/SGI. Never signal before the descriptor is complete.
+4. **Acquire-after-doorbell** — consumer refreshes or observes the visible head/sequence with the primitive's acquire contract before reading payload.
+5. **No lost-wakeup window** — any process park path must have a sticky wake latch or equivalent sequence check so "check work -> arm/block" is atomic relative to wake publication.
+6. **Scheduler-local means cache-line-local** — per-core scheduler state (`current_proc`, `rr_cursor`, diagnostics, current PID/state, idle counters) must be per-core and 64-byte isolated.
+7. **Process control line isolation** — PID/state/affinity/wake metadata must not share a cache line with another process slot or another core's mutable fields.
+8. **No cross-core state mutation without ownership** — a core may only mutate process state for processes it owns, except through an explicit remote-wake/migration/command protocol.
+9. **Wake target must be core-qualified** — remote wake records must carry enough routing identity to prove `target_core` and PID/slot ownership are consistent.
+10. **Counters are diagnostics, not synchronization** — debug counters may be approximate unless explicitly marked coherent; scheduling correctness must not depend on them.
+11. **Single cacheability model per physical page** — no PA may be mapped WB in one TTBR and NC/device in another. Attribute mismatch is a boot-time/panic-level bug.
+12. **Stage-2 fails closed** — EL2 stage-2 may only map ranges whose attributes it can prove or mirror. No blanket WB mappings.
+13. **Descriptor ownership is linear** — a descriptor is owned by exactly one domain at a time: producer, kernel, consumer, or free pool. No shared mutable ownership.
+14. **Sequence numbers beat booleans** — wake, FIFO, and descriptor publication state should use monotonic sequence numbers where possible. Flags are lossy under races.
+15. **Reuse requires generation tags** — any recycled process slot, descriptor, FIFO entry, lease, or pool descriptor should carry a generation/version to catch stale references.
+16. **No control/data aliasing** — control words and payload buffers should not share cache lines. Payload churn must not dirty control metadata.
+17. **Barriers are part of the ABI** — every FIFO/wake primitive must define its release/acquire barrier contract. Callers do not improvise barriers.
+18. **Remote mutation is message passing** — if core A needs core B's state changed, it posts a command. It does not poke B's scheduler/process fields directly.
+19. **Diagnostics must not perturb scheduling** — tracing/counters must be isolated enough that enabling diagnostics cannot change cache-line ownership of scheduler state.
+20. **Every park has a reason and every wake has evidence** — park records should capture the last checked sequence/head, and wake records should carry the published sequence/head.
+
 ## FIFO Location
 
 FIFOs live in shared memory at `SHARED_FIFO_BASE` (0x04800000), outside any core's private RAM. Total: 1MB.

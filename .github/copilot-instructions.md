@@ -35,6 +35,31 @@ PIOS hardware bring-up is expected to fail iteratively before it works. Do not s
 
 For risky hardware paths, prefer guarded harness commands over boot-time enablement: bound interrupt counts/rates, auto-disable lines before storms, snapshot pre/post MMIO state in one response, and leave the live board on a health-stable image before committing. Treat every failed probe as data for the next narrower probe.
 
+### Hard inter-core invariants
+
+Use these as scan/review rules for FIFO, wake-ring, scheduler, descriptor, IPC, and DMA changes:
+
+1. **Single writer per cache line** — words written by different cores must live on different 64-byte lines.
+2. **SPSC ownership only** — each FIFO direction has exactly one producer and one consumer unless a different primitive is explicitly designed.
+3. **Publish-before-doorbell** — producer writes payload/control, performs the release/publish barrier contract, then signals with `sev`/SGI.
+4. **Acquire-after-doorbell** — consumer refreshes/observes sequence/head with the acquire contract before reading payload.
+5. **No lost-wakeup window** — park paths use a sticky wake latch or monotonic sequence check around "check work -> block".
+6. **Scheduler-local means cache-line-local** — per-core scheduler state must be per-core and 64-byte isolated.
+7. **Process control line isolation** — PID/state/affinity/wake metadata must not share lines with another process slot or another core's mutable fields.
+8. **No cross-core state mutation without ownership** — remote state changes are commands/messages, not direct pokes.
+9. **Wake target must be core-qualified** — wake records must prove target core and PID/slot ownership are consistent.
+10. **Counters are diagnostics, not synchronization** — correctness must not depend on approximate counters.
+11. **Single cacheability model per physical page** — no PA may be mapped WB in one TTBR and NC/device in another; attribute mismatch is a panic-level bug.
+12. **Stage-2 fails closed** — EL2 may map only ranges whose attributes it can prove/mirror.
+13. **Descriptor ownership is linear** — a descriptor is owned by exactly one domain at a time: producer, kernel, consumer, or free pool.
+14. **Sequence numbers beat booleans** — publication state should use monotonic sequences where possible; flags are lossy under races.
+15. **Reuse requires generation tags** — recycled process slots, descriptors, FIFO entries, leases, and pool descriptors need generation/version tags.
+16. **No control/data aliasing** — control words and payload buffers must not share cache lines.
+17. **Barriers are part of the ABI** — FIFO/wake primitives define release/acquire contracts; callers do not improvise barriers.
+18. **Remote mutation is message passing** — core A changes core B's scheduler/process state by posting a command to B.
+19. **Diagnostics must not perturb scheduling** — tracing/counters must be isolated so enabling diagnostics cannot change scheduler cache-line ownership.
+20. **Every park has a reason and every wake has evidence** — park records capture last checked sequence/head; wake records carry the published sequence/head.
+
 ### Core Assignment (fixed, not scheduled)
 
 | Core | Role | Hot loop | Source |
