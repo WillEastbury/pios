@@ -58,19 +58,26 @@ PIOS uses a **static partitioning** model. Each core runs a single dedicated rol
 ```
 Physical Address        Size    Region              Cacheability
 ────────────────────────────────────────────────────────────────
-0x0000_0000_0008_0000   ~240KB  Kernel .text+.rodata Normal WB
-0x0000_0000_001x_xxxx   ~1MB    BSS (stacks, bufs)   Normal WB
-0x0000_0000_0020_0000   16MB    Core 0 private        Normal WB
-0x0000_0000_0120_0000   16MB    Core 1 private        Normal WB
-0x0000_0000_0220_0000   16MB    Core 2 private        Normal WB
-0x0000_0000_0320_0000   16MB    Core 3 private        Normal WB
-0x0000_0000_0420_0000   1MB     Shared FIFO rings     Normal WB
-0x0000_0000_0430_0000   2MB     DMA NET buffers       Normal WB
-0x0000_0000_0450_0000   2MB     DMA DISK buffers      Normal WB
-0x0000_0000_0470_0000   1MB     IPC shared regions    Normal WB
+0x0000_0000_0008_0000   var     Kernel .text/.rodata  Normal WB
+0x0000_0000_001x_xxxx   var     BSS/stacks/metadata   Normal NC
+0x0000_0000_0080_0000   16MB    Core 0 private        Normal WB
+0x0000_0000_0180_0000   16MB    Core 1 private        Normal WB
+0x0000_0000_0280_0000   16MB    Core 2 private        Normal WB
+0x0000_0000_0380_0000   16MB    Core 3 private        Normal WB
+0x0000_0000_0480_0000   1MB     Shared FIFO rings     Normal NC
+0x0000_0000_0490_0000   2MB     DMA NET buffers       Normal NC
+0x0000_0000_04B0_0000   2MB     DMA DISK buffers      Normal NC
+0x0000_0000_04D0_0000   1MB     IPC shared regions    Normal NC
+0x0000_0000_0500_0000   16MB    HDMI back buffer      Normal WB
 0x0000_0001_07C0_0000   4MB     BCM2712 peripherals   Device-nGnRnE
 0x0000_001F_0000_0000   16MB    RP1 BAR0 (PCIe)       Device-nGnRnE
 ```
+
+### Memory Attribute Invariant
+
+No physical page may ever be visible with conflicting memory attributes. Every mapping of the same PA must agree on cacheability, shareability, and device-vs-normal type across kernel TTBR0, user/process TTBR0, high-VA aliases, temporary diagnostics, and stage-2.
+
+This is a hard correctness rule. Scheduler/process metadata, FIFOs, DMA windows, and IPC control/data pages are NC in the kernel table and must be NC everywhere else they are visible. Private process slots are WB and may be WB in user tables because the kernel view is also WB. Device MMIO is Device-nGnRnE everywhere.
 
 ### Per-Core Private RAM Layout
 

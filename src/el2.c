@@ -1,6 +1,7 @@
 #include "el2.h"
 #include "simd.h"
 #include "proc.h"
+#include "core_env.h"
 
 __asm__(".global __el2_integrity_start\n__el2_integrity_start:");
 
@@ -83,6 +84,18 @@ static void el2_stage2_build_table(u32 id)
                   S2_PTE_VALID | S2_PTE_BLOCK | S2_PTE_AF |
                   S2_MEMATTR_NORMAL | S2_SH_INNER | S2_S2AP_RW;
     }
+
+}
+
+static bool el2_stage2_pa_range_is_normal_wb(u64 pa_base, u64 size)
+{
+    if (size == 0 || pa_base + size < pa_base)
+        return false;
+    /* Stage-2 descriptors currently encode only Normal cacheable memory. Do not
+     * map any PA that is NC/device in stage-1, or the same physical page would be
+     * visible with conflicting attributes. For now capsules may map only the
+     * per-core private RAM window, which the kernel maps WB everywhere. */
+    return pa_base >= CORE0_RAM_BASE && pa_base + size <= SHARED_FIFO_BASE;
 }
 
 static bool el2_stage2_program_hw(u32 id)
@@ -203,6 +216,8 @@ i32 el2_stage2_plan_set(u32 id, u64 ipa_base, u64 ipa_size, u64 pa_base, u64 fla
         return -1;
     if ((ipa_base & ((1UL << 21) - 1)) != 0 || (pa_base & ((1UL << 21) - 1)) != 0 ||
         (ipa_size & ((1UL << 21) - 1)) != 0)
+        return -1;
+    if (!el2_stage2_pa_range_is_normal_wb(pa_base, ipa_size))
         return -1;
     struct el2_stage2_plan *p = &g_stage2[id];
     p->configured = true;

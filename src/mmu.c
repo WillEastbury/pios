@@ -306,21 +306,37 @@ void mmu_init(void) {
     for (u32 i = 0; i < 512; i++)
         l1[i] = 0;
 
-    /* RAM: L1[0] split into 2MB blocks via l2_table_low, L1[1-3] WB cacheable */
-    u64 ram_attr = PTE_VALID | PTE_BLOCK | PTE_AF |
-                   PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
-
-    /* L1[0] = table descriptor → l2_table_low (first 1GB in 2MB blocks) */
+    /* L1[0] = table descriptor -> l2_table_low. Preserve the same low-RAM
+     * attribute split used by mmu_enable_caching(): kernel code/data WB,
+     * kernel BSS/page-tables/scheduler metadata NC, core-private RAM WB,
+     * shared FIFO/DMA/IPC NC, framebuffer back buffer WB. */
     volatile u64 *l2 = l2_table_low;
+    extern char __text_start[];
+    extern char __bss_start[];
+    const u64 code_lo = (u64)(usize)__text_start & ~(L3_PAGE_SIZE - 1);
+    const u64 code_hi = (u64)(usize)__bss_start  & ~(L3_PAGE_SIZE - 1);
     for (u32 i = 0; i < 512; i++) {
         u64 addr = (u64)i * L2_BLOCK_SIZE;
-        l2[i] = addr | ram_attr;  /* Normal WB Cacheable */
+        if (i == 0) {
+            for (u32 p = 0; p < 512; p++) {
+                u64 page = (u64)p * L3_PAGE_SIZE;
+                u64 attr = (page >= code_lo && page < code_hi)
+                               ? PTE_ATTR(MT_NORMAL) : PTE_ATTR(MT_NORMAL_NC);
+                l3_block0[p] = page | PTE_VALID | PTE_PAGE | PTE_AF |
+                               PTE_SH_INNER | attr | PTE_AP_RW_EL1;
+            }
+            l2[i] = (u64)(usize)l3_block0 | PTE_VALID | PTE_TABLE;
+            continue;
+        }
+        bool cache = (addr >= CORE0_RAM_BASE && addr < SHARED_FIFO_BASE) ||
+                     (addr >= FB_BACK_BASE && addr < FB_BACK_BASE + FB_BACK_SIZE);
+        l2[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);
     }
     l1[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
 
-    l1[1] = 0x40000000UL | ram_attr;
-    l1[2] = 0x80000000UL | ram_attr;
-    l1[3] = 0xC0000000UL | ram_attr;
+    l1[1] = ram_block_1g(0x40000000UL);
+    l1[2] = ram_block_1g(0x80000000UL);
+    l1[3] = ram_block_1g(0xC0000000UL);
 
     /* Peripherals: indices 64-67 (BCM2712 at 0x107C000000 = 65GB) */
     u64 dev_attr = PTE_VALID | PTE_BLOCK | PTE_AF |

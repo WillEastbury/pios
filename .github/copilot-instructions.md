@@ -62,7 +62,19 @@ Cores communicate **only** through lock-free SPSC FIFOs (`fifo.h`). No shared mu
 0x1F00000000        RP1 southbridge (PCIe BAR, device memory)
 ```
 
-All addresses are physical. The MMU is identity-mapped (VA == PA). RAM regions are Normal WB Cacheable; peripheral regions are Device-nGnRnE.
+All addresses are physical. The MMU is identity-mapped (VA == PA). Cacheability is region-specific; do not assume "RAM == WB". Kernel `.bss`, page tables, shared FIFO/DMA/IPC windows, and other control metadata may be Normal NC even when nearby private RAM is WB.
+
+### Hard MMU invariant: no conflicting attributes
+
+No physical page may ever be visible through two mappings with conflicting memory attributes. This is a correctness rule, not a performance preference.
+
+- If a PA is mapped Normal NC in the kernel table, every user, alias, stage-2, diagnostic, and temporary mapping of that same PA must also be Normal NC with compatible shareability.
+- If a PA is mapped Device-nGnRnE, every visible mapping of that PA must be Device-nGnRnE.
+- Only map a PA as Normal WB if every visible alias of that PA is also Normal WB.
+- User page tables must mirror the kernel attributes for scheduler/process/FIFO/IPC metadata. Use helpers such as `map_user_kernel_low()`, `user_ram_nc_attrs()`, and `user_page_el0_nc_xn_attrs()` rather than open-coded WB mappings for shared/control regions.
+- Stage-2 mappings are part of the same invariant. If stage-2 cannot express the correct effective attribute for a PA, reject the mapping instead of approximating it.
+
+Violations create stale or incoherent metadata that looks like scheduler ghosts. Before debugging process state, wake rings, FIFOs, IPC, or DMA, first verify that every mapping of the physical page has identical cacheability/shareability/device attributes.
 
 ### Boot Sequence
 
