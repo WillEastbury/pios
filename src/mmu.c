@@ -165,13 +165,13 @@ static inline u64 user_page_rw_xn_attrs(void)
 static inline u64 user_page_el0_rx_attrs(void)
 {
     return PTE_VALID | PTE_PAGE | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RO_EL0 | PTE_PXN;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL0 | PTE_PXN | PTE_NG;
 }
 
 static inline u64 user_page_el0_rw_xn_attrs(void)
 {
     return PTE_VALID | PTE_PAGE | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN | PTE_NG;
 }
 
 static bool mmu_user_slot_pages(u32 core, u32 slot, u64 slot_base, u64 slot_size,
@@ -218,6 +218,14 @@ static bool mmu_user_slot_pages(u32 core, u32 slot, u64 slot_base, u64 slot_size
     }
 
     return l3_count > 0;
+}
+
+static void mmu_user_table_publish(u32 uc, u32 slot)
+{
+    dcache_clean_invalidate_range((u64)(usize)user_l1[uc][slot], sizeof(user_l1[uc][slot]));
+    dcache_clean_invalidate_range((u64)(usize)user_l2_low[uc][slot], sizeof(user_l2_low[uc][slot]));
+    dcache_clean_invalidate_range((u64)(usize)user_l3_proc[uc][slot], sizeof(user_l3_proc[uc][slot]));
+    dsb();
 }
 
 void mmu_init(void) {
@@ -466,6 +474,7 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
     /* Keep peripheral MMIO mapped for current direct-call kernel API ABI. */
     map_user_device_windows(l1);
 
+    mmu_user_table_publish(uc, slot);
     user_table_valid[uc][slot] = true;
     return true;
 }
@@ -497,6 +506,7 @@ bool mmu_user_table_build_split(u32 core, u32 slot, u64 slot_base, u64 slot_size
 
     map_user_device_windows(l1);
 
+    mmu_user_table_publish(uc, slot);
     user_table_valid[uc][slot] = true;
     return true;
 }
@@ -525,6 +535,60 @@ bool mmu_user_table_build_split_el0(u32 core, u32 slot, u64 slot_base, u64 slot_
 
     map_user_device_windows(l1);
 
+    mmu_user_table_publish(uc, slot);
+    user_table_valid[uc][slot] = true;
+    return true;
+}
+
+bool mmu_user_table_build_split_el0_at(u32 core, u32 slot, u64 va_base, u64 pa_base,
+                                       u64 slot_size, u32 code_bytes)
+{
+    if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
+        return false;
+    if ((va_base & (L3_PAGE_SIZE - 1)) != 0 || (pa_base & (L3_PAGE_SIZE - 1)) != 0 ||
+        slot_size != PROC_SLOT_SIZE)
+        return false;
+    if (code_bytes == 0 || code_bytes > slot_size)
+        return false;
+
+    u32 uc = user_core_index(core);
+    u64 *l1 = user_l1[uc][slot];
+    u64 *l2 = user_l2_low[uc][slot];
+    simd_zero(l1, 512 * sizeof(u64));
+    simd_zero(l2, 512 * sizeof(u64));
+
+    l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
+    const u64 ram_attrs = user_ram_attrs();
+    for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++)
+        map_user_low_2m(l2, b, (u64)b * L2_BLOCK_SIZE, ram_attrs);
+
+    u64 l1idx = va_base / L1_BLOCK_SIZE;
+    if (l1idx >= 512)
+        return false;
+    l1[l1idx] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
+
+    simd_zero(user_l3_proc[uc][slot][0], 512 * sizeof(u64));
+    simd_zero(user_l3_proc[uc][slot][1], 512 * sizeof(u64));
+    u64 code_end = va_base + code_bytes;
+    u64 data_start = (code_end + L3_PAGE_SIZE - 1) & ~(u64)(L3_PAGE_SIZE - 1);
+    u64 first_l2 = (va_base % L1_BLOCK_SIZE) / L2_BLOCK_SIZE;
+    for (u64 off = 0; off < slot_size; off += L3_PAGE_SIZE) {
+        u64 va = va_base + off;
+        u64 pa = pa_base + off;
+        u64 idx = (va % L1_BLOCK_SIZE) / L2_BLOCK_SIZE;
+        u32 table = (u32)(idx - first_l2);
+        if (table >= 2)
+            return false;
+        if (l2[idx] == 0)
+            l2[idx] = (u64)(usize)user_l3_proc[uc][slot][table] | PTE_VALID | PTE_TABLE;
+        u64 attrs = (va < data_start) ? user_page_el0_rx_attrs() : user_page_el0_rw_xn_attrs();
+        user_l3_proc[uc][slot][table][(va / L3_PAGE_SIZE) & 511U] =
+            (pa & ~(L3_PAGE_SIZE - 1)) | attrs;
+    }
+
+    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
+    map_user_device_windows(l1);
+    mmu_user_table_publish(uc, slot);
     user_table_valid[uc][slot] = true;
     return true;
 }
@@ -567,6 +631,37 @@ bool mmu_user_ipc_shm_window(u32 core, u32 slot, bool enable)
 
     if (core == core_id())
         mmu_invalidate_tlb();
+    return true;
+}
+
+bool mmu_user_pte_snapshot(u32 core, u32 slot, u64 va, u64 *l1e, u64 *l2e, u64 *l3e)
+{
+    if (l1e) *l1e = 0;
+    if (l2e) *l2e = 0;
+    if (l3e) *l3e = 0;
+    if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
+        return false;
+    u32 uc = user_core_index(core);
+    if (!user_table_valid[uc][slot])
+        return false;
+    u32 l1idx = (u32)(va / L1_BLOCK_SIZE);
+    if (l1idx >= 512)
+        return false;
+    if (l1e) *l1e = user_l1[uc][slot][l1idx];
+    u32 l2idx = (u32)(va / L2_BLOCK_SIZE);
+    if (l2idx >= 512)
+        return false;
+    u64 e2 = user_l2_low[uc][slot][l2idx];
+    if (l2e) *l2e = e2;
+    if ((e2 & (PTE_VALID | PTE_TABLE)) == (PTE_VALID | PTE_TABLE)) {
+        u64 slot_base = (u64)core_ram_bases[core] + PROC_SLOT_OFFSET + (u64)slot * PROC_SLOT_SIZE;
+        u64 first_l2 = slot_base / L2_BLOCK_SIZE;
+        if (l2idx < first_l2 || l2idx - first_l2 >= 2)
+            return true;
+        u32 table = (u32)(l2idx - first_l2);
+        u32 pidx = (u32)((va / L3_PAGE_SIZE) & 511U);
+        if (l3e) *l3e = user_l3_proc[uc][slot][table][pidx];
+    }
     return true;
 }
 

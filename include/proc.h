@@ -525,8 +525,15 @@ i32  proc_launch_on_core_as_prio(u32 target_core, const char *path, u32 principa
 i32  proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
                         u32 priority_class, u32 affinity_core);
 i32  proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
-                            u64 linked_base, u32 priority_class, u32 affinity_core);
+                            u64 linked_base, u64 physical_base,
+                            u32 priority_class, u32 affinity_core);
 void proc_el0_probe_snapshot(u32 *seen, u32 *pid, u32 *spsr, u64 *arg, u64 *elr, u32 *exits);
+void proc_el0_diag_snapshot(i32 *launch_status, u32 *launch_pid, u32 *launch_slot,
+                            u64 *launch_base, u32 *enter_count, u32 *enter_pid,
+                            u64 *enter_pc, u64 *enter_sp, u32 *fault_pid,
+                            u64 *fault_esr, u64 *fault_elr, u64 *fault_far,
+                            u64 *fault_l1e, u64 *fault_l2e, u64 *fault_l3e,
+                            u64 *fault_par0w, u64 *fault_par0r, u64 *fault_par1w);
 /* Block the current process until woken (BLOCKED + yield to scheduler). */
 void proc_park(void);
 /* Post a wake for `pid` onto `target_core`'s wake ring and SEV. Safe to call

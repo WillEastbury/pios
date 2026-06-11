@@ -42,6 +42,13 @@ if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_el0_probe.elf user_el0_probe.img
 if errorlevel 1 exit /b 1
 for %%f in (user_el0_probe.img) do echo user_el0_probe.img size: %%~zf bytes
+"%CC%" %USER_CFLAGS% -c user\el0_pico.c -o build_user\el0_pico.o
+if errorlevel 1 exit /b 1
+"%LD%" -T user\el0_pico.ld -nostdlib -o build_user\user_el0_pico.elf build_user\ustart.o build_user\el0_pico.o build_user\picovm.o
+if errorlevel 1 exit /b 1
+"%OC%" -O binary build_user\user_el0_pico.elf user_el0_pico.img
+if errorlevel 1 exit /b 1
+for %%f in (user_el0_pico.img) do echo user_el0_pico.img size: %%~zf bytes
 
 echo Building full kernel as real_kernel.img...
 if not exist build mkdir build

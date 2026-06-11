@@ -3154,6 +3154,53 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_hex64(out, &len, max, elr);
         http_append(out, &len, max, " exits=");
         http_append_u64(out, &len, max, exits);
+        i32 lst = 0; u32 lpid = 0, lslot = 0, ecnt = 0, epid = 0, fpid = 0;
+        u64 lbase = 0, epc = 0, esp = 0, fesr = 0, felr = 0, ffar = 0, fl1e = 0, fl2e = 0, fl3e = 0;
+        u64 par0w = 0, par0r = 0, par1w = 0;
+        proc_el0_diag_snapshot(&lst, &lpid, &lslot, &lbase, &ecnt, &epid,
+                               &epc, &esp, &fpid, &fesr, &felr, &ffar, &fl1e, &fl2e, &fl3e,
+                               &par0w, &par0r, &par1w);
+        http_append(out, &len, max, " launch=");
+        if (lst < 0) {
+            http_append(out, &len, max, "-");
+            http_append_u64(out, &len, max, (u32)(-lst));
+        } else {
+            http_append_u64(out, &len, max, (u32)lst);
+        }
+        http_append(out, &len, max, " lpid=");
+        http_append_u64(out, &len, max, lpid);
+        http_append(out, &len, max, " slot=");
+        http_append_u64(out, &len, max, lslot);
+        http_append(out, &len, max, " base=0x");
+        http_append_hex64(out, &len, max, lbase);
+        http_append(out, &len, max, " enter=");
+        http_append_u64(out, &len, max, ecnt);
+        http_append(out, &len, max, " epid=");
+        http_append_u64(out, &len, max, epid);
+        http_append(out, &len, max, " epc=0x");
+        http_append_hex64(out, &len, max, epc);
+        http_append(out, &len, max, " esp=0x");
+        http_append_hex64(out, &len, max, esp);
+        http_append(out, &len, max, " fpid=");
+        http_append_u64(out, &len, max, fpid);
+        http_append(out, &len, max, " fesr=0x");
+        http_append_hex64(out, &len, max, fesr);
+        http_append(out, &len, max, " felr=0x");
+        http_append_hex64(out, &len, max, felr);
+        http_append(out, &len, max, " ffar=0x");
+        http_append_hex64(out, &len, max, ffar);
+        http_append(out, &len, max, " l1e=0x");
+        http_append_hex64(out, &len, max, fl1e);
+        http_append(out, &len, max, " l2e=0x");
+        http_append_hex64(out, &len, max, fl2e);
+        http_append(out, &len, max, " l3e=0x");
+        http_append_hex64(out, &len, max, fl3e);
+        http_append(out, &len, max, " par0w=0x");
+        http_append_hex64(out, &len, max, par0w);
+        http_append(out, &len, max, " par0r=0x");
+        http_append_hex64(out, &len, max, par0r);
+        http_append(out, &len, max, " par1w=0x");
+        http_append_hex64(out, &len, max, par1w);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "ipc bench") || http_starts_with(cmd, "ipc bench ")) {
         u32 iters = 10000;
@@ -13551,6 +13598,8 @@ extern const u8 user_httpd_start[];
 extern const u8 user_httpd_end[];
 extern const u8 user_el0_probe_start[];
 extern const u8 user_el0_probe_end[];
+extern const u8 user_el0_pico_start[];
+extern const u8 user_el0_pico_end[];
 NORETURN void core2_main(void) {
     core_mark_online(CORE_USER0, 1);
     core_env_init(CORE_USER0);
@@ -13583,9 +13632,15 @@ NORETURN void core3_main(void) {
     core_mark_online(CORE_USER1, 4);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     core_mark_online(CORE_USER1, 5);
-    proc_exec_from_mem_el0("user/el0probe", user_el0_probe_start,
-                           (u32)(usize)(user_el0_probe_end - user_el0_probe_start),
-                           0x03B00000ULL, PROC_PRIO_NORMAL, core_id());
+    {
+        u64 sctlr;
+        __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+        sctlr |= (1ULL << 23); /* SPAN: do not force PAN on EL1 exception entry */
+        __asm__ volatile("msr sctlr_el1, %0\nisb" :: "r"(sctlr) : "memory");
+    }
+    proc_exec_from_mem_el0("user/el0pico", user_el0_pico_start,
+                           (u32)(usize)(user_el0_pico_end - user_el0_pico_start),
+                           0x2002000000ULL, 0x03B00000ULL, PROC_PRIO_NORMAL, core_id());
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }

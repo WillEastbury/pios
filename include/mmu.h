@@ -31,6 +31,7 @@
 #define PTE_AP_RO_EL0       (3UL << 6)   /* EL1/EL0 read-only */
 #define PTE_UXN             (1UL << 54)  /* Unprivileged Execute Never */
 #define PTE_PXN             (1UL << 53)  /* Privileged Execute Never */
+#define PTE_NG              (1UL << 11)  /* not global */
 #define PTE_ATTR(idx)       ((u64)(idx) << 2)
 
 /* Block sizes at each translation level (4KB granule) */
@@ -71,12 +72,15 @@ bool mmu_user_table_build_split(u32 core, u32 slot, u64 slot_base, u64 slot_size
 
 /* Build split process table with EL0-accessible code/data permissions. */
 bool mmu_user_table_build_split_el0(u32 core, u32 slot, u64 slot_base, u64 slot_size, u32 code_bytes);
+bool mmu_user_table_build_split_el0_at(u32 core, u32 slot, u64 va_base, u64 pa_base,
+                                       u64 slot_size, u32 code_bytes);
 
 /* Switch active TTBR0 to a process table on core 2/3 */
 bool mmu_switch_to_user(u32 core, u32 slot);
 
 /* Toggle user-process visibility of the IPC SHM window (coarse 2MB block). */
 bool mmu_user_ipc_shm_window(u32 core, u32 slot, bool enable);
+bool mmu_user_pte_snapshot(u32 core, u32 slot, u64 va, u64 *l1e, u64 *l2e, u64 *l3e);
 
 /* Switch active TTBR0 back to the global kernel table */
 void mmu_switch_to_kernel(void);
