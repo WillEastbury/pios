@@ -180,6 +180,8 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HTTP_ROUTE_ACME       10U
 #define HTTP_ROUTE_PICOSCRIPT 11U
 #define HTTP_ROUTE_FAVICON    12U
+#define HTTP_ROUTE_STATIC     13U
+#define HTTP_ROUTE_STATIC_PUT 14U
 
 #define HTTP_ERR_NONE         0U
 #define HTTP_ERR_RESP_TIMEOUT 1U
@@ -224,6 +226,8 @@ static const char *http_route_name(u32 route)
     case HTTP_ROUTE_ACME: return "acme";
     case HTTP_ROUTE_PICOSCRIPT: return "picoscript";
     case HTTP_ROUTE_FAVICON: return "favicon";
+    case HTTP_ROUTE_STATIC: return "static";
+    case HTTP_ROUTE_STATIC_PUT: return "static-put";
     default: return "?";
     }
 }
@@ -269,6 +273,10 @@ static u32 http_resp_off;
 static const u8 *http_static_body;
 static u32 http_static_len;
 static u32 http_static_off;
+static u64 http_file_id;
+static u32 http_file_len;
+static u32 http_file_off;
+static u8 http_file_chunk[512];
 static u32 http_last_state;
 static u32 http_last_readable;
 static u32 http_last_writable;
@@ -378,6 +386,8 @@ static void admin_services_poll(void);
 static void http_log_event(const char *event, u32 a, u32 b);
 static u32 http_build_no_content_response(char *out, u32 max);
 static u32 http_build_picoscript_response(char *out, u32 max);
+static u32 http_build_static_file_response(char *out, u32 max, const u8 *req, u32 req_len);
+static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, u32 req_len);
 static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len);
 static void pios_bootctrl_mark_success(void);
 static void core0_sched_snapshot(u64 *wake, u64 *wfi_count, u64 *idle_ticks,
@@ -1046,13 +1056,15 @@ static bool http_request_path_prefix_token(const u8 *req, u32 len, const char *p
 
 static u32 http_route_id(const u8 *req, u32 len)
 {
-    char token[ACME_TOKEN_MAX];
+    char token[256];
     if (http_request_path_prefix_token(req, len, "/.well-known/acme-challenge/", token, sizeof(token)))
         return HTTP_ROUTE_ACME;
     if (http_request_path_is(req, len, "/api/status"))
         return HTTP_ROUTE_STATUS;
     if (http_request_path_is(req, len, "/api/netstat"))
         return HTTP_ROUTE_NETSTAT;
+    if (http_request_path_prefix_token(req, len, "/static/", token, sizeof(token)))
+        return HTTP_ROUTE_STATIC;
     if (http_request_path_is(req, len, "/picoscript") ||
         http_request_path_is(req, len, "/picoscript/") ||
         http_request_path_is(req, len, "/picoscript/playground.html"))
@@ -1068,6 +1080,8 @@ static u32 http_route_id(const u8 *req, u32 len)
         return HTTP_ROUTE_LOGS;
     if (http_request_path_is(req, len, "/api/admin/kernel-update"))
         return HTTP_ROUTE_UPDATE;
+    if (http_request_path_is(req, len, "/api/admin/static-put"))
+        return HTTP_ROUTE_STATIC_PUT;
     if (http_request_path_is(req, len, "/api/admin/hotpatch-kernel"))
         return HTTP_ROUTE_HOTPATCH;
     if (http_request_path_is(req, len, "/api/terminal") ||
@@ -5820,6 +5834,12 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
         http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
         return len;
     }
+    if (route == HTTP_ROUTE_STATIC) {
+        len = http_build_static_file_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
     if (route == HTTP_ROUTE_FAVICON) {
         len = http_build_no_content_response(out, max);
         http_diag.build_len = len;
@@ -6089,6 +6109,266 @@ static u32 http_build_picoscript_response(char *out, u32 max)
     return len;
 }
 
+static bool http_static_path_from_req(const u8 *req, u32 req_len, char *out, u32 out_max)
+{
+    char rel[256];
+    if (!http_request_path_prefix_token(req, req_len, "/static/", rel, sizeof(rel)))
+        return false;
+    if (!out || out_max < 18)
+        return false;
+    u32 p = 0;
+    static const char base[] = "/var/www/static/";
+    for (u32 i = 0; base[i]; i++) out[p++] = base[i];
+    for (u32 i = 0; rel[i]; i++) {
+        char c = rel[i];
+        if (c == '\\' || c == '\r' || c == '\n' || c == '\t')
+            return false;
+        if (c == '.' && rel[i + 1] == '.')
+            return false;
+        if ((u8)c < 0x20)
+            return false;
+        if (p + 1 >= out_max)
+            return false;
+        out[p++] = c;
+    }
+    out[p] = 0;
+    return p > (u32)(sizeof(base) - 1);
+}
+
+static bool http_has_suffix(const char *s, const char *suffix)
+{
+    if (!s || !suffix) return false;
+    u32 sl = pios_strlen(s);
+    u32 tl = pios_strlen(suffix);
+    if (tl > sl) return false;
+    for (u32 i = 0; i < tl; i++)
+        if (s[sl - tl + i] != suffix[i]) return false;
+    return true;
+}
+
+static const char *http_content_type_for_path(const char *path)
+{
+    if (http_has_suffix(path, ".js")) return "application/javascript; charset=utf-8";
+    if (http_has_suffix(path, ".css")) return "text/css; charset=utf-8";
+    if (http_has_suffix(path, ".html")) return "text/html; charset=utf-8";
+    if (http_has_suffix(path, ".json")) return "application/json; charset=utf-8";
+    if (http_has_suffix(path, ".wasm")) return "application/wasm";
+    if (http_has_suffix(path, ".woff2")) return "font/woff2";
+    if (http_has_suffix(path, ".ttf")) return "font/ttf";
+    if (http_has_suffix(path, ".svg")) return "image/svg+xml";
+    if (http_has_suffix(path, ".ico")) return "image/x-icon";
+    return "application/octet-stream";
+}
+
+static u32 http_build_static_file_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    char path[256];
+    if (!http_static_path_from_req(req, req_len, path, sizeof(path))) {
+        http_append(out, &len, max,
+            "HTTP/1.0 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nbad static path\n");
+        return len;
+    }
+    u64 id = walfs_find(path);
+    struct walfs_inode ino;
+    if (!id || !walfs_stat(id, &ino) || (ino.flags & WALFS_DIR)) {
+        http_append(out, &len, max,
+            "HTTP/1.0 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nstatic asset not found\n");
+        return len;
+    }
+    http_file_id = id;
+    http_file_len = ino.size > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (u32)ino.size;
+    http_file_off = 0;
+    http_append(out, &len, max, "HTTP/1.0 200 OK\r\nContent-Type: ");
+    http_append(out, &len, max, http_content_type_for_path(path));
+    http_append(out, &len, max, "\r\nCache-Control: max-age=3600\r\nContent-Length: ");
+    http_append_u64(out, &len, max, http_file_len);
+    http_append(out, &len, max, "\r\nConnection: close\r\n\r\n");
+    return len;
+}
+
+static bool http_walfs_static_path_safe(const char *path)
+{
+    static const char prefix[] = "/var/www/static/";
+    if (!path)
+        return false;
+    for (u32 i = 0; prefix[i]; i++)
+        if (path[i] != prefix[i])
+            return false;
+    for (u32 i = 0; path[i]; i++) {
+        char c = path[i];
+        if (c == '\\' || c == '\r' || c == '\n' || c == '\t' || (u8)c < 0x20)
+            return false;
+        if (c == '.' && path[i + 1] == '.')
+            return false;
+    }
+    return true;
+}
+
+static bool http_walfs_parent_leaf(const char *path, char *parent, u32 parent_max,
+                                   char *leaf, u32 leaf_max)
+{
+    if (!path || path[0] != '/' || !parent || !leaf)
+        return false;
+    u32 len = pios_strlen(path);
+    if (len < 2)
+        return false;
+    i32 slash = -1;
+    for (u32 i = 0; i < len; i++)
+        if (path[i] == '/') slash = (i32)i;
+    if (slash < 0 || (u32)slash >= len - 1)
+        return false;
+    u32 nlen = len - (u32)slash - 1U;
+    if (nlen + 1U > leaf_max)
+        return false;
+    for (u32 i = 0; i < nlen; i++)
+        leaf[i] = path[(u32)slash + 1U + i];
+    leaf[nlen] = 0;
+    if (slash == 0) {
+        if (parent_max < 2)
+            return false;
+        parent[0] = '/';
+        parent[1] = 0;
+        return true;
+    }
+    if ((u32)slash + 1U > parent_max)
+        return false;
+    for (u32 i = 0; i < (u32)slash; i++)
+        parent[i] = path[i];
+    parent[slash] = 0;
+    return true;
+}
+
+static bool http_walfs_ensure_dir_path(const char *path)
+{
+    if (!path || path[0] != '/')
+        return false;
+    if (path[1] == 0)
+        return true;
+    char cur[256];
+    u32 p = 0;
+    cur[p++] = '/';
+    cur[p] = 0;
+    u64 parent_id = WALFS_ROOT_INODE;
+    const char *s = path + 1;
+    while (*s) {
+        char seg[128];
+        u32 n = 0;
+        while (*s && *s != '/') {
+            if (n + 1U >= sizeof(seg))
+                return false;
+            seg[n++] = *s++;
+        }
+        seg[n] = 0;
+        if (*s == '/') s++;
+        if (n == 0)
+            return false;
+        if (p > 1) {
+            if (p + 1U >= sizeof(cur)) return false;
+            cur[p++] = '/';
+        }
+        if (p + n + 1U >= sizeof(cur))
+            return false;
+        for (u32 i = 0; i < n; i++) cur[p++] = seg[i];
+        cur[p] = 0;
+        u64 id = walfs_find(cur);
+        if (!id) {
+            id = walfs_create(parent_id, seg, WALFS_DIR, 0755);
+            if (!id)
+                return false;
+        } else {
+            struct walfs_inode ino;
+            if (!walfs_stat(id, &ino) || !(ino.flags & WALFS_DIR))
+                return false;
+        }
+        parent_id = id;
+    }
+    return true;
+}
+
+static bool http_walfs_ensure_file(const char *path, u64 *id_out)
+{
+    char parent[256], leaf[128];
+    if (id_out) *id_out = 0;
+    if (!http_walfs_static_path_safe(path) ||
+        !http_walfs_parent_leaf(path, parent, sizeof(parent), leaf, sizeof(leaf)) ||
+        !http_walfs_ensure_dir_path(parent))
+        return false;
+    u64 id = walfs_find(path);
+    if (!id) {
+        u64 parent_id = walfs_find(parent);
+        if (!parent_id)
+            return false;
+        id = walfs_create(parent_id, leaf, WALFS_FILE, 0644);
+        if (!id)
+            return false;
+    } else {
+        struct walfs_inode ino;
+        if (!walfs_stat(id, &ino) || (ino.flags & WALFS_DIR))
+            return false;
+    }
+    if (id_out) *id_out = id;
+    return true;
+}
+
+static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    char path[256], confirm[8], tmp[16];
+    u32 offset = 0, total = 0;
+    u32 body_off = http_header_body_offset(req, req_len);
+    u32 body_len = body_off && body_off <= req_len ? req_len - body_off : 0;
+    u32 content_len = 0;
+    bool has_content_len = body_off && http_content_length(req, body_off, &content_len);
+    bool ok = false;
+    const char *error = NULL;
+    u64 id = 0;
+
+    path[0] = 0; confirm[0] = 0; tmp[0] = 0;
+    (void)http_query_value(req, req_len, "/api/admin/static-put", "path", path, sizeof(path));
+    (void)http_query_value(req, req_len, "/api/admin/static-put", "confirm", confirm, sizeof(confirm));
+    if (http_query_value(req, req_len, "/api/admin/static-put", "offset", tmp, sizeof(tmp)))
+        (void)http_parse_u32(tmp, &offset);
+    tmp[0] = 0;
+    if (http_query_value(req, req_len, "/api/admin/static-put", "total", tmp, sizeof(tmp)))
+        (void)http_parse_u32(tmp, &total);
+
+    if (!http_streq(confirm, "1")) error = "requires confirm=1";
+    else if (!path[0] || !http_walfs_static_path_safe(path)) error = "bad static path";
+    else if (!has_content_len || body_len != content_len) error = "incomplete body";
+    else if (total != 0 && (offset > total || body_len > total - offset)) error = "chunk exceeds total";
+    else if (!http_walfs_ensure_file(path, &id)) error = "create/find failed";
+    else {
+        if (offset == 0 && !walfs_replace(id, NULL, 0)) {
+            error = "truncate failed";
+        } else if (!walfs_write(id, offset, req + body_off, body_len)) {
+            error = "write failed";
+        } else {
+            ok = true;
+        }
+    }
+
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{\"ok\":");
+    http_append(out, &len, max, ok ? "true" : "false");
+    http_append(out, &len, max, ",\"path\":");
+    http_append_json_string(out, &len, max, path);
+    http_append(out, &len, max, ",\"offset\":");
+    http_append_u64(out, &len, max, offset);
+    http_append(out, &len, max, ",\"bytes\":");
+    http_append_u64(out, &len, max, body_len);
+    if (total) {
+        http_append(out, &len, max, ",\"total\":");
+        http_append_u64(out, &len, max, total);
+    }
+    if (!ok && error) {
+        http_append(out, &len, max, ",\"error\":");
+        http_append_json_string(out, &len, max, error);
+    }
+    http_append(out, &len, max, "}\n");
+    return len;
+}
+
 static void http_save_ascii_prefix(char out[25], const void *data, u32 len)
 {
     const u8 *p = (const u8 *)data;
@@ -6138,6 +6418,9 @@ static void http_reset_client(bool close_conn)
     http_static_body = NULL;
     http_static_len = 0;
     http_static_off = 0;
+    http_file_id = 0;
+    http_file_len = 0;
+    http_file_off = 0;
     http_last_write = 0;
 }
 
@@ -6247,6 +6530,8 @@ static u32 admin_build_reboot_response(char *out, u32 max, const u8 *req, u32 re
 
 static u32 admin_build_update_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
+    if (http_request_path_is(req, req_len, "/api/admin/static-put"))
+        return http_build_static_upload_response(out, max, req, req_len);
     return http_build_kernel_update_response(out, max, req, req_len);
 }
 
@@ -6633,10 +6918,34 @@ static void echo_tcp_poll(void) {
                     }
                     http_static_off += n;
                 }
+            } else if (http_resp_len > 0 && http_file_id && http_file_off < http_file_len) {
+                u32 writable = tcp_writable(http_client_conn);
+                u32 remain = http_file_len - http_file_off;
+                if (writable > 0) {
+                    u32 chunk = remain < writable ? remain : writable;
+                    if (chunk > sizeof(http_file_chunk)) chunk = sizeof(http_file_chunk);
+                    u32 got = walfs_read(http_file_id, http_file_off, http_file_chunk, chunk);
+                    if (got == 0) {
+                        http_diag.error = HTTP_ERR_RESP_TIMEOUT;
+                        http_abort_client();
+                    } else {
+                        u32 n = tcp_write(http_client_conn, http_file_chunk, got);
+                        http_diag.write_calls++;
+                        http_last_write = n;
+                        if (n == 0) {
+                            http_diag.write_zero++;
+                        } else {
+                            http_diag.write_bytes += n;
+                            http_last_activity_ms = timer_monotonic_ms();
+                        }
+                        http_file_off += n;
+                    }
+                }
             }
 
             if (http_resp_len > 0 && http_resp_off >= http_resp_len &&
-                (!http_static_body || http_static_off >= http_static_len)) {
+                (!http_static_body || http_static_off >= http_static_len) &&
+                (!http_file_id || http_file_off >= http_file_len)) {
                 http_diag.closes++;
                 http_complete_tick++;
                 http_trace(HTTP_EVT_CLOSE, http_diag.route, http_resp_len, http_resp_off);
