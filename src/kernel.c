@@ -1310,6 +1310,14 @@ struct perf_counter_snapshot {
     u64 sched_idle_ticks;
     u64 sched_total_ticks;
     u32 sched_flags;
+    u32 board_revision;
+    bool board_revision_new_style;
+    u32 board_mem_code;
+    u32 board_model_code;
+    u32 board_processor_code;
+    u32 board_manufacturer_code;
+    u32 board_pcb_revision;
+    u64 installed_ram_bytes;
     u64 physical_ram_bytes;
     u32 ram_total_kib;
     u32 ram_used_kib;
@@ -1360,6 +1368,59 @@ struct perf_counter_snapshot {
     u64 dash_render_ticks;
     u64 fb_blit_ticks;
 };
+
+struct board_revision_snapshot {
+    u32 revision;
+    bool new_style;
+    u32 mem_code;
+    u32 model_code;
+    u32 processor_code;
+    u32 manufacturer_code;
+    u32 pcb_revision;
+    u64 installed_ram_bytes;
+};
+
+static u64 board_revision_memory_bytes(u32 mem_code)
+{
+    static const u64 sizes[] = {
+        256ULL << 20, 512ULL << 20, 1024ULL << 20, 2048ULL << 20,
+        4096ULL << 20, 8192ULL << 20, 16384ULL << 20
+    };
+    return mem_code < (u32)(sizeof(sizes) / sizeof(sizes[0])) ? sizes[mem_code] : 0;
+}
+
+static void board_revision_snapshot(struct board_revision_snapshot *out)
+{
+    static bool probed;
+    static struct board_revision_snapshot snap;
+    static volatile u32 ALIGNED(16) mbox_rev[7];
+
+    if (!out)
+        return;
+    if (!probed) {
+        probed = true;
+        mbox_rev[0] = sizeof(mbox_rev);
+        mbox_rev[1] = 0;
+        mbox_rev[2] = TAG_GET_BOARD_REV;
+        mbox_rev[3] = 4;
+        mbox_rev[4] = 0;
+        mbox_rev[5] = 0;
+        mbox_rev[6] = TAG_END;
+        if (mbox_call(MBOX_CH_PROP, mbox_rev) && (mbox_rev[4] & 0x80000000U)) {
+            snap.revision = mbox_rev[5];
+            snap.new_style = (snap.revision & (1U << 23)) != 0;
+            if (snap.new_style) {
+                snap.mem_code = (snap.revision >> 20) & 0x7U;
+                snap.manufacturer_code = (snap.revision >> 16) & 0xFU;
+                snap.processor_code = (snap.revision >> 12) & 0xFU;
+                snap.model_code = (snap.revision >> 4) & 0xFFU;
+                snap.pcb_revision = snap.revision & 0xFU;
+                snap.installed_ram_bytes = board_revision_memory_bytes(snap.mem_code);
+            }
+        }
+    }
+    *out = snap;
+}
 
 static u64 perf_physical_ram_bytes(void)
 {
@@ -1412,6 +1473,16 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
     if (!p)
         return;
     simd_zero(p, sizeof(*p));
+    struct board_revision_snapshot br;
+    board_revision_snapshot(&br);
+    p->board_revision = br.revision;
+    p->board_revision_new_style = br.new_style;
+    p->board_mem_code = br.mem_code;
+    p->board_model_code = br.model_code;
+    p->board_processor_code = br.processor_code;
+    p->board_manufacturer_code = br.manufacturer_code;
+    p->board_pcb_revision = br.pcb_revision;
+    p->installed_ram_bytes = br.installed_ram_bytes;
     p->physical_ram_bytes = perf_physical_ram_bytes();
     p->ram_total_kib = (u32)((CORE_PRIV_SIZE * 4ULL) >> 10);
     for (u32 i = 0; i < 4; i++)
@@ -1567,6 +1638,17 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "cpu1_permille", perf.cpu_permille[1], true);
     http_append_json_metric(out, &len, max, "cpu2_permille", perf.cpu_permille[2], true);
     http_append_json_metric(out, &len, max, "cpu3_permille", perf.cpu_permille[3], true);
+    http_append_json_metric(out, &len, max, "board_revision", perf.board_revision, true);
+    http_append_json_metric(out, &len, max, "board_revision_new_style", perf.board_revision_new_style ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "board_mem_code", perf.board_mem_code, true);
+    http_append_json_metric(out, &len, max, "board_model_code", perf.board_model_code, true);
+    http_append_json_metric(out, &len, max, "board_processor_code", perf.board_processor_code, true);
+    http_append_json_metric(out, &len, max, "board_manufacturer_code", perf.board_manufacturer_code, true);
+    http_append_json_metric(out, &len, max, "board_pcb_revision", perf.board_pcb_revision, true);
+    http_append_json_metric(out, &len, max, "ram_installed_bytes", perf.installed_ram_bytes, true);
+    http_append_json_metric(out, &len, max, "ram_installed_kib", perf.installed_ram_bytes >> 10, true);
+    http_append_json_metric(out, &len, max, "ram_arm_visible_bytes", perf.physical_ram_bytes, true);
+    http_append_json_metric(out, &len, max, "ram_arm_visible_kib", perf.physical_ram_bytes >> 10, true);
     http_append_json_metric(out, &len, max, "ram_physical_bytes", perf.physical_ram_bytes, true);
     http_append_json_metric(out, &len, max, "ram_physical_kib", perf.physical_ram_bytes >> 10, true);
     http_append_json_metric(out, &len, max, "ram_total_kib", perf.ram_total_kib, true);
@@ -13763,6 +13845,21 @@ static void dash_put_mbps(u32 mbps_x1000)
     }
 }
 
+static void dash_put_uptime_breakdown(u64 sec)
+{
+    static const u32 min = 60U, hour = 60U * 60U, day = 24U * 60U * 60U;
+    static const u32 week = 7U * 24U * 60U * 60U;
+    static const u32 month = 30U * 24U * 60U * 60U;
+    static const u32 year = 365U * 24U * 60U * 60U;
+    u32 y = (u32)(sec / year); sec %= year;
+    u32 mo = (u32)(sec / month); sec %= month;
+    u32 w = (u32)(sec / week); sec %= week;
+    u32 d = (u32)(sec / day); sec %= day;
+    u32 h = (u32)(sec / hour); sec %= hour;
+    u32 m = (u32)(sec / min);
+    fb_printf(" (%uY %uM %uW %uD %uH %uM)", y, mo, w, d, h, m);
+}
+
 static u32 dash_prefix_len_from_mask(u32 mask)
 {
     u32 n = 0;
@@ -13881,8 +13978,10 @@ static void hdmi_dashboard_render(void)
     fb_set_color(0x0000FF80, 0x00000000);
     fb_puts("UPTIME: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("%u", (u32)(now_ms / 1000ULL));
+    u64 uptime_s = now_ms / 1000ULL;
+    fb_printf("%u", (u32)uptime_s);
     fb_puts("s");
+    dash_put_uptime_breakdown(uptime_s);
     fb_set_cursor(h2, header_row + 1);
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts("IP: ");
@@ -13909,20 +14008,30 @@ static void hdmi_dashboard_render(void)
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts("RAM: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_puts("ARM=");
+    fb_puts("Inst=");
+    dash_put_bytes_mb(perf.installed_ram_bytes);
+    fb_puts(" ARM=");
     dash_put_bytes_mb(perf.physical_ram_bytes);
     fb_puts(" Pool=");
     fb_printf("%uMB", perf.ram_total_kib >> 10);
     fb_puts(" Used=");
     fb_printf("%uMB", perf.ram_used_kib >> 10);
-    fb_set_cursor(h2, header_row + 2);
-    fb_set_color(0x0000CCFF, 0x00000000);
-    fb_puts("RAM SPLIT: ");
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_puts("K=");
+    fb_puts(" K=");
     fb_printf("%uMB", perf.ram_kernel_kib >> 10);
     fb_puts(" U=");
     fb_printf("%uMB", perf.ram_user_kib >> 10);
+    fb_set_cursor(h2, header_row + 2);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("BOARD: ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts("rev=0x");
+    fb_printf("%x", perf.board_revision);
+    fb_puts(" model=0x");
+    fb_printf("%x", perf.board_model_code);
+    fb_puts(" pcb=");
+    fb_printf("%u", perf.board_pcb_revision);
+    fb_puts(" ram=");
+    dash_put_bytes_mb(perf.installed_ram_bytes);
 
     fb_set_cursor(h0, header_row + 3);
     fb_set_color(0x0000CCFF, 0x00000000);
