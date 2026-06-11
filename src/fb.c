@@ -867,6 +867,45 @@ void fb_box(u32 width, u32 height, const char *title)
     fb_putc('\n');
 }
 
+void fb_box_at(u32 col, u32 row, u32 width, u32 height, const char *title)
+{
+    if (width < 4 || height < 2)
+        return;
+    if (col >= cols || row >= rows)
+        return;
+    if (col + width > cols)
+        width = cols - col;
+    if (row + height > rows)
+        height = rows - row;
+    if (width < 4 || height < 2)
+        return;
+
+    fb_set_cursor(col, row);
+    fb_put_codepoint(0x250C);
+    fb_hline(width - 2);
+    fb_put_codepoint(0x2510);
+
+    if (title) {
+        fb_set_cursor(col + 2U, row);
+        fb_putc(' ');
+        for (u32 i = 0; title[i] && i + 5U < width; i++)
+            fb_putc(title[i]);
+        fb_putc(' ');
+    }
+
+    for (u32 r = row + 1U; r + 1U < row + height; r++) {
+        fb_set_cursor(col, r);
+        fb_put_codepoint(0x2502);
+        fb_set_cursor(col + width - 1U, r);
+        fb_put_codepoint(0x2502);
+    }
+
+    fb_set_cursor(col, row + height - 1U);
+    fb_put_codepoint(0x2514);
+    fb_hline(width - 2);
+    fb_put_codepoint(0x2518);
+}
+
 /* Minimal printf: %d %u %x %s %c %% */
 static void fb_print_u32(u32 val) {
     char buf[11];

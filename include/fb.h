@@ -17,6 +17,7 @@ u32 fb_rows(void);
 u32 fb_reserved_rows(void);
 void fb_hline(u32 n);
 void fb_box(u32 width, u32 height, const char *title);
+void fb_box_at(u32 col, u32 row, u32 width, u32 height, const char *title);
 
 /* Direct pixel access */
 void fb_pixel(u32 x, u32 y, u32 color);

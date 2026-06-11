@@ -13248,18 +13248,6 @@ static void dash_ip(u32 ip)
               (ip >> 8) & 0xFF, ip & 0xFF);
 }
 
-static void dash_core0_flags(u32 flags)
-{
-    bool any = false;
-    if (flags & CORE0_IO_NET)   { fb_puts("NET");   any = true; }
-    if (flags & CORE0_IO_TCP)   { if (any) fb_puts("|"); fb_puts("TCP");   any = true; }
-    if (flags & CORE0_IO_UART)  { if (any) fb_puts("|"); fb_puts("UART");  any = true; }
-    if (flags & CORE0_IO_USB)   { if (any) fb_puts("|"); fb_puts("USB");   any = true; }
-    if (flags & CORE0_IO_MAINT) { if (any) fb_puts("|"); fb_puts("MAINT"); any = true; }
-    if (flags & CORE0_IO_DASH)  { if (any) fb_puts("|"); fb_puts("DASH");  any = true; }
-    if (!any) fb_puts("none");
-}
-
 static inline u64 dash_now_ticks(void) { u64 c; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(c)); return c; }
 
 static void dash_blank_line(u32 col, u32 row, u32 width)
@@ -13269,6 +13257,15 @@ static void dash_blank_line(u32 col, u32 row, u32 width)
     fb_set_cursor(col, row);
     for (u32 i = 0; i < width; i++)
         fb_putc(' ');
+}
+
+static void dash_put_trunc(const char *s, u32 max_chars)
+{
+    u32 i = 0;
+    while (s && s[i] && i < max_chars) {
+        fb_putc(s[i]);
+        i++;
+    }
 }
 
 static void dash_clear_body(u32 col, u32 row, u32 width, u32 height)
@@ -13294,32 +13291,7 @@ static void dash_draw_window(u32 col, u32 row, u32 width, u32 height,
         return;
 
     fb_set_color(color, 0x00000000);
-    fb_set_cursor(col, row);
-    fb_putc('+');
-    for (u32 i = 0; i < width - 2U; i++)
-        fb_putc('=');
-    fb_putc('+');
-
-    if (title) {
-        fb_set_cursor(col + 2U, row);
-        fb_putc(' ');
-        for (u32 i = 0; title[i] && i + 5U < width; i++)
-            fb_putc(title[i]);
-        fb_putc(' ');
-    }
-
-    for (u32 r = row + 1U; r + 1U < row + height; r++) {
-        fb_set_cursor(col, r);
-        fb_putc('|');
-        fb_set_cursor(col + width - 1U, r);
-        fb_putc('|');
-    }
-
-    fb_set_cursor(col, row + height - 1U);
-    fb_putc('+');
-    for (u32 i = 0; i < width - 2U; i++)
-        fb_putc('-');
-    fb_putc('+');
+    fb_box_at(col, row, width, height, title);
 }
 
 static void dash_put_permille_pct(u32 permille)
@@ -13394,13 +13366,12 @@ static void hdmi_dashboard_render(void)
     u32 screen_rows = fb_rows();
     bool wide = screen_cols >= 180U;
     u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 4U;
-    u32 sys_col = 0, sys_row = 5, sys_w = wide ? 58U : 78U, sys_h = wide ? 8U : 5U;
-    u32 map_col = wide ? (sys_col + sys_w + 2U) : 0U;
-    u32 map_row = wide ? 5U : 11U;
-    u32 map_w = wide ? ((screen_cols > map_col + 2U) ? (screen_cols - map_col - 1U) : 78U) : 78U;
-    u32 map_h = wide ? 8U : 13U;
+    u32 map_col = 0U;
+    u32 map_row = 5U;
+    u32 map_w = wide ? header_w : 78U;
+    u32 map_h = wide ? 10U : 13U;
     u32 log_col = 0;
-    u32 log_top = wide ? 14U : (screen_rows > 10U ? screen_rows - 9U : 28U);
+    u32 log_top = wide ? 16U : (screen_rows > 10U ? screen_rows - 9U : 28U);
     u32 log_w = header_w;
     u32 log_h = 8U;
     if (log_top + log_h >= screen_rows && screen_rows > log_h + 1U)
@@ -13411,7 +13382,6 @@ static void hdmi_dashboard_render(void)
     if (!layout_drawn) {
         fb_clear(0x00000000);
         dash_draw_window(header_col, header_row, header_w, header_h, "PIOS WORKBENCH", 0x0000FF80);
-        dash_draw_window(sys_col, sys_row, sys_w, sys_h, "SYSTEM", 0x0000CCFF);
         dash_draw_window(map_col, map_row, map_w, map_h, "NETWORK / PROCESS MAP", 0x00FFAA00);
         dash_draw_window(log_col, log_top, log_w, log_h, "WARNINGS / ERRORS", 0x00FF4040);
         layout_drawn = true;
@@ -13466,58 +13436,65 @@ static void hdmi_dashboard_render(void)
         fb_printf("%uMB", perf.ram_user_kib >> 10);
     }
 
-    dash_clear_body(sys_col, sys_row, sys_w, sys_h);
-    fb_set_cursor(sys_col + 3, sys_row + 1);
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_printf("sched wake=%u wfi=%u flags=0x%x ", (u32)perf.sched_wake, (u32)perf.sched_wfi, perf.sched_flags);
-    dash_core0_flags(perf.sched_flags);
-    fb_set_cursor(sys_col + 3, sys_row + 2);
-    fb_printf("Kernel mem=%uK static=%uK core_alloc=%uK cap=%uK",
-              perf.kernel_mem_kib, perf.kernel_static_kib, perf.kernel_core_kib, perf.kernel_cap_kib);
-    fb_set_cursor(sys_col + 3, sys_row + 3);
-    fb_printf("Core RAM c0=%uK c1=%uK c2=%uK c3=%uK",
-              perf.core_alloc_kib[0], perf.core_alloc_kib[1], perf.core_alloc_kib[2], perf.core_alloc_kib[3]);
-
     dash_clear_body(map_col, map_row, map_w, map_h);
     u32 row = map_row + 1U;
-    fb_set_cursor(map_col + 3U, row++);
+    const u32 c_port = map_col + 3U;
+    const u32 c_owner = map_col + 15U;
+    const u32 c_pid = map_col + 39U;
+    const u32 c_core = map_col + 49U;
+    const u32 c_pending = map_col + 57U;
+    const u32 c_proc = map_col + 69U;
+    fb_set_cursor(c_port, row);
     fb_set_color(0x00AAAAAA, 0x00000000);
-    fb_puts("PORT     FIFO/BRIDGE          PID/CORE       PROCESS");
+    fb_puts("PORT");
+    fb_set_cursor(c_owner, row);
+    fb_puts("FIFO / OWNER");
+    fb_set_cursor(c_pid, row);
+    fb_puts("PID");
+    fb_set_cursor(c_core, row);
+    fb_puts("CORE");
+    fb_set_cursor(c_pending, row);
+    fb_puts("PENDING");
+    fb_set_cursor(c_proc, row++);
+    fb_puts("PROCESS");
     fb_set_color(0x00FFFFFF, 0x00000000);
     u32 shown_listeners = 0;
     for (u32 i = 0; i < tcp_n && row + 1U < map_row + map_h; i++) {
         if (tcp[i].state != TCP_LISTEN)
             continue;
         shown_listeners++;
-        fb_set_cursor(map_col + 3U, row++);
         u32 bridge = 0, pid = 0, pcore = 0;
         const char *image = "-";
         bool has_bridge = dash_bridge_for_port(tcp[i].local_port, &bridge, &pid);
         bool has_proc = pid && dash_proc_for_pid(proc, proc_n, pid, &pcore, &image);
+        fb_set_cursor(c_port, row);
         fb_puts("tcp/");
         fb_printf("%u", tcp[i].local_port);
-        fb_puts("  ");
+        fb_set_cursor(c_owner, row);
         if (has_bridge) {
             fb_puts("uhttp bridge");
             fb_printf("%u", bridge);
-            fb_puts(" fifo-wake ");
+            fb_puts(" fifo");
         } else {
-            fb_puts(tcp_owner_label(tcp[i].local_port));
-            fb_puts(" kernel     ");
+            dash_put_trunc(tcp_owner_label(tcp[i].local_port), 20U);
         }
+        fb_set_cursor(c_pid, row);
         if (has_proc) {
-            fb_puts("pid=");
             fb_printf("%u", pid);
-            fb_puts(" core=");
+            fb_set_cursor(c_core, row);
             fb_printf("%u", pcore);
-            fb_puts("  ");
-            fb_puts(image);
+            fb_set_cursor(c_proc, row);
+            dash_put_trunc(image, (map_w > c_proc - map_col + 2U) ? (map_w - (c_proc - map_col) - 2U) : 10U);
         } else {
-            fb_puts("pid=- core=0  ");
-            fb_puts(tcp_owner_label(tcp[i].local_port));
+            fb_puts("-");
+            fb_set_cursor(c_core, row);
+            fb_puts("0");
+            fb_set_cursor(c_proc, row);
+            dash_put_trunc(tcp_owner_label(tcp[i].local_port), (map_w > c_proc - map_col + 2U) ? (map_w - (c_proc - map_col) - 2U) : 10U);
         }
-        fb_puts(" pend=");
+        fb_set_cursor(c_pending, row);
         fb_printf("%u", tcp[i].pending_count);
+        row++;
     }
     if (shown_listeners == 0) {
         fb_set_cursor(map_col + 3U, row);
