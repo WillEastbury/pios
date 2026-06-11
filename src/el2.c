@@ -22,11 +22,37 @@ static u32 g_boot_el1_hash;
 static u32 g_boot_el2_hash;
 struct el2_port_owner {
     bool used;
+    u32 generation;
     u16 port;
     u32 owner_pid;
     u32 capsule_hash;
-} PACKED;
+    u32 _pad[11];
+} ALIGNED(64);
 static struct el2_port_owner g_port_owner[128];
+_Static_assert(sizeof(struct el2_port_owner) == 64,
+               "EL2 port-owner descriptors must be one cache line");
+
+#define EL2_PORT_POISON_U32 0xDEAD2E12U
+#define EL2_PORT_POISON_U16 0xDEADU
+
+static u32 el2_bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void el2_port_owner_poison(struct el2_port_owner *o)
+{
+    if (!o)
+        return;
+    u32 g = el2_bump_generation(o->generation);
+    simd_zero(o, sizeof(*o));
+    o->used = false;
+    o->generation = g;
+    o->port = EL2_PORT_POISON_U16;
+    o->owner_pid = EL2_PORT_POISON_U32;
+    o->capsule_hash = EL2_PORT_POISON_U32;
+}
 static struct el2_capsule_desc g_capsules[EL2_CAPSULE_MAX];
 static struct el2_stage2_plan g_stage2[EL2_CAPSULE_MAX];
 static u64 g_stage2_root[EL2_CAPSULE_MAX][512] ALIGNED(4096);
@@ -161,7 +187,8 @@ void el2_init(void)
     g_boot_el1_text_len = 0;
     g_boot_el1_hash = 0;
     g_boot_el2_hash = 0;
-    simd_zero(g_port_owner, sizeof(g_port_owner));
+    for (u32 i = 0; i < (u32)(sizeof(g_port_owner) / sizeof(g_port_owner[0])); i++)
+        el2_port_owner_poison(&g_port_owner[i]);
     simd_zero(g_capsules, sizeof(g_capsules));
     simd_zero(g_stage2, sizeof(g_stage2));
     simd_zero(g_stage2_root, sizeof(g_stage2_root));
@@ -393,7 +420,10 @@ i32 el2_hvc_dispatch(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0)
         }
         for (u32 i = 0; i < (u32)(sizeof(g_port_owner) / sizeof(g_port_owner[0])); i++) {
             if (g_port_owner[i].used) continue;
+            u32 gen = el2_bump_generation(g_port_owner[i].generation);
+            simd_zero(&g_port_owner[i], sizeof(g_port_owner[i]));
             g_port_owner[i].used = true;
+            g_port_owner[i].generation = gen;
             g_port_owner[i].port = port;
             g_port_owner[i].owner_pid = pid;
             g_port_owner[i].capsule_hash = cap;
@@ -408,7 +438,7 @@ i32 el2_hvc_dispatch(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0)
         for (u32 i = 0; i < (u32)(sizeof(g_port_owner) / sizeof(g_port_owner[0])); i++) {
             if (!g_port_owner[i].used) continue;
             if (g_port_owner[i].port == port && g_port_owner[i].owner_pid == pid) {
-                g_port_owner[i].used = false;
+                el2_port_owner_poison(&g_port_owner[i]);
                 *ret0 = 0;
                 return 0;
             }
@@ -439,7 +469,7 @@ i32 el2_hvc_dispatch(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0)
         if (pid == 0) return -1;
         for (u32 i = 0; i < (u32)(sizeof(g_port_owner) / sizeof(g_port_owner[0])); i++) {
             if (g_port_owner[i].used && g_port_owner[i].owner_pid == pid)
-                g_port_owner[i].used = false;
+                el2_port_owner_poison(&g_port_owner[i]);
         }
         *ret0 = 0;
         return 0;

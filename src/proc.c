@@ -232,14 +232,35 @@ static u32 proc_el1_integrity_baseline;
 static u64 proc_el1_integrity_next_check_tick;
 
 #define MAX_PAGED_IO_HANDLES 16
+#define PAGED_IO_POISON_INODE 0xDEADDEADDEADDEADULL
 struct paged_io_handle {
     bool used;
+    u32 generation;
     u32 owner_pid;
     u32 page_size;
     u32 flags;
     u64 inode_id;
-};
+    u64 _pad[4];
+} ALIGNED(64);
 static struct paged_io_handle paged_io_tab[MAX_PAGED_IO_HANDLES];
+_Static_assert(sizeof(struct paged_io_handle) == 64,
+               "paged I/O handles must be one cache line");
+
+static void paged_io_poison(struct paged_io_handle *h)
+{
+    if (!h)
+        return;
+    u32 g = h->generation + 1U;
+    if (g == 0)
+        g = 1U;
+    memset(h, 0xA5, sizeof(*h));
+    h->used = false;
+    h->generation = g;
+    h->owner_pid = 0xDEAD1C00U;
+    h->page_size = 0;
+    h->flags = 0xDEAD1C00U;
+    h->inode_id = PAGED_IO_POISON_INODE;
+}
 
 static bool proc_prio_valid(u32 p)
 {
@@ -1717,7 +1738,7 @@ void proc_init_shared(void)
         procs[i].generation = 0;
     }
     for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++)
-        paged_io_tab[i].used = false;
+        paged_io_poison(&paged_io_tab[i]);
     /* rc-percore-sched: current_proc/rr_cursor are per-core arrays now. This
      * runs exactly once (on core 0, before the secondaries start), so zero every
      * core's slot explicitly rather than relying on the macro (which would only
@@ -4508,7 +4529,12 @@ static i32 page_handle_alloc(u64 inode_id, u32 page_size, u32 flags)
     u32 owner_pid = procs[current_proc].pid;
     for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++) {
         if (!paged_io_tab[i].used) {
+            u32 gen = paged_io_tab[i].generation + 1U;
+            if (gen == 0)
+                gen = 1U;
+            memset(&paged_io_tab[i], 0, sizeof(paged_io_tab[i]));
             paged_io_tab[i].used = true;
+            paged_io_tab[i].generation = gen;
             paged_io_tab[i].owner_pid = owner_pid;
             paged_io_tab[i].page_size = page_size;
             paged_io_tab[i].flags = flags;
@@ -4830,7 +4856,7 @@ static i32 sys_page_close(i32 page_id)
 {
     struct paged_io_handle *h = page_handle_get(page_id);
     if (!h) return -1;
-    h->used = false;
+    paged_io_poison(h);
     return 0;
 }
 
