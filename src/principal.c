@@ -58,9 +58,15 @@ static void name_pack_32(const char *src, u8 out[32])
     }
 }
 
+struct principal_core_word {
+    volatile u32 v;
+    u32 _pad[15];
+} ALIGNED(64);
+_Static_assert(sizeof(struct principal_core_word) == 64, "principal core word must be one cache line");
+
 static struct principal principals[PRINCIPAL_MAX];
 static u32 principal_count;
-static u32 current_principal[4];  /* one slot per core */
+static struct principal_core_word current_principal[4];  /* one cache line per core */
 
 /* ---- Internal helpers ---- */
 
@@ -184,25 +190,25 @@ bool principal_auth(const char *name, const char *pass, u32 *id_out)
     if (!found || !ct_eq(chosen_hash, h, 4))
         return false;
 
-    current_principal[core_id()] = chosen_id;
+    current_principal[core_id()].v = chosen_id;
     if (id_out) *id_out = chosen_id;
     return true;
 }
 
 u32 principal_current(void)
 {
-    return current_principal[core_id()];
+    return current_principal[core_id()].v;
 }
 
 u32 principal_current_for(u32 core)
 {
     if (core > 3) return PRINCIPAL_ROOT;
-    return current_principal[core];
+    return current_principal[core].v;
 }
 
 void principal_set_current(u32 id)
 {
-    current_principal[core_id()] = id;
+    current_principal[core_id()].v = id;
 }
 
 bool principal_has_cap(u32 id, u32 cap_flag)

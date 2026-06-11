@@ -39,7 +39,13 @@ static u64 user_l1[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
 static u64 user_l2_low[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
 static u64 user_l3_proc[3][MAX_PROCS_PER_CORE][2][512] ALIGNED(4096);
 static u64 user_l3_ipc[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
-static bool user_table_valid[3][MAX_PROCS_PER_CORE];
+struct mmu_valid_slot {
+    volatile u32 v;
+    u32 _pad[15];
+} ALIGNED(64);
+static struct mmu_valid_slot user_table_valid[3][MAX_PROCS_PER_CORE];
+_Static_assert(sizeof(struct mmu_valid_slot) == 64,
+               "user table validity slots must be one cache line");
 
 /* Exported for secondary cores (read by start.S) */
 u64 shared_ttbr0;
@@ -560,7 +566,7 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
     map_user_device_windows(l1);
 
     mmu_user_table_publish(uc, slot);
-    user_table_valid[uc][slot] = true;
+    user_table_valid[uc][slot].v = true;
     return true;
 }
 
@@ -591,7 +597,7 @@ bool mmu_user_table_build_split(u32 core, u32 slot, u64 slot_base, u64 slot_size
     map_user_device_windows(l1);
 
     mmu_user_table_publish(uc, slot);
-    user_table_valid[uc][slot] = true;
+    user_table_valid[uc][slot].v = true;
     return true;
 }
 
@@ -620,7 +626,7 @@ bool mmu_user_table_build_split_el0(u32 core, u32 slot, u64 slot_base, u64 slot_
     map_user_device_windows(l1);
 
     mmu_user_table_publish(uc, slot);
-    user_table_valid[uc][slot] = true;
+    user_table_valid[uc][slot].v = true;
     return true;
 }
 
@@ -673,7 +679,7 @@ bool mmu_user_table_build_split_el0_at(u32 core, u32 slot, u64 va_base, u64 pa_b
     map_user_ipc_el0_alias(uc, slot, l1, l2, 0x2003000000ULL);
     map_user_device_windows(l1);
     mmu_user_table_publish(uc, slot);
-    user_table_valid[uc][slot] = true;
+    user_table_valid[uc][slot].v = true;
     return true;
 }
 
@@ -682,7 +688,7 @@ bool mmu_switch_to_user(u32 core, u32 slot)
     if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
         return false;
     u32 uc = user_core_index(core);
-    if (!user_table_valid[uc][slot])
+    if (!user_table_valid[uc][slot].v)
         return false;
 
     u64 ttbr = (u64)(usize)user_l1[uc][slot];
@@ -702,7 +708,7 @@ bool mmu_user_ipc_shm_window(u32 core, u32 slot, bool enable)
     if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
         return false;
     u32 uc = user_core_index(core);
-    if (!user_table_valid[uc][slot])
+    if (!user_table_valid[uc][slot].v)
         return false;
 
     u64 *l2 = user_l2_low[uc][slot];
@@ -726,7 +732,7 @@ bool mmu_user_pte_snapshot(u32 core, u32 slot, u64 va, u64 *l1e, u64 *l2e, u64 *
     if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
         return false;
     u32 uc = user_core_index(core);
-    if (!user_table_valid[uc][slot])
+    if (!user_table_valid[uc][slot].v)
         return false;
     u32 l1idx = (u32)(va / L1_BLOCK_SIZE);
     if (l1idx >= 512)

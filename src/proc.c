@@ -65,10 +65,21 @@ static u64 heap_top[MAX_PROCS_PER_CORE];
  * metadata lines with other process slots. proc_soft_event() sets it;
  * proc_park() consumes it and refuses to block while it is set. */
 static struct proc_core_word proc_wake_pending[MAX_PROCS_PER_CORE];
-static volatile bool preempt_enabled[3];
-static volatile bool preempt_armed[3];
-static volatile bool preempt_pending[3];
-static u64 preempt_quantum_ticks[3];
+struct proc_preempt_core {
+    volatile u32 enabled;
+    volatile u32 armed;
+    volatile u32 pending;
+    u32 _pad0;
+    u64 quantum_ticks;
+    u64 _pad[5];
+} ALIGNED(64);
+static struct proc_preempt_core preempt_state[3];
+#define preempt_enabled(uc)       (preempt_state[(uc)].enabled)
+#define preempt_armed(uc)         (preempt_state[(uc)].armed)
+#define preempt_pending(uc)       (preempt_state[(uc)].pending)
+#define preempt_quantum_ticks(uc) (preempt_state[(uc)].quantum_ticks)
+_Static_assert(sizeof(struct proc_preempt_core) == 64,
+               "preempt core state must be one cache line");
 /* Per-user-core scheduler diagnostics. Each core's counters occupy a PRIVATE,
  * 64-byte-aligned cache line so a writer core's `dc cvac` (clean-to-PoC, needed
  * because inter-core snoop coherency is inactive on this A76) only ever writes
@@ -1644,10 +1655,10 @@ void proc_init(void)
         core_mark_online(core_id(), 0x25);
     if (on_user_core()) {
         core_mark_online(core_id(), 0x250);
-        preempt_enabled[uc] = false;
-        preempt_armed[uc] = false;
-        preempt_pending[uc] = false;
-        preempt_quantum_ticks[uc] = 1;
+        preempt_enabled(uc) = false;
+        preempt_armed(uc) = false;
+        preempt_pending(uc) = false;
+        preempt_quantum_ticks(uc) = 1;
         sched_diag[uc].preempt_count = 0;
         core_mark_online(core_id(), 0x251);
         sched_diag[uc].start_ticks = 0;
@@ -2121,24 +2132,24 @@ void proc_yield(void)
     u32 uc = user ? user_core_slot() : 0;
     struct process *p = &procs[current_proc];
     if (user) {
-        preempt_armed[uc] = false;
-        preempt_pending[uc] = false;
+        preempt_armed(uc) = false;
+        preempt_pending(uc) = false;
     }
     proc_account_runtime(p);
     if (p->state == PROC_RUNNING)
         p->state = PROC_READY;
     proc_note_desched(2U);
     ctx_switch(&p->ctx, &scheduler_ctx);
-    if (user && preempt_enabled[uc] && p->state == PROC_RUNNING)
-        preempt_armed[uc] = true;
+    if (user && preempt_enabled(uc) && p->state == PROC_RUNNING)
+        preempt_armed(uc) = true;
 }
 
 NORETURN void proc_exit(u32 code)
 {
     if (on_user_core()) {
         u32 uc = user_core_slot();
-        preempt_armed[uc] = false;
-        preempt_pending[uc] = false;
+        preempt_armed(uc) = false;
+        preempt_pending(uc) = false;
     }
     struct process *p = &procs[current_proc];
     proc_account_runtime(p);
@@ -2285,17 +2296,17 @@ void proc_schedule(void)
                 (void)el2_stage2_activate(PROC_CAPSULE_ID_NONE);
             } else {
                 proc_sched_stage(50);
-                if (user && preempt_enabled[uc]) {
-                    preempt_pending[uc] = false;
-                    preempt_armed[uc] = true;
+                if (user && preempt_enabled(uc)) {
+                    preempt_pending(uc) = false;
+                    preempt_armed(uc) = true;
                 }
                 proc_sched_note_ctx_enter(procs[chosen].pid);
                 ctx_switch(&scheduler_ctx, &procs[chosen].ctx);
                 proc_sched_note_ctx_exit();
                 proc_sched_stage(51);
                 if (user) {
-                    preempt_armed[uc] = false;
-                    preempt_pending[uc] = false;
+                    preempt_armed(uc) = false;
+                    preempt_pending(uc) = false;
                 }
                 mmu_switch_to_kernel();
                 __asm__ volatile("msr daif, %0" :: "r"(sched_daif) : "memory");
@@ -2346,8 +2357,8 @@ bool proc_handle_fault(u64 esr, u64 elr, u64 far)
     if (p->state != PROC_RUNNING)
         return false;
 
-    preempt_armed[uc] = false;
-    preempt_pending[uc] = false;
+    preempt_armed(uc) = false;
+    preempt_pending(uc) = false;
     proc_account_runtime(p);
     if (p->run_at_el0) {
         el0_fault_pid = p->pid;
@@ -2482,16 +2493,16 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
     if (q == 0)
         q = 1;
 
-    preempt_quantum_ticks[uc] = q;
-    preempt_pending[uc] = false;
-    preempt_armed[uc] = false;
+    preempt_quantum_ticks(uc) = q;
+    preempt_pending(uc) = false;
+    preempt_armed(uc) = false;
     /* Preemption stays OFF: the timer PPI never reached user cores before the
      * CPU-interface fix, so the scheduler has always run cooperatively. Now that
      * the timer fires, leaving preemption enabled would activate the (untested)
      * IRQ descheduling trampoline and corrupt a running process (observed: httpd
      * on core 2 wedged). Cooperative behaviour is unchanged from the baseline;
      * re-enabling preemption is a separate task that must validate the trampoline. */
-    preempt_enabled[uc] = false;
+    preempt_enabled(uc) = false;
     timer_set_tick_hook(proc_tick_hook);
 
     /* Idle wake source:
@@ -2547,7 +2558,7 @@ static void proc_tick_hook(u32 core, u64 tick)
         return;
 
     u32 uc = core - CORE_USERM;
-    if (!preempt_enabled[uc] || !preempt_armed[uc] || preempt_pending[uc])
+    if (!preempt_enabled(uc) || !preempt_armed(uc) || preempt_pending(uc))
         return;
 
     struct process *p = &procs[current_proc];
@@ -2556,7 +2567,7 @@ static void proc_tick_hook(u32 core, u64 tick)
 
     u64 elapsed = tick - p->ticks;
     if (elapsed >= p->quantum_ticks)
-        preempt_pending[uc] = true;
+        preempt_pending(uc) = true;
 }
 
 void proc_irq_maybe_preempt(struct irq_frame *frame)
@@ -2565,16 +2576,16 @@ void proc_irq_maybe_preempt(struct irq_frame *frame)
         return;
 
     u32 uc = user_core_slot();
-    if (!preempt_enabled[uc] || !preempt_armed[uc] || !preempt_pending[uc])
+    if (!preempt_enabled(uc) || !preempt_armed(uc) || !preempt_pending(uc))
         return;
 
     struct process *p = &procs[current_proc];
     if (p->state != PROC_RUNNING) {
-        preempt_pending[uc] = false;
+        preempt_pending(uc) = false;
         return;
     }
 
-    preempt_pending[uc] = false;
+    preempt_pending(uc) = false;
     proc_account_runtime(p);
     p->state = PROC_READY;
     p->preemptions++;
@@ -3040,8 +3051,8 @@ void proc_park(void) {
      * on-core, so disarming preemption makes the test-and-block atomic w.r.t.
      * wake_pending without masking IRQs. */
     if (user) {
-        preempt_armed[uc] = false;
-        preempt_pending[uc] = false;
+        preempt_armed(uc) = false;
+        preempt_pending(uc) = false;
     }
     /* A wake delivered after our caller decided "no work" but before we parked
      * leaves wake_pending set even though our state was never BLOCKED. Consume it
@@ -3049,8 +3060,8 @@ void proc_park(void) {
      * source. This closes the lost-wakeup race behind the port-81 504 strand. */
     if (proc_wake_pending[current_proc].v) {
         proc_wake_pending[current_proc].v = 0;
-        if (user && preempt_enabled[uc])
-            preempt_armed[uc] = true;
+        if (user && preempt_enabled(uc))
+            preempt_armed(uc) = true;
         proc_park_note(1U); /* park_early++ */
         return;
     }
@@ -3061,8 +3072,8 @@ void proc_park(void) {
     ctx_switch(&p->ctx, &scheduler_ctx);
     proc_park_note(3U); /* park_resume++ */
     proc_wake_pending[current_proc].v = 0;   /* consume the wake that dispatched us */
-    if (user && preempt_enabled[uc] && p->state == PROC_RUNNING)
-        preempt_armed[uc] = true;
+    if (user && preempt_enabled(uc) && p->state == PROC_RUNNING)
+        preempt_armed(uc) = true;
 }
 
 /* Deterministic, seq+index-dependent payload pattern. */
