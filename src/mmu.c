@@ -145,6 +145,27 @@ static inline u64 user_ram_attrs(void)
            PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
 }
 
+static inline u64 user_ram_nc_attrs(void)
+{
+    return PTE_VALID | PTE_BLOCK | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1;
+}
+
+static void map_user_kernel_low(u64 *l2)
+{
+    for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++) {
+        u64 pa = (u64)b * L2_BLOCK_SIZE;
+        /* Mirror the live kernel low-RAM attributes. After cache enable,
+         * l2_table_low[0] points at the mixed WB-code/NC-BSS L3 table and
+         * blocks 1..3 are NC. Before cache enable, fall back to the original
+         * all-NC low-RAM mapping. Never map kernel .bss/scheduler metadata WB
+         * here: SVC/ctx-switch code runs under the user TTBR and must not write
+         * process state through a cacheable alias that the kernel TTBR later
+         * reads through its NC alias. */
+        l2[b] = l2_table_low[b] ? l2_table_low[b] : ram_block_2m_nc(pa);
+    }
+}
+
 static inline u64 user_page_rwx_attrs(void)
 {
     return PTE_VALID | PTE_PAGE | PTE_AF |
@@ -510,14 +531,13 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
      * be able to reach its own stack, procs[], scheduler_ctx and preempt state
      * (all live well above the old 2MB window, up to ~5.6MB). These blocks are
      * EL0-inaccessible, so the user process gains nothing: isolation preserved. */
-    const u64 ram_attrs = user_ram_attrs();
-    for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++)
-        map_user_low_2m(l2, b, (u64)b * L2_BLOCK_SIZE, ram_attrs);
+    map_user_kernel_low(l2);
 
     /* Map this process slot and shared FIFO window (kernel ABI FIFO path). */
     if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, 0, false, false))
         return false;
-    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
+    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE),
+                    SHARED_FIFO_BASE, user_ram_nc_attrs());
     map_user_ipc_el0_alias(uc, slot, l1, l2, 0x2003000000ULL);
 
     /* Keep peripheral MMIO mapped for current direct-call kernel API ABI. */
@@ -546,12 +566,11 @@ bool mmu_user_table_build_split(u32 core, u32 slot, u64 slot_base, u64 slot_size
     /* Map ALL kernel RAM [0, CORE0_RAM_BASE) privileged (see mmu_user_table_build).
      * Required so the scheduler can run its dispatch tail + ctx_switch on its own
      * (high) kernel stack while TTBR0 points at this user table. EL0-inaccessible. */
-    const u64 ram_attrs = user_ram_attrs();
-    for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++)
-        map_user_low_2m(l2, b, (u64)b * L2_BLOCK_SIZE, ram_attrs);
+    map_user_kernel_low(l2);
     if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, code_bytes, true, false))
         return false;
-    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
+    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE),
+                    SHARED_FIFO_BASE, user_ram_nc_attrs());
 
     map_user_device_windows(l1);
 
@@ -575,12 +594,11 @@ bool mmu_user_table_build_split_el0(u32 core, u32 slot, u64 slot_base, u64 slot_
 
     l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
 
-    const u64 ram_attrs = user_ram_attrs();
-    for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++)
-        map_user_low_2m(l2, b, (u64)b * L2_BLOCK_SIZE, ram_attrs);
+    map_user_kernel_low(l2);
     if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, code_bytes, true, true))
         return false;
-    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
+    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE),
+                    SHARED_FIFO_BASE, user_ram_nc_attrs());
     map_user_ipc_el0_alias(uc, slot, l1, l2, 0x2003000000ULL);
 
     map_user_device_windows(l1);
@@ -608,9 +626,7 @@ bool mmu_user_table_build_split_el0_at(u32 core, u32 slot, u64 va_base, u64 pa_b
     simd_zero(l2, 512 * sizeof(u64));
 
     l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
-    const u64 ram_attrs = user_ram_attrs();
-    for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++)
-        map_user_low_2m(l2, b, (u64)b * L2_BLOCK_SIZE, ram_attrs);
+    map_user_kernel_low(l2);
 
     u64 l1idx = va_base / L1_BLOCK_SIZE;
     if (l1idx >= 512)
@@ -636,7 +652,8 @@ bool mmu_user_table_build_split_el0_at(u32 core, u32 slot, u64 va_base, u64 pa_b
             (pa & ~(L3_PAGE_SIZE - 1)) | attrs;
     }
 
-    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
+    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE),
+                    SHARED_FIFO_BASE, user_ram_nc_attrs());
     map_user_ipc_el0_alias(uc, slot, l1, l2, 0x2003000000ULL);
     map_user_device_windows(l1);
     mmu_user_table_publish(uc, slot);
@@ -675,7 +692,7 @@ bool mmu_user_ipc_shm_window(u32 core, u32 slot, bool enable)
     u64 *l2 = user_l2_low[uc][slot];
     u32 idx = (u32)(IPC_SHM_BASE / L2_BLOCK_SIZE);
     if (enable) {
-        map_user_low_2m(l2, idx, IPC_SHM_BASE, user_ram_attrs());
+        map_user_low_2m(l2, idx, IPC_SHM_BASE, user_ram_nc_attrs());
     } else if (idx < 512) {
         l2[idx] = 0;
     }

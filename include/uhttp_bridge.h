@@ -1,7 +1,7 @@
 /*
  * uhttp_bridge.h - shared kernel<->userland HTTP bridge.
  *
- * The kernel (core 0, network) terminates TCP on port 81 and hands each request
+ * The kernel (core 0, network) terminates TCP on benchmark ports and hands each request
  * to a userland HTTP process via a shared-memory ring + a cross-core software
  * wake (proc_post_remote_wake + SEV). The userland process sleeps (BLOCKED)
  * between requests and is woken only when a request arrives — no syscall spin,
@@ -33,7 +33,10 @@
 #include "types.h"
 
 #define UHTTP_BRIDGE_MAGIC   0x48545450U   /* 'HTTP' */
-#define UHTTP_PORT           81U
+#define UHTTP_PORT           82U
+#define UHTTP_NATIVE_PORT    83U
+#define UHTTP_BRIDGE_COUNT   2U
+#define UHTTP_BRIDGE_STRIDE  0x00010000UL
 #define UHTTP_REQ_MAX        8192U
 #define UHTTP_RESP_MAX       24576U
 #define UHTTP_PICO_MAX       4096U
@@ -41,9 +44,14 @@
 #define UHTTP_PICO_PROGRAM_RECORD 0U
 #define UHTTP_PICO_STATIC_RECORD  1U
 #define UHTTP_PICO_API_RECORD     2U
+#define UHTTP_PICO_DYNAMIC_RECORD 3U
 /* Must equal IPC_SHM_BASE (core_env.h); verified by _Static_assert in the .c. */
 #ifdef PIOS_USER_EL0
-#define UHTTP_BRIDGE_ADDR    0x2003000000UL
+#ifndef UHTTP_BRIDGE_INDEX
+#define UHTTP_BRIDGE_INDEX   0U
+#endif
+#define UHTTP_BRIDGE_ALIAS_BASE 0x2003000000UL
+#define UHTTP_BRIDGE_ADDR    (UHTTP_BRIDGE_ALIAS_BASE + (UHTTP_BRIDGE_INDEX * UHTTP_BRIDGE_STRIDE))
 #else
 #define UHTTP_BRIDGE_ADDR    0x04D00000UL
 #endif
@@ -119,6 +127,15 @@ static inline struct uhttp_bridge *uhttp_bridge(void)
     return (struct uhttp_bridge *)(usize)UHTTP_BRIDGE_ADDR;
 }
 
+static inline struct uhttp_bridge *uhttp_bridge_at(u32 idx)
+{
+#ifdef PIOS_USER_EL0
+    return (struct uhttp_bridge *)(usize)(UHTTP_BRIDGE_ALIAS_BASE + (idx * UHTTP_BRIDGE_STRIDE));
+#else
+    return (struct uhttp_bridge *)(usize)(0x04D00000UL + (idx * UHTTP_BRIDGE_STRIDE));
+#endif
+}
+
 /* Core 0 side. */
 void uhttp_bridge_init(void);   /* tcp_listen(81) + reset bridge header */
 void uhttp_bridge_poll(void);   /* per-connection state machine; call from core 0 */
@@ -127,3 +144,5 @@ u32  uhttp_bridge_requests(void);
 /* Diagnostics: snapshot the core0 state machine + shared bridge header. */
 void uhttp_bridge_state(i32 *listen_conn, u32 *state, u32 *req_seq, u32 *resp_seq,
                         u32 *reqs, u32 *magic, u32 *httpd_pid);
+void uhttp_bridge_state_idx(u32 idx, i32 *listen_conn, u32 *state, u32 *req_seq, u32 *resp_seq,
+                            u32 *reqs, u32 *magic, u32 *httpd_pid);

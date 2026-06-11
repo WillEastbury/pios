@@ -30,7 +30,7 @@
 #include "pix.h"
 #include "watchdog.h"
 
-static struct process  procs[MAX_PROCS_PER_CORE];
+static struct process  procs[MAX_PROCS_PER_CORE] ALIGNED(64);
 /* rc-percore-sched: the scheduler's saved context, the current-process index,
  * and the round-robin cursor are PER-CORE. procs[] stays shared (each core
  * filters by affinity_core), but a single global scheduler_ctx would let two
@@ -42,21 +42,29 @@ static struct process  procs[MAX_PROCS_PER_CORE];
  * MPIDR_EL1 (pure/side-effect-free), so resolving per reference is correct and
  * cheap. Behaviour is identical for today's single-user-core topology (core 2 ->
  * slot 2; core 0 -> slot 0, value 0 as before). */
-static struct proc_context scheduler_ctx_arr[4];
-static u32 current_proc_arr[4];   /* per-core index into procs[] */
-static u32 rr_cursor_arr[4];
+struct proc_core_word {
+    volatile u32 v;
+    u32 _pad[15];
+} ALIGNED(64);
+static struct proc_context scheduler_ctx_arr[4] ALIGNED(64);
+static struct proc_core_word current_proc_arr[4];   /* per-core index into procs[] */
+static struct proc_core_word rr_cursor_arr[4];
+static struct proc_core_word proc_hosts_process_arr[4];
 #define scheduler_ctx (scheduler_ctx_arr[core_id()])
-#define current_proc  (current_proc_arr[core_id()])
-#define rr_cursor     (rr_cursor_arr[core_id()])
+#define current_proc  (current_proc_arr[core_id()].v)
+#define rr_cursor     (rr_cursor_arr[core_id()].v)
+_Static_assert((sizeof(struct proc_context) & 63U) == 0U,
+               "proc_context array elements must not share cache lines");
+_Static_assert((sizeof(struct process) & 63U) == 0U,
+               "process table slots must not share cache lines");
 static u32 next_pid;
 static bool initialized;
 static u64 heap_top[MAX_PROCS_PER_CORE];
 /* Sticky per-slot soft-event wake latch (semaphore semantics). Kept OUT of
- * struct process so the process-table element stride / .bss layout stays
- * byte-identical. proc_soft_event() sets it; proc_park() consumes it and
- * refuses to block while it is set, closing the lost-wakeup race that stranded
- * the port-81 httpd after its first request (504 on every subsequent one). */
-static volatile u32 proc_wake_pending[MAX_PROCS_PER_CORE];
+ * struct process and cache-line isolated so per-core wake writes cannot share
+ * metadata lines with other process slots. proc_soft_event() sets it;
+ * proc_park() consumes it and refuses to block while it is set. */
+static struct proc_core_word proc_wake_pending[MAX_PROCS_PER_CORE];
 static volatile bool preempt_enabled[3];
 static volatile bool preempt_armed[3];
 static volatile bool preempt_pending[3];
@@ -210,6 +218,12 @@ static struct paged_io_handle paged_io_tab[MAX_PAGED_IO_HANDLES];
 static bool proc_prio_valid(u32 p)
 {
     return p <= PROC_PRIO_REALTIME;
+}
+
+static inline void proc_publish_control(u32 slot)
+{
+    if (slot < MAX_PROCS_PER_CORE)
+        dcache_clean_range((u64)(usize)&procs[slot], 64U);
 }
 
 static i32 proc_find_slot_by_pid(u32 pid)
@@ -1601,8 +1615,9 @@ void proc_init_shared(void)
      * core's slot explicitly rather than relying on the macro (which would only
      * touch core 0's slot via core_id()). */
     for (u32 c = 0; c < 4; c++) {
-        current_proc_arr[c] = 0;
-        rr_cursor_arr[c] = 0;
+        current_proc_arr[c].v = 0;
+        rr_cursor_arr[c].v = 0;
+        proc_hosts_process_arr[c].v = 0;
     }
     next_pid = (core_id() << 16) | 1;  /* encode core in upper bits */
     proc_el1_integrity_baseline = proc_el1_integrity_hash_now();
@@ -1661,6 +1676,14 @@ void proc_init(void)
     mmu_switch_to_kernel();
     if (on_user_core())
         core_mark_online(core_id(), 0x2A);
+}
+
+void proc_mark_core_hosts_process(u32 core)
+{
+    if (core >= 4U)
+        return;
+    proc_hosts_process_arr[core].v = 1U;
+    dcache_clean_range((u64)(usize)&proc_hosts_process_arr[core], sizeof(proc_hosts_process_arr[core]));
 }
 
 static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affinity_core)
@@ -1736,7 +1759,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->pid = next_pid++;
     p->parent_pid = 0;
     p->state = PROC_READY;
-    proc_wake_pending[slot] = 0;
+    proc_wake_pending[slot].v = 0;
     p->principal_id = principal_current();
     p->affinity_core = affinity_core;
     p->priority_class = priority_class;
@@ -1762,6 +1785,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
         uart_puts("[proc] image leaves no data arena\n");
         p->state = PROC_EMPTY;
         p->pid = 0;
+        proc_publish_control((u32)slot);
         return -1;
     }
     p->arena_capacity_bytes = (p->arena_limit > p->arena_base) ?
@@ -1874,7 +1898,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     p->pid = next_pid++;
     p->parent_pid = 0;
     p->state = PROC_READY;
-    proc_wake_pending[slot] = 0;
+    proc_wake_pending[slot].v = 0;
     p->principal_id = PRINCIPAL_ROOT;   /* trusted: embedded in kernel image */
     p->affinity_core = affinity_core;
     p->priority_class = priority_class;
@@ -2014,7 +2038,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     p->pid = next_pid++;
     p->parent_pid = 0;
     p->state = PROC_READY;
-    proc_wake_pending[slot] = 0;
+    proc_wake_pending[slot].v = 0;
     p->principal_id = PRINCIPAL_ROOT;
     p->affinity_core = affinity_core;
     p->priority_class = priority_class;
@@ -2039,6 +2063,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     if (p->arena_base >= p->arena_limit) {
         p->state = PROC_EMPTY;
         p->pid = 0;
+        proc_publish_control((u32)slot);
         el0_launch_status = -9;
         return -1;
     }
@@ -2073,6 +2098,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
                                            PROC_SLOT_SIZE, loaded)) {
         p->state = PROC_EMPTY;
         p->pid = 0;
+        proc_publish_control((u32)slot);
         el0_launch_status = -11;
         return -1;
     }
@@ -2442,7 +2468,7 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
      * but inactive -- abi el0_ready=false), stage-2 is the only thing isolating
      * them. Once processes run at EL0, stage-1 EL0 perms isolate and this whole
      * per-core split can go away. */
-    bool hosts_process = (core_id() == CORE_USER0);
+    bool hosts_process = (proc_hosts_process_arr[core_id()].v != 0U);
     if (!hosts_process)
         gic_cpu_init();
 
@@ -2590,7 +2616,7 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
      * to BLOCKED (still RUNNING/READY mid park-transition) — the port-81 504
      * strand. proc_park() consumes this latch and refuses to block while it is
      * set, so a wake can never be lost regardless of the park/wake interleaving. */
-    proc_wake_pending[(u32)slot] = 1U;
+    proc_wake_pending[(u32)slot].v = 1U;
     if (p->state == PROC_BLOCKED)
         p->state = PROC_READY;
     if (boost && (p->state == PROC_READY || p->state == PROC_RUNNING)) {
@@ -2598,6 +2624,7 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
         sched_diag[uc].soft_boost_count++;
         diag_clean_word(&sched_diag[uc]);
     }
+    proc_publish_control((u32)slot);
     sev();
     return true;
 }
@@ -3020,8 +3047,8 @@ void proc_park(void) {
      * leaves wake_pending set even though our state was never BLOCKED. Consume it
      * and return WITHOUT blocking; the caller re-loops and re-checks its work
      * source. This closes the lost-wakeup race behind the port-81 504 strand. */
-    if (proc_wake_pending[current_proc]) {
-        proc_wake_pending[current_proc] = 0;
+    if (proc_wake_pending[current_proc].v) {
+        proc_wake_pending[current_proc].v = 0;
         if (user && preempt_enabled[uc])
             preempt_armed[uc] = true;
         proc_park_note(1U); /* park_early++ */
@@ -3033,7 +3060,7 @@ void proc_park(void) {
     proc_note_desched(1U);
     ctx_switch(&p->ctx, &scheduler_ctx);
     proc_park_note(3U); /* park_resume++ */
-    proc_wake_pending[current_proc] = 0;   /* consume the wake that dispatched us */
+    proc_wake_pending[current_proc].v = 0;   /* consume the wake that dispatched us */
     if (user && preempt_enabled[uc] && p->state == PROC_RUNNING)
         preempt_armed[uc] = true;
 }

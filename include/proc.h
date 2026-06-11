@@ -240,7 +240,7 @@ struct appf_service_record {
 struct proc_context {
     u64 x19_x30[12];   /* x19-x30 (12 callee-saved registers) */
     u64 sp;
-} ALIGNED(16);
+} ALIGNED(64);
 
 struct process {
     u32 pid;
@@ -307,7 +307,7 @@ struct process {
     u32 arena_span_high_bytes;
     u32 arena_span_count;
     u32 arena_span_high_count;
-};
+} ALIGNED(64);
 
 /* PIKEE (Pi Kernel Execution Environment) API table passed to processes in x0 at entry.
  * This is the COMPLETE userland API surface.
@@ -484,6 +484,7 @@ extern void ctx_switch(struct proc_context *old, struct proc_context *new_ctx);
 
 void proc_init(void);              /* init scheduler on this core */
 void proc_init_shared(void);       /* init single-instance shared proc tables once (core 0, pre-SMP) */
+void proc_mark_core_hosts_process(u32 core);
 i32  proc_exec(const char *path);  /* load + start process from WALFS */
 void proc_yield(void);             /* cooperative context switch */
 NORETURN void proc_exit(u32 code); /* terminate current process */

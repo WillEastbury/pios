@@ -2661,6 +2661,27 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "usage pixe put <card> <record> <wordoffset> <hexword>...\n");
         }
     } else if (http_streq(cmd, "uhttp")) {
+        for (u32 bi = 0; bi < UHTTP_BRIDGE_COUNT; bi++) {
+            i32 bl = 0; u32 bst = 0, brq = 0, brs = 0, breq = 0, bmagic = 0, bpid = 0;
+            uhttp_bridge_state_idx(bi, &bl, &bst, &brq, &brs, &breq, &bmagic, &bpid);
+            http_append(out, &len, max, "bridge");
+            http_append_u64(out, &len, max, bi);
+            http_append(out, &len, max, " listen=");
+            http_append_u64(out, &len, max, (u32)bl);
+            http_append(out, &len, max, " state=");
+            http_append_u64(out, &len, max, bst);
+            http_append(out, &len, max, " req_seq=");
+            http_append_u64(out, &len, max, brq);
+            http_append(out, &len, max, " resp_seq=");
+            http_append_u64(out, &len, max, brs);
+            http_append(out, &len, max, " reqs=");
+            http_append_u64(out, &len, max, breq);
+            http_append(out, &len, max, " magic=0x");
+            http_append_hex32(out, &len, max, bmagic);
+            http_append(out, &len, max, " pid=");
+            http_append_u64(out, &len, max, bpid);
+            http_append(out, &len, max, "\n");
+        }
         i32 lc = 0; u32 st = 0, rq = 0, rs = 0, reqs = 0, magic = 0, pid = 0;
         uhttp_bridge_state(&lc, &st, &rq, &rs, &reqs, &magic, &pid);
         http_append(out, &len, max, "uhttp listen=");
@@ -2704,6 +2725,15 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, lp);
             http_append(out, &len, max, " c2_stage=");
             http_append_u64(out, &len, max, proc_sched_stage_get(CORE_USER0));
+            proc_sched_ctx_stats(CORE_USER1, &ce, &cx, &lp);
+            http_append(out, &len, max, " c3_ctxin=");
+            http_append_u64(out, &len, max, ce);
+            http_append(out, &len, max, " c3_ctxout=");
+            http_append_u64(out, &len, max, cx);
+            http_append(out, &len, max, " c3_lastpid=");
+            http_append_u64(out, &len, max, lp);
+            http_append(out, &len, max, " c3_stage=");
+            http_append_u64(out, &len, max, proc_sched_stage_get(CORE_USER1));
         }
         {
             u32 di = 0, dp = 0, dz = 0, dc = 0, dn = 0, ds = 0;
@@ -2731,6 +2761,15 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, " c2_disp=");
             http_append_u64(out, &len, max, dn);
             http_append(out, &len, max, " c2_wfe=");
+            http_append_u64(out, &len, max, wf);
+            proc_rwake_live(CORE_USER1, &ls, &lp, &dn, &wf);
+            http_append(out, &len, max, " c3_curstate=");
+            http_append_u64(out, &len, max, ls);
+            http_append(out, &len, max, " c3_curpid=");
+            http_append_u64(out, &len, max, lp);
+            http_append(out, &len, max, " c3_disp=");
+            http_append_u64(out, &len, max, dn);
+            http_append(out, &len, max, " c3_wfe=");
             http_append_u64(out, &len, max, wf);
         }
         {
@@ -13593,9 +13632,11 @@ NORETURN void core1_main(void) {
 }
 
 /* Core 2: User core 0 - process scheduler */
-/* Embedded userland HTTP server flat binary (src/user_httpd_payload.S). */
-extern const u8 user_httpd_start[];
-extern const u8 user_httpd_end[];
+/* Embedded userland HTTP server flat binaries (src/user_httpd_payload.S). */
+extern const u8 user_httpd_vm_start[];
+extern const u8 user_httpd_vm_end[];
+extern const u8 user_httpd_native_start[];
+extern const u8 user_httpd_native_end[];
 extern const u8 user_el0_probe_start[];
 extern const u8 user_el0_probe_end[];
 extern const u8 user_el0_pico_start[];
@@ -13609,11 +13650,12 @@ NORETURN void core2_main(void) {
     core_mark_online(CORE_USER0, 3);
     timer_init(PROC_PREEMPT_TIMER_HZ);
     core_mark_online(CORE_USER0, 4);
+    proc_mark_core_hosts_process(CORE_USER0);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     core_mark_online(CORE_USER0, 5);
-    /* Launch the embedded PicoScript-backed HTTP server at real EL0. */
-    proc_exec_from_mem_el0("user/httpd-el0", user_httpd_start,
-                           (u32)(usize)(user_httpd_end - user_httpd_start),
+    /* Launch the PicoScript VM-backed HTTP benchmark worker on port 82. */
+    proc_exec_from_mem_el0("user/httpd-vm-el0", user_httpd_vm_start,
+                           (u32)(usize)(user_httpd_vm_end - user_httpd_vm_start),
                            0x2001000000ULL, 0x02900000ULL, PROC_PRIO_NORMAL, core_id());
     proc_schedule(); /* never returns */
     for (;;) wfe();
@@ -13629,17 +13671,19 @@ NORETURN void core3_main(void) {
     core_mark_online(CORE_USER1, 3);
     timer_init(PROC_PREEMPT_TIMER_HZ);
     core_mark_online(CORE_USER1, 4);
+    proc_mark_core_hosts_process(CORE_USER1);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     core_mark_online(CORE_USER1, 5);
+    /* Launch the native-C HTTP benchmark worker on port 83. */
+    proc_exec_from_mem_el0("user/httpd-native-el0", user_httpd_native_start,
+                           (u32)(usize)(user_httpd_native_end - user_httpd_native_start),
+                           0x2001000000ULL, 0x03B00000ULL, PROC_PRIO_NORMAL, core_id());
     {
         u64 sctlr;
         __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
         sctlr |= (1ULL << 23); /* SPAN: do not force PAN on EL1 exception entry */
         __asm__ volatile("msr sctlr_el1, %0\nisb" :: "r"(sctlr) : "memory");
     }
-    proc_exec_from_mem_el0("user/el0pico", user_el0_pico_start,
-                           (u32)(usize)(user_el0_pico_end - user_el0_pico_start),
-                           0x2002000000ULL, 0x03B00000ULL, PROC_PRIO_NORMAL, core_id());
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }

@@ -1,17 +1,21 @@
 /*
  * user_httpd_payload.S - embed the userland HTTP server flat binary.
  *
- * user_httpd.img is produced by the userland build (user/httpd.c linked flat at
- * the core-2 slot-0 base via user/user.ld). The kernel copies these bytes into
- * the process slot and currently enters them through the legacy EL1 direct-KPI
- * ctx_switch path. True EL0 entry is tracked separately in the EL0 eret/SVC work.
- * See proc_exec_from_mem in src/proc.c and the boot launch in core2_main.
+ * user_httpd_vm.img and user_httpd_native.img are produced by the userland build.
+ * Both are linked at the same high EL0 VA; the kernel maps them into different
+ * physical process slots/cores for benchmark comparison.
  */
 .section .rodata.user_httpd, "a"
 .balign 64
-.global user_httpd_start
-.global user_httpd_end
-user_httpd_start:
-    .incbin "user_httpd.img"
+.global user_httpd_vm_start
+.global user_httpd_vm_end
+.global user_httpd_native_start
+.global user_httpd_native_end
+user_httpd_vm_start:
+    .incbin "user_httpd_vm.img"
 .balign 64
-user_httpd_end:
+user_httpd_vm_end:
+user_httpd_native_start:
+    .incbin "user_httpd_native.img"
+.balign 64
+user_httpd_native_end:
