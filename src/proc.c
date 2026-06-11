@@ -1277,26 +1277,29 @@ static void  proc_park_note(u32 which);
 #define APPF_SERVICE_MAX        32U
 #define APPF_HOOK_BIND_MAX      32U
 
-struct appf_ring_event {
-    struct appf_event_record recs[APPF_EVENT_RING_SIZE];
+struct appf_ring_ctrl {
     u32 head;
     u32 tail;
     u32 seq;
-};
+    u32 _pad[13];
+} ALIGNED(64);
+
+struct appf_ring_event {
+    struct appf_ring_ctrl ctrl;
+    struct appf_event_record recs[APPF_EVENT_RING_SIZE] ALIGNED(64);
+} ALIGNED(64);
 
 struct appf_ring_log {
-    struct appf_log_record recs[APPF_LOG_RING_SIZE];
-    u32 head;
-    u32 tail;
-    u32 seq;
-};
+    struct appf_ring_ctrl ctrl;
+    struct appf_log_record recs[APPF_LOG_RING_SIZE] ALIGNED(64);
+} ALIGNED(64);
 
 struct appf_service_entry {
     bool used;
     struct appf_service_record rec;
     bool capsule_enabled;
     u32 capsule_manifest_hash;
-};
+} ALIGNED(64);
 
 struct appf_hook_binding {
     bool used;
@@ -1305,25 +1308,45 @@ struct appf_hook_binding {
     u32 owner_principal;
     bool capsule_enabled;
     u32 capsule_manifest_hash;
-};
+} ALIGNED(64);
 
 struct ipc_ns_entry {
     bool used;
     u32 owner_principal;
     bool capsule_enabled;
     u32 capsule_manifest_hash;
-};
+} ALIGNED(64);
 
-static struct appf_ring_event appf_events[3];
-static struct appf_ring_log appf_logs[3];
+struct appf_capsule_ns_entry {
+    bool capsule_enabled;
+    u32 capsule_manifest_hash;
+} ALIGNED(64);
+
+static struct appf_ring_event appf_events[3] ALIGNED(64);
+static struct appf_ring_log appf_logs[3] ALIGNED(64);
 static struct appf_service_entry appf_services[3][APPF_SERVICE_MAX];
 static struct appf_hook_binding appf_hooks[3][APPF_HOOK_BIND_MAX];
 static struct ipc_ns_entry ipc_queue_ns[3][IPC_QUEUE_MAX_OBJECTS];
 static struct ipc_ns_entry ipc_topic_ns[3][IPC_TOPIC_MAX];
-static struct {
-    bool capsule_enabled;
-    u32 capsule_manifest_hash;
-} appf_event_ns[3][APPF_EVENT_RING_SIZE], appf_log_ns[3][APPF_LOG_RING_SIZE];
+static struct appf_capsule_ns_entry appf_event_ns[3][APPF_EVENT_RING_SIZE];
+static struct appf_capsule_ns_entry appf_log_ns[3][APPF_LOG_RING_SIZE];
+_Static_assert(sizeof(struct appf_ring_ctrl) == 64, "APPF ring control must be one cache line");
+_Static_assert((__builtin_offsetof(struct appf_ring_event, recs) & 63U) == 0U,
+               "APPF event records must start on a cache line");
+_Static_assert((sizeof(struct appf_ring_event) & 63U) == 0U,
+               "APPF event ring stride must be cache-line aligned");
+_Static_assert((__builtin_offsetof(struct appf_ring_log, recs) & 63U) == 0U,
+               "APPF log records must start on a cache line");
+_Static_assert((sizeof(struct appf_ring_log) & 63U) == 0U,
+               "APPF log ring stride must be cache-line aligned");
+_Static_assert((sizeof(struct appf_service_entry) & 63U) == 0U,
+               "APPF service entries must have cache-line stride");
+_Static_assert((sizeof(struct appf_hook_binding) & 63U) == 0U,
+               "APPF hook bindings must have cache-line stride");
+_Static_assert((sizeof(struct ipc_ns_entry) & 63U) == 0U,
+               "IPC namespace entries must have cache-line stride");
+_Static_assert((sizeof(struct appf_capsule_ns_entry) & 63U) == 0U,
+               "APPF capsule namespace entries must have cache-line stride");
 
 static inline u32 appf_core_slot(void)
 {
@@ -3927,11 +3950,11 @@ u32 proc_log_snapshot(struct proc_log_ui_entry *out, u32 max_entries)
     u32 n = 0;
     for (u32 cs = 0; cs < 3 && n < max_entries; cs++) {
         struct appf_ring_log *q = &appf_logs[cs];
-        u32 head = q->head;
-        u32 tail = q->tail;
+        u32 head = q->ctrl.head;
+        u32 tail = q->ctrl.tail;
         if (head >= APPF_LOG_RING_SIZE || tail >= APPF_LOG_RING_SIZE)
             continue;
-        u32 i = q->tail;
+        u32 i = q->ctrl.tail;
         u32 scanned = 0;
         while (i != head && scanned < APPF_LOG_RING_SIZE && n < max_entries) {
             struct appf_log_record *r = &q->recs[i];
@@ -5196,19 +5219,19 @@ static i32 sys_event_emit(u32 type, const void *data, u32 len)
     if (len > 0 && (!data || !ptr_valid(data, len))) return -1;
     u32 cs = appf_core_slot();
     struct appf_ring_event *q = &appf_events[cs];
-    u32 i = q->head;
+    u32 i = q->ctrl.head;
     struct appf_event_record *r = &q->recs[i];
     struct process *me = current_process();
-    r->seq = ++q->seq;
+    r->seq = ++q->ctrl.seq;
     r->type = type;
     r->len = len;
     if (len > 0)
         simd_memcpy(r->data, data, len);
     appf_event_ns[cs][i].capsule_enabled = me->capsule_enabled;
     appf_event_ns[cs][i].capsule_manifest_hash = me->capsule_manifest_hash;
-    q->head = (q->head + 1U) % APPF_EVENT_RING_SIZE;
-    if (q->head == q->tail)
-        q->tail = (q->tail + 1U) % APPF_EVENT_RING_SIZE;
+    q->ctrl.head = (q->ctrl.head + 1U) % APPF_EVENT_RING_SIZE;
+    if (q->ctrl.head == q->ctrl.tail)
+        q->ctrl.tail = (q->ctrl.tail + 1U) % APPF_EVENT_RING_SIZE;
     return (i32)len;
 }
 
@@ -5219,15 +5242,15 @@ static i32 sys_event_next(struct appf_event_record *out)
     u32 cs = appf_core_slot();
     struct appf_ring_event *q = &appf_events[cs];
     struct process *me = current_process();
-    while (q->tail != q->head) {
-        u32 i = q->tail;
+    while (q->ctrl.tail != q->ctrl.head) {
+        u32 i = q->ctrl.tail;
         if (capsule_namespace_visible(me, appf_event_ns[cs][i].capsule_enabled,
                                       appf_event_ns[cs][i].capsule_manifest_hash)) {
             simd_memcpy(out, &q->recs[i], sizeof(*out));
-            q->tail = (q->tail + 1U) % APPF_EVENT_RING_SIZE;
+            q->ctrl.tail = (q->ctrl.tail + 1U) % APPF_EVENT_RING_SIZE;
             return (i32)out->len;
         }
-        q->tail = (q->tail + 1U) % APPF_EVENT_RING_SIZE;
+        q->ctrl.tail = (q->ctrl.tail + 1U) % APPF_EVENT_RING_SIZE;
     }
     return -1;
 }
@@ -5238,19 +5261,19 @@ static i32 sys_log_write(u32 level, const char *msg, u32 len)
     if (len > 0 && (!msg || !ptr_valid(msg, len))) return -1;
     u32 cs = appf_core_slot();
     struct appf_ring_log *q = &appf_logs[cs];
-    u32 i = q->head;
+    u32 i = q->ctrl.head;
     struct appf_log_record *r = &q->recs[i];
     struct process *me = current_process();
-    r->seq = ++q->seq;
+    r->seq = ++q->ctrl.seq;
     r->level = level;
     r->len = len;
     if (len > 0)
         simd_memcpy(r->msg, msg, len);
     appf_log_ns[cs][i].capsule_enabled = me->capsule_enabled;
     appf_log_ns[cs][i].capsule_manifest_hash = me->capsule_manifest_hash;
-    q->head = (q->head + 1U) % APPF_LOG_RING_SIZE;
-    if (q->head == q->tail)
-        q->tail = (q->tail + 1U) % APPF_LOG_RING_SIZE;
+    q->ctrl.head = (q->ctrl.head + 1U) % APPF_LOG_RING_SIZE;
+    if (q->ctrl.head == q->ctrl.tail)
+        q->ctrl.tail = (q->ctrl.tail + 1U) % APPF_LOG_RING_SIZE;
     return (i32)len;
 }
 
@@ -5260,15 +5283,15 @@ static i32 sys_log_next(struct appf_log_record *out)
     u32 cs = appf_core_slot();
     struct appf_ring_log *q = &appf_logs[cs];
     struct process *me = current_process();
-    while (q->tail != q->head) {
-        u32 i = q->tail;
+    while (q->ctrl.tail != q->ctrl.head) {
+        u32 i = q->ctrl.tail;
         if (capsule_namespace_visible(me, appf_log_ns[cs][i].capsule_enabled,
                                       appf_log_ns[cs][i].capsule_manifest_hash)) {
             simd_memcpy(out, &q->recs[i], sizeof(*out));
-            q->tail = (q->tail + 1U) % APPF_LOG_RING_SIZE;
+            q->ctrl.tail = (q->ctrl.tail + 1U) % APPF_LOG_RING_SIZE;
             return (i32)out->len;
         }
-        q->tail = (q->tail + 1U) % APPF_LOG_RING_SIZE;
+        q->ctrl.tail = (q->ctrl.tail + 1U) % APPF_LOG_RING_SIZE;
     }
     return -1;
 }
