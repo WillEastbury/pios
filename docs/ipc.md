@@ -6,99 +6,95 @@ All inter-core communication uses **lock-free SPSC (Single-Producer Single-Consu
 
 There are 16 FIFO channels arranged in a 4×4 grid (`fifo[src][dst]`). The diagonal (`fifo[i][i]`) is unused. This gives 12 active unidirectional channels.
 
-## Inter-Core Correctness Invariants
+## Inter-Core and ABI Scan Invariants
 
-These are hard invariants for FIFO, wake-ring, scheduler, descriptor, IPC, and DMA work. Treat violations as correctness bugs before investigating higher-level behavior.
+These are hard scan/review rules for FIFO, wake-ring, scheduler, descriptor, IPC, DMA, MMU, parser, trap, and hot-path changes. Treat violations as correctness bugs before investigating higher-level behavior.
 
-1. **Single writer per cache line** — any FIFO head/tail/counter/state word written by different cores must live on separate 64-byte cache lines. No packed per-core arrays for mutable scheduler/FIFO state.
-2. **SPSC ownership only** — each FIFO direction has exactly one producer core and one consumer core. MPSC/MPMC behavior requires a different primitive.
-3. **Publish-before-doorbell** — producer writes payload, publishes payload/control with the primitive's release barrier/cache-maintenance contract, updates the visible head/sequence, then signals with `sev`/SGI. Never signal before the descriptor is complete.
-4. **Acquire-after-doorbell** — consumer refreshes or observes the visible head/sequence with the primitive's acquire contract before reading payload.
-5. **No lost-wakeup window** — any process park path must have a sticky wake latch or equivalent sequence check so "check work -> arm/block" is atomic relative to wake publication.
-6. **Scheduler-local means cache-line-local** — per-core scheduler state (`current_proc`, `rr_cursor`, diagnostics, current PID/state, idle counters) must be per-core and 64-byte isolated.
-7. **Process control line isolation** — PID/state/affinity/wake metadata must not share a cache line with another process slot or another core's mutable fields.
-8. **No cross-core state mutation without ownership** — a core may only mutate process state for processes it owns, except through an explicit remote-wake/migration/command protocol.
-9. **Wake target must be core-qualified** — remote wake records must carry enough routing identity to prove `target_core` and PID/slot ownership are consistent.
-10. **Counters are diagnostics, not synchronization** — debug counters may be approximate unless explicitly marked coherent; scheduling correctness must not depend on them.
-11. **Single cacheability model per physical page** — no PA may be mapped WB in one TTBR and NC/device in another. Attribute mismatch is a boot-time/panic-level bug.
-12. **Stage-2 fails closed** — EL2 stage-2 may only map ranges whose attributes it can prove or mirror. No blanket WB mappings.
-13. **Descriptor ownership is linear** — a descriptor is owned by exactly one domain at a time: producer, kernel, consumer, or free pool. No shared mutable ownership.
-14. **Sequence numbers beat booleans** — wake, FIFO, and descriptor publication state should use monotonic sequence numbers where possible. Flags are lossy under races.
-15. **Reuse requires generation tags** — any recycled process slot, descriptor, FIFO entry, lease, or pool descriptor should carry a generation/version to catch stale references.
-16. **No control/data aliasing** — control words and payload buffers should not share cache lines. Payload churn must not dirty control metadata.
-17. **Barriers are part of the ABI** — every FIFO/wake primitive must define its release/acquire barrier contract. Callers do not improvise barriers.
-18. **Remote mutation is message passing** — if core A needs core B's state changed, it posts a command. It does not poke B's scheduler/process fields directly.
-19. **Diagnostics must not perturb scheduling** — tracing/counters must be isolated enough that enabling diagnostics cannot change cache-line ownership of scheduler state.
-20. **Every park has a reason and every wake has evidence** — park records should capture the last checked sequence/head, and wake records should carry the published sequence/head.
-21. **Length is authority** — every buffer, span, and descriptor carries pointer, length, used, and capacity. Never trust terminators and never infer length from content.
-22. **Bounds checked before touch** — validate the full range before the first read/write, not after decode starts. Parsers must not partially mutate state before bounds pass.
-23. **Red zones around arenas** — debug builds place guard bytes/pages before and after arenas, stacks, FIFO rings, and descriptor pools, and trap on corruption.
-24. **Poison on free/release** — released descriptors, leases, and pool entries are poisoned and generation-bumped. Any later access faults loudly.
-25. **Underrun is also a bug** — reads must prove `available >= requested`. Short reads are explicit status, not "whatever bytes happened to be there".
-26. **Parser budget invariant** — every parser has byte, depth, token, and time/step limits. Fuzz input must not create infinite parse or pathological recursion.
-27. **Fail closed on malformed descriptors** — bad kind, invalid phase, impossible length, stale generation, wrong owner, or bad checksum means reject/abort, never silently repair.
-28. **Trap records are structured** — every fault emits core, EL, PID, capsule, PC, SP, TTBR, syndrome, descriptor id, generation, owner, and last FIFO sequence.
-29. **Canary every control block** — scheduler/process/FIFO/descriptor structs carry magic/version/canary fields in debug. Validate at entry/exit of hot boundaries.
-30. **No implicit widening/truncation** — all length/index arithmetic is checked for overflow. Size conversions must be explicit.
-31. **Fuzzable ABI** — FIFO messages, descriptors, HTTP spans, card records, and PicoScript bytecode must have standalone fuzz harnesses.
-32. **Deterministic replay** — every crash path should preserve enough ring history to replay inbound descriptor ids, wake sequences, handler ids, and binding ids.
-33. **Capability check before decode** — do not parse or materialize data for a binding the capsule is not authorized to see.
-34. **Immutable after publish** — once visible to another core/domain, control descriptors are immutable except for explicitly owned ack/status fields.
-35. **Panic on impossible state** — there is no "best effort" for scheduler/MMU/descriptor invariants. Impossible means panic, dump, and reboot cleanly.
+### Memory layout and cache-line ownership
 
-### Categorized scan rules
-
-**Memory Layout**
 - RULE: No mutable shared struct may cross a cache-line boundary.
-- RULE: Per-core arrays of mutable state forbidden.
-- RULE: Shared control structures must be alignas(64).
-- RULE: Struct stride must be multiple of 64 if accessed cross-core.
-- RULE: Control and payload fields may not reside in same cache line.
+- RULE: Packed per-core arrays of mutable state are forbidden; if an array is unavoidable, each element must be an `ALIGNED(64)` owner record with 64-byte stride.
+- RULE: Shared control structures must be `ALIGNED(64)` / `alignas(64)`.
+- RULE: Struct stride must be a multiple of 64 if accessed cross-core.
+- RULE: Control and payload fields may not reside in the same cache line.
+- RULE: PID/state/affinity/wake metadata must not share a cache line with another process slot or another core's mutable fields.
 
-**Ownership**
+### Ownership and lifetime
+
 - RULE: One writer per field.
-- RULE: Shared mutable globals forbidden.
+- RULE: Shared mutable globals are forbidden unless ownership, cache-line isolation, and publication semantics are explicit.
+- RULE: Descriptor ownership is linear: producer, kernel, consumer, or free pool, exactly one at a time.
 - RULE: Descriptor ownership transitions must be explicit.
-- RULE: No raw pointer handoff between ownership domains.
-- RULE: Generation field required for reusable objects.
+- RULE: No raw pointer handoff between ownership domains; hand off descriptors/spans with authority metadata.
+- RULE: Generation field required for reusable objects: process slots, descriptors, FIFO entries, leases, and pool descriptors.
+- RULE: Released descriptors, leases, and pool entries are poisoned and generation-bumped.
+- RULE: Once visible to another core/domain, control descriptors are immutable except for explicitly owned ack/status fields.
+- RULE: No descriptor duplication unless ownership changes.
 
-**MMU / Cacheability**
-- RULE: Same PA must never have conflicting attributes.
-- RULE: Stage-2 mappings must specify attribute class.
+### MMU and cacheability
+
+- RULE: Same PA must never have conflicting attributes across kernel TTBR0, user TTBR0, aliases, diagnostics, or stage-2.
+- RULE: Stage-2 mappings must specify/prove the attribute class and fail closed if they cannot mirror the PA attributes.
 - RULE: WB+NC alias detection is fatal.
 - RULE: Device memory may never be mapped Normal.
-- RULE: Shared metadata attribute must match across TTBRs.
+- RULE: Shared metadata attributes must match across TTBRs.
+- RULE: Attribute mismatch is a boot-time/panic-level bug.
 
-**FIFO / Ring Safety**
-- RULE: Producer writes payload before head.
-- RULE: Consumer reads head before payload.
-- RULE: Every publication has release barrier.
-- RULE: Every consumption has acquire barrier.
-- RULE: No MPSC/MPMC on SPSC primitives.
+### FIFO, wake, and ring safety
+
+- RULE: SPSC primitives are SPSC only; no MPSC/MPMC on SPSC paths.
+- RULE: Producer writes payload before head/sequence.
+- RULE: Consumer reads head/sequence before payload.
+- RULE: Every publication has a release barrier/cache-maintenance contract.
+- RULE: Every consumption has an acquire barrier/cache-maintenance contract.
+- RULE: Barriers are part of the ABI; callers do not improvise them.
 - RULE: Wake publication must be sequence-backed.
+- RULE: Park paths need a sticky wake latch or monotonic sequence check around "check work -> block".
+- RULE: Wake records must prove target core and PID/slot ownership are consistent.
+- RULE: Every park records the last checked sequence/head; every wake carries the published sequence/head.
 
-**Length Safety**
-- RULE: memcpy requires explicit bounds proof.
-- RULE: strlen forbidden in kernel.
-- RULE: str* APIs forbidden.
+### Remote mutation and scheduler isolation
+
+- RULE: Remote mutation is message passing: core A changes core B's state by posting a command, not by poking scheduler/process fields.
+- RULE: A core may mutate process state only for processes it owns, except through explicit remote-wake/migration/command protocols.
+- RULE: Scheduler-local state is cache-line-local: `current_proc`, `rr_cursor`, diagnostics, current PID/state, and idle counters are per-core and 64-byte isolated.
+- RULE: No locks in scheduler.
+- RULE: No syscalls from scheduler context.
+- RULE: Counters are diagnostics, not synchronization.
+
+### Length, parsing, and bounds
+
+- RULE: Length is authority: every buffer/span/descriptor carries pointer, length, used, and capacity.
+- RULE: Never trust terminators and never infer length from content.
+- RULE: `strlen` and `str*` APIs are forbidden in kernel logic; use explicit-length helpers.
+- RULE: `memcpy`/`simd_memcpy` requires explicit bounds proof.
+- RULE: Bounds checked before touch: validate full range before first read/write or decode side effect.
 - RULE: All spans carry length.
-- RULE: Integer overflow checked before allocation.
+- RULE: Reads prove `available >= requested`; short read is explicit status.
+- RULE: Integer overflow checked before allocation or indexing.
 - RULE: Pointer+length arithmetic validated.
+- RULE: Parser budget invariant: byte, depth, token, and time/step limits on every parser.
+- RULE: Capability check before decode/materialization for protected bindings.
+- RULE: Malformed descriptors fail closed: bad kind, phase, length, generation, owner, or checksum rejects/aborts.
 
-**Fault Containment**
-- RULE: Every trap path records context.
+### Fault containment, diagnostics, and replay
+
+- RULE: Every trap path records structured context: core, EL, PID, capsule, PC, SP, TTBR, syndrome, descriptor id, generation, owner, and last FIFO sequence.
 - RULE: Panic paths may not allocate.
 - RULE: Panic paths may not block.
-- RULE: Error paths must be deterministic.
-- RULE: Impossible states must terminate.
+- RULE: Error paths are deterministic.
+- RULE: Impossible states terminate: panic, dump, and reboot cleanly; no best-effort repair.
+- RULE: Diagnostics must not perturb scheduling or change scheduler cache-line ownership.
+- RULE: Crash paths preserve enough ring history for deterministic replay: inbound descriptor ids, wake sequences, handler ids, and binding ids.
+- RULE: Debug builds use red zones around arenas, stacks, FIFO rings, and descriptor pools.
+- RULE: Debug builds canary scheduler/process/FIFO/descriptor control blocks and validate them at hot boundaries.
 
-**Performance**
+### Performance and fuzzability
+
 - RULE: No heap allocation in hot path.
-- RULE: No locks in scheduler.
-- RULE: No copies larger than N bytes.
-- RULE: No syscalls from scheduler context.
 - RULE: No dynamic string formatting in IRQ path.
-- RULE: No descriptor duplication unless ownership changes.
+- RULE: No copies larger than the reviewed threshold N bytes on hot paths; use descriptors/spans/zero-copy instead.
+- RULE: FIFO messages, descriptors, HTTP spans, card records, and PicoScript bytecode must have standalone fuzz harnesses.
 
 ## FIFO Location
 
