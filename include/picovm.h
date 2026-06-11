@@ -19,6 +19,7 @@
 #define PV_MAX_CARDS  2048      /* open-addressed; must be a power of two */
 #define PV_MAX_CALL   256
 #define PV_MAX_OUT    8192
+#define PV_MAX_SPANS  1024      /* span table: handle = 1-based index, 0 = null */
 
 /* ---- 16 core opcodes (bits [31:28]) ---------------------------------- */
 enum {
@@ -76,6 +77,17 @@ struct pv_ctx {
     long      mem_size;
 
     int       dot_len;        /* active span length for Dot8.Of */
+
+    /* Span table + bump arena for the span/string namespaces (String/Number and,
+     * built on these, Template/Http/...). A span handle is a 1-based index into
+     * span_ptr/span_len; handle 0 is the null/empty span. Results bump-allocate at
+     * arena_top. Mirrors picoscript_vm.PicoVM (spans=[None], arena_top=0x8000). */
+    uint32_t  span_ptr[PV_MAX_SPANS];
+    int32_t   span_len[PV_MAX_SPANS];
+    int       span_count;
+    uint32_t  arena_top;
+    uint32_t  str_repl_ptr;   /* String.SetReplace pending replacement (ptr,len) */
+    int32_t   str_repl_len;
 
     pv_host_fn host;
 };

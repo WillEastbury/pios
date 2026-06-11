@@ -120,6 +120,43 @@ int32_t pv_dot8(pv_ctx *ctx, uint32_t wptr, uint32_t aptr)
     return s;
 }
 
+/* ---- span table + bump-arena helpers (mirror picoscript_vm.PicoVM) ----
+ * A span handle is a 1-based index; handle 0 is the null/empty span. Result
+ * bytes are written at arena_top and a new span registered, exactly as the
+ * Python/JS interpreters' _new_span_bytes does. */
+static uint32_t pv_span_p(pv_ctx *ctx, int h)
+{
+    return (h > 0 && h < ctx->span_count) ? ctx->span_ptr[h] : 0;
+}
+static int32_t pv_span_n(pv_ctx *ctx, int h)
+{
+    return (h > 0 && h < ctx->span_count) ? ctx->span_len[h] : 0;
+}
+static uint8_t pv_arena_get(pv_ctx *ctx, uint32_t a)
+{
+    return (ctx->mem && a < (uint32_t)ctx->mem_size) ? ctx->mem[a] : 0;
+}
+static int pv_span_make(pv_ctx *ctx, uint32_t ptr, int32_t len)
+{
+    if (len < 0) len = 0;
+    if (ctx->span_count >= PV_MAX_SPANS) return 0;
+    ctx->span_ptr[ctx->span_count] = ptr;
+    ctx->span_len[ctx->span_count] = len;
+    return ctx->span_count++;
+}
+static void pv_arena_put(pv_ctx *ctx, uint32_t *k, uint8_t b)
+{
+    uint32_t a = ctx->arena_top + *k;
+    if (ctx->mem && a < (uint32_t)ctx->mem_size) ctx->mem[a] = b;
+    (*k)++;
+}
+static int pv_arena_finish(pv_ctx *ctx, uint32_t k)
+{
+    int h = pv_span_make(ctx, ctx->arena_top, (int32_t)k);
+    ctx->arena_top += k;
+    return h;
+}
+
 /* ---- default host: Random.U32 + Queue.* (mirrors HostApi) ------------- */
 
 void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
@@ -202,6 +239,239 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
         pv_io_write(ctx, ctx->regs[rs1]);
         return;
     }
+
+    /* ---- Span.* (handle = 1-based index into the span table) ---------- */
+    if (hook == PV_HOOK_SPAN_MAKE) {
+        ctx->regs[rd] = pv_span_make(ctx, (uint32_t)(ctx->regs[rs1] & 0xFFFF), ctx->regs[rs2]);
+        return;
+    }
+    if (hook == PV_HOOK_SPAN_SLICE) {
+        int h = ctx->regs[rs1];
+        uint32_t p = pv_span_p(ctx, h);
+        int32_t l = pv_span_n(ctx, h);
+        int32_t off = ctx->regs[rs2];
+        if (off < 0) off = 0;
+        if (off > l) off = l;
+        ctx->regs[rd] = pv_span_make(ctx, p + (uint32_t)off, l - off);
+        return;
+    }
+    if (hook == PV_HOOK_SPAN_MATERIALIZE) {
+        int h = ctx->regs[rs1];
+        uint32_t p = pv_span_p(ctx, h);
+        int32_t l = pv_span_n(ctx, h);
+        uint32_t k = 0;
+        for (int32_t i = 0; i < l; i++) pv_arena_put(ctx, &k, pv_arena_get(ctx, p + (uint32_t)i));
+        ctx->regs[rd] = pv_arena_finish(ctx, k);
+        return;
+    }
+    if (hook == PV_HOOK_SPAN_LEN) {
+        ctx->regs[rd] = pv_span_n(ctx, ctx->regs[rs1]);
+        return;
+    }
+    if (hook == PV_HOOK_SPAN_GET) {
+        int h = ctx->regs[rs1];
+        int32_t idx = ctx->regs[rs2];
+        int32_t l = pv_span_n(ctx, h);
+        ctx->regs[rd] = (idx >= 0 && idx < l)
+                      ? (int32_t)pv_arena_get(ctx, pv_span_p(ctx, h) + (uint32_t)idx) : 0;
+        return;
+    }
+    if (hook == PV_HOOK_IO_WRITE) {
+        int h = ctx->regs[rs1];
+        uint32_t p = pv_span_p(ctx, h);
+        int32_t l = pv_span_n(ctx, h);
+        for (int32_t i = 0; i < l; i++)
+            if (ctx->out_len < PV_MAX_OUT) ctx->out[ctx->out_len++] = pv_arena_get(ctx, p + (uint32_t)i);
+        return;
+    }
+
+    /* ---- String.* (spans in, span/int out) --------------------------- */
+    if (hook == PV_HOOK_STRING_LENGTH) {
+        ctx->regs[rd] = pv_span_n(ctx, ctx->regs[rs1]);
+        return;
+    }
+    if (hook == PV_HOOK_STRING_CONCAT) {
+        int ha = ctx->regs[rs1], hb = ctx->regs[rs2];
+        uint32_t pa = pv_span_p(ctx, ha), pb = pv_span_p(ctx, hb);
+        int32_t la = pv_span_n(ctx, ha), lb = pv_span_n(ctx, hb);
+        uint32_t k = 0;
+        for (int32_t i = 0; i < la; i++) pv_arena_put(ctx, &k, pv_arena_get(ctx, pa + (uint32_t)i));
+        for (int32_t i = 0; i < lb; i++) pv_arena_put(ctx, &k, pv_arena_get(ctx, pb + (uint32_t)i));
+        ctx->regs[rd] = pv_arena_finish(ctx, k);
+        return;
+    }
+    if (hook == PV_HOOK_STRING_SUBSTRING) {
+        int ha = ctx->regs[rs1];
+        uint32_t pa = pv_span_p(ctx, ha);
+        int32_t la = pv_span_n(ctx, ha);
+        int32_t start = ctx->regs[rs2];
+        if (start < 0) start = 0;
+        uint32_t k = 0;
+        for (int32_t i = start; i < la; i++) pv_arena_put(ctx, &k, pv_arena_get(ctx, pa + (uint32_t)i));
+        ctx->regs[rd] = pv_arena_finish(ctx, k);
+        return;
+    }
+    if (hook == PV_HOOK_STRING_INDEXOF) {
+        int ha = ctx->regs[rs1], hb = ctx->regs[rs2];
+        uint32_t pa = pv_span_p(ctx, ha), pb = pv_span_p(ctx, hb);
+        int32_t la = pv_span_n(ctx, ha), lb = pv_span_n(ctx, hb);
+        int32_t found = -1;
+        if (lb == 0) {
+            found = 0;
+        } else {
+            for (int32_t i = 0; i + lb <= la; i++) {
+                int32_t j = 0;
+                for (; j < lb; j++)
+                    if (pv_arena_get(ctx, pa + (uint32_t)(i + j)) != pv_arena_get(ctx, pb + (uint32_t)j)) break;
+                if (j == lb) { found = i; break; }
+            }
+        }
+        ctx->regs[rd] = found;
+        return;
+    }
+    if (hook == PV_HOOK_STRING_STARTSWITH || hook == PV_HOOK_STRING_ENDSWITH) {
+        int ha = ctx->regs[rs1], hb = ctx->regs[rs2];
+        uint32_t pa = pv_span_p(ctx, ha), pb = pv_span_p(ctx, hb);
+        int32_t la = pv_span_n(ctx, ha), lb = pv_span_n(ctx, hb);
+        int ok = (lb <= la);
+        int32_t base = (hook == PV_HOOK_STRING_ENDSWITH) ? (la - lb) : 0;
+        for (int32_t j = 0; ok && j < lb; j++)
+            if (pv_arena_get(ctx, pa + (uint32_t)(base + j)) != pv_arena_get(ctx, pb + (uint32_t)j)) ok = 0;
+        ctx->regs[rd] = ok ? 1 : 0;
+        return;
+    }
+    if (hook == PV_HOOK_STRING_TOUPPER || hook == PV_HOOK_STRING_TOLOWER) {
+        int ha = ctx->regs[rs1];
+        uint32_t pa = pv_span_p(ctx, ha);
+        int32_t la = pv_span_n(ctx, ha);
+        uint32_t k = 0;
+        for (int32_t i = 0; i < la; i++) {
+            uint8_t c = pv_arena_get(ctx, pa + (uint32_t)i);
+            if (hook == PV_HOOK_STRING_TOUPPER) { if (c >= 97 && c <= 122) c = (uint8_t)(c - 32); }
+            else { if (c >= 65 && c <= 90) c = (uint8_t)(c + 32); }
+            pv_arena_put(ctx, &k, c);
+        }
+        ctx->regs[rd] = pv_arena_finish(ctx, k);
+        return;
+    }
+    if (hook == PV_HOOK_STRING_TRIM) {
+        int ha = ctx->regs[rs1];
+        uint32_t pa = pv_span_p(ctx, ha);
+        int32_t la = pv_span_n(ctx, ha);
+        int32_t s = 0, e = la;
+        while (s < e) { uint8_t c = pv_arena_get(ctx, pa + (uint32_t)s);       if (c==0x20||c==0x09||c==0x0d||c==0x0a) s++; else break; }
+        while (e > s) { uint8_t c = pv_arena_get(ctx, pa + (uint32_t)(e - 1)); if (c==0x20||c==0x09||c==0x0d||c==0x0a) e--; else break; }
+        uint32_t k = 0;
+        for (int32_t i = s; i < e; i++) pv_arena_put(ctx, &k, pv_arena_get(ctx, pa + (uint32_t)i));
+        ctx->regs[rd] = pv_arena_finish(ctx, k);
+        return;
+    }
+    if (hook == PV_HOOK_STRING_SETREPLACE) {
+        int ha = ctx->regs[rs1];
+        ctx->str_repl_ptr = pv_span_p(ctx, ha);
+        ctx->str_repl_len = pv_span_n(ctx, ha);
+        return;
+    }
+    if (hook == PV_HOOK_STRING_REPLACE) {
+        int ha = ctx->regs[rs1], hb = ctx->regs[rs2];
+        uint32_t pa = pv_span_p(ctx, ha), pb = pv_span_p(ctx, hb);
+        int32_t la = pv_span_n(ctx, ha), lb = pv_span_n(ctx, hb);
+        uint32_t pr = ctx->str_repl_ptr;
+        int32_t lr = ctx->str_repl_len;
+        uint32_t k = 0;
+        if (lb == 0) {
+            /* bytes.replace(b"", repl): repl before every byte and once at the end */
+            for (int32_t j = 0; j < lr; j++) pv_arena_put(ctx, &k, pv_arena_get(ctx, pr + (uint32_t)j));
+            for (int32_t i = 0; i < la; i++) {
+                pv_arena_put(ctx, &k, pv_arena_get(ctx, pa + (uint32_t)i));
+                for (int32_t j = 0; j < lr; j++) pv_arena_put(ctx, &k, pv_arena_get(ctx, pr + (uint32_t)j));
+            }
+        } else {
+            int32_t i = 0;
+            while (i < la) {
+                int match = (i + lb <= la);
+                for (int32_t j = 0; match && j < lb; j++)
+                    if (pv_arena_get(ctx, pa + (uint32_t)(i + j)) != pv_arena_get(ctx, pb + (uint32_t)j)) match = 0;
+                if (match) {
+                    for (int32_t j = 0; j < lr; j++) pv_arena_put(ctx, &k, pv_arena_get(ctx, pr + (uint32_t)j));
+                    i += lb;
+                } else {
+                    pv_arena_put(ctx, &k, pv_arena_get(ctx, pa + (uint32_t)i));
+                    i++;
+                }
+            }
+        }
+        ctx->regs[rd] = pv_arena_finish(ctx, k);
+        return;
+    }
+
+    /* ---- Number.* (int in, int/span out) ----------------------------- */
+    if (hook == PV_HOOK_NUMBER_PARSE) {
+        int ha = ctx->regs[rs1];
+        uint32_t pa = pv_span_p(ctx, ha);
+        int32_t la = pv_span_n(ctx, ha);
+        int32_t i = 0, e = la;
+        while (i < e) { uint8_t c = pv_arena_get(ctx, pa + (uint32_t)i);       if (c==0x20||c==0x09||c==0x0d||c==0x0a) i++; else break; }
+        while (e > i) { uint8_t c = pv_arena_get(ctx, pa + (uint32_t)(e - 1)); if (c==0x20||c==0x09||c==0x0d||c==0x0a) e--; else break; }
+        int neg = 0;
+        if (i < e) { uint8_t c = pv_arena_get(ctx, pa + (uint32_t)i); if (c=='+'||c=='-') { neg = (c=='-'); i++; } }
+        int valid = (i < e);
+        uint32_t val = 0;
+        for (; i < e; i++) {
+            uint8_t c = pv_arena_get(ctx, pa + (uint32_t)i);
+            if (c < '0' || c > '9') { valid = 0; break; }
+            val = val * 10u + (uint32_t)(c - '0');
+        }
+        if (!valid) val = 0;
+        ctx->regs[rd] = neg ? (int32_t)(0u - val) : (int32_t)val;
+        return;
+    }
+    if (hook == PV_HOOK_NUMBER_ABS) {
+        uint32_t a = (uint32_t)ctx->regs[rs1];
+        ctx->regs[rd] = (ctx->regs[rs1] < 0) ? (int32_t)(0u - a) : (int32_t)a;
+        return;
+    }
+    if (hook == PV_HOOK_NUMBER_MIN) {
+        int32_t a = ctx->regs[rs1], b = ctx->regs[rs2];
+        ctx->regs[rd] = (a < b) ? a : b;
+        return;
+    }
+    if (hook == PV_HOOK_NUMBER_MAX) {
+        int32_t a = ctx->regs[rs1], b = ctx->regs[rs2];
+        ctx->regs[rd] = (a > b) ? a : b;
+        return;
+    }
+    if (hook == PV_HOOK_NUMBER_FLOOR || hook == PV_HOOK_NUMBER_CEILING || hook == PV_HOOK_NUMBER_ROUND) {
+        ctx->regs[rd] = ctx->regs[rs1];
+        return;
+    }
+    if (hook == PV_HOOK_NUMBER_TOSTRING) {
+        int32_t v = ctx->regs[rs1];
+        uint8_t tmp[16];
+        int t = 0, neg = 0;
+        uint32_t u;
+        if (v < 0) { neg = 1; u = 0u - (uint32_t)v; } else u = (uint32_t)v;
+        if (u == 0) tmp[t++] = '0';
+        while (u) { tmp[t++] = (uint8_t)('0' + (u % 10u)); u /= 10u; }
+        uint32_t k = 0;
+        if (neg) pv_arena_put(ctx, &k, '-');
+        while (t > 0) pv_arena_put(ctx, &k, tmp[--t]);
+        ctx->regs[rd] = pv_arena_finish(ctx, k);
+        return;
+    }
+    if (hook == PV_HOOK_NUMBER_TOHEX || hook == PV_HOOK_NUMBER_TOOCTAL || hook == PV_HOOK_NUMBER_TOBINARY) {
+        uint32_t u = (uint32_t)ctx->regs[rs1];
+        uint32_t base = (hook == PV_HOOK_NUMBER_TOHEX) ? 16u : (hook == PV_HOOK_NUMBER_TOOCTAL) ? 8u : 2u;
+        uint8_t tmp[40];
+        int t = 0;
+        if (u == 0) tmp[t++] = '0';
+        while (u) { uint32_t d = u % base; tmp[t++] = (uint8_t)(d < 10 ? '0' + d : 'a' + (d - 10)); u /= base; }
+        uint32_t k = 0;
+        while (t > 0) pv_arena_put(ctx, &k, tmp[--t]);
+        ctx->regs[rd] = pv_arena_finish(ctx, k);
+        return;
+    }
+
     /* unknown host-fillable primitive: ignore (host supplies on real target) */
 }
 
@@ -220,6 +490,8 @@ void pv_init(pv_ctx *ctx)
     ctx->http_type = 0;
     ctx->rng_state = 0x2545F4914F6CDD1DULL;
     ctx->max_steps = 1000000L;
+    ctx->span_count = 1;        /* handle 0 reserved as the null span */
+    ctx->arena_top = 0x8000;    /* bump pointer for span results (matches PicoVM) */
     ctx->host = pv_default_host;
 }
 
