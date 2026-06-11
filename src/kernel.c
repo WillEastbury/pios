@@ -73,6 +73,7 @@
 #include "picovm.h"
 #include "pixe_request.h"
 #include "pixe_host.h"
+#include "picoscript_playground_asset.h"
 #include "keystore.h"
 #include "tls.h"
 #include "brotli.h"
@@ -177,6 +178,7 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HTTP_ROUTE_NOT_FOUND  8U
 #define HTTP_ROUTE_NETSTAT    9U
 #define HTTP_ROUTE_ACME       10U
+#define HTTP_ROUTE_PICOSCRIPT 11U
 
 #define HTTP_ERR_NONE         0U
 #define HTTP_ERR_RESP_TIMEOUT 1U
@@ -219,6 +221,7 @@ static const char *http_route_name(u32 route)
     case HTTP_ROUTE_NOT_FOUND: return "not-found";
     case HTTP_ROUTE_NETSTAT: return "netstat";
     case HTTP_ROUTE_ACME: return "acme";
+    case HTTP_ROUTE_PICOSCRIPT: return "picoscript";
     default: return "?";
     }
 }
@@ -261,6 +264,9 @@ static i32 ksvc_timer_id = -1;
 static char http_resp_buf[16000];
 static u32 http_resp_len;
 static u32 http_resp_off;
+static const u8 *http_static_body;
+static u32 http_static_len;
+static u32 http_static_off;
 static u32 http_last_state;
 static u32 http_last_readable;
 static u32 http_last_writable;
@@ -368,6 +374,7 @@ static void net_services_listen(void);
 static void admin_services_listen(void);
 static void admin_services_poll(void);
 static void http_log_event(const char *event, u32 a, u32 b);
+static u32 http_build_picoscript_response(char *out, u32 max);
 static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len);
 static void pios_bootctrl_mark_success(void);
 static void core0_sched_snapshot(u64 *wake, u64 *wfi_count, u64 *idle_ticks,
@@ -1034,6 +1041,10 @@ static u32 http_route_id(const u8 *req, u32 len)
         return HTTP_ROUTE_STATUS;
     if (http_request_path_is(req, len, "/api/netstat"))
         return HTTP_ROUTE_NETSTAT;
+    if (http_request_path_is(req, len, "/picoscript") ||
+        http_request_path_is(req, len, "/picoscript/") ||
+        http_request_path_is(req, len, "/picoscript/playground.html"))
+        return HTTP_ROUTE_PICOSCRIPT;
     if (http_request_path_is(req, len, "/api/admin/reboot"))
         return HTTP_ROUTE_REBOOT;
     if (http_request_path_is(req, len, "/api/admin/log-stream") ||
@@ -5655,9 +5666,9 @@ static u32 http_build_spa_response(char *out, u32 max)
         "<!doctype html><html><head><meta charset='utf-8'><title>PIOS Admin</title>"
         "<script>(()=>{const p=new URLSearchParams(window.location.search).get('clawpilotTheme');const t=p||(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.setAttribute('data-theme',t);})();</script>"
         "<style>:root{color-scheme:light;--cp-bg:#f7f4ef;--cp-bg-elevated:#fcfbf8;--cp-surface:#ffffff;--cp-surface-soft:#f5f5f5;--cp-border:#dedede;--cp-border-strong:#919191;--cp-text:#242424;--cp-text-muted:#5c5c5c;--cp-text-soft:#6f6f6f;--cp-accent:#b11f4b;--cp-accent-hover:#9a1a41;--cp-accent-soft:rgba(177,31,75,.08);--cp-accent-fg:#ffffff;--cp-success:#16a34a;--cp-danger:#dc2626;--cp-warning:#f59e0b;--cp-link:#0078d4;--cp-shadow:0 18px 48px rgba(0,0,0,.12);--cp-overlay:rgba(255,255,255,.8);--cp-panel:rgba(255,255,255,.86);--cp-panel-strong:rgba(255,255,255,.96);--cp-sheen:rgba(255,255,255,.55);--cp-highlight:rgba(177,31,75,.12)}html[data-theme='dark']{color-scheme:dark;--cp-bg:#3d3b3a;--cp-bg-elevated:#343231;--cp-surface:#292929;--cp-surface-soft:#2e2e2e;--cp-border:#474747;--cp-border-strong:#5f5f5f;--cp-text:#dedede;--cp-text-muted:#919191;--cp-text-soft:#b0b0b0;--cp-accent:#fd8ea1;--cp-accent-hover:#fb7b91;--cp-accent-soft:rgba(253,142,161,.14);--cp-accent-fg:#1a1a1a;--cp-success:#4ade80;--cp-danger:#f87171;--cp-warning:#fbbf24;--cp-link:#4da6ff;--cp-shadow:0 18px 48px rgba(0,0,0,.32);--cp-overlay:rgba(41,41,41,.88);--cp-panel:rgba(41,41,41,.72);--cp-panel-strong:rgba(41,41,41,.96);--cp-sheen:rgba(255,255,255,.04);--cp-highlight:rgba(253,142,161,.12)}</style>"
-        "<style>body{margin:0;background:var(--cp-bg);color:var(--cp-text);font-family:'Segoe UI',Aptos,Calibri,-apple-system,BlinkMacSystemFont,sans-serif}.wrap{padding:24px}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-end}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:16px 0}.tabs button,.bt{border:1px solid var(--cp-border);background:var(--cp-surface);color:var(--cp-text);border-radius:.625rem;padding:8px 12px}.tabs button.act,.bt.primary{background:var(--cp-accent);color:var(--cp-accent-fg);border-color:var(--cp-accent)}.tabs button:hover,.bt:hover{border-color:var(--cp-border-strong)}.tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px}.tools input{width:88px}.tools label{color:var(--cp-text-muted)}input{background:var(--cp-surface);color:var(--cp-text);border:1px solid var(--cp-border);border-radius:.625rem;padding:7px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.cd,.tile{background:var(--cp-surface);border:1px solid var(--cp-border);border-radius:16px;box-shadow:0 0 2px rgba(0,0,0,.12),0 1px 2px rgba(0,0,0,.14);padding:16px;margin:12px 0}.tile{margin:0}.muted{color:var(--cp-text-muted)}.pill{display:inline-block;border:1px solid var(--cp-border);border-radius:.625rem;padding:2px 7px;background:var(--cp-accent-soft)}a{color:var(--cp-link)}pre,code,.nt{font-family:Consolas,'Courier New',Courier,monospace}pre{white-space:pre-wrap;overflow:auto}.nt{width:100%;border-collapse:collapse;font-size:13px}.nt th,.nt td{border-bottom:1px solid var(--cp-border);padding:7px 8px;text-align:left;vertical-align:top}.nt th{color:var(--cp-text-muted);background:var(--cp-surface-soft)}.ok{color:var(--cp-success)}.warn{color:var(--cp-warning)}.bad{color:var(--cp-danger)}.term{background:var(--cp-bg-elevated);color:var(--cp-success);border:1px solid var(--cp-success);border-radius:.625rem;overflow:hidden;font-family:Consolas,'Courier New',Courier,monospace}.bar{background:var(--cp-surface-soft);padding:8px 12px;border-bottom:1px solid var(--cp-border);letter-spacing:.08em}.screen{height:420px;overflow:auto;padding:14px;white-space:pre-wrap;font-size:14px;line-height:1.35}.prompt{display:flex;gap:8px;align-items:center;border-top:1px solid var(--cp-border);background:var(--cp-surface-soft);padding:10px 12px}.prompt input{flex:1;border:0;outline:0;font-family:Consolas,'Courier New',Courier,monospace}.cursor{animation:blink 1s steps(1) infinite}@keyframes blink{50%{opacity:0}}</style></head><body><div class='wrap'><div class='top'><div><h1>PIOS Admin Console</h1><p id='sub' class='muted'>Structured tabs; manual refresh.</p></div><div class='muted'>SECOND STAGE</div></div><div class='tabs'><button class='act' data-t='overview'>Overview</button><button data-t='processes'>Processes</button><button data-t='netstat'>Netstat</button><button data-t='graphs'>Graphs</button><button data-t='system'>System</button><button data-t='users'>Users</button><button data-t='logs'>Logs</button><button data-t='walfs'>WALFS</button><button data-t='firewall'>Firewall</button><button data-t='terminal'>Terminal</button><button data-t='admin'>Admin</button></div><div id='app'></div></div>");
+        "<style>body{margin:0;background:var(--cp-bg);color:var(--cp-text);font-family:'Segoe UI',Aptos,Calibri,-apple-system,BlinkMacSystemFont,sans-serif}.wrap{padding:24px}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-end}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:16px 0}.tabs button,.bt{border:1px solid var(--cp-border);background:var(--cp-surface);color:var(--cp-text);border-radius:.625rem;padding:8px 12px}.tabs button.act,.bt.primary{background:var(--cp-accent);color:var(--cp-accent-fg);border-color:var(--cp-accent)}.tabs button:hover,.bt:hover{border-color:var(--cp-border-strong)}.tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px}.tools input{width:88px}.tools label{color:var(--cp-text-muted)}input{background:var(--cp-surface);color:var(--cp-text);border:1px solid var(--cp-border);border-radius:.625rem;padding:7px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.cd,.tile{background:var(--cp-surface);border:1px solid var(--cp-border);border-radius:16px;box-shadow:0 0 2px rgba(0,0,0,.12),0 1px 2px rgba(0,0,0,.14);padding:16px;margin:12px 0}.tile{margin:0}.muted{color:var(--cp-text-muted)}.pill{display:inline-block;border:1px solid var(--cp-border);border-radius:.625rem;padding:2px 7px;background:var(--cp-accent-soft)}a{color:var(--cp-link)}pre,code,.nt{font-family:Consolas,'Courier New',Courier,monospace}pre{white-space:pre-wrap;overflow:auto}.nt{width:100%;border-collapse:collapse;font-size:13px}.nt th,.nt td{border-bottom:1px solid var(--cp-border);padding:7px 8px;text-align:left;vertical-align:top}.nt th{color:var(--cp-text-muted);background:var(--cp-surface-soft)}.ok{color:var(--cp-success)}.warn{color:var(--cp-warning)}.bad{color:var(--cp-danger)}.term{background:var(--cp-bg-elevated);color:var(--cp-success);border:1px solid var(--cp-success);border-radius:.625rem;overflow:hidden;font-family:Consolas,'Courier New',Courier,monospace}.bar{background:var(--cp-surface-soft);padding:8px 12px;border-bottom:1px solid var(--cp-border);letter-spacing:.08em}.screen{height:420px;overflow:auto;padding:14px;white-space:pre-wrap;font-size:14px;line-height:1.35}.prompt{display:flex;gap:8px;align-items:center;border-top:1px solid var(--cp-border);background:var(--cp-surface-soft);padding:10px 12px}.prompt input{flex:1;border:0;outline:0;font-family:Consolas,'Courier New',Courier,monospace}.pico-frame{width:100%;height:70vh;border:1px solid var(--cp-border);border-radius:16px;background:var(--cp-surface)}.cursor{animation:blink 1s steps(1) infinite}@keyframes blink{50%{opacity:0}}</style></head><body><div class='wrap'><div class='top'><div><h1>PIOS Admin Console</h1><p id='sub' class='muted'>Structured tabs; manual refresh.</p></div><div class='muted'>SECOND STAGE</div></div><div class='tabs'><button class='act' data-t='overview'>Overview</button><button data-t='processes'>Processes</button><button data-t='netstat'>Netstat</button><button data-t='graphs'>Graphs</button><button data-t='system'>System</button><button data-t='users'>Users</button><button data-t='logs'>Logs</button><button data-t='walfs'>WALFS</button><button data-t='picoscript'>PicoScript</button><button data-t='firewall'>Firewall</button><button data-t='terminal'>Terminal</button><button data-t='admin'>Admin</button></div><div id='app'></div></div>");
     http_append(out, &len, max,
-        "<script>let tab='overview',samples=[],hist=['PIOS remote terminal ready. Type Help for assistance!'],auto=false,ms=3000,timer=0;const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function bust(u){return u+(u.includes('?')?'&':'?')+'_='+Date.now()}async function txt(u){let r=await fetch(bust(u));return await r.text()}async function js(u){let r=await fetch(bust(u));return await r.json()}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}function tools(){return `<div class=tools><button class='bt primary' id=rf>Refresh</button><label><input id=ar type=checkbox ${auto?'checked':''}> auto-refresh</label><input id=ms type=number min=250 step=250 value='${ms}'><span class=muted>ms</span></div>`}function bind(){let r=document.getElementById('rf'),a=document.getElementById('ar'),m=document.getElementById('ms');if(r)r.onclick=draw;if(a)a.onchange=()=>{auto=a.checked;sync()};if(m)m.onchange=()=>{ms=Math.max(250,parseInt(m.value||'3000'));m.value=ms;sync()};sync()}function sync(){if(timer){clearInterval(timer);timer=0}if(auto&&tab!=='terminal')timer=setInterval(draw,ms)}function table(h,rows){let b=rows.length?rows.map(r=>'<tr>'+h.map((_,i)=>'<td>'+esc(r[i]||'')+'</td>').join('')+'</tr>').join(''):`<tr><td colspan='${h.length}' class=muted>No rows</td></tr>`;return '<table class=nt><thead><tr>'+h.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+b+'</tbody></table>'}function kv(o){return table(['Key','Value'],Object.keys(o).map(k=>[k,o[k]]))}function splitRows(t){return t.trim().split('\\n').filter(x=>x&&x[0]>='0'&&x[0]<='9').map(x=>x.trim().split(/\\s+/))}function spark(a){let m=Math.max(1,...a);return a.map(v=>String(v).padStart(4,' ')+ ' '+ '#'.repeat(Math.min(40,Math.round(v*40/m)))).join('\\n')}async function overview(){let d=await js('/api/status'),dg=d.diag||{};app.innerHTML=card('Overview',tools()+`<div class=grid><div class=tile><b>Build</b><p>${esc(d.build)}</p><span class=pill>${esc(d.version)}</span></div><div class=tile><b>Network</b><p>${esc(d.ip)}</p><p class=muted>${esc(d.mode)}</p></div><div class=tile><b>Uptime</b><p>${esc(d.uptime)} seconds</p></div><div class=tile><b>HTTP diagnostics</b>${kv(dg)}</div></div>`);bind()}async function system(){let r=await txt('/api/terminal?cmd=status'),rows=[];r.split(/\\s+/).forEach(p=>{let i=p.indexOf('=');if(i>0)rows.push([p.slice(0,i),p.slice(i+1)])});app.innerHTML=card('System',tools()+`<div class=grid><div class=tile><b>${esc((r.split('\\n')[0]||'PIOS'))}</b></div><div class=tile>${table(['Metric','Value'],rows)}</div></div><pre>${esc(r)}</pre>`);bind()}async function netstat(){let n=await js('/api/netstat');app.innerHTML=card('Netstat',tools()+table(n.cols,n.rows)+`<p class=muted>syn=${n.diag.syn} accepted=${n.diag.accepted} fw_rx_drop=${n.fw.rxDrop}</p>`);bind()}async function graphs(){let s=await js('/api/status'),n=await js('/api/netstat');samples.push([s.uptime,n.count,n.diag.syn,n.fw.rxDrop]);while(samples.length>48)samples.shift();app.innerHTML=card('Graphs',tools()+table(['uptime','conns','syn','fw_rx_drop'],samples)+`<div class=grid><div class=tile><h3>Connections</h3><pre>${esc(spark(samples.map(x=>x[1])))}</pre></div><div class=tile><h3>Firewall RX drops</h3><pre>${esc(spark(samples.map(x=>x[3])))}</pre></div></div>`);bind()}async function processes(){let r=await txt('/api/terminal?cmd=processes'),p=r.split('\\n\\nGRAPH\\n'),rows=splitRows(p[0]);app.innerHTML=card('Processes',tools()+table(['PID','PPID','Core','State','Pri','CPU','MemK','ArenaCap','ArenaUsed','ArenaHigh','Bump','SpanK','Span#','Image'],rows)+`<h3>Process graph</h3><pre>${esc(p[1]||'')}</pre>`);bind()}async function users(){let r=await txt('/api/terminal?cmd=users');app.innerHTML=card('Users',tools()+table(['ID','Flags','Name'],splitRows(r)));bind()}async function logs(){let a=await txt('/api/admin/log-stream?tail=24'),b=await txt('/api/logs');app.innerHTML=card('Logs',tools()+`<div class=grid><div class=tile><h3>Operator tail</h3><pre>${esc(a)}</pre></div><div class=tile><h3>Process logs</h3><pre>${esc(b)}</pre></div></div>`);bind()}async function walfs(){let d=await js('/api/walfs?path=/'),body='';if(d.entries)body=table(['ID','Name','Size','Flags'],d.entries.map(e=>[e.id,e.name,e.size,e.flags]));else body=kv(d);app.innerHTML=card('WALFS',tools()+body);bind()}async function firewall(){let r=await txt('/api/terminal?cmd=firewall%20list'),rows=[];r.split('\\n').forEach(l=>{let m=l.match(/^(\\d+):\\s+(\\S+)\\s+(\\S+)\\s+(.*)$/);if(m)rows.push([m[1],m[2],m[3],m[4]])});app.innerHTML=card('Firewall',tools()+`<p class=muted>${esc(r.split('\\n')[0]||'')}</p>`+table(['#','Action','Dir','Match'],rows)+`<h3>Mutation examples</h3><pre>firewall allow in tcp port 2323 src 192.168.218.9\\nfirewall deny in tcp port 80 src 192.168.218.0/24\\nfirewall reset</pre>`);bind()}function term(){sync();app.innerHTML=card('Terminal',`<div class=term><div class=bar>PIOS // SECOND STAGE LOADER // REMOTE CONSOLE</div><div class=screen id=screen></div><div class=prompt><span>ready&gt;</span><input id=cmd autocomplete=off spellcheck=false autofocus><span class=cursor>_</span></div></div>`);const sc=document.getElementById('screen'),cmd=document.getElementById('cmd');function paint(){sc.textContent=hist.join('\\n');sc.scrollTop=sc.scrollHeight}async function run(){let c=cmd.value.trim();cmd.value='';if(!c)return;if(c==='clear'){hist=[];paint();return}hist.push('ready> '+c);try{hist.push(await txt('/api/terminal?cmd='+encodeURIComponent(c)))}catch(e){hist.push('ERR '+e)}while(hist.length>160)hist.shift();paint()}cmd.onkeydown=e=>{if(e.key==='Enter')run()};paint();cmd.focus()}function admin(){app.innerHTML=card('Admin',tools()+`<div class=grid><div class=tile><b>Logs</b><p><a href='/api/admin/log-stream?tail=24'>Tail log stream</a></p></div><div class=tile><b>OTA</b><p><a href='/api/admin/kernel-update?confirm=1'>Kernel update status</a></p></div><div class=tile><b>Reboot</b><p><a href='/api/admin/reboot?confirm=1'>Queue hot reboot</a></p></div></div>`);bind()}async function draw(){sub.textContent='Loading '+tab+'...';try{if(tab==='overview')await overview();else if(tab==='system')await system();else if(tab==='netstat')await netstat();else if(tab==='graphs')await graphs();else if(tab==='processes')await processes();else if(tab==='users')await users();else if(tab==='logs')await logs();else if(tab==='walfs')await walfs();else if(tab==='firewall')await firewall();else if(tab==='terminal')term();else if(tab==='admin')admin();else app.innerHTML=card(tab,'unknown tab')}catch(e){app.innerHTML=card('Error',`<pre>${esc(e)}</pre>`)}sub.textContent='Tab '+tab+(auto&&tab!=='terminal'?` // auto ${ms}ms`:'')}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
+        "<script>let tab='overview',samples=[],hist=['PIOS remote terminal ready. Type Help for assistance!'],auto=false,ms=3000,timer=0;const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function bust(u){return u+(u.includes('?')?'&':'?')+'_='+Date.now()}async function txt(u){let r=await fetch(bust(u));return await r.text()}async function js(u){let r=await fetch(bust(u));return await r.json()}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}function tools(){return `<div class=tools><button class='bt primary' id=rf>Refresh</button><label><input id=ar type=checkbox ${auto?'checked':''}> auto-refresh</label><input id=ms type=number min=250 step=250 value='${ms}'><span class=muted>ms</span></div>`}function bind(){let r=document.getElementById('rf'),a=document.getElementById('ar'),m=document.getElementById('ms');if(r)r.onclick=draw;if(a)a.onchange=()=>{auto=a.checked;sync()};if(m)m.onchange=()=>{ms=Math.max(250,parseInt(m.value||'3000'));m.value=ms;sync()};sync()}function sync(){if(timer){clearInterval(timer);timer=0}if(auto&&tab!=='terminal')timer=setInterval(draw,ms)}function table(h,rows){let b=rows.length?rows.map(r=>'<tr>'+h.map((_,i)=>'<td>'+esc(r[i]||'')+'</td>').join('')+'</tr>').join(''):`<tr><td colspan='${h.length}' class=muted>No rows</td></tr>`;return '<table class=nt><thead><tr>'+h.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+b+'</tbody></table>'}function kv(o){return table(['Key','Value'],Object.keys(o).map(k=>[k,o[k]]))}function splitRows(t){return t.trim().split('\\n').filter(x=>x&&x[0]>='0'&&x[0]<='9').map(x=>x.trim().split(/\\s+/))}function spark(a){let m=Math.max(1,...a);return a.map(v=>String(v).padStart(4,' ')+ ' '+ '#'.repeat(Math.min(40,Math.round(v*40/m)))).join('\\n')}async function overview(){let d=await js('/api/status'),dg=d.diag||{};app.innerHTML=card('Overview',tools()+`<div class=grid><div class=tile><b>Build</b><p>${esc(d.build)}</p><span class=pill>${esc(d.version)}</span></div><div class=tile><b>Network</b><p>${esc(d.ip)}</p><p class=muted>${esc(d.mode)}</p></div><div class=tile><b>Uptime</b><p>${esc(d.uptime)} seconds</p></div><div class=tile><b>HTTP diagnostics</b>${kv(dg)}</div></div>`);bind()}async function system(){let r=await txt('/api/terminal?cmd=status'),rows=[];r.split(/\\s+/).forEach(p=>{let i=p.indexOf('=');if(i>0)rows.push([p.slice(0,i),p.slice(i+1)])});app.innerHTML=card('System',tools()+`<div class=grid><div class=tile><b>${esc((r.split('\\n')[0]||'PIOS'))}</b></div><div class=tile>${table(['Metric','Value'],rows)}</div></div><pre>${esc(r)}</pre>`);bind()}async function netstat(){let n=await js('/api/netstat');app.innerHTML=card('Netstat',tools()+table(n.cols,n.rows)+`<p class=muted>syn=${n.diag.syn} accepted=${n.diag.accepted} fw_rx_drop=${n.fw.rxDrop}</p>`);bind()}async function graphs(){let s=await js('/api/status'),n=await js('/api/netstat');samples.push([s.uptime,n.count,n.diag.syn,n.fw.rxDrop]);while(samples.length>48)samples.shift();app.innerHTML=card('Graphs',tools()+table(['uptime','conns','syn','fw_rx_drop'],samples)+`<div class=grid><div class=tile><h3>Connections</h3><pre>${esc(spark(samples.map(x=>x[1])))}</pre></div><div class=tile><h3>Firewall RX drops</h3><pre>${esc(spark(samples.map(x=>x[3])))}</pre></div></div>`);bind()}async function processes(){let r=await txt('/api/terminal?cmd=processes'),p=r.split('\\n\\nGRAPH\\n'),rows=splitRows(p[0]);app.innerHTML=card('Processes',tools()+table(['PID','PPID','Core','State','Pri','CPU','MemK','ArenaCap','ArenaUsed','ArenaHigh','Bump','SpanK','Span#','Image'],rows)+`<h3>Process graph</h3><pre>${esc(p[1]||'')}</pre>`);bind()}async function users(){let r=await txt('/api/terminal?cmd=users');app.innerHTML=card('Users',tools()+table(['ID','Flags','Name'],splitRows(r)));bind()}async function logs(){let a=await txt('/api/admin/log-stream?tail=24'),b=await txt('/api/logs');app.innerHTML=card('Logs',tools()+`<div class=grid><div class=tile><h3>Operator tail</h3><pre>${esc(a)}</pre></div><div class=tile><h3>Process logs</h3><pre>${esc(b)}</pre></div></div>`);bind()}async function walfs(){let d=await js('/api/walfs?path=/'),body='';if(d.entries)body=table(['ID','Name','Size','Flags'],d.entries.map(e=>[e.id,e.name,e.size,e.flags]));else body=kv(d);app.innerHTML=card('WALFS',tools()+body);bind()}function picoscript(){sync();app.innerHTML=card('PicoScript Editor',`<p class=muted>Full PicoScript playground/editor served from this PIOS image. <a href='/picoscript' target='_blank'>Open in new tab</a></p><iframe class=pico-frame src='/picoscript'></iframe>`)}async function firewall(){let r=await txt('/api/terminal?cmd=firewall%20list'),rows=[];r.split('\\n').forEach(l=>{let m=l.match(/^(\\d+):\\s+(\\S+)\\s+(\\S+)\\s+(.*)$/);if(m)rows.push([m[1],m[2],m[3],m[4]])});app.innerHTML=card('Firewall',tools()+`<p class=muted>${esc(r.split('\\n')[0]||'')}</p>`+table(['#','Action','Dir','Match'],rows)+`<h3>Mutation examples</h3><pre>firewall allow in tcp port 2323 src 192.168.218.9\\nfirewall deny in tcp port 80 src 192.168.218.0/24\\nfirewall reset</pre>`);bind()}function term(){sync();app.innerHTML=card('Terminal',`<div class=term><div class=bar>PIOS // SECOND STAGE LOADER // REMOTE CONSOLE</div><div class=screen id=screen></div><div class=prompt><span>ready&gt;</span><input id=cmd autocomplete=off spellcheck=false autofocus><span class=cursor>_</span></div></div>`);const sc=document.getElementById('screen'),cmd=document.getElementById('cmd');function paint(){sc.textContent=hist.join('\\n');sc.scrollTop=sc.scrollHeight}async function run(){let c=cmd.value.trim();cmd.value='';if(!c)return;if(c==='clear'){hist=[];paint();return}hist.push('ready> '+c);try{hist.push(await txt('/api/terminal?cmd='+encodeURIComponent(c)))}catch(e){hist.push('ERR '+e)}while(hist.length>160)hist.shift();paint()}cmd.onkeydown=e=>{if(e.key==='Enter')run()};paint();cmd.focus()}function admin(){app.innerHTML=card('Admin',tools()+`<div class=grid><div class=tile><b>Logs</b><p><a href='/api/admin/log-stream?tail=24'>Tail log stream</a></p></div><div class=tile><b>OTA</b><p><a href='/api/admin/kernel-update?confirm=1'>Kernel update status</a></p></div><div class=tile><b>Reboot</b><p><a href='/api/admin/reboot?confirm=1'>Queue hot reboot</a></p></div></div>`);bind()}async function draw(){sub.textContent='Loading '+tab+'...';try{if(tab==='overview')await overview();else if(tab==='system')await system();else if(tab==='netstat')await netstat();else if(tab==='graphs')await graphs();else if(tab==='processes')await processes();else if(tab==='users')await users();else if(tab==='logs')await logs();else if(tab==='walfs')await walfs();else if(tab==='picoscript')picoscript();else if(tab==='firewall')await firewall();else if(tab==='terminal')term();else if(tab==='admin')admin();else app.innerHTML=card(tab,'unknown tab')}catch(e){app.innerHTML=card('Error',`<pre>${esc(e)}</pre>`)}sub.textContent='Tab '+tab+(auto&&tab!=='terminal'?` // auto ${ms}ms`:'')}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
     return len;
 }
 
@@ -5669,6 +5680,12 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
     http_trace(HTTP_EVT_BUILD_ENTER, route, req_len, max);
     if (route == HTTP_ROUTE_ACME) {
         len = http_build_acme_challenge_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (route == HTTP_ROUTE_PICOSCRIPT) {
+        len = http_build_picoscript_response(out, max);
         http_diag.build_len = len;
         http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
         return len;
@@ -5907,6 +5924,24 @@ static u32 http_build_header_too_large(char *out, u32 max)
     return len;
 }
 
+static u32 http_build_picoscript_response(char *out, u32 max)
+{
+    u32 len = 0;
+    http_static_body = picoscript_playground_html;
+    http_static_len = picoscript_playground_html_len;
+    http_static_off = 0;
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Cache-Control: no-store\r\n"
+        "Content-Length: ");
+    http_append_u64(out, &len, max, http_static_len);
+    http_append(out, &len, max,
+        "\r\n"
+        "Connection: close\r\n\r\n");
+    return len;
+}
+
 static void http_save_ascii_prefix(char out[25], const void *data, u32 len)
 {
     const u8 *p = (const u8 *)data;
@@ -5953,6 +5988,9 @@ static void http_reset_client(bool close_conn)
     http_req_prefix_dumped = false;
     http_resp_len = 0;
     http_resp_off = 0;
+    http_static_body = NULL;
+    http_static_len = 0;
+    http_static_off = 0;
     http_last_write = 0;
 }
 
@@ -6431,9 +6469,27 @@ static void echo_tcp_poll(void) {
                     }
                     http_resp_off += n;
                 }
+            } else if (http_resp_len > 0 && http_static_body && http_static_off < http_static_len) {
+                u32 writable = tcp_writable(http_client_conn);
+                u32 remain = http_static_len - http_static_off;
+                if (writable > 0) {
+                    u32 chunk = remain < writable ? remain : writable;
+                    if (chunk > 512) chunk = 512;
+                    u32 n = tcp_write(http_client_conn, http_static_body + http_static_off, chunk);
+                    http_diag.write_calls++;
+                    http_last_write = n;
+                    if (n == 0) {
+                        http_diag.write_zero++;
+                    } else {
+                        http_diag.write_bytes += n;
+                        http_last_activity_ms = timer_monotonic_ms();
+                    }
+                    http_static_off += n;
+                }
             }
 
-            if (http_resp_len > 0 && http_resp_off >= http_resp_len) {
+            if (http_resp_len > 0 && http_resp_off >= http_resp_len &&
+                (!http_static_body || http_static_off >= http_static_len)) {
                 http_diag.closes++;
                 http_complete_tick++;
                 http_trace(HTTP_EVT_CLOSE, http_diag.route, http_resp_len, http_resp_off);
