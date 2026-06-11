@@ -1176,7 +1176,7 @@ static void *sys_span_rent(u32 bytes, u32 align, u32 type);
 static i32   sys_span_release(void *ptr);
 static void *sys_memset(void *dst, i32 c, u32 n);
 static void *sys_memcpy(void *dst, const void *src, u32 n);
-static u32   sys_strlen(const char *s);
+static i32   sys_span_copy(void *dst, u32 dst_cap, const void *src, u32 src_len, u32 *copied);
 static i32   sys_spawn(const char *path);
 static i32   sys_wait(i32 pid);
 static u32   sys_nprocs(void);
@@ -1445,7 +1445,7 @@ static struct kernel_api kernel_api_tab = {
     .span_release    = sys_span_release,
     .memset          = sys_memset,
     .memcpy          = sys_memcpy,
-    .strlen          = sys_strlen,
+    .span_copy       = sys_span_copy,
     /* Process management */
     .spawn           = sys_spawn,
     .wait            = sys_wait,
@@ -4996,10 +4996,21 @@ static void *sys_memcpy(void *dst, const void *src, u32 n)
     return memcpy(dst, src, n);
 }
 
-static u32 sys_strlen(const char *s)
+static i32 sys_span_copy(void *dst, u32 dst_cap, const void *src, u32 src_len, u32 *copied)
 {
-    if (!ptr_valid_cstr(s, 4096)) return 0;
-    return pios_strlen(s);
+    if (copied && !ptr_valid(copied, sizeof(*copied)))
+        return -1;
+    if (src_len > dst_cap)
+        return -1;
+    if (dst_cap > 0 && !ptr_valid(dst, dst_cap))
+        return -1;
+    if (src_len > 0 && !ptr_valid(src, src_len))
+        return -1;
+    if (src_len > 0)
+        memcpy(dst, src, src_len);
+    if (copied)
+        *copied = src_len;
+    return 0;
 }
 
 /* ---- Process management ---- */

@@ -387,7 +387,7 @@ struct kernel_api {
     void *(*sbrk)(i32 increment);
     void *(*memset)(void *dst, i32 c, u32 n);
     void *(*memcpy)(void *dst, const void *src, u32 n);
-    u32   (*strlen)(const char *s);
+    i32   (*span_copy)(void *dst, u32 dst_cap, const void *src, u32 src_len, u32 *copied);
 
     /* ---- Process management ---- */
     i32 (*spawn)(const char *path);     /* load + start child process */

@@ -84,7 +84,7 @@ struct kernel_api {
     void *(*sbrk)(i32 increment);
     void *(*memset)(void *dst, i32 c, u32 n);
     void *(*memcpy)(void *dst, const void *src, u32 n);
-    u32   (*strlen)(const char *s);
+    i32   (*span_copy)(void *dst, u32 dst_cap, const void *src, u32 src_len, u32 *copied);
 
     i32 (*spawn)(const char *path);
     i32 (*wait)(i32 pid);
@@ -244,12 +244,12 @@ Watchdog/HA baseline:
 - `whoami()`
 - `auth(user, pass)`
 
-### Memory/libc helpers
+### Memory/span helpers
 
 - `sbrk(increment)`
 - `memset(dst, c, n)`
 - `memcpy(dst, src, n)`
-- `strlen(s)`
+- `span_copy(dst, dst_cap, src, src_len, copied)` — validates `dst_cap`, `src_len`, source range, destination range, and optional output pointer before copying. This replaces the old terminator-derived `strlen` KPI surface; length authority is explicit.
 
 ### Process management
 
