@@ -187,14 +187,20 @@ _Static_assert((sizeof(struct proc_launch_req) & 63U) == 0U,
 _Static_assert(sizeof(struct proc_launch_status) == 64,
                "launch status must be one cache line");
 #define PROC_SPANS_PER_PROCESS 8U
+#define PROC_SPAN_POISON_ADDR 0xDEADDEADDEADDEADULL
 struct proc_span_slot {
     bool used;
+    u32 generation;
     u32 type;
     u32 size;
+    u32 capacity;
     u64 addr;
-};
+    u64 _pad[4];
+} ALIGNED(64);
 static struct proc_span_slot proc_spans[MAX_PROCS_PER_CORE][PROC_SPANS_PER_PROCESS];
 static u64 proc_span_floor[MAX_PROCS_PER_CORE];
+_Static_assert(sizeof(struct proc_span_slot) == 64,
+               "process span descriptors must be one cache line");
 static inline bool on_user_core(void);
 static inline u32 user_core_slot(void);
 static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affinity_core);
@@ -633,12 +639,27 @@ static void proc_arena_update_high(struct process *p, u32 slot)
         p->arena_span_high_count = p->arena_span_count;
 }
 
+static void proc_span_poison(struct proc_span_slot *s)
+{
+    if (!s)
+        return;
+    u32 g = s->generation + 1U;
+    if (g == 0)
+        g = 1U;
+    s->generation = g;
+    s->used = false;
+    s->type = 0xFFFFFFFFU;
+    s->size = 0;
+    s->capacity = 0;
+    s->addr = PROC_SPAN_POISON_ADDR;
+}
+
 static void proc_span_reset(u32 slot)
 {
     if (slot >= MAX_PROCS_PER_CORE)
         return;
     for (u32 i = 0; i < PROC_SPANS_PER_PROCESS; i++)
-        proc_spans[slot][i].used = false;
+        proc_span_poison(&proc_spans[slot][i]);
     proc_span_floor[slot] = procs[slot].arena_limit;
     procs[slot].arena_span_bytes = 0;
     procs[slot].arena_span_count = 0;
@@ -4986,9 +5007,14 @@ void *proc_span_rent(u32 bytes, u32 align, u32 type)
     if (candidate + bytes > floor || candidate < heap_top[current_proc] || candidate < p->arena_base)
         return NULL;
     struct proc_span_slot *s = &proc_spans[current_proc][(u32)free_slot];
+    u32 gen = s->generation + 1U;
+    if (gen == 0)
+        gen = 1U;
+    s->generation = gen;
     s->used = true;
     s->type = type;
     s->size = bytes;
+    s->capacity = bytes;
     s->addr = candidate;
     proc_span_floor[current_proc] = candidate;
     p->arena_span_bytes += bytes;
@@ -5014,7 +5040,7 @@ bool proc_span_release(void *ptr)
             p->arena_span_bytes = 0;
         if (p->arena_span_count > 0)
             p->arena_span_count--;
-        s->used = false;
+        proc_span_poison(s);
         released = true;
         break;
     }
