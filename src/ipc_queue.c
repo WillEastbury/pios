@@ -2,6 +2,7 @@
 
 struct ipc_queue_obj {
     bool used;
+    u32 generation;
     u8 name[IPC_NAME_MAX + 1];
     u32 flags;
     u32 depth;
@@ -10,11 +11,36 @@ struct ipc_queue_obj {
     u32 count;
     u16 lens[IPC_QUEUE_MAX_DEPTH];
     u8 frames[IPC_QUEUE_MAX_DEPTH][IPC_FRAME_MAX];
-};
+} ALIGNED(64);
 
 static struct ipc_queue_obj g_queues[IPC_QUEUE_MAX_OBJECTS];
 static bool g_persist_runtime;
 static const char *const g_queue_walfs_path = "/var/ipc/queues";
+_Static_assert((sizeof(struct ipc_queue_obj) & 63U) == 0U,
+               "IPC queue objects must have cache-line stride");
+
+#define IPC_QUEUE_POISON_U32 0xDEAD0A0AU
+
+static u32 queue_bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void queue_poison(struct ipc_queue_obj *q)
+{
+    if (!q)
+        return;
+    u32 gen = queue_bump_generation(q->generation);
+    memset(q, 0xA5, sizeof(*q));
+    q->used = false;
+    q->generation = gen;
+    q->flags = IPC_QUEUE_POISON_U32;
+    q->depth = 0;
+    q->frame_max = 0;
+    q->head = IPC_QUEUE_POISON_U32;
+    q->count = IPC_QUEUE_POISON_U32;
+}
 
 static void copy_bytes(void *dst, const void *src, u32 n)
 {
@@ -69,7 +95,8 @@ static u32 queue_pop_index(const struct ipc_queue_obj *q)
 
 void ipc_queue_init(void)
 {
-    memset(g_queues, 0, sizeof(g_queues));
+    for (u32 i = 0; i < IPC_QUEUE_MAX_OBJECTS; i++)
+        queue_poison(&g_queues[i]);
     g_persist_runtime = false;
 }
 
@@ -88,8 +115,10 @@ i32 ipc_queue_create(const char *name, u32 depth, u32 flags, u32 frame_max)
     for (u32 i = 0; i < IPC_QUEUE_MAX_OBJECTS; i++) {
         if (g_queues[i].used) continue;
         struct ipc_queue_obj *q = &g_queues[i];
+        u32 gen = queue_bump_generation(q->generation);
         memset(q, 0, sizeof(*q));
         q->used = true;
+        q->generation = gen;
         q->flags = flags;
         q->depth = depth;
         q->frame_max = frame_max;

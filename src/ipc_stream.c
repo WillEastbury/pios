@@ -2,11 +2,14 @@
 
 struct topic_sub {
     bool used;
+    u32 generation;
     u32 cursor_seq;
-};
+    u32 _pad[13];
+} ALIGNED(64);
 
 struct ipc_topic_obj {
     bool used;
+    u32 generation;
     u8 name[IPC_NAME_MAX + 1];
     u32 flags;
     u32 window;
@@ -18,11 +21,47 @@ struct ipc_topic_obj {
     u32 seqs[IPC_TOPIC_WINDOW_MAX];
     u8 events[IPC_TOPIC_WINDOW_MAX][IPC_TOPIC_EVENT_MAX];
     struct topic_sub subs[IPC_TOPIC_SUBS_MAX];
-};
+} ALIGNED(64);
 
 static struct ipc_topic_obj g_topics[IPC_TOPIC_MAX];
 static bool g_persist_runtime;
 static const char *const g_topic_walfs_path = "/var/ipc/topics";
+_Static_assert(sizeof(struct topic_sub) == 64,
+               "IPC topic subscriptions must be one cache line");
+_Static_assert((sizeof(struct ipc_topic_obj) & 63U) == 0U,
+               "IPC topic objects must have cache-line stride");
+
+#define IPC_TOPIC_POISON_U32 0xDEAD7070U
+
+static u32 topic_bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void topic_poison(struct ipc_topic_obj *t)
+{
+    if (!t)
+        return;
+    u32 gen = topic_bump_generation(t->generation);
+    u32 sub_gen[IPC_TOPIC_SUBS_MAX];
+    for (u32 i = 0; i < IPC_TOPIC_SUBS_MAX; i++)
+        sub_gen[i] = topic_bump_generation(t->subs[i].generation);
+    memset(t, 0xA5, sizeof(*t));
+    t->used = false;
+    t->generation = gen;
+    t->flags = IPC_TOPIC_POISON_U32;
+    t->window = 0;
+    t->event_max = 0;
+    t->head = IPC_TOPIC_POISON_U32;
+    t->count = IPC_TOPIC_POISON_U32;
+    t->next_seq = IPC_TOPIC_POISON_U32;
+    for (u32 i = 0; i < IPC_TOPIC_SUBS_MAX; i++) {
+        t->subs[i].used = false;
+        t->subs[i].generation = sub_gen[i];
+        t->subs[i].cursor_seq = IPC_TOPIC_POISON_U32;
+    }
+}
 
 static void copy_bytes(void *dst, const void *src, u32 n)
 {
@@ -89,7 +128,8 @@ static u32 topic_tail(const struct ipc_topic_obj *t)
 
 void ipc_stream_init(void)
 {
-    memset(g_topics, 0, sizeof(g_topics));
+    for (u32 i = 0; i < IPC_TOPIC_MAX; i++)
+        topic_poison(&g_topics[i]);
     g_persist_runtime = false;
 }
 
@@ -108,8 +148,10 @@ i32 ipc_topic_create(const char *name, u32 replay_window, u32 flags, u32 event_m
     for (u32 i = 0; i < IPC_TOPIC_MAX; i++) {
         if (g_topics[i].used) continue;
         struct ipc_topic_obj *t = &g_topics[i];
+        u32 gen = topic_bump_generation(t->generation);
         memset(t, 0, sizeof(*t));
         t->used = true;
+        t->generation = gen;
         t->flags = flags;
         t->window = replay_window;
         t->event_max = event_max;
@@ -156,7 +198,10 @@ i32 ipc_topic_subscribe(i32 topic_handle)
 
     for (u32 i = 0; i < IPC_TOPIC_SUBS_MAX; i++) {
         if (t->subs[i].used) continue;
+        u32 gen = topic_bump_generation(t->subs[i].generation);
+        memset(&t->subs[i], 0, sizeof(t->subs[i]));
         t->subs[i].used = true;
+        t->subs[i].generation = gen;
         t->subs[i].cursor_seq = (t->count == 0) ? t->next_seq : (t->next_seq - t->count);
         return sub_encode((u32)topic_handle, i);
     }
