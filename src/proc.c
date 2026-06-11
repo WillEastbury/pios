@@ -149,8 +149,7 @@ static u8 proc_image_validate_scratch[PROC_IMAGE_VALIDATE_HEADER_MAX];
 
 #define PROC_LAUNCH_PATH_MAX 96
 struct proc_launch_req {
-    volatile u32 pending;
-    i32 result_pid;
+    volatile u32 seq;        /* producer-owned command sequence */
     u32 principal_id;
     u32 has_principal;
     u32 priority_class;
@@ -175,8 +174,18 @@ struct proc_launch_req {
     u32 migrate_exec_hash_check_nonce;
     u32 has_migrate_state;
     char path[PROC_LAUNCH_PATH_MAX];
-};
+} ALIGNED(64);
+struct proc_launch_status {
+    volatile u32 done_seq;   /* target-core-owned completion sequence */
+    i32 result_pid;
+    u32 _pad[14];
+} ALIGNED(64);
 static struct proc_launch_req launch_req[3];
+static struct proc_launch_status launch_status[3];
+_Static_assert((sizeof(struct proc_launch_req) & 63U) == 0U,
+               "launch request stride must be cache-line aligned");
+_Static_assert(sizeof(struct proc_launch_status) == 64,
+               "launch status must be one cache line");
 #define PROC_SPANS_PER_PROCESS 8U
 struct proc_span_slot {
     bool used;
@@ -620,8 +629,10 @@ static void proc_handle_launch_request(void)
     if (!on_user_core())
         return;
     u32 uc = user_core_slot();
-    if (!launch_req[uc].pending)
+    u32 seq = launch_req[uc].seq;
+    if (seq == launch_status[uc].done_seq)
         return;
+    dmb();
 
     u32 prev_principal = principal_current();
     if (launch_req[uc].has_principal)
@@ -663,9 +674,9 @@ static void proc_handle_launch_request(void)
     }
     if (launch_req[uc].has_principal)
         principal_set_current(prev_principal);
-    launch_req[uc].result_pid = pid;
+    launch_status[uc].result_pid = pid;
     dmb();
-    launch_req[uc].pending = 0;
+    launch_status[uc].done_seq = seq;
     sev();
 }
 
@@ -4189,7 +4200,10 @@ i32 proc_launch_on_core_as_prio(u32 target_core, const char *path, u32 principal
         return -1;
 
     u32 uc = target_core - CORE_USERM;
-    if (launch_req[uc].pending)
+    u32 seq = launch_req[uc].seq + 1U;
+    if (seq == 0)
+        seq = 1U;
+    if (launch_req[uc].seq != launch_status[uc].done_seq)
         return -1;
 
     u32 i = 0;
@@ -4221,18 +4235,17 @@ i32 proc_launch_on_core_as_prio(u32 target_core, const char *path, u32 principal
     launch_req[uc].migrate_exec_hash_next_check_tick = 0;
     launch_req[uc].migrate_exec_hash_check_nonce = 0;
     launch_req[uc].has_migrate_state = 0;
-    launch_req[uc].result_pid = -1;
     dmb();
-    launch_req[uc].pending = 1;
+    launch_req[uc].seq = seq;
     proc_signal_user_core(target_core);
 
     u64 start = timer_ticks();
-    while (launch_req[uc].pending) {
+    while (launch_status[uc].done_seq != seq) {
         if (timer_ticks() - start > 2000)
             return -1;
         wfe();
     }
-    return launch_req[uc].result_pid;
+    return launch_status[uc].result_pid;
 }
 
 bool proc_set_priority(u32 pid, u32 priority_class)
@@ -4263,7 +4276,10 @@ bool proc_set_affinity(u32 pid, u32 core)
             if (procs[i].image_path[0] == 0)
                 return false;
             u32 uc = core - CORE_USERM;
-            if (launch_req[uc].pending)
+            u32 seq = launch_req[uc].seq + 1U;
+            if (seq == 0)
+                seq = 1U;
+            if (launch_req[uc].seq != launch_status[uc].done_seq)
                 return false;
             u32 j = 0;
             for (; j < PROC_LAUNCH_PATH_MAX - 1 && procs[i].image_path[j]; j++)
@@ -4306,17 +4322,16 @@ bool proc_set_affinity(u32 pid, u32 core)
             launch_req[uc].migrate_exec_hash_next_check_tick = procs[i].exec_hash_next_check_tick;
             launch_req[uc].migrate_exec_hash_check_nonce = procs[i].exec_hash_check_nonce;
             launch_req[uc].has_migrate_state = 1;
-            launch_req[uc].result_pid = -1;
             dmb();
-            launch_req[uc].pending = 1;
+            launch_req[uc].seq = seq;
             proc_signal_user_core(core);
             u64 start = timer_ticks();
-            while (launch_req[uc].pending) {
+            while (launch_status[uc].done_seq != seq) {
                 if (timer_ticks() - start > 2000)
                     return false;
                 wfe();
             }
-            i32 new_pid = launch_req[uc].result_pid;
+            i32 new_pid = launch_status[uc].result_pid;
             if (new_pid < 0)
                 return false;
             procs[i].state = PROC_DEAD;
