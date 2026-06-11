@@ -59,6 +59,21 @@ Use these as scan/review rules for FIFO, wake-ring, scheduler, descriptor, IPC, 
 18. **Remote mutation is message passing** — core A changes core B's scheduler/process state by posting a command to B.
 19. **Diagnostics must not perturb scheduling** — tracing/counters must be isolated so enabling diagnostics cannot change scheduler cache-line ownership.
 20. **Every park has a reason and every wake has evidence** — park records capture last checked sequence/head; wake records carry the published sequence/head.
+21. **Length is authority** — every buffer/span/descriptor carries pointer, length, used, and capacity; never trust terminators or infer length from content.
+22. **Bounds checked before touch** — validate ranges before first read/write; parsers must not partially mutate state before bounds pass.
+23. **Red zones around arenas** — debug builds guard arenas, stacks, FIFO rings, and descriptor pools with bytes/pages and trap on corruption.
+24. **Poison on free/release** — released descriptors, leases, and pool entries are poisoned and generation-bumped; later access faults loudly.
+25. **Underrun is also a bug** — reads prove available bytes are at least requested bytes; short reads return explicit status.
+26. **Parser budget invariant** — parsers have byte, depth, token, and time/step limits; fuzz input cannot create infinite parse or recursion.
+27. **Fail closed on malformed descriptors** — bad kind, invalid phase, impossible length, stale generation, wrong owner, or bad checksum rejects/aborts.
+28. **Trap records are structured** — faults emit core, EL, PID, capsule, PC, SP, TTBR, syndrome, descriptor id, generation, owner, and last FIFO sequence.
+29. **Canary every control block** — scheduler/process/FIFO/descriptor structs carry magic/version/canary fields in debug and validate at hot boundaries.
+30. **No implicit widening/truncation** — all length/index arithmetic is overflow-checked; size conversions are explicit.
+31. **Fuzzable ABI** — FIFO messages, descriptors, HTTP spans, card records, and PicoScript bytecode have standalone fuzz harnesses.
+32. **Deterministic replay** — crash paths preserve enough ring history to replay inbound descriptor ids, wake sequences, handler ids, and binding ids.
+33. **Capability check before decode** — do not parse or materialize data for a binding the capsule is not authorized to see.
+34. **Immutable after publish** — once visible to another core/domain, control descriptors are immutable except for explicitly owned ack/status fields.
+35. **Panic on impossible state** — scheduler/MMU/descriptor invariant violations panic, dump, and reboot cleanly; no best-effort repair.
 
 ### Core Assignment (fixed, not scheduled)
 
