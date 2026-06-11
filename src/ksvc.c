@@ -5,6 +5,7 @@
 
 struct ksvc_entry {
     bool used;
+    u32 generation;
     u32 id;
     u32 owner_core;
     u32 kind;
@@ -27,9 +28,35 @@ struct ksvc_entry {
     void *poll_ctx;
     struct ksvc_msg mailbox[KSVC_MBOX_DEPTH];
     char name[32];
-};
+} ALIGNED(64);
 
 static struct ksvc_entry services[NUM_CORES][KSVC_MAX_SERVICES];
+_Static_assert((sizeof(struct ksvc_entry) & 63U) == 0U,
+               "KSVC service descriptors must have cache-line stride");
+
+#define KSVC_POISON_U32 0xDEAD5E12U
+
+static u32 ksvc_bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void ksvc_poison(struct ksvc_entry *e)
+{
+    if (!e)
+        return;
+    u32 gen = ksvc_bump_generation(e->generation);
+    simd_zero(e, sizeof(*e));
+    e->used = false;
+    e->generation = gen;
+    e->id = KSVC_POISON_U32;
+    e->owner_core = KSVC_POISON_U32;
+    e->kind = KSVC_POISON_U32;
+    e->state = KSVC_STATE_EMPTY;
+    e->priority = KSVC_POISON_U32;
+    e->last_error = KSVC_POISON_U32;
+}
 
 static inline u64 ksvc_counter_ticks(void)
 {
@@ -64,7 +91,8 @@ static struct ksvc_entry *ksvc_get(i32 id)
 void ksvc_init_core(void)
 {
     u32 c = core_id() & 3U;
-    simd_zero(services[c], sizeof(services[c]));
+    for (u32 i = 0; i < KSVC_MAX_SERVICES; i++)
+        ksvc_poison(&services[c][i]);
 }
 
 i32 ksvc_register(const char *name, u32 kind, u32 owner_core, u32 priority)
@@ -73,7 +101,10 @@ i32 ksvc_register(const char *name, u32 kind, u32 owner_core, u32 priority)
     struct ksvc_entry *tab = services[owner_core];
     for (u32 i = 0; i < KSVC_MAX_SERVICES; i++) {
         if (!tab[i].used) {
+            u32 gen = ksvc_bump_generation(tab[i].generation);
+            simd_zero(&tab[i], sizeof(tab[i]));
             tab[i].used = true;
+            tab[i].generation = gen;
             tab[i].id = ((owner_core & 0xFFU) << 8) | (i & 0xFFU);
             tab[i].owner_core = owner_core;
             tab[i].kind = kind;
