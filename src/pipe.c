@@ -9,6 +9,7 @@
 
 struct pipe_obj {
     bool used;
+    u32 generation;
     u8 path[PIPE_PATH_MAX + 1];
     u32 type;
     u32 domain;
@@ -18,9 +19,39 @@ struct pipe_obj {
     i32 backend;
     i32 stream_sub;
     u32 open_count;
-};
+    u32 _pad[4];
+} ALIGNED(64);
 
 static struct pipe_obj g_pipes[PIPE_MAX_OBJECTS];
+_Static_assert((sizeof(struct pipe_obj) & 63U) == 0U,
+               "pipe descriptors must have cache-line stride");
+
+#define PIPE_POISON_U32 0xDEAD717EU
+#define PIPE_POISON_I32 ((i32)-0x717)
+
+static u32 pipe_bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void pipe_poison(struct pipe_obj *p)
+{
+    if (!p)
+        return;
+    u32 gen = pipe_bump_generation(p->generation);
+    memset(p, 0xA5, sizeof(*p));
+    p->used = false;
+    p->generation = gen;
+    p->type = PIPE_POISON_U32;
+    p->domain = PIPE_POISON_U32;
+    p->flags = PIPE_POISON_U32;
+    p->depth = 0;
+    p->frame_max = 0;
+    p->backend = PIPE_POISON_I32;
+    p->stream_sub = PIPE_POISON_I32;
+    p->open_count = 0;
+}
 
 static void copy_bytes(void *dst, const void *src, u32 n)
 {
@@ -171,7 +202,8 @@ static i32 backend_open_ipc(const char *name, u32 type, i32 *stream_sub_out)
 
 void pipe_init(void)
 {
-    memset(g_pipes, 0, sizeof(g_pipes));
+    for (u32 i = 0; i < PIPE_MAX_OBJECTS; i++)
+        pipe_poison(&g_pipes[i]);
 }
 
 i32 pipe_create(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
@@ -195,8 +227,10 @@ i32 pipe_create(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
     if (backend < 0) return backend;
 
     struct pipe_obj *p = &g_pipes[slot];
+    u32 gen = pipe_bump_generation(p->generation);
     memset(p, 0, sizeof(*p));
     p->used = true;
+    p->generation = gen;
     p->type = type;
     p->domain = domain;
     p->flags = flags;
@@ -238,8 +272,10 @@ i32 pipe_open(const char *path, u32 type)
     if (backend < 0) return backend;
 
     struct pipe_obj *p = &g_pipes[slot];
+    u32 gen = pipe_bump_generation(p->generation);
     memset(p, 0, sizeof(*p));
     p->used = true;
+    p->generation = gen;
     p->type = type;
     p->domain = domain;
     p->flags = 0;
@@ -258,6 +294,8 @@ i32 pipe_close(i32 pipe_id)
     if (!p) return IPC_ERR_INVAL;
     if (p->open_count == 0) return IPC_ERR_INVAL;
     p->open_count--;
+    if (p->open_count == 0)
+        pipe_poison(p);
     return IPC_OK;
 }
 
