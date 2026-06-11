@@ -421,6 +421,7 @@ bool proc_entry_contract_selftest(void)
 #define PROC_SVC_GETPID    1U
 #define PROC_SVC_EL0_PROBE 2U
 #define PROC_SVC_EXIT      3U
+#define PROC_SVC_PARK      4U
 
 static volatile u32 el0_probe_seen;
 static volatile u32 el0_probe_pid;
@@ -495,6 +496,10 @@ static bool proc_handle_svc_inner(struct irq_frame *frame, u64 esr, bool account
         el0_probe_exits++;
         proc_exit((u32)frame->x[0]);
         __builtin_unreachable();
+    case PROC_SVC_PARK:
+        proc_park();
+        frame->x[0] = 0;
+        return true;
     default:
         if (account)
             svc_bad_count++;

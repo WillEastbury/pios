@@ -38,6 +38,7 @@ static u64 l3_block0[512] ALIGNED(4096);     /* block 0 (0-2MB) split to 4KB pag
 static u64 user_l1[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
 static u64 user_l2_low[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
 static u64 user_l3_proc[3][MAX_PROCS_PER_CORE][2][512] ALIGNED(4096);
+static u64 user_l3_ipc[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
 static bool user_table_valid[3][MAX_PROCS_PER_CORE];
 
 /* Exported for secondary cores (read by start.S) */
@@ -174,6 +175,52 @@ static inline u64 user_page_el0_rw_xn_attrs(void)
            PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN | PTE_NG;
 }
 
+static inline u64 user_page_el1_nc_xn_attrs(void)
+{
+    return PTE_VALID | PTE_PAGE | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN | PTE_NG;
+}
+
+static inline u64 user_page_el0_nc_xn_attrs(void)
+{
+    return PTE_VALID | PTE_PAGE | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN | PTE_NG;
+}
+
+static void map_user_ipc_el0_pages(u32 uc, u32 slot, u64 *l2)
+{
+    u32 idx = (u32)(IPC_SHM_BASE / L2_BLOCK_SIZE);
+    u64 block_base = (u64)idx * L2_BLOCK_SIZE;
+    simd_zero(user_l3_ipc[uc][slot], sizeof(user_l3_ipc[uc][slot]));
+    l2[idx] = (u64)(usize)user_l3_ipc[uc][slot] | PTE_VALID | PTE_TABLE;
+    for (u32 i = 0; i < 512; i++) {
+        u64 pa = block_base + (u64)i * L3_PAGE_SIZE;
+        u64 attrs = (pa >= IPC_SHM_BASE && pa < IPC_SHM_BASE + IPC_SHM_SIZE)
+                        ? user_page_el0_nc_xn_attrs()
+                        : user_page_el1_nc_xn_attrs();
+        user_l3_ipc[uc][slot][i] = pa | attrs;
+    }
+}
+
+static void map_user_ipc_el0_alias(u32 uc, u32 slot, u64 *l1, u64 *l2, u64 alias)
+{
+    u64 l1idx = alias / L1_BLOCK_SIZE;
+    if (l1idx >= 512)
+        return;
+    l1[l1idx] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
+    u32 idx = (u32)((alias % L1_BLOCK_SIZE) / L2_BLOCK_SIZE);
+    simd_zero(user_l3_ipc[uc][slot], sizeof(user_l3_ipc[uc][slot]));
+    l2[idx] = (u64)(usize)user_l3_ipc[uc][slot] | PTE_VALID | PTE_TABLE;
+    for (u32 i = 0; i < 512; i++) {
+        if ((u64)i * L3_PAGE_SIZE >= IPC_SHM_SIZE) {
+            user_l3_ipc[uc][slot][i] = 0;
+            continue;
+        }
+        u64 pa = IPC_SHM_BASE + (u64)i * L3_PAGE_SIZE;
+        user_l3_ipc[uc][slot][i] = pa | user_page_el0_nc_xn_attrs();
+    }
+}
+
 static bool mmu_user_slot_pages(u32 core, u32 slot, u64 slot_base, u64 slot_size,
                                 u32 code_bytes, bool split, bool el0_access)
 {
@@ -225,6 +272,7 @@ static void mmu_user_table_publish(u32 uc, u32 slot)
     dcache_clean_invalidate_range((u64)(usize)user_l1[uc][slot], sizeof(user_l1[uc][slot]));
     dcache_clean_invalidate_range((u64)(usize)user_l2_low[uc][slot], sizeof(user_l2_low[uc][slot]));
     dcache_clean_invalidate_range((u64)(usize)user_l3_proc[uc][slot], sizeof(user_l3_proc[uc][slot]));
+    dcache_clean_invalidate_range((u64)(usize)user_l3_ipc[uc][slot], sizeof(user_l3_ipc[uc][slot]));
     dsb();
 }
 
@@ -470,6 +518,7 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
     if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, 0, false, false))
         return false;
     map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
+    map_user_ipc_el0_alias(uc, slot, l1, l2, 0x2003000000ULL);
 
     /* Keep peripheral MMIO mapped for current direct-call kernel API ABI. */
     map_user_device_windows(l1);
@@ -532,6 +581,7 @@ bool mmu_user_table_build_split_el0(u32 core, u32 slot, u64 slot_base, u64 slot_
     if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, code_bytes, true, true))
         return false;
     map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
+    map_user_ipc_el0_alias(uc, slot, l1, l2, 0x2003000000ULL);
 
     map_user_device_windows(l1);
 
@@ -587,6 +637,7 @@ bool mmu_user_table_build_split_el0_at(u32 core, u32 slot, u64 va_base, u64 pa_b
     }
 
     map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE), SHARED_FIFO_BASE, ram_attrs);
+    map_user_ipc_el0_alias(uc, slot, l1, l2, 0x2003000000ULL);
     map_user_device_windows(l1);
     mmu_user_table_publish(uc, slot);
     user_table_valid[uc][slot] = true;
@@ -648,14 +699,17 @@ bool mmu_user_pte_snapshot(u32 core, u32 slot, u64 va, u64 *l1e, u64 *l2e, u64 *
     if (l1idx >= 512)
         return false;
     if (l1e) *l1e = user_l1[uc][slot][l1idx];
-    u32 l2idx = (u32)(va / L2_BLOCK_SIZE);
-    if (l2idx >= 512)
-        return false;
+    u32 l2idx = (u32)((va % L1_BLOCK_SIZE) / L2_BLOCK_SIZE);
     u64 e2 = user_l2_low[uc][slot][l2idx];
     if (l2e) *l2e = e2;
     if ((e2 & (PTE_VALID | PTE_TABLE)) == (PTE_VALID | PTE_TABLE)) {
         u64 slot_base = (u64)core_ram_bases[core] + PROC_SLOT_OFFSET + (u64)slot * PROC_SLOT_SIZE;
         u64 first_l2 = slot_base / L2_BLOCK_SIZE;
+        if (l2idx == (u32)((0x2003000000ULL % L1_BLOCK_SIZE) / L2_BLOCK_SIZE)) {
+            u32 pidx = (u32)((va / L3_PAGE_SIZE) & 511U);
+            if (l3e) *l3e = user_l3_ipc[uc][slot][pidx];
+            return true;
+        }
         if (l2idx < first_l2 || l2idx - first_l2 >= 2)
             return true;
         u32 table = (u32)(l2idx - first_l2);

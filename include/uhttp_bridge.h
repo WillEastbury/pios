@@ -42,7 +42,11 @@
 #define UHTTP_PICO_STATIC_RECORD  1U
 #define UHTTP_PICO_API_RECORD     2U
 /* Must equal IPC_SHM_BASE (core_env.h); verified by _Static_assert in the .c. */
+#ifdef PIOS_USER_EL0
+#define UHTTP_BRIDGE_ADDR    0x2003000000UL
+#else
 #define UHTTP_BRIDGE_ADDR    0x04D00000UL
+#endif
 
 #define UHTTP_LINE           64U
 
@@ -81,11 +85,16 @@ struct uhttp_bridge {
  * visible to other cores even if this core stays idle and never evicts. */
 static inline void uhttp_clean(const volatile void *p, u32 n)
 {
+#ifdef PIOS_USER_EL0
+    (void)p; (void)n;
+    __asm__ volatile("" ::: "memory");
+#else
     u64 a = (u64)(usize)p & ~(u64)(UHTTP_LINE - 1U);
     u64 e = (u64)(usize)p + n;
     for (; a < e; a += UHTTP_LINE)
         __asm__ volatile("dc cvac, %0" :: "r"(a) : "memory");
     __asm__ volatile("dsb ish" ::: "memory");
+#endif
 }
 
 /* Invalidate a range to PoC (reader side): drop this core's possibly-stale copy
@@ -93,11 +102,16 @@ static inline void uhttp_clean(const volatile void *p, u32 n)
  * this core never writes — dc ivac discards dirty data without write-back. */
 static inline void uhttp_inval(volatile void *p, u32 n)
 {
+#ifdef PIOS_USER_EL0
+    (void)p; (void)n;
+    __asm__ volatile("" ::: "memory");
+#else
     u64 a = (u64)(usize)p & ~(u64)(UHTTP_LINE - 1U);
     u64 e = (u64)(usize)p + n;
     for (; a < e; a += UHTTP_LINE)
         __asm__ volatile("dc ivac, %0" :: "r"(a) : "memory");
     __asm__ volatile("dsb ish" ::: "memory");
+#endif
 }
 
 static inline struct uhttp_bridge *uhttp_bridge(void)

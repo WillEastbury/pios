@@ -60,6 +60,21 @@ static void u_append_u32(char *dst, u32 *off, u32 cap, u32 v)
     u_append(dst, off, cap, rev);
 }
 
+#ifdef PIOS_USER_EL0
+static inline u32 el0_getpid(void)
+{
+    register u64 x0 __asm__("x0");
+    __asm__ volatile("svc #1" : "=r"(x0) :: "memory");
+    return (u32)x0;
+}
+
+static inline void el0_wait_event(void)
+{
+    register u64 x0 __asm__("x0");
+    __asm__ volatile("svc #4" : "=r"(x0) :: "memory");
+}
+#endif
+
 #define PICOWEB_MEM_SIZE        8192U
 #define PICOWEB_MAX_SPANS       64U
 
@@ -359,14 +374,21 @@ void user_main(struct kernel_api *api)
      * 0, we entered but api->getpid() stalled; if magic stays 0, we never ran. */
     b->magic = UHTTP_BRIDGE_MAGIC;
 
-    /* Now exercise the kernel API: publish our pid so the kernel can wake us. */
     b->resp_seq = 0;
+#ifdef PIOS_USER_EL0
+    (void)api;
+    b->httpd_pid = el0_getpid();
+#else
+    /* Now exercise the kernel API: publish our pid so the kernel can wake us. */
     b->httpd_pid = api->getpid();
+#endif
     /* Push the whole Zone B control line to PoC so core 0 sees magic/pid even
      * though this core is about to park and never evict the line on its own. */
     uhttp_clean(&b->magic, UHTTP_LINE);
 
+#ifndef PIOS_USER_EL0
     api->print("[httpd] attached, waiting on :81\n");
+#endif
 
     uhttp_inval(&b->req_seq, UHTTP_LINE);
     u32 last = b->req_seq;
@@ -379,7 +401,11 @@ void user_main(struct kernel_api *api)
         if (cur == last) {
             b->dbg_phase = 12U;                 /* parking (no new request) */
             uhttp_clean(&b->magic, UHTTP_LINE); /* publish dbg_loops/resp_seq, then sleep */
+#ifdef PIOS_USER_EL0
+            el0_wait_event();     /* kernel wake path sends SEV when request arrives */
+#else
             api->park();          /* sleep until the kernel wakes us */
+#endif
             b->dbg_phase = 13U;                 /* resumed from park */
             uhttp_clean(&b->magic, UHTTP_LINE);
             continue;

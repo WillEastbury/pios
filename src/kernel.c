@@ -13611,11 +13611,10 @@ NORETURN void core2_main(void) {
     core_mark_online(CORE_USER0, 4);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     core_mark_online(CORE_USER0, 5);
-    /* Launch the embedded userland HTTP server (port 81) at EL1 (direct-KPI).
-     * Failure is non-fatal: fall through to the scheduler regardless. */
-    proc_exec_from_mem("user/httpd", user_httpd_start,
-                       (u32)(usize)(user_httpd_end - user_httpd_start),
-                       PROC_PRIO_NORMAL, core_id());
+    /* Launch the embedded PicoScript-backed HTTP server at real EL0. */
+    proc_exec_from_mem_el0("user/httpd-el0", user_httpd_start,
+                           (u32)(usize)(user_httpd_end - user_httpd_start),
+                           0x2001000000ULL, 0x02900000ULL, PROC_PRIO_NORMAL, core_id());
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }

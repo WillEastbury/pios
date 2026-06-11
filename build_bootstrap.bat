@@ -30,7 +30,9 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%CC%" %USER_CFLAGS% -c src\picovm.c -o build_user\picovm.o
 if errorlevel 1 exit /b 1
-"%LD%" -T user\user.ld -nostdlib -o build_user\user_httpd.elf build_user\ustart.o build_user\httpd.o build_user\picovm.o
+"%CC%" %USER_CFLAGS% -DPIOS_USER_EL0 -c user\httpd.c -o build_user\httpd_el0.o
+if errorlevel 1 exit /b 1
+"%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_httpd.elf build_user\ustart.o build_user\httpd_el0.o build_user\picovm.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_httpd.elf user_httpd.img
 if errorlevel 1 exit /b 1
