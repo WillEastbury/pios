@@ -692,8 +692,13 @@ static void nic_render_counter_panel(void)
 
 static void nic_count_packet(bool tx, const u8 *frame, u32 len)
 {
-    if (tx) pkt_counts.tx_total++;
-    else    pkt_counts.rx_total++;
+    if (tx) {
+        pkt_counts.tx_total++;
+        pkt_counts.tx_bytes += len;
+    } else {
+        pkt_counts.rx_total++;
+        pkt_counts.rx_bytes += len;
+    }
     flow_record_packet(tx, frame, len);
 
     if (len < 14) {

@@ -68,6 +68,7 @@
 #include "fat32.h"
 #include "pios_addr.h"
 #include "picoscript.h"
+#include "mailbox.h"
 #include "picovm.h"
 #include "pixe_request.h"
 #include "pixe_host.h"
@@ -181,6 +182,57 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HTTP_ERR_REQ_TIMEOUT  2U
 #define HTTP_ERR_BAD_STATE    3U
 #define HTTP_ERR_HEADER_BIG   4U
+
+static const char *http_event_name(u32 event)
+{
+    switch (event) {
+    case HTTP_EVT_LISTEN: return "listen";
+    case HTTP_EVT_ACCEPT: return "accept";
+    case HTTP_EVT_RX: return "rx";
+    case HTTP_EVT_COMPLETE: return "complete";
+    case HTTP_EVT_BUILD_ENTER: return "build-enter";
+    case HTTP_EVT_BUILD_EXIT: return "build-exit";
+    case HTTP_EVT_TX: return "tx";
+    case HTTP_EVT_CLOSE: return "close";
+    case HTTP_EVT_ABORT: return "abort";
+    case HTTP_EVT_RESET: return "reset";
+    case HTTP_EVT_BAD_STATE: return "bad-state";
+    case HTTP_EVT_STATUS_ENTER: return "status-enter";
+    case HTTP_EVT_STATUS_EXIT: return "status-exit";
+    case HTTP_EVT_ADMIN_BUILD: return "admin-build";
+    default: return "?";
+    }
+}
+
+static const char *http_route_name(u32 route)
+{
+    switch (route) {
+    case HTTP_ROUTE_UNKNOWN: return "unknown";
+    case HTTP_ROUTE_ROOT: return "root";
+    case HTTP_ROUTE_STATUS: return "status";
+    case HTTP_ROUTE_REBOOT: return "reboot";
+    case HTTP_ROUTE_LOGS: return "logs";
+    case HTTP_ROUTE_UPDATE: return "update";
+    case HTTP_ROUTE_HOTPATCH: return "hotpatch";
+    case HTTP_ROUTE_PLACEHOLDER: return "placeholder";
+    case HTTP_ROUTE_NOT_FOUND: return "not-found";
+    case HTTP_ROUTE_NETSTAT: return "netstat";
+    case HTTP_ROUTE_ACME: return "acme";
+    default: return "?";
+    }
+}
+
+static const char *http_error_name(u32 err)
+{
+    switch (err) {
+    case HTTP_ERR_NONE: return "none";
+    case HTTP_ERR_RESP_TIMEOUT: return "resp-timeout";
+    case HTTP_ERR_REQ_TIMEOUT: return "req-timeout";
+    case HTTP_ERR_BAD_STATE: return "bad-state";
+    case HTTP_ERR_HEADER_BIG: return "header-too-big";
+    default: return "?";
+    }
+}
 
 static tcp_conn_t echo_listen_conn = -1;
 static tcp_conn_t echo_client_conn = -1;
@@ -1258,6 +1310,7 @@ struct perf_counter_snapshot {
     u64 sched_idle_ticks;
     u64 sched_total_ticks;
     u32 sched_flags;
+    u64 physical_ram_bytes;
     u32 ram_total_kib;
     u32 ram_used_kib;
     u32 ram_kernel_kib;
@@ -1274,16 +1327,88 @@ struct perf_counter_snapshot {
     u32 proc_dead;
     u32 net_listen_count;
     u32 net_listen_pending;
+    u64 nic_rx_bytes;
+    u64 nic_tx_bytes;
+    u32 nic_rx_mbps_x1000;
+    u32 nic_tx_mbps_x1000;
+    u32 nic_rx_peak_mbps_x1000;
+    u32 nic_tx_peak_mbps_x1000;
+    u64 sd_read_bytes;
+    u64 sd_write_bytes;
+    u32 sd_read_mbps_x1000;
+    u32 sd_write_mbps_x1000;
+    u32 sd_read_peak_mbps_x1000;
+    u32 sd_write_peak_mbps_x1000;
+    bool walfs_mounted;
+    bool walfs_super_ok;
+    bool walfs_root_ok;
+    bool walfs_legacy_present;
+    u32 walfs_partition_lba;
+    u32 walfs_base_lba;
+    u64 walfs_partition_bytes;
+    u64 walfs_region_bytes;
+    u64 walfs_used_bytes;
+    u64 walfs_free_bytes;
+    u32 walfs_records;
     u64 dash_snap_ticks;
     u64 dash_render_ticks;
     u64 fb_blit_ticks;
 };
 
+static u64 perf_physical_ram_bytes(void)
+{
+    static bool probed;
+    static u64 bytes;
+    static volatile u32 ALIGNED(16) mbox_mem[8];
+    if (probed)
+        return bytes;
+    probed = true;
+    mbox_mem[0] = sizeof(mbox_mem);
+    mbox_mem[1] = 0;
+    mbox_mem[2] = TAG_GET_ARM_MEMORY;
+    mbox_mem[3] = 8;
+    mbox_mem[4] = 0;
+    mbox_mem[5] = 0;
+    mbox_mem[6] = 0;
+    mbox_mem[7] = TAG_END;
+    if (mbox_call(MBOX_CH_PROP, mbox_mem) && (mbox_mem[4] & 0x80000000U))
+        bytes = mbox_mem[6];
+    return bytes;
+}
+
+static u64 perf_counter_delta(u64 now, u64 last)
+{
+    return now >= last ? now - last : now;
+}
+
+static u32 perf_mbps_x1000(u64 bytes, u64 elapsed_ms)
+{
+    if (elapsed_ms == 0)
+        return 0;
+    u64 v = (bytes * 8ULL) / elapsed_ms;
+    return v > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (u32)v;
+}
+
 static void perf_counter_snapshot(struct perf_counter_snapshot *p)
 {
+    static u64 rate_last_ms;
+    static u64 rate_last_nic_rx;
+    static u64 rate_last_nic_tx;
+    static u64 rate_last_sd_reads;
+    static u64 rate_last_sd_writes;
+    static u32 rate_nic_rx;
+    static u32 rate_nic_tx;
+    static u32 rate_sd_read;
+    static u32 rate_sd_write;
+    static u32 peak_nic_rx;
+    static u32 peak_nic_tx;
+    static u32 peak_sd_read;
+    static u32 peak_sd_write;
+
     if (!p)
         return;
     simd_zero(p, sizeof(*p));
+    p->physical_ram_bytes = perf_physical_ram_bytes();
     p->ram_total_kib = (u32)((CORE_PRIV_SIZE * 4ULL) >> 10);
     for (u32 i = 0; i < 4; i++)
         p->core_alloc_kib[i] = http_core_ram_used_kib(i);
@@ -1326,6 +1451,63 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
             p->net_listen_pending += tcp[i].pending_count;
         }
     }
+
+    nic_packet_counters_t nc;
+    nic_packet_counters(&nc);
+    const sd_stats_t *ss = sd_get_stats();
+    u64 sd_reads = ss ? ss->reads : 0;
+    u64 sd_writes = ss ? ss->writes : 0;
+    p->nic_rx_bytes = nc.rx_bytes;
+    p->nic_tx_bytes = nc.tx_bytes;
+    p->sd_read_bytes = sd_reads * (u64)SD_BLOCK_SIZE;
+    p->sd_write_bytes = sd_writes * (u64)SD_BLOCK_SIZE;
+
+    u64 now_ms = timer_monotonic_ms();
+    if (rate_last_ms == 0) {
+        rate_last_ms = now_ms ? now_ms : 1;
+        rate_last_nic_rx = nc.rx_bytes;
+        rate_last_nic_tx = nc.tx_bytes;
+        rate_last_sd_reads = sd_reads;
+        rate_last_sd_writes = sd_writes;
+    } else if (now_ms > rate_last_ms && now_ms - rate_last_ms >= 250ULL) {
+        u64 dt = now_ms - rate_last_ms;
+        rate_nic_rx = perf_mbps_x1000(perf_counter_delta(nc.rx_bytes, rate_last_nic_rx), dt);
+        rate_nic_tx = perf_mbps_x1000(perf_counter_delta(nc.tx_bytes, rate_last_nic_tx), dt);
+        rate_sd_read = perf_mbps_x1000(perf_counter_delta(sd_reads, rate_last_sd_reads) * (u64)SD_BLOCK_SIZE, dt);
+        rate_sd_write = perf_mbps_x1000(perf_counter_delta(sd_writes, rate_last_sd_writes) * (u64)SD_BLOCK_SIZE, dt);
+        if (rate_nic_rx > peak_nic_rx) peak_nic_rx = rate_nic_rx;
+        if (rate_nic_tx > peak_nic_tx) peak_nic_tx = rate_nic_tx;
+        if (rate_sd_read > peak_sd_read) peak_sd_read = rate_sd_read;
+        if (rate_sd_write > peak_sd_write) peak_sd_write = rate_sd_write;
+        rate_last_ms = now_ms;
+        rate_last_nic_rx = nc.rx_bytes;
+        rate_last_nic_tx = nc.tx_bytes;
+        rate_last_sd_reads = sd_reads;
+        rate_last_sd_writes = sd_writes;
+    }
+    p->nic_rx_mbps_x1000 = rate_nic_rx;
+    p->nic_tx_mbps_x1000 = rate_nic_tx;
+    p->nic_rx_peak_mbps_x1000 = peak_nic_rx;
+    p->nic_tx_peak_mbps_x1000 = peak_nic_tx;
+    p->sd_read_mbps_x1000 = rate_sd_read;
+    p->sd_write_mbps_x1000 = rate_sd_write;
+    p->sd_read_peak_mbps_x1000 = peak_sd_read;
+    p->sd_write_peak_mbps_x1000 = peak_sd_write;
+
+    struct walfs_status_snapshot ws;
+    walfs_status(&ws);
+    p->walfs_mounted = ws.mounted;
+    p->walfs_super_ok = ws.super_ok;
+    p->walfs_root_ok = ws.root_ok;
+    p->walfs_legacy_present = ws.legacy_present;
+    p->walfs_partition_lba = ws.partition_lba;
+    p->walfs_base_lba = ws.base_lba;
+    p->walfs_partition_bytes = (u64)ws.partition_blocks * (u64)SD_BLOCK_SIZE;
+    p->walfs_region_bytes = (u64)ws.region_blocks * (u64)SD_BLOCK_SIZE;
+    p->walfs_used_bytes = ws.super_head;
+    p->walfs_free_bytes = p->walfs_region_bytes > p->walfs_used_bytes ?
+                          p->walfs_region_bytes - p->walfs_used_bytes : 0;
+    p->walfs_records = ws.super_records;
     p->dash_snap_ticks = g_dash_snap_ticks;
     p->dash_render_ticks = g_dash_render_ticks;
     p->fb_blit_ticks = fb_last_blit_ticks();
@@ -1377,7 +1559,10 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "cpu1_permille", perf.cpu_permille[1], true);
     http_append_json_metric(out, &len, max, "cpu2_permille", perf.cpu_permille[2], true);
     http_append_json_metric(out, &len, max, "cpu3_permille", perf.cpu_permille[3], true);
+    http_append_json_metric(out, &len, max, "ram_physical_bytes", perf.physical_ram_bytes, true);
+    http_append_json_metric(out, &len, max, "ram_physical_kib", perf.physical_ram_bytes >> 10, true);
     http_append_json_metric(out, &len, max, "ram_total_kib", perf.ram_total_kib, true);
+    http_append_json_metric(out, &len, max, "ram_pool_total_kib", perf.ram_total_kib, true);
     http_append_json_metric(out, &len, max, "ram_used_kib", perf.ram_used_kib, true);
     http_append_json_metric(out, &len, max, "ram_kernel_kib", perf.ram_kernel_kib, true);
     http_append_json_metric(out, &len, max, "ram_user_kib", perf.ram_user_kib, true);
@@ -1387,6 +1572,29 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "kernel_cap_kib", perf.kernel_cap_kib, true);
     http_append_json_metric(out, &len, max, "net_listen_count", perf.net_listen_count, true);
     http_append_json_metric(out, &len, max, "net_listen_pending", perf.net_listen_pending, true);
+    http_append_json_metric(out, &len, max, "nic_rx_bytes", perf.nic_rx_bytes, true);
+    http_append_json_metric(out, &len, max, "nic_tx_bytes", perf.nic_tx_bytes, true);
+    http_append_json_metric(out, &len, max, "nic_rx_mbps_x1000", perf.nic_rx_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "nic_tx_mbps_x1000", perf.nic_tx_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "nic_rx_peak_mbps_x1000", perf.nic_rx_peak_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "nic_tx_peak_mbps_x1000", perf.nic_tx_peak_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "sd_read_bytes", perf.sd_read_bytes, true);
+    http_append_json_metric(out, &len, max, "sd_write_bytes", perf.sd_write_bytes, true);
+    http_append_json_metric(out, &len, max, "sd_read_mbps_x1000", perf.sd_read_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "sd_write_mbps_x1000", perf.sd_write_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "sd_read_peak_mbps_x1000", perf.sd_read_peak_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "sd_write_peak_mbps_x1000", perf.sd_write_peak_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "walfs_mounted", perf.walfs_mounted ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "walfs_super_ok", perf.walfs_super_ok ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "walfs_root_ok", perf.walfs_root_ok ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "walfs_legacy_present", perf.walfs_legacy_present ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "walfs_partition_lba", perf.walfs_partition_lba, true);
+    http_append_json_metric(out, &len, max, "walfs_base_lba", perf.walfs_base_lba, true);
+    http_append_json_metric(out, &len, max, "walfs_partition_bytes", perf.walfs_partition_bytes, true);
+    http_append_json_metric(out, &len, max, "walfs_region_bytes", perf.walfs_region_bytes, true);
+    http_append_json_metric(out, &len, max, "walfs_used_bytes", perf.walfs_used_bytes, true);
+    http_append_json_metric(out, &len, max, "walfs_free_bytes", perf.walfs_free_bytes, true);
+    http_append_json_metric(out, &len, max, "walfs_records", perf.walfs_records, true);
     http_append_json_metric(out, &len, max, "dash_snap_ticks", perf.dash_snap_ticks, true);
     http_append_json_metric(out, &len, max, "dash_render_ticks", perf.dash_render_ticks, true);
     http_append_json_metric(out, &len, max, "fb_blit_ticks", perf.fb_blit_ticks, false);
@@ -5000,6 +5208,29 @@ static u32 http_build_log_stream_response(char *out, u32 max, const u8 *req, u32
         http_append_u64(out, &len, max, e->a);
         http_append(out, &len, max, " b=");
         http_append_u64(out, &len, max, e->b);
+        if (e->event && http_streq(e->event, "http-error")) {
+            u32 ev = (e->a >> 24) & 0xFFU;
+            u32 route = (e->a >> 16) & 0xFFU;
+            u32 arg = e->a & 0xFFFFU;
+            http_append(out, &len, max, " detail event=");
+            http_append(out, &len, max, http_event_name(ev));
+            http_append(out, &len, max, " route=");
+            http_append(out, &len, max, http_route_name(route));
+            if (ev == HTTP_EVT_ABORT) {
+                http_append(out, &len, max, " error=");
+                http_append(out, &len, max, http_error_name(arg));
+                http_append(out, &len, max, " conn=");
+                http_append_u64(out, &len, max, e->b);
+            } else if (ev == HTTP_EVT_BAD_STATE) {
+                http_append(out, &len, max, " state=");
+                http_append_u64(out, &len, max, arg);
+                http_append(out, &len, max, " idle_ms=");
+                http_append_u64(out, &len, max, e->b);
+            } else {
+                http_append(out, &len, max, " arg=");
+                http_append_u64(out, &len, max, arg);
+            }
+        }
         http_append(out, &len, max, "\n");
     }
     return len;
@@ -13268,6 +13499,19 @@ static void dash_put_trunc(const char *s, u32 max_chars)
     }
 }
 
+static bool dash_streq(const char *a, const char *b)
+{
+    if (!a || !b)
+        return false;
+    u32 i = 0;
+    while (a[i] && b[i]) {
+        if (a[i] != b[i])
+            return false;
+        i++;
+    }
+    return a[i] == b[i];
+}
+
 static void dash_clear_body(u32 col, u32 row, u32 width, u32 height)
 {
     if (width < 3 || height < 3)
@@ -13304,17 +13548,35 @@ static void dash_put_permille_pct(u32 permille)
         fb_printf("%u%%", whole);
 }
 
-static bool dash_proc_for_pid(const struct proc_ui_entry *proc, u32 proc_n,
-                              u32 pid, u32 *core_out, const char **image_out)
+static const struct proc_ui_entry *
+dash_proc_for_pid(const struct proc_ui_entry *proc, u32 proc_n, u32 pid)
 {
     for (u32 i = 0; i < proc_n; i++) {
         if (proc[i].pid != pid)
             continue;
-        if (core_out) *core_out = proc[i].affinity_core;
-        if (image_out) *image_out = proc[i].image_path;
-        return true;
+        return &proc[i];
     }
-    return false;
+    return (const struct proc_ui_entry *)0;
+}
+
+static const struct proc_capsule_ui_entry *
+dash_capsule_for_pid(const struct proc_capsule_ui_entry *caps, u32 caps_n, u32 pid)
+{
+    for (u32 i = 0; i < caps_n; i++) {
+        if (caps[i].pid == pid)
+            return &caps[i];
+    }
+    return (const struct proc_capsule_ui_entry *)0;
+}
+
+static bool dash_capsule_same_group(const struct proc_capsule_ui_entry *a,
+                                    const struct proc_capsule_ui_entry *b)
+{
+    if (!a || !b)
+        return false;
+    return a->capsule_id == b->capsule_id &&
+           a->capsule_hash == b->capsule_hash &&
+           dash_streq(a->group, b->group);
 }
 
 static bool dash_bridge_for_port(u16 port, u32 *bridge_out, u32 *pid_out)
@@ -13337,6 +13599,196 @@ static bool dash_bridge_for_port(u16 port, u32 *bridge_out, u32 *pid_out)
     return true;
 }
 
+struct dash_listener_info {
+    u16 port;
+    u32 bridge;
+    u32 pid;
+    u32 core;
+    u32 principal_id;
+    u32 cpu_percent;
+    u32 mem_kib;
+    bool has_bridge;
+    bool has_proc;
+    const char *image;
+    const char *owner;
+    const char *principal;
+    const struct proc_capsule_ui_entry *capsule;
+};
+
+static const char *dash_principal_name(const struct principal_ui_entry *users,
+                                       u32 users_n, u32 principal_id)
+{
+    for (u32 i = 0; i < users_n; i++) {
+        if (users[i].id == principal_id)
+            return users[i].name;
+    }
+    return principal_id == PRINCIPAL_ROOT ? "root" : "?";
+}
+
+static u32 dash_listener_group(const struct dash_listener_info *info)
+{
+    if (info->has_proc)
+        return 2U; /* user */
+    if (info->port == ADMIN_STATUS_TCP_PORT ||
+        info->port == ADMIN_REBOOT_TCP_PORT ||
+        info->port == ADMIN_UPDATE_TCP_PORT)
+        return 1U; /* admin */
+    return 0U;     /* kernel */
+}
+
+static const char *dash_group_name(u32 group)
+{
+    if (group == 0U) return "KERNEL";
+    if (group == 1U) return "ADMIN";
+    return "USER";
+}
+
+static struct dash_listener_info dash_listener_info_for(
+    const tcp_snapshot_entry_t *tcp,
+    const struct proc_ui_entry *proc, u32 proc_n,
+    const struct proc_capsule_ui_entry *caps, u32 caps_n,
+    const struct principal_ui_entry *users, u32 users_n)
+{
+    struct dash_listener_info info = {0};
+    info.port = tcp->local_port;
+    info.owner = tcp_owner_label(tcp->local_port);
+    info.image = info.owner;
+    info.principal_id = PRINCIPAL_ROOT;
+    info.principal = "root";
+    info.has_bridge = dash_bridge_for_port(tcp->local_port, &info.bridge, &info.pid);
+    if (info.pid) {
+        const struct proc_ui_entry *p = dash_proc_for_pid(proc, proc_n, info.pid);
+        if (p) {
+            info.has_proc = true;
+            info.core = p->affinity_core;
+            info.principal_id = p->principal_id;
+            info.principal = dash_principal_name(users, users_n, p->principal_id);
+            info.cpu_percent = p->cpu_percent;
+            info.mem_kib = p->mem_kib;
+            info.image = p->image_path;
+        }
+        info.capsule = dash_capsule_for_pid(caps, caps_n, info.pid);
+    }
+    return info;
+}
+
+static bool dash_info_same_capsule(const struct dash_listener_info *a,
+                                   const struct dash_listener_info *b)
+{
+    if (!a || !b)
+        return false;
+    if (dash_listener_group(a) != dash_listener_group(b))
+        return false;
+    if (a->has_proc != b->has_proc)
+        return false;
+    if (!a->has_proc)
+        return true;
+    if (!a->capsule || !b->capsule)
+        return a->capsule == b->capsule;
+    return dash_capsule_same_group(a->capsule, b->capsule);
+}
+
+static void dash_draw_group_header(u32 row, u32 col, u32 group)
+{
+    fb_set_cursor(col, row);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts(dash_group_name(group));
+}
+
+static void dash_draw_capsule_header(u32 row, u32 col,
+                                     const struct proc_capsule_ui_entry *cap,
+                                     bool kernel_group)
+{
+    fb_set_cursor(col, row);
+    fb_set_color(0x00FFAA00, 0x00000000);
+    fb_puts("CAPSULE ");
+    if (kernel_group) {
+        fb_puts("kernel/platform");
+        return;
+    }
+    if (!cap) {
+        fb_puts("unknown");
+        return;
+    }
+    if (cap->group[0])
+        dash_put_trunc(cap->group, 28U);
+    else if (cap->capsule_id == PROC_CAPSULE_ID_NONE)
+        fb_puts("none");
+    else {
+        fb_puts("id=");
+        fb_printf("%u", cap->capsule_id);
+    }
+    fb_puts(" hash=0x");
+    fb_printf("%x", cap->capsule_hash);
+}
+
+static void dash_put_mib(u32 kib)
+{
+    u32 mib = kib >> 10;
+    u32 frac = ((kib & 1023U) * 10U) >> 10;
+    if (frac)
+        fb_printf("%u.%uM", mib, frac);
+    else
+        fb_printf("%uM", mib);
+}
+
+static void dash_put_bytes_mb(u64 bytes)
+{
+    fb_printf("%uMB", (u32)(bytes >> 20));
+}
+
+static void dash_put_mbps(u32 mbps_x1000)
+{
+    fb_printf("%u", mbps_x1000 / 1000U);
+    u32 frac = mbps_x1000 % 1000U;
+    if (frac) {
+        fb_putc('.');
+        fb_putc((char)('0' + (frac / 100U) % 10U));
+        fb_putc((char)('0' + (frac / 10U) % 10U));
+        fb_putc((char)('0' + frac % 10U));
+    }
+}
+
+static void dash_draw_listener_row(u32 row, u32 c_pid, u32 c_core, u32 c_user,
+                                   u32 c_cpu, u32 c_mem, u32 c_proc,
+                                   u32 c_fifo, u32 proc_width, u32 fifo_width,
+                                   const struct dash_listener_info *info)
+{
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_set_cursor(c_pid, row);
+    if (info->has_proc)
+        fb_printf("%u", info->pid);
+    else
+        fb_puts("kern");
+    fb_set_cursor(c_core, row);
+    fb_printf("%u", info->has_proc ? info->core : 0U);
+    fb_set_cursor(c_user, row);
+    dash_put_trunc(info->principal ? info->principal : "?", 10U);
+    fb_set_cursor(c_cpu, row);
+    if (info->has_proc)
+        fb_printf("%u%%", info->cpu_percent);
+    else
+        fb_puts("-");
+    fb_set_cursor(c_mem, row);
+    if (info->has_proc)
+        dash_put_mib(info->mem_kib);
+    else
+        fb_puts("-");
+    fb_set_cursor(c_proc, row);
+    dash_put_trunc(info->image ? info->image : "-", proc_width);
+    fb_set_cursor(c_fifo, row);
+    if (info->has_bridge) {
+        fb_puts("uhttp bridge");
+        fb_printf("%u", info->bridge);
+        fb_puts(" fifo -> tcp/");
+        fb_printf("%u", info->port);
+    } else {
+        dash_put_trunc(info->owner, fifo_width);
+        fb_puts(" -> tcp/");
+        fb_printf("%u", info->port);
+    }
+}
+
 static void hdmi_dashboard_render(void)
 {
     static u64 last_ms;
@@ -13356,26 +13808,29 @@ static void hdmi_dashboard_render(void)
     struct perf_counter_snapshot perf;
     perf_counter_snapshot(&perf);
 
-    nic_packet_counters_t pc;
-    nic_packet_counters(&pc);
     tcp_snapshot_entry_t tcp[TCP_MAX_CONNECTIONS];
     u32 tcp_n = tcp_snapshot(tcp, TCP_MAX_CONNECTIONS);
     struct proc_ui_entry proc[UI_SNAPSHOT_MAX];
     u32 proc_n = proc_snapshot(proc, UI_SNAPSHOT_MAX);
+    struct proc_capsule_ui_entry caps[UI_SNAPSHOT_MAX];
+    u32 caps_n = proc_capsule_snapshot(caps, UI_SNAPSHOT_MAX);
+    struct principal_ui_entry users[PRINCIPAL_MAX];
+    u32 users_n = principal_snapshot(users, PRINCIPAL_MAX);
     u32 screen_cols = fb_cols();
     u32 screen_rows = fb_rows();
     bool wide = screen_cols >= 180U;
-    u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 4U;
+    u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 6U;
     u32 map_col = 0U;
-    u32 map_row = 5U;
+    u32 map_row = header_row + header_h + 1U;
     u32 map_w = wide ? header_w : 78U;
-    u32 map_h = wide ? 10U : 13U;
     u32 log_col = 0;
-    u32 log_top = wide ? 16U : (screen_rows > 10U ? screen_rows - 9U : 28U);
+    u32 log_h = wide ? 6U : 8U;
+    u32 log_top = screen_rows > log_h + map_row + 5U ? screen_rows - log_h - 1U :
+                  (wide ? 28U : (screen_rows > 10U ? screen_rows - 9U : 28U));
     u32 log_w = header_w;
-    u32 log_h = 8U;
     if (log_top + log_h >= screen_rows && screen_rows > log_h + 1U)
         log_top = screen_rows - log_h - 1U;
+    u32 map_h = log_top > map_row + 3U ? log_top - map_row - 1U : (wide ? 16U : 13U);
 
     u64 t_dash1 = dash_now_ticks();
     g_dash_snap_ticks = t_dash1 - t_dash0;
@@ -13426,75 +13881,133 @@ static void hdmi_dashboard_render(void)
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_puts("RAM: ");
         fb_set_color(0x00FFFFFF, 0x00000000);
-        fb_puts("Total=");
+        fb_puts("Phys=");
+        dash_put_bytes_mb(perf.physical_ram_bytes);
+        fb_puts(" Pool=");
         fb_printf("%uMB", perf.ram_total_kib >> 10);
         fb_puts(" Used=");
         fb_printf("%uMB", perf.ram_used_kib >> 10);
-        fb_puts(" Kernel=");
+        fb_puts(" K=");
         fb_printf("%uMB", perf.ram_kernel_kib >> 10);
-        fb_puts(" User=");
+        fb_puts(" U=");
         fb_printf("%uMB", perf.ram_user_kib >> 10);
     }
+    fb_set_cursor(header_col + 3, header_row + 3);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("NET: ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts("Rx=");
+    dash_put_mbps(perf.nic_rx_mbps_x1000);
+    fb_puts("/");
+    dash_put_mbps(perf.nic_rx_peak_mbps_x1000);
+    fb_puts(" Tx=");
+    dash_put_mbps(perf.nic_tx_mbps_x1000);
+    fb_puts("/");
+    dash_put_mbps(perf.nic_tx_peak_mbps_x1000);
+    fb_puts(" Mb/s   ");
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("SD: ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts("R=");
+    dash_put_mbps(perf.sd_read_mbps_x1000);
+    fb_puts("/");
+    dash_put_mbps(perf.sd_read_peak_mbps_x1000);
+    fb_puts(" W=");
+    dash_put_mbps(perf.sd_write_mbps_x1000);
+    fb_puts("/");
+    dash_put_mbps(perf.sd_write_peak_mbps_x1000);
+    fb_puts(" Mb/s");
+    fb_set_cursor(header_col + 3, header_row + 4);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("WALFS: ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts(perf.walfs_mounted ? "mounted " : "unmounted ");
+    fb_puts("part=");
+    dash_put_bytes_mb(perf.walfs_partition_bytes);
+    fb_puts(" region=");
+    dash_put_bytes_mb(perf.walfs_region_bytes);
+    fb_puts(" used=");
+    dash_put_bytes_mb(perf.walfs_used_bytes);
+    fb_puts(" free=");
+    dash_put_bytes_mb(perf.walfs_free_bytes);
+    fb_puts(" rec=");
+    fb_printf("%u", perf.walfs_records);
+    fb_puts(" super=");
+    fb_puts(perf.walfs_super_ok ? "ok" : "bad");
+    fb_puts(" root=");
+    fb_puts(perf.walfs_root_ok ? "ok" : "bad");
 
     dash_clear_body(map_col, map_row, map_w, map_h);
     u32 row = map_row + 1U;
-    const u32 c_port = map_col + 3U;
-    const u32 c_owner = map_col + 15U;
-    const u32 c_pid = map_col + 39U;
-    const u32 c_core = map_col + 49U;
-    const u32 c_pending = map_col + 57U;
-    const u32 c_proc = map_col + 69U;
-    fb_set_cursor(c_port, row);
-    fb_set_color(0x00AAAAAA, 0x00000000);
-    fb_puts("PORT");
-    fb_set_cursor(c_owner, row);
-    fb_puts("FIFO / OWNER");
+    const u32 map_end = map_row + map_h - 1U;
+    const u32 c_pid = map_col + 3U;
+    const u32 c_core = wide ? (map_col + 10U) : (map_col + 9U);
+    const u32 c_user = wide ? (map_col + 16U) : (map_col + 14U);
+    const u32 c_cpu = wide ? (map_col + 30U) : (map_col + 24U);
+    const u32 c_mem = wide ? (map_col + 38U) : (map_col + 31U);
+    const u32 c_proc = wide ? (map_col + 48U) : (map_col + 39U);
+    const u32 c_fifo = wide ? (map_col + 96U) : (map_col + 56U);
+    const u32 proc_width = wide ? 44U : 15U;
+    const u32 fifo_width = map_w > c_fifo - map_col + 2U ? map_w - (c_fifo - map_col) - 2U : 20U;
     fb_set_cursor(c_pid, row);
+    fb_set_color(0x00AAAAAA, 0x00000000);
     fb_puts("PID");
     fb_set_cursor(c_core, row);
     fb_puts("CORE");
-    fb_set_cursor(c_pending, row);
-    fb_puts("PENDING");
-    fb_set_cursor(c_proc, row++);
+    fb_set_cursor(c_user, row);
+    fb_puts("USER");
+    fb_set_cursor(c_cpu, row);
+    fb_puts("CPU");
+    fb_set_cursor(c_mem, row);
+    fb_puts("RAM");
+    fb_set_cursor(c_proc, row);
     fb_puts("PROCESS");
-    fb_set_color(0x00FFFFFF, 0x00000000);
-    u32 shown_listeners = 0;
-    for (u32 i = 0; i < tcp_n && row + 1U < map_row + map_h; i++) {
+    fb_set_cursor(c_fifo, row);
+    fb_puts("FIFO / PORT");
+    row++;
+    struct dash_listener_info listeners[TCP_MAX_CONNECTIONS];
+    u32 listener_n = 0;
+    for (u32 i = 0; i < tcp_n && listener_n < TCP_MAX_CONNECTIONS; i++) {
         if (tcp[i].state != TCP_LISTEN)
             continue;
-        shown_listeners++;
-        u32 bridge = 0, pid = 0, pcore = 0;
-        const char *image = "-";
-        bool has_bridge = dash_bridge_for_port(tcp[i].local_port, &bridge, &pid);
-        bool has_proc = pid && dash_proc_for_pid(proc, proc_n, pid, &pcore, &image);
-        fb_set_cursor(c_port, row);
-        fb_puts("tcp/");
-        fb_printf("%u", tcp[i].local_port);
-        fb_set_cursor(c_owner, row);
-        if (has_bridge) {
-            fb_puts("uhttp bridge");
-            fb_printf("%u", bridge);
-            fb_puts(" fifo");
-        } else {
-            dash_put_trunc(tcp_owner_label(tcp[i].local_port), 20U);
+        listeners[listener_n++] = dash_listener_info_for(&tcp[i], proc, proc_n, caps, caps_n,
+                                                         users, users_n);
+    }
+    u32 shown_listeners = 0;
+    for (u32 group = 0; group < 3U && row < map_end; group++) {
+        bool group_header_drawn = false;
+        for (u32 i = 0; i < listener_n && row < map_end; i++) {
+            if (dash_listener_group(&listeners[i]) != group)
+                continue;
+            bool capsule_seen = false;
+            for (u32 j = 0; j < i; j++) {
+                if (dash_listener_group(&listeners[j]) == group &&
+                    dash_info_same_capsule(&listeners[j], &listeners[i])) {
+                    capsule_seen = true;
+                    break;
+                }
+            }
+            if (capsule_seen)
+                continue;
+            if (!group_header_drawn) {
+                dash_draw_group_header(row++, map_col + 2U, group);
+                group_header_drawn = true;
+                if (row >= map_end)
+                    break;
+            }
+            dash_draw_capsule_header(row++, map_col + 4U,
+                                     listeners[i].capsule,
+                                     !listeners[i].has_proc);
+            for (u32 k = 0; k < listener_n && row < map_end; k++) {
+                if (dash_listener_group(&listeners[k]) != group ||
+                    !dash_info_same_capsule(&listeners[k], &listeners[i]))
+                    continue;
+                dash_draw_listener_row(row++, c_pid, c_core, c_user, c_cpu, c_mem,
+                                       c_proc, c_fifo, proc_width, fifo_width,
+                                       &listeners[k]);
+                shown_listeners++;
+            }
         }
-        fb_set_cursor(c_pid, row);
-        if (has_proc) {
-            fb_printf("%u", pid);
-            fb_set_cursor(c_core, row);
-            fb_printf("%u", pcore);
-            fb_set_cursor(c_proc, row);
-            dash_put_trunc(image, (map_w > c_proc - map_col + 2U) ? (map_w - (c_proc - map_col) - 2U) : 10U);
-        } else {
-            fb_puts("-");
-            fb_set_cursor(c_core, row);
-            fb_puts("0");
-            fb_set_cursor(c_proc, row);
-            dash_put_trunc(tcp_owner_label(tcp[i].local_port), (map_w > c_proc - map_col + 2U) ? (map_w - (c_proc - map_col) - 2U) : 10U);
-        }
-        fb_set_cursor(c_pending, row);
-        fb_printf("%u", tcp[i].pending_count);
-        row++;
     }
     if (shown_listeners == 0) {
         fb_set_cursor(map_col + 3U, row);
@@ -13516,7 +14029,21 @@ static void hdmi_dashboard_render(void)
             !dash_contains(e->event, "warn"))
             continue;
         fb_set_cursor(log_col + 3U, row++);
-        fb_printf("%u t=%u %s a=%u b=%u", e->seq, e->tick_ms, e->event, e->a, e->b);
+        if (dash_streq(e->event, "http-error")) {
+            u32 ev = (e->a >> 24) & 0xFFU;
+            u32 route = (e->a >> 16) & 0xFFU;
+            u32 arg = e->a & 0xFFFFU;
+            fb_printf("%u t=%u http-error event=%s route=%s",
+                      e->seq, e->tick_ms, http_event_name(ev), http_route_name(route));
+            if (ev == HTTP_EVT_ABORT)
+                fb_printf(" error=%s conn=%u", http_error_name(arg), e->b);
+            else if (ev == HTTP_EVT_BAD_STATE)
+                fb_printf(" state=%u idle_ms=%u", arg, e->b);
+            else
+                fb_printf(" arg=%u b=%u", arg, e->b);
+        } else {
+            fb_printf("%u t=%u %s a=%u b=%u", e->seq, e->tick_ms, e->event, e->a, e->b);
+        }
         shown++;
     }
     if (shown == 0) {

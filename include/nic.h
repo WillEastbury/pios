@@ -27,6 +27,7 @@ void nic_set_local_ipv4(u32 ip);
 void nic_set_packet_dump(bool enable);
 
 typedef struct {
+    u64 rx_bytes, tx_bytes;
     u64 rx_total, tx_total;
     u64 rx_arp, tx_arp;
     u64 rx_arp_req, tx_arp_req;
