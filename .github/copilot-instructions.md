@@ -75,6 +75,60 @@ Use these as scan/review rules for FIFO, wake-ring, scheduler, descriptor, IPC, 
 34. **Immutable after publish** — once visible to another core/domain, control descriptors are immutable except for explicitly owned ack/status fields.
 35. **Panic on impossible state** — scheduler/MMU/descriptor invariant violations panic, dump, and reboot cleanly; no best-effort repair.
 
+#### Categorized scan rules
+
+**Memory Layout**
+- RULE: No mutable shared struct may cross a cache-line boundary.
+- RULE: Per-core arrays of mutable state forbidden.
+- RULE: Shared control structures must be alignas(64).
+- RULE: Struct stride must be multiple of 64 if accessed cross-core.
+- RULE: Control and payload fields may not reside in same cache line.
+
+**Ownership**
+- RULE: One writer per field.
+- RULE: Shared mutable globals forbidden.
+- RULE: Descriptor ownership transitions must be explicit.
+- RULE: No raw pointer handoff between ownership domains.
+- RULE: Generation field required for reusable objects.
+
+**MMU / Cacheability**
+- RULE: Same PA must never have conflicting attributes.
+- RULE: Stage-2 mappings must specify attribute class.
+- RULE: WB+NC alias detection is fatal.
+- RULE: Device memory may never be mapped Normal.
+- RULE: Shared metadata attribute must match across TTBRs.
+
+**FIFO / Ring Safety**
+- RULE: Producer writes payload before head.
+- RULE: Consumer reads head before payload.
+- RULE: Every publication has release barrier.
+- RULE: Every consumption has acquire barrier.
+- RULE: No MPSC/MPMC on SPSC primitives.
+- RULE: Wake publication must be sequence-backed.
+
+**Length Safety**
+- RULE: memcpy requires explicit bounds proof.
+- RULE: strlen forbidden in kernel.
+- RULE: str* APIs forbidden.
+- RULE: All spans carry length.
+- RULE: Integer overflow checked before allocation.
+- RULE: Pointer+length arithmetic validated.
+
+**Fault Containment**
+- RULE: Every trap path records context.
+- RULE: Panic paths may not allocate.
+- RULE: Panic paths may not block.
+- RULE: Error paths must be deterministic.
+- RULE: Impossible states must terminate.
+
+**Performance**
+- RULE: No heap allocation in hot path.
+- RULE: No locks in scheduler.
+- RULE: No copies larger than N bytes.
+- RULE: No syscalls from scheduler context.
+- RULE: No dynamic string formatting in IRQ path.
+- RULE: No descriptor duplication unless ownership changes.
+
 ### Core Assignment (fixed, not scheduled)
 
 | Core | Role | Hot loop | Source |
