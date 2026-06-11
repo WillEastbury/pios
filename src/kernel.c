@@ -69,6 +69,7 @@
 #include "pios_addr.h"
 #include "picoscript.h"
 #include "mailbox.h"
+#include "highmem.h"
 #include "picovm.h"
 #include "pixe_request.h"
 #include "pixe_host.h"
@@ -1319,6 +1320,7 @@ struct perf_counter_snapshot {
     u32 board_pcb_revision;
     u64 installed_ram_bytes;
     u64 physical_ram_bytes;
+    struct highmem_status highmem;
     u32 ram_total_kib;
     u32 ram_used_kib;
     u32 ram_kernel_kib;
@@ -1484,6 +1486,7 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
     p->board_pcb_revision = br.pcb_revision;
     p->installed_ram_bytes = br.installed_ram_bytes;
     p->physical_ram_bytes = perf_physical_ram_bytes();
+    highmem_status(&p->highmem);
     p->ram_total_kib = (u32)((CORE_PRIV_SIZE * 4ULL) >> 10);
     for (u32 i = 0; i < 4; i++)
         p->core_alloc_kib[i] = http_core_ram_used_kib(i);
@@ -1651,6 +1654,16 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "ram_arm_visible_kib", perf.physical_ram_bytes >> 10, true);
     http_append_json_metric(out, &len, max, "ram_physical_bytes", perf.physical_ram_bytes, true);
     http_append_json_metric(out, &len, max, "ram_physical_kib", perf.physical_ram_bytes >> 10, true);
+    http_append_json_metric(out, &len, max, "ram_high_ready", perf.highmem.ready ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "ram_high_probe_ok", perf.highmem.probe_ok ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "ram_high_base", perf.highmem.base, true);
+    http_append_json_metric(out, &len, max, "ram_high_limit", perf.highmem.limit, true);
+    http_append_json_metric(out, &len, max, "ram_high_total_bytes", perf.highmem.total_bytes, true);
+    http_append_json_metric(out, &len, max, "ram_high_used_bytes", perf.highmem.used_bytes, true);
+    http_append_json_metric(out, &len, max, "ram_high_free_bytes", perf.highmem.free_bytes, true);
+    http_append_json_metric(out, &len, max, "ram_high_probe_fail_addr", perf.highmem.probe_fail_addr, true);
+    http_append_json_metric(out, &len, max, "ram_high_probe_lines", perf.highmem.probe_lines, true);
+    http_append_json_metric(out, &len, max, "ram_high_alloc_count", perf.highmem.alloc_count, true);
     http_append_json_metric(out, &len, max, "ram_total_kib", perf.ram_total_kib, true);
     http_append_json_metric(out, &len, max, "ram_pool_total_kib", perf.ram_total_kib, true);
     http_append_json_metric(out, &len, max, "ram_used_kib", perf.ram_used_kib, true);
@@ -14014,6 +14027,11 @@ static void hdmi_dashboard_render(void)
     dash_put_bytes_mb(perf.physical_ram_bytes);
     fb_puts(" Pool=");
     fb_printf("%uMB", perf.ram_total_kib >> 10);
+    fb_puts(" High=");
+    if (perf.highmem.ready)
+        dash_put_bytes_mb(perf.highmem.total_bytes);
+    else
+        fb_puts("off");
     fb_puts(" Used=");
     fb_printf("%uMB", perf.ram_used_kib >> 10);
     fb_puts(" K=");
@@ -15046,6 +15064,14 @@ void kernel_main(void) {
 #else
         bp_warn("[mmu] cache remap GATED (PIOS_ENABLE_CACHE_REMAP=0)");
 #endif
+
+        {
+            struct board_revision_snapshot br;
+            board_revision_snapshot(&br);
+            bool high_ok = highmem_init(br.installed_ram_bytes, perf_physical_ram_bytes());
+            bp_log(high_ok ? "[ram] highmem 1-4GiB probe OK" :
+                             "[ram] highmem unavailable/probe failed");
+        }
 
         bp_log("[exc] exception_init...");
         exception_init();
