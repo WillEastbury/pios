@@ -1428,6 +1428,27 @@ static struct process *current_process(void)
     return &procs[current_proc];
 }
 
+void proc_trap_context(u32 *pid, u32 *capsule, u32 *generation, u32 *owner_principal)
+{
+    u32 out_pid = 0;
+    u32 out_capsule = PROC_CAPSULE_ID_NONE;
+    u32 out_generation = 0;
+    u32 out_owner = PRINCIPAL_ROOT;
+    if (on_user_core() && current_proc < MAX_PROCS_PER_CORE) {
+        struct process *p = &procs[current_proc];
+        if (p->state == PROC_READY || p->state == PROC_RUNNING || p->state == PROC_BLOCKED) {
+            out_pid = p->pid;
+            out_capsule = p->capsule_id;
+            out_generation = p->generation;
+            out_owner = p->principal_id;
+        }
+    }
+    if (pid) *pid = out_pid;
+    if (capsule) *capsule = out_capsule;
+    if (generation) *generation = out_generation;
+    if (owner_principal) *owner_principal = out_owner;
+}
+
 static bool ipc_ns_handle_visible(const struct ipc_ns_entry *e)
 {
     struct process *me = current_process();

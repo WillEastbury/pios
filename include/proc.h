@@ -536,6 +536,7 @@ void proc_el0_diag_snapshot(i32 *launch_status, u32 *launch_pid, u32 *launch_slo
                             u64 *fault_esr, u64 *fault_elr, u64 *fault_far,
                             u64 *fault_l1e, u64 *fault_l2e, u64 *fault_l3e,
                             u64 *fault_par0w, u64 *fault_par0r, u64 *fault_par1w);
+void proc_trap_context(u32 *pid, u32 *capsule, u32 *generation, u32 *owner_principal);
 /* Block the current process until woken (BLOCKED + yield to scheduler). */
 void proc_park(void);
 /* Post a wake for `pid` onto `target_core`'s wake ring and SEV. Safe to call

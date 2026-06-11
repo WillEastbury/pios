@@ -40,27 +40,60 @@ static struct irq_diag_snapshot irq_diag;
 
 struct crash_record {
     u32 magic;
+    u32 version;
     u32 kind;   /* 1 sync, 2 serror */
     u32 core;
+    u32 current_el;
     u32 ec;
+    u32 pid;
+    u32 capsule;
+    u32 process_generation;
+    u32 owner_principal;
+    u32 descriptor_id;
+    u32 descriptor_generation;
+    u32 descriptor_owner;
+    u32 last_fifo_seq;
     u64 esr;
     u64 elr;
     u64 far;
+    u64 sp;
+    u64 ttbr0;
+    u64 syndrome;
     u64 ticks;
 } PACKED;
 
 #define CRASH_RECORD_MAGIC 0x43524153U /* 'CRAS' */
+#define CRASH_RECORD_VERSION 2U
 
 static void crash_persist(u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
 {
     struct crash_record r;
+    u32 pid = 0, capsule = 0, generation = 0, owner = 0;
+    u64 current_el = 0, sp = 0, ttbr0 = 0;
+    proc_trap_context(&pid, &capsule, &generation, &owner);
+    __asm__ volatile("mrs %0, CurrentEL" : "=r"(current_el));
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
     r.magic = CRASH_RECORD_MAGIC;
+    r.version = CRASH_RECORD_VERSION;
     r.kind = kind;
     r.core = core_id();
+    r.current_el = (u32)((current_el >> 2) & 3U);
     r.ec = ec;
+    r.pid = pid;
+    r.capsule = capsule;
+    r.process_generation = generation;
+    r.owner_principal = owner;
+    r.descriptor_id = pid;
+    r.descriptor_generation = generation;
+    r.descriptor_owner = owner;
+    r.last_fifo_seq = 0;
     r.esr = esr;
     r.elr = elr;
     r.far = far;
+    r.sp = sp;
+    r.ttbr0 = ttbr0;
+    r.syndrome = esr;
     r.ticks = timer_ticks();
     (void)picowal_db_put(0, 3, &r, sizeof(r)); /* deck0/record3 = last crash */
 }
