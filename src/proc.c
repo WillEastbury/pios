@@ -246,6 +246,26 @@ static inline void proc_publish_control(u32 slot)
         dcache_clean_range((u64)(usize)&procs[slot], 64U);
 }
 
+static void proc_bump_generation(u32 slot)
+{
+    if (slot >= MAX_PROCS_PER_CORE)
+        return;
+    u32 g = procs[slot].generation + 1U;
+    if (g == 0)
+        g = 1U;
+    procs[slot].generation = g;
+}
+
+static void proc_mark_empty(u32 slot)
+{
+    if (slot >= MAX_PROCS_PER_CORE)
+        return;
+    proc_bump_generation(slot);
+    procs[slot].state = PROC_EMPTY;
+    procs[slot].pid = 0;
+    proc_publish_control(slot);
+}
+
 static i32 proc_find_slot_by_pid(u32 pid)
 {
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
@@ -1652,6 +1672,7 @@ void proc_init_shared(void)
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
         procs[i].state = PROC_EMPTY;
         procs[i].pid = 0;
+        procs[i].generation = 0;
     }
     for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++)
         paged_io_tab[i].used = false;
@@ -1801,6 +1822,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     u32 exec_hash = hw_crc32c(base, loaded);
 
     struct process *p = &procs[slot];
+    proc_bump_generation((u32)slot);
     p->pid = next_pid++;
     p->parent_pid = 0;
     p->state = PROC_READY;
@@ -1828,9 +1850,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->arena_limit = (u64)(usize)base + PROC_SLOT_SIZE - 65536ULL;
     if (p->arena_base >= p->arena_limit) {
         uart_puts("[proc] image leaves no data arena\n");
-        p->state = PROC_EMPTY;
-        p->pid = 0;
-        proc_publish_control((u32)slot);
+        proc_mark_empty((u32)slot);
         return -1;
     }
     p->arena_capacity_bytes = (p->arena_limit > p->arena_base) ?
@@ -1847,8 +1867,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     }
     if (!capsule_manifest_load(p, path)) {
         uart_puts("[proc] invalid capsule manifest\n");
-        p->state = PROC_EMPTY;
-        p->pid = 0;
+        proc_mark_empty((u32)slot);
         return -1;
     }
     if (p->capsule_enabled) {
@@ -1858,8 +1877,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
             p->capsule_id = cid;
         } else {
             uart_puts("[proc] capsule bind failed\n");
-            p->state = PROC_EMPTY;
-            p->pid = 0;
+            proc_mark_empty((u32)slot);
             return -1;
         }
     }
@@ -1874,8 +1892,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->entry_flags = proc_entry_contract_flags();
     if (!proc_entry_contract_validate(p)) {
         uart_puts("[proc] invalid entry contract\n");
-        p->state = PROC_EMPTY;
-        p->pid = 0;
+        proc_mark_empty((u32)slot);
         return -1;
     }
 
@@ -1886,8 +1903,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->ctx.sp = p->entry_sp;
 
     if (!mmu_user_table_build_split(core_id(), (u32)slot, (u64)(usize)base, PROC_SLOT_SIZE, loaded)) {
-        p->state = PROC_EMPTY;
-        p->pid = 0;
+        proc_mark_empty((u32)slot);
         return -1;
     }
 
@@ -1940,6 +1956,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     u32 exec_hash = hw_crc32c(base, loaded);
 
     struct process *p = &procs[slot];
+    proc_bump_generation((u32)slot);
     p->pid = next_pid++;
     p->parent_pid = 0;
     p->state = PROC_READY;
@@ -1966,8 +1983,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     p->arena_limit = (u64)(usize)base + PROC_SLOT_SIZE - 65536ULL;
     if (p->arena_base >= p->arena_limit) {
         uart_puts("[proc] mem-exec: no data arena\n");
-        p->state = PROC_EMPTY;
-        p->pid = 0;
+        proc_mark_empty((u32)slot);
         return -1;
     }
     p->arena_capacity_bytes = (u32)(p->arena_limit - p->arena_base);
@@ -1995,8 +2011,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     p->entry_flags = proc_entry_contract_flags();
     if (!proc_entry_contract_validate(p)) {
         uart_puts("[proc] mem-exec: bad entry contract\n");
-        p->state = PROC_EMPTY;
-        p->pid = 0;
+        proc_mark_empty((u32)slot);
         return -1;
     }
 
@@ -2008,8 +2023,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
 
     if (!mmu_user_table_build_split(core_id(), (u32)slot, (u64)(usize)base,
                                     PROC_SLOT_SIZE, loaded)) {
-        p->state = PROC_EMPTY;
-        p->pid = 0;
+        proc_mark_empty((u32)slot);
         return -1;
     }
     /* Map the shared IPC_SHM window so the process can reach the kernel<->user
@@ -2080,6 +2094,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     u32 exec_hash = hw_crc32c(base, loaded);
 
     struct process *p = &procs[slot];
+    proc_bump_generation((u32)slot);
     p->pid = next_pid++;
     p->parent_pid = 0;
     p->state = PROC_READY;
@@ -2106,9 +2121,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     p->arena_base = ((u64)(usize)base + loaded + L3_PAGE_SIZE - 1) & ~(L3_PAGE_SIZE - 1);
     p->arena_limit = (u64)(usize)base + PROC_SLOT_SIZE - 65536ULL;
     if (p->arena_base >= p->arena_limit) {
-        p->state = PROC_EMPTY;
-        p->pid = 0;
-        proc_publish_control((u32)slot);
+        proc_mark_empty((u32)slot);
         el0_launch_status = -9;
         return -1;
     }
@@ -2141,9 +2154,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
 
     if (!mmu_user_table_build_split_el0_at(core_id(), (u32)slot, linked_base, (u64)(usize)base,
                                            PROC_SLOT_SIZE, loaded)) {
-        p->state = PROC_EMPTY;
-        p->pid = 0;
-        proc_publish_control((u32)slot);
+        proc_mark_empty((u32)slot);
         el0_launch_status = -11;
         return -1;
     }
@@ -2241,8 +2252,7 @@ void proc_schedule(void)
                     u64 out = 0;
                     (void)el2_hvc_call(EL2_HVC_PORT_UNBIND_ALL, procs[i].pid, 0, 0, 0, &out);
                 }
-                procs[i].state = PROC_EMPTY;
-                procs[i].pid = 0;
+                proc_mark_empty(i);
             }
         }
         proc_sched_stage(13);

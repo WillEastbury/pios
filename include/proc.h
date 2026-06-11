@@ -244,6 +244,7 @@ struct proc_context {
 
 struct process {
     u32 pid;
+    u32 generation;
     u32 parent_pid;
     u32 state;
     u32 principal_id;
