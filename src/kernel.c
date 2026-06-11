@@ -3015,6 +3015,55 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " pmr=");
         http_append_u64(out, &len, max, hw.gicc_pmr);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "coredump") || http_streq(cmd, "crash")) {
+        struct exception_crash_record cr;
+        if (!exception_crash_snapshot(&cr)) {
+            http_append(out, &len, max, "coredump none\n");
+        } else {
+            http_append(out, &len, max, "coredump magic=0x");
+            http_append_hex32(out, &len, max, cr.magic);
+            http_append(out, &len, max, " version=");
+            http_append_u64(out, &len, max, cr.version);
+            http_append(out, &len, max, " kind=");
+            http_append_u64(out, &len, max, cr.kind);
+            http_append(out, &len, max, " core=");
+            http_append_u64(out, &len, max, cr.core);
+            http_append(out, &len, max, " el=");
+            http_append_u64(out, &len, max, cr.current_el);
+            http_append(out, &len, max, " ec=0x");
+            http_append_hex32(out, &len, max, cr.ec);
+            http_append(out, &len, max, "\npid=");
+            http_append_u64(out, &len, max, cr.pid);
+            http_append(out, &len, max, " capsule=");
+            http_append_u64(out, &len, max, cr.capsule);
+            http_append(out, &len, max, " generation=");
+            http_append_u64(out, &len, max, cr.process_generation);
+            http_append(out, &len, max, " owner=");
+            http_append_u64(out, &len, max, cr.owner_principal);
+            http_append(out, &len, max, "\ndesc_id=");
+            http_append_u64(out, &len, max, cr.descriptor_id);
+            http_append(out, &len, max, " desc_gen=");
+            http_append_u64(out, &len, max, cr.descriptor_generation);
+            http_append(out, &len, max, " desc_owner=");
+            http_append_u64(out, &len, max, cr.descriptor_owner);
+            http_append(out, &len, max, " fifo_seq=");
+            http_append_u64(out, &len, max, cr.last_fifo_seq);
+            http_append(out, &len, max, "\nesr=0x");
+            http_append_hex64(out, &len, max, cr.esr);
+            http_append(out, &len, max, " elr=0x");
+            http_append_hex64(out, &len, max, cr.elr);
+            http_append(out, &len, max, " far=0x");
+            http_append_hex64(out, &len, max, cr.far);
+            http_append(out, &len, max, "\nsp=0x");
+            http_append_hex64(out, &len, max, cr.sp);
+            http_append(out, &len, max, " ttbr0=0x");
+            http_append_hex64(out, &len, max, cr.ttbr0);
+            http_append(out, &len, max, " syndrome=0x");
+            http_append_hex64(out, &len, max, cr.syndrome);
+            http_append(out, &len, max, " ticks=");
+            http_append_u64(out, &len, max, cr.ticks);
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "irq selftest")) {
         http_append(out, &len, max, irq_diag_selftest() ? "IRQ selftest OK\n" : "IRQ selftest FAILED\n");
     } else if (http_starts_with(cmd, "irq cntpns step ")) {

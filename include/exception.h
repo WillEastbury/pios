@@ -89,6 +89,33 @@ struct irq_gic_probe_snapshot {
     struct irq_gic_probe_entry entries[IRQ_GIC_PROBE_MAX];
 } PACKED;
 
+#define EXCEPTION_CRASH_RECORD_MAGIC   0x43524153U /* 'CRAS' */
+#define EXCEPTION_CRASH_RECORD_VERSION 2U
+
+struct exception_crash_record {
+    u32 magic;
+    u32 version;
+    u32 kind;   /* 1 sync, 2 serror */
+    u32 core;
+    u32 current_el;
+    u32 ec;
+    u32 pid;
+    u32 capsule;
+    u32 process_generation;
+    u32 owner_principal;
+    u32 descriptor_id;
+    u32 descriptor_generation;
+    u32 descriptor_owner;
+    u32 last_fifo_seq;
+    u64 esr;
+    u64 elr;
+    u64 far;
+    u64 sp;
+    u64 ttbr0;
+    u64 syndrome;
+    u64 ticks;
+} PACKED;
+
 /* Install the exception vector table */
 void exception_init(void);
 
@@ -106,5 +133,6 @@ void irq_trace_dump(u32 *enter, u32 *pre_h, u32 *post_h,
 void irq_trace_reset(void);
 void irq_vector_minimal_arm(bool enabled);
 void irq_vector_minimal_snapshot(u32 *count, u32 *last_iar);
+bool exception_crash_snapshot(struct exception_crash_record *out);
 
 NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far);

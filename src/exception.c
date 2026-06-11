@@ -10,7 +10,6 @@
 #include "proc.h"
 #include "fifo.h"
 #include "timer.h"
-#include "picowal_db.h"
 #include "sd.h"
 
 /* IRQ trace via raw SD blocks.
@@ -38,72 +37,77 @@ static irq_handler_t irq_handlers[GIC_MAX_IRQ];
 static volatile bool panic_in_progress;
 
 static struct irq_diag_snapshot irq_diag;
+static volatile bool crash_record_valid;
+static volatile struct exception_crash_record crash_record_last;
 
-struct crash_record {
-    u32 magic;
-    u32 version;
-    u32 kind;   /* 1 sync, 2 serror */
-    u32 core;
-    u32 current_el;
-    u32 ec;
-    u32 pid;
-    u32 capsule;
-    u32 process_generation;
-    u32 owner_principal;
-    u32 descriptor_id;
-    u32 descriptor_generation;
-    u32 descriptor_owner;
-    u32 last_fifo_seq;
-    u64 esr;
-    u64 elr;
-    u64 far;
-    u64 sp;
-    u64 ttbr0;
-    u64 syndrome;
-    u64 ticks;
-} PACKED;
-
-#define CRASH_RECORD_MAGIC 0x43524153U /* 'CRAS' */
-#define CRASH_RECORD_VERSION 2U
-
-static void crash_persist(u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
+static void crash_capture(u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
 {
-    struct crash_record r;
     u32 pid = 0, capsule = 0, generation = 0, owner = 0;
     u64 current_el = 0, sp = 0, ttbr0 = 0;
     proc_trap_context(&pid, &capsule, &generation, &owner);
     __asm__ volatile("mrs %0, CurrentEL" : "=r"(current_el));
     __asm__ volatile("mov %0, sp" : "=r"(sp));
     __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
-    r.magic = CRASH_RECORD_MAGIC;
-    r.version = CRASH_RECORD_VERSION;
-    r.kind = kind;
-    r.core = core_id();
-    r.current_el = (u32)((current_el >> 2) & 3U);
-    r.ec = ec;
-    r.pid = pid;
-    r.capsule = capsule;
-    r.process_generation = generation;
-    r.owner_principal = owner;
-    r.descriptor_id = pid;
-    r.descriptor_generation = generation;
-    r.descriptor_owner = owner;
-    r.last_fifo_seq = fifo_last_sequence(r.core);
-    r.esr = esr;
-    r.elr = elr;
-    r.far = far;
-    r.sp = sp;
-    r.ttbr0 = ttbr0;
-    r.syndrome = esr;
-    r.ticks = timer_ticks();
-    (void)picowal_db_put(0, 3, &r, sizeof(r)); /* deck0/record3 = last crash */
+    u32 core = core_id();
+    crash_record_last.magic = EXCEPTION_CRASH_RECORD_MAGIC;
+    crash_record_last.version = EXCEPTION_CRASH_RECORD_VERSION;
+    crash_record_last.kind = kind;
+    crash_record_last.core = core;
+    crash_record_last.current_el = (u32)((current_el >> 2) & 3U);
+    crash_record_last.ec = ec;
+    crash_record_last.pid = pid;
+    crash_record_last.capsule = capsule;
+    crash_record_last.process_generation = generation;
+    crash_record_last.owner_principal = owner;
+    crash_record_last.descriptor_id = pid;
+    crash_record_last.descriptor_generation = generation;
+    crash_record_last.descriptor_owner = owner;
+    crash_record_last.last_fifo_seq = fifo_last_sequence(core);
+    crash_record_last.esr = esr;
+    crash_record_last.elr = elr;
+    crash_record_last.far = far;
+    crash_record_last.sp = sp;
+    crash_record_last.ttbr0 = ttbr0;
+    crash_record_last.syndrome = esr;
+    crash_record_last.ticks = timer_ticks();
+    dmb_ishst();
+    crash_record_valid = true;
+}
+
+bool exception_crash_snapshot(struct exception_crash_record *out)
+{
+    if (!out || !crash_record_valid)
+        return false;
+    dmb_ishld();
+    out->magic = crash_record_last.magic;
+    out->version = crash_record_last.version;
+    out->kind = crash_record_last.kind;
+    out->core = crash_record_last.core;
+    out->current_el = crash_record_last.current_el;
+    out->ec = crash_record_last.ec;
+    out->pid = crash_record_last.pid;
+    out->capsule = crash_record_last.capsule;
+    out->process_generation = crash_record_last.process_generation;
+    out->owner_principal = crash_record_last.owner_principal;
+    out->descriptor_id = crash_record_last.descriptor_id;
+    out->descriptor_generation = crash_record_last.descriptor_generation;
+    out->descriptor_owner = crash_record_last.descriptor_owner;
+    out->last_fifo_seq = crash_record_last.last_fifo_seq;
+    out->esr = crash_record_last.esr;
+    out->elr = crash_record_last.elr;
+    out->far = crash_record_last.far;
+    out->sp = crash_record_last.sp;
+    out->ttbr0 = crash_record_last.ttbr0;
+    out->syndrome = crash_record_last.syndrome;
+    out->ticks = crash_record_last.ticks;
+    return true;
 }
 
 static NORETURN void pisod_halt(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
 {
     if (!panic_in_progress) {
         panic_in_progress = true;
-        crash_persist(kind, ec, esr, elr, far);
+        crash_capture(kind, ec, esr, elr, far);
     }
 
     uart_puts("\n=== PiSOD ===\n");
@@ -128,7 +132,7 @@ static NORETURN void pisod_halt(const char *title, u32 kind, u32 ec, u64 esr, u6
     fb_printf("esr=0x%x\n", esr);
     fb_printf("elr=0x%x\n", elr);
     fb_printf("far=0x%x\n", far);
-    fb_printf("last crash persisted to deck0/record3\n");
+    fb_printf("last crash captured in memory\n");
 
     fb_present();   /* force the panic frame to the scanout before halting */
 
