@@ -5,6 +5,7 @@
 
 struct proc_fifo_channel {
     bool used;
+    u32 generation;
     u8 name[PROC_IPC_NAME_MAX + 1];
     u32 owner_core;
     u32 owner_principal;
@@ -19,10 +20,11 @@ struct proc_fifo_channel {
     u32 count;
     u16 lens[PROC_IPC_FIFO_DEPTH_MAX];
     u8  frames[PROC_IPC_FIFO_DEPTH_MAX][PROC_IPC_FIFO_MSG_MAX];
-};
+} ALIGNED(64);
 
 struct proc_shm_region {
     bool used;
+    u32 generation;
     u8 name[PROC_IPC_NAME_MAX + 1];
     u32 owner_core;
     u32 owner_principal;
@@ -32,22 +34,81 @@ struct proc_shm_region {
     u32 peer_acl;
     u32 size;
     u32 offset;
-};
+} ALIGNED(64);
 
 struct proc_shm_map {
     bool used;
+    u32 generation;
     i32 region_id;
     u32 core;
     u32 principal;
     u32 pid;
     u32 flags;
-};
+    u32 _pad[9];
+} ALIGNED(64);
 
 static struct proc_fifo_channel g_fifos[PROC_IPC_FIFO_MAX];
 static struct proc_shm_region g_regions[PROC_IPC_SHM_MAX_REGIONS];
 static struct proc_shm_map g_maps[PROC_IPC_SHM_MAX_MAPS];
 static u32 g_shm_pool_off;
 static volatile u32 g_shm_alloc_lock;
+_Static_assert((sizeof(struct proc_fifo_channel) & 63U) == 0U,
+               "proc FIFO channel descriptors must have cache-line stride");
+_Static_assert((sizeof(struct proc_shm_region) & 63U) == 0U,
+               "proc SHM region descriptors must have cache-line stride");
+_Static_assert(sizeof(struct proc_shm_map) == 64,
+               "proc SHM map descriptors must be one cache line");
+
+#define PROC_IPC_POISON_U32 0xDEAD1C00U
+#define PROC_IPC_POISON_I32 ((i32)-0x1EC)
+
+static u32 bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void poison_fifo(struct proc_fifo_channel *ch)
+{
+    u32 g = bump_generation(ch ? ch->generation : 0);
+    if (!ch) return;
+    memset(ch, 0xA5, sizeof(*ch));
+    ch->used = false;
+    ch->generation = g;
+    ch->owner_core = PROC_IPC_POISON_U32;
+    ch->owner_principal = PROC_IPC_POISON_U32;
+    ch->owner_pid = PROC_IPC_POISON_U32;
+    ch->peer_principal = PROC_IPC_POISON_U32;
+}
+
+static void poison_region(struct proc_shm_region *r)
+{
+    u32 g = bump_generation(r ? r->generation : 0);
+    if (!r) return;
+    memset(r, 0xA5, sizeof(*r));
+    r->used = false;
+    r->generation = g;
+    r->owner_core = PROC_IPC_POISON_U32;
+    r->owner_principal = PROC_IPC_POISON_U32;
+    r->owner_pid = PROC_IPC_POISON_U32;
+    r->peer_principal = PROC_IPC_POISON_U32;
+    r->size = 0;
+    r->offset = PROC_IPC_POISON_U32;
+}
+
+static void poison_map(struct proc_shm_map *m)
+{
+    u32 g = bump_generation(m ? m->generation : 0);
+    if (!m) return;
+    memset(m, 0xA5, sizeof(*m));
+    m->used = false;
+    m->generation = g;
+    m->region_id = PROC_IPC_POISON_I32;
+    m->core = PROC_IPC_POISON_U32;
+    m->principal = PROC_IPC_POISON_U32;
+    m->pid = PROC_IPC_POISON_U32;
+    m->flags = PROC_IPC_POISON_U32;
+}
 
 static void shm_alloc_lock(void)
 {
@@ -121,9 +182,12 @@ static u32 principal_acl(u32 principal, u32 owner_principal, u32 peer_principal,
 
 void ipc_proc_init(void)
 {
-    memset(g_fifos, 0, sizeof(g_fifos));
-    memset(g_regions, 0, sizeof(g_regions));
-    memset(g_maps, 0, sizeof(g_maps));
+    for (u32 i = 0; i < PROC_IPC_FIFO_MAX; i++)
+        poison_fifo(&g_fifos[i]);
+    for (u32 i = 0; i < PROC_IPC_SHM_MAX_REGIONS; i++)
+        poison_region(&g_regions[i]);
+    for (u32 i = 0; i < PROC_IPC_SHM_MAX_MAPS; i++)
+        poison_map(&g_maps[i]);
     simd_zero((void *)(usize)IPC_SHM_BASE, IPC_SHM_SIZE);
     g_shm_pool_off = 0;
     dsb();
@@ -149,8 +213,10 @@ i32 ipc_proc_fifo_create(u32 owner_principal, u32 owner_pid, const char *name,
     for (u32 i = 0; i < PROC_IPC_FIFO_MAX; i++) {
         if (g_fifos[i].used) continue;
         struct proc_fifo_channel *ch = &g_fifos[i];
+        u32 gen = bump_generation(ch->generation);
         memset(ch, 0, sizeof(*ch));
         ch->used = true;
+        ch->generation = gen;
         ch->owner_core = core_id();
         ch->owner_principal = owner_principal;
         ch->owner_pid = owner_pid;
@@ -332,8 +398,10 @@ i32 ipc_proc_shm_create(u32 owner_principal, u32 owner_pid, const char *name,
     for (u32 i = 0; i < PROC_IPC_SHM_MAX_REGIONS; i++) {
         if (g_regions[i].used) continue;
         struct proc_shm_region *r = &g_regions[i];
+        u32 gen = bump_generation(r->generation);
         memset(r, 0, sizeof(*r));
         r->used = true;
+        r->generation = gen;
         r->owner_core = core_id();
         r->owner_principal = owner_principal;
         r->owner_pid = owner_pid;
@@ -394,7 +462,10 @@ i32 ipc_proc_shm_map(u32 principal, u32 pid, i32 region_id, u32 req_flags,
 
     for (u32 i = 0; i < PROC_IPC_SHM_MAX_MAPS; i++) {
         if (g_maps[i].used) continue;
+        u32 gen = bump_generation(g_maps[i].generation);
+        memset(&g_maps[i], 0, sizeof(g_maps[i]));
         g_maps[i].used = true;
+        g_maps[i].generation = gen;
         g_maps[i].region_id = region_id;
         g_maps[i].core = core_id();
         g_maps[i].principal = principal;
@@ -418,7 +489,7 @@ i32 ipc_proc_shm_unmap(u32 principal, u32 pid, i32 map_handle)
     if (m->principal != principal || m->pid != pid)
         return PROC_IPC_ERR_ACCESS;
     dmb(); /* caller must complete writes before releasing map handle */
-    memset(m, 0, sizeof(*m));
+    poison_map(m);
     dmb();
     return PROC_IPC_OK;
 }
