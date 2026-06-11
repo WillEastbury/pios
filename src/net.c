@@ -32,8 +32,16 @@ static u32 our_gw;
 static u32 our_mask;
 static u8  our_mac[6];
 
+#define UDP_SUBSCRIBER_MAX 4U
+struct udp_subscriber_slot {
+    udp_recv_cb cb;
+    u64 _pad[7];
+} ALIGNED(64);
+
 static udp_recv_cb udp_callback;
-static udp_recv_cb udp_subscribers[4];
+static struct udp_subscriber_slot udp_subscribers[UDP_SUBSCRIBER_MAX];
+_Static_assert(sizeof(struct udp_subscriber_slot) == 64,
+               "UDP subscriber slots must be one cache line");
 static net_stats_t stats;
 
 static bool mac_is_zero_6(const u8 *m) {
@@ -488,12 +496,13 @@ static void handle_udp(const u8 *frame, u32 len,
                      ntohs(udp->dst_port),
                      data, data_len);
     }
-    for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++) {
-        if (udp_subscribers[i]) {
-            udp_subscribers[i](ntohl(ip->src_ip),
-                               ntohs(udp->src_port),
-                               ntohs(udp->dst_port),
-                               data, data_len);
+    for (u32 i = 0; i < UDP_SUBSCRIBER_MAX; i++) {
+        udp_recv_cb cb = udp_subscribers[i].cb;
+        if (cb) {
+            cb(ntohl(ip->src_ip),
+               ntohs(udp->src_port),
+               ntohs(udp->dst_port),
+               data, data_len);
         }
     }
 }
@@ -856,8 +865,8 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     route_count = 0;
     multicast_count = 0;
     udp_callback   = NULL;
-    for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++)
-        udp_subscribers[i] = NULL;
+    for (u32 i = 0; i < UDP_SUBSCRIBER_MAX; i++)
+        udp_subscribers[i].cb = NULL;
     ip_id_counter  = 1;
 
     icmp_min_interval = 0;  /* Disable ICMP rate limiting for testing */
@@ -917,13 +926,13 @@ udp_recv_cb net_swap_udp_callback(udp_recv_cb cb) {
 bool net_udp_subscribe(udp_recv_cb cb)
 {
     if (!cb) return false;
-    for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++) {
-        if (udp_subscribers[i] == cb)
+    for (u32 i = 0; i < UDP_SUBSCRIBER_MAX; i++) {
+        if (udp_subscribers[i].cb == cb)
             return true;
     }
-    for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++) {
-        if (!udp_subscribers[i]) {
-            udp_subscribers[i] = cb;
+    for (u32 i = 0; i < UDP_SUBSCRIBER_MAX; i++) {
+        if (!udp_subscribers[i].cb) {
+            udp_subscribers[i].cb = cb;
             return true;
         }
     }
@@ -933,9 +942,9 @@ bool net_udp_subscribe(udp_recv_cb cb)
 bool net_udp_unsubscribe(udp_recv_cb cb)
 {
     if (!cb) return false;
-    for (u32 i = 0; i < (u32)(sizeof(udp_subscribers) / sizeof(udp_subscribers[0])); i++) {
-        if (udp_subscribers[i] == cb) {
-            udp_subscribers[i] = NULL;
+    for (u32 i = 0; i < UDP_SUBSCRIBER_MAX; i++) {
+        if (udp_subscribers[i].cb == cb) {
+            udp_subscribers[i].cb = NULL;
             return true;
         }
     }
