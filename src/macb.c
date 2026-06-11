@@ -182,6 +182,8 @@ static u32 rx_idx;
 static u32 tx_idx;
 static u8 mac_addr[6];
 static u8 phy_addr;
+static u32 link_mbps;
+static bool link_full_duplex;
 
 /* ── Register helpers ── */
 static inline u32 mr(u32 off) { return mmio_read(MACB_BASE + off); }
@@ -678,6 +680,8 @@ bool macb_init(void) {
         if (spd100) ncfgr |= NCFGR_SPD;
         if (fd)     ncfgr |= NCFGR_FD;
         mw(NCFGR, ncfgr);
+        link_mbps = gig ? 1000U : (spd100 ? 100U : 10U);
+        link_full_duplex = fd;
 
         uart_puts("[mac] neg: ");
         uart_puts(gig ? "1000" : (spd100 ? "100" : "10"));
@@ -1010,4 +1014,14 @@ bool macb_link_up(void) {
      * First read clears any latched-low condition, second gives live status. */
     (void)mdio_read(phy_addr, 0x01);
     return (mdio_read(phy_addr, 0x01) & (1 << 2)) != 0;
+}
+
+u32 macb_link_mbps(void)
+{
+    return macb_link_up() ? link_mbps : 0;
+}
+
+bool macb_link_full_duplex(void)
+{
+    return macb_link_up() && link_full_duplex;
 }

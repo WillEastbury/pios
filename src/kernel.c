@@ -1333,10 +1333,16 @@ struct perf_counter_snapshot {
     u32 nic_tx_mbps_x1000;
     u32 nic_rx_peak_mbps_x1000;
     u32 nic_tx_peak_mbps_x1000;
+    u32 nic_link_mbps;
+    bool nic_link_full_duplex;
+    u32 nic_rx_capacity_mbps;
+    u32 nic_tx_capacity_mbps;
     u64 sd_read_bytes;
     u64 sd_write_bytes;
     u32 sd_read_mbps_x1000;
     u32 sd_write_mbps_x1000;
+    u32 sd_read_last_mbps_x1000;
+    u32 sd_write_last_mbps_x1000;
     u32 sd_read_peak_mbps_x1000;
     u32 sd_write_peak_mbps_x1000;
     bool walfs_mounted;
@@ -1402,8 +1408,6 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
     static u32 rate_sd_write;
     static u32 peak_nic_rx;
     static u32 peak_nic_tx;
-    static u32 peak_sd_read;
-    static u32 peak_sd_write;
 
     if (!p)
         return;
@@ -1477,8 +1481,6 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
         rate_sd_write = perf_mbps_x1000(perf_counter_delta(sd_writes, rate_last_sd_writes) * (u64)SD_BLOCK_SIZE, dt);
         if (rate_nic_rx > peak_nic_rx) peak_nic_rx = rate_nic_rx;
         if (rate_nic_tx > peak_nic_tx) peak_nic_tx = rate_nic_tx;
-        if (rate_sd_read > peak_sd_read) peak_sd_read = rate_sd_read;
-        if (rate_sd_write > peak_sd_write) peak_sd_write = rate_sd_write;
         rate_last_ms = now_ms;
         rate_last_nic_rx = nc.rx_bytes;
         rate_last_nic_tx = nc.tx_bytes;
@@ -1489,10 +1491,16 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
     p->nic_tx_mbps_x1000 = rate_nic_tx;
     p->nic_rx_peak_mbps_x1000 = peak_nic_rx;
     p->nic_tx_peak_mbps_x1000 = peak_nic_tx;
+    p->nic_link_mbps = nic_link_mbps();
+    p->nic_link_full_duplex = nic_link_full_duplex();
+    p->nic_rx_capacity_mbps = p->nic_link_mbps;
+    p->nic_tx_capacity_mbps = p->nic_link_mbps;
     p->sd_read_mbps_x1000 = rate_sd_read;
     p->sd_write_mbps_x1000 = rate_sd_write;
-    p->sd_read_peak_mbps_x1000 = peak_sd_read;
-    p->sd_write_peak_mbps_x1000 = peak_sd_write;
+    p->sd_read_last_mbps_x1000 = ss ? ss->read_last_mbps_x1000 : 0;
+    p->sd_write_last_mbps_x1000 = ss ? ss->write_last_mbps_x1000 : 0;
+    p->sd_read_peak_mbps_x1000 = ss ? ss->read_peak_mbps_x1000 : 0;
+    p->sd_write_peak_mbps_x1000 = ss ? ss->write_peak_mbps_x1000 : 0;
 
     struct walfs_status_snapshot ws;
     walfs_status(&ws);
@@ -1578,10 +1586,16 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "nic_tx_mbps_x1000", perf.nic_tx_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "nic_rx_peak_mbps_x1000", perf.nic_rx_peak_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "nic_tx_peak_mbps_x1000", perf.nic_tx_peak_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "nic_link_mbps", perf.nic_link_mbps, true);
+    http_append_json_metric(out, &len, max, "nic_link_full_duplex", perf.nic_link_full_duplex ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "nic_rx_capacity_mbps", perf.nic_rx_capacity_mbps, true);
+    http_append_json_metric(out, &len, max, "nic_tx_capacity_mbps", perf.nic_tx_capacity_mbps, true);
     http_append_json_metric(out, &len, max, "sd_read_bytes", perf.sd_read_bytes, true);
     http_append_json_metric(out, &len, max, "sd_write_bytes", perf.sd_write_bytes, true);
     http_append_json_metric(out, &len, max, "sd_read_mbps_x1000", perf.sd_read_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "sd_write_mbps_x1000", perf.sd_write_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "sd_read_last_mbps_x1000", perf.sd_read_last_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "sd_write_last_mbps_x1000", perf.sd_write_last_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "sd_read_peak_mbps_x1000", perf.sd_read_peak_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "sd_write_peak_mbps_x1000", perf.sd_write_peak_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "walfs_mounted", perf.walfs_mounted ? 1U : 0U, true);
@@ -13895,7 +13909,7 @@ static void hdmi_dashboard_render(void)
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts("RAM: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
-    fb_puts("Phys=");
+    fb_puts("ARM=");
     dash_put_bytes_mb(perf.physical_ram_bytes);
     fb_puts(" Pool=");
     fb_printf("%uMB", perf.ram_total_kib >> 10);
@@ -13917,12 +13931,18 @@ static void hdmi_dashboard_render(void)
     fb_puts("Rx=");
     dash_put_mbps(perf.nic_rx_mbps_x1000);
     fb_puts("/");
-    dash_put_mbps(perf.nic_rx_peak_mbps_x1000);
+    dash_put_mbps(perf.nic_rx_capacity_mbps * 1000U);
     fb_puts(" Tx=");
     dash_put_mbps(perf.nic_tx_mbps_x1000);
     fb_puts("/");
-    dash_put_mbps(perf.nic_tx_peak_mbps_x1000);
-    fb_puts(" Mb/s");
+    dash_put_mbps(perf.nic_tx_capacity_mbps * 1000U);
+    fb_puts(" Mb/s ");
+    if (perf.nic_link_mbps) {
+        fb_printf("%u", perf.nic_link_mbps);
+        fb_puts(perf.nic_link_full_duplex ? "FD" : "HD");
+    } else {
+        fb_puts("down");
+    }
     fb_set_cursor(h1, header_row + 3);
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts("WALFS: ");

@@ -115,6 +115,34 @@ static sd_stats_t stats;
 
 static inline void sd_write(u32 off, u32 val) { mmio_write(EMMC2_BASE + off, val); }
 static inline u32  sd_read(u32 off)           { return mmio_read(EMMC2_BASE + off); }
+static inline u64 sd_now_us(void);
+
+static u32 sd_mbps_x1000(u32 blocks, u64 elapsed_us)
+{
+    if (blocks == 0 || elapsed_us == 0)
+        return 0;
+    u64 bytes = (u64)blocks * (u64)SD_BLOCK_SIZE;
+    u64 v = (bytes * 8000ULL) / elapsed_us;
+    return v > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (u32)v;
+}
+
+static void sd_record_read_rate(u32 blocks, u64 start_us)
+{
+    u64 end = sd_now_us();
+    u32 rate = sd_mbps_x1000(blocks, end > start_us ? end - start_us : 1);
+    stats.read_last_mbps_x1000 = rate;
+    if (rate > stats.read_peak_mbps_x1000)
+        stats.read_peak_mbps_x1000 = rate;
+}
+
+static void sd_record_write_rate(u32 blocks, u64 start_us)
+{
+    u64 end = sd_now_us();
+    u32 rate = sd_mbps_x1000(blocks, end > start_us ? end - start_us : 1);
+    stats.write_last_mbps_x1000 = rate;
+    if (rate > stats.write_peak_mbps_x1000)
+        stats.write_peak_mbps_x1000 = rate;
+}
 
 /* Timer-based microsecond timestamp (reads ARM generic counter directly).
  * Returns ~UINT64_MAX when CNTFRQ_EL0 == 0 so deadlines never expire
@@ -561,9 +589,11 @@ static bool sd_read_block_inner(u32 lba, u8 *buf) {
 }
 
 bool sd_read_block(u32 lba, u8 *buf) {
+    u64 start = sd_now_us();
     for (u32 try = 0; try < SD_MAX_RETRIES; try++) {
         if (sd_read_block_inner(lba, buf)) {
             stats.reads++;
+            sd_record_read_rate(1, start);
             return true;
         }
         stats.retries++;
@@ -578,6 +608,7 @@ bool sd_read_block(u32 lba, u8 *buf) {
     if (sd_init()) {
         if (sd_read_block_inner(lba, buf)) {
             stats.reads++;
+            sd_record_read_rate(1, start);
             return true;
         }
     }
@@ -635,9 +666,11 @@ static bool sd_write_block_inner(u32 lba, const u8 *buf) {
 }
 
 bool sd_write_block(u32 lba, const u8 *buf) {
+    u64 start = sd_now_us();
     for (u32 try = 0; try < SD_MAX_RETRIES; try++) {
         if (sd_write_block_inner(lba, buf)) {
             stats.writes++;
+            sd_record_write_rate(1, start);
             return true;
         }
         stats.retries++;
@@ -699,9 +732,11 @@ bool sd_read_blocks(u32 lba, u32 count, u8 *buf) {
     if (count == 0) return true;
     if (count == 1) return sd_read_block(lba, buf);
 
+    u64 start = sd_now_us();
     for (u32 try = 0; try < SD_MAX_RETRIES; try++) {
         if (sd_read_blocks_multi(lba, count, buf)) {
             stats.reads += count;
+            sd_record_read_rate(count, start);
             return true;
         }
         stats.retries++;
@@ -767,9 +802,11 @@ bool sd_write_blocks(u32 lba, u32 count, const u8 *buf) {
     if (count == 0) return true;
     if (count == 1) return sd_write_block(lba, buf);
 
+    u64 start = sd_now_us();
     for (u32 try = 0; try < SD_MAX_RETRIES; try++) {
         if (sd_write_blocks_multi(lba, count, buf)) {
             stats.writes += count;
+            sd_record_write_rate(count, start);
             return true;
         }
         stats.retries++;

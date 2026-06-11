@@ -1001,6 +1001,16 @@ bool nic_link_up(void)
     return macb_link_up();
 }
 
+u32 nic_link_mbps(void)
+{
+    return macb_link_mbps();
+}
+
+bool nic_link_full_duplex(void)
+{
+    return macb_link_full_duplex();
+}
+
 void nic_set_tx_checksum_offload(bool enable)
 {
     tx_checksum_offload = enable;

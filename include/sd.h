@@ -41,6 +41,10 @@ typedef struct {
     u64 retries;        /* transient-error retries */
     u64 cmd_timeouts;   /* command timeouts */
     u64 data_timeouts;  /* data transfer timeouts */
+    u32 read_last_mbps_x1000;   /* last successful read operation */
+    u32 write_last_mbps_x1000;  /* last successful write operation */
+    u32 read_peak_mbps_x1000;   /* fastest observed read operation */
+    u32 write_peak_mbps_x1000;  /* fastest observed write operation */
 } sd_stats_t;
 
 const sd_stats_t *sd_get_stats(void);

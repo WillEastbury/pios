@@ -12,6 +12,8 @@ bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_l
 bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted);
 void nic_get_mac(u8 *mac);
 bool nic_link_up(void);
+u32  nic_link_mbps(void);
+bool nic_link_full_duplex(void);
 
 void nic_set_tx_checksum_offload(bool enable);
 void nic_set_rx_checksum_offload(bool enable);

@@ -19,6 +19,8 @@ bool macb_send(const u8 *frame, u32 len);
 bool macb_recv(u8 *frame, u32 *len);
 void macb_get_mac(u8 *mac);
 bool macb_link_up(void);
+u32  macb_link_mbps(void);
+bool macb_link_full_duplex(void);
 void macb_dump_full_state(const char *tag);
 
 struct macb_irq_snapshot {
