@@ -579,6 +579,15 @@ static void http_append(char *out, u32 *len, u32 max, const char *s)
     out[*len] = 0;
 }
 
+static void http_append_bytes(char *out, u32 *len, u32 max, const u8 *data, u32 n)
+{
+    if (!out || !len || !data || max == 0)
+        return;
+    for (u32 i = 0; i < n && *len < max - 1; i++)
+        out[(*len)++] = (char)data[i];
+    out[*len] = 0;
+}
+
 static void http_append_u64(char *out, u32 *len, u32 max, u64 v)
 {
     char tmp[21];
@@ -1980,6 +1989,23 @@ static int pixe_parse_hex32(const char *s, u32 *out)
     return 1;
 }
 
+static bool pixe_hex_nibble(char c, u8 *out)
+{
+    if (c >= '0' && c <= '9') { *out = (u8)(c - '0'); return true; }
+    if (c >= 'a' && c <= 'f') { *out = (u8)(10 + c - 'a'); return true; }
+    if (c >= 'A' && c <= 'F') { *out = (u8)(10 + c - 'A'); return true; }
+    return false;
+}
+
+static bool pixe_parse_hex_byte_pair(const char *s, u8 *out)
+{
+    u8 hi = 0, lo = 0;
+    if (!s || !pixe_hex_nibble(s[0], &hi) || !pixe_hex_nibble(s[1], &lo))
+        return false;
+    *out = (u8)((hi << 4) | lo);
+    return true;
+}
+
 /* examples/sum.pc compiled with picoscript_build.py emit --as bytecode.
  * Reference VM result: 55 steps, status=200, regs=[1,10,55,11,55,0...], out empty. */
 static const u32 pixe_sum_program[] = {
@@ -3091,6 +3117,104 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             }
         } else {
             http_append(out, &len, max, "usage pixe put <card> <record> <wordoffset> <hexword>...\n");
+        }
+    } else if (http_starts_with(cmd, "pixe srcput ")) {
+        /* Chunked source-text upload:
+         * pixe srcput <card> <record> <byteoffset> <hexbytes>
+         * byteoffset 0 starts/truncates; subsequent chunks extend. */
+        char *pargv[6];
+        u32 pargc = http_split_args(cmd, pargv, 6);
+        u32 card = 0, rec = 0, off = 0;
+        if (pargc >= 6 && http_parse_u32(pargv[2], &card) && http_parse_u32(pargv[3], &rec) &&
+            http_parse_u32(pargv[4], &off) && card <= PICOWAL_CARD_MAX &&
+            rec <= PICOWAL_RECORD_MAX && off < PICOWAL_DATA_MAX) {
+            static u8 src_buf[PICOWAL_DATA_MAX];
+            u32 old_len = 0;
+            if (off != 0) {
+                i32 g = picowal_db_get((u16)card, rec, src_buf, PICOWAL_DATA_MAX);
+                if (g > 0) old_len = (u32)g;
+            }
+            for (u32 z = old_len; z < off && z < PICOWAL_DATA_MAX; z++) src_buf[z] = 0;
+            const char *hex = pargv[5];
+            u32 hex_len = pios_strlen(hex);
+            bool ok = (hex_len != 0 && (hex_len & 1U) == 0);
+            u32 count = hex_len / 2U;
+            if (off + count > PICOWAL_DATA_MAX) ok = false;
+            for (u32 i = 0; ok && i < count; i++)
+                ok = pixe_parse_hex_byte_pair(hex + i * 2U, &src_buf[off + i]);
+            if (!ok) {
+                http_append(out, &len, max, "usage pixe srcput <card> <record> <byteoffset> <hexbytes>\n");
+            } else {
+                u32 new_len = off + count;
+                if (new_len < old_len) new_len = old_len;
+                i32 n = picowal_db_put((u16)card, rec, src_buf, new_len);
+                if (n < 0) {
+                    http_append(out, &len, max, "ERR: pixe srcput failed\n");
+                } else {
+                    http_append(out, &len, max, "pixe srcput card=");
+                    http_append_u64(out, &len, max, card);
+                    http_append(out, &len, max, " record=");
+                    http_append_u64(out, &len, max, rec);
+                    http_append(out, &len, max, " offset=");
+                    http_append_u64(out, &len, max, off);
+                    http_append(out, &len, max, " count=");
+                    http_append_u64(out, &len, max, count);
+                    http_append(out, &len, max, " total_bytes=");
+                    http_append_u64(out, &len, max, (u32)n);
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        } else {
+            http_append(out, &len, max, "usage pixe srcput <card> <record> <byteoffset> <hexbytes>\n");
+        }
+    } else if (http_starts_with(cmd, "pixe srcget ")) {
+        char *pargv[6];
+        u32 pargc = http_split_args(cmd, pargv, 6);
+        u32 card = 0, rec = 0;
+        if (pargc >= 4 && http_parse_u32(pargv[2], &card) && http_parse_u32(pargv[3], &rec) &&
+            card <= PICOWAL_CARD_MAX && rec <= PICOWAL_RECORD_MAX) {
+            static u8 src_get_buf[PICOWAL_DATA_MAX];
+            i32 n = picowal_db_get((u16)card, rec, src_get_buf, PICOWAL_DATA_MAX);
+            if (n < 0) {
+                http_append(out, &len, max, "ERR: pixe srcget failed\n");
+            } else {
+                http_append(out, &len, max, "pixe source card=");
+                http_append_u64(out, &len, max, card);
+                http_append(out, &len, max, " record=");
+                http_append_u64(out, &len, max, rec);
+                http_append(out, &len, max, " bytes=");
+                http_append_u64(out, &len, max, (u32)n);
+                http_append(out, &len, max, "\n");
+                http_append_bytes(out, &len, max, src_get_buf, (u32)n);
+                http_append(out, &len, max, "\n");
+            }
+        } else {
+            http_append(out, &len, max, "usage pixe srcget <card> <record>\n");
+        }
+    } else if (http_starts_with(cmd, "pixe srchex ")) {
+        char *pargv[6];
+        u32 pargc = http_split_args(cmd, pargv, 6);
+        u32 card = 0, rec = 0;
+        if (pargc >= 4 && http_parse_u32(pargv[2], &card) && http_parse_u32(pargv[3], &rec) &&
+            card <= PICOWAL_CARD_MAX && rec <= PICOWAL_RECORD_MAX) {
+            static u8 src_get_buf[PICOWAL_DATA_MAX];
+            i32 n = picowal_db_get((u16)card, rec, src_get_buf, PICOWAL_DATA_MAX);
+            if (n < 0) {
+                http_append(out, &len, max, "ERR: pixe srchex failed\n");
+            } else {
+                http_append(out, &len, max, "pixe srchex card=");
+                http_append_u64(out, &len, max, card);
+                http_append(out, &len, max, " record=");
+                http_append_u64(out, &len, max, rec);
+                http_append(out, &len, max, " bytes=");
+                http_append_u64(out, &len, max, (u32)n);
+                http_append(out, &len, max, "\n");
+                for (i32 i = 0; i < n; i++)
+                    http_append_hex8(out, &len, max, src_get_buf[i]);
+                http_append(out, &len, max, "\n");
+            }
+        } else {
+            http_append(out, &len, max, "usage pixe srchex <card> <record>\n");
         }
     } else if (http_streq(cmd, "uhttp")) {
         for (u32 bi = 0; bi < UHTTP_BRIDGE_COUNT; bi++) {
@@ -6536,9 +6660,19 @@ static void echo_tcp_poll(void) {
                 uart_puts("\n");
                 http_abort_client();
             } else if (http_resp_len == 0 && (timer_monotonic_ms() - http_last_activity_ms) > 3000ULL) {
-                http_diag.aborts++;
-                http_diag.error = HTTP_ERR_REQ_TIMEOUT;
-                http_abort_client();
+                if (http_req_len == 0) {
+                    /* Browsers may open speculative/preconnect sockets and never
+                     * send a request line. Close those quietly; only partial
+                     * requests are actionable request timeouts. */
+                    http_diag.closes++;
+                    http_trace(HTTP_EVT_CLOSE, HTTP_ROUTE_UNKNOWN, 0,
+                               http_client_conn >= 0 ? (u32)http_client_conn : 0xFFFFFFFFU);
+                    http_reset_client(true);
+                } else {
+                    http_diag.aborts++;
+                    http_diag.error = HTTP_ERR_REQ_TIMEOUT;
+                    http_abort_client();
+                }
             }
         } else {
             http_diag.aborts++;
