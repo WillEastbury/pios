@@ -17,6 +17,7 @@
 #include "proc.h"
 #include "types.h"
 #include "picowal_db.h"
+#include "capsule_store.h"
 
 _Static_assert(UHTTP_BRIDGE_ADDR == IPC_SHM_BASE,
                "uhttp bridge must live at IPC_SHM_BASE");
@@ -102,9 +103,41 @@ static bool uhttp_card_text_ok(const u8 *p, u32 n, u8 first)
     return true;
 }
 
-static void uhttp_preload_picoweb(struct uhttp_bridge *b)
+static bool uhttp_streq(const char *a, const char *b)
 {
-    b->pico_prog_len = uhttp_load_card(UHTTP_PICO_PROGRAM_RECORD, b->pico_prog);
+    if (!a || !b) return false;
+    while (*a && *b) {
+        if (*a != *b) return false;
+        a++;
+        b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static u32 uhttp_load_capsule_process(struct uhttp_runtime *r, u8 *dst)
+{
+    struct capsule_manifest m;
+    char err[64];
+    if (!r || !dst || !capsule_store_load_manifest(1024U, &m, err, sizeof(err)))
+        return 0;
+
+    for (u32 i = 0; i < m.process_count; i++) {
+        struct capsule_process *p = &m.processes[i];
+        if (!p->has_tcp || p->tcp_port != r->port)
+            continue;
+        if (p->entry[0] && !uhttp_streq(p->entry, "http"))
+            continue;
+        i32 n = capsule_store_read(1024U, p->bytecode, dst, UHTTP_PICO_MAX);
+        return n > 0 ? (u32)n : 0;
+    }
+    return 0;
+}
+
+static void uhttp_preload_picoweb(struct uhttp_runtime *r, struct uhttp_bridge *b)
+{
+    b->pico_prog_len = uhttp_load_capsule_process(r, b->pico_prog);
+    if (b->pico_prog_len == 0)
+        b->pico_prog_len = uhttp_load_card(UHTTP_PICO_PROGRAM_RECORD, b->pico_prog);
     b->pico_static_len = uhttp_load_card(UHTTP_PICO_STATIC_RECORD, b->pico_static);
     b->pico_api_len = uhttp_load_card(UHTTP_PICO_API_RECORD, b->pico_api);
     if ((b->pico_prog_len & 3U) != 0)
@@ -220,7 +253,7 @@ static void uhttp_bridge_poll_one(struct uhttp_runtime *r, struct uhttp_bridge *
              * reads them coherently. */
             if (b->req_len)
                 uhttp_clean(b->req, b->req_len);
-            uhttp_preload_picoweb(b);
+            uhttp_preload_picoweb(r, b);
             b->req_seq = b->req_seq + 1U;
             r->dispatch_seq = b->req_seq;
             uhttp_clean(&b->req_seq, UHTTP_LINE);
