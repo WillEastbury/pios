@@ -4285,7 +4285,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         u32 argc = http_split_args(cmd, argv, 10);
         if (argc < 2 || http_streq(argv[1], "help")) {
             http_append(out, &len, max,
-                "capsule status <pack> | capsule list <pack> | capsule get|gethex <pack> <card>\n"
+                "capsule status <pack> | capsule realize <pack> | capsule list <pack> | capsule get|gethex <pack> <card>\n"
                 "capsule puthex <pack> <card> <byteoffset> <hexbytes> | capsule del <pack> <card>\n"
                 "capsule import <pack> <adapter_card> [manifest_rec source_rec bytecode_rec]\n");
         } else if (http_streq(argv[1], "status") || http_streq(argv[1], "manifest")) {
@@ -4345,6 +4345,44 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
                         http_append_u64(out, &len, max, f->frame_max);
                         http_append(out, &len, max, "\n");
                     }
+                }
+            }
+        } else if (http_streq(argv[1], "realize")) {
+            u32 pack = 0;
+            if (argc < 3 || !http_parse_u32(argv[2], &pack)) {
+                http_append(out, &len, max, "ERR: usage capsule realize <pack>\n");
+            } else {
+                struct capsule_manifest m;
+                char err[64];
+                if (!capsule_store_load_manifest(pack, &m, err, sizeof(err))) {
+                    http_append(out, &len, max, "ERR: ");
+                    http_append(out, &len, max, err);
+                    http_append(out, &len, max, "\n");
+                } else {
+                    u32 wrote = 0;
+                    for (u32 i = 0; i < m.fifo_count; i++) {
+                        struct capsule_fifo *f = &m.fifos[i];
+                        char desc[256];
+                        u32 dl = 0;
+                        http_append(desc, &dl, sizeof(desc), "ipc_fifo = ");
+                        http_append(desc, &dl, sizeof(desc), f->name);
+                        http_append(desc, &dl, sizeof(desc), "\n  from = ");
+                        http_append(desc, &dl, sizeof(desc), f->from);
+                        http_append(desc, &dl, sizeof(desc), "\n  to = ");
+                        http_append(desc, &dl, sizeof(desc), f->to);
+                        http_append(desc, &dl, sizeof(desc), "\n  depth = ");
+                        http_append_u64(desc, &dl, sizeof(desc), f->depth);
+                        http_append(desc, &dl, sizeof(desc), "\n  frame_max = ");
+                        http_append_u64(desc, &dl, sizeof(desc), f->frame_max);
+                        http_append(desc, &dl, sizeof(desc), "\n");
+                        if (dl > 0 && capsule_store_write(pack, 20000U + i, desc, dl))
+                            wrote++;
+                    }
+                    http_append(out, &len, max, "capsule realize pack=");
+                    http_append_u64(out, &len, max, pack);
+                    http_append(out, &len, max, " fifo_cards=");
+                    http_append_u64(out, &len, max, wrote);
+                    http_append(out, &len, max, "\n");
                 }
             }
         } else if (http_streq(argv[1], "list")) {

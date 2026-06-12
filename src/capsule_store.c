@@ -134,8 +134,8 @@ const char *capsule_card_role(u32 card)
     if (card == 0) return "manifest";
     if (card >= 1U && card <= 1000U) return "exec";
     if (card >= 1001U && card <= 10000U) return "source";
-    if (card >= 10001U && card <= 20000U) return "bytecode";
     if (card >= 20000U) return "ipc";
+    if (card >= 10001U) return "bytecode";
     return "card";
 }
 
@@ -292,8 +292,11 @@ static void list_cb(const struct walfs_dirent *entry)
 {
     if (!entry || !g_list_ctx.out || g_list_ctx.n >= g_list_ctx.max) return;
     u32 card = 0;
-    if (parse_card_name(entry->name, &card))
+    if (parse_card_name(entry->name, &card)) {
+        for (u32 i = 0; i < g_list_ctx.n; i++)
+            if (g_list_ctx.out[i] == card) return;
         g_list_ctx.out[g_list_ctx.n++] = card;
+    }
 }
 
 u32 capsule_store_list(u32 pack, u32 *out_cards, u32 max_cards)
