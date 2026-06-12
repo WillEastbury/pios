@@ -81,6 +81,7 @@
 #include "acme.h"
 #include "abi.h"
 #include "mmio.h"
+#include "capsule_store.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -4278,6 +4279,200 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             } else {
                 http_append(out, &len, max, "ERR: unknown db op\n");
             }
+        }
+    } else if (http_streq(cmd, "capsule") || http_starts_with(cmd, "capsule ")) {
+        char *argv[10];
+        u32 argc = http_split_args(cmd, argv, 10);
+        if (argc < 2 || http_streq(argv[1], "help")) {
+            http_append(out, &len, max,
+                "capsule status <pack> | capsule list <pack> | capsule get|gethex <pack> <card>\n"
+                "capsule puthex <pack> <card> <byteoffset> <hexbytes> | capsule del <pack> <card>\n"
+                "capsule import <pack> <adapter_card> [manifest_rec source_rec bytecode_rec]\n");
+        } else if (http_streq(argv[1], "status") || http_streq(argv[1], "manifest")) {
+            u32 pack = 0;
+            if (argc < 3 || !http_parse_u32(argv[2], &pack)) {
+                http_append(out, &len, max, "ERR: usage capsule status <pack>\n");
+            } else {
+                struct capsule_manifest m;
+                char err[64];
+                if (!capsule_store_load_manifest(pack, &m, err, sizeof(err))) {
+                    http_append(out, &len, max, "ERR: ");
+                    http_append(out, &len, max, err);
+                    http_append(out, &len, max, "\n");
+                } else {
+                    http_append(out, &len, max, "capsule pack=");
+                    http_append_u64(out, &len, max, pack);
+                    http_append(out, &len, max, " name=");
+                    http_append(out, &len, max, m.name);
+                    http_append(out, &len, max, " cards=");
+                    http_append_u64(out, &len, max, m.cards_lo);
+                    http_append(out, &len, max, "-");
+                    http_append_u64(out, &len, max, m.cards_hi);
+                    http_append(out, &len, max, " processes=");
+                    http_append_u64(out, &len, max, m.process_count);
+                    http_append(out, &len, max, " fifos=");
+                    http_append_u64(out, &len, max, m.fifo_count);
+                    http_append(out, &len, max, "\n");
+                    for (u32 i = 0; i < m.process_count; i++) {
+                        struct capsule_process *p = &m.processes[i];
+                        http_append(out, &len, max, "process ");
+                        http_append(out, &len, max, p->name);
+                        http_append(out, &len, max, " source=");
+                        http_append_u64(out, &len, max, p->source);
+                        http_append(out, &len, max, " bytecode=");
+                        http_append_u64(out, &len, max, p->bytecode);
+                        if (p->io[0]) {
+                            http_append(out, &len, max, " io=");
+                            http_append(out, &len, max, p->io);
+                        }
+                        if (p->entry[0]) {
+                            http_append(out, &len, max, " entry=");
+                            http_append(out, &len, max, p->entry);
+                        }
+                        http_append(out, &len, max, "\n");
+                    }
+                    for (u32 i = 0; i < m.fifo_count; i++) {
+                        struct capsule_fifo *f = &m.fifos[i];
+                        http_append(out, &len, max, "ipc_fifo ");
+                        http_append(out, &len, max, f->name);
+                        http_append(out, &len, max, " from=");
+                        http_append(out, &len, max, f->from);
+                        http_append(out, &len, max, " to=");
+                        http_append(out, &len, max, f->to);
+                        http_append(out, &len, max, " depth=");
+                        http_append_u64(out, &len, max, f->depth);
+                        http_append(out, &len, max, " frame_max=");
+                        http_append_u64(out, &len, max, f->frame_max);
+                        http_append(out, &len, max, "\n");
+                    }
+                }
+            }
+        } else if (http_streq(argv[1], "list")) {
+            u32 pack = 0;
+            if (argc < 3 || !http_parse_u32(argv[2], &pack)) {
+                http_append(out, &len, max, "ERR: usage capsule list <pack>\n");
+            } else {
+                u32 cards[64];
+                u32 n = capsule_store_list(pack, cards, 64);
+                http_append(out, &len, max, "capsule pack=");
+                http_append_u64(out, &len, max, pack);
+                http_append(out, &len, max, " count=");
+                http_append_u64(out, &len, max, n);
+                http_append(out, &len, max, "\n");
+                for (u32 i = 0; i < n; i++) {
+                    http_append(out, &len, max, "card=");
+                    http_append_u64(out, &len, max, cards[i]);
+                    http_append(out, &len, max, " role=");
+                    http_append(out, &len, max, capsule_card_role(cards[i]));
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        } else if (http_streq(argv[1], "get") || http_streq(argv[1], "gethex")) {
+            u32 pack = 0, card = 0;
+            if (argc < 4 || !http_parse_u32(argv[2], &pack) || !http_parse_u32(argv[3], &card)) {
+                http_append(out, &len, max, "ERR: usage capsule get|gethex <pack> <card>\n");
+            } else {
+                static u8 cbuf[CAPSULE_STORE_CARD_MAX_BYTES];
+                i32 n = capsule_store_read(pack, card, cbuf, sizeof(cbuf));
+                if (n < 0) {
+                    http_append(out, &len, max, "ERR: capsule card read failed\n");
+                } else {
+                    http_append(out, &len, max, "capsule pack=");
+                    http_append_u64(out, &len, max, pack);
+                    http_append(out, &len, max, " card=");
+                    http_append_u64(out, &len, max, card);
+                    http_append(out, &len, max, " bytes=");
+                    http_append_u64(out, &len, max, (u32)n);
+                    http_append(out, &len, max, "\n");
+                    if (http_streq(argv[1], "gethex")) {
+                        for (i32 i = 0; i < n; i++) http_append_hex8(out, &len, max, cbuf[i]);
+                    } else {
+                        http_append_sanitized_bytes(out, &len, max, cbuf, (u32)n);
+                    }
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        } else if (http_streq(argv[1], "puthex")) {
+            u32 pack = 0, card = 0, off = 0;
+            if (argc < 6 || !http_parse_u32(argv[2], &pack) || !http_parse_u32(argv[3], &card) ||
+                !http_parse_u32(argv[4], &off)) {
+                http_append(out, &len, max, "ERR: usage capsule puthex <pack> <card> <byteoffset> <hexbytes>\n");
+            } else {
+                static u8 cbuf[CAPSULE_STORE_CARD_MAX_BYTES];
+                u32 old_len = 0;
+                if (off != 0) {
+                    i32 got = capsule_store_read(pack, card, cbuf, sizeof(cbuf));
+                    if (got > 0) old_len = (u32)got;
+                }
+                for (u32 z = old_len; z < off && z < sizeof(cbuf); z++) cbuf[z] = 0;
+                const char *hex = argv[5];
+                u32 hex_len = pios_strlen(hex);
+                bool ok = (hex_len != 0 && (hex_len & 1U) == 0);
+                u32 count = hex_len / 2U;
+                if (off + count > sizeof(cbuf)) ok = false;
+                for (u32 i = 0; ok && i < count; i++)
+                    ok = pixe_parse_hex_byte_pair(hex + i * 2U, &cbuf[off + i]);
+                if (!ok) {
+                    http_append(out, &len, max, "ERR: bad hex/range\n");
+                } else {
+                    u32 new_len = off + count;
+                    if (new_len < old_len) new_len = old_len;
+                    if (!capsule_store_write(pack, card, cbuf, new_len)) {
+                        http_append(out, &len, max, "ERR: capsule card write failed\n");
+                    } else {
+                        http_append(out, &len, max, "OK: capsule puthex pack=");
+                        http_append_u64(out, &len, max, pack);
+                        http_append(out, &len, max, " card=");
+                        http_append_u64(out, &len, max, card);
+                        http_append(out, &len, max, " bytes=");
+                        http_append_u64(out, &len, max, new_len);
+                        http_append(out, &len, max, "\n");
+                    }
+                }
+            }
+        } else if (http_streq(argv[1], "del")) {
+            u32 pack = 0, card = 0;
+            if (argc < 4 || !http_parse_u32(argv[2], &pack) || !http_parse_u32(argv[3], &card))
+                http_append(out, &len, max, "ERR: usage capsule del <pack> <card>\n");
+            else
+                http_append(out, &len, max, capsule_store_delete(pack, card) ? "OK: deleted\n" : "ERR: delete failed\n");
+        } else if (http_streq(argv[1], "import")) {
+            u32 pack = 0, adapter = 0, manifest_rec = 10, source_rec = capsule_source_for(1), code_rec = capsule_code_for(1);
+            if (argc < 4 || !http_parse_u32(argv[2], &pack) || !http_parse_u32(argv[3], &adapter) ||
+                adapter > PICOWAL_CARD_MAX) {
+                http_append(out, &len, max, "ERR: usage capsule import <pack> <adapter_card> [manifest_rec source_rec bytecode_rec]\n");
+            } else {
+                if (argc >= 5) (void)http_parse_u32(argv[4], &manifest_rec);
+                if (argc >= 6) (void)http_parse_u32(argv[5], &source_rec);
+                if (argc >= 7) (void)http_parse_u32(argv[6], &code_rec);
+                static u8 ibuf[PICOWAL_DATA_MAX];
+                u32 wrote = 0;
+                i32 n = picowal_db_get((u16)adapter, manifest_rec, ibuf, sizeof(ibuf));
+                if (n > 0 && capsule_store_write(pack, 0, ibuf, (u32)n)) wrote++;
+                n = picowal_db_get((u16)adapter, source_rec, ibuf, sizeof(ibuf));
+                if (n > 0 && capsule_store_write(pack, capsule_source_for(1), ibuf, (u32)n)) wrote++;
+                n = picowal_db_get((u16)adapter, code_rec, ibuf, sizeof(ibuf));
+                if (n <= 0 && code_rec != 0)
+                    n = picowal_db_get((u16)adapter, 0, ibuf, sizeof(ibuf));
+                if (n > 0 && capsule_store_write(pack, capsule_code_for(1), ibuf, (u32)n)) wrote++;
+                http_append(out, &len, max, "capsule import pack=");
+                http_append_u64(out, &len, max, pack);
+                http_append(out, &len, max, " adapter=");
+                http_append_u64(out, &len, max, adapter);
+                http_append(out, &len, max, " wrote=");
+                http_append_u64(out, &len, max, wrote);
+                http_append(out, &len, max, " manifest=");
+                http_append_u64(out, &len, max, manifest_rec);
+                http_append(out, &len, max, " source=");
+                http_append_u64(out, &len, max, source_rec);
+                http_append(out, &len, max, " bytecode=");
+                http_append_u64(out, &len, max, code_rec);
+                if (code_rec != 0)
+                    http_append(out, &len, max, " fallback=0");
+                http_append(out, &len, max, "\n");
+            }
+        } else {
+            http_append(out, &len, max, "ERR: unknown capsule subcommand\n");
         }
     } else if (http_streq(cmd, "processes")) {
         struct proc_ui_entry snap[MAX_PROCS_PER_CORE + 1U];
