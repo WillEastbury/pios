@@ -1,5 +1,5 @@
 #pragma once
-#define PIOS_BUILD_STAMP "20260611.232035"
-#define PIOS_VERSION "v20260611.232035"
+#define PIOS_BUILD_STAMP "20260612.095928"
+#define PIOS_VERSION "v20260612.095928"
 #define PIOS_BUILD_NAME "PIOS Kernel"
-#define PIOS_BUILD_LABEL "PIOS Kernel Booted and Running -> Version v20260611.232035"
+#define PIOS_BUILD_LABEL "PIOS Kernel Booted and Running -> Version v20260612.095928"
