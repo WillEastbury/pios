@@ -263,7 +263,11 @@ static void picoweb_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int im
         ctx->regs[rd] = pico_req_span(h, hook);
         return;
     case PV_HOOK_CONTEXT_GETPORT:
+#if defined(UHTTP_BRIDGE_INDEX) && UHTTP_BRIDGE_INDEX == 1
+        ctx->regs[rd] = UHTTP_NATIVE_PORT;
+#else
         ctx->regs[rd] = UHTTP_PORT;
+#endif
         return;
     case PV_HOOK_CONTEXT_GETUSER:
         ctx->regs[rd] = 0;

@@ -36,7 +36,7 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_httpd.elf user_httpd_vm.img
 if errorlevel 1 exit /b 1
-"%CC%" %USER_CFLAGS% -DPIOS_USER_EL0 -DPIOS_HTTPD_NATIVE -DUHTTP_BRIDGE_INDEX=1 -c user\httpd.c -o build_user\httpd_native.o
+"%CC%" %USER_CFLAGS% -DPIOS_USER_EL0 -DUHTTP_BRIDGE_INDEX=1 -c user\httpd.c -o build_user\httpd_native.o
 if errorlevel 1 exit /b 1
 "%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_httpd_native.elf build_user\ustart.o build_user\httpd_native.o build_user\picovm.o
 if errorlevel 1 exit /b 1

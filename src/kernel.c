@@ -15358,8 +15358,8 @@ NORETURN void core3_main(void) {
     proc_mark_core_hosts_process(CORE_USER1);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     core_mark_online(CORE_USER1, 5);
-    /* Launch the native-C HTTP benchmark worker on port 83. */
-    proc_exec_from_mem_el0("user/httpd-native-el0", user_httpd_native_start,
+    /* Launch a second PicoScript VM-backed HTTP worker on bridge 1 / port 83. */
+    proc_exec_from_mem_el0("user/httpd-vm1-el0", user_httpd_native_start,
                            (u32)(usize)(user_httpd_native_end - user_httpd_native_start),
                            0x2001000000ULL, 0x03B00000ULL, PROC_PRIO_NORMAL, core_id());
     {
