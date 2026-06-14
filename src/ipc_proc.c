@@ -295,6 +295,19 @@ i32 ipc_proc_fifo_recv(u32 principal, i32 channel_id, void *out, u32 out_max, u3
     return PROC_IPC_OK;
 }
 
+i32 ipc_proc_fifo_count(u32 principal, i32 channel_id)
+{
+    if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX) return PROC_IPC_ERR_INVAL;
+    struct proc_fifo_channel *ch = &g_fifos[channel_id];
+    if (!ch->used) return PROC_IPC_ERR_NOENT;
+    if (ch->owner_core != core_id()) return PROC_IPC_ERR_UNSUPPORTED;
+    u32 acl = principal_acl(principal, ch->owner_principal, ch->peer_principal,
+                            ch->owner_acl, ch->peer_acl);
+    if ((acl & (PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV)) == 0)
+        return PROC_IPC_ERR_ACCESS;
+    return (i32)ch->count;
+}
+
 static struct proc_fifo_channel *fifo_for_access(u32 principal, i32 channel_id, u32 perm)
 {
     if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX)

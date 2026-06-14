@@ -240,7 +240,20 @@ bool capsule_store_write(u32 pack, u32 card, const void *data, u32 len)
         struct walfs_inode ino;
         if (!walfs_stat(id, &ino) || (ino.flags & WALFS_DIR)) return false;
     }
-    return walfs_replace(id, data, len);
+    if (!walfs_replace(id, data, len)) return false;
+
+    struct walfs_inode ino;
+    if (!walfs_stat(id, &ino) || (ino.flags & WALFS_DIR) || ino.size != len)
+        return false;
+
+    static u8 verify[CAPSULE_STORE_CARD_MAX_BYTES];
+    u32 got = walfs_read(id, 0, verify, len);
+    if (got != len) return false;
+    const u8 *src = (const u8 *)data;
+    for (u32 i = 0; i < len; i++)
+        if (verify[i] != src[i])
+            return false;
+    return true;
 }
 
 i32 capsule_store_read(u32 pack, u32 card, void *out, u32 out_len)

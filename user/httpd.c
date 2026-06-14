@@ -17,6 +17,8 @@
 #include "uhttp_bridge.h"  /* struct uhttp_bridge, UHTTP_BRIDGE_ADDR */
 #include "picovm.h"
 #include "pico_hooks.h"
+#include "walfs.h"
+#include "ipc_proc.h"
 
 /* Minimal freestanding mem primitives (also satisfy implicit compiler calls). */
 void *memcpy(void *d, const void *s, unsigned long n)
@@ -85,6 +87,10 @@ static inline void el0_wait_event(void)
 
 #define PICOWEB_MEM_SIZE        8192U
 #define PICOWEB_MAX_SPANS       64U
+#define PICOWEB_CAPSULE_PACK_MIN 1024U
+#define PICOWEB_CAPSULE_PACK_MAX 4095U
+#define PICOWEB_CAPSULE_CARD_MAX 65535U
+#define PICOWEB_CARD_MAX_BYTES   16384U
 
 struct pico_span {
     u32 ptr;
@@ -94,7 +100,9 @@ struct pico_span {
 struct picoweb_host {
     pv_ctx vm;                 /* first: pv_host callback receives &vm */
     struct uhttp_bridge *bridge;
+    struct kernel_api *api;
     u32 reqs;
+    u32 active_pack;
     u8 mem[PICOWEB_MEM_SIZE];
     u32 arena_top;
     struct pico_span spans[PICOWEB_MAX_SPANS];
@@ -143,6 +151,15 @@ static int pico_alloc_span(struct picoweb_host *h, const u8 *src, u32 n)
     return handle;
 }
 
+static int pico_alloc_span_direct(struct picoweb_host *h, u32 ptr, u32 n)
+{
+    if (h->span_count >= (int)PICOWEB_MAX_SPANS) { h->oom = 1; return 0; }
+    int handle = h->span_count++;
+    h->spans[handle].ptr = ptr;
+    h->spans[handle].len = n;
+    return handle;
+}
+
 static void pico_write_span(struct picoweb_host *h, i32 handle)
 {
     if (handle <= 0 || handle >= h->span_count) return;
@@ -164,6 +181,198 @@ static bool pico_text_ok(const u8 *p, u32 n, u8 first)
     }
     return true;
 }
+
+    static bool pico_pack_ok(u32 pack)
+    {
+        return pack >= PICOWEB_CAPSULE_PACK_MIN && pack <= PICOWEB_CAPSULE_PACK_MAX;
+    }
+
+    static const char *pico_card_role(u32 card)
+    {
+        if (card == 0) return "manifest";
+        if (card >= 1U && card <= 1000U) return "exec";
+        if (card >= 1001U && card <= 10000U) return "source";
+        if (card >= 20000U) return "ipc";
+        if (card >= 10001U) return "bytecode";
+        return "card";
+    }
+
+    static bool pico_append(char *dst, u32 *off, u32 cap, const char *src)
+    {
+        while (*src) {
+            if (*off + 1U >= cap) return false;
+            dst[(*off)++] = *src++;
+        }
+        dst[*off] = 0;
+        return true;
+    }
+
+    static bool pico_append_u32(char *dst, u32 *off, u32 cap, u32 v)
+    {
+        char tmp[12];
+        u32 n = 0;
+        if (v == 0) tmp[n++] = '0';
+        while (v && n < sizeof(tmp)) {
+            tmp[n++] = (char)('0' + (v % 10U));
+            v /= 10U;
+        }
+        while (n) {
+            if (*off + 1U >= cap) return false;
+            dst[(*off)++] = tmp[--n];
+        }
+        dst[*off] = 0;
+        return true;
+    }
+
+    static bool pico_capsule_pack_dir(u32 pack, char *out, u32 out_max)
+    {
+        u32 off = 0;
+        return pico_pack_ok(pack) &&
+               pico_append(out, &off, out_max, "/var/capsules/p") &&
+               pico_append_u32(out, &off, out_max, pack);
+    }
+
+    static bool pico_capsule_card_path(u32 pack, u32 card, char *out, u32 out_max)
+    {
+        u32 off = 0;
+        if (!pico_pack_ok(pack) || card > PICOWEB_CAPSULE_CARD_MAX) return false;
+        return pico_append(out, &off, out_max, "/var/capsules/p") &&
+               pico_append_u32(out, &off, out_max, pack) &&
+               pico_append(out, &off, out_max, "/c") &&
+               pico_append_u32(out, &off, out_max, card) &&
+               pico_append(out, &off, out_max, ".") &&
+               pico_append(out, &off, out_max, pico_card_role(card));
+    }
+
+    static int pico_card_address_span(struct picoweb_host *h, u32 pack, u32 card)
+    {
+        char addr[32];
+        u32 off = 0;
+        if (!pico_pack_ok(pack) || card > PICOWEB_CAPSULE_CARD_MAX) return 0;
+        if (!pico_append_u32(addr, &off, sizeof(addr), pack) ||
+            !pico_append(addr, &off, sizeof(addr), "/") ||
+            !pico_append_u32(addr, &off, sizeof(addr), card))
+            return 0;
+        return pico_alloc_span(h, (const u8 *)addr, off);
+    }
+
+    static void pico_ensure_capsule_dirs(struct picoweb_host *h, u32 pack)
+    {
+        if (!h->api) return;
+        char dir[64];
+        if (!pico_capsule_pack_dir(pack, dir, sizeof(dir))) return;
+        (void)h->api->mkdir("/var");
+        (void)h->api->mkdir("/var/capsules");
+        (void)h->api->mkdir(dir);
+    }
+
+    static int pico_card_read_span(struct picoweb_host *h, u32 card)
+    {
+        if (!h->api) { h->vm.host_status = 20; return 0; }
+        char path[96];
+        if (!pico_capsule_card_path(h->active_pack, card, path, sizeof(path))) { h->vm.host_status = 21; return 0; }
+        struct walfs_inode ino;
+        if (h->api->stat(path, &ino) != 0 || (ino.flags & WALFS_DIR)) { h->vm.host_status = 22; return 0; }
+        u32 n = (ino.size > PICOWEB_CARD_MAX_BYTES) ? PICOWEB_CARD_MAX_BYTES : (u32)ino.size;
+        if (n > PICOWEB_MEM_SIZE - h->arena_top) { h->oom = 1; h->vm.host_status = 23; return 0; }
+        i32 fd = h->api->open(path, 0);
+        if (fd < 0) { h->vm.host_status = 24; return 0; }
+        u32 ptr = h->arena_top;
+        i32 got = h->api->pread(fd, &h->mem[ptr], n, 0);
+        (void)h->api->close(fd);
+        if (got < 0) { h->vm.host_status = 25; return 0; }
+        h->arena_top += (u32)got;
+        h->vm.host_status = 0;
+        return pico_alloc_span_direct(h, ptr, (u32)got);
+    }
+
+    static bool pico_card_verify(struct picoweb_host *h, const char *path, const u8 *data, u32 len)
+    {
+        u8 tmp[256];
+        i32 fd = h->api->open(path, 0);
+        if (fd < 0) return false;
+        u32 off = 0;
+        while (off < len) {
+            u32 chunk = len - off;
+            if (chunk > sizeof(tmp)) chunk = sizeof(tmp);
+            i32 got = h->api->pread(fd, tmp, chunk, off);
+            if (got != (i32)chunk) { (void)h->api->close(fd); return false; }
+            for (u32 i = 0; i < chunk; i++) {
+                if (tmp[i] != data[off + i]) { (void)h->api->close(fd); return false; }
+            }
+            off += chunk;
+        }
+        struct walfs_inode ino;
+        bool ok = h->api->stat(path, &ino) == 0 && ino.size == len;
+        (void)h->api->close(fd);
+        return ok;
+    }
+
+    static int pico_card_write_span(struct picoweb_host *h, u32 card, i32 handle)
+    {
+        if (!h->api) { h->vm.host_status = 10; return 0; }
+        if (handle <= 0 || handle >= h->span_count) { h->vm.host_status = 11; return 0; }
+        struct pico_span s = h->spans[handle];
+        if (s.len == 0 || s.len > PICOWEB_CARD_MAX_BYTES) { h->vm.host_status = 12; return 0; }
+        char path[96];
+        if (!pico_capsule_card_path(h->active_pack, card, path, sizeof(path))) { h->vm.host_status = 13; return 0; }
+        pico_ensure_capsule_dirs(h, h->active_pack);
+        (void)h->api->unlink(path);
+        i32 fd = h->api->creat(path, 0, 0644);
+        if (fd < 0) { h->vm.host_status = 14; return 0; }
+        i32 wrote = h->api->pwrite(fd, &h->mem[s.ptr], s.len, 0);
+        (void)h->api->close(fd);
+        if (wrote != (i32)s.len) { h->vm.host_status = 15; return 0; }
+        if (!pico_card_verify(h, path, &h->mem[s.ptr], s.len)) { h->vm.host_status = 16; return 0; }
+        h->vm.host_status = 0;
+        return 1;
+    }
+
+    static bool pico_span_name(struct picoweb_host *h, i32 handle, char *out, u32 out_max)
+    {
+        if (handle <= 0 || handle >= h->span_count || !out || out_max < 2) return false;
+        struct pico_span s = h->spans[handle];
+        if (s.len == 0 || s.len + 1U > out_max) return false;
+        for (u32 i = 0; i < s.len; i++) {
+            char c = (char)h->mem[s.ptr + i];
+            bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') || c == '_' || c == '-';
+            if (!ok) return false;
+            out[i] = c;
+        }
+        out[s.len] = 0;
+        return true;
+    }
+
+    static int pico_fifo_open(struct picoweb_host *h, i32 name_span)
+    {
+        if (!h->api) { h->vm.host_status = 30; return -1; }
+        char name[PROC_IPC_NAME_MAX + 1];
+        if (!pico_span_name(h, name_span, name, sizeof(name))) { h->vm.host_status = 31; return -1; }
+        i32 hnd = h->api->ipc_fifo_open(name, PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV);
+        if (hnd >= 0) { h->vm.host_status = 0; return hnd; }
+        hnd = h->api->ipc_fifo_create(name, PROC_IPC_PEER_ANY,
+                                      PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV,
+                                      PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV,
+                                      PROC_IPC_FIFO_DEPTH_MAX, PROC_IPC_FIFO_MSG_MAX);
+        if (hnd < 0) { h->vm.host_status = 32; return hnd; }
+        hnd = h->api->ipc_fifo_open(name, PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV);
+        h->vm.host_status = (hnd >= 0) ? 0 : 33;
+        return hnd;
+    }
+
+    static int pico_fifo_recv_span(struct picoweb_host *h, i32 fifo)
+    {
+        if (!h->api) { h->vm.host_status = 30; return 0; }
+        if (!h->api || h->arena_top >= PICOWEB_MEM_SIZE) return 0;
+        u32 ptr = h->arena_top;
+        u32 cap = PICOWEB_MEM_SIZE - ptr;
+        if (cap > PROC_IPC_FIFO_MSG_MAX) cap = PROC_IPC_FIFO_MSG_MAX;
+        i32 got = h->api->ipc_fifo_recv(fifo, &h->mem[ptr], cap);
+        if (got <= 0) return 0;
+        h->arena_top += (u32)got;
+        return pico_alloc_span_direct(h, ptr, (u32)got);
+    }
 
 static void req_bounds(struct uhttp_bridge *b, u32 *method_s, u32 *method_n,
                        u32 *path_s, u32 *path_n, u32 *query_s, u32 *query_n,
@@ -287,6 +496,16 @@ static void picoweb_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int im
     case PV_HOOK_IO_WRITEBYTE:
         if (ctx->out_len < PV_MAX_OUT) ctx->out[ctx->out_len++] = (u8)(ctx->regs[rs1] & 0xFF);
         return;
+    case PV_HOOK_SPAN_MAKE: {
+        u32 ptr = (u32)ctx->regs[rs1];
+        i32 len = ctx->regs[rs2];
+        if (len < 0) len = 0;
+        if (PICOWEB_MEM_SIZE) ptr %= PICOWEB_MEM_SIZE;
+        if ((u32)len > PICOWEB_MEM_SIZE - ptr)
+            len = (i32)(PICOWEB_MEM_SIZE - ptr);
+        ctx->regs[rd] = pico_alloc_span_direct(h, ptr, (u32)len);
+        return;
+    }
     case PV_HOOK_SPAN_LEN: {
         i32 hd = ctx->regs[rs1];
         ctx->regs[rd] = (hd > 0 && hd < h->span_count) ? (i32)h->spans[hd].len : 0;
@@ -310,21 +529,71 @@ static void picoweb_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int im
         ctx->regs[rd] = handle;
         return;
     }
+    case PV_HOOK_SPAN_MATERIALIZE: {
+        i32 hd = ctx->regs[rs1];
+        if (hd <= 0 || hd >= h->span_count) { ctx->regs[rd] = 0; return; }
+        struct pico_span s = h->spans[hd];
+        ctx->regs[rd] = pico_alloc_span(h, &h->mem[s.ptr], s.len);
+        return;
+    }
+    case PV_HOOK_PACK_USE: {
+        u32 pack = (u32)ctx->regs[rs1];
+        if (pico_pack_ok(pack)) {
+            h->active_pack = pack;
+            ctx->regs[rd] = 1;
+        } else {
+            ctx->regs[rd] = 0;
+        }
+        return;
+    }
+    case PV_HOOK_CARD_READ:
+        ctx->regs[rd] = pico_card_read_span(h, (u32)ctx->regs[rs1]);
+        return;
+    case PV_HOOK_CARD_WRITE:
+        ctx->regs[rd] = pico_card_write_span(h, (u32)ctx->regs[rs1], ctx->regs[rs2]);
+        return;
+    case PV_HOOK_CARD_ADDRESS:
+        ctx->regs[rd] = pico_card_address_span(h, (u32)ctx->regs[rs1], (u32)ctx->regs[rs2]);
+        return;
+    case PV_HOOK_FIFO_OPEN:
+        ctx->regs[rd] = pico_fifo_open(h, ctx->regs[rs1]);
+        return;
+    case PV_HOOK_FIFO_SEND: {
+        i32 hd = ctx->regs[rs2];
+        if (h->api && hd > 0 && hd < h->span_count) {
+            struct pico_span s = h->spans[hd];
+            ctx->regs[rd] = (h->api->ipc_fifo_send(ctx->regs[rs1], &h->mem[s.ptr], s.len) == PROC_IPC_OK) ? 1 : 0;
+        } else {
+            h->vm.host_status = 30;
+            ctx->regs[rd] = 0;
+        }
+        return;
+    }
+    case PV_HOOK_FIFO_RECV:
+        ctx->regs[rd] = pico_fifo_recv_span(h, ctx->regs[rs1]);
+        return;
+    case PV_HOOK_FIFO_POLL:
+        ctx->regs[rd] = h->api ? h->api->ipc_fifo_poll(ctx->regs[rs1]) : 0;
+        if (!h->api) h->vm.host_status = 30;
+        return;
     default:
         pv_default_host(ctx, hook, rd, rs1, rs2, imm16);
         return;
     }
 }
 
-static void picoweb_init(struct picoweb_host *h, struct uhttp_bridge *b, u32 reqs)
+static void picoweb_init(struct picoweb_host *h, struct uhttp_bridge *b, struct kernel_api *api, u32 reqs)
 {
     pv_init(&h->vm);
     h->vm.host = picoweb_hook;
     h->vm.mem = h->mem;
     h->vm.mem_size = PICOWEB_MEM_SIZE;
     h->bridge = b;
+    h->api = api;
     h->reqs = reqs;
+    h->active_pack = PICOWEB_CAPSULE_PACK_MIN;
     h->arena_top = 0;
+    for (u32 i = 0; i < PICOWEB_MEM_SIZE; i++) h->mem[i] = 0;
     h->span_count = 1;
     h->spans[0].ptr = 0;
     h->spans[0].len = 0;
@@ -384,12 +653,6 @@ static u32 load_program(struct uhttp_bridge *b, u32 *words, u32 max_words)
     if (n == 0 || n > UHTTP_PICO_MAX || (n & 3U) != 0)
         return 0;
     uhttp_inval(b->pico_prog, n);
-    u32 first = (u32)b->pico_prog[0] |
-                ((u32)b->pico_prog[1] << 8) |
-                ((u32)b->pico_prog[2] << 16) |
-                ((u32)b->pico_prog[3] << 24);
-    if (first != 0x000070E1U)
-        return 0;
     u32 nw = (u32)n / 4U;
     if (nw > max_words) nw = max_words;
     for (u32 i = 0; i < nw; i++)
@@ -400,7 +663,7 @@ static u32 load_program(struct uhttp_bridge *b, u32 *words, u32 max_words)
     return nw;
 }
 
-static u32 build_body(struct uhttp_bridge *b, char *buf, u32 cap, u32 reqs, u32 *status_out)
+static u32 build_body(struct uhttp_bridge *b, struct kernel_api *api, char *buf, u32 cap, u32 reqs, u32 *status_out)
 {
 #ifdef PIOS_HTTPD_NATIVE
     if (status_out) *status_out = 200U;
@@ -440,8 +703,17 @@ static u32 build_body(struct uhttp_bridge *b, char *buf, u32 cap, u32 reqs, u32 
         nwords = loaded;
     }
 
-    picoweb_init(&h, b, reqs);
+    picoweb_init(&h, b, api, reqs);
     (void)pv_vm_run(&h.vm, program, (int)nwords);
+    if (h.vm.fault != PV_FAULT_NONE) {
+        const char *fault = "PicoScript fault\n";
+        u32 fn = u_strlen(fault);
+        if (fn >= cap) fn = cap - 1U;
+        for (u32 i = 0; i < fn; i++) buf[i] = fault[i];
+        buf[fn] = 0;
+        if (status_out) *status_out = 500U;
+        return fn;
+    }
     u32 st = (h.vm.http_status >= 100 && h.vm.http_status <= 599) ? (u32)h.vm.http_status : 200U;
     if (status_out) *status_out = st;
     u32 n = (u32)h.vm.out_len;
@@ -504,7 +776,7 @@ void user_main(struct kernel_api *api)
         char body[3072];
         u32 status = 200U;
         bool is_api = req_is_api(b);
-        u32 blen = build_body(b, body, sizeof(body), reqs, &status);
+        u32 blen = build_body(b, api, body, sizeof(body), reqs, &status);
 
         b->dbg_phase = 21U;                     /* body built: writing response */
         uhttp_clean(&b->magic, UHTTP_LINE);

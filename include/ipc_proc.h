@@ -53,6 +53,7 @@ i32 ipc_proc_fifo_create(u32 owner_principal, u32 owner_pid, const char *name,
 i32 ipc_proc_fifo_open(u32 principal, u32 pid, const char *name, u32 want_acl);
 i32 ipc_proc_fifo_send(u32 principal, i32 channel_id, const void *data, u32 len);
 i32 ipc_proc_fifo_recv(u32 principal, i32 channel_id, void *out, u32 out_max, u32 *len_out);
+i32 ipc_proc_fifo_count(u32 principal, i32 channel_id);
 i32 ipc_proc_fifo_send_span(u32 principal, i32 channel_id, const struct proc_ipc_span_desc *desc);
 i32 ipc_proc_fifo_recv_span(u32 principal, i32 channel_id, struct proc_ipc_span_desc *out);
 u32 ipc_proc_fifo_owner_pid(i32 channel_id);

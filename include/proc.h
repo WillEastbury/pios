@@ -451,6 +451,7 @@ struct kernel_api {
     i32 (*ipc_fifo_send)(i32 channel_id, const void *data, u32 len);
     i32 (*ipc_fifo_send_span)(i32 channel_id, const void *addr, u32 len, u32 flags, u64 tag);
     i32 (*ipc_fifo_recv)(i32 channel_id, void *out, u32 out_max); /* returns msg len */
+    i32 (*ipc_fifo_poll)(i32 channel_id);
     i32 (*ipc_shm_create)(const char *name, u32 peer_principal, u32 owner_acl,
                           u32 peer_acl, u32 size);
     i32 (*ipc_shm_open)(const char *name, u32 want_acl);

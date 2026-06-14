@@ -1309,6 +1309,7 @@ static i32   sys_ipc_fifo_open(const char *name, u32 want_acl);
 static i32   sys_ipc_fifo_send(i32 channel_id, const void *data, u32 len);
 static i32   sys_ipc_fifo_send_span(i32 channel_id, const void *addr, u32 len, u32 flags, u64 tag);
 static i32   sys_ipc_fifo_recv(i32 channel_id, void *out, u32 out_max);
+static i32   sys_ipc_fifo_poll(i32 channel_id);
 static i32   sys_ipc_shm_create(const char *name, u32 peer_principal, u32 owner_acl,
                                 u32 peer_acl, u32 size);
 static i32   sys_ipc_shm_open(const char *name, u32 want_acl);
@@ -1626,6 +1627,7 @@ static struct kernel_api kernel_api_tab = {
     .ipc_fifo_send   = sys_ipc_fifo_send,
     .ipc_fifo_send_span = sys_ipc_fifo_send_span,
     .ipc_fifo_recv   = sys_ipc_fifo_recv,
+    .ipc_fifo_poll   = sys_ipc_fifo_poll,
     .ipc_shm_create  = sys_ipc_shm_create,
     .ipc_shm_open    = sys_ipc_shm_open,
     .ipc_shm_map     = sys_ipc_shm_map,
@@ -5825,6 +5827,12 @@ static i32 sys_ipc_fifo_recv(i32 channel_id, void *out, u32 out_max)
     i32 r = ipc_proc_fifo_recv(principal_current(), channel_id, out, out_max, &len);
     if (r != PROC_IPC_OK) return r;
     return (i32)len;
+}
+
+static i32 sys_ipc_fifo_poll(i32 channel_id)
+{
+    if (!has_ipc_cap()) return PROC_IPC_ERR_ACCESS;
+    return ipc_proc_fifo_count(principal_current(), channel_id);
 }
 
 static i32 sys_ipc_shm_create(const char *name, u32 peer_principal, u32 owner_acl,

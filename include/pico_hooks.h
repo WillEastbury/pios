@@ -9,6 +9,11 @@
 #define PV_NET_BODY_MARKER 0xB000
 #define PV_NET_CLOSE_MARKER 0xC000
 
+/* Module container (INV-23): wire format shared with pico_module.py / picovm.js. */
+#define PV_MODULE_MAGIC 0x50534331
+#define PV_MODULE_ABI_VERSION 1
+#define PV_HOOK_TABLE_VERSION 0x42427AEB
+
 #define PV_HOOK_KERNEL_WAITIRQ                   0x01
 #define PV_HOOK_KERNEL_WAITSWIRQ                 0x02
 #define PV_HOOK_KERNEL_FIRESWIRQ                 0x03
@@ -101,6 +106,8 @@
 #define PV_HOOK_LEASE_CACHEDVALIDATE             0x5B
 #define PV_HOOK_LEASE_GETSPAN                    0x5C
 #define PV_HOOK_LEASE_GETTYPEHINT                0x5D
+#define PV_HOOK_STATUS_LAST                      0x5E
+#define PV_HOOK_MEMORY_SETCONST                  0x5F
 #define PV_HOOK_STORAGE_GETSCHEMAFORPACK         0x60
 #define PV_HOOK_STORAGE_SETSCHEMAFORPACK         0x61
 #define PV_HOOK_STORAGE_ADDCARD                  0x62
@@ -128,6 +135,9 @@
 #define PV_HOOK_XML_EMPTY                        0x79
 #define PV_HOOK_TEMPLATE_COMPILE                 0x7A
 #define PV_HOOK_TEMPLATE_RENDER                  0x7B
+#define PV_HOOK_ARENA_MARK                       0x7C
+#define PV_HOOK_ARENA_REWIND                     0x7D
+#define PV_HOOK_ARENA_RESET                      0x7E
 #define PV_HOOK_STRING_CONCAT                    0x80
 #define PV_HOOK_STRING_LENGTH                    0x81
 #define PV_HOOK_STRING_SUBSTRING                 0x82
@@ -265,5 +275,20 @@
 #define PV_HOOK_HTML_DECODE                      0x147
 #define PV_HOOK_HTML_SERIALIZE                   0x148
 #define PV_HOOK_HTML_QUERYSELECTOR               0x149
+#define PV_HOOK_GPIO_COUNT                       0x150
+#define PV_HOOK_GPIO_SETDIR                      0x151
+#define PV_HOOK_GPIO_GETDIR                      0x152
+#define PV_HOOK_GPIO_SETPULL                     0x153
+#define PV_HOOK_GPIO_GETPULL                     0x154
+#define PV_HOOK_GPIO_WRITE                       0x155
+#define PV_HOOK_GPIO_READ                        0x156
+#define PV_HOOK_PACK_USE                         0x160
+#define PV_HOOK_CARD_READ                        0x161
+#define PV_HOOK_CARD_WRITE                       0x162
+#define PV_HOOK_CARD_ADDRESS                     0x163
+#define PV_HOOK_FIFO_OPEN                        0x164
+#define PV_HOOK_FIFO_SEND                        0x165
+#define PV_HOOK_FIFO_RECV                        0x166
+#define PV_HOOK_FIFO_POLL                        0x167
 
 #endif
