@@ -11,7 +11,7 @@ if not exist build mkdir build
 set ERRORS=0
 
 for %%f in (src\*.S) do (
-    if /I not "%%~nxf"=="qemu_virt_start.S" (
+    if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" (
         echo Compiling %%~nf.S...
         "%CC%" %ASFLAGS% -c "%%f" -o "build\%%~nf.o"
         if errorlevel 1 (

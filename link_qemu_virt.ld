@@ -9,6 +9,9 @@ SECTIONS
         *(.text.boot)
         *(.text*)
     }
+    .stage2_manifest : {
+        KEEP(*(.stage2_manifest))
+    }
     .rodata : { *(.rodata*) }
     .data : { *(.data*) }
     .bss (NOLOAD) : {
@@ -26,4 +29,3 @@ SECTIONS
 
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }
-

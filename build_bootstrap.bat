@@ -62,7 +62,7 @@ for %%f in (user_el0_pico.img) do echo user_el0_pico.img size: %%~zf bytes
 echo Building full kernel as real_kernel.img...
 if not exist build mkdir build
 for %%f in (src\*.S) do (
-    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="bootstrap_trampoline.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" (
+    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="bootstrap_trampoline.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" (
         echo Compiling %%~nf.S...
         "%CC%" %ASFLAGS% -c "%%f" -o "build\%%~nf.o"
         if errorlevel 1 exit /b 1

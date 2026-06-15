@@ -113,7 +113,7 @@ static sd_card_t  card;
 static sd_stats_t stats;
 
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
-#define QEMU_RAM_SD_BLOCKS 65536U  /* 32 MiB */
+#define QEMU_RAM_SD_BLOCKS 32768U  /* 16 MiB: enough for 10MiB reserved + RAM WALFS */
 static u8 qemu_ram_sd[QEMU_RAM_SD_BLOCKS * SD_BLOCK_SIZE] ALIGNED(64);
 static bool qemu_ram_sd_ready;
 
