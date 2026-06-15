@@ -656,7 +656,16 @@ static bool vnet_poll_admin_once(void)
                 const u8 *payload = tcp + tcp_off;
                 if (rd16(tcp+2) == 80 && (tcp[13] & 0x02)) ip_tcp_reply(frame, flen, 0, 0, 0x12);
                 else if (rd16(tcp+2) == 80 && payload_len > 0 && http_payload_start(payload, payload_len)) {
-                    static const u8 resp[]="HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nPIOS QEMU LAN ADMIN\r\nwalfs=ok\r\n";
+                    static const u8 resp[] =
+                        "HTTP/1.0 200 OK\r\n"
+                        "Content-Type: text/html\r\n"
+                        "Connection: close\r\n\r\n"
+                        "<!doctype html><title>PIOS QEMU Admin</title>"
+                        "<body style='background:#050607;color:#dde7f0;font-family:Segoe UI,Aptos,sans-serif'>"
+                        "<h1 style='color:#fd8ea1'>PIOS QEMU Admin Console</h1>"
+                        "<p>platform=qemu-virt</p><p>boot=BOOTAA64.EFI/QEMU EDK2</p>"
+                        "<p>stage2=one-kernel-pgs2</p><p style='color:#4ade80'>RAM SD OK | WALFS OK | LAN hostfwd OK</p>"
+                        "</body>";
                     ip_tcp_reply(frame, flen, resp, sizeof(resp)-1U, 0x19); return true;
                 }
             }
