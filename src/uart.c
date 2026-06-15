@@ -9,6 +9,7 @@
 #include "rp1_gpio.h"
 #include "mmio.h"
 #include "fb.h"
+#include "platform.h"
 
 /* Use RP1 UART0 for GPIO14/15 serial header */
 static bool use_rp1;
@@ -28,6 +29,7 @@ static bool use_rp1;
 #define FR_RXFE     (1 << 4)    /* RX FIFO empty */
 
 void uart_init(void) {
+#if PIOS_HAS_RP1
     /* Debug: dump GPIO14/15 config to serial to see firmware state */
     volatile u32 *gpio14_ctrl = (volatile u32 *)(0x1F000D0000UL + 14 * 8 + 0x04);
     volatile u32 *gpio15_ctrl = (volatile u32 *)(0x1F000D0000UL + 15 * 8 + 0x04);
@@ -76,6 +78,9 @@ void uart_init(void) {
 #endif
 
     use_rp1 = true;
+#else
+    use_rp1 = false;
+#endif
 }
 
 /* Mirror all uart output to HDMI framebuffer when enabled */

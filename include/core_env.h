@@ -20,31 +20,32 @@
 
 #pragma once
 #include "types.h"
+#include "platform.h"
 
-#define CORE_PRIV_SIZE      0x01000000UL  /* 16MB per core */
+#define CORE_PRIV_SIZE      PIOS_CORE_PRIV_SIZE
 
-#define CORE0_RAM_BASE      0x00800000UL
-#define CORE1_RAM_BASE      0x01800000UL
-#define CORE2_RAM_BASE      0x02800000UL
-#define CORE3_RAM_BASE      0x03800000UL
+#define CORE0_RAM_BASE      PIOS_CORE0_RAM_BASE
+#define CORE1_RAM_BASE      PIOS_CORE1_RAM_BASE
+#define CORE2_RAM_BASE      PIOS_CORE2_RAM_BASE
+#define CORE3_RAM_BASE      PIOS_CORE3_RAM_BASE
 
-#define SHARED_FIFO_BASE    0x04800000UL
-#define SHARED_FIFO_SIZE    0x00100000UL  /* 1MB */
+#define SHARED_FIFO_BASE    PIOS_SHARED_FIFO_BASE
+#define SHARED_FIFO_SIZE    PIOS_SHARED_FIFO_SIZE
 
-#define DMA_NET_BASE        0x04900000UL
-#define DMA_NET_SIZE        0x00200000UL  /* 2MB */
+#define DMA_NET_BASE        PIOS_DMA_NET_BASE
+#define DMA_NET_SIZE        PIOS_DMA_NET_SIZE
 
-#define DMA_DISK_BASE       0x04B00000UL
-#define DMA_DISK_SIZE       0x00200000UL  /* 2MB */
+#define DMA_DISK_BASE       PIOS_DMA_DISK_BASE
+#define DMA_DISK_SIZE       PIOS_DMA_DISK_SIZE
 
-#define IPC_SHM_BASE        0x04D00000UL
-#define IPC_SHM_SIZE        0x00100000UL  /* 1MB */
+#define IPC_SHM_BASE        PIOS_IPC_SHM_BASE
+#define IPC_SHM_SIZE        PIOS_IPC_SHM_SIZE
 
 /* HDMI double-buffer: rendering goes to this cached back buffer, then a DMA
  * blit pushes dirty rows to the VideoCore scanout buffer. Sized for 1080p32
  * (1920*1080*4 = 8.29MB) with headroom for pitch padding. */
-#define FB_BACK_BASE        0x05000000UL
-#define FB_BACK_SIZE        0x01000000UL  /* 16MB */
+#define FB_BACK_BASE        PIOS_FB_BACK_BASE
+#define FB_BACK_SIZE        PIOS_FB_BACK_SIZE
 
 static const u64 core_ram_bases[4] = {
     CORE0_RAM_BASE, CORE1_RAM_BASE, CORE2_RAM_BASE, CORE3_RAM_BASE

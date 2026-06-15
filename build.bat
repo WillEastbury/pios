@@ -11,20 +11,24 @@ if not exist build mkdir build
 set ERRORS=0
 
 for %%f in (src\*.S) do (
-    echo Compiling %%~nf.S...
-    "%CC%" %ASFLAGS% -c "%%f" -o "build\%%~nf.o"
-    if errorlevel 1 (
-        echo FAIL: %%~nf.S
-        set /a ERRORS+=1
+    if /I not "%%~nxf"=="qemu_virt_start.S" (
+        echo Compiling %%~nf.S...
+        "%CC%" %ASFLAGS% -c "%%f" -o "build\%%~nf.o"
+        if errorlevel 1 (
+            echo FAIL: %%~nf.S
+            set /a ERRORS+=1
+        )
     )
 )
 
 for %%f in (src\*.c) do (
-    echo Compiling %%~nf.c...
-    "%CC%" %CFLAGS% -c "%%f" -o "build\%%~nf.o"
-    if errorlevel 1 (
-        echo FAIL: %%~nf.c
-        set /a ERRORS+=1
+    if /I not "%%~nxf"=="qemu_virt_min.c" (
+        echo Compiling %%~nf.c...
+        "%CC%" %CFLAGS% -c "%%f" -o "build\%%~nf.o"
+        if errorlevel 1 (
+            echo FAIL: %%~nf.c
+            set /a ERRORS+=1
+        )
     )
 )
 

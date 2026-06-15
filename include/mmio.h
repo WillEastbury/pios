@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+#include "platform.h"
 
 /*
  * BCM2712 (Raspberry Pi 5) peripheral address map.
@@ -8,30 +9,30 @@
  * Adjust if your firmware/DTB uses a different mapping.
  */
 
-#define PERIPH_BASE         0x107C000000UL
+#define PERIPH_BASE         PIOS_PERIPH_BASE
 
 /* PL011 UART0 - pre-configured by firmware for serial console.
  * On BCM2712 this is at PERIPH_BASE + 0x201000 in the SoC address map,
  * but GPIO14/15 UART is routed through RP1. For early boot before our
  * PCIe driver runs, firmware maps RP1 at 0x1c00000000 with enable_rp1_uart=1.
  * After our PCIe init remaps RP1 to RP1_BAR_BASE, use rp1_uart.h instead. */
-#define UART0_BASE          (PERIPH_BASE + 0x201000)
+#define UART0_BASE          PIOS_UART0_BASE
 
 /* VideoCore Mailbox (confirmed from bcm2712.dtsi: mailbox@7c013880) */
-#define MBOX_BASE           (PERIPH_BASE + 0x013880)
+#define MBOX_BASE           PIOS_MBOX_BASE
 
 /* EMMC2 / SD Host Controller
  * Pi 5 uses 0x1000FFF000 (not PERIPH_BASE + 0x300000 like Pi 4) */
-#define EMMC2_BASE          0x1000FFF000UL
+#define EMMC2_BASE          PIOS_EMMC2_BASE
 
 /* GENET v5 Ethernet MAC */
-#define GENET_BASE          0x107D580000UL
+#define GENET_BASE          PIOS_GENET_BASE
 
 /* BCM2712 PCIe Root Complex (PCIe2, quad-lane, connected to RP1) */
-#define PCIE_RC_BASE        0x1000120000UL
+#define PCIE_RC_BASE        PIOS_PCIE_RC_BASE
 
 /* RP1 southbridge register window (mapped via PCIe outbound ATU) */
-#define RP1_BAR_BASE        0x1F00000000UL
+#define RP1_BAR_BASE        PIOS_RP1_BAR_BASE
 
 static inline void mmio_write(u64 addr, u32 val) {
     *(volatile u32 *)addr = val;

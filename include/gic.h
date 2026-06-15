@@ -4,14 +4,15 @@
 
 #pragma once
 #include "types.h"
+#include "platform.h"
 
 /*
  * BCM2712 GIC-400 base addresses.
  * Distributor and CPU interface are at fixed offsets from GIC base.
  */
-#define GIC_BASE            0x107FFF8000UL
-#define GICD_BASE           (GIC_BASE + 0x1000)
-#define GICC_BASE           (GIC_BASE + 0x2000)
+#define GIC_BASE            PIOS_GIC_BASE
+#define GICD_BASE           PIOS_GICD_BASE
+#define GICC_BASE           PIOS_GICC_BASE
 
 /* Distributor registers */
 #define GICD_CTLR           (GICD_BASE + 0x000)

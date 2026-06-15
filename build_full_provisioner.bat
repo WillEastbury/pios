@@ -19,14 +19,14 @@ mkdir build
 
 echo Building second-stage payload as real_kernel.img...
 for %%f in (src\*.S) do (
-    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="provision_payload.S" (
+    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" (
         echo Compiling %%~nf.S...
         "%CC%" %ASFLAGS% -c "%%f" -o "build\%%~nf.o"
         if errorlevel 1 exit /b 1
     )
 )
 for %%f in (src\*.c) do (
-    if /I not "%%~nxf"=="bootstrap.c" if /I not "%%~nxf"=="provision.c" (
+    if /I not "%%~nxf"=="bootstrap.c" if /I not "%%~nxf"=="provision.c" if /I not "%%~nxf"=="qemu_virt_min.c" (
         echo Compiling %%~nf.c...
         "%CC%" %CFLAGS% -c "%%f" -o "build\%%~nf.o"
         if errorlevel 1 exit /b 1
@@ -40,14 +40,14 @@ if errorlevel 1 exit /b 1
 
 echo Building normal-boot one-off provisioner kernel8.img...
 for %%f in (src\*.S) do (
-    if /I not "%%~nxf"=="bootstrap_start.S" (
+    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="qemu_virt_start.S" (
         echo Compiling provision %%~nf.S...
         "%CC%" %ASFLAGS% -c "%%f" -o "build\%%~nf.o"
         if errorlevel 1 exit /b 1
     )
 )
 for %%f in (src\*.c) do (
-    if /I not "%%~nxf"=="bootstrap.c" if /I not "%%~nxf"=="provision.c" (
+    if /I not "%%~nxf"=="bootstrap.c" if /I not "%%~nxf"=="provision.c" if /I not "%%~nxf"=="qemu_virt_min.c" (
         echo Compiling provision %%~nf.c...
         "%CC%" %CFLAGS% -DPIOS_ONEOFF_PROVISION -c "%%f" -o "build\%%~nf.o"
         if errorlevel 1 exit /b 1
