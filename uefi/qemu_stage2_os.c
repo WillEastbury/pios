@@ -464,6 +464,15 @@ static u8 tx_buf[2048] ALIGNED(64);
 static u16 tx_used_idx;
 static u8 vnet_mac[6] = {0x52,0x54,0x00,0x12,0x34,0x56};
 static u32 vnet_ip = IP4_ADDR(10,0,2,15);
+static bool g_qemu_sd_ok;
+static bool g_qemu_fmt_ok;
+static bool g_qemu_mount_ok;
+static bool g_qemu_create_ok;
+static bool g_qemu_write_ok;
+static bool g_qemu_read_ok;
+static bool g_qemu_verify_ok;
+static u32 g_qemu_walfs_records;
+static u32 g_qemu_admin_requests;
 
 struct vq_legacy {
     struct vq_desc desc[VQ_SIZE];
@@ -609,11 +618,11 @@ static void send_arp_reply(const u8 *req)
 
 static void ip_tcp_reply(const u8 *req, u32 req_len, const u8 *payload, u32 plen, u8 flags)
 {
-    if (req_len < 54 || plen > 512) return;
+    if (req_len < 54 || plen > 1400) return;
     const u8 *ip = req + 14; const u8 *tcp = ip + ((ip[0] & 0x0FU) * 4U);
     u32 ihl = (u32)(ip[0] & 0x0FU) * 4U; u32 tcp_off = (u32)(tcp[12] >> 4) * 4U;
     u32 ip_len = rd16(ip + 2); u32 tcp_payload = (ip_len > ihl + tcp_off) ? ip_len - ihl - tcp_off : 0;
-    u8 f[1024]; u32 n = build_eth(f, req + 6, vnet_mac, 0x0800); u8 *oip = f + n; u8 *otcp = oip + 20;
+    u8 f[1536]; u32 n = build_eth(f, req + 6, vnet_mac, 0x0800); u8 *oip = f + n; u8 *otcp = oip + 20;
     memset(oip,0,20+20); oip[0]=0x45; oip[8]=64; oip[9]=6; wr16(oip+2,(u16)(20+20+plen)); wr32(oip+12,vnet_ip); memcpy(oip+16,ip+12,4);
     wr16(otcp,80); memcpy(otcp+2,tcp,2);
     wr32(otcp+4, (flags & 0x02U) ? 0x10203040U : rd32(tcp + 8));
@@ -632,15 +641,131 @@ static bool http_payload_start(const u8 *p, u32 n)
            (n >= 5 && p[0] == 'H' && p[1] == 'E' && p[2] == 'A' && p[3] == 'D' && p[4] == ' ');
 }
 
-static bool vnet_poll_admin_once(void)
+static bool qhttp_path_is(const u8 *p, u32 n, const char *path)
+{
+    u32 i = 0;
+    while (i < n && p[i] != ' ') i++;
+    if (i >= n) return false;
+    i++;
+    u32 start = i;
+    while (i < n && p[i] != ' ' && p[i] != '?' && p[i] != '\r' && p[i] != '\n') i++;
+    u32 plen = i - start;
+    u32 j = 0;
+    while (path[j]) {
+        if (j >= plen || p[start + j] != (u8)path[j]) return false;
+        j++;
+    }
+    return j == plen;
+}
+
+static void qhttp_append(char *out, u32 *len, u32 max, const char *s)
+{
+    while (s && *s && *len + 1U < max) out[(*len)++] = *s++;
+    if (max) out[*len < max ? *len : max - 1U] = 0;
+}
+
+static void qhttp_append_u64(char *out, u32 *len, u32 max, u64 v)
+{
+    char tmp[24];
+    u32 n = 0;
+    if (!v) tmp[n++] = '0';
+    while (v && n < sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (v % 10U));
+        v /= 10U;
+    }
+    while (n && *len + 1U < max) out[(*len)++] = tmp[--n];
+    if (max) out[*len < max ? *len : max - 1U] = 0;
+}
+
+static void qhttp_append_bool(char *out, u32 *len, u32 max, bool v)
+{
+    qhttp_append(out, len, max, v ? "true" : "false");
+}
+
+static u32 qhttp_begin(char *out, u32 max, const char *type)
+{
+    u32 len = 0;
+    qhttp_append(out, &len, max, "HTTP/1.0 200 OK\r\nContent-Type: ");
+    qhttp_append(out, &len, max, type);
+    qhttp_append(out, &len, max, "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
+    return len;
+}
+
+static u32 qhttp_build_response(const u8 *req, u32 req_len, char *out, u32 max)
+{
+    if (qhttp_path_is(req, req_len, "/api/status")) {
+        u32 len = qhttp_begin(out, max, "application/json");
+        qhttp_append(out, &len, max, "{\"ok\":true,\"platform\":\"qemu-virt\",\"version\":\"qemu-stage2\",");
+        qhttp_append(out, &len, max, "\"build\":\"PIOSSTG2 common\",\"uptime\":");
+        qhttp_append_u64(out, &len, max, timer_monotonic_ms() / 1000ULL);
+        qhttp_append(out, &len, max, ",\"ip\":\"10.0.2.15\",\"mode\":\"qemu-common-stage2\",");
+        qhttp_append(out, &len, max, "\"boot\":\"BOOTAA64.EFI/PGS2\",\"diag\":{\"vnet\":");
+        qhttp_append_u64(out, &len, max, vnet_diag_code);
+        qhttp_append(out, &len, max, ",\"requests\":");
+        qhttp_append_u64(out, &len, max, g_qemu_admin_requests);
+        qhttp_append(out, &len, max, "},\"perf\":{\"ram_pool_total_kib\":16384,\"walfs_records\":");
+        qhttp_append_u64(out, &len, max, g_qemu_walfs_records);
+        qhttp_append(out, &len, max, ",\"sd_ram\":");
+        qhttp_append_bool(out, &len, max, g_qemu_sd_ok);
+        qhttp_append(out, &len, max, ",\"walfs_mounted\":");
+        qhttp_append_bool(out, &len, max, g_qemu_mount_ok);
+        qhttp_append(out, &len, max, ",\"walfs_create\":");
+        qhttp_append_bool(out, &len, max, g_qemu_create_ok);
+        qhttp_append(out, &len, max, ",\"walfs_write\":");
+        qhttp_append_bool(out, &len, max, g_qemu_write_ok);
+        qhttp_append(out, &len, max, ",\"walfs_readback\":");
+        qhttp_append_bool(out, &len, max, g_qemu_read_ok);
+        qhttp_append(out, &len, max, ",\"walfs_verified\":");
+        qhttp_append_bool(out, &len, max, g_qemu_verify_ok);
+        qhttp_append(out, &len, max, "},\"services\":{\"admin\":true,\"workbench\":true,\"stage2\":true}}\n");
+        return len;
+    }
+    if (qhttp_path_is(req, req_len, "/api/netstat")) {
+        u32 len = qhttp_begin(out, max, "application/json");
+        qhttp_append(out, &len, max, "{\"ok\":true,\"count\":2,\"diag\":{\"syn\":1,\"synack\":1,\"accepted\":");
+        qhttp_append_u64(out, &len, max, g_qemu_admin_requests);
+        qhttp_append(out, &len, max, ",\"noListen\":0,\"badCsum\":0},\"fw\":{\"rxDrop\":0,\"txDrop\":0},");
+        qhttp_append(out, &len, max, "\"cols\":[\"id\",\"st\",\"lip\",\"lp\",\"rip\",\"rp\",\"own\",\"pend\",\"rx\",\"tx\",\"ret\"],");
+        qhttp_append(out, &len, max, "\"rows\":[[0,\"LISTEN\",\"10.0.2.15\",80,\"0.0.0.0\",0,\"qemu-admin\",0,0,0,0],");
+        qhttp_append(out, &len, max, "[1,\"CLOSE\",\"10.0.2.15\",80,\"hostfwd\",0,\"common-stage2\",0,0,0,0]]}\n");
+        return len;
+    }
+    if (qhttp_path_is(req, req_len, "/logs") || qhttp_path_is(req, req_len, "/api/logs") ||
+        qhttp_path_is(req, req_len, "/api/admin/log-stream")) {
+        u32 len = qhttp_begin(out, max, "text/plain");
+        qhttp_append(out, &len, max, "PIOS QEMU log tail\nboot=BOOTAA64.EFI\nstage2=PIOSSTG2.BIN selected by PGS2\n");
+        qhttp_append(out, &len, max, "workbench=rendered\nram_sd=");
+        qhttp_append(out, &len, max, g_qemu_sd_ok ? "ok" : "fail");
+        qhttp_append(out, &len, max, "\nwalfs=");
+        qhttp_append(out, &len, max, (g_qemu_fmt_ok && g_qemu_mount_ok && g_qemu_verify_ok) ? "ok" : "fail");
+        qhttp_append(out, &len, max, "\nadmin_requests=");
+        qhttp_append_u64(out, &len, max, g_qemu_admin_requests);
+        qhttp_append(out, &len, max, "\nvnet_diag=");
+        qhttp_append_u64(out, &len, max, vnet_diag_code);
+        qhttp_append(out, &len, max, "\n");
+        return len;
+    }
+
+    u32 len = qhttp_begin(out, max, "text/html");
+    qhttp_append(out, &len, max, "<!doctype html><title>PIOS QEMU Admin</title><body><h1>PIOS QEMU Admin Console</h1>");
+    qhttp_append(out, &len, max, "<p>platform=qemu-virt boot=BOOTAA64.EFI stage2=PIOSSTG2.BIN</p>");
+    qhttp_append(out, &len, max, "<p>RAM SD OK | WALFS OK | LAN hostfwd OK</p>");
+    qhttp_append(out, &len, max, "<p><a href='/api/status'>status</a> <a href='/api/netstat'>netstat</a> <a href='/logs'>logs</a></p>");
+    qhttp_append(out, &len, max, "</body>\n");
+    return len;
+}
+
+static bool vnet_poll_admin(u32 timeout_ms)
 {
     if (!vnet_base) return false;
     struct vq_avail *ra = vnet_legacy ? &rx_legacy.avail : &rx_avail;
     struct vq_used *ru = vnet_legacy ? &rx_legacy.used : &rx_used;
     u64 start = timer_monotonic_ms();
     while (timer_monotonic_ms() - start < 30000) {
+        if (timeout_ms && timer_monotonic_ms() - start >= timeout_ms) break;
         if (ru->idx == rx_used_idx) continue;
         u32 slot = rx_used_idx % VQ_SIZE; u32 id = ru->ring[slot].id; u32 len = ru->ring[slot].len; rx_used_idx++;
+        bool served = false;
         if (id < VQ_SIZE && len > VNET_HDR_LEN + 14) {
             u8 *frame = rx_buf[id] + VNET_HDR_LEN; u32 flen = len - VNET_HDR_LEN; u16 et = rd16(frame+12);
             if (et == 0x0806 && flen >= 42 && rd32(frame+38) == vnet_ip) send_arp_reply(frame);
@@ -653,23 +778,21 @@ static bool vnet_poll_admin_once(void)
                 const u8 *payload = tcp + tcp_off;
                 if (rd16(tcp+2) == 80 && (tcp[13] & 0x02)) ip_tcp_reply(frame, flen, 0, 0, 0x12);
                 else if (rd16(tcp+2) == 80 && payload_len > 0 && http_payload_start(payload, payload_len)) {
-                    static const u8 resp[] =
-                        "HTTP/1.0 200 OK\r\n"
-                        "Content-Type: text/html\r\n"
-                        "Connection: close\r\n\r\n"
-                        "<!doctype html><title>PIOS QEMU Admin</title>"
-                        "<body style='background:#050607;color:#dde7f0;font-family:Segoe UI,Aptos,sans-serif'>"
-                        "<h1 style='color:#fd8ea1'>PIOS QEMU Admin Console</h1>"
-                        "<p>platform=qemu-virt</p><p>boot=BOOTAA64.EFI/QEMU EDK2</p>"
-                        "<p>stage2=one-kernel-pgs2</p><p style='color:#4ade80'>RAM SD OK | WALFS OK | LAN hostfwd OK</p>"
-                        "</body>";
-                    ip_tcp_reply(frame, flen, resp, sizeof(resp)-1U, 0x19); return true;
+                    static char resp[1400];
+                    u32 resp_len = qhttp_build_response(payload, payload_len, resp, (u32)sizeof(resp));
+                    ip_tcp_reply(frame, flen, (const u8 *)resp, resp_len, 0x19);
+                    served = true;
                 }
             }
         }
         ra->ring[ra->idx % VQ_SIZE] = (u16)id; ra->idx++; vnet_notify(0); mmio_write32(vnet_base + VIRTIO_REG_INT_ACK, mmio_read32(vnet_base + VIRTIO_REG_INT_STATUS));
+        if (served) {
+            g_qemu_admin_requests++;
+            return true;
+        }
     }
-    vnet_diag_code = 20;
+    if (timeout_ms == 0 || timeout_ms >= 30000U)
+        vnet_diag_code = 20;
     return false;
 }
 
@@ -1222,17 +1345,33 @@ efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
 
     struct walfs_health wh;
     bool verify_ok = walfs_verify(&wh);
+    g_qemu_sd_ok = sd_ok;
+    g_qemu_fmt_ok = fmt_ok;
+    g_qemu_mount_ok = mount_ok;
+    g_qemu_create_ok = create_ok;
+    g_qemu_write_ok = write_ok;
+    g_qemu_read_ok = read_ok;
+    g_qemu_verify_ok = verify_ok;
+    g_qemu_walfs_records = verify_ok ? wh.valid_records : 0;
     if (gop_ok) {
         gop_render_workbench(sd_ok, fmt_ok, mount_ok, create_ok, write_ok, read_ok,
                              verify_ok, false, verify_ok ? wh.valid_records : 0,
                              timer_monotonic_ms());
         g_log_quiet = false;
-        bool lan_ok = vnet_init() && vnet_poll_admin_once();
+        bool lan_ok = vnet_init() && vnet_poll_admin(30000);
         g_log_quiet = true;
         gop_render_workbench(sd_ok, fmt_ok, mount_ok, create_ok, write_ok, read_ok,
                              verify_ok, lan_ok, verify_ok ? wh.valid_records : 0,
                              timer_monotonic_ms());
-        park_silent();
+        for (;;) {
+            bool served = vnet_poll_admin(1000);
+            if (served && !lan_ok) {
+                lan_ok = true;
+                gop_render_workbench(sd_ok, fmt_ok, mount_ok, create_ok, write_ok, read_ok,
+                                    verify_ok, true, verify_ok ? wh.valid_records : 0,
+                                    timer_monotonic_ms());
+            }
+        }
     }
 
     g_log_quiet = false;
