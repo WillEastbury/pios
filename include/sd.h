@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+#include "platform.h"
 
 /*
  * Raw SD block I/O via SDHCI (BCM2712 EMMC2 controller).
@@ -48,3 +49,9 @@ typedef struct {
 } sd_stats_t;
 
 const sd_stats_t *sd_get_stats(void);
+
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+const char *sd_qemu_backend_name(void);
+bool sd_qemu_virtio_blk_ready(void);
+u32 sd_qemu_virtio_blk_diag(void);
+#endif

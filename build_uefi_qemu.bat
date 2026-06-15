@@ -45,4 +45,5 @@ if errorlevel 1 exit /b 1
 
 for %%f in (build_uefi\EFI\BOOT\BOOTAA64.EFI) do echo BOOTAA64.EFI size: %%~zf bytes
 for %%f in (build_uefi\PIOSSTG2.BIN) do echo PIOSSTG2.BIN size: %%~zf bytes
-echo Run with: qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a53 -m 512M -nographic -bios "C:\Program Files\qemu\share\edk2-aarch64-code.fd" -drive if=none,file=fat:rw:build_uefi,format=raw,id=esp -device virtio-blk-device,drive=esp
+echo Optional persistent disk: fsutil file createnew qemu_pios_disk.img 67108864
+echo Run with: qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a53 -m 512M -nographic -bios "C:\Program Files\qemu\share\edk2-aarch64-code.fd" -drive if=none,file=fat:rw:build_uefi,format=raw,id=esp -device virtio-blk-device,drive=esp -drive if=none,file=qemu_pios_disk.img,format=raw,id=piosdisk -device virtio-blk-device,drive=piosdisk

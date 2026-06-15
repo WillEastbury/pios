@@ -111,11 +111,143 @@
 
 static sd_card_t  card;
 static sd_stats_t stats;
+static inline u64 sd_now_us(void);
 
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
 #define QEMU_RAM_SD_BLOCKS 32768U  /* 16 MiB: enough for 10MiB reserved + RAM WALFS */
+#define QEMU_VIRTIO_MMIO_BASE       0x0A000000ULL
+#define QEMU_VIRTIO_MMIO_STRIDE     0x200ULL
+#define QEMU_VIRTIO_MMIO_COUNT      32U
+#define QEMU_VIRTIO_MMIO_MAGIC      0x74726976U
+#define QEMU_VIRTIO_BLK_DEVICE_ID   2U
+#define QEMU_VIRTIO_STATUS_ACK      1U
+#define QEMU_VIRTIO_STATUS_DRIVER   2U
+#define QEMU_VIRTIO_STATUS_DRIVER_OK 4U
+#define QEMU_VIRTIO_STATUS_FEAT_OK  8U
+#define QEMU_VIRTQ_DESC_F_NEXT      1U
+#define QEMU_VIRTQ_DESC_F_WRITE     2U
+#define QEMU_BLK_VQ_SIZE            8U
+#define QEMU_BLK_TIMEOUT_US         5000000ULL
+#define QEMU_VIRTIO_REG_MAGIC       0x000U
+#define QEMU_VIRTIO_REG_VERSION     0x004U
+#define QEMU_VIRTIO_REG_DEVICE_ID   0x008U
+#define QEMU_VIRTIO_REG_DEVICE_FEAT 0x010U
+#define QEMU_VIRTIO_REG_DEVICE_SEL  0x014U
+#define QEMU_VIRTIO_REG_DRIVER_FEAT 0x020U
+#define QEMU_VIRTIO_REG_DRIVER_SEL  0x024U
+#define QEMU_VIRTIO_REG_GUEST_PAGE  0x028U
+#define QEMU_VIRTIO_REG_QUEUE_SEL   0x030U
+#define QEMU_VIRTIO_REG_QUEUE_NUMMAX 0x034U
+#define QEMU_VIRTIO_REG_QUEUE_NUM   0x038U
+#define QEMU_VIRTIO_REG_QUEUE_ALIGN 0x03CU
+#define QEMU_VIRTIO_REG_QUEUE_PFN   0x040U
+#define QEMU_VIRTIO_REG_QUEUE_READY 0x044U
+#define QEMU_VIRTIO_REG_QUEUE_NOTIFY 0x050U
+#define QEMU_VIRTIO_REG_INT_STATUS  0x060U
+#define QEMU_VIRTIO_REG_INT_ACK     0x064U
+#define QEMU_VIRTIO_REG_STATUS      0x070U
+#define QEMU_VIRTIO_REG_Q_DESC_LOW  0x080U
+#define QEMU_VIRTIO_REG_Q_DESC_HIGH 0x084U
+#define QEMU_VIRTIO_REG_Q_DRV_LOW   0x090U
+#define QEMU_VIRTIO_REG_Q_DRV_HIGH  0x094U
+#define QEMU_VIRTIO_REG_Q_DEV_LOW   0x0A0U
+#define QEMU_VIRTIO_REG_Q_DEV_HIGH  0x0A4U
+#define QEMU_VIRTIO_BLK_CONFIG_CAPACITY 0x100U
+#define QEMU_VIRTIO_BLK_T_IN        0U
+#define QEMU_VIRTIO_BLK_T_OUT       1U
+#define QEMU_VIRTIO_BLK_S_OK        0U
+
 static u8 qemu_ram_sd[QEMU_RAM_SD_BLOCKS * SD_BLOCK_SIZE] ALIGNED(64);
 static bool qemu_ram_sd_ready;
+static u64 qemu_blk_base;
+static bool qemu_blk_legacy;
+static bool qemu_blk_ready;
+static u64 qemu_blk_sectors;
+static u32 qemu_blk_diag;
+
+struct qemu_vq_desc {
+    u64 addr;
+    u32 len;
+    u16 flags;
+    u16 next;
+} PACKED;
+
+struct qemu_vq_avail {
+    u16 flags;
+    u16 idx;
+    u16 ring[QEMU_BLK_VQ_SIZE];
+    u16 used_event;
+} PACKED;
+
+struct qemu_vq_used_elem {
+    u32 id;
+    u32 len;
+} PACKED;
+
+struct qemu_vq_used {
+    u16 flags;
+    u16 idx;
+    struct qemu_vq_used_elem ring[QEMU_BLK_VQ_SIZE];
+    u16 avail_event;
+} PACKED;
+
+struct qemu_vq_legacy {
+    struct qemu_vq_desc desc[QEMU_BLK_VQ_SIZE];
+    struct qemu_vq_avail avail;
+    u8 pad[4096U - (sizeof(struct qemu_vq_desc) * QEMU_BLK_VQ_SIZE) - sizeof(struct qemu_vq_avail)];
+    struct qemu_vq_used used;
+    u8 tail_pad[128];
+} ALIGNED(4096);
+
+struct qemu_blk_req_hdr {
+    u32 type;
+    u32 reserved;
+    u64 sector;
+} PACKED;
+
+static struct qemu_vq_desc qemu_blk_desc[QEMU_BLK_VQ_SIZE] ALIGNED(64);
+static struct qemu_vq_avail qemu_blk_avail ALIGNED(64);
+static struct qemu_vq_used qemu_blk_used ALIGNED(64);
+static struct qemu_vq_legacy qemu_blk_legacy_q;
+static struct qemu_blk_req_hdr qemu_blk_req ALIGNED(64);
+static u8 qemu_blk_status[64] ALIGNED(64);
+static u16 qemu_blk_used_idx;
+
+static void qemu_dcache_clean_range(u64 start, u64 size)
+{
+    if (size == 0) return;
+    u64 a = start & ~63ULL;
+    u64 e = (start + size + 63ULL) & ~63ULL;
+    while (a < e) {
+        __asm__ volatile("dc cvac, %0" :: "r"(a) : "memory");
+        a += 64U;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void qemu_dcache_invalidate_range(u64 start, u64 size)
+{
+    if (size == 0) return;
+    u64 a = start & ~63ULL;
+    u64 e = (start + size + 63ULL) & ~63ULL;
+    while (a < e) {
+        __asm__ volatile("dc ivac, %0" :: "r"(a) : "memory");
+        a += 64U;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void qemu_dcache_clean_invalidate_range(u64 start, u64 size)
+{
+    if (size == 0) return;
+    u64 a = start & ~63ULL;
+    u64 e = (start + size + 63ULL) & ~63ULL;
+    while (a < e) {
+        __asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+        a += 64U;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+}
 
 static bool qemu_ram_lba_ok(u32 lba, u32 count)
 {
@@ -131,13 +263,216 @@ static void qemu_ram_copy_in(u8 *dst, const u8 *src, u32 n)
 {
     for (u32 i = 0; i < n; i++) dst[i] = src[i];
 }
+
+static void qemu_blk_notify(u32 q)
+{
+    __asm__ volatile("dsb sy" ::: "memory");
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_QUEUE_NOTIFY, q);
+}
+
+static bool qemu_blk_setup_queue(struct qemu_vq_desc *d,
+                                 struct qemu_vq_avail *a,
+                                 struct qemu_vq_used *u)
+{
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_QUEUE_SEL, 0);
+    if (mmio_read(qemu_blk_base + QEMU_VIRTIO_REG_QUEUE_NUMMAX) < QEMU_BLK_VQ_SIZE)
+        return false;
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_QUEUE_NUM, QEMU_BLK_VQ_SIZE);
+    if (qemu_blk_legacy) {
+        mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_GUEST_PAGE, 4096);
+        mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_QUEUE_ALIGN, 4096);
+        mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_QUEUE_PFN, (u32)((u64)(usize)d >> 12));
+        return true;
+    }
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_Q_DESC_LOW, (u32)(usize)d);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_Q_DESC_HIGH, (u32)((u64)(usize)d >> 32));
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_Q_DRV_LOW, (u32)(usize)a);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_Q_DRV_HIGH, (u32)((u64)(usize)a >> 32));
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_Q_DEV_LOW, (u32)(usize)u);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_Q_DEV_HIGH, (u32)((u64)(usize)u >> 32));
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_QUEUE_READY, 1);
+    return true;
+}
+
+static bool qemu_blk_probe(void)
+{
+    u32 blocks = 0;
+    u64 selected = 0;
+    for (u32 i = 0; i < QEMU_VIRTIO_MMIO_COUNT; i++) {
+        u64 base = QEMU_VIRTIO_MMIO_BASE + (u64)i * QEMU_VIRTIO_MMIO_STRIDE;
+        if (mmio_read(base + QEMU_VIRTIO_REG_MAGIC) == QEMU_VIRTIO_MMIO_MAGIC &&
+            mmio_read(base + QEMU_VIRTIO_REG_DEVICE_ID) == QEMU_VIRTIO_BLK_DEVICE_ID) {
+            blocks++;
+            if (selected == 0)
+                selected = base;
+        }
+    }
+    if (blocks < 2 || selected == 0)
+        return false;
+    qemu_blk_base = selected;
+    qemu_blk_diag = blocks;
+    return true;
+}
+
+static bool qemu_blk_init(void)
+{
+    if (qemu_blk_ready)
+        return true;
+    qemu_blk_diag = 0;
+    if (!qemu_blk_probe()) {
+        qemu_blk_diag = 1;
+        return false;
+    }
+
+    u32 ver = mmio_read(qemu_blk_base + QEMU_VIRTIO_REG_VERSION);
+    if (ver != 1U && ver != 2U) {
+        qemu_blk_diag = 0x200U | ver;
+        return false;
+    }
+    qemu_blk_legacy = (ver == 1U);
+
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_DEVICE_SEL, 0);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_DEVICE_SEL, 1);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_STATUS, 0);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_STATUS, QEMU_VIRTIO_STATUS_ACK);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_STATUS, QEMU_VIRTIO_STATUS_ACK | QEMU_VIRTIO_STATUS_DRIVER);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_DRIVER_SEL, 0);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_DRIVER_FEAT, 0);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_DRIVER_SEL, 1);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_DRIVER_FEAT, qemu_blk_legacy ? 0U : 1U);
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_STATUS,
+               QEMU_VIRTIO_STATUS_ACK | QEMU_VIRTIO_STATUS_DRIVER | QEMU_VIRTIO_STATUS_FEAT_OK);
+    if ((mmio_read(qemu_blk_base + QEMU_VIRTIO_REG_STATUS) & QEMU_VIRTIO_STATUS_FEAT_OK) == 0) {
+        qemu_blk_diag = 3;
+        return false;
+    }
+
+    memset(qemu_blk_desc, 0, sizeof(qemu_blk_desc));
+    memset(&qemu_blk_avail, 0, sizeof(qemu_blk_avail));
+    memset(&qemu_blk_used, 0, sizeof(qemu_blk_used));
+    memset(&qemu_blk_legacy_q, 0, sizeof(qemu_blk_legacy_q));
+    qemu_blk_used_idx = 0;
+
+    struct qemu_vq_desc *d = qemu_blk_legacy ? qemu_blk_legacy_q.desc : qemu_blk_desc;
+    struct qemu_vq_avail *a = qemu_blk_legacy ? &qemu_blk_legacy_q.avail : &qemu_blk_avail;
+    struct qemu_vq_used *u = qemu_blk_legacy ? &qemu_blk_legacy_q.used : &qemu_blk_used;
+    if (!qemu_blk_setup_queue(d, a, u)) {
+        qemu_blk_diag = 4;
+        return false;
+    }
+
+    u32 cap_lo = mmio_read(qemu_blk_base + QEMU_VIRTIO_BLK_CONFIG_CAPACITY);
+    u32 cap_hi = mmio_read(qemu_blk_base + QEMU_VIRTIO_BLK_CONFIG_CAPACITY + 4U);
+    qemu_blk_sectors = ((u64)cap_hi << 32) | cap_lo;
+    if (qemu_blk_sectors == 0) {
+        qemu_blk_diag = 5;
+        return false;
+    }
+
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_STATUS,
+               QEMU_VIRTIO_STATUS_ACK | QEMU_VIRTIO_STATUS_DRIVER |
+               QEMU_VIRTIO_STATUS_FEAT_OK | QEMU_VIRTIO_STATUS_DRIVER_OK);
+    qemu_blk_ready = true;
+    qemu_blk_diag = 10;
+    return true;
+}
+
+static bool qemu_blk_lba_ok(u32 lba, u32 count)
+{
+    return count != 0 && (u64)count <= qemu_blk_sectors &&
+           (u64)lba <= qemu_blk_sectors - (u64)count;
+}
+
+static bool qemu_blk_rw(u32 lba, u32 count, void *buf, bool write)
+{
+    if (!qemu_blk_ready || !buf || !qemu_blk_lba_ok(lba, count)) {
+        qemu_blk_diag = 0x20;
+        return false;
+    }
+    u64 bytes = (u64)count * (u64)SD_BLOCK_SIZE;
+    if (bytes > 0xFFFFFFFFULL) {
+        qemu_blk_diag = 0x21;
+        return false;
+    }
+
+    struct qemu_vq_desc *d = qemu_blk_legacy ? qemu_blk_legacy_q.desc : qemu_blk_desc;
+    struct qemu_vq_avail *a = qemu_blk_legacy ? &qemu_blk_legacy_q.avail : &qemu_blk_avail;
+    struct qemu_vq_used *u = qemu_blk_legacy ? &qemu_blk_legacy_q.used : &qemu_blk_used;
+
+    qemu_blk_req.type = write ? QEMU_VIRTIO_BLK_T_OUT : QEMU_VIRTIO_BLK_T_IN;
+    qemu_blk_req.reserved = 0;
+    qemu_blk_req.sector = lba;
+    qemu_blk_status[0] = 0xFFU;
+
+    d[0].addr = (u64)(usize)&qemu_blk_req;
+    d[0].len = sizeof(qemu_blk_req);
+    d[0].flags = QEMU_VIRTQ_DESC_F_NEXT;
+    d[0].next = 1;
+    d[1].addr = (u64)(usize)buf;
+    d[1].len = (u32)bytes;
+    d[1].flags = QEMU_VIRTQ_DESC_F_NEXT | (write ? 0U : QEMU_VIRTQ_DESC_F_WRITE);
+    d[1].next = 2;
+    d[2].addr = (u64)(usize)qemu_blk_status;
+    d[2].len = 1;
+    d[2].flags = QEMU_VIRTQ_DESC_F_WRITE;
+    d[2].next = 0;
+
+    a->ring[a->idx % QEMU_BLK_VQ_SIZE] = 0;
+    a->idx++;
+    qemu_dcache_clean_range((u64)(usize)&qemu_blk_req, sizeof(qemu_blk_req));
+    qemu_dcache_clean_range((u64)(usize)d, sizeof(d[0]) * 3U);
+    qemu_dcache_clean_range((u64)(usize)a, sizeof(*a));
+    qemu_dcache_clean_invalidate_range((u64)(usize)qemu_blk_status, sizeof(qemu_blk_status));
+    qemu_dcache_clean_invalidate_range((u64)(usize)u, sizeof(*u));
+    if (write)
+        qemu_dcache_clean_range((u64)(usize)buf, bytes);
+    else
+        qemu_dcache_clean_invalidate_range((u64)(usize)buf, bytes);
+    qemu_blk_notify(0);
+
+    u64 deadline = sd_now_us() + QEMU_BLK_TIMEOUT_US;
+    while (sd_now_us() < deadline) {
+        qemu_dcache_invalidate_range((u64)(usize)u, sizeof(*u));
+        if (u->idx != qemu_blk_used_idx)
+            break;
+    }
+    if (u->idx == qemu_blk_used_idx) {
+        stats.data_timeouts++;
+        qemu_blk_diag = 0x22;
+        return false;
+    }
+    qemu_blk_used_idx = u->idx;
+    mmio_write(qemu_blk_base + QEMU_VIRTIO_REG_INT_ACK,
+               mmio_read(qemu_blk_base + QEMU_VIRTIO_REG_INT_STATUS));
+    __asm__ volatile("dsb sy" ::: "memory");
+    qemu_dcache_invalidate_range((u64)(usize)qemu_blk_status, sizeof(qemu_blk_status));
+    if (!write)
+        qemu_dcache_invalidate_range((u64)(usize)buf, bytes);
+    if (qemu_blk_status[0] != QEMU_VIRTIO_BLK_S_OK)
+        qemu_blk_diag = 0x30U | qemu_blk_status[0];
+    return qemu_blk_status[0] == QEMU_VIRTIO_BLK_S_OK;
+}
+
+const char *sd_qemu_backend_name(void)
+{
+    return qemu_blk_ready ? "virtio-blk" : "ram";
+}
+
+bool sd_qemu_virtio_blk_ready(void)
+{
+    return qemu_blk_ready;
+}
+
+u32 sd_qemu_virtio_blk_diag(void)
+{
+    return qemu_blk_diag;
+}
 #endif
 
 /* ── helpers ──────────────────────────────────────────────────────── */
 
 static inline void sd_write(u32 off, u32 val) { mmio_write(EMMC2_BASE + off, val); }
 static inline u32  sd_read(u32 off)           { return mmio_read(EMMC2_BASE + off); }
-static inline u64 sd_now_us(void);
 
 static u32 sd_mbps_x1000(u32 blocks, u64 elapsed_us)
 {
@@ -397,8 +732,20 @@ bool sd_init(void) {
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
     card.type = 2;
     card.rca = 1;
-    card.capacity = (u64)QEMU_RAM_SD_BLOCKS * SD_BLOCK_SIZE;
     memset((void *)&stats, 0, sizeof(stats));
+    if (qemu_blk_init()) {
+        card.capacity = qemu_blk_sectors * (u64)SD_BLOCK_SIZE;
+        uart_puts("[sd] qemu virtio-blk backend cap=");
+        uart_hex(card.capacity);
+        uart_puts("\n");
+        return true;
+    }
+    if (qemu_blk_diag != 1U) {
+        uart_puts("[sd] qemu virtio-blk unavailable diag=");
+        uart_hex(qemu_blk_diag);
+        uart_puts("; falling back to RAM\n");
+    }
+    card.capacity = (u64)QEMU_RAM_SD_BLOCKS * SD_BLOCK_SIZE;
     if (!qemu_ram_sd_ready) {
         memset(qemu_ram_sd, 0, sizeof(qemu_ram_sd));
         qemu_ram_sd_ready = true;
@@ -628,6 +975,15 @@ static bool sd_read_block_inner(u32 lba, u8 *buf) {
 bool sd_read_block(u32 lba, u8 *buf) {
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
     u64 start = sd_now_us();
+    if (qemu_blk_ready) {
+        if (!buf || !qemu_blk_rw(lba, 1, buf, false)) {
+            stats.errors++;
+            return false;
+        }
+        stats.reads++;
+        sd_record_read_rate(1, start);
+        return true;
+    }
     if (!buf || !qemu_ram_lba_ok(lba, 1)) {
         stats.errors++;
         return false;
@@ -717,6 +1073,15 @@ static bool sd_write_block_inner(u32 lba, const u8 *buf) {
 bool sd_write_block(u32 lba, const u8 *buf) {
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
     u64 start = sd_now_us();
+    if (qemu_blk_ready) {
+        if (!buf || !qemu_blk_rw(lba, 1, (void *)(usize)buf, true)) {
+            stats.errors++;
+            return false;
+        }
+        stats.writes++;
+        sd_record_write_rate(1, start);
+        return true;
+    }
     if (!buf || !qemu_ram_lba_ok(lba, 1)) {
         stats.errors++;
         return false;
@@ -793,6 +1158,15 @@ bool sd_read_blocks(u32 lba, u32 count, u8 *buf) {
     if (count == 0) return true;
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
     u64 start = sd_now_us();
+    if (qemu_blk_ready) {
+        if (!buf || !qemu_blk_rw(lba, count, buf, false)) {
+            stats.errors++;
+            return false;
+        }
+        stats.reads += count;
+        sd_record_read_rate(count, start);
+        return true;
+    }
     if (!buf || !qemu_ram_lba_ok(lba, count)) {
         stats.errors++;
         return false;
@@ -876,6 +1250,15 @@ bool sd_write_blocks(u32 lba, u32 count, const u8 *buf) {
     if (count == 0) return true;
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
     u64 start = sd_now_us();
+    if (qemu_blk_ready) {
+        if (!buf || !qemu_blk_rw(lba, count, (void *)(usize)buf, true)) {
+            stats.errors++;
+            return false;
+        }
+        stats.writes += count;
+        sd_record_write_rate(count, start);
+        return true;
+    }
     if (!buf || !qemu_ram_lba_ok(lba, count)) {
         stats.errors++;
         return false;

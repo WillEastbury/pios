@@ -701,12 +701,21 @@ static u32 qhttp_build_response(const u8 *req, u32 req_len, char *out, u32 max)
         qhttp_append(out, &len, max, ",\"ip\":\"10.0.2.15\",\"mode\":\"qemu-common-stage2\",");
         qhttp_append(out, &len, max, "\"boot\":\"BOOTAA64.EFI/PGS2\",\"diag\":{\"vnet\":");
         qhttp_append_u64(out, &len, max, vnet_diag_code);
+        qhttp_append(out, &len, max, ",\"blk\":");
+        qhttp_append_u64(out, &len, max, sd_qemu_virtio_blk_diag());
         qhttp_append(out, &len, max, ",\"requests\":");
         qhttp_append_u64(out, &len, max, g_qemu_admin_requests);
         qhttp_append(out, &len, max, "},\"perf\":{\"ram_pool_total_kib\":16384,\"walfs_records\":");
         qhttp_append_u64(out, &len, max, g_qemu_walfs_records);
+        qhttp_append(out, &len, max, ",\"storage\":\"");
+        qhttp_append(out, &len, max, sd_qemu_backend_name());
+        qhttp_append(out, &len, max, "\",\"storage_bytes\":");
+        const sd_card_t *card = sd_get_card_info();
+        qhttp_append_u64(out, &len, max, card ? card->capacity : 0);
         qhttp_append(out, &len, max, ",\"sd_ram\":");
-        qhttp_append_bool(out, &len, max, g_qemu_sd_ok);
+        qhttp_append_bool(out, &len, max, g_qemu_sd_ok && !sd_qemu_virtio_blk_ready());
+        qhttp_append(out, &len, max, ",\"virtio_blk\":");
+        qhttp_append_bool(out, &len, max, sd_qemu_virtio_blk_ready());
         qhttp_append(out, &len, max, ",\"walfs_mounted\":");
         qhttp_append_bool(out, &len, max, g_qemu_mount_ok);
         qhttp_append(out, &len, max, ",\"walfs_create\":");
@@ -734,7 +743,12 @@ static u32 qhttp_build_response(const u8 *req, u32 req_len, char *out, u32 max)
         qhttp_path_is(req, req_len, "/api/admin/log-stream")) {
         u32 len = qhttp_begin(out, max, "text/plain");
         qhttp_append(out, &len, max, "PIOS QEMU log tail\nboot=BOOTAA64.EFI\nstage2=PIOSSTG2.BIN selected by PGS2\n");
-        qhttp_append(out, &len, max, "workbench=rendered\nram_sd=");
+        qhttp_append(out, &len, max, "workbench=rendered\nstorage=");
+        qhttp_append(out, &len, max, sd_qemu_backend_name());
+        qhttp_append(out, &len, max, "\nstorage_bytes=");
+        const sd_card_t *card = sd_get_card_info();
+        qhttp_append_u64(out, &len, max, card ? card->capacity : 0);
+        qhttp_append(out, &len, max, "\nsd=");
         qhttp_append(out, &len, max, g_qemu_sd_ok ? "ok" : "fail");
         qhttp_append(out, &len, max, "\nwalfs=");
         qhttp_append(out, &len, max, (g_qemu_fmt_ok && g_qemu_mount_ok && g_qemu_verify_ok) ? "ok" : "fail");
@@ -742,6 +756,8 @@ static u32 qhttp_build_response(const u8 *req, u32 req_len, char *out, u32 max)
         qhttp_append_u64(out, &len, max, g_qemu_admin_requests);
         qhttp_append(out, &len, max, "\nvnet_diag=");
         qhttp_append_u64(out, &len, max, vnet_diag_code);
+        qhttp_append(out, &len, max, "\nblk_diag=");
+        qhttp_append_u64(out, &len, max, sd_qemu_virtio_blk_diag());
         qhttp_append(out, &len, max, "\n");
         return len;
     }
@@ -749,7 +765,9 @@ static u32 qhttp_build_response(const u8 *req, u32 req_len, char *out, u32 max)
     u32 len = qhttp_begin(out, max, "text/html");
     qhttp_append(out, &len, max, "<!doctype html><title>PIOS QEMU Admin</title><body><h1>PIOS QEMU Admin Console</h1>");
     qhttp_append(out, &len, max, "<p>platform=qemu-virt boot=BOOTAA64.EFI stage2=PIOSSTG2.BIN</p>");
-    qhttp_append(out, &len, max, "<p>RAM SD OK | WALFS OK | LAN hostfwd OK</p>");
+    qhttp_append(out, &len, max, "<p>storage=");
+    qhttp_append(out, &len, max, sd_qemu_backend_name());
+    qhttp_append(out, &len, max, " | WALFS OK | LAN hostfwd OK</p>");
     qhttp_append(out, &len, max, "<p><a href='/api/status'>status</a> <a href='/api/netstat'>netstat</a> <a href='/logs'>logs</a></p>");
     qhttp_append(out, &len, max, "</body>\n");
     return len;
@@ -1241,8 +1259,8 @@ static void gop_render_workbench(bool sd_ok, bool fmt_ok, bool mount_ok,
     draw_cell(42, 3, "RAM: 512MB  POOL=RAM", 0xFFFFFF);
     draw_cell(78, 3, "BOARD: QEMU-VIRT", 0xFFFFFF);
     draw_cell(4, 4,  lan_ok ? "NET: HOSTFWD 127.0.0.1:8088 OK" : "NET: HOSTFWD WAITING", lan_ok ? 0x4ADE80 : 0xFBBF24);
-    draw_cell(42, 4, (fmt_ok && mount_ok) ? "WALFS: RAM MOUNT OK" : "WALFS: RAM DOWN", (fmt_ok && mount_ok) ? 0x4ADE80 : 0xF87171);
-    draw_cell(78, 4, sd_ok ? "SD: RAM BLOCK OK" : "SD: FAIL", sd_ok ? 0x4ADE80 : 0xF87171);
+    draw_cell(42, 4, (fmt_ok && mount_ok) ? "WALFS: BLOCK MOUNT OK" : "WALFS: BLOCK DOWN", (fmt_ok && mount_ok) ? 0x4ADE80 : 0xF87171);
+    draw_cell(78, 4, sd_ok ? (sd_qemu_virtio_blk_ready() ? "SD: VIRTIO-BLK OK" : "SD: RAM BLOCK OK") : "SD: FAIL", sd_ok ? 0x4ADE80 : 0xF87171);
 
     draw_box(1, 7, 118, 18, "NETWORK / PROCESS MAP", 0xFFAA00);
     draw_cell(4, 8, "PID", 0xB0B0B0);
@@ -1267,7 +1285,7 @@ static void gop_render_workbench(bool sd_ok, bool fmt_ok, bool mount_ok,
     draw_cell(34, 14, "ok", 0x4ADE80);
     draw_cell(44, 14, "16M", 0xFFFFFF);
     draw_cell(56, 14, "PIOSSTG2 common", 0xFFFFFF);
-    draw_cell(88, 14, "ram walfs", 0xFFFFFF);
+    draw_cell(88, 14, sd_qemu_virtio_blk_ready() ? "virtio walfs" : "ram walfs", 0xFFFFFF);
     draw_cell(6, 15, "2", 0xFFFFFF);
     draw_cell(12, 15, "0", 0xFFFFFF);
     draw_cell(22, 15, "root", 0xFFFFFF);
@@ -1287,7 +1305,7 @@ static void gop_render_workbench(bool sd_ok, bool fmt_ok, bool mount_ok,
 
     draw_box(1, 27, 118, 10, "WARNINGS / ERRORS", 0xFF4040);
     draw_cell(4, 29, "No warnings or errors in QEMU PIOS workbench.", 0x4ADE80);
-    draw_cell(4, 31, "Validated: RAM SD, WALFS create/write/readback/verify, LAN ADMIN HTTP.", 0xDDE7F0);
+    draw_cell(4, 31, sd_qemu_virtio_blk_ready() ? "Validated: VIRTIO-BLK, WALFS create/write/readback/verify, LAN ADMIN HTTP." : "Validated: RAM SD, WALFS create/write/readback/verify, LAN ADMIN HTTP.", 0xDDE7F0);
     draw_cell(4, 33, "Admin URL: http://127.0.0.1:8088/", 0xFBBF24);
     draw_cell(4, 35, "Screenshot is rendered from common stage2 PIOSSTG2.BIN.", 0xB0B0B0);
     (void)uptime;
@@ -1321,16 +1339,30 @@ efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
         if (g_con->enable_cursor) (void)g_con->enable_cursor(g_con, false);
     }
 
-    g_log_quiet = true;
+    g_log_quiet = false;
 
     bool sd_ok = sd_init();
-    if (!sd_ok) park();
+    if (!sd_ok) {
+        wb_puts("[qemu] sd_init failed diag=");
+        wb_hex(sd_qemu_virtio_blk_diag());
+        wb_puts("\n");
+        park();
+    }
 
     bcache_init();
 
     bool fmt_ok = walfs_format_reserved();
     bool mount_ok = fmt_ok && walfs_init();
-    if (!mount_ok) park();
+    if (!mount_ok) {
+        wb_puts("[qemu] walfs init failed fmt=");
+        wb_hex(fmt_ok ? 1U : 0U);
+        wb_puts(" mount=");
+        wb_hex(mount_ok ? 1U : 0U);
+        wb_puts(" blkdiag=");
+        wb_hex(sd_qemu_virtio_blk_diag());
+        wb_puts("\n");
+        park();
+    }
 
     u64 id = walfs_create(WALFS_ROOT_INODE, "uefi.txt", WALFS_FILE, 0644);
     bool create_ok = id != 0;
