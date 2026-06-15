@@ -8,6 +8,7 @@
 #define PIOS_STAGE2_PLATFORM_PI5        1U
 #define PIOS_STAGE2_PLATFORM_QEMU_VIRT  2U
 #define PIOS_STAGE2_PLATFORM_UEFI       3U
+#define PIOS_STAGE2_PLATFORM_HYPERV_ARM 4U
 
 #define PIOS_STAGE2_FEAT_AARCH64        (1ULL << 0)
 #define PIOS_STAGE2_FEAT_GENERIC_TIMER  (1ULL << 1)
@@ -21,6 +22,10 @@
 #define PIOS_STAGE2_FEAT_MAILBOX_FB     (1ULL << 9)
 #define PIOS_STAGE2_FEAT_RAM_WALFS      (1ULL << 10)
 #define PIOS_STAGE2_FEAT_UEFI           (1ULL << 11)
+#define PIOS_STAGE2_FEAT_HYPERV         (1ULL << 12)
+#define PIOS_STAGE2_FEAT_VMBUS          (1ULL << 13)
+#define PIOS_STAGE2_FEAT_HV_NETVSC      (1ULL << 14)
+#define PIOS_STAGE2_FEAT_HV_STORVSC     (1ULL << 15)
 
 struct pios_stage2_manifest_header {
     u32 magic;

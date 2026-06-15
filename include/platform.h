@@ -3,6 +3,7 @@
 
 #define PIOS_PLATFORM_PI5        1
 #define PIOS_PLATFORM_QEMU_VIRT  2
+#define PIOS_PLATFORM_HYPERV_ARM 3
 
 #ifndef PIOS_PLATFORM
 #define PIOS_PLATFORM PIOS_PLATFORM_PI5
@@ -26,6 +27,28 @@
 #define PIOS_HAS_GENET              0
 #define PIOS_HAS_SD                 0
 #define PIOS_HAS_MAILBOX_FB         0
+#define PIOS_HAS_HYPERV             0
+#define PIOS_HAS_VMBUS              0
+#elif PIOS_PLATFORM == PIOS_PLATFORM_HYPERV_ARM
+#define PIOS_PLATFORM_NAME          "hyperv-arm64"
+#define PIOS_PLATFORM_CORE_COUNT    4U
+#define PIOS_PERIPH_BASE            0UL
+#define PIOS_UART0_BASE             0UL
+#define PIOS_MBOX_BASE              0UL
+#define PIOS_EMMC2_BASE             0UL
+#define PIOS_GENET_BASE             0UL
+#define PIOS_PCIE_RC_BASE           0UL
+#define PIOS_RP1_BAR_BASE           0UL
+#define PIOS_GIC_BASE               0UL
+#define PIOS_GICD_BASE              0UL
+#define PIOS_GICC_BASE              0UL
+#define PIOS_HAS_RP1                0
+#define PIOS_HAS_PCIE               0
+#define PIOS_HAS_GENET              0
+#define PIOS_HAS_SD                 0
+#define PIOS_HAS_MAILBOX_FB         0
+#define PIOS_HAS_HYPERV             1
+#define PIOS_HAS_VMBUS              1
 #else
 #define PIOS_PLATFORM_NAME          "pi5-bcm2712"
 #define PIOS_PLATFORM_CORE_COUNT    4U
@@ -44,6 +67,8 @@
 #define PIOS_HAS_GENET              1
 #define PIOS_HAS_SD                 1
 #define PIOS_HAS_MAILBOX_FB         1
+#define PIOS_HAS_HYPERV             0
+#define PIOS_HAS_VMBUS              0
 #endif
 
 #define PIOS_CORE_PRIV_SIZE         0x01000000UL
