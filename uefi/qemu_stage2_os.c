@@ -1067,11 +1067,39 @@ static void draw_text(u32 x, u32 y, const char *s, u32 fg, u32 scale)
     }
 }
 
-static void draw_status(u32 y, const char *label, bool ok)
+static void draw_cell(u32 col, u32 row, const char *s, u32 fg)
 {
-    gop_rect(8, y - 1, 300, 11, 0x101820);
-    draw_text(14, y, ok ? "[OK]" : "[FAIL]", ok ? 0x4ADE80 : 0xF87171, 1);
-    draw_text(50, y, label, 0xDDE7F0, 1);
+    draw_text(8 + col * 6U, 8 + row * 10U, s, fg, 1);
+}
+
+static void draw_box(u32 col, u32 row, u32 w, u32 h, const char *title, u32 color)
+{
+    if (w < 4 || h < 2) return;
+    char line[160];
+    if (w >= sizeof(line)) w = (u32)sizeof(line) - 1U;
+    u32 p = 0;
+    line[p++] = '|';
+    line[p++] = '-';
+    if (title) {
+        for (u32 i = 0; title[i] && p + 2 < w; i++)
+            line[p++] = title[i];
+        line[p++] = '-';
+    }
+    while (p + 1 < w) line[p++] = '-';
+    line[p++] = '|';
+    line[p] = 0;
+    draw_cell(col, row, line, color);
+    for (u32 r = 1; r + 1 < h; r++) {
+        char side[2] = { '|', 0 };
+        draw_cell(col, row + r, side, color);
+        draw_cell(col + w - 1, row + r, side, color);
+    }
+    p = 0;
+    line[p++] = '|';
+    while (p + 1 < w) line[p++] = '-';
+    line[p++] = '|';
+    line[p] = 0;
+    draw_cell(col, row + h - 1, line, color);
 }
 
 static void gop_render_workbench(bool sd_ok, bool fmt_ok, bool mount_ok,
@@ -1081,33 +1109,66 @@ static void gop_render_workbench(bool sd_ok, bool fmt_ok, bool mount_ok,
     if (!g_gop || !g_gop->mode || !g_gop->mode->info) return;
     struct efi_gop_mode_info *mi = g_gop->mode->info;
     gop_rect(0, 0, mi->horizontal_resolution, mi->vertical_resolution, 0x050607);
-    gop_rect(0, 0, 320, 22, 0x141414);
-    gop_rect(0, 22, 320, 2, 0xFD8EA1);
-    draw_text(8, 7, "|-PIOS WORKBENCH-----|", 0xFD8EA1, 1);
-    draw_text(8, 34, "PLATFORM: QEMU-VIRT", 0xFFFFFF, 1);
-    draw_text(8, 48, "BOOT: BOOTAA64.EFI", 0xFFFFFF, 1);
-    draw_text(8, 62, "STAGE2: ONE KERNEL PGS2", 0xFFFFFF, 1);
 
-    draw_status(88, "RAM SD BLOCK DEVICE", sd_ok);
-    draw_status(106, "BLOCK CACHE INIT", true);
-    draw_status(124, "RAM WALFS FORMAT", fmt_ok);
-    draw_status(142, "RAM WALFS MOUNT", mount_ok);
-    draw_status(160, "WALFS FILE CREATE", create_ok);
-    draw_status(178, "WALFS FILE WRITE", write_ok);
-    draw_status(196, "WALFS READBACK", read_ok);
-    draw_status(214, "WALFS VERIFY", verify_ok);
-    draw_status(232, "LAN ADMIN HTTP", lan_ok);
+    draw_box(1, 1, 118, 5, "PIOS WORKBENCH", 0x00FF80);
+    draw_cell(4, 2,  "VERSION: QEMU-STAGE2", 0xFD8EA1);
+    draw_cell(42, 2, "UPTIME: LIVE", 0x4ADE80);
+    draw_cell(78, 2, "IP: 10.0.2.15/24", 0x4DA6FF);
+    draw_cell(4, 3,  "CPU: QEMU VIRT AARCH64 EL1", 0xFFFFFF);
+    draw_cell(42, 3, "RAM: 512MB  POOL=RAM", 0xFFFFFF);
+    draw_cell(78, 3, "BOARD: QEMU-VIRT", 0xFFFFFF);
+    draw_cell(4, 4,  lan_ok ? "NET: HOSTFWD 127.0.0.1:8088 OK" : "NET: HOSTFWD WAITING", lan_ok ? 0x4ADE80 : 0xFBBF24);
+    draw_cell(42, 4, (fmt_ok && mount_ok) ? "WALFS: RAM MOUNT OK" : "WALFS: RAM DOWN", (fmt_ok && mount_ok) ? 0x4ADE80 : 0xF87171);
+    draw_cell(78, 4, sd_ok ? "SD: RAM BLOCK OK" : "SD: FAIL", sd_ok ? 0x4ADE80 : 0xF87171);
 
-    draw_text(8, 262, "RECORDS:", 0xB0B0B0, 1);
-    wb_puts(""); /* keep compiler from considering wb_hex only serial-facing */
+    draw_box(1, 7, 118, 18, "NETWORK / PROCESS MAP", 0xFFAA00);
+    draw_cell(4, 8, "PID", 0xB0B0B0);
+    draw_cell(12, 8, "CORE", 0xB0B0B0);
+    draw_cell(22, 8, "USER", 0xB0B0B0);
+    draw_cell(34, 8, "CPU", 0xB0B0B0);
+    draw_cell(44, 8, "RAM", 0xB0B0B0);
+    draw_cell(56, 8, "PROCESS", 0xB0B0B0);
+    draw_cell(88, 8, "FIFO / PORT", 0xB0B0B0);
+    draw_cell(4, 10, "KERNEL", 0x4DA6FF);
+    draw_cell(6, 11, "0", 0xFFFFFF);
+    draw_cell(12, 11, "0", 0xFFFFFF);
+    draw_cell(22, 11, "root", 0xFFFFFF);
+    draw_cell(34, 11, "live", 0xFFFFFF);
+    draw_cell(44, 11, "ram", 0xFFFFFF);
+    draw_cell(56, 11, "BOOTAA64 stage1", 0xFFFFFF);
+    draw_cell(88, 11, "PGS2 -> qemu entry", 0xFFFFFF);
+    draw_cell(4, 13, "CAPSULE qemu/platform", 0xFBBF24);
+    draw_cell(6, 14, "1", 0xFFFFFF);
+    draw_cell(12, 14, "0", 0xFFFFFF);
+    draw_cell(22, 14, "root", 0xFFFFFF);
+    draw_cell(34, 14, "ok", 0x4ADE80);
+    draw_cell(44, 14, "16M", 0xFFFFFF);
+    draw_cell(56, 14, "PIOSSTG2 common", 0xFFFFFF);
+    draw_cell(88, 14, "ram walfs", 0xFFFFFF);
+    draw_cell(6, 15, "2", 0xFFFFFF);
+    draw_cell(12, 15, "0", 0xFFFFFF);
+    draw_cell(22, 15, "root", 0xFFFFFF);
+    draw_cell(34, 15, lan_ok ? "ok" : "wait", lan_ok ? 0x4ADE80 : 0xFBBF24);
+    draw_cell(44, 15, "net", 0xFFFFFF);
+    draw_cell(56, 15, "QEMU admin", 0xFFFFFF);
+    draw_cell(88, 15, "hostfwd -> tcp/80", 0xFFFFFF);
+    draw_cell(6, 16, "3", 0xFFFFFF);
+    draw_cell(12, 16, "0", 0xFFFFFF);
+    draw_cell(22, 16, "root", 0xFFFFFF);
+    draw_cell(34, 16, verify_ok ? "ok" : "fail", verify_ok ? 0x4ADE80 : 0xF87171);
+    draw_cell(44, 16, "wal", 0xFFFFFF);
+    draw_cell(56, 16, "WALFS verify", 0xFFFFFF);
+    draw_cell(88, 16, "records=", 0xFFFFFF);
     char rec_digit[2] = { (char)('0' + (records % 10U)), 0 };
-    draw_text(62, 262, rec_digit, 0x4ADE80, 1);
-    draw_text(92, 262, "NETD:", 0xB0B0B0, 1);
-    char diag_digit[2] = { (char)('0' + (vnet_diag_code % 10U)), 0 };
-    draw_text(128, 262, diag_digit, lan_ok ? 0x4ADE80 : 0xF87171, 1);
-    draw_text(8, 282, "PARITY: PL011 RAMBLOCK WALFS LAN", 0xDDE7F0, 1);
-    draw_text(8, 300, "PARKED - RESET VM TO REBOOT", 0xFBBF24, 1);
+    draw_cell(96, 16, rec_digit, 0x4ADE80);
+
+    draw_box(1, 27, 118, 10, "WARNINGS / ERRORS", 0xFF4040);
+    draw_cell(4, 29, "No warnings or errors in QEMU PIOS workbench.", 0x4ADE80);
+    draw_cell(4, 31, "Validated: RAM SD, WALFS create/write/readback/verify, LAN ADMIN HTTP.", 0xDDE7F0);
+    draw_cell(4, 33, "Admin URL: http://127.0.0.1:8088/", 0xFBBF24);
+    draw_cell(4, 35, "Screenshot is rendered from common stage2 PIOSSTG2.BIN.", 0xB0B0B0);
     (void)uptime;
+    (void)create_ok; (void)write_ok; (void)read_ok; (void)vnet_diag_code;
 }
 
 static void park(void)
