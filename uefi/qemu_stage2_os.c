@@ -1036,6 +1036,7 @@ static void font_rows(char c, u8 rows[7])
     case '9': { u8 r[7]={14,17,17,15,1,2,12}; memcpy(rows,r,7); break; }
     case '[': { u8 r[7]={14,8,8,8,8,8,14}; memcpy(rows,r,7); break; }
     case ']': { u8 r[7]={14,2,2,2,2,2,14}; memcpy(rows,r,7); break; }
+    case '|': { u8 r[7]={4,4,4,4,4,4,4}; memcpy(rows,r,7); break; }
     case '-': { u8 r[7]={0,0,0,31,0,0,0}; memcpy(rows,r,7); break; }
     case '+': { u8 r[7]={0,4,4,31,4,4,0}; memcpy(rows,r,7); break; }
     case ':': { u8 r[7]={0,4,4,0,4,4,0}; memcpy(rows,r,7); break; }
@@ -1082,7 +1083,7 @@ static void gop_render_workbench(bool sd_ok, bool fmt_ok, bool mount_ok,
     gop_rect(0, 0, mi->horizontal_resolution, mi->vertical_resolution, 0x050607);
     gop_rect(0, 0, 320, 22, 0x141414);
     gop_rect(0, 22, 320, 2, 0xFD8EA1);
-    draw_text(8, 7, "PIOS QEMU UEFI BOOTED", 0xFD8EA1, 1);
+    draw_text(8, 7, "|-PIOS WORKBENCH-----|", 0xFD8EA1, 1);
     draw_text(8, 34, "PLATFORM: QEMU-VIRT", 0xFFFFFF, 1);
     draw_text(8, 48, "BOOT: BOOTAA64.EFI", 0xFFFFFF, 1);
     draw_text(8, 62, "STAGE2: ONE KERNEL PGS2", 0xFFFFFF, 1);
