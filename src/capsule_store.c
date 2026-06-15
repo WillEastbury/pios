@@ -258,6 +258,11 @@ bool capsule_store_write(u32 pack, u32 card, const void *data, u32 len)
 
 i32 capsule_store_read(u32 pack, u32 card, void *out, u32 out_len)
 {
+    return capsule_store_read_at(pack, card, 0, out, out_len, NULL);
+}
+
+i32 capsule_store_read_at(u32 pack, u32 card, u32 offset, void *out, u32 out_len, u32 *size_out)
+{
     if (!out || out_len == 0) return -1;
     char path[96];
     if (!capsule_store_path(pack, card, path, sizeof(path))) return -1;
@@ -265,8 +270,12 @@ i32 capsule_store_read(u32 pack, u32 card, void *out, u32 out_len)
     if (!id) return -1;
     struct walfs_inode ino;
     if (!walfs_stat(id, &ino) || (ino.flags & WALFS_DIR)) return -1;
-    u32 n = ino.size > out_len ? out_len : (u32)ino.size;
-    return (i32)walfs_read(id, 0, out, n);
+    if (size_out) *size_out = (ino.size > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (u32)ino.size;
+    if (offset > ino.size) return 0;
+    u64 avail64 = ino.size - offset;
+    u32 avail = (avail64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (u32)avail64;
+    u32 n = avail > out_len ? out_len : avail;
+    return (i32)walfs_read(id, offset, out, n);
 }
 
 bool capsule_store_delete(u32 pack, u32 card)

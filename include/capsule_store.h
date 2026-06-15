@@ -61,6 +61,7 @@ const char *capsule_card_role(u32 card);
 bool capsule_store_init(void);
 bool capsule_store_path(u32 pack, u32 card, char *out, u32 out_max);
 i32 capsule_store_read(u32 pack, u32 card, void *out, u32 out_len);
+i32 capsule_store_read_at(u32 pack, u32 card, u32 offset, void *out, u32 out_len, u32 *size_out);
 bool capsule_store_write(u32 pack, u32 card, const void *data, u32 len);
 bool capsule_store_delete(u32 pack, u32 card);
 u32 capsule_store_list(u32 pack, u32 *out_cards, u32 max_cards);

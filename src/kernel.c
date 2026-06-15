@@ -184,6 +184,7 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HTTP_ROUTE_FAVICON    12U
 #define HTTP_ROUTE_STATIC     13U
 #define HTTP_ROUTE_STATIC_PUT 14U
+#define HTTP_ROUTE_CAPSULE    15U
 
 #define HTTP_ERR_NONE         0U
 #define HTTP_ERR_RESP_TIMEOUT 1U
@@ -230,6 +231,7 @@ static const char *http_route_name(u32 route)
     case HTTP_ROUTE_FAVICON: return "favicon";
     case HTTP_ROUTE_STATIC: return "static";
     case HTTP_ROUTE_STATIC_PUT: return "static-put";
+    case HTTP_ROUTE_CAPSULE: return "capsule";
     default: return "?";
     }
 }
@@ -1091,6 +1093,8 @@ static u32 http_route_id(const u8 *req, u32 len)
         http_request_path_is(req, len, "/api/user") ||
         http_request_path_is(req, len, "/api/walfs"))
         return HTTP_ROUTE_PLACEHOLDER;
+    if (http_request_path_is(req, len, "/api/capsule"))
+        return HTTP_ROUTE_CAPSULE;
     if (http_request_is_root_get(req, len))
         return HTTP_ROUTE_ROOT;
     return HTTP_ROUTE_NOT_FOUND;
@@ -4447,7 +4451,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
                 u32 hex_len = pios_strlen(hex);
                 bool ok = (hex_len != 0 && (hex_len & 1U) == 0);
                 u32 count = hex_len / 2U;
-                if (off + count > sizeof(cbuf)) ok = false;
+                if (off > sizeof(cbuf) || count > sizeof(cbuf) - off) ok = false;
                 for (u32 i = 0; ok && i < count; i++)
                     ok = pixe_parse_hex_byte_pair(hex + i * 2U, &cbuf[off + i]);
                 if (!ok) {
@@ -5103,6 +5107,262 @@ static u32 http_build_walfs_response(char *out, u32 max, const u8 *req, u32 req_
         }
     }
     http_append(out, &len, max, "}\n");
+    return len;
+}
+
+static bool http_capsule_query_u32(const u8 *req, u32 req_len, const char *key, u32 *out)
+{
+    char tmp[16];
+    return http_query_value(req, req_len, "/api/capsule", key, tmp, sizeof(tmp)) &&
+           http_parse_u32(tmp, out);
+}
+
+static void http_capsule_json_error(char *out, u32 *len, u32 max, const char *msg)
+{
+    http_append(out, len, max, "{\"ok\":false,\"error\":");
+    http_append_json_string(out, len, max, msg);
+    http_append(out, len, max, "}\n");
+}
+
+static void http_append_json_hex_bytes(char *out, u32 *len, u32 max, const u8 *data, u32 n)
+{
+    http_append(out, len, max, "\"");
+    for (u32 i = 0; i < n; i++)
+        http_append_hex8(out, len, max, data[i]);
+    http_append(out, len, max, "\"");
+}
+
+static void http_capsule_append_manifest_json(char *out, u32 *len, u32 max,
+                                              u32 pack, const struct capsule_manifest *m)
+{
+    http_append(out, len, max, "{\"ok\":true,\"op\":\"status\",\"pack\":");
+    http_append_u64(out, len, max, pack);
+    http_append(out, len, max, ",\"name\":");
+    http_append_json_string(out, len, max, m->name);
+    http_append(out, len, max, ",\"cardsLo\":");
+    http_append_u64(out, len, max, m->cards_lo);
+    http_append(out, len, max, ",\"cardsHi\":");
+    http_append_u64(out, len, max, m->cards_hi);
+    http_append(out, len, max, ",\"processes\":[");
+    for (u32 i = 0; i < m->process_count; i++) {
+        const struct capsule_process *p = &m->processes[i];
+        if (i) http_append(out, len, max, ",");
+        http_append(out, len, max, "{\"name\":");
+        http_append_json_string(out, len, max, p->name);
+        http_append(out, len, max, ",\"source\":");
+        http_append_u64(out, len, max, p->source);
+        http_append(out, len, max, ",\"bytecode\":");
+        http_append_u64(out, len, max, p->bytecode);
+        http_append(out, len, max, ",\"io\":");
+        http_append_json_string(out, len, max, p->io);
+        http_append(out, len, max, ",\"entry\":");
+        http_append_json_string(out, len, max, p->entry);
+        http_append(out, len, max, "}");
+    }
+    http_append(out, len, max, "],\"fifos\":[");
+    for (u32 i = 0; i < m->fifo_count; i++) {
+        const struct capsule_fifo *f = &m->fifos[i];
+        if (i) http_append(out, len, max, ",");
+        http_append(out, len, max, "{\"name\":");
+        http_append_json_string(out, len, max, f->name);
+        http_append(out, len, max, ",\"from\":");
+        http_append_json_string(out, len, max, f->from);
+        http_append(out, len, max, ",\"to\":");
+        http_append_json_string(out, len, max, f->to);
+        http_append(out, len, max, ",\"depth\":");
+        http_append_u64(out, len, max, f->depth);
+        http_append(out, len, max, ",\"frameMax\":");
+        http_append_u64(out, len, max, f->frame_max);
+        http_append(out, len, max, "}");
+    }
+    http_append(out, len, max, "]}\n");
+}
+
+static u32 http_build_capsule_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    char op[16];
+    u32 pack = 0;
+    u32 card = 0;
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+
+    if (!http_query_value(req, req_len, "/api/capsule", "op", op, sizeof(op))) {
+        u32 o = 0;
+        http_append(op, &o, sizeof(op), "status");
+    }
+    if (!http_capsule_query_u32(req, req_len, "pack", &pack)) {
+        http_capsule_json_error(out, &len, max, "missing pack");
+        return len;
+    }
+
+    if (http_streq(op, "status") || http_streq(op, "manifest")) {
+        struct capsule_manifest m;
+        char err[64];
+        if (!capsule_store_load_manifest(pack, &m, err, sizeof(err))) {
+            http_capsule_json_error(out, &len, max, err);
+            return len;
+        }
+        http_capsule_append_manifest_json(out, &len, max, pack, &m);
+        return len;
+    }
+
+    if (http_streq(op, "list")) {
+        u32 cards[96];
+        u32 n = capsule_store_list(pack, cards, 96);
+        http_append(out, &len, max, "{\"ok\":true,\"op\":\"list\",\"pack\":");
+        http_append_u64(out, &len, max, pack);
+        http_append(out, &len, max, ",\"cards\":[");
+        for (u32 i = 0; i < n; i++) {
+            if (i) http_append(out, &len, max, ",");
+            http_append(out, &len, max, "{\"card\":");
+            http_append_u64(out, &len, max, cards[i]);
+            http_append(out, &len, max, ",\"role\":");
+            http_append_json_string(out, &len, max, capsule_card_role(cards[i]));
+            http_append(out, &len, max, "}");
+        }
+        http_append(out, &len, max, "],\"count\":");
+        http_append_u64(out, &len, max, n);
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+
+    if (http_streq(op, "realize")) {
+        struct capsule_manifest m;
+        char err[64];
+        if (!capsule_store_load_manifest(pack, &m, err, sizeof(err))) {
+            http_capsule_json_error(out, &len, max, err);
+            return len;
+        }
+        u32 wrote = 0;
+        for (u32 i = 0; i < m.fifo_count; i++) {
+            const struct capsule_fifo *f = &m.fifos[i];
+            char desc[256];
+            u32 dl = 0;
+            http_append(desc, &dl, sizeof(desc), "ipc_fifo = ");
+            http_append(desc, &dl, sizeof(desc), f->name);
+            http_append(desc, &dl, sizeof(desc), "\n  from = ");
+            http_append(desc, &dl, sizeof(desc), f->from);
+            http_append(desc, &dl, sizeof(desc), "\n  to = ");
+            http_append(desc, &dl, sizeof(desc), f->to);
+            http_append(desc, &dl, sizeof(desc), "\n  depth = ");
+            http_append_u64(desc, &dl, sizeof(desc), f->depth);
+            http_append(desc, &dl, sizeof(desc), "\n  frame_max = ");
+            http_append_u64(desc, &dl, sizeof(desc), f->frame_max);
+            http_append(desc, &dl, sizeof(desc), "\n");
+            if (dl > 0 && capsule_store_write(pack, 20000U + i, desc, dl))
+                wrote++;
+        }
+        http_append(out, &len, max, "{\"ok\":true,\"op\":\"realize\",\"pack\":");
+        http_append_u64(out, &len, max, pack);
+        http_append(out, &len, max, ",\"fifoCards\":");
+        http_append_u64(out, &len, max, wrote);
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+
+    if (!http_capsule_query_u32(req, req_len, "card", &card)) {
+        http_capsule_json_error(out, &len, max, "missing card");
+        return len;
+    }
+
+    if (http_streq(op, "get") || http_streq(op, "gethex")) {
+        char off_s[16];
+        char max_s[16];
+        u32 off = 0;
+        u32 want = 2048;
+        if (http_query_value(req, req_len, "/api/capsule", "offset", off_s, sizeof(off_s)))
+            (void)http_parse_u32(off_s, &off);
+        if (http_query_value(req, req_len, "/api/capsule", "max", max_s, sizeof(max_s)))
+            (void)http_parse_u32(max_s, &want);
+        if (want == 0 || want > 4096U) want = 2048;
+        static u8 cbuf[4096];
+        u32 total = 0;
+        i32 n = capsule_store_read_at(pack, card, off, cbuf, want, &total);
+        if (n < 0) {
+            http_capsule_json_error(out, &len, max, "card read failed");
+            return len;
+        }
+        http_append(out, &len, max, "{\"ok\":true,\"op\":\"get\",\"pack\":");
+        http_append_u64(out, &len, max, pack);
+        http_append(out, &len, max, ",\"card\":");
+        http_append_u64(out, &len, max, card);
+        http_append(out, &len, max, ",\"role\":");
+        http_append_json_string(out, &len, max, capsule_card_role(card));
+        http_append(out, &len, max, ",\"offset\":");
+        http_append_u64(out, &len, max, off);
+        http_append(out, &len, max, ",\"bytes\":");
+        http_append_u64(out, &len, max, (u32)n);
+        http_append(out, &len, max, ",\"totalBytes\":");
+        http_append_u64(out, &len, max, total);
+        http_append(out, &len, max, ",\"truncated\":");
+        http_append(out, &len, max, (((u64)off + (u32)n) < total) ? "true" : "false");
+        http_append(out, &len, max, ",\"encoding\":\"hex\",\"data\":");
+        http_append_json_hex_bytes(out, &len, max, cbuf, (u32)n);
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+
+    if (http_streq(op, "puthex")) {
+        char off_s[16];
+        char hex[2048];
+        u32 off = 0;
+        if (http_query_value(req, req_len, "/api/capsule", "offset", off_s, sizeof(off_s)))
+            (void)http_parse_u32(off_s, &off);
+        if (!http_query_value(req, req_len, "/api/capsule", "hex", hex, sizeof(hex))) {
+            http_capsule_json_error(out, &len, max, "missing hex");
+            return len;
+        }
+        static u8 cbuf[CAPSULE_STORE_CARD_MAX_BYTES];
+        u32 old_len = 0;
+        if (off != 0) {
+            i32 got = capsule_store_read(pack, card, cbuf, sizeof(cbuf));
+            if (got > 0) old_len = (u32)got;
+        }
+        for (u32 z = old_len; z < off && z < sizeof(cbuf); z++) cbuf[z] = 0;
+        u32 hex_len = pios_strlen(hex);
+        bool ok = (hex_len != 0 && (hex_len & 1U) == 0);
+        u32 count = hex_len / 2U;
+        if (off > sizeof(cbuf) || count > sizeof(cbuf) - off) ok = false;
+        for (u32 i = 0; ok && i < count; i++)
+            ok = pixe_parse_hex_byte_pair(hex + i * 2U, &cbuf[off + i]);
+        if (!ok) {
+            http_capsule_json_error(out, &len, max, "bad hex/range");
+            return len;
+        }
+        u32 new_len = off + count;
+        if (new_len < old_len) new_len = old_len;
+        if (!capsule_store_write(pack, card, cbuf, new_len)) {
+            http_capsule_json_error(out, &len, max, "card write verify failed");
+            return len;
+        }
+        http_append(out, &len, max, "{\"ok\":true,\"op\":\"puthex\",\"pack\":");
+        http_append_u64(out, &len, max, pack);
+        http_append(out, &len, max, ",\"card\":");
+        http_append_u64(out, &len, max, card);
+        http_append(out, &len, max, ",\"bytes\":");
+        http_append_u64(out, &len, max, new_len);
+        http_append(out, &len, max, ",\"verified\":true}\n");
+        return len;
+    }
+
+    if (http_streq(op, "del")) {
+        bool ok = capsule_store_delete(pack, card);
+        http_append(out, &len, max, "{\"ok\":");
+        http_append(out, &len, max, ok ? "true" : "false");
+        http_append(out, &len, max, ",\"op\":\"del\",\"pack\":");
+        http_append_u64(out, &len, max, pack);
+        http_append(out, &len, max, ",\"card\":");
+        http_append_u64(out, &len, max, card);
+        if (!ok) http_append(out, &len, max, ",\"error\":\"delete failed\"");
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+
+    http_capsule_json_error(out, &len, max, "unknown op");
     return len;
 }
 
@@ -6151,6 +6411,12 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
     }
     if (http_request_path_is(req, req_len, "/api/walfs")) {
         len = http_build_walfs_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (http_request_path_is(req, req_len, "/api/capsule")) {
+        len = http_build_capsule_response(out, max, req, req_len);
         http_diag.build_len = len;
         http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
         return len;
