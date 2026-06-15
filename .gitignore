@@ -32,6 +32,7 @@ arm-toolchain/
 *.log
 *.ppm
 qemu_uefi_boot.png
+qemu_uefi_os_boot.png
 core.*
 
 # WiFi credentials (add manually, never commit)

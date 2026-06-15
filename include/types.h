@@ -3,12 +3,21 @@
 typedef unsigned char       u8;
 typedef unsigned short      u16;
 typedef unsigned int        u32;
+#if defined(_WIN64) && defined(__aarch64__)
+typedef unsigned long long  u64;
+#else
 typedef unsigned long       u64;
+#endif
 typedef signed char         i8;
 typedef signed short        i16;
 typedef signed int          i32;
+#if defined(_WIN64) && defined(__aarch64__)
+typedef signed long long    i64;
+typedef unsigned long long  usize;
+#else
 typedef signed long         i64;
 typedef unsigned long       usize;
+#endif
 typedef int                 bool;
 
 #define true  1
