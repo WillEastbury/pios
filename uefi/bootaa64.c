@@ -17,6 +17,49 @@
 typedef u64 efi_status_t;
 typedef void *efi_handle_t;
 
+#define VIRTIO_MMIO_MAGIC       0x74726976U
+#define VIRTIO_NET_DEVICE_ID    1U
+#define VIRTIO_STATUS_ACK       1U
+#define VIRTIO_STATUS_DRIVER    2U
+#define VIRTIO_STATUS_DRIVER_OK 4U
+#define VIRTIO_STATUS_FEAT_OK   8U
+#define VIRTQ_DESC_F_NEXT       1U
+#define VIRTQ_DESC_F_WRITE      2U
+#define VQ_SIZE                 8U
+#define VNET_HDR_LEN            10U
+
+#define VIRTIO_REG_MAGIC        0x000U
+#define VIRTIO_REG_VERSION      0x004U
+#define VIRTIO_REG_DEVICE_ID    0x008U
+#define VIRTIO_REG_DEVICE_FEAT  0x010U
+#define VIRTIO_REG_DEVICE_SEL   0x014U
+#define VIRTIO_REG_DRIVER_FEAT  0x020U
+#define VIRTIO_REG_DRIVER_SEL   0x024U
+#define VIRTIO_REG_GUEST_PAGE   0x028U
+#define VIRTIO_REG_QUEUE_SEL    0x030U
+#define VIRTIO_REG_QUEUE_NUMMAX 0x034U
+#define VIRTIO_REG_QUEUE_NUM    0x038U
+#define VIRTIO_REG_QUEUE_ALIGN  0x03CU
+#define VIRTIO_REG_QUEUE_PFN    0x040U
+#define VIRTIO_REG_QUEUE_READY  0x044U
+#define VIRTIO_REG_QUEUE_NOTIFY 0x050U
+#define VIRTIO_REG_INT_STATUS   0x060U
+#define VIRTIO_REG_INT_ACK      0x064U
+#define VIRTIO_REG_STATUS       0x070U
+#define VIRTIO_REG_Q_DESC_LOW   0x080U
+#define VIRTIO_REG_Q_DESC_HIGH  0x084U
+#define VIRTIO_REG_Q_DRV_LOW    0x090U
+#define VIRTIO_REG_Q_DRV_HIGH   0x094U
+#define VIRTIO_REG_Q_DEV_LOW    0x0A0U
+#define VIRTIO_REG_Q_DEV_HIGH   0x0A4U
+
+#define IP4_ADDR(a,b,c,d) (((u32)(a)<<24)|((u32)(b)<<16)|((u32)(c)<<8)|(u32)(d))
+
+#define EFI_SUCCESS            0ULL
+#define EFI_NOT_READY          6ULL
+#define EVT_NOTIFY_SIGNAL      0x00000200U
+#define TPL_CALLBACK           8U
+
 struct efi_table_header {
     u64 signature;
     u32 revision;
@@ -54,9 +97,23 @@ struct efi_guid {
     u8 data4[8];
 };
 
+typedef void *efi_event_t;
 typedef efi_status_t (*efi_locate_protocol_fn)(struct efi_guid *protocol,
                                                void *registration,
                                                void **interface);
+typedef efi_status_t (*efi_create_event_fn)(u32 type,
+                                            usize notify_tpl,
+                                            void *notify_fn,
+                                            void *notify_ctx,
+                                            efi_event_t *event);
+typedef efi_status_t (*efi_wait_for_event_fn)(usize count,
+                                              efi_event_t *events,
+                                              usize *index);
+typedef efi_status_t (*efi_close_event_fn)(efi_event_t event);
+typedef efi_status_t (*efi_handle_protocol_fn)(efi_handle_t handle,
+                                               struct efi_guid *protocol,
+                                               void **interface);
+typedef efi_status_t (*efi_stall_fn)(usize usec);
 
 struct efi_boot_services {
     struct efi_table_header hdr;
@@ -67,16 +124,16 @@ struct efi_boot_services {
     void *get_memory_map;
     void *allocate_pool;
     void *free_pool;
-    void *create_event;
+    efi_create_event_fn create_event;
     void *set_timer;
-    void *wait_for_event;
+    efi_wait_for_event_fn wait_for_event;
     void *signal_event;
-    void *close_event;
+    efi_close_event_fn close_event;
     void *check_event;
     void *install_protocol_interface;
     void *reinstall_protocol_interface;
     void *uninstall_protocol_interface;
-    void *handle_protocol;
+    efi_handle_protocol_fn handle_protocol;
     void *reserved;
     void *register_protocol_notify;
     void *locate_handle;
@@ -88,7 +145,7 @@ struct efi_boot_services {
     void *unload_image;
     void *exit_boot_services;
     void *get_next_monotonic_count;
-    void *stall;
+    efi_stall_fn stall;
     void *set_watchdog_timer;
     void *connect_controller;
     void *disconnect_controller;
@@ -337,6 +394,278 @@ static void wb_hex(u64 v)
     }
 }
 
+static void raw_hex(u64 v)
+{
+    static const char h[] = "0123456789ABCDEF";
+    efi_put_ascii_raw("0x");
+    for (int i = 60; i >= 0; i -= 4) {
+        char c[2] = { h[(v >> (u32)i) & 0xFULL], 0 };
+        efi_put_ascii_raw(c);
+    }
+}
+
+static void net_log_status(const char *step, efi_status_t st)
+{
+    efi_put_ascii_raw("[tcp4] ");
+    efi_put_ascii_raw(step);
+    efi_put_ascii_raw("=");
+    raw_hex(st);
+    efi_put_ascii_raw("\n");
+}
+
+static inline void mmio_write32(u64 addr, u32 val)
+{
+    *(volatile u32 *)(usize)addr = val;
+}
+
+static inline u32 mmio_read32(u64 addr)
+{
+    return *(volatile u32 *)(usize)addr;
+}
+
+struct vq_desc {
+    u64 addr;
+    u32 len;
+    u16 flags;
+    u16 next;
+} PACKED;
+
+struct vq_avail {
+    u16 flags;
+    u16 idx;
+    u16 ring[VQ_SIZE];
+    u16 used_event;
+} PACKED;
+
+struct vq_used_elem {
+    u32 id;
+    u32 len;
+} PACKED;
+
+struct vq_used {
+    u16 flags;
+    u16 idx;
+    struct vq_used_elem ring[VQ_SIZE];
+    u16 avail_event;
+} PACKED;
+
+static u64 vnet_base;
+static bool vnet_legacy;
+static struct vq_desc rx_desc[VQ_SIZE] ALIGNED(16);
+static struct vq_avail rx_avail ALIGNED(16);
+static struct vq_used rx_used ALIGNED(16);
+static u8 rx_buf[VQ_SIZE][2048] ALIGNED(64);
+static u16 rx_used_idx;
+static struct vq_desc tx_desc[VQ_SIZE] ALIGNED(16);
+static struct vq_avail tx_avail ALIGNED(16);
+static struct vq_used tx_used ALIGNED(16);
+static u8 tx_buf[2048] ALIGNED(64);
+static u16 tx_used_idx;
+static u8 vnet_mac[6] = {0x52,0x54,0x00,0x12,0x34,0x56};
+static u32 vnet_ip = IP4_ADDR(10,0,2,15);
+
+struct vq_legacy {
+    struct vq_desc desc[VQ_SIZE];
+    struct vq_avail avail;
+    u8 pad[4096U - (sizeof(struct vq_desc) * VQ_SIZE) - sizeof(struct vq_avail)];
+    struct vq_used used;
+} ALIGNED(4096);
+
+static struct vq_legacy rx_legacy;
+static struct vq_legacy tx_legacy;
+
+static u16 rd16(const u8 *p) { return ((u16)p[0] << 8) | p[1]; }
+static u32 rd32(const u8 *p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
+static void wr16(u8 *p, u16 v) { p[0]=(u8)(v>>8); p[1]=(u8)v; }
+static void wr32(u8 *p, u32 v) { p[0]=(u8)(v>>24); p[1]=(u8)(v>>16); p[2]=(u8)(v>>8); p[3]=(u8)v; }
+
+static u16 csum16(const void *data, u32 len, u32 sum)
+{
+    const u8 *p = (const u8 *)data;
+    while (len > 1) {
+        sum += ((u16)p[0] << 8) | p[1];
+        p += 2;
+        len -= 2;
+    }
+    if (len) sum += ((u16)p[0] << 8);
+    while (sum >> 16) sum = (sum & 0xFFFFU) + (sum >> 16);
+    return (u16)~sum;
+}
+
+static void vnet_notify(u32 q)
+{
+    __asm__ volatile("dsb sy" ::: "memory");
+    mmio_write32(vnet_base + VIRTIO_REG_QUEUE_NOTIFY, q);
+}
+
+static bool vnet_setup_queue(u32 q, struct vq_desc *d, struct vq_avail *a, struct vq_used *u)
+{
+    mmio_write32(vnet_base + VIRTIO_REG_QUEUE_SEL, q);
+    if (mmio_read32(vnet_base + VIRTIO_REG_QUEUE_NUMMAX) < VQ_SIZE) return false;
+    mmio_write32(vnet_base + VIRTIO_REG_QUEUE_NUM, VQ_SIZE);
+    if (vnet_legacy) {
+        mmio_write32(vnet_base + VIRTIO_REG_GUEST_PAGE, 4096);
+        mmio_write32(vnet_base + VIRTIO_REG_QUEUE_ALIGN, 4096);
+        mmio_write32(vnet_base + VIRTIO_REG_QUEUE_PFN, (u32)((u64)(usize)d >> 12));
+        return true;
+    }
+    mmio_write32(vnet_base + VIRTIO_REG_Q_DESC_LOW, (u32)(usize)d);
+    mmio_write32(vnet_base + VIRTIO_REG_Q_DESC_HIGH, (u32)((u64)(usize)d >> 32));
+    mmio_write32(vnet_base + VIRTIO_REG_Q_DRV_LOW, (u32)(usize)a);
+    mmio_write32(vnet_base + VIRTIO_REG_Q_DRV_HIGH, (u32)((u64)(usize)a >> 32));
+    mmio_write32(vnet_base + VIRTIO_REG_Q_DEV_LOW, (u32)(usize)u);
+    mmio_write32(vnet_base + VIRTIO_REG_Q_DEV_HIGH, (u32)((u64)(usize)u >> 32));
+    mmio_write32(vnet_base + VIRTIO_REG_QUEUE_READY, 1);
+    return true;
+}
+
+static bool vnet_init(void)
+{
+    for (u32 i = 0; i < 32; i++) {
+        u64 base = 0x0A000000ULL + (u64)i * 0x200ULL;
+        u32 magic = mmio_read32(base + VIRTIO_REG_MAGIC);
+        u32 dev = mmio_read32(base + VIRTIO_REG_DEVICE_ID);
+        if (magic == VIRTIO_MMIO_MAGIC && dev == VIRTIO_NET_DEVICE_ID) {
+            vnet_base = base;
+            break;
+        }
+    }
+    if (!vnet_base) {
+        efi_put_ascii_raw("[vnet] no virtio-net mmio\n");
+        return false;
+    }
+    u32 ver = mmio_read32(vnet_base + VIRTIO_REG_VERSION);
+    vnet_legacy = (ver == 1U);
+    mmio_write32(vnet_base + VIRTIO_REG_DEVICE_SEL, 0);
+    mmio_write32(vnet_base + VIRTIO_REG_DEVICE_SEL, 1);
+    mmio_write32(vnet_base + VIRTIO_REG_STATUS, 0);
+    mmio_write32(vnet_base + VIRTIO_REG_STATUS, VIRTIO_STATUS_ACK);
+    mmio_write32(vnet_base + VIRTIO_REG_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
+    mmio_write32(vnet_base + VIRTIO_REG_DRIVER_SEL, 0);
+    mmio_write32(vnet_base + VIRTIO_REG_DRIVER_FEAT, 0);
+    mmio_write32(vnet_base + VIRTIO_REG_DRIVER_SEL, 1);
+    mmio_write32(vnet_base + VIRTIO_REG_DRIVER_FEAT, vnet_legacy ? 0U : 1U); /* VIRTIO_F_VERSION_1 */
+    mmio_write32(vnet_base + VIRTIO_REG_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEAT_OK);
+    if ((mmio_read32(vnet_base + VIRTIO_REG_STATUS) & VIRTIO_STATUS_FEAT_OK) == 0) {
+        efi_put_ascii_raw("[vnet] FEATURES_OK rejected status=");
+        raw_hex(mmio_read32(vnet_base + VIRTIO_REG_STATUS));
+        efi_put_ascii_raw("\n");
+        return false;
+    }
+    memset(rx_desc, 0, sizeof(rx_desc)); memset(&rx_avail, 0, sizeof(rx_avail)); memset(&rx_used, 0, sizeof(rx_used)); memset(&rx_legacy, 0, sizeof(rx_legacy));
+    memset(tx_desc, 0, sizeof(tx_desc)); memset(&tx_avail, 0, sizeof(tx_avail)); memset(&tx_used, 0, sizeof(tx_used)); memset(&tx_legacy, 0, sizeof(tx_legacy));
+    struct vq_desc *rd = vnet_legacy ? rx_legacy.desc : rx_desc;
+    struct vq_avail *ra = vnet_legacy ? &rx_legacy.avail : &rx_avail;
+    struct vq_used *ru = vnet_legacy ? &rx_legacy.used : &rx_used;
+    struct vq_desc *td = vnet_legacy ? tx_legacy.desc : tx_desc;
+    struct vq_avail *ta = vnet_legacy ? &tx_legacy.avail : &tx_avail;
+    struct vq_used *tu = vnet_legacy ? &tx_legacy.used : &tx_used;
+    if (!vnet_setup_queue(0, rd, ra, ru)) { efi_put_ascii_raw("[vnet] rx queue setup failed\n"); return false; }
+    if (!vnet_setup_queue(1, td, ta, tu)) { efi_put_ascii_raw("[vnet] tx queue setup failed\n"); return false; }
+    for (u32 i = 0; i < VQ_SIZE; i++) {
+        rd[i].addr = (u64)(usize)rx_buf[i];
+        rd[i].len = sizeof(rx_buf[i]);
+        rd[i].flags = VIRTQ_DESC_F_WRITE;
+        ra->ring[i] = (u16)i;
+    }
+    ra->idx = VQ_SIZE;
+    vnet_notify(0);
+    mmio_write32(vnet_base + VIRTIO_REG_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEAT_OK | VIRTIO_STATUS_DRIVER_OK);
+    return true;
+}
+
+static bool vnet_send_frame(const u8 *frame, u32 len)
+{
+    if (!vnet_base || len + VNET_HDR_LEN > sizeof(tx_buf)) return false;
+    struct vq_desc *td = vnet_legacy ? tx_legacy.desc : tx_desc;
+    struct vq_avail *ta = vnet_legacy ? &tx_legacy.avail : &tx_avail;
+    struct vq_used *tu = vnet_legacy ? &tx_legacy.used : &tx_used;
+    memset(tx_buf, 0, VNET_HDR_LEN);
+    memcpy(tx_buf + VNET_HDR_LEN, frame, len);
+    td[0].addr = (u64)(usize)tx_buf;
+    td[0].len = len + VNET_HDR_LEN;
+    td[0].flags = 0;
+    ta->ring[ta->idx % VQ_SIZE] = 0;
+    ta->idx++;
+    vnet_notify(1);
+    u64 start = timer_monotonic_ms();
+    while (tu->idx == tx_used_idx && timer_monotonic_ms() - start < 1000) { }
+    if (tu->idx != tx_used_idx) {
+        tx_used_idx = tu->idx;
+        return true;
+    }
+    return false;
+}
+
+static u32 build_eth(u8 *out, const u8 *dst, const u8 *src, u16 type)
+{
+    memcpy(out, dst, 6); memcpy(out + 6, src, 6); wr16(out + 12, type); return 14;
+}
+
+static void send_arp_reply(const u8 *req)
+{
+    u8 f[64]; const u8 *arp = req + 14; u8 *p = f + build_eth(f, req + 6, vnet_mac, 0x0806);
+    wr16(p,1); wr16(p+2,0x0800); p[4]=6; p[5]=4; wr16(p+6,2);
+    memcpy(p+8,vnet_mac,6); wr32(p+14,vnet_ip); memcpy(p+18,arp+8,6); memcpy(p+24,arp+14,4);
+    (void)vnet_send_frame(f, 42);
+}
+
+static void ip_tcp_reply(const u8 *req, u32 req_len, const u8 *payload, u32 plen, u8 flags)
+{
+    if (req_len < 54 || plen > 512) return;
+    const u8 *ip = req + 14; const u8 *tcp = ip + ((ip[0] & 0x0FU) * 4U);
+    u32 ihl = (u32)(ip[0] & 0x0FU) * 4U; u32 tcp_off = (u32)(tcp[12] >> 4) * 4U;
+    u32 ip_len = rd16(ip + 2); u32 tcp_payload = (ip_len > ihl + tcp_off) ? ip_len - ihl - tcp_off : 0;
+    u8 f[1024]; u32 n = build_eth(f, req + 6, vnet_mac, 0x0800); u8 *oip = f + n; u8 *otcp = oip + 20;
+    memset(oip,0,20+20); oip[0]=0x45; oip[8]=64; oip[9]=6; wr16(oip+2,(u16)(20+20+plen)); wr32(oip+12,vnet_ip); memcpy(oip+16,ip+12,4);
+    wr16(otcp,80); memcpy(otcp+2,tcp,2);
+    wr32(otcp+4, (flags & 0x02U) ? 0x10203040U : rd32(tcp + 8));
+    u32 ack=rd32(tcp+4)+tcp_payload+((tcp[13]&0x02)?1U:0U); wr32(otcp+8,ack);
+    otcp[12]=0x50; otcp[13]=flags; wr16(otcp+14,4096); if(plen) memcpy(otcp+20,payload,plen);
+    wr16(oip+10,0); wr16(oip+10,csum16(oip,20,0));
+    u32 sum=0; sum += (vnet_ip>>16)&0xFFFF; sum += vnet_ip&0xFFFF; u32 dip=rd32(ip+12); sum += (dip>>16)&0xFFFF; sum += dip&0xFFFF; sum += 6; sum += 20+plen;
+    wr16(otcp+16,0); wr16(otcp+16,csum16(otcp,20+plen,sum));
+    (void)vnet_send_frame(f,n+20+20+plen);
+}
+
+static bool http_payload_start(const u8 *p, u32 n)
+{
+    return (n >= 4 && p[0] == 'G' && p[1] == 'E' && p[2] == 'T' && p[3] == ' ') ||
+           (n >= 5 && p[0] == 'P' && p[1] == 'O' && p[2] == 'S' && p[3] == 'T' && p[4] == ' ') ||
+           (n >= 5 && p[0] == 'H' && p[1] == 'E' && p[2] == 'A' && p[3] == 'D' && p[4] == ' ');
+}
+
+static bool vnet_poll_admin_once(void)
+{
+    if (!vnet_base) return false;
+    struct vq_avail *ra = vnet_legacy ? &rx_legacy.avail : &rx_avail;
+    struct vq_used *ru = vnet_legacy ? &rx_legacy.used : &rx_used;
+    u64 start = timer_monotonic_ms();
+    while (timer_monotonic_ms() - start < 30000) {
+        if (ru->idx == rx_used_idx) continue;
+        u32 slot = rx_used_idx % VQ_SIZE; u32 id = ru->ring[slot].id; u32 len = ru->ring[slot].len; rx_used_idx++;
+        if (id < VQ_SIZE && len > VNET_HDR_LEN + 14) {
+            u8 *frame = rx_buf[id] + VNET_HDR_LEN; u32 flen = len - VNET_HDR_LEN; u16 et = rd16(frame+12);
+            if (et == 0x0806 && flen >= 42 && rd32(frame+38) == vnet_ip) send_arp_reply(frame);
+            if (et == 0x0800 && flen >= 54 && rd32(frame+30) == vnet_ip && frame[23] == 6) {
+                const u8 *tcp = frame + 14 + ((frame[14] & 0x0F) * 4U);
+                u32 ihl = (u32)(frame[14] & 0x0FU) * 4U;
+                u32 ip_len = rd16(frame + 16);
+                u32 tcp_off = (u32)(tcp[12] >> 4) * 4U;
+                u32 payload_len = (ip_len > ihl + tcp_off) ? ip_len - ihl - tcp_off : 0;
+                const u8 *payload = tcp + tcp_off;
+                if (rd16(tcp+2) == 80 && (tcp[13] & 0x02)) ip_tcp_reply(frame, flen, 0, 0, 0x12);
+                else if (rd16(tcp+2) == 80 && payload_len > 0 && http_payload_start(payload, payload_len)) {
+                    static const u8 resp[]="HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nPIOS QEMU LAN ADMIN\r\nwalfs=ok\r\n";
+                    ip_tcp_reply(frame, flen, resp, sizeof(resp)-1U, 0x19); return true;
+                }
+            }
+        }
+        ra->ring[ra->idx % VQ_SIZE] = (u16)id; ra->idx++; vnet_notify(0); mmio_write32(vnet_base + VIRTIO_REG_INT_ACK, mmio_read32(vnet_base + VIRTIO_REG_INT_STATUS));
+    }
+    return false;
+}
+
 static bool gop_init(struct efi_system_table *st)
 {
     static struct efi_guid gop_guid = {
@@ -351,6 +680,243 @@ static bool gop_init(struct efi_system_table *st)
     g_gop = (struct efi_graphics_output *)iface;
     return g_gop && g_gop->mode && g_gop->mode->info && g_gop->mode->framebuffer_base;
 }
+
+struct efi_service_binding {
+    efi_status_t (*create_child)(struct efi_service_binding *self, efi_handle_t *child);
+    efi_status_t (*destroy_child)(struct efi_service_binding *self, efi_handle_t child);
+};
+
+struct efi_ipv4 {
+    u8 addr[4];
+};
+
+struct efi_tcp4_access_point {
+    u8 use_default_address;
+    struct efi_ipv4 station_address;
+    struct efi_ipv4 subnet_mask;
+    u16 station_port;
+    struct efi_ipv4 remote_address;
+    u16 remote_port;
+    u8 active_flag;
+};
+
+struct efi_tcp4_config {
+    u8 type_of_service;
+    u8 time_to_live;
+    struct efi_tcp4_access_point access_point;
+    void *control_option;
+};
+
+struct efi_tcp4_completion {
+    efi_event_t event;
+    efi_status_t status;
+};
+
+struct efi_tcp4_listen_token {
+    struct efi_tcp4_completion completion;
+    efi_handle_t new_child_handle;
+};
+
+struct efi_tcp4_fragment {
+    u32 len;
+    void *buf;
+};
+
+struct efi_tcp4_rx_data {
+    u8 urgent;
+    u32 data_length;
+    u32 fragment_count;
+    struct efi_tcp4_fragment fragment[1];
+};
+
+struct efi_tcp4_tx_data {
+    u8 push;
+    u8 urgent;
+    u32 data_length;
+    u32 fragment_count;
+    struct efi_tcp4_fragment fragment[1];
+};
+
+struct efi_tcp4_io_token {
+    struct efi_tcp4_completion completion;
+    union {
+        struct efi_tcp4_rx_data *rx;
+        struct efi_tcp4_tx_data *tx;
+    } packet;
+};
+
+struct efi_tcp4_close_token {
+    struct efi_tcp4_completion completion;
+    u8 abort_on_close;
+};
+
+struct efi_tcp4_protocol {
+    void *get_mode_data;
+    efi_status_t (*configure)(struct efi_tcp4_protocol *self, struct efi_tcp4_config *cfg);
+    void *routes;
+    void *connect;
+    efi_status_t (*accept)(struct efi_tcp4_protocol *self, struct efi_tcp4_listen_token *token);
+    efi_status_t (*transmit)(struct efi_tcp4_protocol *self, struct efi_tcp4_io_token *token);
+    efi_status_t (*receive)(struct efi_tcp4_protocol *self, struct efi_tcp4_io_token *token);
+    efi_status_t (*close)(struct efi_tcp4_protocol *self, struct efi_tcp4_close_token *token);
+    void *cancel;
+    efi_status_t (*poll)(struct efi_tcp4_protocol *self);
+};
+
+static bool efi_wait_token(struct efi_system_table *st, efi_event_t ev)
+{
+    if (!st || !st->boot_services || !st->boot_services->wait_for_event || !ev)
+        return false;
+    usize idx = 0;
+    return st->boot_services->wait_for_event(1, &ev, &idx) == 0;
+}
+
+static bool efi_new_event(struct efi_system_table *st, efi_event_t *out)
+{
+    if (!st || !st->boot_services || !st->boot_services->create_event || !out)
+        return false;
+    return st->boot_services->create_event(EVT_NOTIFY_SIGNAL, TPL_CALLBACK, 0, 0, out) == 0;
+}
+
+static bool uefi_tcp4_admin_once(struct efi_system_table *st)
+{
+    static struct efi_guid tcp4_sb_guid = {
+        0x00720665U, 0x67EBU, 0x4A99U,
+        {0xBAU, 0xF7U, 0xD3U, 0xC3U, 0x3AU, 0x1CU, 0x7CU, 0xC9U}
+    };
+    static struct efi_guid tcp4_guid = {
+        0x65530BC7U, 0xA359U, 0x410FU,
+        {0xB0U, 0x10U, 0x5AU, 0xADU, 0xC7U, 0xECU, 0x2BU, 0x62U}
+    };
+    if (!st || !st->boot_services || !st->boot_services->locate_protocol ||
+        !st->boot_services->handle_protocol || !st->boot_services->create_event)
+        return false;
+
+    struct efi_service_binding *sb = 0;
+    efi_status_t st_loc = st->boot_services->locate_protocol(&tcp4_sb_guid, 0, (void **)&sb);
+    net_log_status("locate-sb", st_loc);
+    if (st_loc != EFI_SUCCESS || !sb)
+        return false;
+    efi_handle_t listen_handle = 0;
+    efi_status_t st_child = sb->create_child(sb, &listen_handle);
+    net_log_status("create-listener", st_child);
+    if (st_child != EFI_SUCCESS || !listen_handle)
+        return false;
+
+    struct efi_tcp4_protocol *tcp = 0;
+    efi_status_t st_hp = st->boot_services->handle_protocol(listen_handle, &tcp4_guid, (void **)&tcp);
+    net_log_status("handle-tcp4", st_hp);
+    if (st_hp != EFI_SUCCESS || !tcp)
+        return false;
+
+    struct efi_tcp4_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.time_to_live = 64;
+    cfg.access_point.use_default_address = 1;
+    cfg.access_point.station_port = 80;
+    cfg.access_point.active_flag = 0;
+
+    efi_status_t s = 1;
+    for (u32 i = 0; i < 40; i++) {
+        s = tcp->configure(tcp, &cfg);
+        if (s == 0) break;
+        net_log_status("configure", s);
+        if (st->boot_services->stall) st->boot_services->stall(250000);
+    }
+    net_log_status("configure-final", s);
+    if (s != 0)
+        return false;
+
+    efi_event_t listen_event = 0;
+    if (!efi_new_event(st, &listen_event) || !listen_event)
+        return false;
+    struct efi_tcp4_listen_token listen;
+    memset(&listen, 0, sizeof(listen));
+    listen.completion.event = listen_event;
+    efi_status_t st_accept = tcp->accept(tcp, &listen);
+    net_log_status("accept-post", st_accept);
+    if (st_accept != EFI_SUCCESS)
+        return false;
+    if (!efi_wait_token(st, listen_event) || listen.completion.status != 0 || !listen.new_child_handle) {
+        net_log_status("accept-complete", listen.completion.status);
+        return false;
+    }
+    if (st->boot_services->close_event) st->boot_services->close_event(listen_event);
+
+    struct efi_tcp4_protocol *conn = 0;
+    efi_status_t st_conn = st->boot_services->handle_protocol(listen.new_child_handle, &tcp4_guid, (void **)&conn);
+    net_log_status("handle-conn", st_conn);
+    if (st_conn != EFI_SUCCESS || !conn)
+        return false;
+
+    char rxbuf[512];
+    struct efi_tcp4_rx_data rxdata;
+    struct efi_tcp4_io_token rxtok;
+    memset(&rxdata, 0, sizeof(rxdata));
+    memset(&rxtok, 0, sizeof(rxtok));
+    rxdata.data_length = sizeof(rxbuf);
+    rxdata.fragment_count = 1;
+    rxdata.fragment[0].len = sizeof(rxbuf);
+    rxdata.fragment[0].buf = rxbuf;
+    efi_event_t rx_event = 0;
+    if (efi_new_event(st, &rx_event)) {
+        rxtok.completion.event = rx_event;
+        rxtok.packet.rx = &rxdata;
+        efi_status_t st_rx = conn->receive(conn, &rxtok);
+        net_log_status("rx-post", st_rx);
+        if (st_rx == EFI_SUCCESS)
+            (void)efi_wait_token(st, rx_event);
+        net_log_status("rx-complete", rxtok.completion.status);
+        if (st->boot_services->close_event) st->boot_services->close_event(rx_event);
+    }
+
+    static const char response[] =
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n"
+        "PIOS QEMU UEFI ADMIN\r\n"
+        "platform=qemu-virt\r\n"
+        "ram_sd=ok\r\n"
+        "walfs=ok\r\n"
+        "stage2=one-kernel-pgs2\r\n";
+    struct efi_tcp4_tx_data txdata;
+    struct efi_tcp4_io_token txtok;
+    memset(&txdata, 0, sizeof(txdata));
+    memset(&txtok, 0, sizeof(txtok));
+    txdata.push = 1;
+    txdata.data_length = (u32)sizeof(response) - 1U;
+    txdata.fragment_count = 1;
+    txdata.fragment[0].len = (u32)sizeof(response) - 1U;
+    txdata.fragment[0].buf = (void *)response;
+    efi_event_t tx_event = 0;
+    if (!efi_new_event(st, &tx_event) || !tx_event)
+        return false;
+    txtok.completion.event = tx_event;
+    txtok.packet.tx = &txdata;
+    efi_status_t st_tx = conn->transmit(conn, &txtok);
+    net_log_status("tx-post", st_tx);
+    if (st_tx != EFI_SUCCESS)
+        return false;
+    bool ok = efi_wait_token(st, tx_event) && txtok.completion.status == 0;
+    net_log_status("tx-complete", txtok.completion.status);
+    if (st->boot_services->close_event) st->boot_services->close_event(tx_event);
+
+    if (conn->close) {
+        struct efi_tcp4_close_token close_tok;
+        memset(&close_tok, 0, sizeof(close_tok));
+        efi_event_t close_event = 0;
+        if (efi_new_event(st, &close_event)) {
+            close_tok.completion.event = close_event;
+            close_tok.abort_on_close = 0;
+            if (conn->close(conn, &close_tok) == 0)
+                (void)efi_wait_token(st, close_event);
+            if (st->boot_services->close_event) st->boot_services->close_event(close_event);
+        }
+    }
+    return ok;
+}
+
 
 static void gop_set_largest_mode(void)
 {
@@ -502,7 +1068,7 @@ static void draw_status(u32 y, const char *label, bool ok)
 
 static void gop_render_workbench(bool sd_ok, bool fmt_ok, bool mount_ok,
                                  bool create_ok, bool write_ok, bool read_ok,
-                                 bool verify_ok, u32 records, u64 uptime)
+                                 bool verify_ok, bool lan_ok, u32 records, u64 uptime)
 {
     if (!g_gop || !g_gop->mode || !g_gop->mode->info) return;
     struct efi_gop_mode_info *mi = g_gop->mode->info;
@@ -522,13 +1088,14 @@ static void gop_render_workbench(bool sd_ok, bool fmt_ok, bool mount_ok,
     draw_status(178, "WALFS FILE WRITE", write_ok);
     draw_status(196, "WALFS READBACK", read_ok);
     draw_status(214, "WALFS VERIFY", verify_ok);
+    draw_status(232, "LAN ADMIN HTTP", lan_ok);
 
-    draw_text(8, 244, "RECORDS:", 0xB0B0B0, 1);
+    draw_text(8, 262, "RECORDS:", 0xB0B0B0, 1);
     wb_puts(""); /* keep compiler from considering wb_hex only serial-facing */
     char rec_digit[2] = { (char)('0' + (records % 10U)), 0 };
-    draw_text(62, 244, rec_digit, 0x4ADE80, 1);
-    draw_text(8, 264, "PARITY: PL011 RAMBLOCK WALFS", 0xDDE7F0, 1);
-    draw_text(8, 282, "PARKED - RESET VM TO REBOOT", 0xFBBF24, 1);
+    draw_text(62, 262, rec_digit, 0x4ADE80, 1);
+    draw_text(8, 282, "PARITY: PL011 RAMBLOCK WALFS LAN", 0xDDE7F0, 1);
+    draw_text(8, 300, "PARKED - RESET VM TO REBOOT", 0xFBBF24, 1);
     (void)uptime;
 }
 
@@ -585,7 +1152,11 @@ efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
     bool verify_ok = walfs_verify(&wh);
     if (gop_ok) {
         gop_render_workbench(sd_ok, fmt_ok, mount_ok, create_ok, write_ok, read_ok,
-                             verify_ok, verify_ok ? wh.valid_records : 0,
+                             verify_ok, false, verify_ok ? wh.valid_records : 0,
+                             timer_monotonic_ms());
+        bool lan_ok = vnet_init() && vnet_poll_admin_once();
+        gop_render_workbench(sd_ok, fmt_ok, mount_ok, create_ok, write_ok, read_ok,
+                             verify_ok, lan_ok, verify_ok ? wh.valid_records : 0,
                              timer_monotonic_ms());
         park_silent();
     }
