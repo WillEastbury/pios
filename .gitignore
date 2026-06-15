@@ -1,6 +1,7 @@
 # Build artifacts
 build/
 build_uefi/
+build_qemu_stage2/
 *.o
 *.elf
 *.img

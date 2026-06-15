@@ -101,11 +101,19 @@ static u32 stage0_platform_id(void)
     return PIOS_STAGE2_PLATFORM_PI5;
 }
 
-static bool select_stage2_entry_offset(const u8 *image, u32 image_len, u32 *entry_offset)
+struct stage2_selection {
+    u32 payload_offset;
+    u32 payload_bytes;
+    u32 entry_offset;
+};
+
+static bool select_stage2_image(const u8 *image, u32 image_len, struct stage2_selection *sel)
 {
-    if (!image || !entry_offset)
+    if (!image || !sel)
         return false;
-    *entry_offset = 0;
+    sel->payload_offset = 0;
+    sel->payload_bytes = image_len;
+    sel->entry_offset = 0;
     if (image_len < sizeof(struct pios_stage2_manifest_header))
         return true;
 
@@ -117,10 +125,14 @@ static bool select_stage2_entry_offset(const u8 *image, u32 image_len, u32 *entr
         u16 header_bytes = read_le16(h + 6);
         u16 entry_count = read_le16(h + 8);
         u16 entry_bytes = read_le16(h + 10);
+        u32 flags = read_le32(h + 12);
         if (ver != PIOS_STAGE2_MANIFEST_VERSION ||
             header_bytes < sizeof(struct pios_stage2_manifest_header) ||
             entry_bytes < sizeof(struct pios_stage2_manifest_entry) ||
             entry_count == 0 || entry_count > 16U)
+            continue;
+        if ((flags & PIOS_STAGE2_MANIFEST_FLAG_PACKAGED) &&
+            entry_bytes < PIOS_STAGE2_PACKAGED_ENTRY_BYTES)
             continue;
         u64 table_bytes = (u64)header_bytes + (u64)entry_count * (u64)entry_bytes;
         if (table_bytes > image_len - off)
@@ -133,9 +145,26 @@ static bool select_stage2_entry_offset(const u8 *image, u32 image_len, u32 *entr
             u64 entry = read_le64(e + 8);
             if (platform != want)
                 continue;
+            if (flags & PIOS_STAGE2_MANIFEST_FLAG_PACKAGED) {
+                u64 payload_off = read_le64(e + 64);
+                u64 payload_size = read_le64(e + 72);
+                u64 load_addr = read_le64(e + 80);
+                if (payload_size == 0 || payload_off > image_len ||
+                    payload_size > image_len - payload_off ||
+                    entry >= payload_size ||
+                    payload_size > PIOS_STAGE2_ZONE_BYTES ||
+                    load_addr != BOOT_DST_ADDR)
+                    return false;
+                sel->payload_offset = (u32)payload_off;
+                sel->payload_bytes = (u32)payload_size;
+                sel->entry_offset = (u32)entry;
+                return true;
+            }
             if (entry >= image_len)
                 return false;
-            *entry_offset = (u32)entry;
+            sel->payload_offset = 0;
+            sel->payload_bytes = image_len;
+            sel->entry_offset = (u32)entry;
             return true;
         }
         return false;
@@ -403,15 +432,15 @@ have_header:
             for (;;) wfi();
         }
     }
-    u32 entry_offset = 0;
-    if (!select_stage2_entry_offset(staging, image_len, &entry_offset)) {
+    struct stage2_selection sel;
+    if (!select_stage2_image(staging, image_len, &sel)) {
         fb_set_color(0x00FF0000, 0x00000000);
         fb_puts("[stage0] stage2 manifest select failed\n");
         uart_puts("[boot] stage2 manifest select failed\n");
         for (;;) wfi();
     }
     fb_set_color(0x0000FF00, 0x00000000);
-    fb_printf("[stage0] jumping entry=0x%x\n", entry_offset);
+    fb_printf("[stage0] jumping entry=0x%x\n", sel.entry_offset);
 
     u8 *tramp_dst = (u8 *)(usize)BOOT_TRAMP_ADDR;
     u32 tramp_len = (u32)(bootstrap_trampoline_end - bootstrap_trampoline);
@@ -421,6 +450,7 @@ have_header:
 
     uart_puts("[boot] jumping real kernel\n");
     void (*tramp)(u64, u64, u64, u64) = (void (*)(u64, u64, u64, u64))(usize)BOOT_TRAMP_ADDR;
-    tramp(BOOT_DST_ADDR, BOOT_STAGING_ADDR, image_len, BOOT_DST_ADDR + entry_offset);
+    tramp(BOOT_DST_ADDR, BOOT_STAGING_ADDR + sel.payload_offset, sel.payload_bytes,
+          BOOT_DST_ADDR + sel.entry_offset);
     for (;;) wfi();
 }

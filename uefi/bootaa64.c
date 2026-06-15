@@ -1,8 +1,8 @@
 /*
  * BOOTAA64.EFI - QEMU/UEFI stage1 loader.
  *
- * Loads one common stage2 image (PIOSSTG2.BIN), scans its PGS2 manifest, selects
- * the QEMU platform entry offset, and jumps into that image.
+ * Loads one shared stage2 package, scans its PGS2 manifest, selects the QEMU
+ * payload, and jumps into that platform image.
  */
 #include "../include/types.h"
 #include "../include/stage2_manifest.h"
@@ -126,8 +126,23 @@ static u16 rd16(const u8 *p) { return (u16)(p[0] | ((u16)p[1] << 8)); }
 static u32 rd32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
 static u64 rd64(const u8 *p) { return (u64)rd32(p) | ((u64)rd32(p + 4) << 32); }
 
-static bool find_stage2_entry(const u8 *image, u32 len, u32 *entry_off, u64 *image_size)
+struct stage2_selection {
+    u32 payload_offset;
+    u32 payload_bytes;
+    u32 entry_offset;
+    u64 load_addr;
+    u64 memory_size;
+};
+
+static bool find_stage2_entry(const u8 *image, u32 len, struct stage2_selection *sel)
 {
+    if (!image || !sel)
+        return false;
+    sel->payload_offset = 0;
+    sel->payload_bytes = len;
+    sel->entry_offset = 0;
+    sel->load_addr = STAGE2_LOAD_ADDR;
+    sel->memory_size = STAGE2_MAX_MEMORY_BYTES;
     for (u32 off = 0; off + sizeof(struct pios_stage2_manifest_header) <= len; off += 8) {
         const u8 *h = image + off;
         if (rd32(h) != PIOS_STAGE2_MANIFEST_MAGIC) continue;
@@ -135,7 +150,10 @@ static bool find_stage2_entry(const u8 *image, u32 len, u32 *entry_off, u64 *ima
         u16 hb = rd16(h + 6);
         u16 cnt = rd16(h + 8);
         u16 eb = rd16(h + 10);
+        u32 flags = rd32(h + 12);
         if (ver != PIOS_STAGE2_MANIFEST_VERSION || hb < 32 || eb < 64 || cnt == 0 || cnt > 16)
+            continue;
+        if ((flags & PIOS_STAGE2_MANIFEST_FLAG_PACKAGED) && eb < PIOS_STAGE2_PACKAGED_ENTRY_BYTES)
             continue;
         if ((u64)hb + (u64)cnt * eb > len - off) continue;
         u64 full_size = rd64(h + 24);
@@ -145,9 +163,33 @@ static bool find_stage2_entry(const u8 *image, u32 len, u32 *entry_off, u64 *ima
             const u8 *e = h + hb + i * eb;
             if (rd32(e) != PIOS_STAGE2_PLATFORM_QEMU_VIRT) continue;
             u64 ent = rd64(e + 8);
+            if (flags & PIOS_STAGE2_MANIFEST_FLAG_PACKAGED) {
+                u64 payload_off = rd64(e + 64);
+                u64 payload_size = rd64(e + 72);
+                u64 load_addr = rd64(e + 80);
+                u64 memory_size = rd64(e + 88);
+                if (payload_size == 0 || payload_off > len ||
+                    payload_size > len - payload_off ||
+                    ent >= payload_size ||
+                    payload_size > STAGE2_MAX_BYTES ||
+                    memory_size == 0 ||
+                    memory_size > STAGE2_MAX_MEMORY_BYTES ||
+                    memory_size < payload_size ||
+                    load_addr == 0)
+                    return false;
+                sel->payload_offset = (u32)payload_off;
+                sel->payload_bytes = (u32)payload_size;
+                sel->entry_offset = (u32)ent;
+                sel->load_addr = load_addr;
+                sel->memory_size = memory_size;
+                return true;
+            }
             if (ent >= full_size) return false;
-            *entry_off = (u32)ent;
-            if (image_size) *image_size = full_size;
+            sel->payload_offset = 0;
+            sel->payload_bytes = len;
+            sel->entry_offset = (u32)ent;
+            sel->load_addr = STAGE2_LOAD_ADDR;
+            sel->memory_size = full_size;
             return true;
         }
         return false;
@@ -158,7 +200,7 @@ static bool find_stage2_entry(const u8 *image, u32 len, u32 *entry_off, u64 *ima
 efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
 {
     g_con = st ? st->con_out : 0;
-    puts_ascii("PIOS BOOTAA64: loading embedded common stage2...\n");
+    puts_ascii("PIOS BOOTAA64: loading embedded shared stage2...\n");
     if (!st || !st->boot_services) return EFI_LOAD_ERROR;
 
     usize sz = (usize)(pios_stage2_blob_end - pios_stage2_blob_start);
@@ -166,24 +208,25 @@ efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
         puts_ascii("embedded stage2 size invalid\n");
         return EFI_LOAD_ERROR;
     }
-    u64 addr = STAGE2_LOAD_ADDR;
-    if (st->boot_services->allocate_pages &&
-        st->boot_services->allocate_pages(ALLOCATE_ADDRESS, EFI_LOADER_DATA, STAGE2_MAX_PAGE_COUNT, &addr) != EFI_SUCCESS) {
-        puts_ascii("allocate stage2 pages failed\n");
-        return EFI_LOAD_ERROR;
-    }
-    memset((void *)(usize)addr, 0, STAGE2_MAX_MEMORY_BYTES);
-    memcpy((void *)(usize)addr, pios_stage2_blob_start, sz);
-
-    u32 entry_off = 0;
-    u64 image_size = 0;
-    if (!find_stage2_entry((const u8 *)(usize)addr, (u32)sz, &entry_off, &image_size)) {
+    struct stage2_selection sel;
+    if (!find_stage2_entry(pios_stage2_blob_start, (u32)sz, &sel)) {
         puts_ascii("stage2 PGS2 entry not found\n");
         return EFI_LOAD_ERROR;
     }
+
+    u64 addr = sel.load_addr;
+    usize pages = (usize)((sel.memory_size + 4095ULL) / 4096ULL);
+    if (st->boot_services->allocate_pages &&
+        st->boot_services->allocate_pages(ALLOCATE_ADDRESS, EFI_LOADER_DATA, pages, &addr) != EFI_SUCCESS) {
+        puts_ascii("allocate stage2 pages failed\n");
+        return EFI_LOAD_ERROR;
+    }
+    memset((void *)(usize)addr, 0, (usize)sel.memory_size);
+    memcpy((void *)(usize)addr, pios_stage2_blob_start + sel.payload_offset, sel.payload_bytes);
+
     puts_ascii("stage2 selected; jumping\n");
     void (*entry)(efi_handle_t, struct efi_system_table *) =
-        (void (*)(efi_handle_t, struct efi_system_table *))(usize)(addr + entry_off);
+        (void (*)(efi_handle_t, struct efi_system_table *))(usize)(addr + sel.entry_offset);
     entry(image, st);
     return EFI_SUCCESS;
 }

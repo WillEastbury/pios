@@ -10,6 +10,7 @@
 #include "sd.h"
 #include "mmio.h"
 #include "walfs.h"
+#include "stage2_manifest.h"
 
 #define BOOT_DST_ADDR       0x00080000ULL
 #define BOOT_STAGING_ADDR   0x08000000ULL
@@ -69,6 +70,16 @@ u32 pios_strlen(const char *s)
 static u32 read_le32(const u8 *p)
 {
     return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static u16 read_le16(const u8 *p)
+{
+    return (u16)((u16)p[0] | ((u16)p[1] << 8));
+}
+
+static u64 read_le64(const u8 *p)
+{
+    return (u64)read_le32(p) | ((u64)read_le32(p + 4) << 32);
 }
 
 static void write_le32(u8 *p, u32 v)
@@ -176,6 +187,73 @@ static bool write_slot(u32 slot_lba, const u8 *payload, u32 payload_len)
     return true;
 }
 
+struct stage2_selection {
+    u32 payload_offset;
+    u32 payload_bytes;
+    u32 entry_offset;
+};
+
+static bool select_pi_stage2_payload(const u8 *image, u32 image_len, struct stage2_selection *sel)
+{
+    if (!image || !sel)
+        return false;
+    sel->payload_offset = 0;
+    sel->payload_bytes = image_len;
+    sel->entry_offset = 0;
+    if (image_len < sizeof(struct pios_stage2_manifest_header))
+        return true;
+
+    for (u32 off = 0; off + sizeof(struct pios_stage2_manifest_header) <= image_len; off += 8U) {
+        const u8 *h = image + off;
+        if (read_le32(h) != PIOS_STAGE2_MANIFEST_MAGIC)
+            continue;
+        u16 ver = read_le16(h + 4);
+        u16 header_bytes = read_le16(h + 6);
+        u16 entry_count = read_le16(h + 8);
+        u16 entry_bytes = read_le16(h + 10);
+        u32 flags = read_le32(h + 12);
+        if (ver != PIOS_STAGE2_MANIFEST_VERSION ||
+            header_bytes < sizeof(struct pios_stage2_manifest_header) ||
+            entry_bytes < sizeof(struct pios_stage2_manifest_entry) ||
+            entry_count == 0 || entry_count > 16U)
+            continue;
+        if ((flags & PIOS_STAGE2_MANIFEST_FLAG_PACKAGED) &&
+            entry_bytes < PIOS_STAGE2_PACKAGED_ENTRY_BYTES)
+            continue;
+        u64 table_bytes = (u64)header_bytes + (u64)entry_count * (u64)entry_bytes;
+        if (table_bytes > image_len - off)
+            continue;
+
+        for (u32 i = 0; i < entry_count; i++) {
+            const u8 *e = h + header_bytes + i * (u32)entry_bytes;
+            if (read_le32(e) != PIOS_STAGE2_PLATFORM_PI5)
+                continue;
+            u64 entry = read_le64(e + 8);
+            if (flags & PIOS_STAGE2_MANIFEST_FLAG_PACKAGED) {
+                u64 payload_off = read_le64(e + 64);
+                u64 payload_size = read_le64(e + 72);
+                u64 load_addr = read_le64(e + 80);
+                if (payload_size == 0 || payload_off > image_len ||
+                    payload_size > image_len - payload_off ||
+                    entry >= payload_size ||
+                    payload_size > PIOS_STAGE2_ZONE_BYTES ||
+                    load_addr != BOOT_DST_ADDR)
+                    return false;
+                sel->payload_offset = (u32)payload_off;
+                sel->payload_bytes = (u32)payload_size;
+                sel->entry_offset = (u32)entry;
+                return true;
+            }
+            if (entry >= image_len)
+                return false;
+            sel->entry_offset = (u32)entry;
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
+
 void core1_main(void) { for (;;) wfi(); }
 void core2_main(void) { for (;;) wfi(); }
 void core3_main(void) { for (;;) wfi(); }
@@ -215,8 +293,14 @@ NORETURN void kernel_main(void)
         uart_puts("[prov] write disabled; jump-only test\n");
     }
 
+    struct stage2_selection sel;
+    if (!select_pi_stage2_payload(payload, payload_len, &sel)) {
+        uart_puts("[prov] stage2 package select failed\n");
+        for (;;) wfi();
+    }
+
     u8 *staging = (u8 *)(usize)BOOT_STAGING_ADDR;
-    memcpy(staging, payload, payload_len);
+    memcpy(staging, payload + sel.payload_offset, sel.payload_bytes);
 
     u8 *tramp_dst = (u8 *)(usize)BOOT_TRAMP_ADDR;
     u32 tramp_len = (u32)(bootstrap_trampoline_end - bootstrap_trampoline);
@@ -226,6 +310,6 @@ NORETURN void kernel_main(void)
 
     uart_puts("[prov] jumping payload\n");
     void (*tramp)(u64, u64, u64, u64) = (void (*)(u64, u64, u64, u64))(usize)BOOT_TRAMP_ADDR;
-    tramp(BOOT_DST_ADDR, BOOT_STAGING_ADDR, payload_len, BOOT_DST_ADDR);
+    tramp(BOOT_DST_ADDR, BOOT_STAGING_ADDR, sel.payload_bytes, BOOT_DST_ADDR + sel.entry_offset);
     for (;;) wfi();
 }

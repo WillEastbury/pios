@@ -3,6 +3,7 @@
 
 #define PIOS_STAGE2_MANIFEST_MAGIC   0x32534750  /* 'PGS2' little-endian */
 #define PIOS_STAGE2_MANIFEST_VERSION 1
+#define PIOS_STAGE2_MANIFEST_FLAG_PACKAGED (1U << 0)
 
 #define PIOS_STAGE2_PLATFORM_PI5        1U
 #define PIOS_STAGE2_PLATFORM_QEMU_VIRT  2U
@@ -39,6 +40,16 @@ struct pios_stage2_manifest_entry {
     u64 required_features;
     u64 optional_features;
     char name[32];
+} PACKED;
+
+#define PIOS_STAGE2_PACKAGED_ENTRY_BYTES 96U
+
+struct pios_stage2_packaged_entry {
+    struct pios_stage2_manifest_entry base;
+    u64 payload_offset;
+    u64 payload_size;
+    u64 load_addr;
+    u64 memory_size;
 } PACKED;
 
 extern const u8 pios_stage2_manifest_start[];

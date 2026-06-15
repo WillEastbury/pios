@@ -696,7 +696,7 @@ static u32 qhttp_build_response(const u8 *req, u32 req_len, char *out, u32 max)
     if (qhttp_path_is(req, req_len, "/api/status")) {
         u32 len = qhttp_begin(out, max, "application/json");
         qhttp_append(out, &len, max, "{\"ok\":true,\"platform\":\"qemu-virt\",\"version\":\"qemu-stage2\",");
-        qhttp_append(out, &len, max, "\"build\":\"PIOSSTG2 common\",\"uptime\":");
+        qhttp_append(out, &len, max, "\"build\":\"PIOSSTG2 shared package\",\"uptime\":");
         qhttp_append_u64(out, &len, max, timer_monotonic_ms() / 1000ULL);
         qhttp_append(out, &len, max, ",\"ip\":\"10.0.2.15\",\"mode\":\"qemu-common-stage2\",");
         qhttp_append(out, &len, max, "\"boot\":\"BOOTAA64.EFI/PGS2\",\"diag\":{\"vnet\":");
@@ -742,7 +742,7 @@ static u32 qhttp_build_response(const u8 *req, u32 req_len, char *out, u32 max)
     if (qhttp_path_is(req, req_len, "/logs") || qhttp_path_is(req, req_len, "/api/logs") ||
         qhttp_path_is(req, req_len, "/api/admin/log-stream")) {
         u32 len = qhttp_begin(out, max, "text/plain");
-        qhttp_append(out, &len, max, "PIOS QEMU log tail\nboot=BOOTAA64.EFI\nstage2=PIOSSTG2.BIN selected by PGS2\n");
+        qhttp_append(out, &len, max, "PIOS QEMU log tail\nboot=BOOTAA64.EFI\nstage2=PIOSSTG2.PKG selected by PGS2\n");
         qhttp_append(out, &len, max, "workbench=rendered\nstorage=");
         qhttp_append(out, &len, max, sd_qemu_backend_name());
         qhttp_append(out, &len, max, "\nstorage_bytes=");
@@ -764,7 +764,7 @@ static u32 qhttp_build_response(const u8 *req, u32 req_len, char *out, u32 max)
 
     u32 len = qhttp_begin(out, max, "text/html");
     qhttp_append(out, &len, max, "<!doctype html><title>PIOS QEMU Admin</title><body><h1>PIOS QEMU Admin Console</h1>");
-    qhttp_append(out, &len, max, "<p>platform=qemu-virt boot=BOOTAA64.EFI stage2=PIOSSTG2.BIN</p>");
+    qhttp_append(out, &len, max, "<p>platform=qemu-virt boot=BOOTAA64.EFI stage2=PIOSSTG2.PKG</p>");
     qhttp_append(out, &len, max, "<p>storage=");
     qhttp_append(out, &len, max, sd_qemu_backend_name());
     qhttp_append(out, &len, max, " | WALFS OK | LAN hostfwd OK</p>");
@@ -1284,7 +1284,7 @@ static void gop_render_workbench(bool sd_ok, bool fmt_ok, bool mount_ok,
     draw_cell(22, 14, "root", 0xFFFFFF);
     draw_cell(34, 14, "ok", 0x4ADE80);
     draw_cell(44, 14, "16M", 0xFFFFFF);
-    draw_cell(56, 14, "PIOSSTG2 common", 0xFFFFFF);
+    draw_cell(56, 14, "PIOSSTG2 shared", 0xFFFFFF);
     draw_cell(88, 14, sd_qemu_virtio_blk_ready() ? "virtio walfs" : "ram walfs", 0xFFFFFF);
     draw_cell(6, 15, "2", 0xFFFFFF);
     draw_cell(12, 15, "0", 0xFFFFFF);
@@ -1307,7 +1307,7 @@ static void gop_render_workbench(bool sd_ok, bool fmt_ok, bool mount_ok,
     draw_cell(4, 29, "No warnings or errors in QEMU PIOS workbench.", 0x4ADE80);
     draw_cell(4, 31, sd_qemu_virtio_blk_ready() ? "Validated: VIRTIO-BLK, WALFS create/write/readback/verify, LAN ADMIN HTTP." : "Validated: RAM SD, WALFS create/write/readback/verify, LAN ADMIN HTTP.", 0xDDE7F0);
     draw_cell(4, 33, "Admin URL: http://127.0.0.1:8088/", 0xFBBF24);
-    draw_cell(4, 35, "Screenshot is rendered from common stage2 PIOSSTG2.BIN.", 0xB0B0B0);
+    draw_cell(4, 35, "Screenshot is rendered from shared stage2 PIOSSTG2.PKG.", 0xB0B0B0);
     (void)uptime;
     (void)create_ok; (void)write_ok; (void)read_ok; (void)vnet_diag_code;
 }
