@@ -22,6 +22,7 @@
 #include "mmio.h"
 #include "uart.h"
 #include "fb.h"
+#include "platform.h"
 
 /* SDHCI register offsets from EMMC2_BASE */
 #define REG_ARG2            0x00
@@ -110,6 +111,27 @@
 
 static sd_card_t  card;
 static sd_stats_t stats;
+
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+#define QEMU_RAM_SD_BLOCKS 65536U  /* 32 MiB */
+static u8 qemu_ram_sd[QEMU_RAM_SD_BLOCKS * SD_BLOCK_SIZE] ALIGNED(64);
+static bool qemu_ram_sd_ready;
+
+static bool qemu_ram_lba_ok(u32 lba, u32 count)
+{
+    return count <= QEMU_RAM_SD_BLOCKS && lba <= QEMU_RAM_SD_BLOCKS - count;
+}
+
+static void qemu_ram_copy_out(u8 *dst, const u8 *src, u32 n)
+{
+    for (u32 i = 0; i < n; i++) dst[i] = src[i];
+}
+
+static void qemu_ram_copy_in(u8 *dst, const u8 *src, u32 n)
+{
+    for (u32 i = 0; i < n; i++) dst[i] = src[i];
+}
+#endif
 
 /* ── helpers ──────────────────────────────────────────────────────── */
 
@@ -372,6 +394,20 @@ static bool sd_read_csd(void) {
 /* ── initialisation ───────────────────────────────────────────────── */
 
 bool sd_init(void) {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    card.type = 2;
+    card.rca = 1;
+    card.capacity = (u64)QEMU_RAM_SD_BLOCKS * SD_BLOCK_SIZE;
+    memset((void *)&stats, 0, sizeof(stats));
+    if (!qemu_ram_sd_ready) {
+        memset(qemu_ram_sd, 0, sizeof(qemu_ram_sd));
+        qemu_ram_sd_ready = true;
+    }
+    uart_puts("[sd] qemu RAM block backend cap=");
+    uart_hex(card.capacity);
+    uart_puts("\n");
+    return true;
+#else
     fb_puts("  [sd] reset SDHCI...\n");
     uart_puts("[sd] init\n");
 
@@ -504,6 +540,7 @@ bool sd_init(void) {
     uart_puts("\n");
 
     return true;
+#endif
 }
 
 /* ── PIO helpers (aligned / unaligned) ────────────────────────────── */
@@ -589,6 +626,17 @@ static bool sd_read_block_inner(u32 lba, u8 *buf) {
 }
 
 bool sd_read_block(u32 lba, u8 *buf) {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    u64 start = sd_now_us();
+    if (!buf || !qemu_ram_lba_ok(lba, 1)) {
+        stats.errors++;
+        return false;
+    }
+    qemu_ram_copy_out(buf, qemu_ram_sd + ((usize)lba * SD_BLOCK_SIZE), SD_BLOCK_SIZE);
+    stats.reads++;
+    sd_record_read_rate(1, start);
+    return true;
+#else
     u64 start = sd_now_us();
     for (u32 try = 0; try < SD_MAX_RETRIES; try++) {
         if (sd_read_block_inner(lba, buf)) {
@@ -613,6 +661,7 @@ bool sd_read_block(u32 lba, u8 *buf) {
         }
     }
     return false;
+#endif
 }
 
 static bool sd_write_block_inner(u32 lba, const u8 *buf) {
@@ -666,6 +715,17 @@ static bool sd_write_block_inner(u32 lba, const u8 *buf) {
 }
 
 bool sd_write_block(u32 lba, const u8 *buf) {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    u64 start = sd_now_us();
+    if (!buf || !qemu_ram_lba_ok(lba, 1)) {
+        stats.errors++;
+        return false;
+    }
+    qemu_ram_copy_in(qemu_ram_sd + ((usize)lba * SD_BLOCK_SIZE), buf, SD_BLOCK_SIZE);
+    stats.writes++;
+    sd_record_write_rate(1, start);
+    return true;
+#else
     u64 start = sd_now_us();
     for (u32 try = 0; try < SD_MAX_RETRIES; try++) {
         if (sd_write_block_inner(lba, buf)) {
@@ -677,6 +737,7 @@ bool sd_write_block(u32 lba, const u8 *buf) {
         sd_recover();
     }
     return false;
+#endif
 }
 
 /* ── multi-block I/O (CMD18 / CMD25) ─────────────────────────────── */
@@ -730,6 +791,18 @@ static bool sd_read_blocks_multi(u32 lba, u32 count, u8 *buf) {
 
 bool sd_read_blocks(u32 lba, u32 count, u8 *buf) {
     if (count == 0) return true;
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    u64 start = sd_now_us();
+    if (!buf || !qemu_ram_lba_ok(lba, count)) {
+        stats.errors++;
+        return false;
+    }
+    qemu_ram_copy_out(buf, qemu_ram_sd + ((usize)lba * SD_BLOCK_SIZE),
+                      count * SD_BLOCK_SIZE);
+    stats.reads += count;
+    sd_record_read_rate(count, start);
+    return true;
+#else
     if (count == 1) return sd_read_block(lba, buf);
 
     u64 start = sd_now_us();
@@ -743,6 +816,7 @@ bool sd_read_blocks(u32 lba, u32 count, u8 *buf) {
         sd_recover();
     }
     return false;
+#endif
 }
 
 static bool sd_write_blocks_multi(u32 lba, u32 count, const u8 *buf) {
@@ -800,6 +874,18 @@ static bool sd_write_blocks_multi(u32 lba, u32 count, const u8 *buf) {
 
 bool sd_write_blocks(u32 lba, u32 count, const u8 *buf) {
     if (count == 0) return true;
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    u64 start = sd_now_us();
+    if (!buf || !qemu_ram_lba_ok(lba, count)) {
+        stats.errors++;
+        return false;
+    }
+    qemu_ram_copy_in(qemu_ram_sd + ((usize)lba * SD_BLOCK_SIZE), buf,
+                     count * SD_BLOCK_SIZE);
+    stats.writes += count;
+    sd_record_write_rate(count, start);
+    return true;
+#else
     if (count == 1) return sd_write_block(lba, buf);
 
     u64 start = sd_now_us();
@@ -813,6 +899,7 @@ bool sd_write_blocks(u32 lba, u32 count, const u8 *buf) {
         sd_recover();
     }
     return false;
+#endif
 }
 
 /* ── accessors ────────────────────────────────────────────────────── */
