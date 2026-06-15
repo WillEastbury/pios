@@ -9,11 +9,17 @@ PHDRS
 SECTIONS
 {
     . = 0x80000;
+    __image_start = .;
 
     __text_start = .;
     .text.boot : { *(.text.boot) } :text
     .text      : { *(.text*) } :text
     __text_end = .;
+    .stage2_manifest : {
+        __stage2_manifest_start = .;
+        KEEP(*(.stage2_manifest))
+        __stage2_manifest_end = .;
+    } :text
     .rodata    : { *(.rodata*) } :text
     .data      : { *(.data*) } :data
 
@@ -38,5 +44,6 @@ SECTIONS
 
     . = ALIGN(4096); /* inside RW segment for static reservations */
     __heap_start = .;
+    __image_end = .;
 }
 __bss_size = (__bss_end - __bss_start) >> 3;
