@@ -13,6 +13,8 @@
 #include "../include/walfs.h"
 #include "../include/fifo.h"
 #include "../include/principal.h"
+#include "../include/picocompress.h"
+#include "../include/picoweb.h"
 
 typedef u64 efi_status_t;
 typedef void *efi_handle_t;
@@ -727,6 +729,14 @@ static u32 qhttp_build_response(const u8 *req, u32 req_len, char *out, u32 max)
         qhttp_append(out, &len, max, ",\"walfs_verified\":");
         qhttp_append_bool(out, &len, max, g_qemu_verify_ok);
         qhttp_append(out, &len, max, "},\"services\":{\"admin\":true,\"workbench\":true,\"stage2\":true}}\n");
+        if (len >= 3U) {
+            len -= 3U; /* replace }}\n */
+            qhttp_append(out, &len, max, ",\"picocompress\":");
+            qhttp_append_bool(out, &len, max, pc_selftest());
+            qhttp_append(out, &len, max, ",\"picoweb\":");
+            qhttp_append_bool(out, &len, max, picoweb_selftest());
+            qhttp_append(out, &len, max, "}}\n");
+        }
         return len;
     }
     if (qhttp_path_is(req, req_len, "/api/netstat")) {

@@ -77,6 +77,8 @@
 #include "keystore.h"
 #include "tls.h"
 #include "brotli.h"
+#include "picocompress.h"
+#include "picoweb.h"
 #include "x509.h"
 #include "acme.h"
 #include "abi.h"
@@ -2078,7 +2080,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
             "Examples: status | ps | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
-            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | cachestats\n"
+            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | picocompress selftest | picoweb selftest\n"
             "Command help: help status | help netstat | help firewall | help reboot | help peek | help walfs | help cachestats\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
     } else if (http_starts_with(cmd, "help ")) {
@@ -2123,6 +2125,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append(out, &len, max, "tls status | tls selftest | tls bridge\n  Show kernel TLS diagnostics, run record-layer selftest, or parse a PicoWeb-style plaintext HTTP bridge sample.\n");
         } else if (http_streq(topic, "brotli")) {
             http_append(out, &len, max, "brotli selftest\n  Verify the no-external-dependency Brotli stored encoder and PicoWeb micro-Brotli decoder.\n");
+        } else if (http_streq(topic, "picocompress")) {
+            http_append(out, &len, max, "picocompress selftest\n  Verify upstream-compatible 508-byte block compression/decompression and encoder stats.\n");
+        } else if (http_streq(topic, "picoweb")) {
+            http_append(out, &len, max, "picoweb selftest\n  Verify upstream-compatible method+pattern route dispatch, route params, headers, and status text.\n");
         } else if (http_streq(topic, "x509")) {
             http_append(out, &len, max, "x509 status | x509 generate [cn] | x509 csr [cn] | x509 p256 [cn] | x509 bind | x509 import-self | x509 selftest\n  Manage kernel-only X.509 cert/key, CSR, import, and TLS binding state.\n");
         } else if (http_streq(topic, "acme")) {
@@ -2436,6 +2442,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "brotli") || http_streq(cmd, "brotli selftest")) {
         http_append(out, &len, max, brotli_selftest() ? "Brotli selftest OK\n" : "Brotli selftest FAILED\n");
+    } else if (http_streq(cmd, "picocompress") || http_streq(cmd, "picocompress selftest")) {
+        http_append(out, &len, max, pc_selftest() ? "Picocompress selftest OK\n" : "Picocompress selftest FAILED\n");
+    } else if (http_streq(cmd, "picoweb") || http_streq(cmd, "picoweb selftest")) {
+        http_append(out, &len, max, picoweb_selftest() ? "PicoWeb selftest OK\n" : "PicoWeb selftest FAILED\n");
     } else if (http_streq(cmd, "x509") || http_streq(cmd, "x509 status")) {
         struct x509_status xs;
         x509_status(&xs);
@@ -9360,6 +9370,24 @@ static void ui_cmd_brotli(u32 argc, char **argv)
     ui_console_write("ERR: usage brotli selftest\n");
 }
 
+static void ui_cmd_picocompress(u32 argc, char **argv)
+{
+    if (argc < 2 || ui_streq(argv[1], "selftest")) {
+        ui_console_write(pc_selftest() ? "Picocompress selftest OK\n" : "Picocompress selftest FAILED\n");
+        return;
+    }
+    ui_console_write("ERR: usage picocompress selftest\n");
+}
+
+static void ui_cmd_picoweb(u32 argc, char **argv)
+{
+    if (argc < 2 || ui_streq(argv[1], "selftest")) {
+        ui_console_write(picoweb_selftest() ? "PicoWeb selftest OK\n" : "PicoWeb selftest FAILED\n");
+        return;
+    }
+    ui_console_write("ERR: usage picoweb selftest\n");
+}
+
 static void ui_print_x509_status(void)
 {
     struct x509_status xs;
@@ -13839,6 +13867,10 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("tls bridge\n  Parse a sample plaintext HTTP request through the PicoWeb-style TLS bridge boundary.\n");
     } else if (ui_streq(topic, "brotli")) {
         ui_console_write("brotli selftest\n  Verify PIOS Brotli stored encoder and PicoWeb micro-Brotli decoder.\n");
+    } else if (ui_streq(topic, "picocompress")) {
+        ui_console_write("picocompress selftest\n  Verify upstream-compatible 508-byte block codec and encoder stats.\n");
+    } else if (ui_streq(topic, "picoweb")) {
+        ui_console_write("picoweb selftest\n  Verify upstream-compatible route dispatch, params, headers, and status text.\n");
     } else if (ui_streq(topic, "x509")) {
         ui_console_write("x509 status\n  Show kernel cert/key service state, DER/CSR lengths, and fingerprints.\n");
         ui_console_write("x509 generate [cn]\n  Generate a keystore-backed self-signed Ed25519 DER certificate.\n");
@@ -14339,6 +14371,10 @@ static void ui_console_exec(char *line)
         ui_cmd_tls(argc, argv);
     } else if (ui_streq(argv[0], "brotli")) {
         ui_cmd_brotli(argc, argv);
+    } else if (ui_streq(argv[0], "picocompress")) {
+        ui_cmd_picocompress(argc, argv);
+    } else if (ui_streq(argv[0], "picoweb")) {
+        ui_cmd_picoweb(argc, argv);
     } else if (ui_streq(argv[0], "x509")) {
         ui_cmd_x509(argc, argv);
     } else if (ui_streq(argv[0], "acme")) {

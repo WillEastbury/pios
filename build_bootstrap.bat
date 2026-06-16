@@ -99,7 +99,11 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%CC%" %QEMU_STAGE2_CFLAGS% -c src\lru.c -o build_qemu_stage2\lru.o
 if errorlevel 1 exit /b 1
-"%LD%" -T link_qemu_virt.ld -nostdlib -o build_qemu_stage2\PIOSSTG2_QEMU.ELF build_qemu_stage2\qemu_stage2_start.o build_qemu_stage2\qemu_stage2_manifest.o build_qemu_stage2\qemu_stage2_os.o build_qemu_stage2\sd.o build_qemu_stage2\bcache.o build_qemu_stage2\walfs.o build_qemu_stage2\lru.o
+"%CC%" %QEMU_STAGE2_CFLAGS% -c src\picocompress.c -o build_qemu_stage2\picocompress.o
+if errorlevel 1 exit /b 1
+"%CC%" %QEMU_STAGE2_CFLAGS% -c src\picoweb.c -o build_qemu_stage2\picoweb.o
+if errorlevel 1 exit /b 1
+"%LD%" -T link_qemu_virt.ld -nostdlib -o build_qemu_stage2\PIOSSTG2_QEMU.ELF build_qemu_stage2\qemu_stage2_start.o build_qemu_stage2\qemu_stage2_manifest.o build_qemu_stage2\qemu_stage2_os.o build_qemu_stage2\sd.o build_qemu_stage2\bcache.o build_qemu_stage2\walfs.o build_qemu_stage2\lru.o build_qemu_stage2\picocompress.o build_qemu_stage2\picoweb.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary build_qemu_stage2\PIOSSTG2_QEMU.ELF build_qemu_stage2\PIOSSTG2_QEMU.BIN
 if errorlevel 1 exit /b 1
