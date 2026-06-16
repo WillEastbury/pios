@@ -112,7 +112,7 @@ def main():
     ap.add_argument("--lang", choices=["c", "basic", "python", "english", "v1"],
                     help="force the PicoScript frontend language")
     ap.add_argument("--compiler", help="path to picoscript_build.py (else auto-detect / $PICOSCRIPT_HOME)")
-    ap.add_argument("--host", default="192.168.0.200", help="PIOS host (default 192.168.0.200)")
+    ap.add_argument("--host", default="192.168.0.201", help="PIOS host (default 192.168.0.201)")
     ap.add_argument("--card", type=int, help="destination picowal card (0..1023)")
     ap.add_argument("--record", type=int, help="destination picowal record")
     ap.add_argument("--run", action="store_true", help="execute on-board with `pixe card` after upload")

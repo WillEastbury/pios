@@ -120,7 +120,7 @@ u32 pios_strlen(const char *s) {
 
 /* ---- Version + network configuration (static - no ARP/DHCP) ---- */
 
-#define MY_IP       IP4(192, 168, 0, 200)
+#define MY_IP       IP4(192, 168, 0, 201)
 #define MY_GW       IP4(192, 168, 0, 1)
 #define MY_MASK     IP4(255, 255, 0, 0)
 

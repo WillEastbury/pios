@@ -78,7 +78,7 @@ def pct(values: list[float], p: float) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run a multithreaded PIOS HTTP benchmark.")
-    ap.add_argument("--host", default="192.168.0.200")
+    ap.add_argument("--host", default="192.168.0.201")
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--seconds", type=float, default=15.0)
     ap.add_argument("--timeout", type=float, default=3.0)

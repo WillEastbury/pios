@@ -20,10 +20,12 @@ echo Build version: PIOS Kernel v%BUILD_STAMP%
 if exist build rmdir /S /Q build
 if exist build_boot rmdir /S /Q build_boot
 if exist build_user rmdir /S /Q build_user
+if exist build_pi5_stage2 rmdir /S /Q build_pi5_stage2
 if exist build_qemu_stage2 rmdir /S /Q build_qemu_stage2
 mkdir build
 mkdir build_boot
 mkdir build_user
+mkdir build_pi5_stage2
 mkdir build_qemu_stage2
 
 echo Building embedded userland binaries...
@@ -81,7 +83,7 @@ for %%f in (src\*.c) do (
 (for %%f in (build\*.o) do @echo build\\%%~nxf) > build\objs.rsp
 "%LD%" -T link.ld -nostdlib -o real_kernel.elf @build\objs.rsp
 if errorlevel 1 exit /b 1
-"%OC%" -O binary real_kernel.elf build\PIOS_PI5_STAGE2.BIN
+"%OC%" -O binary real_kernel.elf build_pi5_stage2\PIOS_PI5_STAGE2.BIN
 if errorlevel 1 exit /b 1
 
 echo Building full QEMU feature-parity payload...
@@ -89,7 +91,7 @@ call .\build_qemu_full.bat
 if errorlevel 1 exit /b 1
 
 echo Packaging shared Pi5+QEMU stage2 as real_kernel.img...
-python tools\build_stage2_package.py --pi build\PIOS_PI5_STAGE2.BIN --qemu build_qemu_full\PIOS_QEMU_FULL.BIN --compress-qemu --out real_kernel.img
+python tools\build_stage2_package.py --pi build_pi5_stage2\PIOS_PI5_STAGE2.BIN --qemu build_qemu_full\PIOS_QEMU_FULL.BIN --compress-qemu --out real_kernel.img
 if errorlevel 1 exit /b 1
 
 echo Compiling bootstrap...
@@ -113,7 +115,7 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 
 for %%f in (kernel8.img) do echo bootstrap kernel8.img size: %%~zf bytes
-for %%f in (build\PIOS_PI5_STAGE2.BIN) do echo Pi5 payload size: %%~zf bytes
+for %%f in (build_pi5_stage2\PIOS_PI5_STAGE2.BIN) do echo Pi5 payload size: %%~zf bytes
 for %%f in (build_qemu_full\PIOS_QEMU_FULL.BIN) do echo QEMU full payload size: %%~zf bytes
 for %%f in (real_kernel.img) do echo shared stage2 real_kernel.img size: %%~zf bytes
 echo BOOTSTRAP BUILD COMPLETE

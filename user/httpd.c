@@ -414,7 +414,9 @@ static int pico_req_span(struct picoweb_host *h, int which)
     return pico_alloc_span(h, (const u8 *)"", 0);
 }
 
+#ifdef PIOS_HTTPD_NATIVE
 static bool req_path_is(struct uhttp_bridge *b, const char *want);
+#endif
 static u32 build_large_dynamic(char *buf, u32 cap, u32 reqs, const char *engine);
 
 static int pico_read_card_span(struct picoweb_host *h, u32 card, u32 record)
@@ -609,6 +611,7 @@ static bool req_is_api(struct uhttp_bridge *b)
            b->req[ps + 2] == 'p' && b->req[ps + 3] == 'i';
 }
 
+#ifdef PIOS_HTTPD_NATIVE
 static bool req_path_is(struct uhttp_bridge *b, const char *want)
 {
     u32 ms, mn, ps, pn, qs, qn, bs, bn;
@@ -621,6 +624,7 @@ static bool req_path_is(struct uhttp_bridge *b, const char *want)
             return false;
     return true;
 }
+#endif
 
 static u32 build_large_dynamic(char *buf, u32 cap, u32 reqs, const char *engine)
 {
