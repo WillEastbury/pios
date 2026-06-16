@@ -6,6 +6,7 @@
  */
 #include "../include/types.h"
 #include "../include/stage2_manifest.h"
+#include "../include/bootinfo.h"
 
 typedef u64 efi_status_t;
 typedef void *efi_handle_t;
@@ -83,6 +84,38 @@ struct efi_system_table {
     struct efi_simple_text_output *std_err;
     void *runtime_services;
     struct efi_boot_services *boot_services;
+};
+
+struct efi_pixel_bitmask {
+    u32 red_mask;
+    u32 green_mask;
+    u32 blue_mask;
+    u32 reserved_mask;
+};
+
+struct efi_gop_mode_info {
+    u32 version;
+    u32 horizontal_resolution;
+    u32 vertical_resolution;
+    u32 pixel_format;
+    struct efi_pixel_bitmask pixel_information;
+    u32 pixels_per_scan_line;
+};
+
+struct efi_gop_mode {
+    u32 max_mode;
+    u32 mode;
+    struct efi_gop_mode_info *info;
+    usize size_of_info;
+    u64 framebuffer_base;
+    usize framebuffer_size;
+};
+
+struct efi_graphics_output {
+    void *query_mode;
+    void *set_mode;
+    void *blt;
+    struct efi_gop_mode *mode;
 };
 
 static struct efi_simple_text_output *g_con;
@@ -194,8 +227,23 @@ static bool decompress_picocompress(const u8 *src, u32 src_len, u8 *dst, u32 dst
     return true;
 }
 
-static void stage2_handoff_barrier(void)
+static void dcache_clean_range(u64 start, u64 size)
 {
+    if (size == 0)
+        return;
+    u64 a = start & ~63ULL;
+    u64 e = (start + size + 63ULL) & ~63ULL;
+    while (a < e) {
+        __asm__ volatile("dc cvac, %0" :: "r"(a) : "memory");
+        a += 64U;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void stage2_handoff_barrier(u64 addr, u64 size)
+{
+    dcache_clean_range(addr, size);
+    dcache_clean_range(PIOS_BOOTINFO_ADDR, sizeof(struct pios_bootinfo));
     __asm__ volatile(
         "dsb sy\n"
         "ic iallu\n"
@@ -209,6 +257,32 @@ static void stage2_handoff_barrier(void)
         "dsb sy\n"
         "isb\n"
         ::: "x8", "memory");
+}
+
+static void publish_bootinfo(struct efi_system_table *st)
+{
+    struct pios_bootinfo *bi = (struct pios_bootinfo *)(usize)PIOS_BOOTINFO_ADDR;
+    memset(bi, 0, sizeof(*bi));
+    bi->magic = PIOS_BOOTINFO_MAGIC;
+    bi->version = PIOS_BOOTINFO_VERSION;
+    if (!st || !st->boot_services || !st->boot_services->locate_protocol)
+        return;
+
+    static struct efi_guid gop_guid = {
+        0x9042A9DEU, 0x23DCU, 0x4A38U,
+        {0x96U, 0xFBU, 0x7AU, 0xDEU, 0xD0U, 0x80U, 0x51U, 0x6AU}
+    };
+    struct efi_graphics_output *gop = 0;
+    if (st->boot_services->locate_protocol(&gop_guid, 0, (void **)&gop) != EFI_SUCCESS ||
+        !gop || !gop->mode || !gop->mode->info || !gop->mode->framebuffer_base)
+        return;
+
+    bi->flags |= PIOS_BOOTINFO_FLAG_FRAMEBUFFER;
+    bi->framebuffer_base = gop->mode->framebuffer_base;
+    bi->framebuffer_width = gop->mode->info->horizontal_resolution;
+    bi->framebuffer_height = gop->mode->info->vertical_resolution;
+    bi->framebuffer_pitch = gop->mode->info->pixels_per_scan_line * 4U;
+    bi->framebuffer_format = gop->mode->info->pixel_format;
 }
 
 static bool find_stage2_entry(const u8 *image, u32 len, struct stage2_selection *sel)
@@ -299,7 +373,6 @@ efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
     g_con = st ? st->con_out : 0;
     puts_ascii("PIOS BOOTAA64: loading embedded shared stage2...\n");
     if (!st || !st->boot_services) return EFI_LOAD_ERROR;
-
     usize sz = (usize)(pios_stage2_blob_end - pios_stage2_blob_start);
     if (sz == 0 || sz > STAGE2_MAX_BYTES) {
         puts_ascii("embedded stage2 size invalid\n");
@@ -333,11 +406,12 @@ efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
     } else {
         memcpy((void *)(usize)addr, pios_stage2_blob_start + sel.payload_offset, sel.payload_bytes);
     }
+    publish_bootinfo(st);
 
     puts_ascii("stage2 selected; jumping\n");
     void (*entry)(efi_handle_t, struct efi_system_table *) =
         (void (*)(efi_handle_t, struct efi_system_table *))(usize)(addr + sel.entry_offset);
-    stage2_handoff_barrier();
+    stage2_handoff_barrier(addr, sel.memory_size);
     entry(image, st);
     return EFI_SUCCESS;
 }

@@ -11,6 +11,8 @@
 #include "mmu.h"
 #include "core_env.h"
 #include "simd.h"
+#include "platform.h"
+#include "bootinfo.h"
 
 /* Framebuffer state */
 static u32 *fb_ptr;
@@ -31,6 +33,9 @@ static volatile u64 g_fb_blit_ticks; /* CNTPCT ticks of the last blit */
 #endif
 static u32  fb_fg = 0x00FF9900;  /* amber */
 static u32  fb_bg = 0x00000000;  /* black */
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+static bool fb_direct_clean;      /* direct scanout writes need PoC clean (QEMU ramfb) */
+#endif
 
 /* ── Text-cell shadow cache ──
  * Records the (code,fg,bg) last drawn at each text cell so re-rendering identical
@@ -404,6 +409,54 @@ u32 fb_get_temperature_mc(void) {
 }
 
 bool fb_init(u32 width, u32 height) {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    struct pios_bootinfo *bi = (struct pios_bootinfo *)(usize)PIOS_BOOTINFO_ADDR;
+    if (bi->magic == PIOS_BOOTINFO_MAGIC &&
+        bi->version == PIOS_BOOTINFO_VERSION &&
+        (bi->flags & PIOS_BOOTINFO_FLAG_FRAMEBUFFER) &&
+        bi->framebuffer_base &&
+        bi->framebuffer_width &&
+        bi->framebuffer_height) {
+        u32 pitch = bi->framebuffer_pitch ? bi->framebuffer_pitch : bi->framebuffer_width * 4U;
+        if (bi->framebuffer_width > 4096U ||
+            bi->framebuffer_height > 2160U ||
+            pitch > 32768U ||
+            (u64)pitch * (u64)bi->framebuffer_height > FB_BACK_SIZE)
+            return false;
+        fb_ptr    = (u32 *)(usize)bi->framebuffer_base;
+        fb_width  = bi->framebuffer_width;
+        fb_height = bi->framebuffer_height;
+        fb_pitch  = pitch;
+        fb_size   = fb_pitch * fb_height;
+        cursor_x  = 0;
+        cursor_y  = 0;
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+        if (fb_width > 2u * FB_INSET_PX + 64u && fb_height > 2u * FB_INSET_PX + 64u) {
+            fb_inset_x = FB_INSET_PX;
+            fb_inset_y = FB_INSET_PX;
+        } else {
+            fb_inset_x = 0;
+            fb_inset_y = 0;
+        }
+#endif
+        cols = (fb_width - 2u * fb_inset_x) / 8;
+        rows = (fb_height - 2u * fb_inset_y) / 8;
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+        fb_back = (u32 *)(usize)FB_BACK_BASE;
+        fb_db = false;
+        fb_direct_clean = true;
+        for (u32 k = 0; k < FB_MAX_BANDS / 64u; k++)
+            fb_dirty_band[k] = 0;
+        fb_shadow_on = false;
+#endif
+        /* Do not clear here: under QEMU/ramfb the first full-screen clear before
+         * the kernel is fully up can be very slow. The dashboard renderer owns
+         * the first visible repaint. */
+        (void)width;
+        (void)height;
+        return true;
+    }
+#endif
     /* Build tag buffer — matching canary_main.c exactly */
     int i = 0;
     fb_mbox[i++] = 0;           /* [0] total size (filled below) */
@@ -1035,8 +1088,13 @@ static void fb_flush_pending(void) {
 }
 
 void fb_present(void) {
-    if (!fb_db)
+    if (!fb_db) {
+        if (fb_direct_clean && fb_ptr && fb_size) {
+            dcache_clean_range((u64)(usize)fb_ptr, fb_size);
+            dsb();
+        }
         return;
+    }
 
     fb_flush_pending();
 

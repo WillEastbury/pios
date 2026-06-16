@@ -54,4 +54,8 @@ const sd_stats_t *sd_get_stats(void);
 const char *sd_qemu_backend_name(void);
 bool sd_qemu_virtio_blk_ready(void);
 u32 sd_qemu_virtio_blk_diag(void);
+#else
+static inline const char *sd_qemu_backend_name(void) { return "sdhci"; }
+static inline bool sd_qemu_virtio_blk_ready(void) { return false; }
+static inline u32 sd_qemu_virtio_blk_diag(void) { return 0; }
 #endif

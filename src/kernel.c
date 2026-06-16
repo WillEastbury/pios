@@ -37,6 +37,7 @@
 #include "dma.h"
 #include "gpu.h"
 #include "tensor.h"
+#include "videocore.h"
 #include "walfs.h"
 #include "bcache.h"
 #include "principal.h"
@@ -1448,6 +1449,14 @@ static void board_revision_snapshot(struct board_revision_snapshot *out)
 
     if (!out)
         return;
+#if !PIOS_HAS_MAILBOX_FB
+    if (!probed) {
+        probed = true;
+        snap.installed_ram_bytes = 512ULL << 20;
+    }
+    *out = snap;
+    return;
+#endif
     if (!probed) {
         probed = true;
         mbox_rev[0] = sizeof(mbox_rev);
@@ -1475,6 +1484,9 @@ static void board_revision_snapshot(struct board_revision_snapshot *out)
 
 static u64 perf_physical_ram_bytes(void)
 {
+#if !PIOS_HAS_MAILBOX_FB
+    return 512ULL << 20;
+#else
     static bool probed;
     static u64 bytes;
     static volatile u32 ALIGNED(16) mbox_mem[8];
@@ -1492,6 +1504,7 @@ static u64 perf_physical_ram_bytes(void)
     if (mbox_call(MBOX_CH_PROP, mbox_mem) && (mbox_mem[4] & 0x80000000U))
         bytes = mbox_mem[6];
     return bytes;
+#endif
 }
 
 static u64 perf_counter_delta(u64 now, u64 last)
@@ -7917,6 +7930,15 @@ static void bp_uart_line(const char *prefix, const char *msg)
 
 /* Draw initial progress screen: header + phase list (all dim/pending) */
 static void bp_init(void) {
+#if PIOS_HAS_BOOTINFO_FB && !PIOS_HAS_MAILBOX_FB
+    bp_log_y = BP_LIST_ROW + BP_COUNT + 2;
+    uart_puts("\n[bt] PIOS ");
+    uart_puts(PIOS_BUILD_LABEL);
+    uart_puts(" Boot\n");
+    for (u32 i = 0; i < BP_COUNT; i++)
+        bp_uart_phase(i, "pending");
+    return;
+#endif
     fb_clear(BOOT_BLACK);
     fb_set_cursor(0, 0);
     fb_set_color(BOOT_FG_PINK, BOOT_BLACK);
@@ -7955,6 +7977,10 @@ static void bp_init(void) {
 /* Mark a phase as active: brighten name, show [..] */
 static void bp_active(u32 phase) {
     if (phase >= BP_COUNT) return;
+#if PIOS_HAS_BOOTINFO_FB && !PIOS_HAS_MAILBOX_FB
+    bp_uart_phase(phase, "active");
+    return;
+#endif
     u32 row = BP_LIST_ROW + phase;
     fb_set_cursor(4, row);
     fb_set_color(BOOT_FG_WHITE, BOOT_BLACK);
@@ -7969,6 +7995,10 @@ static void bp_active(u32 phase) {
 /* Mark a phase as done: show [OK] or [!!] */
 static void bp_done(u32 phase, bool ok) {
     if (phase >= BP_COUNT) return;
+#if PIOS_HAS_BOOTINFO_FB && !PIOS_HAS_MAILBOX_FB
+    bp_uart_phase(phase, ok ? "ok" : "failed");
+    return;
+#endif
     u32 row = BP_LIST_ROW + phase;
     fb_set_cursor(BP_STAT_COL, row);
     if (ok) {
@@ -8013,6 +8043,10 @@ static void bp_timestamp(void) {
 
 /* Append a line to the scrolling boot log */
 static void bp_log(const char *msg) {
+#if PIOS_HAS_BOOTINFO_FB && !PIOS_HAS_MAILBOX_FB
+    bp_uart_line("[diag] ", msg);
+    return;
+#endif
     fb_set_color(BOOT_FG_LOG, BOOT_BLACK);
     bp_timestamp();
     fb_puts(msg);
@@ -8023,6 +8057,10 @@ static void bp_log(const char *msg) {
 
 /* Green log — success */
 static void bp_ok(const char *msg) {
+#if PIOS_HAS_BOOTINFO_FB && !PIOS_HAS_MAILBOX_FB
+    bp_uart_line("[ok] ", msg);
+    return;
+#endif
     fb_set_color(BOOT_FG_OK, BOOT_BLACK);
     bp_timestamp();
     fb_puts(msg);
@@ -8033,6 +8071,10 @@ static void bp_ok(const char *msg) {
 
 /* Red log — error */
 static void bp_err(const char *msg) {
+#if PIOS_HAS_BOOTINFO_FB && !PIOS_HAS_MAILBOX_FB
+    bp_uart_line("[err] ", msg);
+    return;
+#endif
     fb_set_color(BOOT_FG_FAIL, BOOT_BLACK);
     bp_timestamp();
     fb_puts(msg);
@@ -8043,6 +8085,10 @@ static void bp_err(const char *msg) {
 
 /* Yellow log — warning */
 static void bp_warn(const char *msg) {
+#if PIOS_HAS_BOOTINFO_FB && !PIOS_HAS_MAILBOX_FB
+    bp_uart_line("[warn] ", msg);
+    return;
+#endif
     fb_set_color(BOOT_YELLOW, BOOT_BLACK);
     bp_timestamp();
     fb_puts(msg);
@@ -14997,6 +15043,58 @@ static u32 dash_prefix_len_from_mask(u32 mask)
     return n;
 }
 
+static void dash_put_active(bool active)
+{
+    fb_set_color(active ? 0x0000FF80 : 0x00FFAA00, 0x00000000);
+    fb_puts(active ? "ACTIVE" : "OFF");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+}
+
+static void dash_hw_row(u32 row, u32 c_dev, u32 c_active, u32 c_load,
+                        u32 c_ram, u32 c_caps, const char *dev,
+                        bool active, const char *load, const char *ram,
+                        const char *caps)
+{
+    fb_set_cursor(c_dev, row);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    dash_put_trunc(dev, c_active > c_dev ? c_active - c_dev - 1U : 10U);
+    fb_set_cursor(c_active, row);
+    dash_put_active(active);
+    fb_set_cursor(c_load, row);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    dash_put_trunc(load, c_ram > c_load ? c_ram - c_load - 1U : 20U);
+    fb_set_cursor(c_ram, row);
+    dash_put_trunc(ram, c_caps > c_ram ? c_caps - c_ram - 1U : 12U);
+    fb_set_cursor(c_caps, row);
+    dash_put_trunc(caps, 44U);
+}
+
+static void dash_hw_row_u64_hex(u32 row, u32 c_dev, u32 c_active, u32 c_load,
+                                u32 c_ram, u32 c_caps, const char *dev,
+                                bool active, const char *prefix, u64 addr,
+                                const char *ram, const char *caps)
+{
+    char load[32];
+    u32 n = 0;
+    while (prefix && *prefix && n + 1U < sizeof(load))
+        load[n++] = *prefix++;
+    if (n + 3U < sizeof(load)) {
+        static const char hex[] = "0123456789ABCDEF";
+        load[n++] = '0';
+        load[n++] = 'x';
+        bool seen = false;
+        for (i32 sh = 60; sh >= 0 && n + 1U < sizeof(load); sh -= 4) {
+            u8 v = (u8)((addr >> (u32)sh) & 0xFULL);
+            if (v || seen || sh == 0) {
+                load[n++] = hex[v];
+                seen = true;
+            }
+        }
+    }
+    load[n] = 0;
+    dash_hw_row(row, c_dev, c_active, c_load, c_ram, c_caps, dev, active, load, ram, caps);
+}
+
 static void dash_draw_listener_row(u32 row, u32 c_pid, u32 c_core, u32 c_user,
                                    u32 c_cpu, u32 c_mem, u32 c_proc,
                                    u32 c_fifo, u32 proc_width, u32 fifo_width,
@@ -15045,7 +15143,7 @@ static void hdmi_dashboard_render(void)
     /* Self-throttle floor (900ms) sits just under the 1Hz core0_io_tick_hook
      * DASH cadence so sub-ms beat between tick-count and monotonic-ms never
      * skips a second, while still preventing pathological back-to-back renders. */
-    if (now_ms < last_ms + 900ULL)
+    if (last_ms != 0 && now_ms < last_ms + 900ULL)
         return;
     last_ms = now_ms;
     u64 t_dash0 = dash_now_ticks();
@@ -15065,8 +15163,12 @@ static void hdmi_dashboard_render(void)
     u32 screen_rows = fb_rows();
     bool wide = screen_cols >= 180U;
     u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 5U;
+    u32 hw_col = 0U;
+    u32 hw_row = header_row + header_h + 1U;
+    u32 hw_w = wide ? header_w : 78U;
+    u32 hw_h = 14U;
     u32 map_col = 0U;
-    u32 map_row = header_row + header_h + 1U;
+    u32 map_row = hw_row + hw_h + 1U;
     u32 map_w = wide ? header_w : 78U;
     u32 log_col = 0;
     u32 log_h = wide ? 11U : 12U;
@@ -15082,6 +15184,7 @@ static void hdmi_dashboard_render(void)
     if (!layout_drawn) {
         fb_clear(0x00000000);
         dash_draw_window(header_col, header_row, header_w, header_h, "PIOS WORKBENCH", 0x0000FF80);
+        dash_draw_window(hw_col, hw_row, hw_w, hw_h, "HARDWARE / CAPABILITIES", 0x0000CCFF);
         dash_draw_window(map_col, map_row, map_w, map_h, "NETWORK / PROCESS MAP", 0x00FFAA00);
         dash_draw_window(log_col, log_top, log_w, log_h, "WARNINGS / ERRORS", 0x00FF4040);
         layout_drawn = true;
@@ -15206,6 +15309,75 @@ static void hdmi_dashboard_render(void)
     fb_puts("/");
     dash_put_mbps(perf.sd_write_peak_mbps_x1000);
     fb_puts(" Mb/s");
+
+    dash_clear_body(hw_col, hw_row, hw_w, hw_h);
+    u32 hw_r = hw_row + 1U;
+    const u32 hw_end = hw_row + hw_h - 1U;
+    const u32 hw_dev = hw_col + 3U;
+    const u32 hw_active = wide ? hw_col + 18U : hw_col + 15U;
+    const u32 hw_load = wide ? hw_col + 29U : hw_col + 24U;
+    const u32 hw_ram = wide ? hw_col + 58U : hw_col + 45U;
+    const u32 hw_caps = wide ? hw_col + 74U : hw_col + 56U;
+    fb_set_cursor(hw_dev, hw_r);
+    fb_set_color(0x00AAAAAA, 0x00000000);
+    fb_puts("HARDWARE");
+    fb_set_cursor(hw_active, hw_r);
+    fb_puts("STATE");
+    fb_set_cursor(hw_load, hw_r);
+    fb_puts("LOAD / MMIO");
+    fb_set_cursor(hw_ram, hw_r);
+    fb_puts("RAM");
+    fb_set_cursor(hw_caps, hw_r);
+    fb_puts("CAPABILITY / DRIVER");
+    hw_r++;
+    if (hw_r < hw_end)
+        dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                            "CPU cores", true, "EL1 ", PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT ? 0x40080000ULL : 0x00080000ULL,
+                            "4x16M", "AArch64 NEON CRC AES/SHA timers");
+    if (hw_r < hw_end)
+        dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                            "Storage", sd_get_card_info() && sd_get_card_info()->capacity != 0,
+                            PIOS_HAS_SD ? "EMMC2 " : "blk ", PIOS_HAS_SD ? PIOS_EMMC2_BASE : 0ULL,
+                            "bcache", PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT ?
+                            (sd_qemu_virtio_blk_ready() ? "virtio-blk + WALFS" : "RAM block + WALFS") :
+                            "SDHCI/SDIO + WALFS");
+    if (hw_r < hw_end)
+        dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                            "NIC", PIOS_HAS_GENET && perf.nic_link_mbps != 0,
+                            "MMIO ", PIOS_GENET_BASE, "rings", PIOS_HAS_GENET ? "GENET/MACB Ethernet" : "no active NIC backend");
+    if (hw_r < hw_end)
+        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                    "WiFi/BT", false, "not loaded", "0", "CYW/BT parked; no active driver");
+    if (hw_r < hw_end)
+        dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                            "USB/HID", PIOS_HAS_RP1, "RP1 ", PIOS_RP1_BAR_BASE,
+                            "xhci", PIOS_HAS_RP1 ? "xHCI + USB HID keyboard" : "not present");
+    if (hw_r < hw_end)
+        dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                            "RP1 bridge", PIOS_HAS_RP1 && PIOS_HAS_PCIE, "BAR ", PIOS_RP1_BAR_BASE,
+                            "regs", PIOS_HAS_RP1 ? "PCIe southbridge, MIP IRQs" : "not present");
+    if (hw_r < hw_end)
+        dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                            "GPIO", PIOS_HAS_RP1, "RP1 ", PIOS_RP1_BAR_BASE,
+                            "regs", PIOS_HAS_RP1 ? "54 GPIO / 28 header pins" : "not present");
+    if (hw_r < hw_end)
+        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                    "I2C / SPI", false, PIOS_HAS_RP1 ? "RP1 ctrl" : "not present",
+                    "0", PIOS_HAS_RP1 ? "HW present; driver pending" : "not present");
+    if (hw_r < hw_end)
+        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                    "SDIO", PIOS_HAS_SD, PIOS_HAS_SD ? "EMMC2" : "virtio/mmio",
+                    "dma/buf", PIOS_HAS_SD ? "SDIO 4-bit path" : "platform block path");
+    if (hw_r < hw_end)
+        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                    "QSPI", false, PIOS_HAS_RP1 ? "RP1/QSPI" : "not present",
+                    "0", "HW planned; driver pending");
+    if (hw_r < hw_end)
+        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                    "Framebuffer", PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB,
+                    PIOS_HAS_MAILBOX_FB ? "mailbox FB" : (PIOS_HAS_BOOTINFO_FB ? "UEFI GOP" : "none"),
+                    (PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB) ? "scanout+back" : "0",
+                    (PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB) ? "workbench dashboard" : "serial console only");
 
     dash_clear_body(map_col, map_row, map_w, map_h);
     u32 row = map_row + 1U;
@@ -15536,11 +15708,22 @@ NORETURN void core0_main(void) {
     core0_io_flags = CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART |
                      CORE0_IO_USB | CORE0_IO_MAINT | CORE0_IO_DASH;
     core0_io_sched_start_ticks = sched_counter_ticks();
+#if PIOS_HAS_BOOTINFO_FB
+    bool dash_fb_ok = fb_init(1920, 1080) || fb_init(1280, 720) || fb_init(1024, 768);
+    uart_puts(dash_fb_ok ? "[fb] UEFI GOP framebuffer online\n" :
+                           "[fb] UEFI GOP framebuffer unavailable\n");
+#endif
+    if (ui_mode == UI_MODE_NONE) {
+        hdmi_dashboard_render();
+        fb_present();
+    }
 
     /* Auto-arm RP1 Ethernet RX → GIC HOST6 so inbound packets wake core 0 via
      * interrupt instead of relying solely on the periodic poll. The 31 Hz NET
      * poll is retained as a safety net until IRQ delivery is proven under load. */
+#if PIOS_HAS_RP1 && PIOS_HAS_GENET
     core0_eth_irq_arm_host(false);
+#endif
 
     for (;;) {
         u32 flags = core0_io_take_flags();
@@ -15795,13 +15978,16 @@ void kernel_fb_early(void) {
 #if !PIOS_HAS_MAILBOX_FB
     uart_puts("PIOS ");
     uart_puts(PIOS_BUILD_LABEL);
-    uart_puts(" - platform framebuffer skipped\n");
+    uart_puts(PIOS_HAS_BOOTINFO_FB ? " - platform framebuffer deferred\n" :
+                                      " - platform framebuffer skipped\n");
     return;
 #endif
     /* Ramp the A76 to the firmware's max clock before anything else — bare-metal
      * Pi 5 otherwise runs at a low default, making the whole system ~10-100x
      * slower (slow FB/IPC/HTTP, high idle). */
+#if PIOS_HAS_MAILBOX_FB
     fb_set_arm_clock_max();
+#endif
     if (!fb_init(1920, 1080) && !fb_init(1280, 720) && !fb_init(1024, 768))
         return;
 
@@ -16129,7 +16315,7 @@ static bool provision_write_payload_to_slot(void)
 
 void kernel_main(void) {
     bool usb_ok = false;
-    bool fb_ok = true;  /* fb already init'd by kernel_fb_early */
+    bool fb_ok = PIOS_HAS_BOOTINFO_FB ? false : true;  /* Pi FB is early; QEMU GOP is deferred. */
     bool sd_ok = false;
     bool walfs_ok = false;
     bool nic_ok = false;
@@ -16145,12 +16331,23 @@ void kernel_main(void) {
     bool at_el1 = (cur_el == 1);
 
     /* ── Progress display (left side) + Register panel (right side) ── */
+#if PIOS_HAS_BOOTINFO_FB && !PIOS_HAS_MAILBOX_FB
+    bp_log_y = BP_LIST_ROW + BP_COUNT + 2;
+    uart_puts("\n[bt] PIOS ");
+    uart_puts(PIOS_BUILD_LABEL);
+    uart_puts(" Boot (serial progress; dashboard after ready)\n");
+#else
     bp_init();
+#if PIOS_HAS_BOOTINFO_FB && !PIOS_HAS_MAILBOX_FB
+    uart_puts("[bt] serial progress ready\n");
+#endif
     reg_panel(at_el1);
     bp_done(0, true);                     /* Firmware handoff */
     bp_done(1, true);                     /* VideoCore (fb from EL2) */
+#endif
 
     /* Show FB physical address — needed for MMU mapping */
+#if !(PIOS_HAS_BOOTINFO_FB && !PIOS_HAS_MAILBOX_FB)
     {
         u64 fb_addr = fb_get_phys_addr();
         fb_set_cursor(1, bp_log_y);
@@ -16158,6 +16355,7 @@ void kernel_main(void) {
         fb_printf("FB phys=0x%X  size=%u", fb_addr, fb_addr ? 1024*768*4 : 0);
         bp_log_y++;
     }
+#endif
 
     if (at_el1) {
         bp_ok("[el2->el1] Transition OK!");
@@ -16429,6 +16627,10 @@ void kernel_main(void) {
     bp_log("[gpu] tensor_init...");
     tensor_init();
     bp_ok("[gpu] tensor compute ready");
+    bp_log("[vc] native probe...");
+    videocore_init();
+    bp_ok(PIOS_ENABLE_NATIVE_VIDEOCORE ? "[vc] native probe complete" :
+                                          "[vc] native probe disabled");
 
     /* Core 0 environment */
     bp_log("[core] core_env_init...");

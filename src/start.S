@@ -17,6 +17,13 @@ core_asm_stage:
 
 .section .text.boot
 
+#ifndef PIOS_PLATFORM
+#define PIOS_PLATFORM 1
+#endif
+#ifndef PIOS_PLATFORM_QEMU_VIRT
+#define PIOS_PLATFORM_QEMU_VIRT 2
+#endif
+
 _start:
     mrs     x0, mpidr_el1
     and     x0, x0, #0x3
@@ -157,6 +164,16 @@ _start:
     ldr     x3, =0xC0000000
     orr     x4, x3, x2
     str     x4, [x0, #24]
+
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    /* QEMU ramfb/GOP can be placed at 0x140000000; map that 1GiB block NC. */
+    mov     x2, #0x705
+    mov     x5, #5
+    lsl     x3, x5, #30
+    orr     x4, x3, x2
+    lsl     x6, x5, #3
+    str     x4, [x0, x6]
+#endif
 
     /* L1[64..67]: Device (BCM2712 peripherals at 0x10_00000000+) */
     mov     x2, #0x401

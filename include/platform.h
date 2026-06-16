@@ -27,6 +27,7 @@
 #define PIOS_HAS_GENET              0
 #define PIOS_HAS_SD                 0
 #define PIOS_HAS_MAILBOX_FB         0
+#define PIOS_HAS_BOOTINFO_FB        1
 #define PIOS_HAS_DMA                0
 #define PIOS_HAS_PSCI_SECONDARIES   0
 #define PIOS_HAS_HYPERV             0
@@ -49,6 +50,7 @@
 #define PIOS_HAS_GENET              0
 #define PIOS_HAS_SD                 0
 #define PIOS_HAS_MAILBOX_FB         0
+#define PIOS_HAS_BOOTINFO_FB        0
 #define PIOS_HAS_DMA                0
 #define PIOS_HAS_PSCI_SECONDARIES   0
 #define PIOS_HAS_HYPERV             1
@@ -71,6 +73,7 @@
 #define PIOS_HAS_GENET              1
 #define PIOS_HAS_SD                 1
 #define PIOS_HAS_MAILBOX_FB         1
+#define PIOS_HAS_BOOTINFO_FB        0
 #define PIOS_HAS_DMA                1
 #define PIOS_HAS_PSCI_SECONDARIES   1
 #define PIOS_HAS_HYPERV             0
@@ -106,3 +109,11 @@
 #define PIOS_DMA_DISK_SIZE          0x00200000UL
 #define PIOS_IPC_SHM_SIZE           0x00100000UL
 #define PIOS_FB_BACK_SIZE           0x01000000UL
+
+/* Experimental native VideoCore probe.
+ * 0 = keep the stable firmware-mailbox framebuffer path only.
+ * 1 = additionally run a read-only VC6/V3D register visibility probe.
+ */
+#ifndef PIOS_ENABLE_NATIVE_VIDEOCORE
+#define PIOS_ENABLE_NATIVE_VIDEOCORE 0
+#endif
