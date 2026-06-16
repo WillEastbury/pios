@@ -39,6 +39,11 @@ typedef struct {
 struct tensor_status {
     bool v3d_available;
     bool v3d_dispatch_supported;
+    bool v3d_native_probe_ok;
+    bool v3d_native_selftest_ok;
+    bool v3d_native_compute_enabled;
+    bool v3d_native_mmu_ready;
+    bool v3d_native_tiny_kernels_ready;
     bool qpu_fallback;
     bool any_kernel_bound;
     u32 ready_mask;
@@ -46,6 +51,16 @@ struct tensor_status {
     u32 ident0;
     u32 ident1;
     u32 ident2;
+    u32 v3d_tech_version;
+    u32 v3d_core_count;
+    u32 v3d_qpus_per_slice;
+    u32 v3d_slice_count;
+    u32 v3d_csd_status;
+    u32 v3d_mmu_ctl;
+    u32 v3d_mmuc_control;
+    u32 v3d_tiny_ready_mask;
+    u32 v3d_tiny_verified_mask;
+    i32 v3d_native_selftest_status;
 } PACKED;
 
 /* QPU job control — one per QPU instance */

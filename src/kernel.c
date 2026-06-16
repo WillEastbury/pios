@@ -4084,6 +4084,16 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, ts.qpu_fallback ? "yes" : "no");
         http_append(out, &len, max, " any_kernel=");
         http_append(out, &len, max, ts.any_kernel_bound ? "yes" : "no");
+        http_append(out, &len, max, " native=");
+        http_append(out, &len, max, ts.v3d_native_probe_ok ? "yes" : "no");
+        http_append(out, &len, max, " nself=");
+        http_append(out, &len, max, ts.v3d_native_selftest_ok ? "yes" : "no");
+        http_append(out, &len, max, " ncomp=");
+        http_append(out, &len, max, ts.v3d_native_compute_enabled ? "yes" : "no");
+        http_append(out, &len, max, " nmmu=");
+        http_append(out, &len, max, ts.v3d_native_mmu_ready ? "yes" : "no");
+        http_append(out, &len, max, " tiny=");
+        http_append(out, &len, max, ts.v3d_native_tiny_kernels_ready ? "yes" : "no");
         http_append(out, &len, max, " ready_mask=");
         http_append_u64(out, &len, max, ts.ready_mask);
         http_append(out, &len, max, " disabled_mask=");
@@ -4094,6 +4104,26 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, ts.ident1);
         http_append(out, &len, max, " ident2=");
         http_append_u64(out, &len, max, ts.ident2);
+        http_append(out, &len, max, " tv=");
+        http_append_u64(out, &len, max, ts.v3d_tech_version);
+        http_append(out, &len, max, " cores=");
+        http_append_u64(out, &len, max, ts.v3d_core_count);
+        http_append(out, &len, max, " qps=");
+        http_append_u64(out, &len, max, ts.v3d_qpus_per_slice);
+        http_append(out, &len, max, " slices=");
+        http_append_u64(out, &len, max, ts.v3d_slice_count);
+        http_append(out, &len, max, " csd=");
+        http_append_u64(out, &len, max, ts.v3d_csd_status);
+        http_append(out, &len, max, " nstat=");
+        http_append_u64(out, &len, max, (u32)ts.v3d_native_selftest_status);
+        http_append(out, &len, max, " mmuctl=");
+        http_append_u64(out, &len, max, ts.v3d_mmu_ctl);
+        http_append(out, &len, max, " mmuc=");
+        http_append_u64(out, &len, max, ts.v3d_mmuc_control);
+        http_append(out, &len, max, " tiny_ready=");
+        http_append_u64(out, &len, max, ts.v3d_tiny_ready_mask);
+        http_append(out, &len, max, " tiny_ver=");
+        http_append_u64(out, &len, max, ts.v3d_tiny_verified_mask);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "tensor selftest") || http_streq(cmd, "qpu selftest")) {
         http_append(out, &len, max, tensor_selftest() ? "Tensor selftest OK\n" : "Tensor selftest FAILED\n");
@@ -10547,6 +10577,16 @@ static void ui_print_tensor_status(void)
     ui_console_write(ts.qpu_fallback ? "yes" : "no");
     ui_console_write(" any_kernel=");
     ui_console_write(ts.any_kernel_bound ? "yes" : "no");
+    ui_console_write(" native=");
+    ui_console_write(ts.v3d_native_probe_ok ? "yes" : "no");
+    ui_console_write(" nself=");
+    ui_console_write(ts.v3d_native_selftest_ok ? "yes" : "no");
+    ui_console_write(" ncomp=");
+    ui_console_write(ts.v3d_native_compute_enabled ? "yes" : "no");
+    ui_console_write(" nmmu=");
+    ui_console_write(ts.v3d_native_mmu_ready ? "yes" : "no");
+    ui_console_write(" tiny=");
+    ui_console_write(ts.v3d_native_tiny_kernels_ready ? "yes" : "no");
     ui_console_write(" ready_mask=");
     ui_console_hex_fixed(ts.ready_mask, 8);
     ui_console_write(" disabled_mask=");
@@ -10557,6 +10597,26 @@ static void ui_print_tensor_status(void)
     ui_console_hex_fixed(ts.ident1, 8);
     ui_console_write(" ident2=");
     ui_console_hex_fixed(ts.ident2, 8);
+    ui_console_write(" tv=");
+    ui_console_hex_fixed(ts.v3d_tech_version, 8);
+    ui_console_write(" cores=");
+    ui_console_hex_fixed(ts.v3d_core_count, 8);
+    ui_console_write(" qps=");
+    ui_console_hex_fixed(ts.v3d_qpus_per_slice, 8);
+    ui_console_write(" slices=");
+    ui_console_hex_fixed(ts.v3d_slice_count, 8);
+    ui_console_write(" csd=");
+    ui_console_hex_fixed(ts.v3d_csd_status, 8);
+    ui_console_write(" nstat=");
+    ui_console_hex_fixed((u32)ts.v3d_native_selftest_status, 8);
+    ui_console_write(" mmuctl=");
+    ui_console_hex_fixed(ts.v3d_mmu_ctl, 8);
+    ui_console_write(" mmuc=");
+    ui_console_hex_fixed(ts.v3d_mmuc_control, 8);
+    ui_console_write(" tiny_ready=");
+    ui_console_hex_fixed(ts.v3d_tiny_ready_mask, 8);
+    ui_console_write(" tiny_ver=");
+    ui_console_hex_fixed(ts.v3d_tiny_verified_mask, 8);
     ui_console_write("\n");
 }
 
@@ -16623,14 +16683,14 @@ void kernel_main(void) {
     bp_ok("[net] IP stack ready");
     watchdog_hw_pet();
 
-    /* GPU + Tensor */
-    bp_log("[gpu] tensor_init...");
-    tensor_init();
-    bp_ok("[gpu] tensor compute ready");
+    /* Native VideoCore visibility probe, then GPU + Tensor. */
     bp_log("[vc] native probe...");
     videocore_init();
     bp_ok(PIOS_ENABLE_NATIVE_VIDEOCORE ? "[vc] native probe complete" :
                                           "[vc] native probe disabled");
+    bp_log("[gpu] tensor_init...");
+    tensor_init();
+    bp_ok("[gpu] tensor compute ready");
 
     /* Core 0 environment */
     bp_log("[core] core_env_init...");

@@ -147,6 +147,7 @@ struct kernel_api {
     i32 (*tensor_scale)(void *b, const void *a, float scalar);
     i32 (*tensor_bind_kernel_blob)(u32 kernel_id, const void *uniform_data, u32 uniform_bytes,
                                    const u64 *shader_code, u32 shader_insts);
+    i32 (*tensor_bind_kernel_csd)(u32 kernel_id, const u32 *csd_cfg, u32 qpu_count);
 };
 ```
 
@@ -407,6 +408,9 @@ Note: this is currently coarse at 2MB block granularity (ARM L2 block map), so I
 - `tensor_mul(c, a, b)`  *(newly userland-exposed)*
 - `tensor_scale(b, a, scalar)`  *(newly userland-exposed)*
 - `tensor_bind_kernel_blob(kernel_id, uniform_data, uniform_bytes, shader_code, shader_insts)`  *(newly userland-exposed, admin-gated)*
+- `tensor_bind_kernel_csd(kernel_id, csd_cfg, qpu_count)`  *(admin-gated; V3D native CSD cfg[0..6] for tiny-kernel bring-up)*
+
+Tiny V3D bring-up shader sources live in `tools/v3d_shaders/`. Use `compile_v3d_shaders.ps1` to generate SPIR-V via Vulkan SDK. When `build/mesa_v3d_wrap.exe` is present, the same script also emits built-in Mesa/V3D QPU words for `vector_add` and `relu` into `build/v3d_shaders/*_builtin.qpu.txt`.
 
 ## 2) Kernel subsystem APIs (C headers)
 

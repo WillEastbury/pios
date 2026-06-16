@@ -117,3 +117,19 @@
 #ifndef PIOS_ENABLE_NATIVE_VIDEOCORE
 #define PIOS_ENABLE_NATIVE_VIDEOCORE 0
 #endif
+
+/* Experimental native V3D compute dispatch.
+ * Depends on PIOS_ENABLE_NATIVE_VIDEOCORE. Keep off until the Pi5 V3D 7.1
+ * MMU/page-table and CSD queue path is validated on hardware.
+ */
+#ifndef PIOS_ENABLE_NATIVE_V3D_COMPUTE
+#define PIOS_ENABLE_NATIVE_V3D_COMPUTE 0
+#endif
+
+/* Experimental built-in tiny QPU kernels.
+ * These are Mesa-emitted V3D 7.1 QPU words for one-element add/ReLU bring-up.
+ * Keep off until hardware trials prove the mailbox/CSD submission path.
+ */
+#ifndef PIOS_ENABLE_TINY_QPU_KERNELS
+#define PIOS_ENABLE_TINY_QPU_KERNELS 0
+#endif

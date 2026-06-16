@@ -473,6 +473,7 @@ struct kernel_api {
     i32 (*tensor_scale)(void *b, const void *a, float scalar);
     i32 (*tensor_bind_kernel_blob)(u32 kernel_id, const void *uniform_data, u32 uniform_bytes,
                                    const u64 *shader_code, u32 shader_insts);
+    i32 (*tensor_bind_kernel_csd)(u32 kernel_id, const u32 *csd_cfg, u32 qpu_count);
 
     /* ---- Arena/span allocation extensions ---- */
     void *(*span_rent)(u32 bytes, u32 align, u32 type);

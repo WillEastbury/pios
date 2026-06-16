@@ -60,9 +60,14 @@ static bool tensor_v3d_work_eligible(v3d_kernel_id_t id, u64 work_hint)
 {
     switch (id) {
     case V3D_KERNEL_ADD:
+    case V3D_KERNEL_RELU:
+#if PIOS_ENABLE_TINY_QPU_KERNELS
+        if (work_hint == 1U)
+            return true;
+#endif
+        return work_hint >= TENSOR_V3D_VEC_MIN_ELEMS;
     case V3D_KERNEL_MUL:
     case V3D_KERNEL_SCALE:
-    case V3D_KERNEL_RELU:
         return work_hint >= TENSOR_V3D_VEC_MIN_ELEMS;
     case V3D_KERNEL_DOT:
         /*
@@ -121,12 +126,31 @@ static bool tensor_any_bound_v3d_kernel(void)
     return false;
 }
 
+static bool tensor_verify_relu_sample(const float *b, const float *a, u32 n)
+{
+    u32 sample = (n < 16U) ? n : 16U;
+    for (u32 i = 0; i < sample; i++) {
+        float expected = (a[i] > 0.0f) ? a[i] : 0.0f;
+        float diff = b[i] - expected;
+        if (diff < 0.0f)
+            diff = -diff;
+        if (diff > 0.0001f)
+            return false;
+    }
+    return true;
+}
+
 void tensor_status(struct tensor_status *out)
 {
     if (!out) return;
     const struct v3d_caps *c = v3d_caps_get();
     out->v3d_available = v3d_available();
     out->v3d_dispatch_supported = v3d_dispatch_supported();
+    out->v3d_native_probe_ok = c ? c->native_probe_ok : false;
+    out->v3d_native_selftest_ok = c ? c->native_selftest_ok : false;
+    out->v3d_native_compute_enabled = c ? c->native_compute_enabled : false;
+    out->v3d_native_mmu_ready = c ? c->native_mmu_ready : false;
+    out->v3d_native_tiny_kernels_ready = c ? c->native_tiny_kernels_ready : false;
     out->qpu_fallback = use_qpu_fallback;
     out->any_kernel_bound = tensor_any_bound_v3d_kernel();
     out->ready_mask = 0;
@@ -134,6 +158,16 @@ void tensor_status(struct tensor_status *out)
     out->ident0 = c ? c->ident0 : 0;
     out->ident1 = c ? c->ident1 : 0;
     out->ident2 = c ? c->ident2 : 0;
+    out->v3d_tech_version = c ? c->tech_version : 0;
+    out->v3d_core_count = c ? c->core_count : 0;
+    out->v3d_qpus_per_slice = c ? c->qpus_per_slice : 0;
+    out->v3d_slice_count = c ? c->slice_count : 0;
+    out->v3d_csd_status = c ? c->csd_status : 0;
+    out->v3d_mmu_ctl = c ? c->mmu_ctl : 0;
+    out->v3d_mmuc_control = c ? c->mmuc_control : 0;
+    out->v3d_tiny_ready_mask = c ? c->tiny_ready_mask : 0;
+    out->v3d_tiny_verified_mask = c ? c->tiny_verified_mask : 0;
+    out->v3d_native_selftest_status = c ? (i32)c->native_selftest_status : (i32)V3D_STATUS_UNSUPPORTED;
     for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
         const struct v3d_kernel_desc *k = v3d_kernel_desc_get((v3d_kernel_id_t)i);
         if (k && k->ready)
@@ -462,12 +496,21 @@ bool tensor_add(tensor_t *c, const tensor_t *a, const tensor_t *b) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n || c->rows * c->cols != n) return false;
 
+#if PIOS_ENABLE_TINY_QPU_KERNELS
+    if (!use_qpu_fallback && n == 1U) {
+        u64 uniforms[3] = { a->bus_addr, b->bus_addr, c->bus_addr };
+        (void)v3d_kernel_bind_builtin_qpu(V3D_KERNEL_ADD, uniforms, sizeof(uniforms));
+    }
+#endif
     if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_ADD, n)) {
         if (tensor_verify_add_sample((const float *)c->arm_ptr,
                                      (const float *)a->arm_ptr,
-                                     (const float *)b->arm_ptr, n))
+                                     (const float *)b->arm_ptr, n)) {
+            v3d_kernel_mark_verified(V3D_KERNEL_ADD, true);
             return true;
+        }
 
+        v3d_kernel_mark_verified(V3D_KERNEL_ADD, false);
         v3d_kernel_disabled[V3D_KERNEL_ADD] = true;
         if (!v3d_kernel_warned[V3D_KERNEL_ADD]) {
             uart_puts("[ten] dis V3D add: verify fail\n");
@@ -534,8 +577,26 @@ bool tensor_relu(tensor_t *b, const tensor_t *a) {
     u32 n = a->rows * a->cols;
     if (b->rows * b->cols != n) return false;
 
-    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_RELU, n))
-        return true;
+#if PIOS_ENABLE_TINY_QPU_KERNELS
+    if (!use_qpu_fallback && n == 1U) {
+        u64 uniforms[2] = { a->bus_addr, b->bus_addr };
+        (void)v3d_kernel_bind_builtin_qpu(V3D_KERNEL_RELU, uniforms, sizeof(uniforms));
+    }
+#endif
+    if (!use_qpu_fallback && tensor_try_v3d(V3D_KERNEL_RELU, n)) {
+        if (tensor_verify_relu_sample((const float *)b->arm_ptr,
+                                      (const float *)a->arm_ptr, n)) {
+            v3d_kernel_mark_verified(V3D_KERNEL_RELU, true);
+            return true;
+        }
+
+        v3d_kernel_mark_verified(V3D_KERNEL_RELU, false);
+        v3d_kernel_disabled[V3D_KERNEL_RELU] = true;
+        if (!v3d_kernel_warned[V3D_KERNEL_RELU]) {
+            uart_puts("[ten] dis V3D relu: verify fail\n");
+            v3d_kernel_warned[V3D_KERNEL_RELU] = true;
+        }
+    }
     neon_vec_relu_f32((float *)b->arm_ptr,
                       (const float *)a->arm_ptr, n);
     dsb();
@@ -725,7 +786,11 @@ void tensor_init(void) {
         use_qpu_fallback = true;
     }
     if (!tensor_any_bound_v3d_kernel())
+#if PIOS_ENABLE_TINY_QPU_KERNELS
+        use_qpu_fallback = !v3d_dispatch_supported();
+#else
         use_qpu_fallback = true;
+#endif
     uart_puts("[ten] NEON: add/mul/scale/dot/mm/relu/sm\n");
 #endif
 }

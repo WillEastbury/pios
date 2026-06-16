@@ -1329,6 +1329,7 @@ static i32   sys_tensor_mul(void *c, const void *a, const void *b);
 static i32   sys_tensor_scale(void *b, const void *a, float scalar);
 static i32   sys_tensor_bind_kernel_blob(u32 kernel_id, const void *uniform_data, u32 uniform_bytes,
                                          const u64 *shader_code, u32 shader_insts);
+static i32   sys_tensor_bind_kernel_csd(u32 kernel_id, const u32 *csd_cfg, u32 qpu_count);
 static void  proc_tick_hook(u32 core, u64 tick);
 static void  proc_preempt_trampoline(void);
 static void  proc_handle_bench_echo(void);
@@ -1646,6 +1647,7 @@ static struct kernel_api kernel_api_tab = {
     .tensor_mul      = sys_tensor_mul,
     .tensor_scale    = sys_tensor_scale,
     .tensor_bind_kernel_blob = sys_tensor_bind_kernel_blob,
+    .tensor_bind_kernel_csd = sys_tensor_bind_kernel_csd,
 };
 
 static u8 *core_ram_base(void)
@@ -6000,4 +6002,11 @@ static i32 sys_tensor_bind_kernel_blob(u32 kernel_id, const void *uniform_data, 
     return (i32)v3d_kernel_bind_blob((v3d_kernel_id_t)kernel_id,
                                      uniform_data, uniform_bytes,
                                      shader_code, shader_insts);
+}
+
+static i32 sys_tensor_bind_kernel_csd(u32 kernel_id, const u32 *csd_cfg, u32 qpu_count)
+{
+    if (!has_cap(PRINCIPAL_ADMIN)) return -1;
+    if (!ptr_valid(csd_cfg, 7U * sizeof(u32))) return -1;
+    return (i32)v3d_kernel_bind_csd((v3d_kernel_id_t)kernel_id, csd_cfg, qpu_count);
 }
