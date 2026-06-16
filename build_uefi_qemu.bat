@@ -9,6 +9,7 @@ call .\build_bootstrap.bat
 if errorlevel 1 exit /b 1
 set CC=%LLVM%\clang.exe
 set LD=%LLVM%\lld-link.exe
+set CFLAGS=-Wall -Wextra -Wno-unused-function -ffreestanding -fshort-wchar -fno-builtin -fno-stack-protector -target aarch64-unknown-windows -DPIOS_PLATFORM=PIOS_PLATFORM_QEMU_VIRT -Iinclude -O2
 
 if exist build_uefi rmdir /S /Q build_uefi
 mkdir build_uefi

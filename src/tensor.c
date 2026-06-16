@@ -13,6 +13,7 @@
 #include "v3d.h"
 #include "simd.h"
 #include "uart.h"
+#include "platform.h"
 
 /* ---- Built-in QPU microcode ---- */
 
@@ -700,6 +701,16 @@ bool qpu_dispatch(const qpu_program_t *prog, struct qpu_job *jobs,
 }
 
 void tensor_init(void) {
+#if !PIOS_HAS_MAILBOX_FB
+    for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
+        v3d_kernel_disabled[i] = true;
+        v3d_kernel_warned[i] = false;
+    }
+    use_qpu_fallback = true;
+    uart_puts("[gpu] skipped on this platform; tensor NEON fallback ready\n");
+    uart_puts("[ten] NEON: add/mul/scale/dot/mm/relu/sm\n");
+    return;
+#else
     gpu_init();
     v3d_init();
     for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
@@ -716,4 +727,5 @@ void tensor_init(void) {
     if (!tensor_any_bound_v3d_kernel())
         use_qpu_fallback = true;
     uart_puts("[ten] NEON: add/mul/scale/dot/mm/relu/sm\n");
+#endif
 }

@@ -31,6 +31,7 @@
  */
 #pragma once
 #include "types.h"
+#include "platform.h"
 
 #define UHTTP_BRIDGE_MAGIC   0x48545450U   /* 'HTTP' */
 #define UHTTP_PORT           82U
@@ -53,7 +54,7 @@
 #define UHTTP_BRIDGE_ALIAS_BASE 0x2003000000UL
 #define UHTTP_BRIDGE_ADDR    (UHTTP_BRIDGE_ALIAS_BASE + (UHTTP_BRIDGE_INDEX * UHTTP_BRIDGE_STRIDE))
 #else
-#define UHTTP_BRIDGE_ADDR    0x04D00000UL
+#define UHTTP_BRIDGE_ADDR    PIOS_IPC_SHM_BASE
 #endif
 
 #define UHTTP_LINE           64U

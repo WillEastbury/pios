@@ -84,6 +84,7 @@
 #include "abi.h"
 #include "mmio.h"
 #include "capsule_store.h"
+#include "platform.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -15507,6 +15508,7 @@ NORETURN void core0_main(void) {
     uart_puts("[sys] INIT COMPLETE\n");
 
     fb_set_color(0x00FFAA00, 0x00000000);
+#if PIOS_HAS_DMA
     fb_puts("[dma] late memcpy selftest...\n");
     uart_puts("[dma] late memcpy selftest...\n");
     if (dma_selftest()) {
@@ -15516,6 +15518,10 @@ NORETURN void core0_main(void) {
         fb_puts("[dma] late memcpy selftest FAILED (using NEON fallback)\n");
         uart_puts("[dma] late memcpy selftest FAILED (using NEON fallback)\n");
     }
+#else
+    fb_puts("[dma] late memcpy selftest skipped on this platform\n");
+    uart_puts("[dma] late memcpy selftest skipped on this platform\n");
+#endif
 
     uart_vt_clear();
     uart_vt_home();
@@ -15786,6 +15792,12 @@ static void boot_diag(bool sd_ok, bool walfs_ok, bool nic_ok, bool usb_ok) {
  * No macros, no helper functions, no optimisation surprises.
  */
 void kernel_fb_early(void) {
+#if !PIOS_HAS_MAILBOX_FB
+    uart_puts("PIOS ");
+    uart_puts(PIOS_BUILD_LABEL);
+    uart_puts(" - platform framebuffer skipped\n");
+    return;
+#endif
     /* Ramp the A76 to the firmware's max clock before anything else — bare-metal
      * Pi 5 otherwise runs at a low default, making the whole system ~10-100x
      * slower (slow FB/IPC/HTTP, high idle). */
@@ -15872,6 +15884,12 @@ void kernel_el2_crash(u64 esr, u64 elr, u64 far, u64 spsr) {
 
 /* Draw register panel on the right side of screen (col 65+) */
 static void reg_panel(u32 at_el1) {
+#if !PIOS_HAS_MAILBOX_FB
+    uart_puts("[reg] CPU Regs skipped on platform without framebuffer; EL=");
+    uart_hex(at_el1 ? 1 : 2);
+    uart_puts("\n");
+    return;
+#endif
     u32 col = 65;
     u32 row = 1;
     u64 val;
@@ -16167,7 +16185,11 @@ void kernel_main(void) {
          * live table), eliminating the TLB-conflict PiSOD. A/B health-gated OTA
          * still backstops a bad boot. */
 #ifndef PIOS_ENABLE_CACHE_REMAP
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+#define PIOS_ENABLE_CACHE_REMAP 0
+#else
 #define PIOS_ENABLE_CACHE_REMAP 1
+#endif
 #endif
 #if PIOS_ENABLE_CACHE_REMAP
         mmu_enable_caching();
@@ -16177,11 +16199,15 @@ void kernel_main(void) {
 #endif
 
         {
+#if PIOS_HAS_MAILBOX_FB
             struct board_revision_snapshot br;
             board_revision_snapshot(&br);
             bool high_ok = highmem_init(br.installed_ram_bytes, perf_physical_ram_bytes());
             bp_log(high_ok ? "[ram] highmem 1-4GiB probe OK" :
                              "[ram] highmem unavailable/probe failed");
+#else
+            bp_warn("[ram] highmem probe skipped on non-Pi platform");
+#endif
         }
 
         bp_log("[exc] exception_init...");
@@ -16210,13 +16236,18 @@ void kernel_main(void) {
     }
 
     bp_log("[dma] dma_init...");
+#if PIOS_HAS_DMA
     dma_init();
     bp_ok("[dma] 6-channel engine ready");
+#else
+    bp_warn("[dma] skipped on this platform");
+#endif
     bp_done(1, true);
     watchdog_hw_pet();
 
     /* ── Phase 2+3: PCIe + RP1 + USB ── */
     bp_active(2);
+#if PIOS_HAS_PCIE && PIOS_HAS_RP1
     bp_log("[pcie] pcie_init...");
     if (pcie_init()) {
         bp_log("[pcie] RC online, calling rp1_init...");
@@ -16248,6 +16279,11 @@ void kernel_main(void) {
     } else {
         bp_err("[pcie] PCIe init FAILED"); bp_done(2, false); bp_done(3, false);
     }
+#else
+    bp_warn("[pcie] skipped on this platform");
+    bp_done(2, true);
+    bp_done(3, true);
+#endif
     watchdog_hw_pet();
 
     /* IPC */
@@ -16264,7 +16300,7 @@ void kernel_main(void) {
 
     /* ── Phase 4: Filesystem ── */
     bp_active(4);
-    bp_log("[sd] sd_init (EMMC2)...");
+    bp_log(PIOS_HAS_SD ? "[sd] sd_init (EMMC2)..." : "[sd] sd_init (platform block)...");
     sd_ok = sd_init();
     if (!sd_ok) {
         bp_err("[sd] SD init FAILED"); bp_done(4, false);
@@ -16354,6 +16390,7 @@ void kernel_main(void) {
 
     /* ── Phase 5: NIC (Cadence MACB/GEM on RP1) ── */
     bp_active(5);
+#if PIOS_HAS_GENET
     bp_log("[nic] nic_init (Cadence GEM)...");
     nic_ok = nic_init();
     if (!nic_ok) {
@@ -16364,6 +16401,10 @@ void kernel_main(void) {
         else bp_warn("[nic] PHY link DOWN (use 'wifi init' for wireless)");
         bp_done(5, true);
     }
+#else
+    bp_warn("[nic] GENET/MACB skipped on this platform");
+    bp_done(5, true);
+#endif
 
     /* Init network stack */
     bp_log("[net] net_init (static IP)...");
@@ -16423,9 +16464,14 @@ void kernel_main(void) {
          * launching the secondaries, so cores 1-3 never race to zero procs[] and
          * a late core cannot wipe a process another core just created. */
         proc_init_shared();
+    }
+    if (at_el1 && PIOS_HAS_PSCI_SECONDARIES) {
         bp_log("[smp] core_start_all (PSCI)...");
         core_start_all();
         bp_ok("[smp] cores 0-3 active");
+        bp_done(6, true);
+    } else if (at_el1) {
+        bp_warn("[skip] multicore secondaries on this platform");
         bp_done(6, true);
     } else {
         bp_warn("[skip] multicore (need EL1)");
@@ -16446,12 +16492,16 @@ void kernel_main(void) {
             fb_set_color(0x00444444, BOOT_BLACK);
             fb_puts("---------------------------------------------");
 
-            u8 mac[6];
-            nic_get_mac(mac);
             fb_set_cursor(1, bp_log_y++);
             fb_set_color(0x0000CCFF, BOOT_BLACK);
-            fb_printf("MAC  %x:%x:%x:%x:%x:%x",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            if (nic_ok) {
+                u8 mac[6];
+                nic_get_mac(mac);
+                fb_printf("MAC  %x:%x:%x:%x:%x:%x",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            } else {
+                fb_puts("MAC  unavailable on this platform");
+            }
 
             fb_set_cursor(1, bp_log_y++);
             fb_printf("IP   %d.%d.%d.%d / %d.%d.%d.%d",
@@ -16475,7 +16525,8 @@ void kernel_main(void) {
 
             fb_set_cursor(1, bp_log_y++);
             fb_set_color(BOOT_FG_PINK, BOOT_BLACK);
-            fb_puts("Serial console active on RP1 UART0");
+            fb_puts(PIOS_HAS_RP1 ? "Serial console active on RP1 UART0" :
+                                    "Serial console active on platform UART");
         }
     }
 

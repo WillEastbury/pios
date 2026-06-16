@@ -14,6 +14,7 @@
 #include "fb.h"
 #include "timer.h"
 #include "core_env.h"
+#include "platform.h"
 
 static bool tx_checksum_offload;
 static bool rx_checksum_offload;
@@ -889,7 +890,11 @@ bool nic_init(void)
     simd_zero(&pkt_counts, sizeof(pkt_counts));
     simd_zero(flow_table, sizeof(flow_table));
     nic_filter_clear();
+#if !PIOS_HAS_GENET
+    return false;
+#else
     return macb_init();
+#endif
 }
 
 bool nic_init_wifi(void)
@@ -916,7 +921,11 @@ bool nic_send(const u8 *frame, u32 len)
     nic_count_packet(true, frame, len);
     if (packet_dump_enabled)
         fb_pkt_dump('T', 0x00FFFF80, frame, len);
+#if PIOS_HAS_GENET
     bool ok = macb_send(frame, len);
+#else
+    bool ok = false;
+#endif
     if (ok) pkt_counts.processed++;
     else    pkt_counts.dropped++;
     nic_render_counter_panel();
@@ -944,7 +953,11 @@ bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_l
     nic_count_packet(true, tx_frame, total);
     if (packet_dump_enabled)
         fb_pkt_dump('T', 0x00FFFF80, tx_frame, total);
+#if PIOS_HAS_GENET
     bool ok = macb_send(tx_frame, total);
+#else
+    bool ok = false;
+#endif
     if (ok) pkt_counts.processed++;
     else    pkt_counts.dropped++;
     nic_render_counter_panel();
@@ -955,6 +968,11 @@ bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
 {
     if (checksum_trusted)
         *checksum_trusted = false;
+#if !PIOS_HAS_GENET
+    (void)frame;
+    (void)len;
+    return false;
+#else
 
     for (u32 attempt = 0; attempt < 16; attempt++) {
         bool ok = macb_recv(frame, len);
@@ -989,26 +1007,43 @@ bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
     }
 
     return false;
+#endif
 }
 
 void nic_get_mac(u8 *mac)
 {
+#if !PIOS_HAS_GENET
+    if (mac) simd_zero(mac, 6);
+#else
     macb_get_mac(mac);
+#endif
 }
 
 bool nic_link_up(void)
 {
+#if !PIOS_HAS_GENET
+    return false;
+#else
     return macb_link_up();
+#endif
 }
 
 u32 nic_link_mbps(void)
 {
+#if !PIOS_HAS_GENET
+    return 0;
+#else
     return macb_link_mbps();
+#endif
 }
 
 bool nic_link_full_duplex(void)
 {
+#if !PIOS_HAS_GENET
+    return false;
+#else
     return macb_link_full_duplex();
+#endif
 }
 
 void nic_set_tx_checksum_offload(bool enable)

@@ -18,7 +18,7 @@ typedef void *efi_event_t;
 #define EFI_LOADER_DATA 2U
 #define STAGE2_LOAD_ADDR 0x40080000ULL
 #define STAGE2_MAX_BYTES (2U * 1024U * 1024U)
-#define STAGE2_MAX_MEMORY_BYTES (20U * 1024U * 1024U)
+#define STAGE2_MAX_MEMORY_BYTES (32U * 1024U * 1024U)
 #define STAGE2_PAGE_COUNT ((STAGE2_MAX_BYTES + 4095U) / 4096U)
 #define STAGE2_MAX_PAGE_COUNT ((STAGE2_MAX_MEMORY_BYTES + 4095U) / 4096U)
 
@@ -132,7 +132,84 @@ struct stage2_selection {
     u32 entry_offset;
     u64 load_addr;
     u64 memory_size;
+    u32 payload_flags;
+    u32 payload_codec;
+    u32 uncompressed_bytes;
 };
+
+static u16 rd16le(const u8 *p) { return (u16)(p[0] | ((u16)p[1] << 8)); }
+
+static bool decompress_picocompress(const u8 *src, u32 src_len, u8 *dst, u32 dst_cap, u32 *out_len)
+{
+    u32 ip = 0;
+    u32 op = 0;
+    while (ip < src_len) {
+        if (src_len - ip < 4)
+            return false;
+        u32 raw_len = rd16le(src + ip);
+        u32 comp_len = rd16le(src + ip + 2);
+        ip += 4;
+        if (raw_len == 0 || raw_len > 508U || op > dst_cap || raw_len > dst_cap - op)
+            return false;
+        if (comp_len == 0) {
+            if (raw_len > src_len - ip)
+                return false;
+            memcpy(dst + op, src + ip, raw_len);
+            ip += raw_len;
+            op += raw_len;
+            continue;
+        }
+        if (comp_len > src_len - ip)
+            return false;
+        u32 frame_end = ip + comp_len;
+        u32 frame_start = op;
+        while (ip < frame_end) {
+            u8 token = src[ip++];
+            if ((token & 0x80U) == 0) {
+                u32 n = (u32)(token & 0x7FU) + 1U;
+                if (n > frame_end - ip || n > dst_cap - op || op + n > frame_start + raw_len)
+                    return false;
+                memcpy(dst + op, src + ip, n);
+                ip += n;
+                op += n;
+            } else {
+                if (ip >= frame_end)
+                    return false;
+                u32 n = ((token >> 4U) & 0x07U) + 3U;
+                u32 off = (((u32)token & 0x0FU) << 8U) | src[ip++];
+                if (off == 0 || off > op - frame_start || n > dst_cap - op ||
+                    op + n > frame_start + raw_len)
+                    return false;
+                for (u32 i = 0; i < n; i++) {
+                    dst[op] = dst[op - off];
+                    op++;
+                }
+            }
+        }
+        if (op != frame_start + raw_len)
+            return false;
+    }
+    if (out_len)
+        *out_len = op;
+    return true;
+}
+
+static void stage2_handoff_barrier(void)
+{
+    __asm__ volatile(
+        "dsb sy\n"
+        "ic iallu\n"
+        "dsb sy\n"
+        "isb\n"
+        "mrs x8, sctlr_el1\n"
+        "bic x8, x8, #(1 << 0)\n"
+        "bic x8, x8, #(1 << 2)\n"
+        "bic x8, x8, #(1 << 12)\n"
+        "msr sctlr_el1, x8\n"
+        "dsb sy\n"
+        "isb\n"
+        ::: "x8", "memory");
+}
 
 static bool find_stage2_entry(const u8 *image, u32 len, struct stage2_selection *sel)
 {
@@ -143,6 +220,9 @@ static bool find_stage2_entry(const u8 *image, u32 len, struct stage2_selection 
     sel->entry_offset = 0;
     sel->load_addr = STAGE2_LOAD_ADDR;
     sel->memory_size = STAGE2_MAX_MEMORY_BYTES;
+    sel->payload_flags = 0;
+    sel->payload_codec = 0;
+    sel->uncompressed_bytes = len;
     for (u32 off = 0; off + sizeof(struct pios_stage2_manifest_header) <= len; off += 8) {
         const u8 *h = image + off;
         if (rd32(h) != PIOS_STAGE2_MANIFEST_MAGIC) continue;
@@ -168,20 +248,36 @@ static bool find_stage2_entry(const u8 *image, u32 len, struct stage2_selection 
                 u64 payload_size = rd64(e + 72);
                 u64 load_addr = rd64(e + 80);
                 u64 memory_size = rd64(e + 88);
+                u32 payload_flags = 0;
+                u32 payload_codec = 0;
+                u64 uncompressed_size = payload_size;
+                if (eb >= PIOS_STAGE2_PACKAGED_ENTRY_BYTES_V2) {
+                    payload_flags = rd32(e + 96);
+                    payload_codec = rd32(e + 100);
+                    uncompressed_size = rd64(e + 104);
+                }
                 if (payload_size == 0 || payload_off > len ||
                     payload_size > len - payload_off ||
-                    ent >= payload_size ||
+                    uncompressed_size == 0 ||
+                    ent >= uncompressed_size ||
                     payload_size > STAGE2_MAX_BYTES ||
+                    uncompressed_size > STAGE2_MAX_BYTES ||
                     memory_size == 0 ||
                     memory_size > STAGE2_MAX_MEMORY_BYTES ||
-                    memory_size < payload_size ||
+                    memory_size < uncompressed_size ||
                     load_addr == 0)
+                    return false;
+                if ((payload_flags & PIOS_STAGE2_PAYLOAD_FLAG_COMPRESSED) &&
+                    payload_codec != PIOS_STAGE2_PAYLOAD_CODEC_PICOCOMPRESS)
                     return false;
                 sel->payload_offset = (u32)payload_off;
                 sel->payload_bytes = (u32)payload_size;
                 sel->entry_offset = (u32)ent;
                 sel->load_addr = load_addr;
                 sel->memory_size = memory_size;
+                sel->payload_flags = payload_flags;
+                sel->payload_codec = payload_codec;
+                sel->uncompressed_bytes = (u32)uncompressed_size;
                 return true;
             }
             if (ent >= full_size) return false;
@@ -190,6 +286,7 @@ static bool find_stage2_entry(const u8 *image, u32 len, struct stage2_selection 
             sel->entry_offset = (u32)ent;
             sel->load_addr = STAGE2_LOAD_ADDR;
             sel->memory_size = full_size;
+            sel->uncompressed_bytes = len;
             return true;
         }
         return false;
@@ -222,11 +319,25 @@ efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
         return EFI_LOAD_ERROR;
     }
     memset((void *)(usize)addr, 0, (usize)sel.memory_size);
-    memcpy((void *)(usize)addr, pios_stage2_blob_start + sel.payload_offset, sel.payload_bytes);
+    if (sel.payload_flags & PIOS_STAGE2_PAYLOAD_FLAG_COMPRESSED) {
+        u32 out_len = 0;
+        if (!decompress_picocompress(pios_stage2_blob_start + sel.payload_offset,
+                                     sel.payload_bytes,
+                                     (u8 *)(usize)addr,
+                                     sel.uncompressed_bytes,
+                                     &out_len) ||
+            out_len != sel.uncompressed_bytes) {
+            puts_ascii("stage2 decompress failed\n");
+            return EFI_LOAD_ERROR;
+        }
+    } else {
+        memcpy((void *)(usize)addr, pios_stage2_blob_start + sel.payload_offset, sel.payload_bytes);
+    }
 
     puts_ascii("stage2 selected; jumping\n");
     void (*entry)(efi_handle_t, struct efi_system_table *) =
         (void (*)(efi_handle_t, struct efi_system_table *))(usize)(addr + sel.entry_offset);
+    stage2_handoff_barrier();
     entry(image, st);
     return EFI_SUCCESS;
 }

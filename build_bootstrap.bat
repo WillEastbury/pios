@@ -84,32 +84,12 @@ if errorlevel 1 exit /b 1
 "%OC%" -O binary real_kernel.elf build\PIOS_PI5_STAGE2.BIN
 if errorlevel 1 exit /b 1
 
-echo Building QEMU stage2 payload...
-"%CC%" -march=armv8-a -DPIOS_PLATFORM=PIOS_PLATFORM_QEMU_VIRT -c src\qemu_stage2_start.S -o build_qemu_stage2\qemu_stage2_start.o
-if errorlevel 1 exit /b 1
-"%CC%" -march=armv8-a -DPIOS_PLATFORM=PIOS_PLATFORM_QEMU_VIRT -c src\qemu_stage2_manifest.S -o build_qemu_stage2\qemu_stage2_manifest.o
-if errorlevel 1 exit /b 1
-"%CC%" %QEMU_STAGE2_CFLAGS% -c uefi\qemu_stage2_os.c -o build_qemu_stage2\qemu_stage2_os.o
-if errorlevel 1 exit /b 1
-"%CC%" %QEMU_STAGE2_CFLAGS% -c src\sd.c -o build_qemu_stage2\sd.o
-if errorlevel 1 exit /b 1
-"%CC%" %QEMU_STAGE2_CFLAGS% -c src\bcache.c -o build_qemu_stage2\bcache.o
-if errorlevel 1 exit /b 1
-"%CC%" %QEMU_STAGE2_CFLAGS% -c src\walfs.c -o build_qemu_stage2\walfs.o
-if errorlevel 1 exit /b 1
-"%CC%" %QEMU_STAGE2_CFLAGS% -c src\lru.c -o build_qemu_stage2\lru.o
-if errorlevel 1 exit /b 1
-"%CC%" %QEMU_STAGE2_CFLAGS% -c src\picocompress.c -o build_qemu_stage2\picocompress.o
-if errorlevel 1 exit /b 1
-"%CC%" %QEMU_STAGE2_CFLAGS% -c src\picoweb.c -o build_qemu_stage2\picoweb.o
-if errorlevel 1 exit /b 1
-"%LD%" -T link_qemu_virt.ld -nostdlib -o build_qemu_stage2\PIOSSTG2_QEMU.ELF build_qemu_stage2\qemu_stage2_start.o build_qemu_stage2\qemu_stage2_manifest.o build_qemu_stage2\qemu_stage2_os.o build_qemu_stage2\sd.o build_qemu_stage2\bcache.o build_qemu_stage2\walfs.o build_qemu_stage2\lru.o build_qemu_stage2\picocompress.o build_qemu_stage2\picoweb.o
-if errorlevel 1 exit /b 1
-"%OC%" -O binary build_qemu_stage2\PIOSSTG2_QEMU.ELF build_qemu_stage2\PIOSSTG2_QEMU.BIN
+echo Building full QEMU feature-parity payload...
+call .\build_qemu_full.bat
 if errorlevel 1 exit /b 1
 
 echo Packaging shared Pi5+QEMU stage2 as real_kernel.img...
-python tools\build_stage2_package.py --pi build\PIOS_PI5_STAGE2.BIN --qemu build_qemu_stage2\PIOSSTG2_QEMU.BIN --out real_kernel.img
+python tools\build_stage2_package.py --pi build\PIOS_PI5_STAGE2.BIN --qemu build_qemu_full\PIOS_QEMU_FULL.BIN --compress-qemu --out real_kernel.img
 if errorlevel 1 exit /b 1
 
 echo Compiling bootstrap...
@@ -134,6 +114,6 @@ if errorlevel 1 exit /b 1
 
 for %%f in (kernel8.img) do echo bootstrap kernel8.img size: %%~zf bytes
 for %%f in (build\PIOS_PI5_STAGE2.BIN) do echo Pi5 payload size: %%~zf bytes
-for %%f in (build_qemu_stage2\PIOSSTG2_QEMU.BIN) do echo QEMU payload size: %%~zf bytes
+for %%f in (build_qemu_full\PIOS_QEMU_FULL.BIN) do echo QEMU full payload size: %%~zf bytes
 for %%f in (real_kernel.img) do echo shared stage2 real_kernel.img size: %%~zf bytes
 echo BOOTSTRAP BUILD COMPLETE

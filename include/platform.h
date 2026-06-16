@@ -27,6 +27,8 @@
 #define PIOS_HAS_GENET              0
 #define PIOS_HAS_SD                 0
 #define PIOS_HAS_MAILBOX_FB         0
+#define PIOS_HAS_DMA                0
+#define PIOS_HAS_PSCI_SECONDARIES   0
 #define PIOS_HAS_HYPERV             0
 #define PIOS_HAS_VMBUS              0
 #elif PIOS_PLATFORM == PIOS_PLATFORM_HYPERV_ARM
@@ -47,6 +49,8 @@
 #define PIOS_HAS_GENET              0
 #define PIOS_HAS_SD                 0
 #define PIOS_HAS_MAILBOX_FB         0
+#define PIOS_HAS_DMA                0
+#define PIOS_HAS_PSCI_SECONDARIES   0
 #define PIOS_HAS_HYPERV             1
 #define PIOS_HAS_VMBUS              1
 #else
@@ -67,22 +71,38 @@
 #define PIOS_HAS_GENET              1
 #define PIOS_HAS_SD                 1
 #define PIOS_HAS_MAILBOX_FB         1
+#define PIOS_HAS_DMA                1
+#define PIOS_HAS_PSCI_SECONDARIES   1
 #define PIOS_HAS_HYPERV             0
 #define PIOS_HAS_VMBUS              0
 #endif
 
 #define PIOS_CORE_PRIV_SIZE         0x01000000UL
+
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+#define PIOS_CORE0_RAM_BASE         0x42000000UL
+#define PIOS_CORE1_RAM_BASE         0x43000000UL
+#define PIOS_CORE2_RAM_BASE         0x44000000UL
+#define PIOS_CORE3_RAM_BASE         0x45000000UL
+#define PIOS_SHARED_FIFO_BASE       0x46000000UL
+#define PIOS_DMA_NET_BASE           0x46100000UL
+#define PIOS_DMA_DISK_BASE          0x46300000UL
+#define PIOS_IPC_SHM_BASE           0x46500000UL
+#define PIOS_FB_BACK_BASE           0x46800000UL
+#else
 #define PIOS_CORE0_RAM_BASE         0x00800000UL
 #define PIOS_CORE1_RAM_BASE         0x01800000UL
 #define PIOS_CORE2_RAM_BASE         0x02800000UL
 #define PIOS_CORE3_RAM_BASE         0x03800000UL
 #define PIOS_SHARED_FIFO_BASE       0x04800000UL
-#define PIOS_SHARED_FIFO_SIZE       0x00100000UL
 #define PIOS_DMA_NET_BASE           0x04900000UL
-#define PIOS_DMA_NET_SIZE           0x00200000UL
 #define PIOS_DMA_DISK_BASE          0x04B00000UL
-#define PIOS_DMA_DISK_SIZE          0x00200000UL
 #define PIOS_IPC_SHM_BASE           0x04D00000UL
-#define PIOS_IPC_SHM_SIZE           0x00100000UL
 #define PIOS_FB_BACK_BASE           0x05000000UL
+#endif
+
+#define PIOS_SHARED_FIFO_SIZE       0x00100000UL
+#define PIOS_DMA_NET_SIZE           0x00200000UL
+#define PIOS_DMA_DISK_SIZE          0x00200000UL
+#define PIOS_IPC_SHM_SIZE           0x00100000UL
 #define PIOS_FB_BACK_SIZE           0x01000000UL

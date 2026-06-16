@@ -754,6 +754,8 @@ static const u8 *fb_glyph_for_code(u32 code)
 
 /* Draw one 8x8 glyph at text position (cx, cy) */
 static void fb_draw_codepoint(u32 cx, u32 cy, u32 code) {
+    if (!fb_ptr || cols == 0 || rows == 0 || cx >= cols || cy >= rows)
+        return;
     struct fb_cell *sc = fb_shadow_at(cx, cy);
     if (sc)
         fb_cell_pending[cy * FB_SH_COLS + cx] = 0;  /* (re)drawn: cancel deferred blank */
@@ -775,6 +777,8 @@ static void fb_draw_codepoint(u32 cx, u32 cy, u32 code) {
 }
 
 static void fb_put_codepoint(u32 code) {
+    if (!fb_ptr || cols == 0 || rows == 0)
+        return;
     if (code == '\n') {
         fb_advance_row();
     } else if (code == '\r') {

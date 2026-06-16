@@ -3,6 +3,7 @@
 #include "exception.h"
 #include "mmio.h"
 #include "fb.h"
+#include "platform.h"
 
 /* BCM2712 PM block (Linux DT watchdog@7d200000, Circle ARM_PM_BASE
  * = ARM_IO_BASE + 0x1200000). Pi 4 used PERIPH_BASE + 0x100000; using
@@ -44,6 +45,10 @@ static NORETURN void watchdog_reboot_best_effort(void)
 
 void watchdog_hw_arm_seconds(u32 seconds)
 {
+#if !PIOS_HAS_MAILBOX_FB
+    (void)seconds;
+    return;
+#else
     if (seconds == 0)
         seconds = 1;
     if (seconds > PM_WDOG_MAX_SECS)
@@ -52,6 +57,7 @@ void watchdog_hw_arm_seconds(u32 seconds)
     mmio_write(PM_RSTC, PM_PASSWORD |
                          (mmio_read(PM_RSTC) & ~PM_RSTC_WRCFG_MASK) |
                          PM_RSTC_FULL);
+#endif
 }
 
 void watchdog_hw_pet(void)
@@ -61,19 +67,31 @@ void watchdog_hw_pet(void)
 
 u32 watchdog_hw_remaining_ticks(void)
 {
+#if !PIOS_HAS_MAILBOX_FB
+    return 0;
+#else
     return mmio_read(PM_WDOG) & 0x000FFFFFU;
+#endif
 }
 
 u32 watchdog_hw_rstc(void)
 {
+#if !PIOS_HAS_MAILBOX_FB
+    return 0;
+#else
     return mmio_read(PM_RSTC);
+#endif
 }
 
 void watchdog_hw_disable(void)
 {
+#if !PIOS_HAS_MAILBOX_FB
+    return;
+#else
     mmio_write(PM_WDOG, PM_PASSWORD);
     mmio_write(PM_RSTC, PM_PASSWORD |
                          (mmio_read(PM_RSTC) & ~PM_RSTC_WRCFG_MASK));
+#endif
 }
 
 void watchdog_init(u32 timeout_ticks, bool reboot_on_trip)
