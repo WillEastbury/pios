@@ -2,6 +2,7 @@
 build/
 build_uefi/
 build_qemu_stage2/
+build_qemu_full/
 *.o
 *.elf
 *.img
