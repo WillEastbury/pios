@@ -1629,8 +1629,20 @@ u32 tcp_write(tcp_conn_t conn, const void *data, u32 len) {
 u32 tcp_read(tcp_conn_t conn, void *data, u32 len) {
     if (!tcb_valid(conn)) return 0;
     struct tcb *t = &tcbs[conn];
+    u32 old_wnd = t->rcv_wnd;
     u32 n = ring_read(&t->rx_buf, data, len);
     t->rcv_wnd = ring_free(&t->rx_buf);
+    /* Window-update ACK: when the application drains the receive buffer and the
+     * advertised window reopens past one MSS after having been (near-)closed,
+     * proactively ACK so the peer resumes immediately. Without this, a bulk
+     * inbound transfer (e.g. an OTA upload into the 4KB rx ring) stalls: the
+     * window hits 0, the peer enters exponentially-backed-off zero-window
+     * probing, and once a probe gap exceeds the admin stall watchdog the board
+     * resets the connection (host sees WinError 10054 mid-upload). This is the
+     * standard receiver-side window-update every TCP must send. */
+    if (n > 0 && t->state == TCP_ESTABLISHED &&
+        old_wnd < TCP_MSS && t->rcv_wnd >= TCP_MSS)
+        tcp_send_ack(t);
     return n;
 }
 
