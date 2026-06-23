@@ -8441,16 +8441,35 @@ static void admin_service_poll(struct admin_http_service *svc)
      * and (optionally) reboot into it. */
     if (svc->stream_mode) {
         u32 readable = tcp_readable(svc->client_conn);
-        if (readable > 0 && ota_stage_buf && svc->stream_received < svc->stream_total) {
+        /* Tight drain: while the stream is active, pump the NIC RX + drain this
+         * connection in a bounded inner loop so the upload runs at wire speed
+         * regardless of the core0 reactor cadence or :80 load. The board has no
+         * other active services during OTA, so dedicating core0 to the stream
+         * here is the right tradeoff. Bounded by stage space and a spin budget so
+         * it always returns to the reactor (watchdog pets, dashboard, etc). */
+        u32 drain_spins = 0;
+        while (ota_stage_buf && svc->stream_received < svc->stream_total &&
+               drain_spins < 4096U) {
+            drain_spins++;
+            if (readable == 0) {
+                net_poll();   /* ingest more inbound frames into the TCP rx ring */
+                readable = tcp_readable(svc->client_conn);
+                if (readable == 0)
+                    break;    /* genuinely nothing available right now */
+            }
             u32 want = svc->stream_total - svc->stream_received;
             if (want > readable) want = readable;
             if (svc->stream_received + want > ota_stage_cap)
                 want = ota_stage_cap - svc->stream_received;
             u32 n = tcp_read(svc->client_conn, ota_stage_buf + svc->stream_received, want);
+            if (n == 0)
+                break;
             svc->stream_received += n;
             ota_update.received = svc->stream_received;
-            if (n > 0)
-                svc->last_activity_ms = now;
+            svc->last_activity_ms = now;
+            readable = tcp_readable(svc->client_conn);
+            if ((drain_spins & 0xFFU) == 0)
+                watchdog_hw_pet();
         }
         if (svc->stream_received < svc->stream_total && readable == 0) {
             /* Waiting for more inbound data (typically the final sub-MSS tail).
@@ -8991,7 +9010,11 @@ static void echo_tcp_poll(void) {
     }
     if (http_conn_count)
         http_rr = (http_rr + http_scanned) % http_conn_count;
-    admin_services_poll();
+    /* admin_services_poll() is intentionally NOT called here anymore. It used to
+     * be nested at the end of this heavy :80 handler, which starved the OTA
+     * admin drain when the multi-connection :80 pool was busy. It is now driven
+     * directly from the core0 reactor (before this handler) so OTA streaming is
+     * never starved by :80 load. */
 }
 
 #define UI_MODE_NONE          0
@@ -18306,6 +18329,10 @@ NORETURN void core0_main(void) {
 
         if (flags & CORE0_IO_TCP) {
             u64 svc_start = ksvc_begin(ksvc_tcp_id);
+            /* Drain the admin services (incl. the OTA upload stream) FIRST and
+             * independently of the heavy multi-connection :80 handler, so a bulk
+             * OTA upload is never starved of core0 time by :80 load. */
+            admin_services_poll();
             echo_tcp_poll();
             uhttp_bridge_poll();   /* userland :81 request/response pump */
             ksvc_end(ksvc_tcp_id, svc_start, false);
