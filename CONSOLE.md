@@ -409,7 +409,17 @@ tensor status
 tensor selftest
 ```
 
-`qpu status` reports V3D availability, dispatch support, fallback state, bound-kernel masks, disabled-kernel masks, and V3D identity registers. `tensor selftest` verifies the safe NEON fallback kernels without touching QPU dispatch.
+`qpu status` reports V3D availability, dispatch support, fallback state, bound-kernel masks, disabled-kernel masks, native probe/selftest/MMU state, CSD status, tiny-kernel readiness masks, and V3D identity registers. `tensor selftest` verifies the safe NEON fallback kernels without touching QPU dispatch.
+
+Native V3D hardware bring-up should proceed in this order:
+
+```text
+PIOS_ENABLE_NATIVE_VIDEOCORE=1       -> qpu status: native=yes tv=71
+PIOS_ENABLE_NATIVE_V3D_COMPUTE=1     -> qpu status: nmmu=yes nself=yes
+PIOS_ENABLE_TINY_QPU_KERNELS=1       -> one-element tensor add/ReLU only
+```
+
+If `nself=no`, `nmmu=no`, CSD is busy, or a tiny kernel is quarantined, leave the board on the NEON fallback path and inspect the V3D status fields before attempting wider dispatch.
 
 ## Brotli codec diagnostics
 

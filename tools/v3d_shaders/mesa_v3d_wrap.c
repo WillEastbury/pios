@@ -17,6 +17,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define _interlockedexchange64 _InterlockedExchange64
+#define _interlockedexchangeadd64 _InterlockedExchangeAdd64
+#endif
+
 #include "common/v3d_device_info.h"
 #include "common/v3d_limits.h"
 #include "compiler/glsl_types.h"
@@ -25,6 +31,16 @@
 #include "compiler/spirv/nir_spirv.h"
 #include "compiler/spirv/spirv.h"
 #include "broadcom/compiler/v3d_compiler.h"
+#include "broadcom/qpu/qpu_disasm.h"
+
+uint32_t v3d_mesa_debug = 0;
+
+bool
+v3d_debug_flag_for_shader_stage(mesa_shader_stage stage)
+{
+    (void)stage;
+    return false;
+}
 
 static void
 shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *align)
@@ -146,6 +162,20 @@ load_u64_uniform(nir_builder *b, int base)
                             .base = base, .range = 8, .dest_type = nir_type_uint64);
 }
 
+static nir_def *
+load_u32_uniform(nir_builder *b, int base)
+{
+    return nir_load_uniform(b, 1, 32, nir_imm_int(b, 0),
+                            .base = base, .range = 4, .dest_type = nir_type_uint32);
+}
+
+static nir_def *
+load_f32_uniform(nir_builder *b, int base)
+{
+    return nir_load_uniform(b, 1, 32, nir_imm_int(b, 0),
+                            .base = base, .range = 4, .dest_type = nir_type_float32);
+}
+
 static nir_shader *
 build_builtin_nir(const char *name)
 {
@@ -163,17 +193,224 @@ build_builtin_nir(const char *name)
         return b.shader;
     }
 
-    nir_def *a_addr = load_u64_uniform(&b, 0);
-    nir_def *a = nir_load_global(&b, 1, 32, a_addr, .align_mul = 4, .align_offset = 0);
-
     nir_def *out;
     nir_def *dst_addr;
-    if (!strcmp(name, "vector_add")) {
+    if (!strcmp(name, "store_const_ssbo")) {
+        nir_def *out = nir_imm_float(&b, 3.75f);
+        nir_store_ssbo(&b, out, nir_imm_int(&b, 0), load_u32_uniform(&b, 0),
+                       .write_mask = 1, .align_mul = 4, .align_offset = 0);
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "store_const_ssbo16")) {
+        b.shader->info.workgroup_size[0] = 16;
+        nir_def *out = nir_imm_float(&b, 3.75f);
+        nir_def *idx = nir_load_local_invocation_index(&b);
+        nir_def *byte_off = nir_imul_imm(&b, idx, 4);
+        nir_store_ssbo(&b, out, nir_imm_int(&b, 0), byte_off,
+                       .write_mask = 1, .align_mul = 4, .align_offset = 0);
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "vector_add16") || !strcmp(name, "vector_mul16")) {
+        b.shader->info.workgroup_size[0] = 16;
+        nir_def *idx = nir_load_local_invocation_index(&b);
+        nir_def *byte_off = nir_imul_imm(&b, idx, 4);
+        nir_def *a = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), byte_off,
+                                   .access = 0, .align_mul = 4);
+        nir_def *bv = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 1), byte_off,
+                                    .access = 0, .align_mul = 4);
+        nir_def *out = !strcmp(name, "vector_mul16") ? nir_fmul(&b, a, bv) : nir_fadd(&b, a, bv);
+        nir_store_ssbo(&b, out, nir_imm_int(&b, 2), byte_off,
+                       .write_mask = 1, .align_mul = 4, .align_offset = 0);
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "relu16")) {
+        b.shader->info.workgroup_size[0] = 16;
+        nir_def *idx = nir_load_local_invocation_index(&b);
+        nir_def *byte_off = nir_imul_imm(&b, idx, 4);
+        nir_def *a = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), byte_off,
+                                   .access = 0, .align_mul = 4);
+        nir_def *out = nir_fmax(&b, a, nir_imm_float(&b, 0.0f));
+        nir_store_ssbo(&b, out, nir_imm_int(&b, 1), byte_off,
+                       .write_mask = 1, .align_mul = 4, .align_offset = 0);
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "vector_addN") || !strcmp(name, "vector_mulN")) {
+        b.shader->info.workgroup_size[0] = 16;
+        nir_def *wg = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+        nir_def *idx = nir_iadd(&b, nir_imul_imm(&b, wg, 16),
+                                nir_load_local_invocation_index(&b));
+        nir_def *count = load_u32_uniform(&b, 0);
+        nir_if *in_range = nir_push_if(&b, nir_ult(&b, idx, count));
+        {
+            nir_def *byte_off = nir_imul_imm(&b, idx, 4);
+            nir_def *a = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), byte_off,
+                                       .access = 0, .align_mul = 4);
+            nir_def *bv = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 1), byte_off,
+                                        .access = 0, .align_mul = 4);
+            nir_def *out = !strcmp(name, "vector_mulN") ? nir_fmul(&b, a, bv) : nir_fadd(&b, a, bv);
+            nir_store_ssbo(&b, out, nir_imm_int(&b, 2), byte_off,
+                           .write_mask = 1, .align_mul = 4, .align_offset = 0);
+        }
+        nir_pop_if(&b, in_range);
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "reluN")) {
+        b.shader->info.workgroup_size[0] = 16;
+        nir_def *wg = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+        nir_def *idx = nir_iadd(&b, nir_imul_imm(&b, wg, 16),
+                                nir_load_local_invocation_index(&b));
+        nir_def *count = load_u32_uniform(&b, 0);
+        nir_if *in_range = nir_push_if(&b, nir_ult(&b, idx, count));
+        {
+            nir_def *byte_off = nir_imul_imm(&b, idx, 4);
+            nir_def *a = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), byte_off,
+                                       .access = 0, .align_mul = 4);
+            nir_def *out = nir_fmax(&b, a, nir_imm_float(&b, 0.0f));
+            nir_store_ssbo(&b, out, nir_imm_int(&b, 1), byte_off,
+                           .write_mask = 1, .align_mul = 4, .align_offset = 0);
+        }
+        nir_pop_if(&b, in_range);
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "scaleN") || !strcmp(name, "axpyN")) {
+        b.shader->info.workgroup_size[0] = 16;
+        nir_def *wg = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+        nir_def *idx = nir_iadd(&b, nir_imul_imm(&b, wg, 16),
+                                nir_load_local_invocation_index(&b));
+        nir_def *count = load_u32_uniform(&b, 0);
+        nir_def *scalar = load_f32_uniform(&b, 4);
+        nir_if *in_range = nir_push_if(&b, nir_ult(&b, idx, count));
+        {
+            nir_def *byte_off = nir_imul_imm(&b, idx, 4);
+            nir_def *a = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), byte_off,
+                                       .access = 0, .align_mul = 4);
+            nir_def *out = nir_fmul(&b, a, scalar);
+            if (!strcmp(name, "axpyN")) {
+                nir_def *bv = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 1), byte_off,
+                                            .access = 0, .align_mul = 4);
+                out = nir_fadd(&b, out, bv);
+                nir_store_ssbo(&b, out, nir_imm_int(&b, 2), byte_off,
+                               .write_mask = 1, .align_mul = 4, .align_offset = 0);
+            } else {
+                nir_store_ssbo(&b, out, nir_imm_int(&b, 1), byte_off,
+                               .write_mask = 1, .align_mul = 4, .align_offset = 0);
+            }
+        }
+        nir_pop_if(&b, in_range);
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "matvec16")) {
+        b.shader->info.workgroup_size[0] = 1;
+        nir_def *row = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+        nir_def *row_base = nir_imul_imm(&b, row, 64);
+        nir_def *sum = nir_imm_float(&b, 0.0f);
+        for (int i = 0; i < 16; i++) {
+            nir_def *a_off = nir_iadd_imm(&b, row_base, i * 4);
+            nir_def *x_off = nir_imm_int(&b, i * 4);
+            nir_def *a = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), a_off,
+                                       .access = 0, .align_mul = 4);
+            nir_def *x = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 1), x_off,
+                                       .access = 0, .align_mul = 4);
+            sum = nir_fadd(&b, sum, nir_fmul(&b, a, x));
+        }
+        nir_def *out_off = nir_imul_imm(&b, row, 4);
+        nir_store_ssbo(&b, sum, nir_imm_int(&b, 2), out_off,
+                       .write_mask = 1, .align_mul = 4, .align_offset = 0);
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "matmul4")) {
+        b.shader->info.workgroup_size[0] = 1;
+        nir_def *idx = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+        nir_def *row = nir_ushr_imm(&b, idx, 2);
+        nir_def *col = nir_iand_imm(&b, idx, 3);
+        nir_def *sum = nir_imm_float(&b, 0.0f);
+        for (int k = 0; k < 4; k++) {
+            nir_def *a_idx = nir_iadd_imm(&b, nir_imul_imm(&b, row, 16), k * 4);
+            nir_def *b_idx = nir_iadd(&b, nir_imm_int(&b, k * 16), nir_imul_imm(&b, col, 4));
+            nir_def *a = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), a_idx,
+                                       .access = 0, .align_mul = 4);
+            nir_def *bv = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 1), b_idx,
+                                        .access = 0, .align_mul = 4);
+            sum = nir_fadd(&b, sum, nir_fmul(&b, a, bv));
+        }
+        nir_def *out_off = nir_imul_imm(&b, idx, 4);
+        nir_store_ssbo(&b, sum, nir_imm_int(&b, 2), out_off,
+                       .write_mask = 1, .align_mul = 4, .align_offset = 0);
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "matvecN")) {
+        /* One output row per workgroup; dynamic K-loop fused dot product.
+         * Uniforms (PIOS stream): wg_mask, tmu_cfg, K, <const>, A_ssbo, x_ssbo, y_ssbo.
+         * SSBO 0 = A (row-major, K cols), 1 = x (K), 2 = y (rows). */
+        b.shader->info.workgroup_size[0] = 1;
+        nir_def *row = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+        nir_def *K = load_u32_uniform(&b, 0);
+        nir_variable *sumv = nir_local_variable_create(b.impl, glsl_float_type(), "sum");
+        nir_variable *kv = nir_local_variable_create(b.impl, glsl_uint_type(), "k");
+        nir_store_var(&b, sumv, nir_imm_float(&b, 0.0f), 0x1);
+        nir_store_var(&b, kv, nir_imm_int(&b, 0), 0x1);
+        nir_push_loop(&b);
+        {
+            nir_def *k = nir_load_var(&b, kv);
+            nir_if *done = nir_push_if(&b, nir_uge(&b, k, K));
+            {
+                nir_jump(&b, nir_jump_break);
+            }
+            nir_pop_if(&b, done);
+            nir_def *a_idx = nir_iadd(&b, nir_imul(&b, row, K), k);
+            nir_def *a_off = nir_imul_imm(&b, a_idx, 4);
+            nir_def *x_off = nir_imul_imm(&b, k, 4);
+            nir_def *a = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), a_off,
+                                       .access = 0, .align_mul = 4);
+            nir_def *x = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 1), x_off,
+                                       .access = 0, .align_mul = 4);
+            nir_def *acc = nir_fadd(&b, nir_load_var(&b, sumv), nir_fmul(&b, a, x));
+            nir_store_var(&b, sumv, acc, 0x1);
+            nir_store_var(&b, kv, nir_iadd_imm(&b, k, 1), 0x1);
+        }
+        nir_pop_loop(&b, NULL);
+        nir_def *out_off = nir_imul_imm(&b, row, 4);
+        nir_store_ssbo(&b, nir_load_var(&b, sumv), nir_imm_int(&b, 2), out_off,
+                       .write_mask = 1, .align_mul = 4, .align_offset = 0);
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "store_const")) {
+        out = nir_imm_float(&b, 3.75f);
+        dst_addr = load_u64_uniform(&b, 0);
+    } else if (!strcmp(name, "load_store")) {
+        nir_def *a_addr = load_u64_uniform(&b, 0);
+        out = nir_load_global(&b, 1, 32, a_addr, .align_mul = 4, .align_offset = 0);
+        dst_addr = load_u64_uniform(&b, 8);
+    } else if (!strcmp(name, "vector_add") || !strcmp(name, "vector_mul")) {
+        nir_def *a_addr = load_u64_uniform(&b, 0);
+        nir_def *a = nir_load_global(&b, 1, 32, a_addr, .align_mul = 4, .align_offset = 0);
         nir_def *b_addr = load_u64_uniform(&b, 8);
         nir_def *bv = nir_load_global(&b, 1, 32, b_addr, .align_mul = 4, .align_offset = 0);
-        out = nir_fadd(&b, a, bv);
+        out = !strcmp(name, "vector_mul") ? nir_fmul(&b, a, bv) : nir_fadd(&b, a, bv);
         dst_addr = load_u64_uniform(&b, 16);
     } else if (!strcmp(name, "relu")) {
+        nir_def *a_addr = load_u64_uniform(&b, 0);
+        nir_def *a = nir_load_global(&b, 1, 32, a_addr, .align_mul = 4, .align_offset = 0);
         out = nir_fmax(&b, a, nir_imm_float(&b, 0.0f));
         dst_addr = load_u64_uniform(&b, 8);
     } else {
@@ -190,7 +427,7 @@ int
 main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s shader.spv | --builtin vector_add|relu\n", argv[0]);
+        fprintf(stderr, "usage: %s shader.spv | --builtin <pios builtin>\n", argv[0]);
         return 2;
     }
 
@@ -199,7 +436,7 @@ main(int argc, char **argv)
     nir_shader *nir = NULL;
     if (!strcmp(argv[1], "--builtin")) {
         if (argc < 3) {
-            fprintf(stderr, "--builtin requires vector_add or relu\n");
+            fprintf(stderr, "--builtin requires a PIOS builtin name\n");
             glsl_type_singleton_decref();
             return 2;
         }
@@ -244,7 +481,7 @@ main(int argc, char **argv)
 
     struct v3d_device_info devinfo = {
         .ver = 71,
-        .rev = 6,
+        .rev = 1,
         .compat_rev = 4,
         .vpm_size = 128 * 1024,
         .qpu_count = 12,
@@ -277,8 +514,22 @@ main(int argc, char **argv)
     }
 
     printf("qpu_size=%u\n", qpu_size);
+    if (prog_data) {
+        struct v3d_compute_prog_data *cp = (struct v3d_compute_prog_data *)prog_data;
+        printf("meta threads=%u single_seg=%u shared=%u local=%u,%u,%u supergroups=%u uniforms=%u\n",
+               prog_data->threads,
+               prog_data->single_seg ? 1 : 0,
+               cp->shared_size,
+               cp->local_size[0], cp->local_size[1], cp->local_size[2],
+               cp->can_use_supergroups ? 1 : 0,
+               prog_data->uniforms.count);
+        for (uint32_t i = 0; i < prog_data->uniforms.count; i++)
+            printf("uniform[%u] contents=%u data=0x%08x\n",
+                   i, (uint32_t)prog_data->uniforms.contents[i],
+                   prog_data->uniforms.data[i]);
+    }
     for (uint32_t i = 0; i < qpu_size / sizeof(uint64_t); i++)
-        printf("0x%016" PRIx64 "\n", qpu[i]);
+        printf("0x%016" PRIx64 "  %s\n", qpu[i], v3d_qpu_disasm(&devinfo, qpu[i]));
 
     free(qpu);
     v3d_compiler_free(compiler);

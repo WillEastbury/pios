@@ -53,7 +53,12 @@ foreach ($shader in @("vector_add", "relu")) {
 }
 
 if (Test-Path (Join-Path $root "build\mesa_v3d_wrap.exe")) {
-    foreach ($shader in @("vector_add", "relu")) {
+    foreach ($shader in @(
+        "store_const", "load_store", "store_const_ssbo", "store_const_ssbo16",
+        "vector_add16", "vector_mul16", "relu16",
+        "vector_addN", "vector_mulN", "reluN",
+        "scaleN", "axpyN", "matvec16", "matmul4", "matvecN"
+    )) {
         $qpu = Join-Path $out "$($shader)_builtin.qpu.txt"
         $log = Join-Path $out "$($shader)_builtin.log"
         & (Join-Path $root "build\mesa_v3d_wrap.exe") --builtin $shader 2> $log |

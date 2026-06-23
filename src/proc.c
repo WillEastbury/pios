@@ -273,6 +273,12 @@ static inline void proc_publish_control(u32 slot)
         dcache_clean_range((u64)(usize)&procs[slot], 64U);
 }
 
+static inline void proc_diag_refresh_slot(u32 slot)
+{
+    if (slot < MAX_PROCS_PER_CORE && core_id() == CORE_NET)
+        dcache_invalidate_range((u64)(usize)&procs[slot], 64U);
+}
+
 static void proc_bump_generation(u32 slot)
 {
     if (slot >= MAX_PROCS_PER_CORE)
@@ -3968,6 +3974,7 @@ u32 proc_snapshot(struct proc_ui_entry *out, u32 max_entries)
         return 1;
 
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+        proc_diag_refresh_slot(i);
         struct process p = procs[i];
         if (p.state != PROC_READY && p.state != PROC_RUNNING && p.state != PROC_BLOCKED)
             continue;
@@ -4057,6 +4064,7 @@ u32 proc_capsule_snapshot(struct proc_capsule_ui_entry *out, u32 max_entries)
         return 0;
     u32 n = 0;
     for (u32 i = 0; i < MAX_PROCS_PER_CORE && n < max_entries; i++) {
+        proc_diag_refresh_slot(i);
         struct process *p = &procs[i];
         if (p->state != PROC_READY && p->state != PROC_RUNNING && p->state != PROC_BLOCKED)
             continue;

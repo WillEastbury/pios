@@ -382,25 +382,30 @@ have_header:
                       (layout_ver != 0 && layout_ver != PIOS_RESERVED_LAYOUT_VERSION) ||
                       (stage2_off != 0 && stage2_off != PIOS_STAGE2_OFFSET) ||
                       (stage2_bytes != 0 && stage2_bytes != PIOS_STAGE2_ZONE_BYTES);
-    if (bad_header && slot_lba != root_lba) {
-        fb_puts("[stage0] candidate bad; falling back to A\n");
-        uart_puts("[boot] candidate bad; fallback A\n");
-        bootctrl_mark_fallback_a(root_lba);
-        slot_lba = root_lba;
-        if (!sd_read_block(slot_lba, hdr)) {
-            fb_set_color(0x00FF0000, 0x00000000);
-            fb_puts("[stage0] fallback header read failed\n");
-            for (;;) wfi();
+    if (bad_header) {
+        /* Bidirectional slot fallback: if the active slot's header is bad, try
+         * the OTHER slot before giving up. The original code only fell back
+         * B->A (slot_lba != root_lba), so a corrupt active slot A would halt
+         * with no recovery — which is exactly the brick this fixes. */
+        u32 other = (slot_lba == root_lba)
+                        ? root_lba + (PIOS_BOOT_SLOT_B_OFFSET / SD_BLOCK_SIZE)
+                        : root_lba;
+        if (other != slot_lba) {
+            fb_puts("[stage0] active slot bad; trying other slot\n");
+            uart_puts("[boot] active slot bad; trying other\n");
+            slot_lba = other;
+            if (sd_read_block(slot_lba, hdr)) {
+                magic = read_le32(hdr + PIOS_HDR_MAGIC_OFF);
+                image_len = read_le32(hdr + PIOS_HDR_STAGE2_LEN_OFF);
+                layout_ver = read_le32(hdr + PIOS_HDR_LAYOUT_VERSION_OFF);
+                stage2_off = read_le32(hdr + PIOS_HDR_STAGE2_OFFSET_OFF);
+                stage2_bytes = read_le32(hdr + PIOS_HDR_STAGE2_BYTES_OFF);
+                bad_header = magic != BOOT_SLOT_MAGIC || image_len == 0 || image_len > PIOS_STAGE2_ZONE_BYTES ||
+                             (layout_ver != 0 && layout_ver != PIOS_RESERVED_LAYOUT_VERSION) ||
+                             (stage2_off != 0 && stage2_off != PIOS_STAGE2_OFFSET) ||
+                             (stage2_bytes != 0 && stage2_bytes != PIOS_STAGE2_ZONE_BYTES);
+            }
         }
-        magic = read_le32(hdr + PIOS_HDR_MAGIC_OFF);
-        image_len = read_le32(hdr + PIOS_HDR_STAGE2_LEN_OFF);
-        layout_ver = read_le32(hdr + PIOS_HDR_LAYOUT_VERSION_OFF);
-        stage2_off = read_le32(hdr + PIOS_HDR_STAGE2_OFFSET_OFF);
-        stage2_bytes = read_le32(hdr + PIOS_HDR_STAGE2_BYTES_OFF);
-        bad_header = magic != BOOT_SLOT_MAGIC || image_len == 0 || image_len > PIOS_STAGE2_ZONE_BYTES ||
-                     (layout_ver != 0 && layout_ver != PIOS_RESERVED_LAYOUT_VERSION) ||
-                     (stage2_off != 0 && stage2_off != PIOS_STAGE2_OFFSET) ||
-                     (stage2_bytes != 0 && stage2_bytes != PIOS_STAGE2_ZONE_BYTES);
     }
     if (bad_header) {
         fb_set_color(0x00FF0000, 0x00000000);

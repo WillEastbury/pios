@@ -405,6 +405,44 @@ static void flow_record_key(const struct flow_key *key)
     flow_bucket_add(e->hour, FLOW_HOUR_BUCKETS, hour_slot);
 }
 
+static bool nic_ip_l4_checksum_field_zero(const u8 *frame, u32 len, bool *is_l4_out)
+{
+    if (is_l4_out)
+        *is_l4_out = false;
+    if (len < 34 || be16(frame + 12) != 0x0800)
+        return false;
+    const u8 *ip = frame + 14;
+    u32 ihl = (u32)(ip[0] & 0x0F) * 4U;
+    if ((ip[0] >> 4) != 4 || ihl < 20U || len < 14U + ihl)
+        return false;
+    u8 proto = ip[9];
+    const u8 *l4 = ip + ihl;
+    u32 l4_len = len - 14U - ihl;
+    if (proto == 6 && l4_len >= 18U) {
+        if (is_l4_out)
+            *is_l4_out = true;
+        return be16(l4 + 16U) == 0U;
+    }
+    if (proto == 17 && l4_len >= 8U) {
+        if (is_l4_out)
+            *is_l4_out = true;
+        return be16(l4 + 6U) == 0U;
+    }
+    return false;
+}
+
+static void nic_record_tx_checksum_path(const u8 *frame, u32 len)
+{
+    bool is_l4 = false;
+    bool csum_zero = nic_ip_l4_checksum_field_zero(frame, len, &is_l4);
+    if (!is_l4)
+        return;
+    if (tx_checksum_offload && csum_zero)
+        pkt_counts.tx_csum_offloaded++;
+    else
+        pkt_counts.tx_csum_software++;
+}
+
 static void flow_record_packet(bool tx, const u8 *frame, u32 len)
 {
     if (len < 14)
@@ -918,6 +956,7 @@ bool nic_send(const u8 *frame, u32 len)
         fb_filter_drop('T', filter_tx_dropped);
         return false;
     }
+    nic_record_tx_checksum_path(frame, len);
     nic_count_packet(true, frame, len);
     if (packet_dump_enabled)
         fb_pkt_dump('T', 0x00FFFF80, frame, len);
@@ -950,6 +989,7 @@ bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_l
         fb_filter_drop('T', filter_tx_dropped);
         return false;
     }
+    nic_record_tx_checksum_path(tx_frame, total);
     nic_count_packet(true, tx_frame, total);
     if (packet_dump_enabled)
         fb_pkt_dump('T', 0x00FFFF80, tx_frame, total);
@@ -975,9 +1015,12 @@ bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
 #else
 
     for (u32 attempt = 0; attempt < 16; attempt++) {
-        bool ok = macb_recv(frame, len);
+        bool rx_trusted = false;
+        bool ok = macb_recv(frame, len, &rx_trusted);
         if (!ok)
             return false;
+        if (checksum_trusted)
+            *checksum_trusted = rx_trusted;
 
         if (nic_drop_arp_broadcast_not_for_us(frame, *len)) {
             filter_rx_dropped++;
@@ -998,6 +1041,10 @@ bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
         }
 
         nic_count_packet(false, frame, *len);
+        if (rx_trusted)
+            pkt_counts.rx_csum_trusted++;
+        else
+            pkt_counts.rx_csum_untrusted++;
 
         if (packet_dump_enabled)
             fb_pkt_dump('R', 0x0080C8FF, frame, *len);
@@ -1049,30 +1096,50 @@ bool nic_link_full_duplex(void)
 void nic_set_tx_checksum_offload(bool enable)
 {
     tx_checksum_offload = enable;
+#if PIOS_HAS_GENET
+    macb_set_tx_checksum_offload(enable);
+#endif
 }
 
 void nic_set_rx_checksum_offload(bool enable)
 {
     rx_checksum_offload = enable;
+#if PIOS_HAS_GENET
+    macb_set_rx_checksum_offload(enable);
+#endif
 }
 
 void nic_set_tso(bool enable)
 {
-    tso_enabled = enable && tx_checksum_offload;
+#if PIOS_HAS_GENET
+    macb_set_tso(enable);
+    tso_enabled = macb_tso_enabled();
+#else
+    tso_enabled = false;
+#endif
 }
 
 bool nic_tx_checksum_offload_enabled(void)
 {
+#if PIOS_HAS_GENET
+    tx_checksum_offload = tx_checksum_offload && macb_tx_checksum_offload_enabled();
+#endif
     return tx_checksum_offload;
 }
 
 bool nic_rx_checksum_offload_enabled(void)
 {
+#if PIOS_HAS_GENET
+    rx_checksum_offload = rx_checksum_offload && macb_rx_checksum_offload_enabled();
+#endif
     return rx_checksum_offload;
 }
 
 bool nic_tso_enabled(void)
 {
+#if PIOS_HAS_GENET
+    tso_enabled = macb_tso_enabled();
+#endif
     return tso_enabled;
 }
 
@@ -1090,6 +1157,26 @@ void nic_packet_counters(nic_packet_counters_t *out)
 {
     if (out)
         *out = pkt_counts;
+}
+
+void nic_offload_status(nic_offload_status_t *out)
+{
+    if (!out)
+        return;
+    simd_zero(out, sizeof(*out));
+#if PIOS_HAS_GENET
+    out->tx_checksum_capable = true;
+    out->rx_checksum_capable = true;
+    out->tso_capable = false;
+    out->tx_checksum_enabled = nic_tx_checksum_offload_enabled();
+    out->rx_checksum_enabled = nic_rx_checksum_offload_enabled();
+    out->tso_enabled = nic_tso_enabled();
+    macb_offload_regs(&out->mac_ncfgr, &out->mac_dmacfg);
+#endif
+    out->tx_csum_offloaded = pkt_counts.tx_csum_offloaded;
+    out->tx_csum_software = pkt_counts.tx_csum_software;
+    out->rx_csum_trusted = pkt_counts.rx_csum_trusted;
+    out->rx_csum_untrusted = pkt_counts.rx_csum_untrusted;
 }
 
 void nic_record_rate_limited(void)

@@ -1024,6 +1024,15 @@ void fb_debug_info(u32 *db, u32 *size, u32 *pitch) {
 #endif
 }
 
+void fb_display_info(u64 *base, u32 *width, u32 *height, u32 *pitch, u32 *size)
+{
+    if (base) *base = (u64)(usize)fb_ptr;
+    if (width) *width = fb_width;
+    if (height) *height = fb_height;
+    if (pitch) *pitch = fb_pitch;
+    if (size) *size = fb_size;
+}
+
 u64 fb_last_blit_ticks(void) {
 #ifndef PIOS_FB_NO_DOUBLE_BUFFER
     return g_fb_blit_ticks;

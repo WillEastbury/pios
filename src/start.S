@@ -24,6 +24,24 @@ core_asm_stage:
 #define PIOS_PLATFORM_QEMU_VIRT 2
 #endif
 
+/* GATE (reversible): canonical AArch64 cache bring-up before enabling SCTLR.C/I.
+ * Set to 0 and rebuild to revert. A/B health-gated OTA backstops a bad boot.
+ * Diagnosing the long-standing "caches enabled but not allocating" A76 bug. */
+#ifndef PIOS_CACHE_BRINGUP_FIX
+#define PIOS_CACHE_BRINGUP_FIX 1
+#endif
+
+/* GATE (reversible): map the low 1GB (kernel RAM) Write-Back cacheable from the
+ * boot translation table instead of Non-Cacheable, so the kernel never runs a
+ * Non-Cacheable phase that is later swapped to WB (Circle maps RAM WB single-
+ * stage; PIOS's NC-then-swap may be poisoning the A76 cache so it won't
+ * allocate). Side effect: the scanout framebuffer at 0x3F400000 becomes WB
+ * (HDMI may show stale frames) — acceptable for a network-accessed test. Set to
+ * 0 and rebuild to revert. */
+#ifndef PIOS_CACHE_WB_FROM_BOOT
+#define PIOS_CACHE_WB_FROM_BOOT 1
+#endif
+
 _start:
     mrs     x0, mpidr_el1
     and     x0, x0, #0x3
@@ -148,10 +166,21 @@ _start:
     subs    x1, x1, #1
     b.ne    .Lzero_l1
 
-    /* L1[0]: Non-Cacheable RAM (FB at 0x3F400000) — ATTR(1) = 0x705 */
+    /* L1[0]: first 1GB. */
     ldr     x0, =l1_table
-    mov     x2, #0x705
+#if PIOS_CACHE_WB_FROM_BOOT
+    /* Map block 0 (which holds the kernel code window) Write-Back from the very
+     * first cache enable. This is the proven breakthrough fix: it eliminates the
+     * Non-Cacheable boot window that otherwise poisons the A76 cache so it never
+     * allocates. The runtime mmu_enable_caching() then splits block 0 (code WB,
+     * rest NC) and maps blocks 1-3 NC so all DMA driver .bss stays coherent.
+     * Reverts to the original NC block-0 when the gate is 0. */
+    mov     x2, #0x709                 /* ATTR(2) = WB cacheable          */
     str     x2, [x0, #0]
+#else
+    mov     x2, #0x705                 /* original: NC 1GB block          */
+    str     x2, [x0, #0]
+#endif
 
     /* L1[1..3]: Cacheable RAM — ATTR(2) = 0x709 */
     mov     x2, #0x709
@@ -221,6 +250,59 @@ _start:
     tlbi    vmalle1
     dsb     sy
     isb
+
+#if PIOS_CACHE_BRINGUP_FIX
+    /* Canonical AArch64 bring-up: clean+invalidate ALL data/unified caches by
+     * set/way over every level to PoC, then invalidate the I-cache, BEFORE
+     * enabling SCTLR.C/I. PIOS previously skipped this (Circle/Linux do it).
+     * clean+invalidate (not plain invalidate) so any dirty BSS-clear lines the
+     * firmware's EL2 caches may hold are written back, not lost. Standard Linux
+     * __flush_dcache_all algorithm. Clobbers x0-x11,x16,x17 (all scratch here;
+     * the stack is reloaded before entering C). Gated by PIOS_CACHE_BRINGUP_FIX
+     * so it reverts with a one-line change. */
+    mrs     x0, clidr_el1
+    and     w3, w0, #0x07000000        /* LoC = CLIDR[26:24]            */
+    lsr     w3, w3, #23                /* LoC * 2 (level index step)    */
+    cbz     w3, .Lci_done
+    mov     w10, #0                    /* w10 = 2 * current level       */
+    mov     w8, #1
+.Lci_level:
+    add     w2, w10, w10, lsr #1       /* w2 = 3 * level (ctype shift)  */
+    lsr     w1, w0, w2
+    and     w1, w1, #7                 /* cache type at this level      */
+    cmp     w1, #2
+    b.lt    .Lci_next                  /* <2 => no D/unified cache here  */
+    msr     csselr_el1, x10            /* select cache level            */
+    isb
+    mrs     x1, ccsidr_el1
+    and     w2, w1, #7
+    add     w2, w2, #4                 /* w2 = log2(line bytes)         */
+    ubfx    w4, w1, #3, #10            /* w4 = max way index            */
+    clz     w5, w4                     /* w5 = way field bit position   */
+    lsl     w9, w4, w5                 /* w9 = way << waybit            */
+    lsl     w16, w8, w5
+.Lci_way:
+    ubfx    w7, w1, #13, #15           /* w7 = max set index            */
+    lsl     w7, w7, w2
+    lsl     w17, w8, w2
+.Lci_set:
+    orr     w11, w10, w9               /* level | way                   */
+    orr     w11, w11, w7               /* | set                         */
+    dc      cisw, x11                  /* clean+invalidate by set/way   */
+    subs    w7, w7, w17
+    b.ge    .Lci_set
+    subs    x9, x9, x16
+    b.ge    .Lci_way
+.Lci_next:
+    add     w10, w10, #2
+    cmp     w3, w10
+    dsb     sy
+    b.gt    .Lci_level
+.Lci_done:
+    ic      iallu                      /* invalidate all I-cache to PoU */
+    dsb     sy
+    isb
+#endif
 
     /* Enable EL1 MMU + caches */
     mrs     x1, sctlr_el1

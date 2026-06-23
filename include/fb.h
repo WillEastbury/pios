@@ -36,6 +36,7 @@ void fb_present(void);
 
 /* Report whether double-buffering is active plus FB byte-size and pitch. */
 void fb_debug_info(u32 *db, u32 *size, u32 *pitch);
+void fb_display_info(u64 *base, u32 *width, u32 *height, u32 *pitch, u32 *size);
 
 /* CNTPCT ticks taken by the most recent back→front blit. */
 u64 fb_last_blit_ticks(void);

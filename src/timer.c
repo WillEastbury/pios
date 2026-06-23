@@ -175,3 +175,206 @@ void timer_delay_us(u64 us) {
 void timer_delay_ms(u64 ms) {
     timer_delay_us(ms * 1000);
 }
+
+static inline u64 timer_count_now(void)
+{
+    u64 v;
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v) :: "memory");
+    return v;
+}
+
+/* Serial sub+branch loop the A76 fuses to ~1 cycle/iteration. The counter is
+ * kept live as an asm in/out so the loop cannot be optimized away. */
+static u64 timer_spin_iters(u64 n)
+{
+    __asm__ volatile(
+        "1:\n"
+        "   subs %0, %0, #1\n"
+        "   b.ne 1b\n"
+        : "+r"(n) :: "cc");
+    return n;
+}
+
+/*
+ * Estimate the A76 core clock in Hz by timing a serial dependency loop against
+ * the fixed-frequency generic timer (CNTFRQ_EL0, ~54MHz on Pi5). The loop runs
+ * at ~1 iteration/cycle, so hz ~= iterations * cntfrq / elapsed_ticks. This is
+ * approximate (loop fusion assumptions) but easily distinguishes a throttled
+ * ~54MHz core from a full ~2.4GHz one. The measured run is sized to ~window_us
+ * regardless of the actual clock and hard-capped, so a short window keeps the
+ * caller stall tiny. Diagnostic only — call from a loop/command, never an IRQ.
+ */
+u64 cpu_clock_estimate_hz(u32 window_us)
+{
+    u64 freq;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    if (freq == 0)
+        return 0;
+    if (window_us == 0)
+        window_us = 2000U;
+
+    /* Probe to size the measured run to the requested window. */
+    const u64 probe_iters = 1000000ULL;
+    u64 p0 = timer_count_now();
+    (void)timer_spin_iters(probe_iters);
+    u64 p_ticks = timer_count_now() - p0;
+    if (p_ticks == 0)
+        p_ticks = 1;
+
+    u64 want_ticks = (freq * (u64)window_us) / 1000000ULL;
+    if (want_ticks == 0)
+        want_ticks = 1;
+    u64 iters = (probe_iters * want_ticks) / p_ticks;
+    if (iters < probe_iters)
+        iters = probe_iters;
+    if (iters > 200000000ULL)
+        iters = 200000000ULL;
+
+    /* Mask IRQs across the measured run so the timer/net IRQ handlers cannot
+     * steal cycles and inflate the elapsed-tick count (which at a throttled
+     * clock would badly under-report the frequency). The generic timer counter
+     * keeps advancing while IRQs are masked, so timing stays correct; we only
+     * stop handlers from running during the window. */
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    u64 t0 = timer_count_now();
+    (void)timer_spin_iters(iters);
+    u64 ticks = timer_count_now() - t0;
+    __asm__ volatile("msr daifclr, #2" ::: "memory");
+    if (ticks == 0)
+        return 0;
+
+    return (iters * freq) / ticks;
+}
+
+/*
+ * Definitive A76 core clock via the PMU cycle counter (PMCCNTR_EL0) timed
+ * against the fixed generic timer. PMCCNTR counts REAL CPU cycles, so this needs
+ * no cycles-per-iteration assumption (unlike cpu_clock_estimate_hz). The window
+ * is bounded by the generic timer, so it always lasts ~window_us of wall-clock
+ * regardless of core speed. Returns 0 if the cycle counter does not advance
+ * (PMU disabled/unavailable).
+ *
+ * Access note: PMCCNTR_EL0 is readable at EL1 unless MDCR_EL2.TPM traps it to
+ * EL2. The reset value of TPM is 0 and PIOS never sets it, so EL1 access is
+ * expected to work without any EL2 change. Diagnostic only — not for hot paths.
+ */
+u64 cpu_clock_pmu_hz(u32 window_us)
+{
+    u64 freq;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    if (freq == 0)
+        return 0;
+    if (window_us == 0)
+        window_us = 10000U;
+
+    /* Enable the cycle counter: PMCR_EL0.E (bit0) + counter reset (bit2), clear
+     * the /64 divider PMCR_EL0.D (bit3) so it counts every cycle; then enable
+     * the dedicated cycle counter via PMCNTENSET_EL0.C (bit31). */
+    u64 pmcr;
+    __asm__ volatile("mrs %0, pmcr_el0" : "=r"(pmcr));
+    pmcr = (pmcr | (1ULL << 0) | (1ULL << 2)) & ~(1ULL << 3);
+    __asm__ volatile("msr pmcr_el0, %0" :: "r"(pmcr));
+    __asm__ volatile("msr pmcntenset_el0, %0" :: "r"(1ULL << 31));
+    __asm__ volatile("isb");
+
+    u64 want_ticks = (freq * (u64)window_us) / 1000000ULL;
+    if (want_ticks == 0)
+        want_ticks = 1;
+
+    /* Mask IRQs for a clean read (not strictly required — PMCCNTR counts IRQ
+     * cycles as real cycles too — but keeps the window handler-free). */
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    u64 c0, t0, tnow;
+    __asm__ volatile("isb; mrs %0, pmccntr_el0" : "=r"(c0) :: "memory");
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t0));
+    do {
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(tnow));
+    } while ((tnow - t0) < want_ticks);
+    u64 c1;
+    __asm__ volatile("isb; mrs %0, pmccntr_el0" : "=r"(c1) :: "memory");
+    __asm__ volatile("msr daifclr, #2" ::: "memory");
+
+    u64 dt = tnow - t0;
+    u64 dc = c1 - c0;
+    if (dt == 0 || dc == 0)
+        return 0;
+    return (dc * freq) / dt;
+}
+
+/* See timer.h. Buffer is volatile so loads aren't optimized away; 64 u64 = 512B
+ * = 8 cache lines, trivially L1D-resident if the D-cache is allocating. */
+static volatile u64 cpudiag_buf[64] __attribute__((aligned(64)));
+
+static inline void cpudiag_pmu_on(void)
+{
+    u64 pmcr;
+    __asm__ volatile("mrs %0, pmcr_el0" : "=r"(pmcr));
+    pmcr = (pmcr | 1ULL | 4ULL) & ~8ULL;   /* E | C(reset) | clear D(/64) */
+    __asm__ volatile("msr pmcr_el0, %0" :: "r"(pmcr));
+    __asm__ volatile("msr pmcntenset_el0, %0" :: "r"(1ULL << 31));
+    __asm__ volatile("isb");
+}
+
+static inline u64 cpudiag_pmccntr(void)
+{
+    u64 v;
+    __asm__ volatile("isb; mrs %0, pmccntr_el0" : "=r"(v) :: "memory");
+    return v;
+}
+
+void cpu_pmu_microbench(u64 out[5])
+{
+    const u64 spin_iters = 1000000ULL;
+    const u64 nop_reps   = 100000ULL;    /* x64 NOPs = 6.4M straight NOPs */
+    const u64 load_iters = 1000000ULL;
+
+    for (u32 i = 0; i < 64; i++) cpudiag_buf[i] = i;
+    cpudiag_pmu_on();
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+
+    /* [0] branchy register spin loop */
+    u64 c0 = cpudiag_pmccntr();
+    (void)timer_spin_iters(spin_iters);
+    u64 c1 = cpudiag_pmccntr();
+    out[0] = c1 - c0;
+
+    /* [1] branch-free straight-line NOPs (64/rep, L1I-resident after pass 1) */
+    c0 = cpudiag_pmccntr();
+    for (u64 i = 0; i < nop_reps; i++)
+        __asm__ volatile(".rept 64\n nop\n .endr\n" ::: "memory");
+    c1 = cpudiag_pmccntr();
+    out[1] = c1 - c0;
+
+    /* [2] dependent loads from a tiny LOW-RAM .bss buffer (WB via runtime remap) */
+    c0 = cpudiag_pmccntr();
+    u64 acc = 0;
+    for (u64 i = 0; i < load_iters; i++)
+        acc += cpudiag_buf[(acc + i) & 63];
+    c1 = cpudiag_pmccntr();
+    out[2] = c1 - c0;
+
+    /* [3] dependent loads from a tiny HIGH-RAM buffer (0x80000000, WB direct from
+     * the boot l1_table L1[2], never touched by the runtime remap). Read-only:
+     * whatever data is there is fine, we only care if repeats stay resident. */
+    volatile u64 *hi = (volatile u64 *)(usize)0x80000000ULL;
+    c0 = cpudiag_pmccntr();
+    u64 acc2 = 0;
+    for (u64 i = 0; i < load_iters; i++)
+        acc2 += hi[(acc2 + i) & 63];
+    c1 = cpudiag_pmccntr();
+    out[3] = c1 - c0;
+
+    /* [4] dependent scattered loads over 8MB LOW RAM (DRAM-forced baseline) */
+    volatile u64 *big = (volatile u64 *)(usize)0x02000000ULL;
+    const u64 nlines = (8ULL << 20) / 64ULL;
+    c0 = cpudiag_pmccntr();
+    for (u64 i = 0; i < load_iters; i++) {
+        u64 idx = ((acc + i * 4099ULL) & (nlines - 1)) * 8ULL;
+        acc += big[idx];
+    }
+    c1 = cpudiag_pmccntr();
+    out[4] = c1 - c0;
+    __asm__ volatile("" :: "r"(acc), "r"(acc2));
+
+    __asm__ volatile("msr daifclr, #2" ::: "memory");
+}

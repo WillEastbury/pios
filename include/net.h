@@ -155,7 +155,7 @@ bool net_join_multicast_mac(const u8 *mac);
 bool net_leave_multicast_mac(const u8 *mac);
 
 /* Poll: process one incoming frame (call in tight loop on core 0) */
-void net_poll(void);
+u32 net_poll(void);
 
 /* Send a UDP datagram */
 bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
@@ -190,6 +190,7 @@ typedef struct {
     u64 drop_no_neighbor;   /* no static MAC for dst */
     u64 drop_udp_malformed; /* UDP length mismatch */
     u64 drop_oversized;     /* frame > MTU */
+    u64 drop_udp_bad_cksum;  /* UDP checksum failed */
 } net_stats_t;
 
 const net_stats_t *net_get_stats(void);

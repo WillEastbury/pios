@@ -137,3 +137,6 @@ typedef struct {
 } tcp_diag_t;
 
 const tcp_diag_t *tcp_diag(void);
+
+/* Live connection-table capacity + in-use count (network-first scaling diag). */
+void tcp_table_stats(u32 *capacity, u32 *inuse, u32 *listeners);

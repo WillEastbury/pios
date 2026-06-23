@@ -134,5 +134,8 @@ void irq_trace_reset(void);
 void irq_vector_minimal_arm(bool enabled);
 void irq_vector_minimal_snapshot(u32 *count, u32 *last_iar);
 bool exception_crash_snapshot(struct exception_crash_record *out);
+void exception_crash_persist_sd(void);
+bool exception_crash_sd_read(struct exception_crash_record *out);
+void exception_crash_sd_clear(void);
 
 NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far);

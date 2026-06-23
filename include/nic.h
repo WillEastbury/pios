@@ -46,10 +46,31 @@ typedef struct {
     u64 firewalled;
     u64 flood_blocked;
     u64 rate_limited;
+    u64 tx_csum_offloaded;
+    u64 tx_csum_software;
+    u64 rx_csum_trusted;
+    u64 rx_csum_untrusted;
 } nic_packet_counters_t;
 
 void nic_packet_counters(nic_packet_counters_t *out);
 void nic_record_rate_limited(void);
+
+typedef struct {
+    bool tx_checksum_capable;
+    bool rx_checksum_capable;
+    bool tso_capable;
+    bool tx_checksum_enabled;
+    bool rx_checksum_enabled;
+    bool tso_enabled;
+    u64 tx_csum_offloaded;
+    u64 tx_csum_software;
+    u64 rx_csum_trusted;
+    u64 rx_csum_untrusted;
+    u32 mac_ncfgr;
+    u32 mac_dmacfg;
+} nic_offload_status_t;
+
+void nic_offload_status(nic_offload_status_t *out);
 
 /* Packet firewall at the NIC boundary.
  *

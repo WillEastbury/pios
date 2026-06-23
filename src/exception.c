@@ -25,6 +25,14 @@
 
 static u8 irq_trace_sd_buf[SD_BLOCK_SIZE] ALIGNED(16);
 
+/* Persist the last crash record to a fixed SD sector so it survives the
+ * BCM2712 watchdog reset (which clears DRAM). LBA 24 sits in the boot gap
+ * just above the IRQ trace band (16..23) and well below the partition table
+ * @ LBA 2048. After a crash+reset, the `crashlba` / `coredump` command reads
+ * it back to reveal where core0 faulted (elr/far/ec). */
+#define CRASH_PERSIST_LBA   24u
+static u8 crash_persist_sd_buf[SD_BLOCK_SIZE] ALIGNED(16);
+
 extern volatile u32 irq_vector_minimal_mode;
 extern volatile u32 irq_vector_minimal_count;
 extern volatile u32 irq_vector_minimal_last_iar;
@@ -103,11 +111,55 @@ bool exception_crash_snapshot(struct exception_crash_record *out)
     return true;
 }
 
+/* Write the captured crash record to SD LBA 24 (synchronous PIO, same path as
+ * irq_sd_band). Best-effort, panic-context safe: bounded, no allocation. */
+void exception_crash_persist_sd(void)
+{
+    struct exception_crash_record rec;
+    if (!exception_crash_snapshot(&rec))
+        return;
+    for (u32 i = 0; i < SD_BLOCK_SIZE; i++)
+        crash_persist_sd_buf[i] = 0;
+    const u8 *s = (const u8 *)&rec;
+    for (u32 i = 0; i < sizeof(rec); i++)
+        crash_persist_sd_buf[i] = s[i];
+    (void)sd_write_block(CRASH_PERSIST_LBA, crash_persist_sd_buf);
+}
+
+/* Read back the persisted crash record after a reset. Returns false if the
+ * sector is unreadable or has no valid crash magic. */
+bool exception_crash_sd_read(struct exception_crash_record *out)
+{
+    if (!out)
+        return false;
+    if (!sd_read_block(CRASH_PERSIST_LBA, crash_persist_sd_buf))
+        return false;
+    struct exception_crash_record tmp;
+    u8 *d = (u8 *)&tmp;
+    for (u32 i = 0; i < sizeof(tmp); i++)
+        d[i] = crash_persist_sd_buf[i];
+    if (tmp.magic != EXCEPTION_CRASH_RECORD_MAGIC)
+        return false;
+    *out = tmp;
+    return true;
+}
+
+/* Clear the persisted crash sector (after we've read/acknowledged it). */
+void exception_crash_sd_clear(void)
+{
+    for (u32 i = 0; i < SD_BLOCK_SIZE; i++)
+        crash_persist_sd_buf[i] = 0;
+    (void)sd_write_block(CRASH_PERSIST_LBA, crash_persist_sd_buf);
+}
+
 static NORETURN void pisod_halt(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
 {
     if (!panic_in_progress) {
         panic_in_progress = true;
         crash_capture(kind, ec, esr, elr, far);
+        /* Persist to SD before the (DRAM-clearing) watchdog reset so the
+         * faulting elr/far/ec survive and can be read back after reboot. */
+        exception_crash_persist_sd();
     }
 
     uart_puts("\n=== PiSOD ===\n");

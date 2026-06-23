@@ -37,7 +37,9 @@
 #include "dma.h"
 #include "gpu.h"
 #include "tensor.h"
+#include "v3d.h"
 #include "videocore.h"
+#include "vc_display.h"
 #include "walfs.h"
 #include "bcache.h"
 #include "principal.h"
@@ -57,6 +59,7 @@
 #include "build_version.h"
 #include "ipc_stream.h"
 #include "ipc_proc.h"
+#include "lease.h"
 #include "pipe.h"
 #include "setup.h"
 #include "ksem.h"
@@ -255,7 +258,6 @@ static const char *http_error_name(u32 err)
 static tcp_conn_t echo_listen_conn = -1;
 static tcp_conn_t echo_client_conn = -1;
 static tcp_conn_t http_listen_conn = -1;
-static tcp_conn_t http_client_conn = -1;
 static tcp_conn_t https_tls_listen_conn = -1;
 static tcp_conn_t https_tls_tcp_conn = -1;
 static tls_conn_t https_tls_conn = -1;
@@ -264,10 +266,6 @@ static u32 https_tls_req_len;
 static bool https_tls_accepted;
 static bool https_tls_response_sent;
 static u64 https_tls_last_activity_ms;
-static u8 http_req_buf[1024];
-static u32 http_req_len;
-static bool http_auth_checked;
-static bool http_auth_ok;
 static bool http_reboot_pending;
 static i32 ksvc_net_id = -1;
 static i32 ksvc_tcp_id = -1;
@@ -275,26 +273,71 @@ static i32 ksvc_debug_id = -1;
 static i32 ksvc_ui_id = -1;
 static i32 ksvc_dashboard_id = -1;
 static i32 ksvc_timer_id = -1;
-static char http_resp_buf[16000];
-static u32 http_resp_len;
-static u32 http_resp_off;
-static const u8 *http_static_body;
-static u32 http_static_len;
-static u32 http_static_off;
-static u64 http_file_id;
-static u32 http_file_len;
-static u32 http_file_off;
-static u8 http_file_chunk[HTTP_TX_CHUNK_MAX];
-static u32 http_last_state;
-static u32 http_last_readable;
-static u32 http_last_writable;
-static u32 http_last_write;
 static u32 http_complete_tick;
-static bool http_prefix_dumped;
-static bool http_req_prefix_dumped;
-static u64 http_last_activity_ms;
-static char http_last_req_prefix[25];
-static char http_last_resp_prefix[25];
+
+/* ── Multi-connection HTTP server (:80) ──
+ * The :80 server services a POOL of concurrent client connections instead of
+ * one-at-a-time, so many simultaneous clients are accepted and advanced in
+ * parallel (per poll). Each slot owns its full request/response state; the
+ * existing per-request state machine runs on the current slot via the cursor
+ * `Hc` (the http_* identifiers below are macros onto Hc->*), so the proven
+ * serving logic stays byte-identical. The pool lives in highmem (~17KB/slot). */
+#define HTTP_MAX_CONCURRENT 48
+struct http_conn {
+    tcp_conn_t client_conn;
+    u8 req_buf[1024];
+    u32 req_len;
+    bool auth_checked;
+    bool auth_ok;
+    char resp_buf[16000];
+    u32 resp_len;
+    u32 resp_off;
+    const u8 *static_body;
+    u32 static_len;
+    u32 static_off;
+    u64 file_id;
+    u32 file_len;
+    u32 file_off;
+    u8 file_chunk[HTTP_TX_CHUNK_MAX];
+    u32 last_state;
+    u32 last_readable;
+    u32 last_writable;
+    u32 last_write;
+    bool prefix_dumped;
+    bool req_prefix_dumped;
+    u64 last_activity_ms;
+    char last_req_prefix[25];
+    char last_resp_prefix[25];
+};
+static struct http_conn *http_conns;             /* highmem pool [HTTP_MAX_CONCURRENT] */
+static struct http_conn  http_conns_fallback[4]; /* if highmem unavailable */
+static u32 http_conn_count;
+static struct http_conn *Hc;                     /* current slot the state machine acts on */
+
+#define http_client_conn       (Hc->client_conn)
+#define http_req_buf           (Hc->req_buf)
+#define http_req_len           (Hc->req_len)
+#define http_auth_checked      (Hc->auth_checked)
+#define http_auth_ok           (Hc->auth_ok)
+#define http_resp_buf          (Hc->resp_buf)
+#define http_resp_len          (Hc->resp_len)
+#define http_resp_off          (Hc->resp_off)
+#define http_static_body       (Hc->static_body)
+#define http_static_len        (Hc->static_len)
+#define http_static_off        (Hc->static_off)
+#define http_file_id           (Hc->file_id)
+#define http_file_len          (Hc->file_len)
+#define http_file_off          (Hc->file_off)
+#define http_file_chunk        (Hc->file_chunk)
+#define http_last_state        (Hc->last_state)
+#define http_last_readable     (Hc->last_readable)
+#define http_last_writable     (Hc->last_writable)
+#define http_last_write        (Hc->last_write)
+#define http_prefix_dumped     (Hc->prefix_dumped)
+#define http_req_prefix_dumped (Hc->req_prefix_dumped)
+#define http_last_activity_ms  (Hc->last_activity_ms)
+#define http_last_req_prefix   (Hc->last_req_prefix)
+#define http_last_resp_prefix  (Hc->last_resp_prefix)
 static struct {
     u64 accepts;
     u64 reads;
@@ -329,6 +372,13 @@ struct admin_http_service {
     u64 last_activity_ms;
     u64 last_ok_ms;
     u32 completions;
+    /* Single-connection streaming OTA upload: the whole image arrives over ONE
+     * POST body (no per-chunk connection churn that overruns the polling NIC),
+     * streamed straight into the RAM staging buffer. */
+    bool stream_mode;
+    bool stream_reboot;
+    u32  stream_total;
+    u32  stream_received;
 };
 
 static struct admin_http_service admin_status_svc = {
@@ -365,6 +415,13 @@ struct ota_update_state {
     const char *last_error;
 };
 static struct ota_update_state ota_update;
+/* OTA RAM staging: chunks land in this highmem buffer (fast memcpy) instead of
+ * doing per-chunk blocking SD writes on core0 (which stall the polling NIC and
+ * wedge the upload). The full image flushes to the SD slot once, at commit.
+ * Falls back to direct per-chunk SD writes if highmem is unavailable. */
+static u8 *ota_stage_buf;
+static u32 ota_stage_cap;
+static bool ota_stage_ready;
 static tcp_conn_t debug_listen_conn = -1;
 static tcp_conn_t debug_client_conn = -1;
 static bool debug_tcp_unlocked;
@@ -1356,6 +1413,7 @@ static u32 http_core_ram_used_kib(u32 core)
 struct perf_counter_snapshot {
     u32 cpu_permille[4];
     u32 cpu_total_permille;
+    u32 cpu_clock_mhz;
     u64 sched_wake;
     u64 sched_wfi;
     u64 sched_idle_ticks;
@@ -1520,6 +1578,24 @@ static u32 perf_mbps_x1000(u64 bytes, u64 elapsed_ms)
     return v > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (u32)v;
 }
 
+/*
+ * Published cluster A76 core clock in MHz from the PMU cycle counter (true core
+ * Hz). BCM2712 is one ARM frequency domain, so one reading covers all cores.
+ * Written ONLY by core 0 from its main loop on a ~2.5s cadence; read by the
+ * dashboard and /api/status snapshot, both on core 0 — single-writer, same-core
+ * reader. 0 = not yet measured. (The serial-loop "effective throughput" and the
+ * non-cacheable-execution penalty are reported on demand by `cpuclock`.)
+ */
+static volatile u32 g_cpu_clock_mhz;
+
+static void perf_cpu_clock_measure(u32 window_us)
+{
+    u64 hz = cpu_clock_pmu_hz(window_us);
+    if (!hz)
+        hz = cpu_clock_estimate_hz(window_us);   /* fallback if PMU unavailable */
+    g_cpu_clock_mhz = (u32)((hz + 500000ULL) / 1000000ULL);
+}
+
 static void perf_counter_snapshot(struct perf_counter_snapshot *p)
 {
     static u64 rate_last_ms;
@@ -1563,6 +1639,7 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
     p->cpu_permille[3] = (pcs_n > 2) ? pcs[2].busy_permille : 0;
     p->cpu_total_permille = (p->cpu_permille[0] + p->cpu_permille[1] +
                              p->cpu_permille[2] + p->cpu_permille[3]) / 4U;
+    p->cpu_clock_mhz = g_cpu_clock_mhz;
 
     struct proc_ui_entry proc[MAX_PROCS_PER_CORE + 1U];
     u32 proc_n = proc_snapshot(proc, MAX_PROCS_PER_CORE + 1U);
@@ -1693,6 +1770,8 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "clen", http_diag.content_len, true);
     struct perf_counter_snapshot perf;
     perf_counter_snapshot(&perf);
+    const struct videocore_probe *vc = videocore_probe_get();
+    const struct vc_display_status *vcd = vc_display_status_get();
     http_append_json_metric(out, &len, max, "sched_wake", perf.sched_wake, true);
     http_append_json_metric(out, &len, max, "sched_wfi", perf.sched_wfi, true);
     http_append_json_metric(out, &len, max, "sched_busy_permille", perf.cpu_permille[0], true);
@@ -1703,6 +1782,7 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "cpu1_permille", perf.cpu_permille[1], true);
     http_append_json_metric(out, &len, max, "cpu2_permille", perf.cpu_permille[2], true);
     http_append_json_metric(out, &len, max, "cpu3_permille", perf.cpu_permille[3], true);
+    http_append_json_metric(out, &len, max, "cpu_clock_mhz", perf.cpu_clock_mhz, true);
     http_append_json_metric(out, &len, max, "board_revision", perf.board_revision, true);
     http_append_json_metric(out, &len, max, "board_revision_new_style", perf.board_revision_new_style ? 1U : 0U, true);
     http_append_json_metric(out, &len, max, "board_mem_code", perf.board_mem_code, true);
@@ -1710,6 +1790,50 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "board_processor_code", perf.board_processor_code, true);
     http_append_json_metric(out, &len, max, "board_manufacturer_code", perf.board_manufacturer_code, true);
     http_append_json_metric(out, &len, max, "board_pcb_revision", perf.board_pcb_revision, true);
+    http_append_json_metric(out, &len, max, "videocore_enabled", vc && vc->enabled ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_hvs_seen", vc && vc->hvs_seen ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_v3d_seen", vc && vc->v3d_seen ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_v3d_tech", vc ? vc->v3d_tech_version : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_v3d_cores", vc ? vc->v3d_core_count : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_v3d_slices", vc ? vc->v3d_slice_count : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_v3d_qpus_per_slice", vc ? vc->v3d_qpus_per_slice : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_v3d_mmu", vc && vc->v3d_has_mmu ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_v3d_l3c_kb", vc ? vc->v3d_l3c_kb : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_ready", vcd && vcd->ready ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_backend", vcd ? (u32)vcd->backend : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_native_probe", vcd && vcd->native_probe_ready ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_native_owner", vcd && vcd->native_owner ? 1U : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_width", vcd ? vcd->width : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_height", vcd ? vcd->height : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_pitch", vcd ? vcd->pitch : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_scanout", vcd ? vcd->scanout_base : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_presents", vcd ? vcd->present_count : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_previous_backend", vcd ? (u32)vcd->previous_backend : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_takeover_attempts", vcd ? vcd->takeover_attempts : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_fallback_count", vcd ? vcd->fallback_count : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_takeover_status", vcd ? vcd->last_takeover_status : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_snapshot_count", vcd ? vcd->snapshot_count : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_hvs_control", vcd ? vcd->hvs_control : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_hvs_dl_status", vcd ? vcd->hvs_dl_status : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_status", vcd ? vcd->dlist_status : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_count", vcd ? vcd->dlist_count : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_format", vcd ? vcd->dlist_format : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_order", vcd ? vcd->dlist_order : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_stage_index", vcd ? vcd->dlist_stage_index : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_stage_count", vcd ? vcd->dlist_stage_count : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_stage_readback_ok", vcd ? vcd->dlist_stage_readback_ok : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_arm_channel", vcd ? vcd->dlist_arm_channel : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_arm_readback_ok", vcd ? vcd->dlist_arm_readback_ok : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_arm_lptrs", vcd ? vcd->dlist_arm_lptrs_after : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_restore_count", vcd ? vcd->dlist_restore_count : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_restore_readback_ok", vcd ? vcd->dlist_restore_readback_ok : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_dlist_restore_lptrs", vcd ? vcd->dlist_restore_lptrs : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_channel_status", vcd ? vcd->channel_reapply_status : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_channel_reapply_count", vcd ? vcd->channel_reapply_count : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_channel_reapply_ok", vcd ? vcd->channel_reapply_readback_ok : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_global_status", vcd ? vcd->global_reapply_status : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_global_reapply_count", vcd ? vcd->global_reapply_count : 0U, true);
+    http_append_json_metric(out, &len, max, "videocore_display_global_reapply_ok", vcd ? vcd->global_reapply_readback_ok : 0U, true);
     http_append_json_metric(out, &len, max, "ram_installed_bytes", perf.installed_ram_bytes, true);
     http_append_json_metric(out, &len, max, "ram_installed_kib", perf.installed_ram_bytes >> 10, true);
     http_append_json_metric(out, &len, max, "ram_arm_visible_bytes", perf.physical_ram_bytes, true);
@@ -1814,6 +1938,14 @@ static u32 http_build_netstat_json(char *out, u32 max)
     http_append_json_metric(out, &len, max, "badCsum", td->bad_checksum, true);
     http_append_json_metric(out, &len, max, "pendQ", td->pending_queued, true);
     http_append_json_metric(out, &len, max, "pendFull", td->pending_full, false);
+    http_append(out, &len, max, "},\"table\":{");
+    {
+        u32 cap = 0, inuse = 0, lsn = 0;
+        tcp_table_stats(&cap, &inuse, &lsn);
+        http_append_json_metric(out, &len, max, "capacity", cap, true);
+        http_append_json_metric(out, &len, max, "inuse", inuse, true);
+        http_append_json_metric(out, &len, max, "listeners", lsn, false);
+    }
     http_append(out, &len, max, "},\"fw\":{");
     http_append_json_metric(out, &len, max, "rxDrop", rx_drop, true);
     http_append_json_metric(out, &len, max, "txDrop", tx_drop, false);
@@ -2077,6 +2209,60 @@ static void pixe_run_and_report(char *out, u32 *len, u32 max, const u32 *prog, i
     http_append(out, len, max, "\n");
 }
 
+static void http_append_tensor_tail(char *out, u32 *len, u32 max)
+{
+    http_append(out, len, max, " stage=");
+    http_append_u64(out, len, max, (u32)tensor_tiny_last_stage());
+    http_append(out, len, max, " status=");
+    http_append_u64(out, len, max, (u32)tensor_tiny_last_status());
+    http_append(out, len, max, " out=");
+    http_append_u64(out, len, max, tensor_tiny_last_output_bits());
+    http_append(out, len, max, " expect=");
+    http_append_u64(out, len, max, tensor_tiny_last_expected_bits());
+    struct v3d_csd_debug dbg;
+    v3d_csd_debug_last(&dbg);
+    http_append(out, len, max, " csd_st=");
+    http_append_hex32(out, len, max, dbg.status_before);
+    http_append(out, len, max, "/");
+    http_append_hex32(out, len, max, dbg.status_after_kick);
+    http_append(out, len, max, "/");
+    http_append_hex32(out, len, max, dbg.status_after_wait);
+    http_append(out, len, max, " cur=");
+    http_append_hex32(out, len, max, dbg.current_cfg0);
+    http_append(out, len, max, "/");
+    http_append_hex32(out, len, max, dbg.current_cfg5);
+    http_append(out, len, max, "/");
+    http_append_hex32(out, len, max, dbg.current_cfg6);
+    http_append(out, len, max, "\n");
+}
+
+static void http_bench_row(char *out, u32 *len, u32 max, const char *label,
+                           u32 op, u32 m, u32 k, u32 p, u64 flops,
+                           u32 reps_sn, u32 reps_v3d, bool include_v3d)
+{
+    u64 s_ns = tensor_bench(op, m, k, p, TENSOR_BENCH_SCALAR, reps_sn);
+    u64 n_ns = tensor_bench(op, m, k, p, TENSOR_BENCH_NEON, reps_sn);
+    http_append(out, len, max, label);
+    http_append(out, len, max, " s_ns=");
+    http_append_u64(out, len, max, s_ns);
+    http_append(out, len, max, " n_ns=");
+    http_append_u64(out, len, max, n_ns);
+    http_append(out, len, max, " nx100=");
+    http_append_u64(out, len, max, n_ns ? (s_ns * 100ULL) / n_ns : 0ULL);
+    http_append(out, len, max, " ngf100=");
+    http_append_u64(out, len, max, n_ns ? (flops * 100ULL) / n_ns : 0ULL);
+    if (include_v3d) {
+        u64 v_ns = tensor_bench(op, m, k, p, TENSOR_BENCH_V3D, reps_v3d);
+        http_append(out, len, max, " v_ns=");
+        http_append_u64(out, len, max, v_ns);
+        http_append(out, len, max, " vx100=");
+        http_append_u64(out, len, max, v_ns ? (s_ns * 100ULL) / v_ns : 0ULL);
+        http_append(out, len, max, " vgf100=");
+        http_append_u64(out, len, max, v_ns ? (flops * 100ULL) / v_ns : 0ULL);
+    }
+    http_append(out, len, max, "\n");
+}
+
 static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     u32 len = 0;
@@ -2166,7 +2352,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(topic, "arp")) {
             http_append(out, &len, max, "arp probe\n  Send a gratuitous ARP (TX-path test) and report request/learn/conflict counters.\n");
         } else if (http_streq(topic, "nic")) {
-            http_append(out, &len, max, "nic dump <on|off> | nic counters\n  Toggle raw packet dump or show processed/dropped/firewalled/rate-limited counters.\n");
+            http_append(out, &len, max, "nic dump <on|off> | nic counters | nic offload\n  Toggle raw packet dump or show counters/offload capability and checksum telemetry.\n");
         } else {
             http_append(out, &len, max, "ERR: unknown help topic. Try help status, help netstat, help firewall, help reboot, help dma, help tls, help brotli, help walfs, help cachestats\n");
         }
@@ -2640,6 +2826,314 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " last_flags=");
         http_append_hex32(out, &len, max, last_flags);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "cpuclock") || http_streq(cmd, "cpu clock")) {
+        u64 frq;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+        u64 hz = cpu_clock_estimate_hz(30000U);
+        u64 pmu_hz = cpu_clock_pmu_hz(20000U);
+        if (pmu_hz)
+            g_cpu_clock_mhz = (u32)((pmu_hz + 500000ULL) / 1000000ULL);
+        http_append(out, &len, max, "cpuclock core=");
+        http_append_u64(out, &len, max, core_id() & 3U);
+        http_append(out, &len, max, " pmu_khz=");
+        http_append_u64(out, &len, max, (pmu_hz + 500ULL) / 1000ULL);
+        http_append(out, &len, max, " eff_khz=");
+        http_append_u64(out, &len, max, (hz + 500ULL) / 1000ULL);
+        http_append(out, &len, max, " timer_mhz=");
+        http_append_u64(out, &len, max, frq / 1000000ULL);
+        http_append(out, &len, max, " penalty_x=");
+        http_append_u64(out, &len, max, hz ? (pmu_hz / hz) : 0ULL);
+        http_append(out, &len, max, " (pmu=clock eff=throughput gap=nc-exec)\n");
+    } else if (http_streq(cmd, "mmustat")) {
+        u64 sctlr, ttbr0;
+        __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+        __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+        http_append(out, &len, max, "mmustat sctlr=");
+        http_append_hex32(out, &len, max, (u32)sctlr);
+        http_append(out, &len, max, " M=");
+        http_append_u64(out, &len, max, sctlr & 1U);
+        http_append(out, &len, max, " C=");
+        http_append_u64(out, &len, max, (sctlr >> 2) & 1U);
+        http_append(out, &len, max, " I=");
+        http_append_u64(out, &len, max, (sctlr >> 12) & 1U);
+        http_append(out, &len, max, " ttbr0=");
+        http_append_hex32(out, &len, max, (u32)ttbr0);
+        http_append(out, &len, max, "\n");
+        /* AT S1E1R translate a few VAs; PAR_EL1[63:56]=memattr (0xFF=WB,
+         * 0x44=Normal-NC, 0x00=Device), bit0=fault. */
+        u64 probe[3];
+        probe[0] = (u64)(usize)&cpu_clock_estimate_hz; /* kernel .text */
+        u64 stackv = 0; probe[1] = (u64)(usize)&stackv; /* core-0 stack */
+        probe[2] = 0x0059f000ULL;                       /* tensor .bss pool */
+        const char *pn[3] = { "text", "stack", "bss_pool" };
+        for (u32 i = 0; i < 3; i++) {
+            u64 par;
+            __asm__ volatile("at s1e1r, %1\n isb\n mrs %0, par_el1"
+                             : "=r"(par) : "r"(probe[i]) : "memory");
+            http_append(out, &len, max, pn[i]);
+            http_append(out, &len, max, " va=");
+            http_append_hex32(out, &len, max, (u32)probe[i]);
+            http_append(out, &len, max, " par=");
+            http_append_hex32(out, &len, max, (u32)(par >> 32));
+            http_append(out, &len, max, ":");
+            http_append_hex32(out, &len, max, (u32)par);
+            http_append(out, &len, max, (par & 1U) ? " FAULT" : "");
+            http_append(out, &len, max, " attr=");
+            http_append_hex32(out, &len, max, (u32)((par >> 56) & 0xFFU));
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "cacheregs")) {
+        /* Architectural cache identification (all EL1-readable). CCSIDR per level
+         * via CSSELR. CPUECTLR/CPUACTLR are A76 IMP-DEF; EL1 access is enabled by
+         * Pi5 TF-A in practice. If a read faults the recoverable PiSOD will show
+         * it and this command can be trimmed. */
+        u64 ctr, clidr, midr, sctlr, l1d, l1i, l2;
+        __asm__ volatile("mrs %0, midr_el1"  : "=r"(midr));
+        __asm__ volatile("mrs %0, ctr_el0"   : "=r"(ctr));
+        __asm__ volatile("mrs %0, clidr_el1" : "=r"(clidr));
+        __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+        __asm__ volatile("msr csselr_el1, %1\n isb\n mrs %0, ccsidr_el1"
+                         : "=r"(l1d) : "r"(0UL) : "memory"); /* L1D: level0,data  */
+        __asm__ volatile("msr csselr_el1, %1\n isb\n mrs %0, ccsidr_el1"
+                         : "=r"(l1i) : "r"(1UL) : "memory"); /* L1I: level0,instr */
+        __asm__ volatile("msr csselr_el1, %1\n isb\n mrs %0, ccsidr_el1"
+                         : "=r"(l2)  : "r"(2UL) : "memory"); /* L2:  level1,data  */
+        u64 cpuectlr = 0, cpuactlr = 0;
+        __asm__ volatile("mrs %0, s3_0_c15_c1_4" : "=r"(cpuectlr)); /* CPUECTLR */
+        __asm__ volatile("mrs %0, s3_0_c15_c1_0" : "=r"(cpuactlr)); /* CPUACTLR */
+        http_append(out, &len, max, "cacheregs midr=");
+        http_append_hex32(out, &len, max, (u32)midr);
+        http_append(out, &len, max, " ctr=");
+        http_append_hex32(out, &len, max, (u32)ctr);
+        http_append(out, &len, max, " clidr=");
+        http_append_hex32(out, &len, max, (u32)clidr);
+        http_append(out, &len, max, " sctlr=");
+        http_append_hex32(out, &len, max, (u32)sctlr);
+        http_append(out, &len, max, "\n L1D_ccsidr=");
+        http_append_hex32(out, &len, max, (u32)l1d);
+        http_append(out, &len, max, " L1I_ccsidr=");
+        http_append_hex32(out, &len, max, (u32)l1i);
+        http_append(out, &len, max, " L2_ccsidr=");
+        http_append_hex32(out, &len, max, (u32)l2);
+        http_append(out, &len, max, "\n CPUECTLR=");
+        http_append_hex32(out, &len, max, (u32)(cpuectlr >> 32));
+        http_append(out, &len, max, ":");
+        http_append_hex32(out, &len, max, (u32)cpuectlr);
+        http_append(out, &len, max, " CPUACTLR=");
+        http_append_hex32(out, &len, max, (u32)(cpuactlr >> 32));
+        http_append(out, &len, max, ":");
+        http_append_hex32(out, &len, max, (u32)cpuactlr);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "lease")) {
+        /* P0: prove the lease fabric (lifecycle, poison, MMU grant/revoke,
+         * zero-copy handle, copy-once, TLS-direct-write) runs live. */
+        bool ok = lease_selftest();
+        http_append(out, &len, max, ok ? "lease selftest PASS\n" : "lease selftest FAIL\n");
+        struct lease_stats st;
+        lease_get_stats(&st);
+        http_append(out, &len, max, "lease pool slots=");
+        http_append_u64(out, &len, max, st.slots_total);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "macbdiag")) {
+        /* P1 live wedge diagnosis: poll this while ramping load. If rx_owned
+         * climbs to 32 the RX ring is full (overrun); if rx_recv/tx_send stop
+         * climbing the MAC engine has stalled; RSR/TSR carry overrun/HRESP. */
+        struct macb_diag md;
+        macb_diag(&md);
+        http_append(out, &len, max, "macbdiag rx_owned=");
+        http_append_u64(out, &len, max, md.rx_owned);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, md.ring_size);
+        http_append(out, &len, max, " rx_idx=");
+        http_append_u64(out, &len, max, md.rx_idx);
+        http_append(out, &len, max, " tx_idx=");
+        http_append_u64(out, &len, max, md.tx_idx);
+        http_append(out, &len, max, " rx_recv=");
+        http_append_u64(out, &len, max, md.rx_recv);
+        http_append(out, &len, max, " tx_send=");
+        http_append_u64(out, &len, max, md.tx_send);
+        http_append(out, &len, max, " NSR=");
+        http_append_hex32(out, &len, max, md.nsr);
+        http_append(out, &len, max, " RSR=");
+        http_append_hex32(out, &len, max, md.rsr);
+        http_append(out, &len, max, " TSR=");
+        http_append_hex32(out, &len, max, md.tsr);
+        http_append(out, &len, max, " RBQP=");
+        http_append_hex32(out, &len, max, md.rbqp);
+        http_append(out, &len, max, " TBQP=");
+        http_append_hex32(out, &len, max, md.tbqp);
+        http_append(out, &len, max, " ETH_CFG_STAT=");
+        http_append_hex32(out, &len, max, md.eth_cfg_stat);
+        http_append(out, &len, max, " rx_recover=");
+        http_append_u64(out, &len, max, md.rx_recover);
+        http_append(out, &len, max, " tx_drop=");
+        http_append_u64(out, &len, max, md.tx_drop);
+        http_append(out, &len, max, " tx_recover=");
+        http_append_u64(out, &len, max, md.tx_recover);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "stackdiag")) {
+        /* Data-plane health across every layer that carries constant traffic:
+         * IP stack, TCP, kernel TLS, the port FIFO forwarding bridges, and the
+         * inter-core FIFOs. If any of these "falls over" under load this is the
+         * single place to see it. Read-only; safe to poll while ramping load. */
+        const net_stats_t *ns = net_get_stats();
+        const tcp_diag_t *td = tcp_diag();
+        u32 tcap = 0, tinuse = 0, tlisten = 0;
+        tcp_table_stats(&tcap, &tinuse, &tlisten);
+        struct tls_diag_snapshot ts;
+        tls_diag_snapshot(&ts);
+
+        http_append(out, &len, max, "IP   rx=");
+        http_append_u64(out, &len, max, ns->rx_packets);
+        http_append(out, &len, max, " tx=");
+        http_append_u64(out, &len, max, ns->tx_packets);
+        http_append(out, &len, max, " icmp=");
+        http_append_u64(out, &len, max, ns->icmp_echo_replies);
+        http_append(out, &len, max, " udp_rx=");
+        http_append_u64(out, &len, max, ns->udp_recv);
+        http_append(out, &len, max, " udp_tx=");
+        http_append_u64(out, &len, max, ns->udp_sent);
+        http_append(out, &len, max, " | drop runt=");
+        http_append_u64(out, &len, max, ns->drop_runt);
+        http_append(out, &len, max, " cksum=");
+        http_append_u64(out, &len, max, ns->drop_bad_cksum);
+        http_append(out, &len, max, " frag=");
+        http_append_u64(out, &len, max, ns->drop_fragment);
+        http_append(out, &len, max, " ipopt=");
+        http_append_u64(out, &len, max, ns->drop_ip_options);
+        http_append(out, &len, max, " badsrc=");
+        http_append_u64(out, &len, max, ns->drop_bad_src);
+        http_append(out, &len, max, " notforus=");
+        http_append_u64(out, &len, max, ns->drop_not_for_us);
+        http_append(out, &len, max, " badproto=");
+        http_append_u64(out, &len, max, ns->drop_bad_proto);
+        http_append(out, &len, max, " noneigh=");
+        http_append_u64(out, &len, max, ns->drop_no_neighbor);
+        http_append(out, &len, max, " oversz=");
+        http_append_u64(out, &len, max, ns->drop_oversized);
+        http_append(out, &len, max, " udpcksum=");
+        http_append_u64(out, &len, max, ns->drop_udp_bad_cksum);
+        http_append(out, &len, max, "\n");
+
+        http_append(out, &len, max, "TCP  syn=");
+        http_append_u64(out, &len, max, td->syn_seen);
+        http_append(out, &len, max, " synack=");
+        http_append_u64(out, &len, max, td->synack_sent);
+        http_append(out, &len, max, " accept=");
+        http_append_u64(out, &len, max, td->accepted);
+        http_append(out, &len, max, " txseg=");
+        http_append_u64(out, &len, max, td->tx_segments);
+        http_append(out, &len, max, " txnomac=");
+        http_append_u64(out, &len, max, td->tx_no_mac);
+        http_append(out, &len, max, " txfail=");
+        http_append_u64(out, &len, max, td->tx_send_fail);
+        http_append(out, &len, max, " short=");
+        http_append_u64(out, &len, max, td->in_short);
+        http_append(out, &len, max, " badcsum=");
+        http_append_u64(out, &len, max, td->bad_checksum);
+        http_append(out, &len, max, " badhdr=");
+        http_append_u64(out, &len, max, td->bad_header);
+        http_append(out, &len, max, " nolisten=");
+        http_append_u64(out, &len, max, td->no_listener);
+        http_append(out, &len, max, " ackseen=");
+        http_append_u64(out, &len, max, td->ack_cookie_seen);
+        http_append(out, &len, max, " queued=");
+        http_append_u64(out, &len, max, td->pending_queued);
+        http_append(out, &len, max, " cookiebad=");
+        http_append_u64(out, &len, max, td->ack_cookie_bad);
+        http_append(out, &len, max, " pendfull=");
+        http_append_u64(out, &len, max, td->pending_full);
+        http_append(out, &len, max, " | table cap=");
+        http_append_u64(out, &len, max, tcap);
+        http_append(out, &len, max, " inuse=");
+        http_append_u64(out, &len, max, tinuse);
+        http_append(out, &len, max, " listen=");
+        http_append_u64(out, &len, max, tlisten);
+        http_append(out, &len, max, "\n");
+
+        http_append(out, &len, max, "TLS  active=");
+        http_append_u64(out, &len, max, ts.active);
+        http_append(out, &len, max, " est=");
+        http_append_u64(out, &len, max, ts.established);
+        http_append(out, &len, max, " hs_ok=");
+        http_append_u64(out, &len, max, ts.handshakes_ok);
+        http_append(out, &len, max, " hs_fail=");
+        http_append_u64(out, &len, max, ts.handshake_failures);
+        http_append(out, &len, max, " rec_rx=");
+        http_append_u64(out, &len, max, ts.records_rx);
+        http_append(out, &len, max, " rec_tx=");
+        http_append_u64(out, &len, max, ts.records_tx);
+        http_append(out, &len, max, " decfail=");
+        http_append_u64(out, &len, max, ts.decrypt_failures);
+        http_append(out, &len, max, " closes=");
+        http_append_u64(out, &len, max, ts.closes);
+        http_append(out, &len, max, " br_ok=");
+        http_append_u64(out, &len, max, ts.bridge_parse_ok);
+        http_append(out, &len, max, " br_err=");
+        http_append_u64(out, &len, max, ts.bridge_parse_error);
+        http_append(out, &len, max, " last_err=");
+        http_append_hex32(out, &len, max, ts.last_error);
+        http_append(out, &len, max, "\n");
+
+        for (u32 bi = 0; bi < UHTTP_BRIDGE_COUNT; bi++) {
+            i32 lc = -1; u32 st = 0, rq = 0, rs = 0, reqs = 0, mg = 0, pid = 0;
+            uhttp_bridge_state_idx(bi, &lc, &st, &rq, &rs, &reqs, &mg, &pid);
+            http_append(out, &len, max, "FWD  bridge");
+            http_append_u64(out, &len, max, bi);
+            http_append(out, &len, max, " port=");
+            http_append_u64(out, &len, max, bi == 0 ? UHTTP_PORT : UHTTP_NATIVE_PORT);
+            http_append(out, &len, max, " state=");
+            http_append_u64(out, &len, max, st);
+            http_append(out, &len, max, " req=");
+            http_append_u64(out, &len, max, rq);
+            http_append(out, &len, max, " resp=");
+            http_append_u64(out, &len, max, rs);
+            http_append(out, &len, max, " lag=");
+            http_append_u64(out, &len, max, (rq >= rs) ? (rq - rs) : 0);
+            http_append(out, &len, max, " reqs=");
+            http_append_u64(out, &len, max, reqs);
+            http_append(out, &len, max, " pid=");
+            http_append_u64(out, &len, max, pid);
+            http_append(out, &len, max, mg == UHTTP_BRIDGE_MAGIC ? " magic=ok\n" : " magic=BAD\n");
+        }
+
+        /* Inter-core FIFO occupancy: find the deepest active ring (constant
+         * cross-core traffic for disk/net/socket/IPC). A ring pinned near
+         * FIFO_CAPACITY means a consumer core stopped draining. */
+        u32 fmax = 0, fmd = 0, fms = 0;
+        for (u32 d = 0; d < 4U; d++) {
+            for (u32 s = 0; s < 4U; s++) {
+                if (d == s) continue;
+                u32 fc = fifo_count(d, s);
+                if (fc > fmax) { fmax = fc; fmd = d; fms = s; }
+            }
+        }
+        http_append(out, &len, max, "FIFO max_depth=");
+        http_append_u64(out, &len, max, fmax);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, FIFO_CAPACITY);
+        http_append(out, &len, max, " (dst");
+        http_append_u64(out, &len, max, fmd);
+        http_append(out, &len, max, "<-src");
+        http_append_u64(out, &len, max, fms);
+        http_append(out, &len, max, ")\n");
+    } else if (http_streq(cmd, "cachediag")) {
+        /* milli-cycles per op = cyc*1000/ops, so 1000 == 1.0 cyc/op. If nop and
+         * load are both ~hundreds-of-thousands (i.e. ~hundreds cyc/op) the caches
+         * are not allocating (every access is a DRAM round-trip). */
+        u64 r[5] = {0,0,0,0,0};
+        cpu_pmu_microbench(r);
+        http_append(out, &len, max, "cachediag spin/i=");
+        http_append_u64(out, &len, max, (r[0] * 1000ULL) / 2000000ULL);
+        http_append(out, &len, max, " nop/i=");
+        http_append_u64(out, &len, max, (r[1] * 1000ULL) / 6400000ULL);
+        http_append(out, &len, max, " | load_lo=");
+        http_append_u64(out, &len, max, r[2] / 1000ULL);
+        http_append(out, &len, max, " load_hi=");
+        http_append_u64(out, &len, max, r[3] / 1000ULL);
+        http_append(out, &len, max, " load_dram=");
+        http_append_u64(out, &len, max, r[4] / 1000ULL);
+        http_append(out, &len, max, " cyc/load (lo~=hi~=dram => caches dead; hi<<lo => remap bug)\n");
     } else if (http_streq(cmd, "proc sched")) {
         struct proc_sched_core_snapshot ps[3];
         u32 pn = proc_sched_snapshot(ps, 3);
@@ -3615,6 +4109,28 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " pmr=");
         http_append_u64(out, &len, max, hw.gicc_pmr);
         http_append(out, &len, max, "\n");
+        /* SW reactor (SEV/WFE) + ETH RX IRQ + hardware watchdog liveness. */
+        u64 wk = 0, wf = 0, it = 0, tt = 0; u32 bp = 0, lf = 0;
+        core0_sched_snapshot(&wk, &wf, &it, &tt, &bp, &lf);
+        struct watchdog_status wd;
+        watchdog_status(&wd);
+        http_append(out, &len, max, "sw wake=");
+        http_append_u64(out, &len, max, wk);
+        http_append(out, &len, max, " wfi=");
+        http_append_u64(out, &len, max, wf);
+        http_append(out, &len, max, " busy_permille=");
+        http_append_u64(out, &len, max, bp);
+        http_append(out, &len, max, " | eth_irq=");
+        http_append_u64(out, &len, max, core0_eth_irq_count);
+        http_append(out, &len, max, " eth_quench_passes=");
+        http_append_u64(out, &len, max, core0_eth_irq_quench_passes);
+        http_append(out, &len, max, "\nwdog armed=");
+        http_append(out, &len, max, wd.armed ? "yes" : "no");
+        http_append(out, &len, max, " reset_in_s=");
+        http_append_u64(out, &len, max, watchdog_hw_remaining_ticks() >> 16);
+        http_append(out, &len, max, " trips=");
+        http_append_u64(out, &len, max, wd.trip_count);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "coredump") || http_streq(cmd, "crash")) {
         struct exception_crash_record cr;
         if (!exception_crash_snapshot(&cr)) {
@@ -3664,6 +4180,41 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             http_append_u64(out, &len, max, cr.ticks);
             http_append(out, &len, max, "\n");
         }
+    } else if (http_streq(cmd, "crashlba")) {
+        /* Read the SD-persisted crash record (survives the watchdog reset that
+         * clears DRAM). After a wedge-crash+reboot, this reveals where core0
+         * faulted: elr=faulting PC, far=fault address, ec=exception class. */
+        struct exception_crash_record cr;
+        if (!exception_crash_sd_read(&cr)) {
+            http_append(out, &len, max, "crashlba none (no persisted crash on SD)\n");
+        } else {
+            http_append(out, &len, max, "crashlba kind=");
+            http_append_u64(out, &len, max, cr.kind);
+            http_append(out, &len, max, " core=");
+            http_append_u64(out, &len, max, cr.core);
+            http_append(out, &len, max, " el=");
+            http_append_u64(out, &len, max, cr.current_el);
+            http_append(out, &len, max, " ec=0x");
+            http_append_hex32(out, &len, max, cr.ec);
+            http_append(out, &len, max, "\nesr=0x");
+            http_append_hex64(out, &len, max, cr.esr);
+            http_append(out, &len, max, " elr=0x");
+            http_append_hex64(out, &len, max, cr.elr);
+            http_append(out, &len, max, " far=0x");
+            http_append_hex64(out, &len, max, cr.far);
+            http_append(out, &len, max, "\nsp=0x");
+            http_append_hex64(out, &len, max, cr.sp);
+            http_append(out, &len, max, " ttbr0=0x");
+            http_append_hex64(out, &len, max, cr.ttbr0);
+            http_append(out, &len, max, " pid=");
+            http_append_u64(out, &len, max, cr.pid);
+            http_append(out, &len, max, " ticks=");
+            http_append_u64(out, &len, max, cr.ticks);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "crashlba clear")) {
+        exception_crash_sd_clear();
+        http_append(out, &len, max, "crashlba cleared\n");
     } else if (http_streq(cmd, "irq selftest")) {
         http_append(out, &len, max, irq_diag_selftest() ? "IRQ selftest OK\n" : "IRQ selftest FAILED\n");
     } else if (http_starts_with(cmd, "irq cntpns step ")) {
@@ -4072,6 +4623,94 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "ps wb_hot=");
         http_append_u64(out, &len, max, r.wb_hot_ps);
         http_append(out, &len, max, "ps\n");
+    } else if (http_streq(cmd, "v3d reset soft") ||
+               http_streq(cmd, "qpu reset soft") ||
+               http_streq(cmd, "tensor reset soft")) {
+        watchdog_hw_arm_seconds(5);
+        v3d_status_t st = v3d_soft_reset();
+        watchdog_hw_disable();
+        struct v3d_reset_debug r;
+        v3d_reset_debug_last(&r);
+        http_append(out, &len, max, st == V3D_STATUS_OK ? "v3d reset soft OK" : "v3d reset soft FAILED");
+        http_append(out, &len, max, " status=");
+        http_append_u64(out, &len, max, (u32)st);
+        http_append(out, &len, max, " err=");
+        http_append_hex32(out, &len, max, r.err_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.err_after_clear);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.err_after_reset);
+        http_append(out, &len, max, " int=");
+        http_append_hex32(out, &len, max, r.core_int_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.hub_int_before);
+        http_append(out, &len, max, " -> ");
+        http_append_hex32(out, &len, max, r.core_int_after);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.hub_int_after);
+        http_append(out, &len, max, " sms=");
+        http_append_hex32(out, &len, max, r.sms_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.sms_after);
+        http_append(out, &len, max, " mmu=");
+        http_append_hex32(out, &len, max, r.mmu_ctl_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.mmuc_before);
+        http_append(out, &len, max, " -> ");
+        http_append_hex32(out, &len, max, r.mmu_ctl_after);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.mmuc_after);
+        http_append(out, &len, max, " pm=");
+        http_append_hex32(out, &len, max, r.pm_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.pm_asserted);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.pm_after);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "v3d reset pm confirm") ||
+               http_streq(cmd, "qpu reset pm confirm") ||
+               http_streq(cmd, "tensor reset pm confirm")) {
+        watchdog_hw_arm_seconds(5);
+        v3d_status_t st = v3d_pm_reset();
+        watchdog_hw_disable();
+        struct v3d_reset_debug r;
+        v3d_reset_debug_last(&r);
+        http_append(out, &len, max, st == V3D_STATUS_OK ? "v3d reset pm OK" : "v3d reset pm FAILED");
+        http_append(out, &len, max, " status=");
+        http_append_u64(out, &len, max, (u32)st);
+        http_append(out, &len, max, " err=");
+        http_append_hex32(out, &len, max, r.err_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.err_after_clear);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.err_after_reset);
+        http_append(out, &len, max, " int=");
+        http_append_hex32(out, &len, max, r.core_int_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.hub_int_before);
+        http_append(out, &len, max, " -> ");
+        http_append_hex32(out, &len, max, r.core_int_after);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.hub_int_after);
+        http_append(out, &len, max, " sms=");
+        http_append_hex32(out, &len, max, r.sms_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.sms_after);
+        http_append(out, &len, max, " mmu=");
+        http_append_hex32(out, &len, max, r.mmu_ctl_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.mmuc_before);
+        http_append(out, &len, max, " -> ");
+        http_append_hex32(out, &len, max, r.mmu_ctl_after);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.mmuc_after);
+        http_append(out, &len, max, " pm=");
+        http_append_hex32(out, &len, max, r.pm_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.pm_asserted);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, r.pm_after);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "qpu") || http_streq(cmd, "qpu status") ||
                http_streq(cmd, "tensor") || http_streq(cmd, "tensor status")) {
         struct tensor_status ts;
@@ -4124,6 +4763,482 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, ts.v3d_tiny_ready_mask);
         http_append(out, &len, max, " tiny_ver=");
         http_append_u64(out, &len, max, ts.v3d_tiny_verified_mask);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "vc display global reapply dryrun") ||
+               http_streq(cmd, "vc display global reapply dry-run") ||
+               http_streq(cmd, "vc display hvs reapply dryrun") ||
+               http_streq(cmd, "vc display hvs reapply dry-run") ||
+               http_streq(cmd, "videocore display global reapply dryrun") ||
+               http_streq(cmd, "videocore display global reapply dry-run") ||
+               http_streq(cmd, "vc display global reapply") ||
+               http_streq(cmd, "vc display hvs reapply") ||
+               http_streq(cmd, "videocore display global reapply")) {
+        bool dry = http_streq(cmd, "vc display global reapply dryrun") ||
+                   http_streq(cmd, "vc display global reapply dry-run") ||
+                   http_streq(cmd, "vc display hvs reapply dryrun") ||
+                   http_streq(cmd, "vc display hvs reapply dry-run") ||
+                   http_streq(cmd, "videocore display global reapply dryrun") ||
+                   http_streq(cmd, "videocore display global reapply dry-run");
+        bool ok = vc_display_global_reapply(dry);
+        const struct vc_display_status *d = vc_display_status_get();
+        http_append(out, &len, max, ok ? "vc_display global reapply OK " :
+                                         "vc_display global reapply FAILED ");
+        http_append(out, &len, max, "status=");
+        http_append(out, &len, max, d ? vc_display_global_status_name(d->global_reapply_status) : "none");
+        http_append(out, &len, max, " control=");
+        http_append_hex32(out, &len, max, d ? d->global_reapply_control : 0U);
+        http_append(out, &len, max, " rb=");
+        http_append_hex32(out, &len, max, d ? d->global_reapply_rb_control : 0U);
+        http_append(out, &len, max, " readback=");
+        http_append(out, &len, max, d && d->global_reapply_readback_ok ? "ok" : (dry ? "dryrun" : "bad"));
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "vc display channel reapply dryrun") ||
+               http_streq(cmd, "vc display channel reapply dry-run") ||
+               http_streq(cmd, "videocore display channel reapply dryrun") ||
+               http_streq(cmd, "videocore display channel reapply dry-run") ||
+               http_streq(cmd, "vc display channel reapply") ||
+               http_streq(cmd, "videocore display channel reapply")) {
+        bool dry = http_streq(cmd, "vc display channel reapply dryrun") ||
+                   http_streq(cmd, "vc display channel reapply dry-run") ||
+                   http_streq(cmd, "videocore display channel reapply dryrun") ||
+                   http_streq(cmd, "videocore display channel reapply dry-run");
+        bool ok = vc_display_channel_reapply(dry);
+        const struct vc_display_status *d = vc_display_status_get();
+        http_append(out, &len, max, ok ? "vc_display channel reapply OK " :
+                                         "vc_display channel reapply FAILED ");
+        http_append(out, &len, max, "status=");
+        http_append(out, &len, max, d ? vc_display_channel_status_name(d->channel_reapply_status) : "none");
+        http_append(out, &len, max, " ch=");
+        http_append_u64(out, &len, max, d ? d->channel_reapply_channel : 0U);
+        http_append(out, &len, max, " ctrl=");
+        http_append_hex32(out, &len, max, d ? d->channel_reapply_ctrl0 : 0U);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, d ? d->channel_reapply_ctrl1 : 0U);
+        http_append(out, &len, max, " cob=");
+        http_append_hex32(out, &len, max, d ? d->channel_reapply_cob : 0U);
+        http_append(out, &len, max, " rb=");
+        http_append_hex32(out, &len, max, d ? d->channel_reapply_rb_ctrl0 : 0U);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, d ? d->channel_reapply_rb_ctrl1 : 0U);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, d ? d->channel_reapply_rb_cob : 0U);
+        http_append(out, &len, max, " readback=");
+        http_append(out, &len, max, d && d->channel_reapply_readback_ok ? "ok" : (dry ? "dryrun" : "bad"));
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "vc display dlist stage") ||
+               http_streq(cmd, "videocore display dlist stage")) {
+        bool ok = vc_display_dlist_stage();
+        const struct vc_display_status *d = vc_display_status_get();
+        http_append(out, &len, max, ok ? "vc_display dlist stage OK " :
+                                         "vc_display dlist stage FAILED ");
+        http_append(out, &len, max, "status=");
+        http_append(out, &len, max, d ? vc_display_dlist_status_name(d->dlist_status) : "none");
+        http_append(out, &len, max, " index=");
+        http_append_u64(out, &len, max, d ? d->dlist_stage_index : 0U);
+        http_append(out, &len, max, " count=");
+        http_append_u64(out, &len, max, d ? d->dlist_stage_count : 0U);
+        http_append(out, &len, max, " readback=");
+        http_append(out, &len, max, d && d->dlist_stage_readback_ok ? "ok" : "bad");
+        http_append(out, &len, max, "\n  readback=");
+        if (d) {
+            for (u32 i = 0; i < d->dlist_stage_count && i < 16U; i++) {
+                if (i)
+                    http_append(out, &len, max, ",");
+                http_append_hex32(out, &len, max, d->dlist_readback[i]);
+            }
+        }
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "vc display dlist arm dryrun") ||
+               http_streq(cmd, "vc display dlist arm dry-run") ||
+               http_streq(cmd, "videocore display dlist arm dryrun") ||
+               http_streq(cmd, "videocore display dlist arm dry-run") ||
+               http_streq(cmd, "vc display dlist arm") ||
+               http_streq(cmd, "videocore display dlist arm")) {
+        bool dry = http_streq(cmd, "vc display dlist arm dryrun") ||
+                   http_streq(cmd, "vc display dlist arm dry-run") ||
+                   http_streq(cmd, "videocore display dlist arm dryrun") ||
+                   http_streq(cmd, "videocore display dlist arm dry-run");
+        bool ok = vc_display_dlist_arm(dry);
+        const struct vc_display_status *d = vc_display_status_get();
+        http_append(out, &len, max, ok ? "vc_display dlist arm OK " :
+                                         "vc_display dlist arm FAILED ");
+        http_append(out, &len, max, "status=");
+        http_append(out, &len, max, d ? vc_display_dlist_status_name(d->dlist_status) : "none");
+        http_append(out, &len, max, " ch=");
+        http_append_u64(out, &len, max, d ? d->dlist_arm_channel : 0U);
+        http_append(out, &len, max, " before=");
+        http_append_hex32(out, &len, max, d ? d->dlist_arm_lptrs_before : 0U);
+        http_append(out, &len, max, " after=");
+        http_append_hex32(out, &len, max, d ? d->dlist_arm_lptrs_after : 0U);
+        http_append(out, &len, max, " readback=");
+        http_append(out, &len, max, d && d->dlist_arm_readback_ok ? "ok" : (dry ? "dryrun" : "bad"));
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "vc display dlist dryrun") ||
+               http_streq(cmd, "vc display dlist dry-run") ||
+               http_streq(cmd, "videocore display dlist dryrun") ||
+               http_streq(cmd, "videocore display dlist dry-run")) {
+        bool ok = vc_display_dlist_dryrun();
+        const struct vc_display_status *d = vc_display_status_get();
+        http_append(out, &len, max, ok ? "vc_display dlist dryrun OK " :
+                                         "vc_display dlist dryrun FAILED ");
+        http_append(out, &len, max, "status=");
+        http_append(out, &len, max, d ? vc_display_dlist_status_name(d->dlist_status) : "none");
+        http_append(out, &len, max, " count=");
+        http_append_u64(out, &len, max, d ? d->dlist_count : 0U);
+        http_append(out, &len, max, " format=");
+        http_append_u64(out, &len, max, d ? d->dlist_format : 0U);
+        http_append(out, &len, max, " order=");
+        http_append_u64(out, &len, max, d ? d->dlist_order : 0U);
+        http_append(out, &len, max, " scanout=");
+        http_append_u64(out, &len, max, d ? d->scanout_base : 0U);
+        http_append(out, &len, max, "\n  words=");
+        if (d) {
+            for (u32 i = 0; i < d->dlist_count && i < 16U; i++) {
+                if (i)
+                    http_append(out, &len, max, ",");
+                http_append_hex32(out, &len, max, d->dlist_words[i]);
+            }
+        }
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "vc display snapshot") ||
+               http_streq(cmd, "videocore display snapshot")) {
+        bool ok = vc_display_snapshot();
+        const struct vc_display_status *d = vc_display_status_get();
+        http_append(out, &len, max, ok ? "vc_display snapshot OK " :
+                                         "vc_display snapshot FAILED ");
+        http_append(out, &len, max, "count=");
+        http_append_u64(out, &len, max, d ? d->snapshot_count : 0U);
+        http_append(out, &len, max, " hvs_ver=");
+        http_append_hex32(out, &len, max, d ? d->snapshot_hvs_version : 0U);
+        http_append(out, &len, max, " hvs_id=");
+        http_append_hex32(out, &len, max, d ? d->snapshot_hvs_id : 0U);
+        http_append(out, &len, max, " control=");
+        http_append_hex32(out, &len, max, d ? d->hvs_control : 0U);
+        http_append(out, &len, max, " fetcher=");
+        http_append_hex32(out, &len, max, d ? d->hvs_fetcher_status : 0U);
+        http_append(out, &len, max, " fetch=");
+        http_append_hex32(out, &len, max, d ? d->hvs_fetch_status : 0U);
+        http_append(out, &len, max, " err=");
+        http_append_hex32(out, &len, max, d ? d->hvs_handle_error : 0U);
+        http_append(out, &len, max, " dlstat=");
+        http_append_hex32(out, &len, max, d ? d->hvs_dl_status : 0U);
+        http_append(out, &len, max, "\n");
+        for (u32 ch = 0; ch < 3U; ch++) {
+            http_append(out, &len, max, "  ch");
+            http_append_u64(out, &len, max, ch);
+            http_append(out, &len, max, " ctrl=");
+            http_append_hex32(out, &len, max, d ? d->hvs_disp_ctrl0[ch] : 0U);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, d ? d->hvs_disp_ctrl1[ch] : 0U);
+            http_append(out, &len, max, " status=");
+            http_append_hex32(out, &len, max, d ? d->hvs_disp_status[ch] : 0U);
+            http_append(out, &len, max, " dl=");
+            http_append_hex32(out, &len, max, d ? d->hvs_disp_dl[ch] : 0U);
+            http_append(out, &len, max, " lptrs=");
+            http_append_hex32(out, &len, max, d ? d->hvs_disp_lptrs[ch] : 0U);
+            http_append(out, &len, max, " cob=");
+            http_append_hex32(out, &len, max, d ? d->hvs_disp_cob[ch] : 0U);
+            http_append(out, &len, max, " run=");
+            http_append_hex32(out, &len, max, d ? d->hvs_disp_run[ch] : 0U);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "vc display takeover dryrun") ||
+               http_streq(cmd, "vc display takeover dry-run") ||
+               http_streq(cmd, "videocore display takeover dryrun") ||
+               http_streq(cmd, "videocore display takeover dry-run")) {
+        bool ok = vc_display_takeover_current(true);
+        const struct vc_display_status *d = vc_display_status_get();
+        http_append(out, &len, max, ok ? "vc_display takeover dryrun OK " :
+                                         "vc_display takeover dryrun FAILED ");
+        http_append(out, &len, max, "status=");
+        http_append(out, &len, max, d ? vc_display_takeover_status_name(d->last_takeover_status) : "none");
+        http_append(out, &len, max, " backend=");
+        http_append(out, &len, max, d ? vc_display_backend_name(d->backend) : "none");
+        http_append(out, &len, max, " native_owner=");
+        http_append(out, &len, max, d && d->native_owner ? "yes" : "no");
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "vc display takeover") ||
+               http_streq(cmd, "videocore display takeover")) {
+        bool ok = vc_display_takeover_current(false);
+        const struct vc_display_status *d = vc_display_status_get();
+        http_append(out, &len, max, ok ? "vc_display takeover OK " :
+                                         "vc_display takeover FAILED ");
+        http_append(out, &len, max, "status=");
+        http_append(out, &len, max, d ? vc_display_takeover_status_name(d->last_takeover_status) : "none");
+        http_append(out, &len, max, " backend=");
+        http_append(out, &len, max, d ? vc_display_backend_name(d->backend) : "none");
+        http_append(out, &len, max, " native_owner=");
+        http_append(out, &len, max, d && d->native_owner ? "yes" : "no");
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "vc display fallback") ||
+               http_streq(cmd, "videocore display fallback")) {
+        bool ok = vc_display_fallback();
+        const struct vc_display_status *d = vc_display_status_get();
+        http_append(out, &len, max, ok ? "vc_display fallback OK " :
+                                         "vc_display fallback FAILED ");
+        http_append(out, &len, max, "backend=");
+        http_append(out, &len, max, d ? vc_display_backend_name(d->backend) : "none");
+        http_append(out, &len, max, " native_owner=");
+        http_append(out, &len, max, d && d->native_owner ? "yes" : "no");
+        http_append(out, &len, max, " restore=");
+        http_append_hex32(out, &len, max, d ? d->dlist_restore_lptrs : 0U);
+        http_append(out, &len, max, "/");
+        http_append(out, &len, max, d && d->dlist_restore_readback_ok ? "ok" : "none");
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "vc display") || http_streq(cmd, "videocore display") ||
+               http_streq(cmd, "display status")) {
+        const struct vc_display_status *d = vc_display_status_get();
+        http_append(out, &len, max, "vc_display ready=");
+        http_append(out, &len, max, d && d->ready ? "yes" : "no");
+        http_append(out, &len, max, " backend=");
+        http_append(out, &len, max, d ? vc_display_backend_name(d->backend) : "none");
+        http_append(out, &len, max, " native_probe=");
+        http_append(out, &len, max, d && d->native_probe_ready ? "yes" : "no");
+        http_append(out, &len, max, " native_owner=");
+        http_append(out, &len, max, d && d->native_owner ? "yes" : "no");
+        http_append(out, &len, max, " hvs=");
+        http_append(out, &len, max, d && d->hvs_seen ? "yes" : "no");
+        http_append(out, &len, max, " v3d=");
+        http_append(out, &len, max, d && d->v3d_seen ? "yes" : "no");
+        http_append(out, &len, max, " mode=");
+        http_append_u64(out, &len, max, d ? d->width : 0U);
+        http_append(out, &len, max, "x");
+        http_append_u64(out, &len, max, d ? d->height : 0U);
+        http_append(out, &len, max, " pitch=");
+        http_append_u64(out, &len, max, d ? d->pitch : 0U);
+        http_append(out, &len, max, " scanout=");
+        http_append_u64(out, &len, max, d ? d->scanout_base : 0U);
+        http_append(out, &len, max, " presents=");
+        http_append_u64(out, &len, max, d ? d->present_count : 0U);
+        http_append(out, &len, max, " takeover=");
+        http_append(out, &len, max, d ? vc_display_takeover_status_name(d->last_takeover_status) : "none");
+        http_append(out, &len, max, " attempts=");
+        http_append_u64(out, &len, max, d ? d->takeover_attempts : 0U);
+        http_append(out, &len, max, " fallbacks=");
+        http_append_u64(out, &len, max, d ? d->fallback_count : 0U);
+        http_append(out, &len, max, " snapshots=");
+        http_append_u64(out, &len, max, d ? d->snapshot_count : 0U);
+        http_append(out, &len, max, " dlist=");
+        http_append(out, &len, max, d ? vc_display_dlist_status_name(d->dlist_status) : "none");
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, d ? d->dlist_count : 0U);
+        http_append(out, &len, max, " staged=");
+        http_append_u64(out, &len, max, d ? d->dlist_stage_index : 0U);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, d ? d->dlist_stage_count : 0U);
+        http_append(out, &len, max, " arm=");
+        http_append_hex32(out, &len, max, d ? d->dlist_arm_lptrs_after : 0U);
+        http_append(out, &len, max, " restore=");
+        http_append_hex32(out, &len, max, d ? d->dlist_restore_lptrs : 0U);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, d ? d->dlist_restore_count : 0U);
+        http_append(out, &len, max, " chan=");
+        http_append(out, &len, max, d ? vc_display_channel_status_name(d->channel_reapply_status) : "none");
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, d ? d->channel_reapply_count : 0U);
+        http_append(out, &len, max, " global=");
+        http_append(out, &len, max, d ? vc_display_global_status_name(d->global_reapply_status) : "none");
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, d ? d->global_reapply_count : 0U);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tensor tiny noop") || http_streq(cmd, "qpu tiny noop")) {
+        bool ok = tensor_tiny_noop_proof();
+        http_append(out, &len, max, ok ? "Tensor tiny noop proof OK" : "Tensor tiny noop proof FAILED");
+        http_append(out, &len, max, " stage=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
+        http_append(out, &len, max, " status=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_status());
+        struct v3d_csd_debug dbg;
+        v3d_csd_debug_last(&dbg);
+        http_append(out, &len, max, " csd_st=");
+        http_append_hex32(out, &len, max, dbg.status_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.status_after_kick);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.status_after_wait);
+        http_append(out, &len, max, " int=");
+        http_append_hex32(out, &len, max, dbg.core_int_sts);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.hub_int_sts);
+        http_append(out, &len, max, " err=");
+        http_append_hex32(out, &len, max, dbg.err_stat);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tensor tiny store") || http_streq(cmd, "qpu tiny store") ||
+               http_streq(cmd, "tensor tiny store-only") || http_streq(cmd, "qpu tiny store-only")) {
+        bool ok = tensor_tiny_store_proof();
+        http_append(out, &len, max, ok ? "Tensor tiny store proof OK" : "Tensor tiny store proof FAILED");
+        http_append(out, &len, max, " stage=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
+        http_append(out, &len, max, " status=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_status());
+        http_append(out, &len, max, " out=");
+        http_append_u64(out, &len, max, tensor_tiny_last_output_bits());
+        http_append(out, &len, max, " expect=");
+        http_append_u64(out, &len, max, tensor_tiny_last_expected_bits());
+        struct v3d_csd_debug dbg;
+        v3d_csd_debug_last(&dbg);
+        http_append(out, &len, max, " csd_st=");
+        http_append_hex32(out, &len, max, dbg.status_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.status_after_kick);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.status_after_wait);
+        http_append(out, &len, max, " int=");
+        http_append_hex32(out, &len, max, dbg.core_int_sts);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.hub_int_sts);
+        http_append(out, &len, max, " err=");
+        http_append_hex32(out, &len, max, dbg.err_stat);
+        http_append(out, &len, max, " gmp=");
+        http_append_hex32(out, &len, max, dbg.gmp_status);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.gmp_cfg);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.gmp_vio_addr);
+        http_append(out, &len, max, " cur=");
+        http_append_hex32(out, &len, max, dbg.current_cfg0);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.current_cfg5);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.current_cfg6);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tensor tiny loadstore") || http_streq(cmd, "qpu tiny loadstore") ||
+               http_streq(cmd, "tensor tiny load-store") || http_streq(cmd, "qpu tiny load-store")) {
+        bool ok = tensor_tiny_load_store_proof();
+        http_append(out, &len, max, ok ? "Tensor tiny load-store proof OK" : "Tensor tiny load-store proof FAILED");
+        http_append(out, &len, max, " stage=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
+        http_append(out, &len, max, " status=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_status());
+        http_append(out, &len, max, " out=");
+        http_append_u64(out, &len, max, tensor_tiny_last_output_bits());
+        http_append(out, &len, max, " expect=");
+        http_append_u64(out, &len, max, tensor_tiny_last_expected_bits());
+        struct v3d_csd_debug dbg;
+        v3d_csd_debug_last(&dbg);
+        http_append(out, &len, max, " csd_st=");
+        http_append_hex32(out, &len, max, dbg.status_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.status_after_kick);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.status_after_wait);
+        http_append(out, &len, max, " int=");
+        http_append_hex32(out, &len, max, dbg.core_int_sts);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.hub_int_sts);
+        http_append(out, &len, max, " err=");
+        http_append_hex32(out, &len, max, dbg.err_stat);
+        http_append(out, &len, max, " gmp=");
+        http_append_hex32(out, &len, max, dbg.gmp_status);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.gmp_cfg);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.gmp_vio_addr);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tensor tiny memory") || http_streq(cmd, "qpu tiny memory") ||
+               http_streq(cmd, "tensor tiny memory proof") || http_streq(cmd, "qpu tiny memory proof")) {
+        bool ok = tensor_tiny_memory_proof();
+        http_append(out, &len, max, ok ? "Tensor tiny memory proof OK" : "Tensor tiny memory proof FAILED");
+        http_append(out, &len, max, " stage=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
+        http_append(out, &len, max, " status=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_status());
+        http_append(out, &len, max, " out=");
+        http_append_u64(out, &len, max, tensor_tiny_last_output_bits());
+        http_append(out, &len, max, " expect=");
+        http_append_u64(out, &len, max, tensor_tiny_last_expected_bits());
+        struct v3d_csd_debug dbg;
+        v3d_csd_debug_last(&dbg);
+        http_append(out, &len, max, " csd_st=");
+        http_append_hex32(out, &len, max, dbg.status_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.status_after_kick);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.status_after_wait);
+        http_append(out, &len, max, " int=");
+        http_append_hex32(out, &len, max, dbg.core_int_sts);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.hub_int_sts);
+        http_append(out, &len, max, " err=");
+        http_append_hex32(out, &len, max, dbg.err_stat);
+        http_append(out, &len, max, " gmp=");
+        http_append_hex32(out, &len, max, dbg.gmp_status);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.gmp_cfg);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.gmp_vio_addr);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tensor vector16") || http_streq(cmd, "qpu vector16") ||
+               http_streq(cmd, "tensor vector16 selftest") || http_streq(cmd, "qpu vector16 selftest")) {
+        bool ok = tensor_vector16_selftest();
+        http_append(out, &len, max, ok ? "Tensor vector16 selftest OK" : "Tensor vector16 selftest FAILED");
+        http_append_tensor_tail(out, &len, max);
+    } else if (http_streq(cmd, "tensor vector128") || http_streq(cmd, "qpu vector128") ||
+               http_streq(cmd, "tensor vectorN") || http_streq(cmd, "qpu vectorN")) {
+        bool ok = tensor_vectorn_selftest(128U);
+        http_append(out, &len, max, ok ? "Tensor vector128 selftest OK" : "Tensor vector128 selftest FAILED");
+        http_append_tensor_tail(out, &len, max);
+    } else if (http_streq(cmd, "tensor matvec128") || http_streq(cmd, "qpu matvec128")) {
+        bool ok = tensor_matvec128_selftest();
+        http_append(out, &len, max, ok ? "Tensor matvec128 selftest OK" : "Tensor matvec128 selftest FAILED");
+        http_append_tensor_tail(out, &len, max);
+    } else if (http_streq(cmd, "tensor bench") || http_streq(cmd, "qpu bench") ||
+               http_streq(cmd, "tensor bench v3d") || http_streq(cmd, "qpu bench v3d")) {
+        bool with_v3d = http_streq(cmd, "tensor bench v3d") ||
+                        http_streq(cmd, "qpu bench v3d");
+        http_append(out, &len, max,
+                    with_v3d ? "tensor bench (scalar/neon/v3d, per-iter ns; gflops are wall-clock)\n"
+                             : "tensor bench (scalar/neon, per-iter ns; add 'v3d' for GPU)\n");
+        http_append(out, &len, max, "clk_mhz=");
+        http_append_u64(out, &len, max, g_cpu_clock_mhz);
+        http_append(out, &len, max, "\n");
+        http_bench_row(out, &len, max, "add  n=1024", TENSOR_BENCH_ADD, 1U, 1024U, 1U, 1024ULL, 1000U, 32U, with_v3d);
+        http_bench_row(out, &len, max, "mul  n=1024", TENSOR_BENCH_MUL, 1U, 1024U, 1U, 1024ULL, 1000U, 32U, with_v3d);
+        http_bench_row(out, &len, max, "relu n=1024", TENSOR_BENCH_RELU, 1U, 1024U, 1U, 1024ULL, 1000U, 32U, with_v3d);
+    } else if (http_streq(cmd, "tensor matmul64") || http_streq(cmd, "qpu matmul64")) {
+        bool ok = tensor_matmul64_selftest();
+        http_append(out, &len, max, ok ? "Tensor matmul64 selftest OK" : "Tensor matmul64 selftest FAILED");
+        http_append_tensor_tail(out, &len, max);
+    } else if (http_streq(cmd, "tensor tiny") || http_streq(cmd, "qpu tiny") ||
+               http_streq(cmd, "tensor tiny selftest") || http_streq(cmd, "qpu tiny selftest")) {
+        bool ok = tensor_tiny_selftest();
+        http_append(out, &len, max, ok ? "Tensor tiny selftest OK" : "Tensor tiny selftest FAILED");
+        http_append(out, &len, max, " stage=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
+        http_append(out, &len, max, " status=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_status());
+        http_append(out, &len, max, " out=");
+        http_append_u64(out, &len, max, tensor_tiny_last_output_bits());
+        http_append(out, &len, max, " expect=");
+        http_append_u64(out, &len, max, tensor_tiny_last_expected_bits());
+        struct v3d_csd_debug dbg;
+        v3d_csd_debug_last(&dbg);
+        http_append(out, &len, max, " csd_st=");
+        http_append_hex32(out, &len, max, dbg.status_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.status_after_kick);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.status_after_wait);
+        http_append(out, &len, max, " int=");
+        http_append_hex32(out, &len, max, dbg.core_int_sts);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.hub_int_sts);
+        http_append(out, &len, max, " err=");
+        http_append_hex32(out, &len, max, dbg.err_stat);
+        http_append(out, &len, max, " mmu=");
+        http_append_hex32(out, &len, max, dbg.mmu_ctl);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.mmu_illegal_addr);
+        http_append(out, &len, max, " vio=");
+        http_append_hex32(out, &len, max, dbg.mmu_vio_addr);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.mmu_vio_id);
+        http_append(out, &len, max, " cur=");
+        http_append_hex32(out, &len, max, dbg.current_cfg0);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.current_cfg5);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.current_cfg6);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "tensor selftest") || http_streq(cmd, "qpu selftest")) {
         http_append(out, &len, max, tensor_selftest() ? "Tensor selftest OK\n" : "Tensor selftest FAILED\n");
@@ -4740,6 +5855,42 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, c.firewalled);
         http_append(out, &len, max, " rate_limited=");
         http_append_u64(out, &len, max, c.rate_limited);
+        http_append(out, &len, max, " tx_csum_hw=");
+        http_append_u64(out, &len, max, c.tx_csum_offloaded);
+        http_append(out, &len, max, " tx_csum_sw=");
+        http_append_u64(out, &len, max, c.tx_csum_software);
+        http_append(out, &len, max, " rx_csum_trusted=");
+        http_append_u64(out, &len, max, c.rx_csum_trusted);
+        http_append(out, &len, max, " rx_csum_untrusted=");
+        http_append_u64(out, &len, max, c.rx_csum_untrusted);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "nic offload")) {
+        nic_offload_status_t s;
+        nic_offload_status(&s);
+        http_append(out, &len, max, "nic offload tx_csum_cap=");
+        http_append(out, &len, max, s.tx_checksum_capable ? "yes" : "no");
+        http_append(out, &len, max, " tx_csum=");
+        http_append(out, &len, max, s.tx_checksum_enabled ? "on" : "off");
+        http_append(out, &len, max, " rx_csum_cap=");
+        http_append(out, &len, max, s.rx_checksum_capable ? "yes" : "no");
+        http_append(out, &len, max, " rx_csum=");
+        http_append(out, &len, max, s.rx_checksum_enabled ? "on" : "off");
+        http_append(out, &len, max, " tso_cap=");
+        http_append(out, &len, max, s.tso_capable ? "yes" : "no");
+        http_append(out, &len, max, " tso=");
+        http_append(out, &len, max, s.tso_enabled ? "on" : "off");
+        http_append(out, &len, max, " tx_hw=");
+        http_append_u64(out, &len, max, s.tx_csum_offloaded);
+        http_append(out, &len, max, " tx_sw=");
+        http_append_u64(out, &len, max, s.tx_csum_software);
+        http_append(out, &len, max, " rx_trusted=");
+        http_append_u64(out, &len, max, s.rx_csum_trusted);
+        http_append(out, &len, max, " rx_untrusted=");
+        http_append_u64(out, &len, max, s.rx_csum_untrusted);
+        http_append(out, &len, max, " ncfgr=");
+        http_append_hex32(out, &len, max, s.mac_ncfgr);
+        http_append(out, &len, max, " dmacfg=");
+        http_append_hex32(out, &len, max, s.mac_dmacfg);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "cachestats")) {
         u64 ih = 0, im = 0, ph = 0, pm = 0, dh = 0, dm = 0, dev = 0, ah = 0, am = 0, aev = 0;
@@ -5449,6 +6600,7 @@ static bool http_update_query_value(const u8 *req, u32 req_len, const char *key,
                                     char *out, u32 out_max)
 {
     return http_query_value(req, req_len, "/api/admin/kernel-update", key, out, out_max) ||
+           http_query_value(req, req_len, "/api/admin/kernel-stream", key, out, out_max) ||
            http_query_value(req, req_len, "/", key, out, out_max);
 }
 
@@ -5913,6 +7065,7 @@ static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *
     u32 base_lba = walfs_partition_lba() + (slot_offset / SD_BLOCK_SIZE);
     u32 pos = offset;
     u32 written = 0;
+    u32 since_pet = 0;
     while (written < len) {
         u32 sector_off = pos % SD_BLOCK_SIZE;
         u32 n = SD_BLOCK_SIZE - sector_off;
@@ -5931,6 +7084,13 @@ static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *
         }
         pos += n;
         written += n;
+        /* Pet the 5s hardware watchdog during a large flush (e.g. the OTA commit
+         * writes ~1.2MB = thousands of blocks); without this the bulk write
+         * would trip the watchdog and reboot mid-write, corrupting the slot. */
+        if (++since_pet >= 64U) {
+            since_pet = 0;
+            watchdog_hw_pet();
+        }
     }
     if (out_written) *out_written = written;
     return true;
@@ -6126,6 +7286,46 @@ static u32 http_build_hotpatch_kernel_response(char *out, u32 max, const u8 *req
     return len;
 }
 
+/* Pre-allocate the OTA RAM staging buffer at boot so chunk uploads are pure
+ * memcpy (no per-chunk SD writes that stall the core0 NIC poll). One-time
+ * highmem allocation; if highmem is unavailable, OTA falls back to direct SD
+ * writes (slower, may stall). Call once after highmem_init. */
+static void ota_staging_init(void)
+{
+    if (ota_stage_buf)
+        return;
+    struct highmem_status hm;
+    highmem_status(&hm);
+    if (!hm.ready)
+        return;
+    ota_stage_buf = (u8 *)highmem_alloc(PIOS_STAGE2_ZONE_BYTES, 64);
+    if (ota_stage_buf)
+        ota_stage_cap = PIOS_STAGE2_ZONE_BYTES;
+}
+
+/* Allocate the multi-connection HTTP :80 pool from highmem at boot (each slot
+ * is ~17KB; HTTP_MAX_CONCURRENT of them). Falls back to a tiny static pool if
+ * highmem is unavailable. Call once after highmem_init. */
+static void http_conns_init(void)
+{
+    if (http_conns)
+        return;
+    struct highmem_status hm;
+    highmem_status(&hm);
+    if (hm.ready) {
+        http_conns = (struct http_conn *)highmem_alloc(
+            (u64)HTTP_MAX_CONCURRENT * sizeof(struct http_conn), 64);
+        if (http_conns)
+            http_conn_count = HTTP_MAX_CONCURRENT;
+    }
+    if (!http_conns) {
+        http_conns = http_conns_fallback;
+        http_conn_count = (u32)(sizeof(http_conns_fallback) / sizeof(http_conns_fallback[0]));
+    }
+    for (u32 i = 0; i < http_conn_count; i++)
+        http_conns[i].client_conn = -1;
+}
+
 static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     u32 len = 0;
@@ -6190,6 +7390,18 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
             ota_update.target_slot = pios_bootctrl_target_slot();
             ota_update.target_slot_offset = pios_boot_slot_offset(ota_update.target_slot);
         }
+        /* Acquire (once) a highmem staging buffer so chunk uploads avoid
+         * per-chunk SD writes that stall the NIC. */
+        if (!error && !ota_stage_buf) {
+            struct highmem_status hm;
+            highmem_status(&hm);
+            if (hm.ready) {
+                ota_stage_buf = (u8 *)highmem_alloc(capacity, 64);
+                if (ota_stage_buf)
+                    ota_stage_cap = capacity;
+            }
+        }
+        ota_stage_ready = (ota_stage_buf != NULL && total <= ota_stage_cap);
         if (!error && !http_write_kernel_slot_header(ota_update.target_slot_offset, total, false)) {
             error = "failed to invalidate slot header";
         } else if (!error) {
@@ -6199,7 +7411,7 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
             ota_update.chunks = 0;
             ota_update.last_error = NULL;
             ok = true;
-            http_log_event("ota-begin", total, walfs_partition_lba());
+            http_log_event("ota-begin", total, ota_stage_ready ? 1U : 0U);
         }
     } else if (http_streq(action, "chunk") || http_streq(action, "data")) {
         if (!ota_update.active) {
@@ -6225,14 +7437,27 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
                 ok = true;
             } else {
                 u32 new_len = body_len - skip;
-                ok = http_write_kernel_payload_range(ota_update.target_slot_offset,
-                                                    ota_update.received,
-                                                    req + body_off + skip,
-                                                    new_len, &written);
+                if (ota_stage_ready) {
+                    /* Fast path: stage in RAM, no SD write -> NIC keeps polling. */
+                    if (ota_update.received + new_len <= ota_stage_cap) {
+                        simd_memcpy(ota_stage_buf + ota_update.received,
+                                    req + body_off + skip, new_len);
+                        written = new_len;
+                        ok = true;
+                    } else {
+                        error = "staged chunk exceeds buffer";
+                        ok = false;
+                    }
+                } else {
+                    ok = http_write_kernel_payload_range(ota_update.target_slot_offset,
+                                                        ota_update.received,
+                                                        req + body_off + skip,
+                                                        new_len, &written);
+                }
                 if (ok && written == new_len) {
                     ota_update.received += written;
                     written = body_len;
-                } else {
+                } else if (!error) {
                     error = "raw slot payload write failed";
                     ok = false;
                 }
@@ -6243,13 +7468,24 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
                     http_log_event("ota-chunk", ota_update.received, ota_update.total);
             }
         }
-    } else if (http_streq(action, "commit")) {
+    } else if (http_streq(action, "commit") || http_streq(action, "writeandreboot")) {
+        /* writeandreboot = the user's flow: after blocks are uploaded (RAM-staged)
+         * and verified (received==total), flush the staged image to the SD slot in
+         * ONE pass and reboot into it. core0 is unresponsive only during this final
+         * flush, which is fine because the board is about to reboot anyway (and the
+         * SD-write loop pets the watchdog). The A/B header is written valid LAST and
+         * the slot is marked pending (health-gated), so a failed flush is safe. */
+        bool force_reboot = http_streq(action, "writeandreboot");
         if (!ota_update.active) {
             error = "no OTA update active";
         } else if (total != 0 && total != ota_update.total) {
             error = "total does not match active OTA update";
         } else if (ota_update.received != ota_update.total) {
             error = "OTA image incomplete";
+        } else if (ota_stage_ready &&
+                   !http_write_kernel_payload_range(ota_update.target_slot_offset, 0,
+                                                    ota_stage_buf, ota_update.total, &written)) {
+            error = "failed to flush staged image to slot";
         } else if (!http_write_kernel_slot_header(ota_update.target_slot_offset,
                                                   ota_update.received, true)) {
             error = "failed to commit slot header";
@@ -6260,8 +7496,9 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
             pios_bootctrl_mark_pending(ota_update.target_slot);
             http_log_event("ota-commit", ota_update.received, ota_update.commits);
             char reboot[8];
-            if (http_update_query_value(req, req_len, "reboot", reboot, sizeof(reboot)) &&
-                http_streq(reboot, "1"))
+            if (force_reboot ||
+                (http_update_query_value(req, req_len, "reboot", reboot, sizeof(reboot)) &&
+                 http_streq(reboot, "1")))
                 http_reboot_pending = true;
         }
     } else if (http_streq(action, "cancel")) {
@@ -6270,7 +7507,7 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
         ok = true;
         http_log_event("ota-cancel", ota_update.received, ota_update.total);
     } else {
-        error = "unknown action; use status, begin, chunk, commit, cancel, or self";
+        error = "unknown action; use status, begin, chunk, commit, writeandreboot, cancel, or self";
     }
 
     if (!ok && error) {
@@ -6307,6 +7544,12 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
     http_append_u64(out, &len, max, ota_update.errors);
     http_append(out, &len, max, ",\"slotLba\":");
     http_append_u64(out, &len, max, walfs_partition_lba());
+    http_append(out, &len, max, ",\"staged\":");
+    http_append(out, &len, max, (ota_stage_buf != NULL) ? "true" : "false");
+    http_append(out, &len, max, ",\"stageReady\":");
+    http_append(out, &len, max, ota_stage_ready ? "true" : "false");
+    http_append(out, &len, max, ",\"stageCap\":");
+    http_append_u64(out, &len, max, ota_stage_cap);
     if (error) {
         http_append(out, &len, max, ",\"error\":");
         http_append_json_string(out, &len, max, error);
@@ -7033,7 +8276,8 @@ static void http_abort_client(void)
                http_client_conn >= 0 ? (u32)http_client_conn : 0xFFFFFFFFU);
     if (http_client_conn >= 0)
         tcp_abort(http_client_conn);
-    tcp_purge_port(HTTP_TCP_PORT);
+    /* Multi-connection: abort only THIS slot's connection, never tcp_purge_port
+     * (which would nuke every other in-flight :80 connection). */
     http_reset_client(false);
 }
 
@@ -7171,6 +8415,10 @@ static void admin_service_poll(struct admin_http_service *svc)
             svc->req_len = 0;
             svc->resp_len = 0;
             svc->resp_off = 0;
+            svc->stream_mode = false;
+            svc->stream_received = 0;
+            svc->stream_total = 0;
+            svc->stream_reboot = false;
             svc->last_activity_ms = now;
             http_log_event("admin-accept", svc->port, 0);
             http_trace(HTTP_EVT_ACCEPT, HTTP_ROUTE_UNKNOWN, svc->port, (u32)svc->client_conn);
@@ -7186,6 +8434,61 @@ static void admin_service_poll(struct admin_http_service *svc)
         return;
     }
 
+    /* ── Streaming OTA upload ── pump the single large POST body straight into
+     * the RAM staging buffer. One connection => no per-chunk churn that overruns
+     * the polling NIC. When the whole image is staged, flush it to the SD slot
+     * and (optionally) reboot into it. */
+    if (svc->stream_mode) {
+        u32 readable = tcp_readable(svc->client_conn);
+        if (readable > 0 && ota_stage_buf && svc->stream_received < svc->stream_total) {
+            u32 want = svc->stream_total - svc->stream_received;
+            if (want > readable) want = readable;
+            if (svc->stream_received + want > ota_stage_cap)
+                want = ota_stage_cap - svc->stream_received;
+            u32 n = tcp_read(svc->client_conn, ota_stage_buf + svc->stream_received, want);
+            svc->stream_received += n;
+            ota_update.received = svc->stream_received;
+            if (n > 0)
+                svc->last_activity_ms = now;
+        }
+        if (svc->stream_received >= svc->stream_total) {
+            bool fok = ota_stage_buf &&
+                http_write_kernel_payload_range(ota_update.target_slot_offset, 0,
+                                                ota_stage_buf, svc->stream_total, NULL) &&
+                http_write_kernel_slot_header(ota_update.target_slot_offset,
+                                              svc->stream_total, true);
+            svc->resp_len = 0;
+            http_append(svc->resp, &svc->resp_len, sizeof(svc->resp),
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
+            if (fok) {
+                ota_update.active = false;
+                ota_update.commits++;
+                pios_bootctrl_mark_pending(ota_update.target_slot);
+                http_log_event("ota-stream-commit", svc->stream_total, ota_update.commits);
+                http_append(svc->resp, &svc->resp_len, sizeof(svc->resp),
+                    "{\"ok\":true,\"streamed\":true,\"reboot\":");
+                http_append(svc->resp, &svc->resp_len, sizeof(svc->resp),
+                    svc->stream_reboot ? "true}\n" : "false}\n");
+                if (svc->stream_reboot)
+                    http_reboot_pending = true;
+            } else {
+                ota_update.errors++;
+                ota_update.last_error = "stream flush failed";
+                http_append(svc->resp, &svc->resp_len, sizeof(svc->resp),
+                    "{\"ok\":false,\"error\":\"stream flush failed\"}\n");
+            }
+            svc->resp_off = 0;
+            svc->stream_mode = false;
+        } else if (now - svc->last_activity_ms > 10000ULL) {
+            /* stalled mid-stream: abort (slot left uncommitted = safe) */
+            ota_update.active = false;
+            ota_update.last_error = "stream stalled";
+            svc->stream_mode = false;
+            admin_service_clear_client(svc, true);
+        }
+        return;
+    }
+
     if (svc->resp_len == 0) {
         u32 readable = tcp_readable(svc->client_conn);
         if (readable > 0 && svc->req_len < sizeof(svc->req)) {
@@ -7196,8 +8499,51 @@ static void admin_service_poll(struct admin_http_service *svc)
             svc->last_activity_ms = now;
             http_trace(HTTP_EVT_RX, http_route_id(svc->req, svc->req_len), svc->port, svc->req_len);
         }
-        if (http_request_complete(svc->req, svc->req_len) ||
-            svc->req_len >= sizeof(svc->req)) {
+        /* Switch to streaming as soon as the HEADERS are complete (a multi-MB
+         * body would never fit svc->req, so we must not wait for the full
+         * request). http_header_body_offset() != 0 means headers are done. */
+        u32 body_off = http_header_body_offset(svc->req, svc->req_len);
+        bool is_stream = body_off != 0 && svc == &admin_update_svc &&
+                         http_request_path_is(svc->req, svc->req_len, "/api/admin/kernel-stream") &&
+                         http_update_confirmed(svc->req, svc->req_len);
+        if (is_stream) {
+            u32 total = http_update_query_u32_default(svc->req, svc->req_len, "total", 0);
+            char reboot[8];
+            bool want_reboot = http_update_query_value(svc->req, svc->req_len, "reboot",
+                                                       reboot, sizeof(reboot)) &&
+                               http_streq(reboot, "1");
+            ota_staging_init();
+            if (total == 0 || total > ota_stage_cap || !ota_stage_buf) {
+                svc->resp_len = 0;
+                http_append(svc->resp, &svc->resp_len, sizeof(svc->resp),
+                    "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                    "{\"ok\":false,\"error\":\"stream unavailable or bad total\"}\n");
+                svc->resp_off = 0;
+            } else {
+                ota_update.target_slot = pios_bootctrl_target_slot();
+                ota_update.target_slot_offset = pios_boot_slot_offset(ota_update.target_slot);
+                ota_update.total = total;
+                ota_update.received = 0;
+                ota_update.active = true;
+                ota_update.last_error = NULL;
+                http_write_kernel_slot_header(ota_update.target_slot_offset, total, false);
+                svc->stream_mode = true;
+                svc->stream_total = total;
+                svc->stream_reboot = want_reboot;
+                svc->stream_received = 0;
+                http_log_event("ota-stream-begin", total, want_reboot ? 1U : 0U);
+                /* Any body bytes already read in with the headers go to staging. */
+                if (body_off < svc->req_len) {
+                    u32 have = svc->req_len - body_off;
+                    if (have > total) have = total;
+                    simd_memcpy(ota_stage_buf, svc->req + body_off, have);
+                    svc->stream_received = have;
+                    ota_update.received = have;
+                }
+            }
+            svc->last_activity_ms = now;
+        } else if (http_request_complete(svc->req, svc->req_len) ||
+                   svc->req_len >= sizeof(svc->req)) {
             http_trace(HTTP_EVT_COMPLETE, http_route_id(svc->req, svc->req_len), svc->port, svc->req_len);
             admin_service_build_response(svc);
             svc->last_activity_ms = now;
@@ -7374,15 +8720,27 @@ static void echo_tcp_poll(void) {
         }
     }
 
-    /* HTTP server on port 80 — returns simple status page */
-    if (http_client_conn < 0 && http_listen_conn >= 0) {
-        http_client_conn = tcp_accept(http_listen_conn);
-        if (http_client_conn >= 0) {
+    /* HTTP :80 — accept new clients into free pool slots (up to a batch per
+     * poll), then below we service ALL active slots so many connections are
+     * handled concurrently instead of one-at-a-time. */
+    if (http_listen_conn >= 0) {
+        for (u32 a = 0; a < 4U; a++) {
+            struct http_conn *slot = NULL;
+            for (u32 i = 0; i < http_conn_count; i++) {
+                if (http_conns[i].client_conn < 0) { slot = &http_conns[i]; break; }
+            }
+            if (!slot)
+                break;                       /* pool full */
+            tcp_conn_t c = tcp_accept(http_listen_conn);
+            if (c < 0)
+                break;                       /* no more pending connections */
+            Hc = slot;
+            http_client_conn = c;
             http_diag.accepts++;
-            http_diag.conn = (u32)http_client_conn;
+            http_diag.conn = (u32)c;
             http_diag.route = HTTP_ROUTE_UNKNOWN;
             http_diag.error = HTTP_ERR_NONE;
-            http_trace(HTTP_EVT_ACCEPT, HTTP_ROUTE_UNKNOWN, (u32)http_client_conn, http_diag.accepts);
+            http_trace(HTTP_EVT_ACCEPT, HTTP_ROUTE_UNKNOWN, (u32)c, http_diag.accepts);
             http_req_len = 0;
             http_auth_checked = false;
             http_auth_ok = false;
@@ -7391,13 +8749,31 @@ static void echo_tcp_poll(void) {
             http_last_write = 0;
             http_prefix_dumped = false;
             http_req_prefix_dumped = false;
+            http_static_body = NULL;
+            http_static_len = 0;
+            http_static_off = 0;
+            http_file_id = 0;
+            http_file_len = 0;
+            http_file_off = 0;
             http_last_req_prefix[0] = 0;
             http_last_resp_prefix[0] = 0;
             http_last_activity_ms = timer_monotonic_ms();
             if (HTTP_DIAG_VERBOSE) uart_puts("[http] accepted\n");
         }
     }
-    if (http_client_conn >= 0) {
+    /* Service active slots round-robin, BOUNDED to a few per poll so this loop
+     * returns quickly and core0's net_poll (RX drain) — which runs after it in
+     * the core0 reactor — isn't starved. Without this bound, serving many
+     * connections per poll overloads single-core0 and overruns the RX ring. */
+    static u32 http_rr;
+    u32 http_served = 0, http_scanned = 0;
+    while (http_scanned < http_conn_count && http_served < 6U) {
+        u32 hi = (http_rr + http_scanned) % http_conn_count;
+        http_scanned++;
+        if (http_conns[hi].client_conn < 0)
+            continue;
+        Hc = &http_conns[hi];
+        http_served++;
         u32 st = tcp_state(http_client_conn);
         http_last_state = st;
         http_last_readable = tcp_readable(http_client_conn);
@@ -7600,6 +8976,8 @@ static void echo_tcp_poll(void) {
         }
         http_render_diag();
     }
+    if (http_conn_count)
+        http_rr = (http_rr + http_scanned) % http_conn_count;
     admin_services_poll();
 }
 
@@ -10627,11 +12005,253 @@ static void ui_cmd_tensor(u32 argc, char **argv)
         ui_print_tensor_status();
         return;
     }
+    if (argc >= 3 && ui_streq(argv[1], "tiny") && ui_streq(argv[2], "noop")) {
+        bool ok = tensor_tiny_noop_proof();
+        ui_console_write(ok ? "Tensor tiny noop proof OK stage=" : "Tensor tiny noop proof FAILED stage=");
+        ui_console_hex_fixed((u32)tensor_tiny_last_stage(), 8);
+        ui_console_write(" status=");
+        ui_console_hex_fixed((u32)tensor_tiny_last_status(), 8);
+        struct v3d_csd_debug dbg;
+        v3d_csd_debug_last(&dbg);
+        ui_console_write(" csd_st=");
+        ui_console_hex_fixed(dbg.status_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.status_after_kick, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.status_after_wait, 8);
+        ui_console_write(" int=");
+        ui_console_hex_fixed(dbg.core_int_sts, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.hub_int_sts, 8);
+        ui_console_write(" err=");
+        ui_console_hex_fixed(dbg.err_stat, 8);
+        ui_console_write("\n");
+        ui_print_tensor_status();
+        return;
+    }
+    if (argc >= 3 && ui_streq(argv[1], "tiny") &&
+        (ui_streq(argv[2], "store") || ui_streq(argv[2], "store-only"))) {
+        bool ok = tensor_tiny_store_proof();
+        ui_console_write(ok ? "Tensor tiny store proof OK stage=" : "Tensor tiny store proof FAILED stage=");
+        ui_console_hex_fixed((u32)tensor_tiny_last_stage(), 8);
+        ui_console_write(" status=");
+        ui_console_hex_fixed((u32)tensor_tiny_last_status(), 8);
+        ui_console_write(" out=");
+        ui_console_hex_fixed(tensor_tiny_last_output_bits(), 8);
+        ui_console_write(" expect=");
+        ui_console_hex_fixed(tensor_tiny_last_expected_bits(), 8);
+        struct v3d_csd_debug dbg;
+        v3d_csd_debug_last(&dbg);
+        ui_console_write(" csd_st=");
+        ui_console_hex_fixed(dbg.status_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.status_after_kick, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.status_after_wait, 8);
+        ui_console_write(" int=");
+        ui_console_hex_fixed(dbg.core_int_sts, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.hub_int_sts, 8);
+        ui_console_write(" err=");
+        ui_console_hex_fixed(dbg.err_stat, 8);
+        ui_console_write("\n");
+        ui_print_tensor_status();
+        return;
+    }
+    if (argc >= 3 && ui_streq(argv[1], "tiny") &&
+        (ui_streq(argv[2], "loadstore") || ui_streq(argv[2], "load-store"))) {
+        bool ok = tensor_tiny_load_store_proof();
+        ui_console_write(ok ? "Tensor tiny load-store proof OK stage=" : "Tensor tiny load-store proof FAILED stage=");
+        ui_console_hex_fixed((u32)tensor_tiny_last_stage(), 8);
+        ui_console_write(" status=");
+        ui_console_hex_fixed((u32)tensor_tiny_last_status(), 8);
+        ui_console_write(" out=");
+        ui_console_hex_fixed(tensor_tiny_last_output_bits(), 8);
+        ui_console_write(" expect=");
+        ui_console_hex_fixed(tensor_tiny_last_expected_bits(), 8);
+        struct v3d_csd_debug dbg;
+        v3d_csd_debug_last(&dbg);
+        ui_console_write(" csd_st=");
+        ui_console_hex_fixed(dbg.status_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.status_after_kick, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.status_after_wait, 8);
+        ui_console_write(" int=");
+        ui_console_hex_fixed(dbg.core_int_sts, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.hub_int_sts, 8);
+        ui_console_write(" err=");
+        ui_console_hex_fixed(dbg.err_stat, 8);
+        ui_console_write("\n");
+        ui_print_tensor_status();
+        return;
+    }
+    if (argc >= 3 && ui_streq(argv[1], "tiny") &&
+        (ui_streq(argv[2], "memory") || ui_streq(argv[2], "mem"))) {
+        bool ok = tensor_tiny_memory_proof();
+        ui_console_write(ok ? "Tensor tiny memory proof OK stage=" : "Tensor tiny memory proof FAILED stage=");
+        ui_console_hex_fixed((u32)tensor_tiny_last_stage(), 8);
+        ui_console_write(" status=");
+        ui_console_hex_fixed((u32)tensor_tiny_last_status(), 8);
+        ui_console_write(" out=");
+        ui_console_hex_fixed(tensor_tiny_last_output_bits(), 8);
+        ui_console_write(" expect=");
+        ui_console_hex_fixed(tensor_tiny_last_expected_bits(), 8);
+        struct v3d_csd_debug dbg;
+        v3d_csd_debug_last(&dbg);
+        ui_console_write(" csd_st=");
+        ui_console_hex_fixed(dbg.status_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.status_after_kick, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.status_after_wait, 8);
+        ui_console_write(" int=");
+        ui_console_hex_fixed(dbg.core_int_sts, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.hub_int_sts, 8);
+        ui_console_write(" err=");
+        ui_console_hex_fixed(dbg.err_stat, 8);
+        ui_console_write("\n");
+        ui_print_tensor_status();
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "tiny")) {
+        bool ok = tensor_tiny_selftest();
+        ui_console_write(ok ? "Tensor tiny selftest OK stage=" : "Tensor tiny selftest FAILED stage=");
+        ui_console_hex_fixed((u32)tensor_tiny_last_stage(), 8);
+        ui_console_write(" status=");
+        ui_console_hex_fixed((u32)tensor_tiny_last_status(), 8);
+        ui_console_write(" out=");
+        ui_console_hex_fixed(tensor_tiny_last_output_bits(), 8);
+        ui_console_write(" expect=");
+        ui_console_hex_fixed(tensor_tiny_last_expected_bits(), 8);
+        struct v3d_csd_debug dbg;
+        v3d_csd_debug_last(&dbg);
+        ui_console_write(" csd_st=");
+        ui_console_hex_fixed(dbg.status_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.status_after_kick, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.status_after_wait, 8);
+        ui_console_write(" int=");
+        ui_console_hex_fixed(dbg.core_int_sts, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.hub_int_sts, 8);
+        ui_console_write(" err=");
+        ui_console_hex_fixed(dbg.err_stat, 8);
+        ui_console_write(" mmu=");
+        ui_console_hex_fixed(dbg.mmu_ctl, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.mmu_illegal_addr, 8);
+        ui_console_write(" vio=");
+        ui_console_hex_fixed(dbg.mmu_vio_addr, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.mmu_vio_id, 8);
+        ui_console_write(" cur=");
+        ui_console_hex_fixed(dbg.current_cfg0, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.current_cfg5, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(dbg.current_cfg6, 8);
+        ui_console_write("\n");
+        ui_print_tensor_status();
+        return;
+    }
     if (argc < 2 || ui_streq(argv[1], "status")) {
         ui_print_tensor_status();
         return;
     }
-    ui_console_write("ERR: usage qpu status | qpu selftest | tensor status | tensor selftest\n");
+    if (argc >= 3 && ui_streq(argv[1], "reset") && ui_streq(argv[2], "soft")) {
+        watchdog_hw_arm_seconds(5);
+        v3d_status_t st = v3d_soft_reset();
+        watchdog_hw_disable();
+        struct v3d_reset_debug r;
+        v3d_reset_debug_last(&r);
+        ui_console_write(st == V3D_STATUS_OK ? "v3d reset soft OK status=" : "v3d reset soft FAILED status=");
+        ui_console_hex_fixed((u32)st, 8);
+        ui_console_write(" err=");
+        ui_console_hex_fixed(r.err_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.err_after_clear, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.err_after_reset, 8);
+        ui_console_write(" int=");
+        ui_console_hex_fixed(r.core_int_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.hub_int_before, 8);
+        ui_console_write("->");
+        ui_console_hex_fixed(r.core_int_after, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.hub_int_after, 8);
+        ui_console_write(" sms=");
+        ui_console_hex_fixed(r.sms_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.sms_after, 8);
+        ui_console_write(" mmu=");
+        ui_console_hex_fixed(r.mmu_ctl_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.mmuc_before, 8);
+        ui_console_write("->");
+        ui_console_hex_fixed(r.mmu_ctl_after, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.mmuc_after, 8);
+        ui_console_write(" pm=");
+        ui_console_hex_fixed(r.pm_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.pm_asserted, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.pm_after, 8);
+        ui_console_write("\n");
+        ui_print_tensor_status();
+        return;
+    }
+    if (argc >= 4 && ui_streq(argv[1], "reset") && ui_streq(argv[2], "pm") &&
+        ui_streq(argv[3], "confirm")) {
+        watchdog_hw_arm_seconds(5);
+        v3d_status_t st = v3d_pm_reset();
+        watchdog_hw_disable();
+        struct v3d_reset_debug r;
+        v3d_reset_debug_last(&r);
+        ui_console_write(st == V3D_STATUS_OK ? "v3d reset pm OK status=" : "v3d reset pm FAILED status=");
+        ui_console_hex_fixed((u32)st, 8);
+        ui_console_write(" err=");
+        ui_console_hex_fixed(r.err_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.err_after_clear, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.err_after_reset, 8);
+        ui_console_write(" int=");
+        ui_console_hex_fixed(r.core_int_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.hub_int_before, 8);
+        ui_console_write("->");
+        ui_console_hex_fixed(r.core_int_after, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.hub_int_after, 8);
+        ui_console_write(" sms=");
+        ui_console_hex_fixed(r.sms_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.sms_after, 8);
+        ui_console_write(" mmu=");
+        ui_console_hex_fixed(r.mmu_ctl_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.mmuc_before, 8);
+        ui_console_write("->");
+        ui_console_hex_fixed(r.mmu_ctl_after, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.mmuc_after, 8);
+        ui_console_write(" pm=");
+        ui_console_hex_fixed(r.pm_before, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.pm_asserted, 8);
+        ui_console_write("/");
+        ui_console_hex_fixed(r.pm_after, 8);
+        ui_console_write("\n");
+        ui_print_tensor_status();
+        return;
+    }
+    ui_console_write("ERR: usage qpu status | qpu reset soft | qpu reset pm confirm | qpu selftest | qpu tiny | tensor status | tensor selftest | tensor tiny\n");
 }
 
 static void ui_print_dns_status(void)
@@ -14102,10 +15722,48 @@ static void ui_cmd_nic(u32 argc, char **argv)
         ui_console_u64_dec(c.firewalled);
         ui_console_write(" rate_limited=");
         ui_console_u64_dec(c.rate_limited);
+        ui_console_write(" tx_csum_hw=");
+        ui_console_u64_dec(c.tx_csum_offloaded);
+        ui_console_write(" tx_csum_sw=");
+        ui_console_u64_dec(c.tx_csum_software);
+        ui_console_write(" rx_csum_trusted=");
+        ui_console_u64_dec(c.rx_csum_trusted);
+        ui_console_write(" rx_csum_untrusted=");
+        ui_console_u64_dec(c.rx_csum_untrusted);
         ui_console_write("\n");
         return;
     }
-    ui_console_write("usage: nic dump <on|off> | nic counters\n");
+    if (argc >= 2 && ui_streq(argv[1], "offload")) {
+        nic_offload_status_t s;
+        nic_offload_status(&s);
+        ui_console_write("nic offload tx_csum_cap=");
+        ui_console_write(s.tx_checksum_capable ? "yes" : "no");
+        ui_console_write(" tx_csum=");
+        ui_console_write(s.tx_checksum_enabled ? "on" : "off");
+        ui_console_write(" rx_csum_cap=");
+        ui_console_write(s.rx_checksum_capable ? "yes" : "no");
+        ui_console_write(" rx_csum=");
+        ui_console_write(s.rx_checksum_enabled ? "on" : "off");
+        ui_console_write(" tso_cap=");
+        ui_console_write(s.tso_capable ? "yes" : "no");
+        ui_console_write(" tso=");
+        ui_console_write(s.tso_enabled ? "on" : "off");
+        ui_console_write(" tx_hw=");
+        ui_console_u64_dec(s.tx_csum_offloaded);
+        ui_console_write(" tx_sw=");
+        ui_console_u64_dec(s.tx_csum_software);
+        ui_console_write(" rx_trusted=");
+        ui_console_u64_dec(s.rx_csum_trusted);
+        ui_console_write(" rx_untrusted=");
+        ui_console_u64_dec(s.rx_csum_untrusted);
+        ui_console_write(" ncfgr=");
+        ui_console_hex_fixed(s.mac_ncfgr, 8);
+        ui_console_write(" dmacfg=");
+        ui_console_hex_fixed(s.mac_dmacfg, 8);
+        ui_console_write("\n");
+        return;
+    }
+    ui_console_write("usage: nic dump <on|off> | nic counters | nic offload\n");
 }
 
 static void ui_cmd_cachestats(u32 argc, char **argv)
@@ -14494,6 +16152,229 @@ static void ui_console_exec(char *line)
         ui_cmd_abi(argc, argv);
     } else if (ui_streq(argv[0], "qpu") || ui_streq(argv[0], "tensor")) {
         ui_cmd_tensor(argc, argv);
+    } else if (ui_streq(argv[0], "vc") || ui_streq(argv[0], "videocore")) {
+        if (argc >= 4 && ui_streq(argv[1], "display") &&
+            (ui_streq(argv[2], "global") || ui_streq(argv[2], "hvs")) &&
+            ui_streq(argv[3], "reapply")) {
+            bool dry = argc >= 5 && (ui_streq(argv[4], "dryrun") || ui_streq(argv[4], "dry-run"));
+            bool ok = vc_display_global_reapply(dry);
+            const struct vc_display_status *d = vc_display_status_get();
+            ui_console_write(ok ? "vc_display global reapply OK status=" :
+                                  "vc_display global reapply FAILED status=");
+            ui_console_write(d ? vc_display_global_status_name(d->global_reapply_status) : "none");
+            ui_console_write(" control=");
+            ui_console_hex_fixed(d ? d->global_reapply_control : 0U, 8);
+            ui_console_write(" rb=");
+            ui_console_hex_fixed(d ? d->global_reapply_rb_control : 0U, 8);
+            ui_console_write(" readback=");
+            ui_console_write(d && d->global_reapply_readback_ok ? "ok" : (dry ? "dryrun" : "bad"));
+            ui_console_write("\n");
+        } else if (argc >= 4 && ui_streq(argv[1], "display") && ui_streq(argv[2], "channel") &&
+            ui_streq(argv[3], "reapply")) {
+            bool dry = argc >= 5 && (ui_streq(argv[4], "dryrun") || ui_streq(argv[4], "dry-run"));
+            bool ok = vc_display_channel_reapply(dry);
+            const struct vc_display_status *d = vc_display_status_get();
+            ui_console_write(ok ? "vc_display channel reapply OK status=" :
+                                  "vc_display channel reapply FAILED status=");
+            ui_console_write(d ? vc_display_channel_status_name(d->channel_reapply_status) : "none");
+            ui_console_write(" ch=");
+            ui_console_u32_dec(d ? d->channel_reapply_channel : 0U);
+            ui_console_write(" ctrl=");
+            ui_console_hex_fixed(d ? d->channel_reapply_ctrl0 : 0U, 8);
+            ui_console_write("/");
+            ui_console_hex_fixed(d ? d->channel_reapply_ctrl1 : 0U, 8);
+            ui_console_write(" cob=");
+            ui_console_hex_fixed(d ? d->channel_reapply_cob : 0U, 8);
+            ui_console_write(" rb=");
+            ui_console_hex_fixed(d ? d->channel_reapply_rb_ctrl0 : 0U, 8);
+            ui_console_write("/");
+            ui_console_hex_fixed(d ? d->channel_reapply_rb_ctrl1 : 0U, 8);
+            ui_console_write("/");
+            ui_console_hex_fixed(d ? d->channel_reapply_rb_cob : 0U, 8);
+            ui_console_write(" readback=");
+            ui_console_write(d && d->channel_reapply_readback_ok ? "ok" : (dry ? "dryrun" : "bad"));
+            ui_console_write("\n");
+        } else if (argc >= 4 && ui_streq(argv[1], "display") && ui_streq(argv[2], "dlist") &&
+            ui_streq(argv[3], "arm")) {
+            bool dry = argc >= 5 && (ui_streq(argv[4], "dryrun") || ui_streq(argv[4], "dry-run"));
+            bool ok = vc_display_dlist_arm(dry);
+            const struct vc_display_status *d = vc_display_status_get();
+            ui_console_write(ok ? "vc_display dlist arm OK status=" :
+                                  "vc_display dlist arm FAILED status=");
+            ui_console_write(d ? vc_display_dlist_status_name(d->dlist_status) : "none");
+            ui_console_write(" ch=");
+            ui_console_u32_dec(d ? d->dlist_arm_channel : 0U);
+            ui_console_write(" before=");
+            ui_console_hex_fixed(d ? d->dlist_arm_lptrs_before : 0U, 8);
+            ui_console_write(" after=");
+            ui_console_hex_fixed(d ? d->dlist_arm_lptrs_after : 0U, 8);
+            ui_console_write(" readback=");
+            ui_console_write(d && d->dlist_arm_readback_ok ? "ok" : (dry ? "dryrun" : "bad"));
+            ui_console_write("\n");
+        } else if (argc >= 4 && ui_streq(argv[1], "display") && ui_streq(argv[2], "dlist") &&
+            ui_streq(argv[3], "stage")) {
+            bool ok = vc_display_dlist_stage();
+            const struct vc_display_status *d = vc_display_status_get();
+            ui_console_write(ok ? "vc_display dlist stage OK status=" :
+                                  "vc_display dlist stage FAILED status=");
+            ui_console_write(d ? vc_display_dlist_status_name(d->dlist_status) : "none");
+            ui_console_write(" index=");
+            ui_console_u32_dec(d ? d->dlist_stage_index : 0U);
+            ui_console_write(" count=");
+            ui_console_u32_dec(d ? d->dlist_stage_count : 0U);
+            ui_console_write(" readback=");
+            ui_console_write(d && d->dlist_stage_readback_ok ? "ok" : "bad");
+            ui_console_write("\n  readback=");
+            if (d) {
+                for (u32 i = 0; i < d->dlist_stage_count && i < 16U; i++) {
+                    if (i)
+                        ui_console_write(",");
+                    ui_console_hex_fixed(d->dlist_readback[i], 8);
+                }
+            }
+            ui_console_write("\n");
+        } else if (argc >= 4 && ui_streq(argv[1], "display") && ui_streq(argv[2], "dlist") &&
+            (ui_streq(argv[3], "dryrun") || ui_streq(argv[3], "dry-run"))) {
+            bool ok = vc_display_dlist_dryrun();
+            const struct vc_display_status *d = vc_display_status_get();
+            ui_console_write(ok ? "vc_display dlist dryrun OK status=" :
+                                  "vc_display dlist dryrun FAILED status=");
+            ui_console_write(d ? vc_display_dlist_status_name(d->dlist_status) : "none");
+            ui_console_write(" count=");
+            ui_console_u32_dec(d ? d->dlist_count : 0U);
+            ui_console_write(" format=");
+            ui_console_u32_dec(d ? d->dlist_format : 0U);
+            ui_console_write(" order=");
+            ui_console_u32_dec(d ? d->dlist_order : 0U);
+            ui_console_write("\n  words=");
+            if (d) {
+                for (u32 i = 0; i < d->dlist_count && i < 16U; i++) {
+                    if (i)
+                        ui_console_write(",");
+                    ui_console_hex_fixed(d->dlist_words[i], 8);
+                }
+            }
+            ui_console_write("\n");
+        } else if (argc >= 3 && ui_streq(argv[1], "display") && ui_streq(argv[2], "snapshot")) {
+            bool ok = vc_display_snapshot();
+            const struct vc_display_status *d = vc_display_status_get();
+            ui_console_write(ok ? "vc_display snapshot OK count=" : "vc_display snapshot FAILED count=");
+            ui_console_u32_dec(d ? d->snapshot_count : 0U);
+            ui_console_write(" hvs_ver=");
+            ui_console_hex_fixed(d ? d->snapshot_hvs_version : 0U, 8);
+            ui_console_write(" hvs_id=");
+            ui_console_hex_fixed(d ? d->snapshot_hvs_id : 0U, 8);
+            ui_console_write(" control=");
+            ui_console_hex_fixed(d ? d->hvs_control : 0U, 8);
+            ui_console_write(" fetcher=");
+            ui_console_hex_fixed(d ? d->hvs_fetcher_status : 0U, 8);
+            ui_console_write(" fetch=");
+            ui_console_hex_fixed(d ? d->hvs_fetch_status : 0U, 8);
+            ui_console_write(" err=");
+            ui_console_hex_fixed(d ? d->hvs_handle_error : 0U, 8);
+            ui_console_write(" dlstat=");
+            ui_console_hex_fixed(d ? d->hvs_dl_status : 0U, 8);
+            ui_console_write("\n");
+            for (u32 ch = 0; ch < 3U; ch++) {
+                ui_console_write("  ch");
+                ui_console_u32_dec(ch);
+                ui_console_write(" ctrl=");
+                ui_console_hex_fixed(d ? d->hvs_disp_ctrl0[ch] : 0U, 8);
+                ui_console_write("/");
+                ui_console_hex_fixed(d ? d->hvs_disp_ctrl1[ch] : 0U, 8);
+                ui_console_write(" status=");
+                ui_console_hex_fixed(d ? d->hvs_disp_status[ch] : 0U, 8);
+                ui_console_write(" dl=");
+                ui_console_hex_fixed(d ? d->hvs_disp_dl[ch] : 0U, 8);
+                ui_console_write(" lptrs=");
+                ui_console_hex_fixed(d ? d->hvs_disp_lptrs[ch] : 0U, 8);
+                ui_console_write(" cob=");
+                ui_console_hex_fixed(d ? d->hvs_disp_cob[ch] : 0U, 8);
+                ui_console_write(" run=");
+                ui_console_hex_fixed(d ? d->hvs_disp_run[ch] : 0U, 8);
+                ui_console_write("\n");
+            }
+        } else if (argc >= 3 && ui_streq(argv[1], "display") && ui_streq(argv[2], "takeover")) {
+            bool dry = argc >= 4 && (ui_streq(argv[3], "dryrun") || ui_streq(argv[3], "dry-run"));
+            bool ok = vc_display_takeover_current(dry);
+            const struct vc_display_status *d = vc_display_status_get();
+            ui_console_write(ok ? "vc_display takeover OK status=" : "vc_display takeover FAILED status=");
+            ui_console_write(d ? vc_display_takeover_status_name(d->last_takeover_status) : "none");
+            ui_console_write(" backend=");
+            ui_console_write(d ? vc_display_backend_name(d->backend) : "none");
+            ui_console_write(" native_owner=");
+            ui_console_write(d && d->native_owner ? "yes" : "no");
+            ui_console_write(" restore=");
+            ui_console_hex_fixed(d ? d->dlist_restore_lptrs : 0U, 8);
+            ui_console_write("/");
+            ui_console_write(d && d->dlist_restore_readback_ok ? "ok" : "none");
+            ui_console_write("\n");
+        } else if (argc >= 3 && ui_streq(argv[1], "display") && ui_streq(argv[2], "fallback")) {
+            bool ok = vc_display_fallback();
+            const struct vc_display_status *d = vc_display_status_get();
+            ui_console_write(ok ? "vc_display fallback OK backend=" : "vc_display fallback FAILED backend=");
+            ui_console_write(d ? vc_display_backend_name(d->backend) : "none");
+            ui_console_write(" native_owner=");
+            ui_console_write(d && d->native_owner ? "yes" : "no");
+            ui_console_write("\n");
+        } else if (argc >= 2 && ui_streq(argv[1], "display")) {
+            const struct vc_display_status *d = vc_display_status_get();
+            ui_console_write("vc_display ready=");
+            ui_console_write(d && d->ready ? "yes" : "no");
+            ui_console_write(" backend=");
+            ui_console_write(d ? vc_display_backend_name(d->backend) : "none");
+            ui_console_write(" native_probe=");
+            ui_console_write(d && d->native_probe_ready ? "yes" : "no");
+            ui_console_write(" native_owner=");
+            ui_console_write(d && d->native_owner ? "yes" : "no");
+            ui_console_write(" hvs=");
+            ui_console_write(d && d->hvs_seen ? "yes" : "no");
+            ui_console_write(" v3d=");
+            ui_console_write(d && d->v3d_seen ? "yes" : "no");
+            ui_console_write(" mode=");
+            ui_console_u32_dec(d ? d->width : 0U);
+            ui_console_write("x");
+            ui_console_u32_dec(d ? d->height : 0U);
+            ui_console_write(" pitch=");
+            ui_console_u32_dec(d ? d->pitch : 0U);
+            ui_console_write(" scanout=");
+            ui_console_hex_fixed((u32)(d ? d->scanout_base : 0U), 8);
+            ui_console_write(" presents=");
+            ui_console_u32_dec(d ? d->present_count : 0U);
+            ui_console_write(" takeover=");
+            ui_console_write(d ? vc_display_takeover_status_name(d->last_takeover_status) : "none");
+            ui_console_write(" attempts=");
+            ui_console_u32_dec(d ? d->takeover_attempts : 0U);
+            ui_console_write(" fallbacks=");
+            ui_console_u32_dec(d ? d->fallback_count : 0U);
+            ui_console_write(" snapshots=");
+            ui_console_u32_dec(d ? d->snapshot_count : 0U);
+            ui_console_write(" dlist=");
+            ui_console_write(d ? vc_display_dlist_status_name(d->dlist_status) : "none");
+            ui_console_write("/");
+            ui_console_u32_dec(d ? d->dlist_count : 0U);
+            ui_console_write(" staged=");
+            ui_console_u32_dec(d ? d->dlist_stage_index : 0U);
+            ui_console_write("/");
+            ui_console_u32_dec(d ? d->dlist_stage_count : 0U);
+            ui_console_write(" arm=");
+            ui_console_hex_fixed(d ? d->dlist_arm_lptrs_after : 0U, 8);
+            ui_console_write(" restore=");
+            ui_console_hex_fixed(d ? d->dlist_restore_lptrs : 0U, 8);
+            ui_console_write("/");
+            ui_console_u32_dec(d ? d->dlist_restore_count : 0U);
+            ui_console_write(" chan=");
+            ui_console_write(d ? vc_display_channel_status_name(d->channel_reapply_status) : "none");
+            ui_console_write("/");
+            ui_console_u32_dec(d ? d->channel_reapply_count : 0U);
+            ui_console_write(" global=");
+            ui_console_write(d ? vc_display_global_status_name(d->global_reapply_status) : "none");
+            ui_console_write("/");
+            ui_console_u32_dec(d ? d->global_reapply_count : 0U);
+            ui_console_write("\n");
+        } else {
+            ui_console_write("ERR: usage vc display | vc display snapshot | vc display global|channel reapply [dryrun] | vc display dlist dryrun|stage|arm [dryrun] | vc display takeover [dryrun] | vc display fallback\n");
+        }
     } else if (ui_streq(argv[0], "netcfg")) {
         ui_cmd_netcfg(argc, argv);
     } else if (ui_streq(argv[0], "firewall")) {
@@ -14772,6 +16653,7 @@ static u32 spin_counter;
 #define CORE0_IO_USB     (1U << 3)
 #define CORE0_IO_MAINT   (1U << 4)
 #define CORE0_IO_DASH    (1U << 5)
+#define CORE0_IO_CPUCLK  (1U << 6)
 
 static void spin_update(void) {
     static const char frames[] = "|/-\\";
@@ -14873,6 +16755,26 @@ static void dash_put_permille_pct(u32 permille)
         fb_printf("%u.%u%%", whole, frac);
     else
         fb_printf("%u%%", whole);
+}
+
+/* Diagnostics-panel helper: "label=y" in on_color when set, dim grey when clear.
+ * Used for decoded status bits where the caller decides which colour "set"
+ * means (red for fault bits, green for healthy bits like link-up). */
+static void dash_flag(const char *label, bool on, u32 on_color)
+{
+    fb_set_color(0x00AAAAAA, 0x00000000);
+    fb_puts(label);
+    fb_set_color(on ? on_color : 0x00606060, 0x00000000);
+    fb_puts(on ? "y" : "n");
+}
+
+/* Diagnostics-panel helper: grey "label=" then a white unsigned value. */
+static void dash_kv_u32(const char *label, u32 val)
+{
+    fb_set_color(0x00AAAAAA, 0x00000000);
+    fb_puts(label);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_printf("%u", val);
 }
 
 static const struct proc_ui_entry *
@@ -15226,9 +17128,13 @@ static void hdmi_dashboard_render(void)
     u32 hw_col = 0U;
     u32 hw_row = header_row + header_h + 1U;
     u32 hw_w = wide ? header_w : 78U;
-    u32 hw_h = 14U;
+    u32 hw_h = 15U;
+    u32 tns_col = 0U;
+    u32 tns_row = hw_row + hw_h + 1U;
+    u32 tns_w = wide ? header_w : 78U;
+    u32 tns_h = 5U;     /* border + 3 content rows: column header, NEON, V3D/QPU */
     u32 map_col = 0U;
-    u32 map_row = hw_row + hw_h + 1U;
+    u32 map_row = tns_row + tns_h + 1U;
     u32 map_w = wide ? header_w : 78U;
     u32 log_col = 0;
     u32 log_h = wide ? 11U : 12U;
@@ -15239,14 +17145,38 @@ static void hdmi_dashboard_render(void)
         log_top = screen_rows - log_h - 1U;
     u32 map_h = log_top > map_row + 3U ? log_top - map_row - 1U : (wide ? 16U : 13U);
 
+    /* Right-hand diagnostics column. On wide screens the HARDWARE / TENSOR /
+     * MAP boxes leave a large unused gutter on the right. Carve a fixed-width
+     * column there for live NIC/MAC, DMA, and FIFO/lease-arena diagnostics —
+     * the one channel that stays readable when the network path wedges. */
+    u32 diag_col = 0U, diag_w = 0U;
+    if (wide && header_w >= 170U) {
+        diag_w = 52U;
+        u32 left_w = header_w - diag_w - 1U;
+        if (left_w < 116U) {            /* keep HW capability strings intact */
+            left_w = 116U;
+            diag_w = header_w - left_w - 1U;
+        }
+        hw_w = left_w;
+        tns_w = left_w;
+        map_w = left_w;
+        diag_col = left_w + 1U;
+    }
+
     u64 t_dash1 = dash_now_ticks();
     g_dash_snap_ticks = t_dash1 - t_dash0;
     if (!layout_drawn) {
         fb_clear(0x00000000);
         dash_draw_window(header_col, header_row, header_w, header_h, "PIOS WORKBENCH", 0x0000FF80);
         dash_draw_window(hw_col, hw_row, hw_w, hw_h, "HARDWARE / CAPABILITIES", 0x0000CCFF);
+        dash_draw_window(tns_col, tns_row, tns_w, tns_h, "TENSOR / AI ACCELERATION", 0x00FF80FF);
         dash_draw_window(map_col, map_row, map_w, map_h, "NETWORK / PROCESS MAP", 0x00FFAA00);
         dash_draw_window(log_col, log_top, log_w, log_h, "WARNINGS / ERRORS", 0x00FF4040);
+        if (diag_w) {
+            dash_draw_window(diag_col, hw_row, diag_w, hw_h, "NIC / MAC RX-TX", 0x0000FFCC);
+            dash_draw_window(diag_col, tns_row, diag_w, tns_h, "DMA ENGINE", 0x00FFCC66);
+            dash_draw_window(diag_col, map_row, diag_w, map_h, "FIFO / LEASE ARENAS", 0x0066FF66);
+        }
         layout_drawn = true;
     }
 
@@ -15292,6 +17222,11 @@ static void hdmi_dashboard_render(void)
     dash_put_permille_pct(perf.cpu_permille[2]);
     fb_puts(" 3=");
     dash_put_permille_pct(perf.cpu_permille[3]);
+    fb_puts(" clk=");
+    if (perf.cpu_clock_mhz)
+        fb_printf("%uMHz", perf.cpu_clock_mhz);
+    else
+        fb_puts("?");
     fb_set_cursor(h1, header_row + 2);
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts("RAM: ");
@@ -15394,6 +17329,15 @@ static void hdmi_dashboard_render(void)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "CPU cores", true, "EL1 ", PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT ? 0x40080000ULL : 0x00080000ULL,
                             "4x16M", "AArch64 NEON CRC AES/SHA timers");
+    const struct videocore_probe *vc = videocore_probe_get();
+    const struct vc_display_status *vcd = vc_display_status_get();
+    if (hw_r < hw_end)
+        dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                            "VideoCore", PIOS_HAS_MAILBOX_FB || (vc && vc->enabled && (vc->hvs_seen || vc->v3d_seen)),
+                            "HVS ", 0x107C580000ULL,
+                            vcd && vcd->ready ? vc_display_backend_name(vcd->backend) : "0",
+                            vc && vc->v3d_seen ? "VC display drv + V3D/QPU/MMU probe" :
+                            (PIOS_HAS_MAILBOX_FB ? "mailbox firmware services" : "not present"));
     if (hw_r < hw_end)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "Storage", sd_get_card_info() && sd_get_card_info()->capacity != 0,
@@ -15435,9 +17379,56 @@ static void hdmi_dashboard_render(void)
     if (hw_r < hw_end)
         dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                     "Framebuffer", PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB,
-                    PIOS_HAS_MAILBOX_FB ? "mailbox FB" : (PIOS_HAS_BOOTINFO_FB ? "UEFI GOP" : "none"),
+                    vcd && vcd->ready ? vc_display_backend_name(vcd->backend) :
+                    (PIOS_HAS_MAILBOX_FB ? "mailbox FB" : (PIOS_HAS_BOOTINFO_FB ? "UEFI GOP" : "none")),
                     (PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB) ? "scanout+back" : "0",
                     (PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB) ? "workbench dashboard" : "serial console only");
+
+    /* TENSOR / AI ACCELERATION section: which compute backends accelerate the
+     * tensor primitives, their live state, and the terminal commands that drive
+     * them. NEON is always present (ARMv8.2 SIMD, fp32); V3D/QPU state is read
+     * live from tensor_status(). */
+    dash_clear_body(tns_col, tns_row, tns_w, tns_h);
+    struct tensor_status tns;
+    tensor_status(&tns);
+    {
+        u32 tns_r = tns_row + 1U;
+        const u32 t_back = tns_col + 3U;
+        const u32 t_state = wide ? (tns_col + 16U) : (tns_col + 13U);
+        const u32 t_detail = wide ? (tns_col + 26U) : (tns_col + 21U);
+        const u32 t_detail_w = tns_w > (t_detail - tns_col) + 2U
+                                   ? tns_w - (t_detail - tns_col) - 2U : 20U;
+        bool v3d_ready = tns.v3d_native_compute_enabled && tns.any_kernel_bound;
+        fb_set_color(0x00AAAAAA, 0x00000000);
+        fb_set_cursor(t_back, tns_r);
+        fb_puts("BACKEND");
+        fb_set_cursor(t_state, tns_r);
+        fb_puts("STATE");
+        fb_set_cursor(t_detail, tns_r);
+        fb_puts("ACCELERATED OPS / COMMANDS");
+        tns_r++;
+        fb_set_color(0x0000FF80, 0x00000000);
+        fb_set_cursor(t_back, tns_r);
+        fb_puts("CPU NEON");
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_set_cursor(t_state, tns_r);
+        fb_puts("ready");
+        fb_set_cursor(t_detail, tns_r);
+        dash_put_trunc("add mul scale dot relu softmax matmul matvec (fp32 SIMD)  cmd: tensor bench",
+                       t_detail_w);
+        tns_r++;
+        fb_set_color(0x0000CCFF, 0x00000000);
+        fb_set_cursor(t_back, tns_r);
+        fb_puts("V3D QPU");
+        fb_set_color(v3d_ready ? 0x0000FF80 : (tns.v3d_available ? 0x00FFAA00 : 0x00FF4040),
+                     0x00000000);
+        fb_set_cursor(t_state, tns_r);
+        fb_puts(v3d_ready ? "ready" : (tns.v3d_available ? "probe" : "off"));
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_set_cursor(t_detail, tns_r);
+        dash_put_trunc("vector16/N add+mul, matvecN, matmul via QPU CSD  cmd: tensor vectorN | bench v3d",
+                       t_detail_w);
+    }
 
     dash_clear_body(map_col, map_row, map_w, map_h);
     u32 row = map_row + 1U;
@@ -15553,6 +17544,466 @@ static void hdmi_dashboard_render(void)
         fb_set_color(0x0000FF80, 0x00000000);
         fb_puts("No warnings or errors in the hot log ring.");
     }
+
+    /* ===== Right-hand diagnostics column ===== */
+    if (diag_w) {
+        const u32 C_RED = 0x00FF4040, C_GRN = 0x0000FF80,
+                  C_WHT = 0x00FFFFFF, C_GRY = 0x00AAAAAA, C_YEL = 0x00FFCC66;
+        u32 dc = diag_col + 2U;
+
+        /* ---- NIC / MAC RX-TX ---- */
+        struct macb_diag md;
+        macb_diag(&md);
+        nic_packet_counters_t nc;
+        nic_packet_counters(&nc);
+        bool bna    = (md.rsr & (1U << 0)) != 0;   /* RX Buffer Not Available */
+        bool rx_ovr = (md.rsr & (1U << 2)) != 0;   /* RX overrun */
+        bool rx_hno = (md.rsr & (1U << 3)) != 0;   /* RX HRESP not OK */
+        bool tx_bex = (md.tsr & (1U << 4)) != 0;   /* TX buffers exhausted */
+        bool tx_und = (md.tsr & (1U << 6)) != 0;   /* TX underrun */
+        bool tx_hno = (md.tsr & (1U << 8)) != 0;   /* TX HRESP not OK */
+        bool rx_en  = (md.ncr & (1U << 2)) != 0;   /* RX enabled */
+        bool tx_en  = (md.ncr & (1U << 3)) != 0;   /* TX enabled */
+        bool link   = perf.nic_link_mbps != 0U;    /* real link state (PHY/MDIO), NSR bit0 is unreliable here */
+        bool axi_err = (md.eth_cfg_stat & 0x30U) != 0U; /* ARLEN/AWLEN illegal = real AXI bus fault */
+        bool ring_full = md.ring_size && md.rx_owned >= (md.ring_size - (md.ring_size / 8U));
+        bool wedged = bna || rx_ovr || rx_hno || tx_bex || tx_und || tx_hno ||
+                      axi_err || ring_full || !rx_en || !tx_en;
+        dash_clear_body(diag_col, hw_row, diag_w, hw_h);
+        u32 dr = hw_row + 1U;
+        fb_set_cursor(dc, dr++);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("STATE: ");
+        fb_set_color(wedged ? C_RED : C_GRN, 0x00000000);
+        fb_puts(wedged ? "** WEDGED **" : "OK");
+        fb_set_cursor(dc, dr++);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("RX ring owned=");
+        fb_set_color(ring_full ? C_RED : C_WHT, 0x00000000);
+        fb_printf("%u", md.rx_owned);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("/");
+        fb_printf("%u", md.ring_size);
+        fb_set_cursor(dc, dr++);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("RSR=0x");
+        fb_set_color(C_WHT, 0x00000000);
+        fb_printf("%x ", md.rsr);
+        dash_flag("BNA=", bna, C_RED);
+        fb_puts(" ");
+        dash_flag("OVR=", rx_ovr, C_RED);
+        fb_puts(" ");
+        dash_flag("HNO=", rx_hno, C_RED);
+        fb_set_cursor(dc, dr++);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("TSR=0x");
+        fb_set_color(C_WHT, 0x00000000);
+        fb_printf("%x ", md.tsr);
+        dash_flag("UND=", tx_und, C_RED);
+        fb_puts(" ");
+        dash_flag("BEX=", tx_bex, C_RED);
+        fb_puts(" ");
+        dash_flag("HNO=", tx_hno, C_RED);
+        fb_set_cursor(dc, dr++);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("NCR=0x");
+        fb_set_color(C_WHT, 0x00000000);
+        fb_printf("%x ", md.ncr);
+        dash_flag("RE=", rx_en, C_GRN);
+        fb_puts(" ");
+        dash_flag("TE=", tx_en, C_GRN);
+        fb_puts(" ");
+        dash_flag("LINK=", link, C_GRN);
+        fb_set_cursor(dc, dr++);
+        dash_kv_u32("rx_idx=", md.rx_idx);
+        fb_puts(" ");
+        dash_kv_u32("tx_idx=", md.tx_idx);
+        fb_set_cursor(dc, dr++);
+        dash_kv_u32("rx_recv=", md.rx_recv);
+        fb_puts(" ");
+        dash_kv_u32("tx_send=", md.tx_send);
+        fb_set_cursor(dc, dr++);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("rx_recover=");
+        fb_set_color(md.rx_recover ? C_YEL : C_WHT, 0x00000000);
+        fb_printf("%u", md.rx_recover);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts(" tx_drop=");
+        fb_set_color(md.tx_drop ? C_YEL : C_WHT, 0x00000000);
+        fb_printf("%u", md.tx_drop);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts(" tx_rec=");
+        fb_set_color(md.tx_recover ? C_YEL : C_WHT, 0x00000000);
+        fb_printf("%u", md.tx_recover);
+        fb_set_cursor(dc, dr++);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("RBQP=0x");
+        fb_set_color(C_WHT, 0x00000000);
+        fb_printf("%x", md.rbqp);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts(" TBQP=0x");
+        fb_set_color(C_WHT, 0x00000000);
+        fb_printf("%x", md.tbqp);
+        fb_set_cursor(dc, dr++);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("ETH_CFG_STAT=0x");
+        fb_set_color(axi_err ? C_RED : C_WHT, 0x00000000);
+        fb_printf("%x", md.eth_cfg_stat);
+        if (axi_err) {
+            fb_set_color(C_RED, 0x00000000);
+            fb_puts(" AXI!");
+        }
+        fb_set_cursor(dc, dr++);
+        dash_kv_u32("pkt proc=", (u32)nc.processed);
+        fb_puts(" ");
+        dash_kv_u32("drop=", (u32)nc.dropped);
+        fb_set_cursor(dc, dr++);
+        dash_kv_u32("fw=", (u32)nc.firewalled);
+        fb_puts(" ");
+        dash_kv_u32("rl=", (u32)nc.rate_limited);
+        fb_puts(" ");
+        dash_kv_u32("flood=", (u32)nc.flood_blocked);
+
+        /* ---- DMA ENGINE ---- */
+        struct dma_diag_snapshot dd;
+        dma_diag_snapshot(&dd);
+        dash_clear_body(diag_col, tns_row, diag_w, tns_h);
+        u32 er = tns_row + 1U;
+        fb_set_cursor(dc, er++);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("hw=");
+        fb_set_color(dd.hw_memcpy_enabled ? C_GRN : C_RED, 0x00000000);
+        fb_puts(dd.hw_memcpy_enabled ? "on" : "off");
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts(" mode=");
+        fb_set_color(C_WHT, 0x00000000);
+        fb_puts(dd.direct_mode ? "direct" : "cb");
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts(" shift=");
+        fb_set_color(C_WHT, 0x00000000);
+        fb_puts(dd.cbaddr_shifted ? "y" : "n");
+        fb_set_cursor(dc, er++);
+        dash_kv_u32("selftest run=", dd.selftest_runs);
+        fb_puts(" ");
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("probe_fail=");
+        fb_set_color(C_WHT, 0x00000000);   /* mode-probe failures are expected; last_err is the real signal */
+        fb_printf("%u", dd.selftest_failures);
+        fb_set_cursor(dc, er++);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts("last_err=0x");
+        fb_set_color(dd.last_error ? C_RED : C_WHT, 0x00000000);
+        fb_printf("%x", dd.last_error);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts(" en=0x");
+        fb_set_color(C_WHT, 0x00000000);
+        fb_printf("%x", dd.enable_reg);
+
+        /* ---- FIFO / LEASE ARENAS ---- */
+        struct lease_stats ls;
+        lease_get_stats(&ls);
+        dash_clear_body(diag_col, map_row, diag_w, map_h);
+        u32 fr = map_row + 1U;
+        const u32 fend = map_row + map_h - 1U;
+        if (fr < fend) {
+            fb_set_cursor(dc, fr++);
+            fb_set_color(C_YEL, 0x00000000);
+            fb_puts("LEASE FABRIC");
+        }
+        if (fr < fend) {
+            fb_set_cursor(dc, fr++);
+            dash_kv_u32("arenas=", ls.arenas);
+            fb_puts(" ");
+            fb_set_color(C_GRY, 0x00000000);
+            fb_puts("slots=");
+            fb_set_color(C_WHT, 0x00000000);
+            fb_printf("%u/%u", ls.slots_live, ls.slots_total);
+        }
+        if (fr < fend) {
+            fb_set_cursor(dc, fr++);
+            dash_kv_u32("acq=", ls.acquires);
+            fb_puts(" ");
+            dash_kv_u32("rel=", ls.releases);
+            fb_puts(" ");
+            dash_kv_u32("xfer=", ls.transfers);
+        }
+        if (fr < fend) {
+            fb_set_cursor(dc, fr++);
+            dash_kv_u32("copy=", ls.copies);
+            fb_puts(" ");
+            dash_kv_u32("grant=", ls.grants);
+            fb_puts(" ");
+            dash_kv_u32("rvk=", ls.revokes);
+        }
+        if (fr < fend) {
+            fb_set_cursor(dc, fr++);
+            fb_set_color(C_GRY, 0x00000000);
+            fb_puts("reject mmu=");
+            fb_set_color(ls.mmu_rejects ? C_RED : C_WHT, 0x00000000);
+            fb_printf("%u", ls.mmu_rejects);
+            fb_set_color(C_GRY, 0x00000000);
+            fb_puts(" stale=");
+            fb_set_color(ls.stale_rejects ? C_RED : C_WHT, 0x00000000);
+            fb_printf("%u", ls.stale_rejects);
+            fb_set_color(C_GRY, 0x00000000);
+            fb_puts(" st=");
+            fb_set_color(ls.state_rejects ? C_RED : C_WHT, 0x00000000);
+            fb_printf("%u", ls.state_rejects);
+        }
+        if (fr + 1U < fend)
+            fr++;   /* spacer */
+        if (fr < fend) {
+            fb_set_cursor(dc, fr++);
+            fb_set_color(C_YEL, 0x00000000);
+            fb_puts("FIFO pending (dst<-src)");
+        }
+        if (fr < fend) {
+            fb_set_cursor(dc, fr++);
+            dash_kv_u32("0<-1=", fifo_count(0U, 1U));
+            fb_puts(" ");
+            dash_kv_u32("0<-2=", fifo_count(0U, 2U));
+            fb_puts(" ");
+            dash_kv_u32("0<-3=", fifo_count(0U, 3U));
+        }
+        if (fr < fend) {
+            fb_set_cursor(dc, fr++);
+            dash_kv_u32("1<-0=", fifo_count(1U, 0U));
+            fb_puts(" ");
+            dash_kv_u32("2<-0=", fifo_count(2U, 0U));
+            fb_puts(" ");
+            dash_kv_u32("3<-0=", fifo_count(3U, 0U));
+        }
+
+        /* ---- NET STACK HEALTH ---- IP / TCP / TLS / port-FIFO forwarding.
+         * Constant-traffic layers; a red counter here means that layer is
+         * dropping or backing up under load. Guarded so it clips on small fb. */
+        {
+            const net_stats_t *ns = net_get_stats();
+            const tcp_diag_t *td = tcp_diag();
+            u32 tcap = 0, tinuse = 0, tlisten = 0;
+            tcp_table_stats(&tcap, &tinuse, &tlisten);
+            struct tls_diag_snapshot ts;
+            tls_diag_snapshot(&ts);
+            if (fr + 1U < fend)
+                fr++;   /* spacer */
+            if (fr < fend) {
+                fb_set_cursor(dc, fr++);
+                fb_set_color(C_YEL, 0x00000000);
+                fb_puts("NET STACK HEALTH");
+            }
+            if (fr < fend) {
+                fb_set_cursor(dc, fr++);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("IP rx=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", (u32)ns->rx_packets);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" tx=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", (u32)ns->tx_packets);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" cksm=");
+                fb_set_color(ns->drop_bad_cksum ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%u", (u32)ns->drop_bad_cksum);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" ovsz=");
+                fb_set_color(ns->drop_oversized ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%u", (u32)ns->drop_oversized);
+            }
+            if (fr < fend) {
+                fb_set_cursor(dc, fr++);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("TCP tbl=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u/%u", tinuse, tcap);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" nolis=");
+                fb_set_color(td->no_listener ? C_YEL : C_WHT, 0x00000000);
+                fb_printf("%u", (u32)td->no_listener);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" pfull=");
+                fb_set_color(td->pending_full ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%u", (u32)td->pending_full);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" txfail=");
+                fb_set_color(td->tx_send_fail ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%u", (u32)td->tx_send_fail);
+            }
+            if (fr < fend) {
+                fb_set_cursor(dc, fr++);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("TLS rx=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", (u32)ts.records_rx);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" tx=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", (u32)ts.records_tx);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" dec!=");
+                fb_set_color(ts.decrypt_failures ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%u", (u32)ts.decrypt_failures);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" err=");
+                fb_set_color(ts.last_error ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%x", ts.last_error);
+            }
+            for (u32 bi = 0; bi < UHTTP_BRIDGE_COUNT && fr < fend; bi++) {
+                i32 lc = -1; u32 st = 0, rq = 0, rs = 0, rqs = 0, mg = 0, pid = 0;
+                uhttp_bridge_state_idx(bi, &lc, &st, &rq, &rs, &rqs, &mg, &pid);
+                u32 lag = (rq >= rs) ? (rq - rs) : 0U;
+                fb_set_cursor(dc, fr++);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("FWD :");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", bi == 0U ? UHTTP_PORT : UHTTP_NATIVE_PORT);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" req=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", rqs);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" lag=");
+                fb_set_color(lag > 1U ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%u", lag);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(mg == UHTTP_BRIDGE_MAGIC ? " ok" : " BAD");
+                fb_set_color(mg == UHTTP_BRIDGE_MAGIC ? C_GRN : C_RED, 0x00000000);
+            }
+        }
+
+        /* ---- INTERRUPTS / WATCHDOG / TIMER ---- the liveness layer. SW = the
+         * core0 reactor wake/sleep (SEV/WFE) counts; HW = GIC IRQ totals incl.
+         * the ETH RX IRQ that drives the network plane; WDOG = hardware
+         * watchdog arm state + seconds-to-reset + trips. If HW IRQ or ETH stop
+         * climbing while traffic flows, the board has fallen back to poll-only
+         * (or wedged); a shrinking WDOG remaining with no pets = imminent reset. */
+        {
+            struct irq_diag_snapshot id;
+            irq_diag_snapshot(&id);
+            struct watchdog_status wd;
+            watchdog_status(&wd);
+            u64 wk = 0, wf = 0, it = 0, tt = 0; u32 bp = 0, lf = 0;
+            core0_sched_snapshot(&wk, &wf, &it, &tt, &bp, &lf);
+            u32 wdog_rem = watchdog_hw_remaining_ticks();
+            if (fr + 1U < fend)
+                fr++;   /* spacer */
+            if (fr < fend) {
+                fb_set_cursor(dc, fr++);
+                fb_set_color(C_YEL, 0x00000000);
+                fb_puts("INTERRUPTS / WDOG / TIMER");
+            }
+            if (fr < fend) {
+                fb_set_cursor(dc, fr++);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("SW wake=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", (u32)wk);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" wfi=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", (u32)wf);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" busy=");
+                fb_set_color(bp > 900U ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%u", bp);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("pm");
+            }
+            if (fr < fend) {
+                fb_set_cursor(dc, fr++);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("HW irq=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", (u32)id.total);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" tmr=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", (u32)id.timer);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" spur=");
+                fb_set_color(id.spurious ? C_YEL : C_WHT, 0x00000000);
+                fb_printf("%u", (u32)id.spurious);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" unh=");
+                fb_set_color(id.unhandled ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%u", (u32)id.unhandled);
+            }
+            if (fr < fend) {
+                fb_set_cursor(dc, fr++);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("ETH irq=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", (u32)core0_eth_irq_count);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" qpass=");
+                fb_set_color(core0_eth_irq_quench_passes > 4U ? C_YEL : C_WHT, 0x00000000);
+                fb_printf("%u", core0_eth_irq_quench_passes);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" lastID=");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", id.last_intid);
+            }
+            if (fr < fend) {
+                fb_set_cursor(dc, fr++);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("WDOG ");
+                fb_set_color(wd.armed ? C_GRN : C_RED, 0x00000000);
+                fb_puts(wd.armed ? "armed" : "OFF");
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" rst_in=");
+                /* RSTC watchdog ticks run at ~65536 Hz on BCM2712. */
+                fb_set_color(wdog_rem < (65536U) ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%u", wdog_rem >> 16);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("s trip=");
+                fb_set_color(wd.trip_count ? C_RED : C_WHT, 0x00000000);
+                fb_printf("%u", (u32)wd.trip_count);
+            }
+        }
+
+        if (fr + 1U < fend)
+            fr++;   /* spacer */
+        if (fr < fend) {
+            /* OTA state: READY (idle) -> UPLOADING (blocks streaming in) ->
+             * ARMED (whole image staged, about to flash+reboot). */
+            fb_set_cursor(dc, fr++);
+            fb_set_color(C_YEL, 0x00000000);
+            fb_puts("OTA: ");
+            bool ota_up = ota_update.active && ota_update.received < ota_update.total;
+            bool ota_armed = ota_update.active && ota_update.total != 0 &&
+                             ota_update.received >= ota_update.total;
+            if (ota_armed) {
+                fb_set_color(C_RED, 0x00000000);
+                fb_puts("ARMED");
+            } else if (ota_up) {
+                fb_set_color(C_YEL, 0x00000000);
+                fb_puts("UPLOADING");
+            } else {
+                fb_set_color(C_GRN, 0x00000000);
+                fb_puts("READY");
+            }
+            if (ota_update.total) {
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts(" ");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%u", ota_update.received >> 10);
+                fb_set_color(C_GRY, 0x00000000);
+                fb_puts("/");
+                fb_set_color(C_WHT, 0x00000000);
+                fb_printf("%uKB", ota_update.total >> 10);
+            }
+        }
+        if (fr < fend) {
+            fb_set_cursor(dc, fr++);
+            dash_kv_u32("commits=", ota_update.commits);
+            fb_puts(" ");
+            fb_set_color(C_GRY, 0x00000000);
+            fb_puts("staged=");
+            fb_set_color((ota_stage_buf != NULL) ? C_GRN : C_RED, 0x00000000);
+            fb_puts((ota_stage_buf != NULL) ? "y" : "n");
+        }
+    }
+
     g_dash_render_ticks = dash_now_ticks() - t_dash1;
 }
 
@@ -15579,17 +18030,33 @@ static void core0_io_tick_hook(u32 core, u64 tick)
 
     u32 flags = 0;
     /* UART/USB stay responsive (~31Hz, cheap polls). NET/TCP drop to ~8Hz as a
-     * safety net now that RX is interrupt-driven. DASH (the expensive HDMI
-     * render) fires at 1Hz; the render itself self-throttles (see
-     * hdmi_dashboard_render). Timer is 1000Hz, so 1000 ticks == 1 second. */
+     * safety net now that RX is interrupt-driven. DASH is framebuffer-heavy but
+     * cheap now that caches are alive, so refresh it at 1Hz (see offset note
+     * below). */
     if ((tick & 31U) == 0)
         flags |= CORE0_IO_UART | CORE0_IO_USB;
-    if ((tick & 127U) == 0)
+    /* NET/TCP at a single fixed 128Hz. ONE deterministic cadence — no hot/idle
+     * state machine (that would add a second mode whose transition timing makes
+     * load behaviour non-reproducible and hard to diagnose). The RP1 ETH RX IRQ
+     * is meant to wake these per-packet but its delivery is unreliable under
+     * load, so this timer poll is the real driver. 8Hz capped HTTP at ~3-8 req/s
+     * and let SYNs sit in the ring under concurrency (connect failures + 2-4s
+     * latency); 128Hz cuts per-request latency ~16x and drains RX 16x more
+     * often. The empty-ring poll is cheap, so idle CPU stays low. */
+    if ((tick & 7U) == 0)
         flags |= CORE0_IO_NET | CORE0_IO_TCP;
     if ((tick % 100U) == 0)
         flags |= CORE0_IO_MAINT;
+    /* Dashboard renders at 1Hz. The CPU-clock perf measurement also samples at
+     * 1Hz, but offset by half a second (tick%1000==500) so its spin/PMU window
+     * never lands on the same tick as the framebuffer-heavy render: this spreads
+     * core0 load across the second and guarantees each render reads a sample at
+     * most ~500ms old. Add future periodic perf captures on their own offset
+     * (e.g. ==250/==750) to keep one heavy job per tick. */
     if ((tick % 1000U) == 0)
         flags |= CORE0_IO_DASH;
+    if ((tick % 1000U) == 500U)
+        flags |= CORE0_IO_CPUCLK;
     if (flags) {
         core0_io_flags |= flags;
         sev();
@@ -15766,7 +18233,7 @@ NORETURN void core0_main(void) {
 
     timer_set_tick_hook(core0_io_tick_hook);
     core0_io_flags = CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART |
-                     CORE0_IO_USB | CORE0_IO_MAINT | CORE0_IO_DASH;
+                     CORE0_IO_USB | CORE0_IO_MAINT | CORE0_IO_DASH | CORE0_IO_CPUCLK;
     core0_io_sched_start_ticks = sched_counter_ticks();
 #if PIOS_HAS_BOOTINFO_FB
     bool dash_fb_ok = fb_init(1920, 1080) || fb_init(1280, 720) || fb_init(1024, 768);
@@ -15788,9 +18255,14 @@ NORETURN void core0_main(void) {
     for (;;) {
         u32 flags = core0_io_take_flags();
         if (flags == 0) {
+            watchdog_hw_pet();
             core0_io_wfi_count++;
             u64 idle_start = sched_counter_ticks();
-            wfi();
+            /* WFI can return immediately while an event/interrupt condition is
+             * still observable on this Pi5 path. Drain a stale SEV event, then
+             * sleep until the next timer/IRQ/SEV so core0 does not hot-spin. */
+            wfe();
+            wfe();
             u64 idle_end = sched_counter_ticks();
             if (idle_end >= idle_start)
                 core0_io_idle_ticks += idle_end - idle_start;
@@ -15803,6 +18275,14 @@ NORETURN void core0_main(void) {
         if (flags & CORE0_IO_NET) {
             u64 svc_start = ksvc_begin(ksvc_net_id);
             net_poll();
+#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+            /* Self-heal a latched RX-overrun stall (BNA/OVR). A burst that
+             * outran the drain leaves GEM with the ring full and RX DMA halted;
+             * without this the NIC stays wedged (rx_idx frozen) even after the
+             * load stops. Recover, then drain the freshly-restarted ring. */
+            if (macb_rx_recover())
+                net_poll();
+#endif
             dns_poll();
             if (core0_eth_irq_deferred_quench) {
                 core0_eth_irq_drain_and_quench(false);
@@ -15838,6 +18318,9 @@ NORETURN void core0_main(void) {
 
         if ((flags & CORE0_IO_DASH) && ui_mode == UI_MODE_NONE)
             ksvc_run(ksvc_dashboard_id);
+
+        if (flags & CORE0_IO_CPUCLK)
+            perf_cpu_clock_measure(2000U);
 
         fb_present();   /* flush any dirty back-buffer rows to the scanout */
         watchdog_hw_pet();
@@ -16451,7 +18934,7 @@ void kernel_main(void) {
 #endif
 #if PIOS_ENABLE_CACHE_REMAP
         mmu_enable_caching();
-        bp_ok("[mmu] cache map: core-RAM+FB WB-IS, DMA/FIFO/IPC NC");
+        bp_ok("[mmu] cache map: code+core-RAM+FB WB-IS, bss/stacks/DMA/FIFO/IPC NC");
 #else
         bp_warn("[mmu] cache remap GATED (PIOS_ENABLE_CACHE_REMAP=0)");
 #endif
@@ -16552,6 +19035,9 @@ void kernel_main(void) {
     bp_log("[ipc] ipc_stream_init...");
     ipc_stream_init();
     ipc_proc_init();
+    lease_init();   /* lease fabric (P0): descriptor-ownership pool init */
+    ota_staging_init();   /* pre-allocate OTA RAM staging so uploads don't block core0 on SD */
+    http_conns_init();    /* allocate the multi-connection HTTP :80 pool */
     bp_log("[ipc] pipe_init...");
     pipe_init();
     bp_ok("[ipc] all channels ready");
@@ -16686,6 +19172,8 @@ void kernel_main(void) {
     /* Native VideoCore visibility probe, then GPU + Tensor. */
     bp_log("[vc] native probe...");
     videocore_init();
+    vc_display_init();
+    vc_display_probe_native();
     bp_ok(PIOS_ENABLE_NATIVE_VIDEOCORE ? "[vc] native probe complete" :
                                           "[vc] native probe disabled");
     bp_log("[gpu] tensor_init...");

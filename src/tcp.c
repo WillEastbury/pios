@@ -17,6 +17,7 @@
 #include "simd.h"
 #include "uart.h"
 #include "timer.h"
+#include "highmem.h"
 
 /* Provided by net.c */
 extern u32 net_get_our_ip(void);
@@ -45,7 +46,7 @@ extern u32 net_get_our_ip(void);
 #define CLOSE_STATE_MS      1500
 #define MAX_RETRIES         8
 
-#define LISTEN_BACKLOG      4
+#define LISTEN_BACKLOG      64
 #define TCP_DMA_COPY_THRESHOLD 256U
 #define TCP_UART_DIAG_VERBOSE 0
 
@@ -247,9 +248,43 @@ struct tcb {
         u32 irs;        /* client ISN */
         u32 iss;        /* our ISN (from SYN cookie) */
     } pending[LISTEN_BACKLOG];
+
+    /* Intrusive links for the O(1) connection table (see below). */
+    i32 hash_next;      /* next tcb index in this hash bucket, -1 = end */
+    i32 free_next;      /* next free tcb index when on the free list, -1 = end */
 };
 
-static struct tcb tcbs[TCP_MAX_CONNECTIONS];
+/* ── Scaled connection table ──────────────────────────────────────────
+ * PIOS is network-first: the connection table is sized for tens of thousands
+ * of concurrent connections and lives in high RAM (highmem_alloc), NOT .bss.
+ * The per-packet hot path (tcb_find) is O(1) via an intrusive hash on the
+ * 4-tuple; allocation is O(1) via a free list; listeners are tracked in a tiny
+ * separate registry so tcb_find_listen stays O(listeners). If highmem is
+ * unavailable (e.g. QEMU/probe-fail) we fall back to a small static table so
+ * the board still boots. TCP_MAX_CONNECTIONS (tcp.h) is unchanged — it remains
+ * the *snapshot/display* cap used by external stack arrays. */
+#define TCP_TABLE_TARGET    16384U   /* highmem table capacity (network-first) */
+#define TCP_TABLE_FALLBACK  128U     /* static .bss table if highmem unavailable */
+#define TCP_MAX_LISTENERS   32U
+
+static struct tcb  tcbs_fallback[TCP_TABLE_FALLBACK];
+static i32         hash_fallback[256];
+static struct tcb *tcbs;             /* points at fallback or highmem array */
+static i32        *tcb_hash;         /* hash bucket heads (index, -1 = empty) */
+static u32         tcb_capacity;     /* live table capacity */
+static u32         tcb_hash_mask;    /* bucket count - 1 (power of two) */
+static i32         tcb_free_head = -1;
+static u32         tcb_inuse;        /* live (non-free) tcb count, diag */
+static i32         tcp_listeners[TCP_MAX_LISTENERS];
+static u32         tcp_listener_count;
+
+static inline u32 tcb_hash_key(u16 local_port, u32 remote_ip, u16 remote_port) {
+    u32 h = (u32)local_port * 2654435761U;
+    h ^= remote_ip * 2246822519U;
+    h ^= ((u32)remote_port << 16) * 3266489917U;
+    h ^= h >> 15;
+    return h & tcb_hash_mask;
+}
 static u32 tcp_local_ip;
 static u8  tcp_local_mac[6];
 static u16 tcp_ip_id;
@@ -289,10 +324,40 @@ static bool seq_lt(u32 a, u32 b)  { return (i32)(a - b) < 0; }
 static bool seq_le(u32 a, u32 b)  { return (i32)(a - b) <= 0; }
 static bool seq_gt(u32 a, u32 b)  { return (i32)(a - b) > 0; }
 
+static i32 tcb_index(const struct tcb *t) {
+    return (i32)(t - tcbs);
+}
+
+/* Insert an active (4-tuple-bearing) tcb into the hash. Call after the 4-tuple
+ * + state are set in connect/accept. Listeners do NOT go in this hash. */
+static void tcb_hash_insert(struct tcb *t) {
+    u32 b = tcb_hash_key(t->local_port, t->remote_ip, t->remote_port);
+    t->hash_next = tcb_hash[b];
+    tcb_hash[b] = tcb_index(t);
+}
+
+/* Remove a tcb from the hash (uses its current 4-tuple to find the bucket). */
+static void tcb_hash_remove(struct tcb *t) {
+    u32 b = tcb_hash_key(t->local_port, t->remote_ip, t->remote_port);
+    i32 idx = tcb_index(t);
+    i32 cur = tcb_hash[b];
+    i32 prev = -1;
+    while (cur >= 0) {
+        if (cur == idx) {
+            if (prev < 0) tcb_hash[b] = t->hash_next;
+            else          tcbs[prev].hash_next = t->hash_next;
+            t->hash_next = -1;
+            return;
+        }
+        prev = cur;
+        cur = tcbs[cur].hash_next;
+    }
+}
+
 static struct tcb *tcb_find(u32 local_port, u32 remote_ip, u16 remote_port) {
-    for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++) {
-        struct tcb *t = &tcbs[i];
-        if (t->state == TCP_CLOSED) continue;
+    u32 b = tcb_hash_key((u16)local_port, remote_ip, remote_port);
+    for (i32 cur = tcb_hash[b]; cur >= 0; cur = tcbs[cur].hash_next) {
+        struct tcb *t = &tcbs[cur];
         if (t->local_port == local_port &&
             t->remote_ip == remote_ip &&
             t->remote_port == remote_port)
@@ -301,9 +366,23 @@ static struct tcb *tcb_find(u32 local_port, u32 remote_ip, u16 remote_port) {
     return NULL;
 }
 
+static void tcp_listener_register(i32 idx) {
+    if (tcp_listener_count < TCP_MAX_LISTENERS)
+        tcp_listeners[tcp_listener_count++] = idx;
+}
+
+static void tcp_listener_unregister(i32 idx) {
+    for (u32 i = 0; i < tcp_listener_count; i++) {
+        if (tcp_listeners[i] == idx) {
+            tcp_listeners[i] = tcp_listeners[--tcp_listener_count];
+            return;
+        }
+    }
+}
+
 static struct tcb *tcb_find_listen(u16 port) {
-    for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++) {
-        struct tcb *t = &tcbs[i];
+    for (u32 i = 0; i < tcp_listener_count; i++) {
+        struct tcb *t = &tcbs[tcp_listeners[i]];
         if (t->state == TCP_LISTEN && t->local_port == port)
             return t;
     }
@@ -311,18 +390,18 @@ static struct tcb *tcb_find_listen(u16 port) {
 }
 
 static struct tcb *tcb_alloc(void) {
-    for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++)
-        if (tcbs[i].state == TCP_CLOSED)
-            return &tcbs[i];
-    return NULL;
-}
-
-static i32 tcb_index(const struct tcb *t) {
-    return (i32)(t - tcbs);
+    if (tcb_free_head < 0)
+        return NULL;
+    i32 idx = tcb_free_head;
+    struct tcb *t = &tcbs[idx];
+    tcb_free_head = t->free_next;
+    t->free_next = -1;
+    tcb_inuse++;
+    return t;
 }
 
 static bool tcb_valid(tcp_conn_t c) {
-    return c >= 0 && c < TCP_MAX_CONNECTIONS && tcbs[c].state != TCP_CLOSED;
+    return c >= 0 && (u32)c < tcb_capacity && tcbs[c].state != TCP_CLOSED;
 }
 
 #if TCP_UART_DIAG_VERBOSE
@@ -895,8 +974,20 @@ static void cc_on_timeout(struct tcb *t) {
 /* ================================================================== */
 
 static void tcb_reset(struct tcb *t) {
-    simd_zero(t, sizeof(struct tcb));
-    t->state = TCP_CLOSED;
+    u32 st = t->state;
+    if (st == TCP_CLOSED)
+        return;   /* already free — never double-link onto the free list */
+    i32 idx = tcb_index(t);
+    if (st == TCP_LISTEN)
+        tcp_listener_unregister(idx);
+    else
+        tcb_hash_remove(t);   /* active conn: unlink from the 4-tuple hash */
+    simd_zero(t, sizeof(struct tcb));   /* state -> TCP_CLOSED (0) */
+    t->hash_next = -1;
+    t->free_next = tcb_free_head;
+    tcb_free_head = idx;
+    if (tcb_inuse)
+        tcb_inuse--;
 }
 
 /* ================================================================== */
@@ -1292,7 +1383,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
 void tcp_tick(void) {
     u64 now = tcp_now_ms();
 
-    for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+    for (u32 i = 0; i < tcb_capacity; i++) {
         struct tcb *t = &tcbs[i];
         if (t->state == TCP_CLOSED || t->state == TCP_LISTEN)
             continue;
@@ -1360,8 +1451,64 @@ void tcp_tick(void) {
 /* ================================================================== */
 
 void tcp_init(void) {
-    for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++)
-        tcb_reset(&tcbs[i]);
+    /* Pick the connection table. Network-first: prefer a large highmem table
+     * (tens of thousands of connections) with an O(1) hash; fall back to a
+     * small static .bss table if highmem is unavailable so the board always
+     * boots and serves. The hot path (tcb_find per packet) is O(1) regardless. */
+    struct highmem_status hm;
+    highmem_status(&hm);
+    struct tcb *table = tcbs_fallback;
+    i32 *hash = hash_fallback;
+    u32 cap = TCP_TABLE_FALLBACK;
+    u32 nbuckets = (u32)(sizeof(hash_fallback) / sizeof(hash_fallback[0]));
+    if (tcbs != NULL) {
+        /* Re-init (e.g. network reconfigure): reuse the already-allocated table
+         * — highmem_alloc never frees, so do not leak a fresh ~150MB table. */
+        table = tcbs;
+        hash = tcb_hash;
+        cap = tcb_capacity;
+        nbuckets = tcb_hash_mask + 1U;
+    } else if (hm.ready) {
+        u32 nb = 1;
+        while (nb < TCP_TABLE_TARGET * 2U)
+            nb <<= 1;
+        /* Allocate the SMALL hash first; only then the large table. highmem is a
+         * bump allocator that never frees, so if the (hundreds-of-MB) table
+         * allocation failed AFTER a successful table-then-hash order, that whole
+         * table would be permanently leaked. Allocating the tiny hash first
+         * bounds the worst-case leak to the hash itself (and if the hash fails we
+         * never attempt the table) before falling back to the static table. */
+        i32 *hh = (i32 *)highmem_alloc((u64)nb * sizeof(i32), 64);
+        struct tcb *ht = hh
+            ? (struct tcb *)highmem_alloc((u64)TCP_TABLE_TARGET * sizeof(struct tcb), 64)
+            : NULL;
+        if (ht && hh) {
+            table = ht;
+            hash = hh;
+            cap = TCP_TABLE_TARGET;
+            nbuckets = nb;
+        }
+    }
+    tcbs = table;
+    tcb_hash = hash;
+    tcb_capacity = cap;
+    tcb_hash_mask = nbuckets - 1U;
+
+    /* Empty all hash buckets. */
+    for (u32 i = 0; i < nbuckets; i++)
+        hash[i] = -1;
+
+    /* Mark every slot CLOSED and thread the free list 0 -> 1 -> ... -> -1.
+     * Other tcb fields stay garbage until tcb_alloc's caller simd_zero()s the
+     * slot, so we avoid zeroing the whole (up to ~134MB) highmem table. */
+    for (u32 i = 0; i < cap; i++) {
+        table[i].state     = TCP_CLOSED;
+        table[i].hash_next = -1;
+        table[i].free_next = (i + 1U < cap) ? (i32)(i + 1U) : -1;
+    }
+    tcb_free_head = 0;
+    tcb_inuse = 0;
+    tcp_listener_count = 0;
 
     nic_get_mac(tcp_local_mac);
     tcp_local_ip = net_get_our_ip();
@@ -1401,6 +1548,7 @@ tcp_conn_t tcp_connect(u32 dst_ip, u16 dst_port) {
 
     /* Send SYN */
     t->state = TCP_SYN_SENT;
+    tcb_hash_insert(t);
     tcp_send_segment(t, TCP_SYN, NULL, 0);
     tcp_diag_counts.active_syn_sent++;
     tcp_diag_active_tuple(t);
@@ -1420,6 +1568,7 @@ tcp_conn_t tcp_listen(u16 port) {
     t->state      = TCP_LISTEN;
     t->rcv_wnd    = TCP_DEFAULT_WINDOW;
 
+    tcp_listener_register(tcb_index(t));
     return tcb_index(t);
 }
 
@@ -1461,6 +1610,7 @@ tcp_conn_t tcp_accept(tcp_conn_t listen_conn) {
     cc_init(t);
 
     t->state = TCP_ESTABLISHED;
+    tcb_hash_insert(t);
     tcp_diag_counts.accepted++;
     tcp_log_established(t, "accepted");
     return tcb_index(t);
@@ -1515,14 +1665,14 @@ void tcp_close(tcp_conn_t conn) {
 
 void tcp_abort(tcp_conn_t conn)
 {
-    if (conn < 0 || conn >= TCP_MAX_CONNECTIONS)
+    if (conn < 0 || (u32)conn >= tcb_capacity)
         return;
     tcb_reset(&tcbs[conn]);
 }
 
 void tcp_purge_port(u16 local_port)
 {
-    for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+    for (u32 i = 0; i < tcb_capacity; i++) {
         struct tcb *t = &tcbs[i];
         if (t->state == TCP_CLOSED)
             continue;
@@ -1537,7 +1687,7 @@ void tcp_purge_port(u16 local_port)
 }
 
 u32 tcp_state(tcp_conn_t conn) {
-    if (conn < 0 || conn >= TCP_MAX_CONNECTIONS)
+    if (conn < 0 || (u32)conn >= tcb_capacity)
         return TCP_CLOSED;
     return tcbs[conn].state;
 }
@@ -1569,7 +1719,7 @@ u32 tcp_tx_pending(tcp_conn_t conn) {
 u32 tcp_active_count(void)
 {
     u32 n = 0;
-    for (u32 i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+    for (u32 i = 0; i < tcb_capacity; i++) {
         u32 st = tcbs[i].state;
         if (st != TCP_CLOSED && st != TCP_LISTEN)
             n++;
@@ -1582,7 +1732,7 @@ u32 tcp_snapshot(tcp_snapshot_entry_t *out, u32 max)
     if (!out || max == 0)
         return 0;
     u32 n = 0;
-    for (u32 i = 0; i < TCP_MAX_CONNECTIONS && n < max; i++) {
+    for (u32 i = 0; i < tcb_capacity && n < max; i++) {
         struct tcb *t = &tcbs[i];
         if (t->state == TCP_CLOSED)
             continue;
@@ -1605,4 +1755,11 @@ u32 tcp_snapshot(tcp_snapshot_entry_t *out, u32 max)
 const tcp_diag_t *tcp_diag(void)
 {
     return &tcp_diag_counts;
+}
+
+void tcp_table_stats(u32 *capacity, u32 *inuse, u32 *listeners)
+{
+    if (capacity)  *capacity = tcb_capacity;
+    if (inuse)     *inuse = tcb_inuse;
+    if (listeners) *listeners = tcp_listener_count;
 }

@@ -16,14 +16,15 @@ MMIO CSD submission now performs an idle handshake before queue programming and 
 
 ## Available Operations
 
-| Operation | Function | NEON Instructions Used |
-|-----------|----------|----------------------|
-| Element-wise add | `tensor_add(c, a, b)` | `ld1`, `fadd`, `st1` |
-| Element-wise multiply | `tensor_mul(c, a, b)` | `ld1`, `fmul`, `st1` |
+| Operation | Function | Accelerated path |
+|-----------|----------|------------------|
+| Element-wise add | `tensor_add(c, a, b)` | Native V3D CSD for up to 1024 floats when 16-aligned; NEON fallback |
+| Element-wise multiply | `tensor_mul(c, a, b)` | Native V3D CSD for up to 1024 floats when 16-aligned; NEON fallback |
 | Scalar multiply | `tensor_scale(b, a, s)` | `dup`, `fmul`, `st1` |
-| Dot product | `tensor_dot(&result, a, b)` | `fmla` (fused multiply-accumulate), `faddp` (pairwise reduce); forced NEON path pending V3D scalar writeback plumbing |
-| Matrix multiply | `tensor_matmul(c, a, b)` | Scalar inner loop (NEON for row operations) |
-| ReLU | `tensor_relu(b, a)` | `fmax` with zero vector |
+| Dot product | `tensor_dot(&result, a, b)` | V3D multiply into a temporary for up to 1024 floats, ARM reduction; NEON fallback |
+| Matrix-vector | `tensor_matmul(c, a, x)` (x is a column) | Single fused GPU dispatch: broadcast x across rows, one V3D multiply over the m*K matrix (m*K up to 1024), ARM row-reduce; NEON fallback |
+| Matrix multiply | `tensor_matmul(c, a, b)` | V3D-assisted dot chunks for small/medium inner dimensions; NEON fallback |
+| ReLU | `tensor_relu(b, a)` | Native V3D CSD for up to 1024 floats when 16-aligned; NEON fallback |
 | Softmax | `tensor_softmax(b, a)` | Schraudolph exp approximation + NEON lane-sum normalize; optional V3D dispatch when a bound softmax kernel exists |
 
 ## Tensor Lifecycle
@@ -77,6 +78,37 @@ qpu_dispatch(&prog, jobs, num_qpus); // Submit to 1-12 QPUs
 qpu_free_program(&prog);
 ```
 
-For real bound kernels, the V3D layer now exposes `v3d_kernel_bind_blob(...)` to upload externally generated uniform/shader blobs into GPU-coherent memory and bind them into the dispatch descriptor table.
+For real bound kernels, the V3D layer now exposes `v3d_kernel_bind_blob(...)` to upload externally generated uniform/shader blobs into GPU-coherent memory and bind them into the dispatch descriptor table. Native CSD bring-up additionally exposes `v3d_kernel_bind_csd(...)`, `v3d_kernel_bind_builtin_qpu_grid(...)`, and an admin-gated user API `tensor_bind_kernel_csd(...)` for binding exact CSD `cfg[0..6]` words.
 
-VideoCore VII has 12 QPUs (3 slices × 4), each a 4-wide float SIMD unit at 800MHz. Peak theoretical: 76.8 GFLOPS. The VC VII ISA is still incomplete publicly, so the production path remains NEON unless valid kernel blobs are explicitly bound in the V3D layer.
+VideoCore VII has 12 QPUs (3 slices × 4), each a 4-wide float SIMD unit at 800MHz. Peak theoretical: 76.8 GFLOPS. The VC VII ISA is still incomplete publicly, so V3D paths remain verification-gated and quarantine on mismatch.
+
+## Native V3D bring-up checklist
+
+Native V3D work is guarded by default-off switches:
+
+```c
+#define PIOS_ENABLE_NATIVE_VIDEOCORE 1
+#define PIOS_ENABLE_NATIVE_V3D_COMPUTE 1
+#define PIOS_ENABLE_TINY_QPU_KERNELS 1
+```
+
+Bring-up order:
+
+1. Boot with `PIOS_ENABLE_NATIVE_VIDEOCORE=1` only and run `qpu status`. Expect `native=yes`, V3D tech version `tv=71`, and sane core/QPU/MMU fields.
+2. Add `PIOS_ENABLE_NATIVE_V3D_COMPUTE=1`. Expect `nmmu=yes`, `nself=yes`, idle CSD status, and no MMU fault output.
+3. Add `PIOS_ENABLE_TINY_QPU_KERNELS=1` and run one-element `tensor_add` / `tensor_relu` trials. These use Mesa-emitted QPU words from `include/v3d_tiny_qpu.h`, verify output against NEON, and quarantine on mismatch.
+4. After one-workgroup verification succeeds, expand with Mesa-generated tensor kernels and keep each new primitive behind output verification and quarantine.
+
+Live Pi5 coverage as of `v20260617.230x`:
+
+- `tensor vector16`, `tensor vector128 direct`, and `tensor vector128` pass on native V3D CSD.
+- `tensor matvec128` runs as a single fused GPU dispatch: x is broadcast across rows, one loop-free `vector_mulN` multiplies the whole m*K matrix, then rows are reduced on ARM. `tensor matmul64` (multi-column) composes verified V3D multiplies with ARM reduction.
+- Direct multi-workgroup vector-N CSD requires `CFG3.MAX_SG_ID = workgroups_x - 1`; leaving it zero CSD-completed but only produced unique workgroup IDs for the first 32 lanes. CSD supergroup/batch packing (`CFG3` wgs-per-sg, batches-per-sg, `CFG4` num_batches) now mirrors Mesa's `v3d_csd_choose_workgroups_per_supergroup` for any workgroup size.
+- Production vector-N tries direct multi-workgroup CSD first with full output verification, then falls back to repeated verified 16-lane dispatches if direct-grid dispatch or verification fails.
+- A fused single-kernel matvec (`matvecN`, `V3D_KERNEL_MATVEC`) is generated and wired (host `--builtin matvecN`, device `tensor matvecn` diagnostic) but is NOT in the production path: its in-shader K-loop relies on V3D's in-loop uniform-pointer rewind (`r:unif` branches), and the direct MMIO CSD path does not yet drive that, so loop kernels complete CSD without storing. Loop-free kernels (vector add/mul/relu N) work; loop kernels are an open item.
+
+Generated host-side shader tooling lives in `tools/v3d_shaders/`:
+
+- `vector_add.comp`, `relu.comp` — GLSL reference sources.
+- `mesa_v3d_wrap.c` — standalone Mesa V3D compiler wrapper with builtins for store/load, vector16, vector-N, scale/AXPY, matvec16, and matmul4.
+- `compile_v3d_shaders.ps1` — generates SPIR-V and, when `build/mesa_v3d_wrap.exe` exists, QPU word dumps for all builtins.

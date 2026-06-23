@@ -161,13 +161,15 @@ static void map_user_kernel_low(u64 *l2)
 {
     for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++) {
         u64 pa = (u64)b * L2_BLOCK_SIZE;
-        /* Mirror the live kernel low-RAM attributes. After cache enable,
-         * l2_table_low[0] points at the mixed WB-code/NC-BSS L3 table and
-         * blocks 1..3 are NC. Before cache enable, fall back to the original
-         * all-NC low-RAM mapping. Never map kernel .bss/scheduler metadata WB
-         * here: SVC/ctx-switch code runs under the user TTBR and must not write
-         * process state through a cacheable alias that the kernel TTBR later
-         * reads through its NC alias. */
+        /* Mirror the live kernel low-RAM attributes EXACTLY by copying
+         * l2_table_low. After cache enable, l2_table_low[0] points at the
+         * WB-code/NC-.bss L3 table and blocks 1..3 (.bss/stacks/heap) are NC;
+         * before cache enable, fall back to the original all-NC low-RAM mapping.
+         * Copying verbatim guarantees the user TTBR and kernel TTBR always agree
+         * on the attribute for every physical address, so SVC/ctx-switch code
+         * running under the user TTBR can never write process/scheduler state
+         * through one cacheability that the kernel TTBR later reads through the
+         * other (the WB/NC alias that previously broke the multicore wake ring). */
         l2[b] = l2_table_low[b] ? l2_table_low[b] : ram_block_2m_nc(pa);
     }
 }
@@ -438,15 +440,16 @@ void mmu_enable_caching(void) {
     const u64 cache_fb_base = FB_BACK_BASE;                  /* 0x05000000 */
     const u64 cache_fb_end  = FB_BACK_BASE + FB_BACK_SIZE;   /* 0x06000000 */
 
-    /* Phase 2a: split block 0 (0x0-0x1FFFFF) into 4KB pages so the kernel's
-     * code + read-only data + initialised data window [__text_start,__bss_start)
-     * becomes Write-Back cacheable + Inner Shareable. Instruction fetch and
-     * .rodata reads (font glyph bitmaps, const tables) then hit the L1/L2 caches
-     * instead of stalling ~250ns/line on NC DRAM — this is what makes the HDMI
-     * dashboard render (instruction-fetch bound) fast. Everything else in block
-     * 0 — the low 512KB below the kernel and all of .bss (DMA descriptor
-     * rings/buffers, page tables, stacks) — stays Non-Cacheable, so no DMA
-     * master loses coherency and the page-table walker keeps reading NC tables. */
+    /* Split block 0 (0x0-0x1FFFFF) into 4KB pages so ONLY the kernel code +
+     * read-only/initialised data window [__text_start, __bss_start) is Write-Back
+     * cacheable + Inner Shareable; the low 512KB below the kernel and the head of
+     * .bss stay Non-Cacheable. Blocks 1-3 (0x200000-0x7FFFFF: rest of .bss, the
+     * per-core stacks, the heap) stay Non-Cacheable too (cache_lo_base starts at
+     * CORE0_RAM_BASE). This keeps every driver DMA buffer/descriptor that lives in
+     * .bss (MACB rings/bufs, etc.) coherent with its DMA master: with the caches
+     * now actually allocating (WB-from-boot fix), mapping that .bss WB caused the
+     * NIC to wedge under load. The dedicated per-core DMA arena (follow-up) will
+     * let us reclaim .bss WB while keeping DMA memory NC. */
     extern char __text_start[];
     extern char __bss_start[];
     const u64 code_lo = (u64)(usize)__text_start & ~(L3_PAGE_SIZE - 1);

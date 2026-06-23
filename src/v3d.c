@@ -1,9 +1,12 @@
 #include "v3d.h"
 
 #include "gpu.h"
+#include "highmem.h"
+#include "mailbox.h"
 #include "mmu.h"
 #include "mmio.h"
 #include "platform.h"
+#include "simd.h"
 #include "timer.h"
 #include "uart.h"
 #include "videocore.h"
@@ -15,11 +18,50 @@
 #define V3D_PI5_HUB_BASE         0x1002000000UL
 #define V3D_PI5_CORE0_BASE       0x1002008000UL
 #define V3D_PI5_SMS_BASE         0x1002030800UL
+#define V3D_PM_BASE              (PERIPH_BASE + 0x01200000UL)
+#define V3D_PM_GRAFX_2712_OFF    0x00000304U
+#define V3D_PM_PASSWORD          0x5A000000U
+#define V3D_PM_V3DRSTN           (1U << 6)
+#define V3D_FW_CLOCK_V3D         5U
+#define V3D_TAG_SET_CLOCK_STATE  0x00038001U
 #define V3D_IDENT0_OFF           0x000U
 #define V3D_IDENT1_OFF           0x004U
 #define V3D_IDENT2_OFF           0x008U
 #define V3D_MAX_TIMEOUT_MS       5000U
 #define V3D_DEFAULT_TIMEOUT_MS   25U
+#define V3D_L2TCACTL_OFF         0x00000030U
+#define V3D_L2TCACTL_TMUWCF      0x00000100U
+#define V3D_L2TCACTL_FLM_CLEAN   0x00000004U
+#define V3D_L2TCACTL_L2TFLS      0x00000001U
+#define V3D_SLCACTL_OFF          0x00000024U
+#define V3D_SLCACTL_INV_ALL      0x0F0F0F0FU
+#define V3D_L2TFLSTA_OFF         0x00000034U
+#define V3D_L2TFLEND_OFF         0x00000038U
+#define V3D_CORE_INT_STS_OFF     0x00000050U
+#define V3D_CORE_INT_CLR_OFF     0x00000058U
+#define V3D_CORE_INT_MSK_SET_OFF 0x00000060U
+#define V3D_CORE_INT_MSK_CLR_OFF 0x00000064U
+#define V3D_CORE_INT_CSDDONE_V71 (1U << 6)
+#define V3D_CORE_INT_FLDONE      (1U << 1)
+#define V3D_CORE_INT_FRDONE      (1U << 0)
+#define V3D_CORE_INT_OUTOMEM     (1U << 2)
+#define V3D_HUB_INT_STS_OFF      0x00000050U
+#define V3D_HUB_INT_CLR_OFF      0x00000058U
+#define V3D_HUB_INT_MSK_SET_OFF  0x00000060U
+#define V3D_HUB_INT_MSK_CLR_OFF  0x00000064U
+#define V3D_HUB_INT_TFUC         (1U << 1)
+#define V3D_HUB_INT_MMU_CAP      (1U << 3)
+#define V3D_HUB_INT_MMU_PTI      (1U << 4)
+#define V3D_HUB_INT_MMU_WRV      (1U << 5)
+#define V3D_HUB_INT_GMPV_V71     (1U << 6)
+#define V3D_ERR_STAT_OFF         0x00000F20U
+#define V3D_GMP_STATUS_V71_OFF   0x00000600U
+#define V3D_GMP_STATUS_CFG_BUSY  0x00000008U
+#define V3D_GMP_CFG_V71_OFF      0x00000604U
+#define V3D_GMP_CFG_PROT_ENABLE  0x00000001U
+#define V3D_GMP_VIO_ADDR_V71_OFF 0x00000608U
+#define V3D_GMP_TABLE_ADDR_OFF   0x00000810U
+#define V3D_GMP_CLEAR_LOAD_OFF   0x00000814U
 #define V3D_CSD_STATUS_OFF       0x3C00U
 #define V3D_CSD_QUEUED_CFG0_OFF  0x3C20U
 #define V3D_CSD_QUEUED_CFG1_OFF  0x3C24U
@@ -34,6 +76,9 @@
 #define V3D_MMU_PT_ENTRIES       1048576U
 #define V3D_MMU_IDENTITY_BYTES   0x40000000UL
 #define V3D_MMU_SCRATCH_BYTES    4096U
+#define V3D_MMU_PT_LOW_BASE      0x06000000UL
+#define V3D_TINY_BLOB_BASE       (PIOS_FB_BACK_BASE + 0x00F00000UL)
+#define V3D_TINY_BLOB_STRIDE     0x00000400UL
 
 #define V3D_PTE_WRITEABLE        0x20000000U
 #define V3D_PTE_VALID            0x10000000U
@@ -55,8 +100,10 @@
 #define V3D_MMU_CTL_TLB_CLEAR    0x00000004U
 #define V3D_MMU_CTL_ENABLE       0x00000001U
 #define V3D_MMU_PT_PA_BASE_OFF   0x00001204U
+#define V3D_MMU_VIO_ID_OFF       0x0000122CU
 #define V3D_MMU_ILLEGAL_ADDR_OFF 0x00001230U
 #define V3D_MMU_ILLEGAL_ADDR_ENABLE 0x80000000U
+#define V3D_MMU_VIO_ADDR_OFF     0x00001234U
 
 #define V3D_CSD_STATUS_OLD_OFF       0x00000900U
 #define V3D_CSD_QUEUED_CFG0_OLD_OFF  0x00000904U
@@ -74,9 +121,26 @@
 #define V3D_CSD_QUEUED_CFG4_V71_OFF  0x00000940U
 #define V3D_CSD_QUEUED_CFG5_V71_OFF  0x00000944U
 #define V3D_CSD_QUEUED_CFG6_V71_OFF  0x00000948U
+#define V3D_CSD_QUEUED_CFG7_V71_OFF  0x0000094CU
+#define V3D_CSD_CURRENT_CFG0_V71_OFF 0x00000958U
+#define V3D_CSD_CURRENT_CFG5_V71_OFF 0x0000096CU
+#define V3D_CSD_CURRENT_CFG6_V71_OFF 0x00000970U
 #define V3D_CSD_STATUS_BUSY_MASK     0x0000000FU
+#define V3D_CSD_STATUS_COMPLETED_MASK 0x00000FF0U
+#define V3D_CSD_CFG012_WG_COUNT_SHIFT 16U
+#define V3D_CSD_CFG3_WGS_PER_SG_SHIFT 8U
+#define V3D_CSD_CFG3_BATCHES_PER_SG_M1_SHIFT 12U
+#define V3D_CSD_CFG3_MAX_SG_ID_SHIFT 20U
+#define V3D_CSD_CFG3_WG_SIZE_SHIFT 0U
+#define V3D_CSD_CFG5_SINGLE_SEG      (1U << 1)
+#define V3D_CSD_CFG5_THREADING       (1U << 0)
+#define V3D_SMS_REE_CS_OFF           0x00000000U
+#define V3D_SMS_STATE_READY          0x00000004U
+#define V3D_SMS_STATE_MASK           0x0000000FU
 
 static struct v3d_caps g_v3d_caps;
+static struct v3d_csd_debug g_csd_debug;
+static struct v3d_reset_debug g_reset_debug;
 static bool g_mmio_auto_quarantined;
 static bool g_mmio_auto_warned;
 static u32 g_kernel_uniform_handle[V3D_KERNEL_MAX];
@@ -91,6 +155,10 @@ static struct v3d_kernel_desc g_kernels[V3D_KERNEL_MAX] = {
     [V3D_KERNEL_DOT]     = { .id = V3D_KERNEL_DOT,     .name = "dot",     .qpu_count = 8 },
     [V3D_KERNEL_SCALE]   = { .id = V3D_KERNEL_SCALE,   .name = "scale",   .qpu_count = 4 },
     [V3D_KERNEL_SOFTMAX] = { .id = V3D_KERNEL_SOFTMAX, .name = "softmax", .qpu_count = 8 },
+    [V3D_KERNEL_STORE_CONST] = { .id = V3D_KERNEL_STORE_CONST, .name = "store_const", .qpu_count = 4 },
+    [V3D_KERNEL_LOAD_STORE]  = { .id = V3D_KERNEL_LOAD_STORE,  .name = "load_store",  .qpu_count = 4 },
+    [V3D_KERNEL_STORE_SSBO]  = { .id = V3D_KERNEL_STORE_SSBO,  .name = "store_ssbo",  .qpu_count = 4 },
+    [V3D_KERNEL_NOOP]        = { .id = V3D_KERNEL_NOOP,        .name = "noop",        .qpu_count = 4 },
 };
 struct v3d_kernel_blob {
     u32 control_handle;
@@ -99,16 +167,63 @@ struct v3d_kernel_blob {
 };
 static struct v3d_kernel_blob g_kernel_blobs[V3D_KERNEL_MAX];
 #if PIOS_ENABLE_NATIVE_V3D_COMPUTE
-static u32 g_v3d_pt[V3D_MMU_PT_ENTRIES] ALIGNED(4096);
+static u32 *g_v3d_pt;
 static u8 g_v3d_scratch[V3D_MMU_SCRATCH_BYTES] ALIGNED(4096);
+static u32 g_tiny_store_uniforms[4] ALIGNED(64);
+static u32 g_tiny_store_ssbo_uniforms[4] ALIGNED(64);
+static u32 g_tiny_load_store_uniforms[4] ALIGNED(64);
+static u32 g_tiny_add_uniforms[4] ALIGNED(64);
+static u32 g_tiny_relu_uniforms[4] ALIGNED(64);
+static u64 g_tiny_store_shader[V3D_TINY_STORE_CONST_QPU_WORDS] ALIGNED(64);
+static u64 g_tiny_store_ssbo_shader[V3D_TINY_STORE_SSBO_QPU_WORDS] ALIGNED(64);
+static u64 g_tiny_load_store_shader[V3D_TINY_LOAD_STORE_QPU_WORDS] ALIGNED(64);
+static u64 g_tiny_add_shader[V3D_TINY_VECTOR_ADD_QPU_WORDS] ALIGNED(64);
+static u64 g_tiny_relu_shader[V3D_TINY_RELU_QPU_WORDS] ALIGNED(64);
+static u64 g_tiny_noop_shader[V3D_TINY_NOOP_QPU_WORDS] ALIGNED(64);
 #endif
 
 #if PIOS_ENABLE_NATIVE_V3D_COMPUTE
+static bool v3d_firmware_clock_enable(void)
+{
+    static volatile u32 mb[8] ALIGNED(16);
+    mb[0] = 8U * 4U;
+    mb[1] = 0;
+    mb[2] = V3D_TAG_SET_CLOCK_STATE;
+    mb[3] = 8;
+    mb[4] = 8;
+    mb[5] = V3D_FW_CLOCK_V3D;
+    mb[6] = 3; /* on + wait */
+    mb[7] = 0;
+    return mbox_call(MBOX_CH_PROP, mb);
+}
+
 static bool v3d_ident_plausible(u32 ident0)
 {
     if (ident0 == 0U || ident0 == 0xFFFFFFFFU)
         return false;
     return true;
+}
+
+/*
+ * Blind power-domain reset of the V3D block via the PM GRAFX register only.
+ * Touches NO V3D core MMIO (a wedged CSD queue can stall those reads, which is
+ * why the full v3d_pm_reset() path hangs). Asserting/deasserting PM_V3DRSTN
+ * power-cycles the V3D core and clears a CSD-queue wedge that survives a warm
+ * reboot (e.g. after an oversized synchronous dispatch storm). Safe to run on
+ * every boot before native init: the 3D/compute core reset is independent of
+ * the firmware-owned HVS/HDMI display path.
+ */
+static void v3d_blind_pm_reset(void)
+{
+    u64 pm_reg = V3D_PM_BASE + V3D_PM_GRAFX_2712_OFF;
+    u32 pm_before = mmio_read(pm_reg);
+    mmio_write(pm_reg, V3D_PM_PASSWORD | (pm_before & ~V3D_PM_V3DRSTN));
+    dsb();
+    timer_delay_ms(10);
+    mmio_write(pm_reg, V3D_PM_PASSWORD | (mmio_read(pm_reg) | V3D_PM_V3DRSTN));
+    dsb();
+    timer_delay_ms(10);
+    (void)v3d_firmware_clock_enable();
 }
 #endif
 
@@ -119,16 +234,22 @@ static void v3d_update_tiny_kernel_state(void)
 
     if (g_kernels[V3D_KERNEL_ADD].ready)
         g_v3d_caps.tiny_ready_mask |= (1U << V3D_KERNEL_ADD);
+    if (g_kernels[V3D_KERNEL_MUL].ready)
+        g_v3d_caps.tiny_ready_mask |= (1U << V3D_KERNEL_MUL);
     if (g_kernels[V3D_KERNEL_RELU].ready)
         g_v3d_caps.tiny_ready_mask |= (1U << V3D_KERNEL_RELU);
     if (g_kernels[V3D_KERNEL_ADD].verified)
         g_v3d_caps.tiny_verified_mask |= (1U << V3D_KERNEL_ADD);
+    if (g_kernels[V3D_KERNEL_MUL].verified)
+        g_v3d_caps.tiny_verified_mask |= (1U << V3D_KERNEL_MUL);
     if (g_kernels[V3D_KERNEL_RELU].verified)
         g_v3d_caps.tiny_verified_mask |= (1U << V3D_KERNEL_RELU);
 
     g_v3d_caps.native_tiny_kernels_ready =
-        ((g_v3d_caps.tiny_verified_mask & ((1U << V3D_KERNEL_ADD) | (1U << V3D_KERNEL_RELU))) ==
-         ((1U << V3D_KERNEL_ADD) | (1U << V3D_KERNEL_RELU)));
+        ((g_v3d_caps.tiny_verified_mask & ((1U << V3D_KERNEL_ADD) |
+                                           (1U << V3D_KERNEL_MUL) |
+                                           (1U << V3D_KERNEL_RELU))) ==
+         ((1U << V3D_KERNEL_ADD) | (1U << V3D_KERNEL_MUL) | (1U << V3D_KERNEL_RELU)));
 }
 
 static bool v3d_reg_allowed(u32 reg_off)
@@ -154,6 +275,18 @@ static u32 v3d_csd_cfg4_off(void) { return g_v3d_caps.tech_version >= 71U ? V3D_
 static u32 v3d_csd_cfg5_off(void) { return g_v3d_caps.tech_version >= 71U ? V3D_CSD_QUEUED_CFG5_V71_OFF : V3D_CSD_QUEUED_CFG5_OLD_OFF; }
 static u32 v3d_csd_cfg6_off(void) { return g_v3d_caps.tech_version >= 71U ? V3D_CSD_QUEUED_CFG6_V71_OFF : V3D_CSD_QUEUED_CFG6_OLD_OFF; }
 
+static u32 v3d_core_irq_mask(void)
+{
+    return V3D_CORE_INT_FLDONE | V3D_CORE_INT_FRDONE |
+           V3D_CORE_INT_OUTOMEM | V3D_CORE_INT_CSDDONE_V71;
+}
+
+static u32 v3d_hub_irq_mask(void)
+{
+    return V3D_HUB_INT_TFUC | V3D_HUB_INT_MMU_CAP | V3D_HUB_INT_MMU_PTI |
+           V3D_HUB_INT_MMU_WRV | V3D_HUB_INT_GMPV_V71;
+}
+
 #if PIOS_ENABLE_NATIVE_V3D_COMPUTE
 static bool v3d_wait_hub_clear(u32 reg_off, u32 mask, u32 timeout_us)
 {
@@ -177,6 +310,76 @@ static bool v3d_mmu_flush_all(void)
     return v3d_wait_hub_clear(V3D_MMU_CTL_OFF, V3D_MMU_CTL_TLB_CLEARING, 100U);
 }
 #endif
+
+static bool v3d_gmp_allow_all(void)
+{
+    if (!g_v3d_caps.mmio_probe_ok || g_v3d_caps.reg_base == 0U)
+        return false;
+    if (g_v3d_caps.tech_version < 71U)
+        return true;
+    mmio_write(g_v3d_caps.reg_base + V3D_GMP_CFG_V71_OFF, V3D_GMP_CFG_PROT_ENABLE);
+    mmio_write(g_v3d_caps.reg_base + V3D_GMP_TABLE_ADDR_OFF, 0U);
+    mmio_write(g_v3d_caps.reg_base + V3D_GMP_CLEAR_LOAD_OFF, 0xFFFFFFFFU);
+    for (u32 i = 0; i < 1000U; i++) {
+        if ((mmio_read(g_v3d_caps.reg_base + V3D_GMP_STATUS_V71_OFF) &
+             V3D_GMP_STATUS_CFG_BUSY) == 0U)
+            return true;
+        timer_delay_us(1);
+    }
+    return false;
+}
+
+static bool v3d_clean_caches(void)
+{
+    if (!g_v3d_caps.mmio_probe_ok || g_v3d_caps.reg_base == 0U)
+        return false;
+    mmio_write(g_v3d_caps.reg_base + V3D_L2TCACTL_OFF, V3D_L2TCACTL_TMUWCF);
+    for (u32 i = 0; i < 100U; i++) {
+        if ((mmio_read(g_v3d_caps.reg_base + V3D_L2TCACTL_OFF) & V3D_L2TCACTL_TMUWCF) == 0U)
+            break;
+        timer_delay_us(1);
+        if (i + 1U == 100U)
+            return false;
+    }
+
+    mmio_write(g_v3d_caps.reg_base + V3D_L2TCACTL_OFF,
+               V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_CLEAN);
+    for (u32 i = 0; i < 100U; i++) {
+        if ((mmio_read(g_v3d_caps.reg_base + V3D_L2TCACTL_OFF) & V3D_L2TCACTL_L2TFLS) == 0U)
+            return true;
+        timer_delay_us(1);
+    }
+    return false;
+}
+
+static void v3d_init_core_cache_state(void)
+{
+    if (!g_v3d_caps.mmio_probe_ok || g_v3d_caps.reg_base == 0U)
+        return;
+    mmio_write(g_v3d_caps.reg_base + V3D_L2TFLSTA_OFF, 0U);
+    mmio_write(g_v3d_caps.reg_base + V3D_L2TFLEND_OFF, 0xFFFFFFFFU);
+}
+
+static void v3d_invalidate_caches(void)
+{
+    if (!g_v3d_caps.mmio_probe_ok || g_v3d_caps.reg_base == 0U)
+        return;
+    mmio_write(g_v3d_caps.reg_base + V3D_L2TCACTL_OFF, V3D_L2TCACTL_L2TFLS);
+    mmio_write(g_v3d_caps.reg_base + V3D_SLCACTL_OFF, V3D_SLCACTL_INV_ALL);
+}
+
+static void v3d_sms_enter_ree(void)
+{
+    if (g_v3d_caps.tech_version < 71U || g_v3d_caps.sms_base == 0U)
+        return;
+    mmio_write(g_v3d_caps.sms_base + V3D_SMS_REE_CS_OFF, V3D_SMS_STATE_READY);
+    for (u32 i = 0; i < 100U; i++) {
+        u32 state = mmio_read(g_v3d_caps.sms_base + V3D_SMS_REE_CS_OFF) & V3D_SMS_STATE_MASK;
+        if (state != 5U && state != 6U)
+            return;
+        timer_delay_us(1);
+    }
+}
 
 static void v3d_kernel_blobs_init(void)
 {
@@ -248,6 +451,7 @@ void v3d_init(void)
     g_v3d_caps.tiny_ready_mask = 0;
     g_v3d_caps.tiny_verified_mask = 0;
     g_v3d_caps.native_selftest_status = V3D_STATUS_UNSUPPORTED;
+    simd_zero(&g_csd_debug, sizeof(g_csd_debug));
     g_mmio_auto_quarantined = false;
     g_mmio_auto_warned = false;
 
@@ -279,7 +483,6 @@ void v3d_init(void)
         g_v3d_caps.mmu_pa_bits = vc->v3d_mmu_pa_bits;
 #if PIOS_ENABLE_NATIVE_V3D_COMPUTE
         g_v3d_caps.mmio_probe_ok = true;
-        g_v3d_caps.mmio_csd = true;
 #endif
     }
 
@@ -288,7 +491,6 @@ void v3d_init(void)
         u32 ident0 = mmio_read(V3D_LEGACY_BASE_ADDR + V3D_IDENT0_OFF);
         if (v3d_ident_plausible(ident0)) {
             g_v3d_caps.mmio_probe_ok = true;
-            g_v3d_caps.mmio_csd = true;
             g_v3d_caps.reg_base = V3D_LEGACY_BASE_ADDR;
             g_v3d_caps.ident0 = ident0;
             g_v3d_caps.ident1 = mmio_read(V3D_LEGACY_BASE_ADDR + V3D_IDENT1_OFF);
@@ -296,12 +498,20 @@ void v3d_init(void)
         }
     }
 #endif
-#if PIOS_ENABLE_NATIVE_V3D_COMPUTE
-    if (g_v3d_caps.mmio_probe_ok)
+#if PIOS_ENABLE_NATIVE_V3D_COMPUTE && PIOS_ENABLE_NATIVE_V3D_MMU_BOOT
+    if (g_v3d_caps.mmio_probe_ok) {
+        v3d_blind_pm_reset();
+        (void)v3d_firmware_clock_enable();
+        v3d_sms_enter_ree();
         (void)v3d_native_mmu_setup();
+        (void)v3d_gmp_allow_all();
+    }
 #endif
+    v3d_init_core_cache_state();
     g_v3d_caps.native_selftest_status = v3d_native_selftest();
-    g_v3d_caps.dispatch_supported = g_v3d_caps.mailbox_qpu || g_v3d_caps.mmio_csd;
+    g_v3d_caps.dispatch_supported = g_v3d_caps.mailbox_qpu ||
+                                    (g_v3d_caps.mmio_csd &&
+                                     g_v3d_caps.native_mmu_ready);
     v3d_kernel_blobs_init();
 
     uart_puts("[v3d] mbox=");
@@ -370,7 +580,9 @@ v3d_status_t v3d_kernel_bind_csd(v3d_kernel_id_t id, const u32 *csd_cfg, u32 qpu
 {
     if (id >= V3D_KERNEL_MAX || !csd_cfg)
         return V3D_STATUS_INVALID;
-    if (id != V3D_KERNEL_ADD && id != V3D_KERNEL_RELU)
+    if (id != V3D_KERNEL_ADD && id != V3D_KERNEL_MUL && id != V3D_KERNEL_RELU &&
+        id != V3D_KERNEL_STORE_CONST && id != V3D_KERNEL_LOAD_STORE &&
+        id != V3D_KERNEL_STORE_SSBO && id != V3D_KERNEL_NOOP)
         return V3D_STATUS_NOT_IMPLEMENTED;
     if (qpu_count == 0U || qpu_count > V3D_QPU_MAX_DISPATCH)
         return V3D_STATUS_INVALID;
@@ -380,7 +592,7 @@ v3d_status_t v3d_kernel_bind_csd(v3d_kernel_id_t id, const u32 *csd_cfg, u32 qpu
     for (u32 i = 0; i < 7U; i++)
         g_kernels[id].csd_cfg[i] = csd_cfg[i];
     g_kernels[id].qpu_count = qpu_count;
-    g_kernels[id].control_list_bus = 1U; /* Native CSD configs do not use mailbox control lists. */
+    g_kernels[id].control_list_bus = 0U; /* Native CSD configs do not use mailbox control lists. */
     g_kernels[id].native_csd = true;
     g_kernels[id].verified = false;
     g_kernels[id].ready = true;
@@ -388,16 +600,208 @@ v3d_status_t v3d_kernel_bind_csd(v3d_kernel_id_t id, const u32 *csd_cfg, u32 qpu
     return V3D_STATUS_OK;
 }
 
-v3d_status_t v3d_kernel_bind_builtin_qpu(v3d_kernel_id_t id,
-                                         const void *uniform_data,
-                                         u32 uniform_bytes)
+/*
+ * Mesa-parity supergroup packing for direct CSD. When the workgroup size is a
+ * multiple of 16 lanes are already saturated (1 wg/supergroup); otherwise pack
+ * multiple workgroups per supergroup to fill the 16-lane batch. Mirrors
+ * v3d_csd_choose_workgroups_per_supergroup (no TSY barrier path).
+ */
+static u32 v3d_choose_wgs_per_sg(u32 num_wgs, u32 wg_size)
 {
+    if (wg_size % 16U == 0U)
+        return 1U;
+    u32 best = 1U;
+    u32 best_unused = 16U;
+    for (u32 w = 1U; w <= 16U; w++) {
+        if (w > num_wgs)
+            return best;
+        u32 unused = (16U - ((w * wg_size) % 16U)) & 0x0fU;
+        if (unused == 0U)
+            return w;
+        if (unused < best_unused) {
+            best = w;
+            best_unused = unused;
+        }
+    }
+    return best;
+}
+
+v3d_status_t v3d_kernel_bind_builtin_qpu_grid(v3d_kernel_id_t id,
+                                              const void *uniform_data,
+                                              u32 uniform_bytes,
+                                              u32 workgroups_x)
+{
+#if PIOS_ENABLE_NATIVE_V3D_COMPUTE && PIOS_ENABLE_TINY_QPU_KERNELS
+    if (g_v3d_caps.native_mmu_ready && g_v3d_caps.mmio_csd) {
+        const u64 *src_shader = NULL;
+        u64 *dst_shader = NULL;
+        u32 *dst_uniforms = NULL;
+        u32 shader_words = 0;
+        u32 uniform_count = 0;
+        u32 wg_size = 1U;
+
+        if (workgroups_x == 0U || workgroups_x > 64U)
+            return V3D_STATUS_INVALID;
+
+        if (id == V3D_KERNEL_STORE_CONST) {
+            src_shader = v3d_tiny_store_const_qpu;
+            dst_shader = (u64 *)(usize)(V3D_TINY_BLOB_BASE + 0U * V3D_TINY_BLOB_STRIDE);
+            dst_uniforms = (u32 *)(usize)(V3D_TINY_BLOB_BASE + 1U * V3D_TINY_BLOB_STRIDE);
+            shader_words = V3D_TINY_STORE_CONST_QPU_WORDS;
+            uniform_count = 2U;
+        } else if (id == V3D_KERNEL_STORE_SSBO) {
+            src_shader = v3d_tiny_store_ssbo_qpu;
+            dst_shader = (u64 *)(usize)(V3D_TINY_BLOB_BASE + 2U * V3D_TINY_BLOB_STRIDE);
+            dst_uniforms = (u32 *)(usize)(V3D_TINY_BLOB_BASE + 3U * V3D_TINY_BLOB_STRIDE);
+            shader_words = V3D_TINY_STORE_SSBO_QPU_WORDS;
+            uniform_count = 3U;
+        } else if (id == V3D_KERNEL_LOAD_STORE) {
+            src_shader = v3d_tiny_load_store_qpu;
+            dst_shader = (u64 *)(usize)(V3D_TINY_BLOB_BASE + 4U * V3D_TINY_BLOB_STRIDE);
+            dst_uniforms = (u32 *)(usize)(V3D_TINY_BLOB_BASE + 5U * V3D_TINY_BLOB_STRIDE);
+            shader_words = V3D_TINY_LOAD_STORE_QPU_WORDS;
+            uniform_count = 2U;
+        } else if (id == V3D_KERNEL_NOOP) {
+            src_shader = v3d_tiny_noop_qpu;
+            dst_shader = (u64 *)(usize)(V3D_TINY_BLOB_BASE + 6U * V3D_TINY_BLOB_STRIDE);
+            dst_uniforms = (u32 *)(usize)(V3D_TINY_BLOB_BASE + 7U * V3D_TINY_BLOB_STRIDE);
+            shader_words = V3D_TINY_NOOP_QPU_WORDS;
+            uniform_count = 0U;
+        } else if (id == V3D_KERNEL_ADD) {
+            dst_shader = (u64 *)(usize)(V3D_TINY_BLOB_BASE + 8U * V3D_TINY_BLOB_STRIDE);
+            dst_uniforms = (u32 *)(usize)(V3D_TINY_BLOB_BASE + 9U * V3D_TINY_BLOB_STRIDE);
+            if (uniform_bytes == 7U * sizeof(u32)) {
+                src_shader = v3d_tiny_vector_add_n_qpu;
+                shader_words = V3D_TINY_VECTOR_ADD_N_QPU_WORDS;
+                uniform_count = 7U;
+            } else {
+                src_shader = v3d_tiny_vector_add_qpu;
+                shader_words = V3D_TINY_VECTOR_ADD_QPU_WORDS;
+                uniform_count = 4U;
+            }
+            wg_size = 16U;
+        } else if (id == V3D_KERNEL_MUL) {
+            dst_shader = (u64 *)(usize)(V3D_TINY_BLOB_BASE + 12U * V3D_TINY_BLOB_STRIDE);
+            dst_uniforms = (u32 *)(usize)(V3D_TINY_BLOB_BASE + 13U * V3D_TINY_BLOB_STRIDE);
+            if (uniform_bytes == 7U * sizeof(u32)) {
+                src_shader = v3d_tiny_vector_mul_n_qpu;
+                shader_words = V3D_TINY_VECTOR_MUL_N_QPU_WORDS;
+                uniform_count = 7U;
+            } else {
+                src_shader = v3d_tiny_vector_mul_qpu;
+                shader_words = V3D_TINY_VECTOR_MUL_QPU_WORDS;
+                uniform_count = 4U;
+            }
+            wg_size = 16U;
+        } else if (id == V3D_KERNEL_RELU) {
+            dst_shader = (u64 *)(usize)(V3D_TINY_BLOB_BASE + 10U * V3D_TINY_BLOB_STRIDE);
+            dst_uniforms = (u32 *)(usize)(V3D_TINY_BLOB_BASE + 11U * V3D_TINY_BLOB_STRIDE);
+            if (uniform_bytes == 6U * sizeof(u32)) {
+                src_shader = v3d_tiny_relu_n_qpu;
+                shader_words = V3D_TINY_RELU_N_QPU_WORDS;
+                uniform_count = 6U;
+            } else {
+                src_shader = v3d_tiny_relu_qpu;
+                shader_words = V3D_TINY_RELU_QPU_WORDS;
+                uniform_count = 3U;
+            }
+            wg_size = 16U;
+        }
+
+        if (!src_shader || (!uniform_data && uniform_count != 0U))
+            return V3D_STATUS_INVALID;
+        if (dst_uniforms)
+            simd_zero(dst_uniforms, 64U);
+        if (uniform_bytes == uniform_count * sizeof(u32)) {
+            const u32 *src32 = (const u32 *)uniform_data;
+            for (u32 i = 0; i < uniform_count; i++)
+                dst_uniforms[i] = src32[i];
+        } else if (uniform_bytes == uniform_count * sizeof(u64)) {
+            const u64 *src64 = (const u64 *)uniform_data;
+            for (u32 i = 0; i < uniform_count; i++)
+                dst_uniforms[i] = (u32)src64[i];
+        } else {
+            return V3D_STATUS_INVALID;
+        }
+
+        memcpy(dst_shader, src_shader, shader_words * sizeof(u64));
+        if (dst_uniforms)
+            dcache_clean_range((u64)(usize)dst_uniforms, 64U);
+        dcache_clean_range((u64)(usize)dst_shader, shader_words * sizeof(u64));
+
+        u32 cfg[7] = { 0 };
+        cfg[0] = workgroups_x << V3D_CSD_CFG012_WG_COUNT_SHIFT;
+        cfg[1] = 1U << V3D_CSD_CFG012_WG_COUNT_SHIFT;
+        cfg[2] = 1U << V3D_CSD_CFG012_WG_COUNT_SHIFT;
+        if (id == V3D_KERNEL_STORE_SSBO)
+            wg_size = 16U;
+        /*
+         * Mesa-parity supergroup/batch packing. For wg_size=16 this reduces to
+         * 1 wg/supergroup, num_batches=num_wgs, max_sg_id=num_wgs-1 (the proven
+         * vector-N config). For wg_size=1 (matvec) it packs up to 16 rows per
+         * supergroup so the 16-lane batch is filled, otherwise CSD completes but
+         * writes nothing.
+         */
+        u32 num_wgs = workgroups_x;
+        u32 wgs_per_sg = v3d_choose_wgs_per_sg(num_wgs, wg_size);
+        if (wgs_per_sg == 0U)
+            wgs_per_sg = 1U;
+        u32 batches_per_sg = (wgs_per_sg * wg_size + 15U) / 16U;
+        if (batches_per_sg == 0U)
+            batches_per_sg = 1U;
+        u32 whole_sgs = num_wgs / wgs_per_sg;
+        u32 rem_wgs = num_wgs - whole_sgs * wgs_per_sg;
+        u32 num_sgs = whole_sgs + (rem_wgs ? 1U : 0U);
+        u32 num_batches = batches_per_sg * whole_sgs +
+                          (rem_wgs * wg_size + 15U) / 16U;
+        cfg[3] = ((wgs_per_sg & 0xfU) << V3D_CSD_CFG3_WGS_PER_SG_SHIFT) |
+                 ((batches_per_sg - 1U) << V3D_CSD_CFG3_BATCHES_PER_SG_M1_SHIFT) |
+                 (((num_sgs - 1U) & 0x3fU) << V3D_CSD_CFG3_MAX_SG_ID_SHIFT) |
+                 ((wg_size & 0xffU) << V3D_CSD_CFG3_WG_SIZE_SHIFT);
+        /* Direct CSD wants the raw batch count (V3D 7.1 C0 does not subtract 1). */
+        cfg[4] = num_batches;
+        cfg[5] = (u32)(usize)dst_shader | V3D_CSD_CFG5_THREADING;
+        if (id == V3D_KERNEL_NOOP)
+            cfg[5] |= V3D_CSD_CFG5_SINGLE_SEG;
+        cfg[6] = (u32)(usize)dst_uniforms;
+        return v3d_kernel_bind_csd(id, cfg, 1U);
+    }
+#endif
+
+    if (workgroups_x != 1U)
+        return V3D_STATUS_NOT_IMPLEMENTED;
+
     switch (id) {
+    case V3D_KERNEL_STORE_CONST:
+        return v3d_kernel_bind_blob(id,
+                                    uniform_data, uniform_bytes,
+                                    v3d_tiny_store_const_qpu,
+                                    V3D_TINY_STORE_CONST_QPU_WORDS);
+    case V3D_KERNEL_STORE_SSBO:
+        return v3d_kernel_bind_blob(id,
+                                    uniform_data, uniform_bytes,
+                                    v3d_tiny_store_ssbo_qpu,
+                                    V3D_TINY_STORE_SSBO_QPU_WORDS);
+    case V3D_KERNEL_NOOP:
+        return v3d_kernel_bind_blob(id,
+                                    uniform_data, uniform_bytes,
+                                    v3d_tiny_noop_qpu,
+                                    V3D_TINY_NOOP_QPU_WORDS);
+    case V3D_KERNEL_LOAD_STORE:
+        return v3d_kernel_bind_blob(id,
+                                    uniform_data, uniform_bytes,
+                                    v3d_tiny_load_store_qpu,
+                                    V3D_TINY_LOAD_STORE_QPU_WORDS);
     case V3D_KERNEL_ADD:
         return v3d_kernel_bind_blob(id,
                                     uniform_data, uniform_bytes,
                                     v3d_tiny_vector_add_qpu,
                                     V3D_TINY_VECTOR_ADD_QPU_WORDS);
+    case V3D_KERNEL_MUL:
+        return v3d_kernel_bind_blob(id,
+                                    uniform_data, uniform_bytes,
+                                    v3d_tiny_vector_mul_qpu,
+                                    V3D_TINY_VECTOR_MUL_QPU_WORDS);
     case V3D_KERNEL_RELU:
         return v3d_kernel_bind_blob(id,
                                     uniform_data, uniform_bytes,
@@ -406,6 +810,13 @@ v3d_status_t v3d_kernel_bind_builtin_qpu(v3d_kernel_id_t id,
     default:
         return V3D_STATUS_NOT_IMPLEMENTED;
     }
+}
+
+v3d_status_t v3d_kernel_bind_builtin_qpu(v3d_kernel_id_t id,
+                                         const void *uniform_data,
+                                         u32 uniform_bytes)
+{
+    return v3d_kernel_bind_builtin_qpu_grid(id, uniform_data, uniform_bytes, 1U);
 }
 
 void v3d_kernel_mark_verified(v3d_kernel_id_t id, bool verified)
@@ -424,19 +835,28 @@ v3d_status_t v3d_native_mmu_setup(void)
     if (!g_v3d_caps.native_probe_ok || !g_v3d_caps.mmio_probe_ok || g_v3d_caps.hub_base == 0U)
         return V3D_STATUS_NOT_READY;
 
-    for (u32 page = 0; page < (u32)(V3D_MMU_IDENTITY_BYTES >> V3D_MMU_PAGE_SHIFT); page++)
+    if (!g_v3d_pt)
+        g_v3d_pt = (u32 *)(usize)V3D_MMU_PT_LOW_BASE;
+
+    for (u32 page = 0; page < V3D_MMU_PT_ENTRIES; page++)
         g_v3d_pt[page] = V3D_PTE_VALID | V3D_PTE_WRITEABLE | page;
-    for (u32 page = (u32)(V3D_MMU_IDENTITY_BYTES >> V3D_MMU_PAGE_SHIFT);
-         page < V3D_MMU_PT_ENTRIES; page++)
-        g_v3d_pt[page] = 0;
 
     g_v3d_caps.pt_paddr = (u64)(usize)g_v3d_pt;
     g_v3d_caps.scratch_paddr = (u64)(usize)g_v3d_scratch;
-    dcache_clean_range((u64)(usize)g_v3d_pt, sizeof(g_v3d_pt));
+    dcache_clean_range((u64)(usize)g_v3d_pt,
+                       (u64)V3D_MMU_PT_ENTRIES * sizeof(u32));
     dcache_clean_range((u64)(usize)g_v3d_scratch, sizeof(g_v3d_scratch));
 
     mmio_write(g_v3d_caps.hub_base + V3D_MMU_PT_PA_BASE_OFF,
                (u32)(g_v3d_caps.pt_paddr >> V3D_MMU_PAGE_SHIFT));
+    /*
+     * Bring-up must not arm V3D MMU abort/interrupt reporting before PIOS has
+     * a V3D fault ISR. The first hardware trial proved identity table install
+     * and selftest could pass, but the board later PiSODed/rebooted without any
+     * tiny kernel ever becoming ready/dispatched. That points at an async V3D
+     * MMU fault path surfacing after boot. Keep fault reporting poll-only for
+     * now; dispatch paths already fail closed via status/timeout/quarantine.
+     */
     mmio_write(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF,
                V3D_MMU_CTL_ENABLE |
                V3D_MMU_CTL_PT_INVALID_ENABLE |
@@ -461,6 +881,7 @@ v3d_status_t v3d_native_mmu_setup(void)
         return V3D_STATUS_FAILED;
 
     g_v3d_caps.native_mmu_ready = true;
+    g_v3d_caps.mmio_csd = true;
     return V3D_STATUS_OK;
 #endif
 }
@@ -511,6 +932,13 @@ static v3d_status_t v3d_dispatch_mmio_csd(const struct v3d_dispatch_cfg *cfg, u3
         timer_delay_us(1);
     }
 
+    g_csd_debug.status_before = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
+    u32 completed_before = g_csd_debug.status_before & V3D_CSD_STATUS_COMPLETED_MASK;
+    (void)v3d_gmp_allow_all();
+    mmio_write(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF, 0xFFFFFFFFU);
+    mmio_write(g_v3d_caps.reg_base + V3D_CORE_INT_CLR_OFF, V3D_CORE_INT_CSDDONE_V71);
+    v3d_invalidate_caches();
+
     mmio_write(g_v3d_caps.reg_base + v3d_csd_cfg1_off(), cfg->csd_cfg[1]);
     mmio_write(g_v3d_caps.reg_base + v3d_csd_cfg2_off(), cfg->csd_cfg[2]);
     mmio_write(g_v3d_caps.reg_base + v3d_csd_cfg3_off(), cfg->csd_cfg[3]);
@@ -518,17 +946,47 @@ static v3d_status_t v3d_dispatch_mmio_csd(const struct v3d_dispatch_cfg *cfg, u3
     mmio_write(g_v3d_caps.reg_base + v3d_csd_cfg5_off(), cfg->csd_cfg[5]);
     dmb();
     mmio_write(g_v3d_caps.reg_base + v3d_csd_cfg6_off(), cfg->csd_cfg[6]);
+    if (g_v3d_caps.tech_version >= 71U)
+        mmio_write(g_v3d_caps.reg_base + V3D_CSD_QUEUED_CFG7_V71_OFF, 0);
     dmb();
     mmio_write(g_v3d_caps.reg_base + v3d_csd_cfg0_off(), cfg->csd_cfg[0]);
+    dmb();
+    g_csd_debug.status_after_kick = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
 
     for (u32 i = 0; i < timeout_ms * 1000U; i++) {
         u32 st = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
-        if ((st & V3D_CSD_STATUS_BUSY_MASK) == 0U) {
+        if ((st & V3D_CSD_STATUS_COMPLETED_MASK) != completed_before &&
+            (st & V3D_CSD_STATUS_BUSY_MASK) == 0U) {
+            g_csd_debug.status_after_wait = st;
+            g_csd_debug.core_int_sts = mmio_read(g_v3d_caps.reg_base + V3D_CORE_INT_STS_OFF);
+            g_csd_debug.hub_int_sts = mmio_read(g_v3d_caps.hub_base + V3D_HUB_INT_STS_OFF);
+            g_csd_debug.err_stat = mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
+            g_csd_debug.mmu_ctl = mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
+            g_csd_debug.mmu_illegal_addr = mmio_read(g_v3d_caps.hub_base + V3D_MMU_ILLEGAL_ADDR_OFF);
+            g_csd_debug.mmu_vio_addr = mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ADDR_OFF);
+            g_csd_debug.mmu_vio_id = mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ID_OFF);
+            g_csd_debug.gmp_status = mmio_read(g_v3d_caps.reg_base + V3D_GMP_STATUS_V71_OFF);
+            g_csd_debug.gmp_cfg = mmio_read(g_v3d_caps.reg_base + V3D_GMP_CFG_V71_OFF);
+            g_csd_debug.gmp_vio_addr = mmio_read(g_v3d_caps.reg_base + V3D_GMP_VIO_ADDR_V71_OFF);
+            g_csd_debug.current_cfg0 = mmio_read(g_v3d_caps.reg_base + V3D_CSD_CURRENT_CFG0_V71_OFF);
+            g_csd_debug.current_cfg5 = mmio_read(g_v3d_caps.reg_base + V3D_CSD_CURRENT_CFG5_V71_OFF);
+            g_csd_debug.current_cfg6 = mmio_read(g_v3d_caps.reg_base + V3D_CSD_CURRENT_CFG6_V71_OFF);
+            (void)v3d_clean_caches();
             dmb();
             return V3D_STATUS_OK;
         }
         timer_delay_us(1);
     }
+    g_csd_debug.status_after_wait = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
+    g_csd_debug.core_int_sts = mmio_read(g_v3d_caps.reg_base + V3D_CORE_INT_STS_OFF);
+    g_csd_debug.hub_int_sts = mmio_read(g_v3d_caps.hub_base + V3D_HUB_INT_STS_OFF);
+    g_csd_debug.err_stat = mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
+    g_csd_debug.mmu_ctl = mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
+    g_csd_debug.mmu_vio_addr = mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ADDR_OFF);
+    g_csd_debug.mmu_vio_id = mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ID_OFF);
+    g_csd_debug.gmp_status = mmio_read(g_v3d_caps.reg_base + V3D_GMP_STATUS_V71_OFF);
+    g_csd_debug.gmp_cfg = mmio_read(g_v3d_caps.reg_base + V3D_GMP_CFG_V71_OFF);
+    g_csd_debug.gmp_vio_addr = mmio_read(g_v3d_caps.reg_base + V3D_GMP_VIO_ADDR_V71_OFF);
     return V3D_STATUS_TIMEOUT;
 }
 
@@ -578,9 +1036,198 @@ v3d_status_t v3d_dispatch_compute(const struct v3d_dispatch_cfg *cfg)
                 uart_puts("[v3d] auto: MMIO->mbox fallback\n");
                 g_mmio_auto_warned = true;
             }
+
         }
     }
     return v3d_dispatch_mailbox(cfg, timeout_ms);
+}
+
+void v3d_csd_debug_last(struct v3d_csd_debug *out)
+{
+    if (out)
+        *out = g_csd_debug;
+}
+
+void v3d_reset_debug_last(struct v3d_reset_debug *out)
+{
+    if (out)
+        *out = g_reset_debug;
+}
+
+v3d_status_t v3d_soft_reset(void)
+{
+#if !PIOS_ENABLE_NATIVE_V3D_COMPUTE
+    return V3D_STATUS_UNSUPPORTED;
+#else
+    if (!g_v3d_caps.native_compute_enabled || !g_v3d_caps.mmio_probe_ok ||
+        !g_v3d_caps.native_mmu_ready || g_v3d_caps.reg_base == 0U ||
+        g_v3d_caps.hub_base == 0U)
+        return V3D_STATUS_NOT_READY;
+
+    simd_zero(&g_reset_debug, sizeof(g_reset_debug));
+    g_reset_debug.attempts = 1;
+    g_reset_debug.err_before = mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
+    g_reset_debug.core_int_before = mmio_read(g_v3d_caps.reg_base + V3D_CORE_INT_STS_OFF);
+    g_reset_debug.hub_int_before = mmio_read(g_v3d_caps.hub_base + V3D_HUB_INT_STS_OFF);
+    if (g_v3d_caps.sms_base != 0U)
+        g_reset_debug.sms_before = mmio_read(g_v3d_caps.sms_base + V3D_SMS_REE_CS_OFF);
+    g_reset_debug.mmu_ctl_before = mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
+    g_reset_debug.mmuc_before = mmio_read(g_v3d_caps.hub_base + V3D_MMUC_CONTROL_OFF);
+
+    for (u32 i = 0; i < 25000U; i++) {
+        if ((mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF) &
+             V3D_CSD_STATUS_BUSY_MASK) == 0U)
+            break;
+        if (i + 1U == 25000U) {
+            g_reset_debug.status = V3D_STATUS_TIMEOUT;
+            return V3D_STATUS_TIMEOUT;
+        }
+
+        timer_delay_us(1);
+    }
+
+    mmio_write(g_v3d_caps.reg_base + V3D_CORE_INT_MSK_SET_OFF, 0xFFFFFFFFU);
+    mmio_write(g_v3d_caps.hub_base + V3D_HUB_INT_MSK_SET_OFF, 0xFFFFFFFFU);
+    mmio_write(g_v3d_caps.reg_base + V3D_CORE_INT_CLR_OFF, v3d_core_irq_mask());
+    mmio_write(g_v3d_caps.hub_base + V3D_HUB_INT_CLR_OFF, v3d_hub_irq_mask());
+    mmio_write(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF, 0xFFFFFFFFU);
+    dsb();
+    g_reset_debug.err_after_clear = mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
+
+    v3d_sms_enter_ree();
+    (void)v3d_gmp_allow_all();
+    v3d_init_core_cache_state();
+    if (v3d_native_mmu_setup() != V3D_STATUS_OK) {
+        g_reset_debug.status = V3D_STATUS_FAILED;
+        return V3D_STATUS_FAILED;
+    }
+    (void)v3d_mmu_flush_all();
+    (void)v3d_clean_caches();
+    v3d_invalidate_caches();
+
+    mmio_write(g_v3d_caps.reg_base + V3D_CORE_INT_CLR_OFF, v3d_core_irq_mask());
+    mmio_write(g_v3d_caps.hub_base + V3D_HUB_INT_CLR_OFF, v3d_hub_irq_mask());
+    mmio_write(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF, 0xFFFFFFFFU);
+    dsb();
+
+    g_reset_debug.err_after_reset = mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
+    g_reset_debug.core_int_after = mmio_read(g_v3d_caps.reg_base + V3D_CORE_INT_STS_OFF);
+    g_reset_debug.hub_int_after = mmio_read(g_v3d_caps.hub_base + V3D_HUB_INT_STS_OFF);
+    if (g_v3d_caps.sms_base != 0U)
+        g_reset_debug.sms_after = mmio_read(g_v3d_caps.sms_base + V3D_SMS_REE_CS_OFF);
+    g_reset_debug.mmu_ctl_after = mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
+    g_reset_debug.mmuc_after = mmio_read(g_v3d_caps.hub_base + V3D_MMUC_CONTROL_OFF);
+
+    g_v3d_caps.native_selftest_status = v3d_native_selftest();
+    g_v3d_caps.dispatch_supported = g_v3d_caps.mailbox_qpu ||
+                                    (g_v3d_caps.mmio_csd &&
+                                     g_v3d_caps.native_mmu_ready);
+
+    g_reset_debug.status = (g_reset_debug.err_after_reset == 0U) ?
+                           V3D_STATUS_OK : V3D_STATUS_FAILED;
+    return g_reset_debug.status;
+#endif
+}
+
+v3d_status_t v3d_pm_reset(void)
+{
+#if !PIOS_ENABLE_NATIVE_V3D_COMPUTE
+    return V3D_STATUS_UNSUPPORTED;
+#else
+    if (!g_v3d_caps.native_compute_enabled || !g_v3d_caps.mmio_probe_ok ||
+        g_v3d_caps.reg_base == 0U || g_v3d_caps.hub_base == 0U ||
+        g_v3d_caps.tech_version < 71U)
+        return V3D_STATUS_NOT_READY;
+
+    (void)v3d_firmware_clock_enable();
+
+    simd_zero(&g_reset_debug, sizeof(g_reset_debug));
+    g_reset_debug.attempts = 1;
+    g_reset_debug.err_before = mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
+    g_reset_debug.core_int_before = mmio_read(g_v3d_caps.reg_base + V3D_CORE_INT_STS_OFF);
+    g_reset_debug.hub_int_before = mmio_read(g_v3d_caps.hub_base + V3D_HUB_INT_STS_OFF);
+    if (g_v3d_caps.sms_base != 0U)
+        g_reset_debug.sms_before = mmio_read(g_v3d_caps.sms_base + V3D_SMS_REE_CS_OFF);
+    g_reset_debug.mmu_ctl_before = mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
+    g_reset_debug.mmuc_before = mmio_read(g_v3d_caps.hub_base + V3D_MMUC_CONTROL_OFF);
+
+    for (u32 i = 0; i < 25000U; i++) {
+        if ((mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF) &
+             V3D_CSD_STATUS_BUSY_MASK) == 0U)
+            break;
+        if (i + 1U == 25000U) {
+            g_reset_debug.status = V3D_STATUS_TIMEOUT;
+            return V3D_STATUS_TIMEOUT;
+        }
+        timer_delay_us(1);
+    }
+
+    mmio_write(g_v3d_caps.reg_base + V3D_CORE_INT_MSK_SET_OFF, 0xFFFFFFFFU);
+    mmio_write(g_v3d_caps.hub_base + V3D_HUB_INT_MSK_SET_OFF, 0xFFFFFFFFU);
+    mmio_write(g_v3d_caps.reg_base + V3D_CORE_INT_CLR_OFF, v3d_core_irq_mask());
+    mmio_write(g_v3d_caps.hub_base + V3D_HUB_INT_CLR_OFF, v3d_hub_irq_mask());
+    mmio_write(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF, 0xFFFFFFFFU);
+    dsb();
+    g_reset_debug.err_after_clear = mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
+
+    u64 pm_reg = V3D_PM_BASE + V3D_PM_GRAFX_2712_OFF;
+    u32 pm_before = mmio_read(pm_reg);
+    g_reset_debug.pm_before = pm_before;
+    mmio_write(pm_reg, V3D_PM_PASSWORD | (pm_before & ~V3D_PM_V3DRSTN));
+    dsb();
+    g_reset_debug.pm_asserted = mmio_read(pm_reg);
+    (void)v3d_firmware_clock_enable();
+    timer_delay_ms(10);
+    mmio_write(pm_reg, V3D_PM_PASSWORD | (mmio_read(pm_reg) | V3D_PM_V3DRSTN));
+    dsb();
+    (void)v3d_firmware_clock_enable();
+    timer_delay_ms(10);
+    g_reset_debug.pm_after = mmio_read(pm_reg);
+
+    g_v3d_caps.ident0 = mmio_read(g_v3d_caps.reg_base + V3D_IDENT0_OFF);
+    g_v3d_caps.ident1 = mmio_read(g_v3d_caps.reg_base + V3D_IDENT1_OFF);
+    g_v3d_caps.ident2 = mmio_read(g_v3d_caps.reg_base + V3D_IDENT2_OFF);
+    if (!v3d_ident_plausible(g_v3d_caps.ident0)) {
+        g_reset_debug.status = V3D_STATUS_FAILED;
+        return V3D_STATUS_FAILED;
+    }
+
+    v3d_sms_enter_ree();
+    v3d_init_core_cache_state();
+    g_v3d_caps.native_mmu_ready = false;
+    g_v3d_caps.mmio_csd = false;
+    if (v3d_native_mmu_setup() != V3D_STATUS_OK) {
+        g_reset_debug.status = V3D_STATUS_FAILED;
+        return V3D_STATUS_FAILED;
+    }
+    (void)v3d_gmp_allow_all();
+    (void)v3d_mmu_flush_all();
+    (void)v3d_clean_caches();
+    v3d_invalidate_caches();
+
+    mmio_write(g_v3d_caps.reg_base + V3D_CORE_INT_CLR_OFF, v3d_core_irq_mask());
+    mmio_write(g_v3d_caps.hub_base + V3D_HUB_INT_CLR_OFF, v3d_hub_irq_mask());
+    mmio_write(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF, 0xFFFFFFFFU);
+    dsb();
+
+    g_reset_debug.err_after_reset = mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
+    g_reset_debug.core_int_after = mmio_read(g_v3d_caps.reg_base + V3D_CORE_INT_STS_OFF);
+    g_reset_debug.hub_int_after = mmio_read(g_v3d_caps.hub_base + V3D_HUB_INT_STS_OFF);
+    if (g_v3d_caps.sms_base != 0U)
+        g_reset_debug.sms_after = mmio_read(g_v3d_caps.sms_base + V3D_SMS_REE_CS_OFF);
+    g_reset_debug.mmu_ctl_after = mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
+    g_reset_debug.mmuc_after = mmio_read(g_v3d_caps.hub_base + V3D_MMUC_CONTROL_OFF);
+
+    g_v3d_caps.native_selftest_status = v3d_native_selftest();
+    g_v3d_caps.dispatch_supported = g_v3d_caps.mailbox_qpu ||
+                                    (g_v3d_caps.mmio_csd &&
+                                     g_v3d_caps.native_mmu_ready);
+
+    g_reset_debug.status = (g_reset_debug.err_after_reset == 0U &&
+                            g_v3d_caps.native_selftest_status == V3D_STATUS_OK) ?
+                           V3D_STATUS_OK : V3D_STATUS_FAILED;
+    return g_reset_debug.status;
+#endif
 }
 
 const struct v3d_kernel_desc *v3d_kernel_desc_get(v3d_kernel_id_t id)
@@ -595,7 +1242,7 @@ v3d_status_t v3d_dispatch_kernel(v3d_kernel_id_t id, u32 timeout_ms)
     if (id >= V3D_KERNEL_MAX)
         return V3D_STATUS_INVALID;
     const struct v3d_kernel_desc *k = &g_kernels[id];
-    if (k->qpu_count == 0 || k->control_list_bus == 0 || !k->ready)
+    if (k->qpu_count == 0 || (!k->native_csd && k->control_list_bus == 0) || !k->ready)
         return V3D_STATUS_NOT_IMPLEMENTED;
 
     struct v3d_dispatch_cfg cfg;
@@ -661,6 +1308,11 @@ v3d_status_t v3d_kernel_bind_blob(v3d_kernel_id_t id,
         gpu_mem_free(uniform_handle);
         return V3D_STATUS_FAILED;
     }
+    if ((uniform_bus & 0x3FFFFFFFU) + uniform_alloc > V3D_MMU_IDENTITY_BYTES) {
+        gpu_mem_unlock(uniform_handle);
+        gpu_mem_free(uniform_handle);
+        return V3D_STATUS_NOT_READY;
+    }
 
     u32 shader_handle = gpu_mem_alloc(shader_alloc, 16, GPU_MEM_FLAG_COHERENT);
     if (!shader_handle) {
@@ -674,6 +1326,13 @@ v3d_status_t v3d_kernel_bind_blob(v3d_kernel_id_t id,
         gpu_mem_unlock(uniform_handle);
         gpu_mem_free(uniform_handle);
         return V3D_STATUS_FAILED;
+    }
+    if ((shader_bus & 0x3FFFFFFFU) + shader_alloc > V3D_MMU_IDENTITY_BYTES) {
+        gpu_mem_unlock(shader_handle);
+        gpu_mem_free(shader_handle);
+        gpu_mem_unlock(uniform_handle);
+        gpu_mem_free(uniform_handle);
+        return V3D_STATUS_NOT_READY;
     }
 
     void *uniform_ptr = (void *)(usize)(uniform_bus & 0x3FFFFFFF);

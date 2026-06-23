@@ -1,8 +1,13 @@
 # Build artifacts
 build/
+build_boot/
 build_uefi/
 build_qemu_stage2/
 build_qemu_full/
+build_hyperv_amd64*/
+hyperv_amd64_esp/
+build_uefi_live*/
+qemu_*.pid
 *.o
 *.elf
 *.img
@@ -32,6 +37,8 @@ arm-toolchain/
 *.tar.xz
 
 # Debug
+__pycache__/
+tools/__pycache__/
 *.log
 *.ppm
 qemu_uefi_boot.png

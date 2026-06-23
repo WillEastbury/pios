@@ -67,7 +67,16 @@ static u64 icmp_min_interval;
 
 static u8 rx_frame[2048] ALIGNED(64);
 static u8 tx_frame[2048] ALIGNED(64);
-#define NET_RX_BURST_MAX 1U
+/* Drain up to a full RX ring (NUM_RX=32) per net_poll call. The MACB RX ring
+ * is 32 descriptors deep; draining only 1 frame/poll (the old value) could not
+ * keep pace with bursty load, so the ring backed up (observed rx_owned->21/32)
+ * and frames waited seconds before being processed -> multi-second ICMP/HTTP
+ * latency that looked like a wedge. Draining the whole ring per poll keeps the
+ * ring empty under load while staying bounded by the ring depth. Must be >=
+ * NUM_RX (macb.c) so one poll can clear a full ring; the deeper ring (512) plus
+ * the macb_rx_recover() overrun safety net is what keeps concurrent-connection
+ * bursts from wedging the NIC. */
+#define NET_RX_BURST_MAX 512U
 #define NET_FIFO_BURST_MAX 4U
 #define NET_MAX_MULTICAST_MACS 8U
 
@@ -155,6 +164,40 @@ void net_egress_snapshot(struct net_egress_snapshot *out)
 
 static u32 net_read_be32(const u8 *p) {
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+static u32 csum_add_bytes(u32 sum, const void *data, u32 len)
+{
+    const u8 *p = (const u8 *)data;
+    while (len >= 2U) {
+        sum += ((u16)p[0] << 8) | p[1];
+        p += 2;
+        len -= 2U;
+    }
+    if (len)
+        sum += ((u16)p[0] << 8);
+    return sum;
+}
+
+static u16 csum_fold(u32 sum)
+{
+    while (sum >> 16)
+        sum = (sum & 0xFFFFU) + (sum >> 16);
+    return (u16)~sum;
+}
+
+static u16 l4_checksum(u32 src_ip, u32 dst_ip, u8 proto,
+                       const void *l4_data, u32 l4_len)
+{
+    u32 sum = 0;
+    sum += (src_ip >> 16) & 0xFFFFU;
+    sum += src_ip & 0xFFFFU;
+    sum += (dst_ip >> 16) & 0xFFFFU;
+    sum += dst_ip & 0xFFFFU;
+    sum += proto;
+    sum += (u16)l4_len;
+    sum = csum_add_bytes(sum, l4_data, l4_len);
+    return htons(csum_fold(sum));
 }
 
 static bool net_drop_arp_not_for_us(const u8 *frame, u32 len) {
@@ -467,7 +510,8 @@ static void handle_icmp(const u8 *frame, u32 len,
 /* ================================================================== */
 
 static void handle_udp(const u8 *frame, u32 len,
-                       struct ip_hdr *ip, u32 payload_off) {
+                       struct ip_hdr *ip, u32 payload_off,
+                       bool checksum_trusted) {
     if (unlikely(payload_off + sizeof(struct udp_hdr) > len)) {
         stats.drop_udp_malformed++;
         return;
@@ -487,6 +531,12 @@ static void handle_udp(const u8 *frame, u32 len,
 
     u16 data_len = udp_len - sizeof(struct udp_hdr);
     const u8 *data = frame + payload_off + sizeof(struct udp_hdr);
+    if (udp->checksum != 0 && !checksum_trusted &&
+        unlikely(l4_checksum(ntohl(ip->src_ip), ntohl(ip->dst_ip),
+                             IP_PROTO_UDP, udp, udp_len) != 0)) {
+        stats.drop_udp_bad_cksum++;
+        return;
+    }
 
     stats.udp_recv++;
 
@@ -587,7 +637,7 @@ static void handle_ip(const u8 *frame, u32 len, bool checksum_trusted) {
                       checksum_trusted);
         break;
     }
-    case IP_PROTO_UDP:  handle_udp(frame, len, ip, payload_off);  break;
+    case IP_PROTO_UDP:  handle_udp(frame, len, ip, payload_off, checksum_trusted);  break;
     default: stats.drop_bad_proto++; break;
     }
 }
@@ -704,7 +754,7 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
     udp->src_port  = htons(src_port);
     udp->dst_port  = htons(dst_port);
     udp->length    = htons(udp_len);
-    udp->checksum  = 0;    /* optional in IPv4 */
+    udp->checksum  = 0;
 
     u32 frame_len = sizeof(struct eth_hdr) + ip_total;
     bool need_pad = frame_len < 60;
@@ -713,6 +763,16 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
     stats.tx_packets++;
     stats.tx_bytes += frame_len;
     stats.udp_sent++;
+
+    bool tx_csum_offload = nic_tx_checksum_offload_enabled();
+    if (!tx_csum_offload) {
+        if (len != 0)
+            simd_memcpy(tx_frame + sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr),
+                        data, len);
+        udp->checksum = l4_checksum(our_ip, dst_ip, IP_PROTO_UDP, udp, udp_len);
+        if (udp->checksum == 0)
+            udp->checksum = 0xFFFFU;
+    }
 
     bool ok = false;
     if (len == 0) {
@@ -723,7 +783,7 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
         return ok;
     }
 
-    if (need_pad) {
+    if (need_pad || !tx_csum_offload) {
         simd_memcpy(tx_frame + sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr),
                     data, len);
         ok = nic_send(tx_frame, frame_len);
@@ -795,9 +855,10 @@ void net_handle_fifo_request(void) {
 /*  Poll + Init                                                        */
 /* ================================================================== */
 
-void net_poll(void) {
+u32 net_poll(void) {
     u32 len;
     bool checksum_trusted;
+    u32 got = 0;
 
     prefetch_r(rx_frame);
 
@@ -806,6 +867,7 @@ void net_poll(void) {
         if (!likely(nic_recv(rx_frame, &len, &checksum_trusted)))
             break;
 
+        got++;
         stats.rx_packets++;
         stats.rx_bytes += len;
 
@@ -840,6 +902,7 @@ void net_poll(void) {
     net_handle_fifo_request();
 
     workq_drain(4);
+    return got;
 }
 
 void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {

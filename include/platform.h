@@ -3,7 +3,9 @@
 
 #define PIOS_PLATFORM_PI5        1
 #define PIOS_PLATFORM_QEMU_VIRT  2
-#define PIOS_PLATFORM_HYPERV_ARM 3
+#define PIOS_PLATFORM_UEFI       3
+#define PIOS_PLATFORM_HYPERV_ARM 4
+#define PIOS_PLATFORM_HYPERV_AMD64 5
 
 #ifndef PIOS_PLATFORM
 #define PIOS_PLATFORM PIOS_PLATFORM_PI5
@@ -34,6 +36,29 @@
 #define PIOS_HAS_VMBUS              0
 #elif PIOS_PLATFORM == PIOS_PLATFORM_HYPERV_ARM
 #define PIOS_PLATFORM_NAME          "hyperv-arm64"
+#define PIOS_PLATFORM_CORE_COUNT    4U
+#define PIOS_PERIPH_BASE            0UL
+#define PIOS_UART0_BASE             0UL
+#define PIOS_MBOX_BASE              0UL
+#define PIOS_EMMC2_BASE             0UL
+#define PIOS_GENET_BASE             0UL
+#define PIOS_PCIE_RC_BASE           0UL
+#define PIOS_RP1_BAR_BASE           0UL
+#define PIOS_GIC_BASE               0UL
+#define PIOS_GICD_BASE              0UL
+#define PIOS_GICC_BASE              0UL
+#define PIOS_HAS_RP1                0
+#define PIOS_HAS_PCIE               0
+#define PIOS_HAS_GENET              0
+#define PIOS_HAS_SD                 0
+#define PIOS_HAS_MAILBOX_FB         0
+#define PIOS_HAS_BOOTINFO_FB        0
+#define PIOS_HAS_DMA                0
+#define PIOS_HAS_PSCI_SECONDARIES   0
+#define PIOS_HAS_HYPERV             1
+#define PIOS_HAS_VMBUS              1
+#elif PIOS_PLATFORM == PIOS_PLATFORM_HYPERV_AMD64
+#define PIOS_PLATFORM_NAME          "hyperv-amd64"
 #define PIOS_PLATFORM_CORE_COUNT    4U
 #define PIOS_PERIPH_BASE            0UL
 #define PIOS_UART0_BASE             0UL
@@ -115,7 +140,7 @@
  * 1 = additionally run a read-only VC6/V3D register visibility probe.
  */
 #ifndef PIOS_ENABLE_NATIVE_VIDEOCORE
-#define PIOS_ENABLE_NATIVE_VIDEOCORE 0
+#define PIOS_ENABLE_NATIVE_VIDEOCORE 1
 #endif
 
 /* Experimental native V3D compute dispatch.
@@ -123,7 +148,15 @@
  * MMU/page-table and CSD queue path is validated on hardware.
  */
 #ifndef PIOS_ENABLE_NATIVE_V3D_COMPUTE
-#define PIOS_ENABLE_NATIVE_V3D_COMPUTE 0
+#define PIOS_ENABLE_NATIVE_V3D_COMPUTE 1
+#endif
+
+/* Keep native V3D MMU programming opt-in while the fault/IRQ path is under
+ * bring-up. Native probe can still prove hardware visibility and compute
+ * capability without leaving the V3D MMU enabled after boot.
+ */
+#ifndef PIOS_ENABLE_NATIVE_V3D_MMU_BOOT
+#define PIOS_ENABLE_NATIVE_V3D_MMU_BOOT 1
 #endif
 
 /* Experimental built-in tiny QPU kernels.
@@ -131,5 +164,5 @@
  * Keep off until hardware trials prove the mailbox/CSD submission path.
  */
 #ifndef PIOS_ENABLE_TINY_QPU_KERNELS
-#define PIOS_ENABLE_TINY_QPU_KERNELS 0
+#define PIOS_ENABLE_TINY_QPU_KERNELS 1
 #endif

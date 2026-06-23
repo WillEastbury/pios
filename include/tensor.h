@@ -130,3 +130,29 @@ bool qpu_dispatch(const qpu_program_t *prog, struct qpu_job *jobs,
 void tensor_init(void);
 void tensor_status(struct tensor_status *out);
 bool tensor_selftest(void);
+bool tensor_tiny_selftest(void);
+bool tensor_tiny_noop_proof(void);
+bool tensor_tiny_store_proof(void);
+bool tensor_tiny_load_store_proof(void);
+bool tensor_tiny_memory_proof(void);
+bool tensor_vector16_selftest(void);
+bool tensor_vectorn_selftest(u32 n);
+bool tensor_matvec128_selftest(void);
+bool tensor_matmul64_selftest(void);
+
+/* Benchmark harness: time one (op, shape, backend); returns per-iter ns. */
+#define TENSOR_BENCH_ADD    0U
+#define TENSOR_BENCH_MUL    1U
+#define TENSOR_BENCH_RELU   2U
+#define TENSOR_BENCH_DOT    3U
+#define TENSOR_BENCH_MATMUL 4U
+
+#define TENSOR_BENCH_SCALAR 0U
+#define TENSOR_BENCH_NEON   1U
+#define TENSOR_BENCH_V3D    2U
+
+u64 tensor_bench(u32 op, u32 m, u32 k, u32 p, u32 backend, u32 reps);
+i32 tensor_tiny_last_stage(void);
+i32 tensor_tiny_last_status(void);
+u32 tensor_tiny_last_output_bits(void);
+u32 tensor_tiny_last_expected_bits(void);
