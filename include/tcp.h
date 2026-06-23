@@ -63,6 +63,10 @@ u32 tcp_write(tcp_conn_t conn, const void *data, u32 len);
 /* Read data from receive buffer. Returns bytes read. */
 u32 tcp_read(tcp_conn_t conn, void *data, u32 len);
 
+/* Re-advertise our receive window via an ACK (self-heals a lost window-update
+ * during a stalled bulk inbound transfer). No-op unless ESTABLISHED. */
+void tcp_advertise_window(tcp_conn_t conn);
+
 /* ---- Connection Management ---- */
 
 /* Initiate graceful close (FIN) */

@@ -379,6 +379,7 @@ struct admin_http_service {
     bool stream_reboot;
     u32  stream_total;
     u32  stream_received;
+    u64  stream_wadv_ms;   /* last window re-advertise while waiting for tail */
 };
 
 static struct admin_http_service admin_status_svc = {
@@ -8450,6 +8451,18 @@ static void admin_service_poll(struct admin_http_service *svc)
             ota_update.received = svc->stream_received;
             if (n > 0)
                 svc->last_activity_ms = now;
+        }
+        if (svc->stream_received < svc->stream_total && readable == 0) {
+            /* Waiting for more inbound data (typically the final sub-MSS tail).
+             * Periodically re-advertise our receive window so a single lost
+             * window-update ACK self-heals: otherwise the peer waits forever for
+             * a window it never heard reopened, the (now-empty) rx ring gives
+             * tcp_read nothing to drain so nothing re-ACKs, and the 10s stall
+             * watchdog resets the connection ~248 bytes short of a 1.2MB upload. */
+            if (now - svc->stream_wadv_ms > 200ULL) {
+                tcp_advertise_window(svc->client_conn);
+                svc->stream_wadv_ms = now;
+            }
         }
         if (svc->stream_received >= svc->stream_total) {
             bool fok = ota_stage_buf &&

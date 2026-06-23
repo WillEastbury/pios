@@ -38,6 +38,13 @@ def stream_upload(host: str, update_port: int, image: bytes, reboot: bool,
         sent = 0
         last_print = time.time()
         piece = 2048  # small pieces keep the board's 4KB RX window fed continuously
+        # The kernel's tcp_read now sends a proper window-update ACK so the bulk
+        # of the transfer is fully TCP-self-paced at line rate. Only the final
+        # stretch is gently paced: that keeps the board's 4KB rx window from ever
+        # hitting zero at the very end, which on a board that lacks the
+        # window-update *self-heal* would otherwise deadlock on a single lost
+        # window-update ACK ~250 bytes short. Harmless once the board has both.
+        tail_pace_from = max(0, total - 131072)  # pace the last 128KB
         while sent < total:
             end = min(sent + piece, total)
             try:
@@ -48,10 +55,8 @@ def stream_upload(host: str, update_port: int, image: bytes, reboot: bool,
                 print(f"[ota] send ended at {sent}/{total} (board rebooting?): {exc}")
                 return
             sent = end
-            # Pace BELOW the board's single-core RX drain rate so its 4KB RX
-            # window never fills — this avoids the window-update deadlock that
-            # otherwise stalls the stream and trips the 10s admin stall-watchdog.
-            time.sleep(0.1)
+            if sent >= tail_pace_from and sent < total:
+                time.sleep(0.04)  # ~50KB/s tail keeps the rx window open to the end
             if time.time() - last_print > 2.0:
                 print(f"[ota] streamed {sent}/{total}")
                 last_print = time.time()

@@ -1626,6 +1626,20 @@ u32 tcp_write(tcp_conn_t conn, const void *data, u32 len) {
     return written;
 }
 
+/* Re-send an ACK that re-advertises our current receive window. Used to
+ * self-heal a lost window-update during a bulk inbound transfer: if the single
+ * window-update ACK sent from tcp_read is dropped, the peer waits forever for a
+ * window it will never hear about and the (now-empty) rx ring gives tcp_read
+ * nothing to drain — so nothing re-triggers the ACK. A caller stalled waiting
+ * for more inbound data can call this to keep the window advertised. */
+void tcp_advertise_window(tcp_conn_t conn) {
+    if (!tcb_valid(conn)) return;
+    struct tcb *t = &tcbs[conn];
+    if (t->state != TCP_ESTABLISHED) return;
+    t->rcv_wnd = ring_free(&t->rx_buf);
+    tcp_send_ack(t);
+}
+
 u32 tcp_read(tcp_conn_t conn, void *data, u32 len) {
     if (!tcb_valid(conn)) return 0;
     struct tcb *t = &tcbs[conn];
