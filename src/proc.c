@@ -1986,6 +1986,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     uart_puts(path);
     uart_putc('\n');
 
+    proc_publish_control((u32)slot);
     return (i32)p->pid;
 }
 
@@ -2109,6 +2110,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     uart_puts(name ? name : "?");
     uart_putc('\n');
 
+    proc_publish_control((u32)slot);
     return (i32)p->pid;
 }
 
@@ -2240,6 +2242,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     el0_launch_status = 1;
     el0_launch_pid = p->pid;
 
+    proc_publish_control((u32)slot);
     return (i32)p->pid;
 }
 
