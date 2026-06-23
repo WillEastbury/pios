@@ -11,7 +11,11 @@ set ASFLAGS=-march=armv8.2-a+simd+crc+crypto
 if not exist build_boot mkdir build_boot
 
 echo Compiling provisioner objects...
-"%CC%" %ASFLAGS% -c build_boot\start_head.S -o build_boot\start_head.o
+REM start_head.S (the NC-from-boot head) was an untracked generated file; it is
+REM exactly src/start.S compiled with block-0 mapped Non-Cacheable (so early SD
+REM DMA is coherent) and the set/way cache bring-up disabled. Compile src/start.S
+REM directly with those two gates off instead of relying on the lost file.
+"%CC%" %ASFLAGS% -DPIOS_CACHE_WB_FROM_BOOT=0 -DPIOS_CACHE_BRINGUP_FIX=0 -c src\start.S -o build_boot\start_head.o
 if errorlevel 1 exit /b 1
 "%CC%" %ASFLAGS% -c src\vectors.S -o build_boot\vectors.o
 if errorlevel 1 exit /b 1
