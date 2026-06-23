@@ -44,7 +44,7 @@ def stream_upload(host: str, update_port: int, image: bytes, reboot: bool,
         # hitting zero at the very end, which on a board that lacks the
         # window-update *self-heal* would otherwise deadlock on a single lost
         # window-update ACK ~250 bytes short. Harmless once the board has both.
-        tail_pace_from = max(0, total - 131072)  # pace the last 128KB
+        tail_pace_from = total  # no pacing: the board self-heals lost window-updates
         while sent < total:
             end = min(sent + piece, total)
             try:
@@ -56,7 +56,7 @@ def stream_upload(host: str, update_port: int, image: bytes, reboot: bool,
                 return
             sent = end
             if sent >= tail_pace_from and sent < total:
-                time.sleep(0.04)  # ~50KB/s tail keeps the rx window open to the end
+                time.sleep(0.1)  # ~20KB/s: keeps the board 4KB rx window from ever filling
             if time.time() - last_print > 2.0:
                 print(f"[ota] streamed {sent}/{total}")
                 last_print = time.time()
