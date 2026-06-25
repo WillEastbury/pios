@@ -15,6 +15,42 @@ bool nic_link_up(void);
 u32  nic_link_mbps(void);
 bool nic_link_full_duplex(void);
 
+/* Pluggable NIC backend abstraction.
+ *
+ * Each hardware backend (Cadence MACB on Pi5, virtio-net on QEMU, future
+ * CYW43 WiFi, ...) exposes a nic_ops vtable. nic_init() probes the registered
+ * backends in priority order and activates the first whose hardware is
+ * detected, so the network stack is brought up against whatever NIC is
+ * present rather than a compile-time-fixed driver.
+ *
+ * probe() must be non-destructive and safe to call on a platform where the
+ * device is absent (it may not touch unmapped MMIO). Offload hooks are
+ * optional and may be NULL. */
+struct nic_ops {
+    const char *name;
+    bool (*probe)(void);                                  /* hardware present? */
+    bool (*init)(void);                                   /* full bring-up */
+    bool (*send)(const u8 *frame, u32 len);
+    bool (*recv)(u8 *frame, u32 *len, bool *checksum_trusted);
+    void (*get_mac)(u8 *mac);
+    bool (*link_up)(void);
+    u32  (*link_mbps)(void);
+    bool (*full_duplex)(void);
+    /* Optional checksum/TSO offload hooks (NULL if unsupported). */
+    void (*set_tx_csum)(bool enable);
+    void (*set_rx_csum)(bool enable);
+    void (*set_tso)(bool enable);
+    bool (*tx_csum_enabled)(void);
+    bool (*rx_csum_enabled)(void);
+    bool (*tso_enabled)(void);
+    void (*offload_regs)(u32 *ncfgr, u32 *dmacfg);
+};
+
+/* True once nic_init() has activated a backend. */
+bool nic_active(void);
+/* Name of the active backend, or "none". */
+const char *nic_active_name(void);
+
 void nic_set_tx_checksum_offload(bool enable);
 void nic_set_rx_checksum_offload(bool enable);
 void nic_set_tso(bool enable);

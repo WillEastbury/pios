@@ -31,7 +31,14 @@
 #define PIOS_HAS_MAILBOX_FB         0
 #define PIOS_HAS_BOOTINFO_FB        1
 #define PIOS_HAS_DMA                0
-#define PIOS_HAS_PSCI_SECONDARIES   0
+#define PIOS_HAS_PSCI_SECONDARIES   1
+#define PIOS_PSCI_USE_HVC           1
+#define PIOS_PSCI_AFF_SHIFT         0
+#define PIOS_HAS_VIRTIO_NET         1
+#define PIOS_VIRTIO_MMIO_BASE       0x0A000000UL
+#define PIOS_VIRTIO_MMIO_STRIDE     0x200UL
+#define PIOS_VIRTIO_MMIO_COUNT      32U
+#define PIOS_ENABLE_NATIVE_VIDEOCORE 0
 #define PIOS_HAS_HYPERV             0
 #define PIOS_HAS_VMBUS              0
 #elif PIOS_PLATFORM == PIOS_PLATFORM_HYPERV_ARM
@@ -55,6 +62,10 @@
 #define PIOS_HAS_BOOTINFO_FB        0
 #define PIOS_HAS_DMA                0
 #define PIOS_HAS_PSCI_SECONDARIES   0
+#define PIOS_PSCI_USE_HVC           0
+#define PIOS_PSCI_AFF_SHIFT         8
+#define PIOS_HAS_VIRTIO_NET         0
+#define PIOS_ENABLE_NATIVE_VIDEOCORE 0
 #define PIOS_HAS_HYPERV             1
 #define PIOS_HAS_VMBUS              1
 #elif PIOS_PLATFORM == PIOS_PLATFORM_HYPERV_AMD64
@@ -78,6 +89,10 @@
 #define PIOS_HAS_BOOTINFO_FB        0
 #define PIOS_HAS_DMA                0
 #define PIOS_HAS_PSCI_SECONDARIES   0
+#define PIOS_PSCI_USE_HVC           0
+#define PIOS_PSCI_AFF_SHIFT         8
+#define PIOS_HAS_VIRTIO_NET         0
+#define PIOS_ENABLE_NATIVE_VIDEOCORE 0
 #define PIOS_HAS_HYPERV             1
 #define PIOS_HAS_VMBUS              1
 #else
@@ -101,6 +116,9 @@
 #define PIOS_HAS_BOOTINFO_FB        0
 #define PIOS_HAS_DMA                1
 #define PIOS_HAS_PSCI_SECONDARIES   1
+#define PIOS_PSCI_USE_HVC           0
+#define PIOS_PSCI_AFF_SHIFT         8
+#define PIOS_HAS_VIRTIO_NET         0
 #define PIOS_HAS_HYPERV             0
 #define PIOS_HAS_VMBUS              0
 #endif

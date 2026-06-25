@@ -8,6 +8,7 @@
 #include "fb.h"
 #include "timer.h"
 #include "watchdog.h"
+#include "platform.h"
 
 /* PSCI function IDs (SMC64 convention) */
 #define PSCI_CPU_ON         0xC4000003
@@ -42,17 +43,25 @@ static i64 psci_cpu_on(u64 target_mpidr, u64 entry, u64 context) {
     register u64 x1 __asm__("x1") = target_mpidr;
     register u64 x2 __asm__("x2") = entry;
     register u64 x3 __asm__("x3") = context;
+    /* QEMU `virt` (no EL3) exposes PSCI via HVC; Pi5 firmware uses SMC. */
+#if PIOS_PSCI_USE_HVC
+    __asm__ volatile("hvc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3)
+        : "memory");
+#else
     __asm__ volatile("smc #0"
         : "+r"(x0)
         : "r"(x1), "r"(x2), "r"(x3)
         : "memory");
+#endif
     return (i64)x0;
 }
 
 void core_start_secondary(u32 id, void (*entry)(void)) {
-    /* Pi 5 (Cortex-A76): core ID is in MPIDR Aff1, not Aff0.
-     * PSCI target_affinity must be (core << 8). */
-    i64 ret = psci_cpu_on((u64)id << 8, (u64)(usize)secondary_entry, (u64)id);
+    /* MPIDR affinity layout is platform-specific: Pi 5 (Cortex-A76) carries the
+     * core index in Aff1 (id << 8); QEMU virt carries it in Aff0 (id). */
+    i64 ret = psci_cpu_on((u64)id << PIOS_PSCI_AFF_SHIFT, (u64)(usize)secondary_entry, (u64)id);
     if (id < NUM_CORES)
         core_psci_ret[id] = ret;
     if (ret == 0) {

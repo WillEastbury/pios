@@ -456,6 +456,10 @@ bool fb_init(u32 width, u32 height) {
         (void)height;
         return true;
     }
+    /* No UEFI GOP bootinfo (e.g. direct -kernel boot): there is no Pi mailbox
+     * framebuffer on QEMU, so fail closed rather than falling through to the
+     * BCM mailbox path below (which would block on absent VideoCore MMIO). */
+    return false;
 #endif
     /* Build tag buffer — matching canary_main.c exactly */
     int i = 0;

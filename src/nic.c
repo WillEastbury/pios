@@ -8,6 +8,7 @@
 
 #include "nic.h"
 #include "macb.h"
+#include "virtio_net.h"
 #include "tcp.h"
 #include "socket.h"
 #include "simd.h"
@@ -22,6 +23,74 @@ static bool tso_enabled;
 static bool packet_dump_enabled;
 static u32 local_ipv4;
 static nic_packet_counters_t pkt_counts;
+
+/* ── Pluggable NIC backend registry ───────────────────────────────────────
+ * Backends are probed in array order; the first whose hardware is detected
+ * is activated. macb (Pi5 wired GEM) takes priority over virtio-net (QEMU),
+ * which takes priority over any future software/wireless backend. Symbols for
+ * every backend exist in all builds (the inactive ones link to stubs), so the
+ * table needs no per-platform #if. */
+
+static bool macb_backend_probe(void)
+{
+    /* The MACB/GEM register window is only mapped on platforms that have it;
+     * gate on the platform capability so we never touch unmapped MMIO. */
+    return PIOS_HAS_GENET ? true : false;
+}
+
+static bool virtio_backend_recv(u8 *frame, u32 *len, bool *checksum_trusted)
+{
+    if (checksum_trusted)
+        *checksum_trusted = false;   /* virtio-net carries no csum-trust signal here */
+    return virtio_net_recv(frame, len);
+}
+
+static u32 virtio_backend_link_mbps(void)
+{
+    return virtio_net_link_up() ? 1000U : 0U;
+}
+
+static const struct nic_ops nic_backend_macb = {
+    .name        = "macb",
+    .probe       = macb_backend_probe,
+    .init        = macb_init,
+    .send        = macb_send,
+    .recv        = macb_recv,
+    .get_mac     = macb_get_mac,
+    .link_up     = macb_link_up,
+    .link_mbps   = macb_link_mbps,
+    .full_duplex = macb_link_full_duplex,
+    .set_tx_csum = macb_set_tx_checksum_offload,
+    .set_rx_csum = macb_set_rx_checksum_offload,
+    .set_tso     = macb_set_tso,
+    .tx_csum_enabled = macb_tx_checksum_offload_enabled,
+    .rx_csum_enabled = macb_rx_checksum_offload_enabled,
+    .tso_enabled = macb_tso_enabled,
+    .offload_regs = macb_offload_regs,
+};
+
+static const struct nic_ops nic_backend_virtio = {
+    .name        = "virtio-net",
+    .probe       = virtio_net_probe,
+    .init        = virtio_net_init,
+    .send        = virtio_net_send,
+    .recv        = virtio_backend_recv,
+    .get_mac     = virtio_net_get_mac,
+    .link_up     = virtio_net_link_up,
+    .link_mbps   = virtio_backend_link_mbps,
+    .full_duplex = virtio_net_link_up,
+    /* no offload hooks */
+};
+
+static const struct nic_ops *const nic_backends[] = {
+    &nic_backend_macb,
+    &nic_backend_virtio,
+};
+
+static const struct nic_ops *g_nic;     /* active backend, or NULL */
+
+bool nic_active(void) { return g_nic != 0; }
+const char *nic_active_name(void) { return g_nic ? g_nic->name : "none"; }
 
 #define NIC_HDMI_TEXT_PANELS 0
 
@@ -928,11 +997,19 @@ bool nic_init(void)
     simd_zero(&pkt_counts, sizeof(pkt_counts));
     simd_zero(flow_table, sizeof(flow_table));
     nic_filter_clear();
-#if !PIOS_HAS_GENET
+
+    g_nic = 0;
+    for (u32 i = 0; i < sizeof(nic_backends) / sizeof(nic_backends[0]); i++) {
+        const struct nic_ops *be = nic_backends[i];
+        if (!be->probe || !be->probe())
+            continue;
+        if (be->init && be->init()) {
+            g_nic = be;
+            return true;
+        }
+        /* probe matched but init failed: keep trying lower-priority backends. */
+    }
     return false;
-#else
-    return macb_init();
-#endif
 }
 
 bool nic_init_wifi(void)
@@ -960,11 +1037,7 @@ bool nic_send(const u8 *frame, u32 len)
     nic_count_packet(true, frame, len);
     if (packet_dump_enabled)
         fb_pkt_dump('T', 0x00FFFF80, frame, len);
-#if PIOS_HAS_GENET
-    bool ok = macb_send(frame, len);
-#else
-    bool ok = false;
-#endif
+    bool ok = (g_nic && g_nic->send) ? g_nic->send(frame, len) : false;
     if (ok) pkt_counts.processed++;
     else    pkt_counts.dropped++;
     nic_render_counter_panel();
@@ -993,11 +1066,7 @@ bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_l
     nic_count_packet(true, tx_frame, total);
     if (packet_dump_enabled)
         fb_pkt_dump('T', 0x00FFFF80, tx_frame, total);
-#if PIOS_HAS_GENET
-    bool ok = macb_send(tx_frame, total);
-#else
-    bool ok = false;
-#endif
+    bool ok = (g_nic && g_nic->send) ? g_nic->send(tx_frame, total) : false;
     if (ok) pkt_counts.processed++;
     else    pkt_counts.dropped++;
     nic_render_counter_panel();
@@ -1008,15 +1077,15 @@ bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
 {
     if (checksum_trusted)
         *checksum_trusted = false;
-#if !PIOS_HAS_GENET
-    (void)frame;
-    (void)len;
-    return false;
-#else
+    if (!g_nic || !g_nic->recv) {
+        (void)frame;
+        (void)len;
+        return false;
+    }
 
     for (u32 attempt = 0; attempt < 16; attempt++) {
         bool rx_trusted = false;
-        bool ok = macb_recv(frame, len, &rx_trusted);
+        bool ok = g_nic->recv(frame, len, &rx_trusted);
         if (!ok)
             return false;
         if (checksum_trusted)
@@ -1054,92 +1123,86 @@ bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
     }
 
     return false;
-#endif
 }
 
 void nic_get_mac(u8 *mac)
 {
-#if !PIOS_HAS_GENET
-    if (mac) simd_zero(mac, 6);
-#else
-    macb_get_mac(mac);
-#endif
+    if (g_nic && g_nic->get_mac)
+        g_nic->get_mac(mac);
+    else if (mac)
+        simd_zero(mac, 6);
 }
 
 bool nic_link_up(void)
 {
-#if !PIOS_HAS_GENET
-    return false;
-#else
-    return macb_link_up();
-#endif
+    return (g_nic && g_nic->link_up) ? g_nic->link_up() : false;
 }
 
 u32 nic_link_mbps(void)
 {
-#if !PIOS_HAS_GENET
-    return 0;
-#else
-    return macb_link_mbps();
-#endif
+    return (g_nic && g_nic->link_mbps) ? g_nic->link_mbps() : 0U;
 }
 
 bool nic_link_full_duplex(void)
 {
-#if !PIOS_HAS_GENET
-    return false;
-#else
-    return macb_link_full_duplex();
-#endif
+    return (g_nic && g_nic->full_duplex) ? g_nic->full_duplex() : false;
 }
 
 void nic_set_tx_checksum_offload(bool enable)
 {
-    tx_checksum_offload = enable;
-#if PIOS_HAS_GENET
-    macb_set_tx_checksum_offload(enable);
-#endif
+    /* Only honour the request if the active backend can actually offload TX
+     * checksums in hardware; otherwise force it off so the stack always emits
+     * software-computed checksums. Without this, a backend with no offload
+     * (e.g. virtio-net) would ship payload segments with an unfilled checksum
+     * that the peer/host silently drops. */
+    if (g_nic && g_nic->set_tx_csum) {
+        tx_checksum_offload = enable;
+        g_nic->set_tx_csum(enable);
+    } else {
+        tx_checksum_offload = false;
+    }
 }
 
 void nic_set_rx_checksum_offload(bool enable)
 {
-    rx_checksum_offload = enable;
-#if PIOS_HAS_GENET
-    macb_set_rx_checksum_offload(enable);
-#endif
+    /* Same rule: only trust hardware RX checksum validation if the active
+     * backend actually performs it; otherwise verify in software. */
+    if (g_nic && g_nic->set_rx_csum) {
+        rx_checksum_offload = enable;
+        g_nic->set_rx_csum(enable);
+    } else {
+        rx_checksum_offload = false;
+    }
 }
 
 void nic_set_tso(bool enable)
 {
-#if PIOS_HAS_GENET
-    macb_set_tso(enable);
-    tso_enabled = macb_tso_enabled();
-#else
-    tso_enabled = false;
-#endif
+    if (g_nic && g_nic->set_tso) {
+        g_nic->set_tso(enable);
+        tso_enabled = g_nic->tso_enabled ? g_nic->tso_enabled() : enable;
+    } else {
+        tso_enabled = false;
+    }
 }
 
 bool nic_tx_checksum_offload_enabled(void)
 {
-#if PIOS_HAS_GENET
-    tx_checksum_offload = tx_checksum_offload && macb_tx_checksum_offload_enabled();
-#endif
+    if (g_nic && g_nic->tx_csum_enabled)
+        tx_checksum_offload = tx_checksum_offload && g_nic->tx_csum_enabled();
     return tx_checksum_offload;
 }
 
 bool nic_rx_checksum_offload_enabled(void)
 {
-#if PIOS_HAS_GENET
-    rx_checksum_offload = rx_checksum_offload && macb_rx_checksum_offload_enabled();
-#endif
+    if (g_nic && g_nic->rx_csum_enabled)
+        rx_checksum_offload = rx_checksum_offload && g_nic->rx_csum_enabled();
     return rx_checksum_offload;
 }
 
 bool nic_tso_enabled(void)
 {
-#if PIOS_HAS_GENET
-    tso_enabled = macb_tso_enabled();
-#endif
+    if (g_nic && g_nic->tso_enabled)
+        tso_enabled = g_nic->tso_enabled();
     return tso_enabled;
 }
 
@@ -1164,15 +1227,16 @@ void nic_offload_status(nic_offload_status_t *out)
     if (!out)
         return;
     simd_zero(out, sizeof(*out));
-#if PIOS_HAS_GENET
-    out->tx_checksum_capable = true;
-    out->rx_checksum_capable = true;
-    out->tso_capable = false;
-    out->tx_checksum_enabled = nic_tx_checksum_offload_enabled();
-    out->rx_checksum_enabled = nic_rx_checksum_offload_enabled();
-    out->tso_enabled = nic_tso_enabled();
-    macb_offload_regs(&out->mac_ncfgr, &out->mac_dmacfg);
-#endif
+    if (g_nic && g_nic->set_tx_csum) {
+        out->tx_checksum_capable = true;
+        out->rx_checksum_capable = (g_nic->set_rx_csum != 0);
+        out->tso_capable = (g_nic->set_tso != 0);
+        out->tx_checksum_enabled = nic_tx_checksum_offload_enabled();
+        out->rx_checksum_enabled = nic_rx_checksum_offload_enabled();
+        out->tso_enabled = nic_tso_enabled();
+        if (g_nic->offload_regs)
+            g_nic->offload_regs(&out->mac_ncfgr, &out->mac_dmacfg);
+    }
     out->tx_csum_offloaded = pkt_counts.tx_csum_offloaded;
     out->tx_csum_software = pkt_counts.tx_csum_software;
     out->rx_csum_trusted = pkt_counts.rx_csum_trusted;

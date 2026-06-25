@@ -504,6 +504,8 @@ u64  proc_svc_bad_calls(void);
 #define PROC_PREEMPT_QUANTUM_MS  5U
 void proc_preempt_init(u32 timer_hz, u32 quantum_ms);
 void proc_irq_maybe_preempt(struct irq_frame *frame);
+/* Preemption-accounting half of the unified timer tick hook (see kernel.c). */
+void proc_timer_tick(u32 core, u64 tick);
 u64  proc_preemptions(void);
 u32  proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries);
 bool proc_soft_event(u32 target_pid, u32 event_type, bool boost);

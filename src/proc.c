@@ -1336,7 +1336,6 @@ static i32   sys_tensor_scale(void *b, const void *a, float scalar);
 static i32   sys_tensor_bind_kernel_blob(u32 kernel_id, const void *uniform_data, u32 uniform_bytes,
                                          const u64 *shader_code, u32 shader_insts);
 static i32   sys_tensor_bind_kernel_csd(u32 kernel_id, const u32 *csd_cfg, u32 qpu_count);
-static void  proc_tick_hook(u32 core, u64 tick);
 static void  proc_preempt_trampoline(void);
 static void  proc_handle_bench_echo(void);
 static void  proc_note_desched(u32 reason);
@@ -2623,7 +2622,10 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
      * on core 2 wedged). Cooperative behaviour is unchanged from the baseline;
      * re-enabling preemption is a separate task that must validate the trampoline. */
     preempt_enabled(uc) = false;
-    timer_set_tick_hook(proc_tick_hook);
+    /* The timer tick hook is registered once, centrally, as the single unified
+     * pios_tick_hook (kernel.c) by each core's main(); proc_preempt_init no
+     * longer installs its own hook, so the reactor (core 0) and preemption
+     * (user cores) can never clobber each other's per-core hook slot. */
 
     /* Idle wake source:
      *   - hosts_process core (cooperative): keep the architected timer EVENT
@@ -2672,7 +2674,10 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
     uart_putc('\n');
 }
 
-static void proc_tick_hook(u32 core, u64 tick)
+/* Preemption-accounting half of the unified per-core timer tick hook. Marks a
+ * user-core process for preemption once it overruns its quantum. No-op on the
+ * network/service core. Invoked from pios_tick_hook (kernel.c). */
+void proc_timer_tick(u32 core, u64 tick)
 {
     if (core != CORE_USERM && core != CORE_USER0 && core != CORE_USER1)
         return;

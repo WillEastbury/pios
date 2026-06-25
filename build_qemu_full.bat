@@ -18,7 +18,7 @@ for %%f in (src\*.S) do (
     )
 )
 for %%f in (src\*.c) do (
-    if /I not "%%~nxf"=="bootstrap.c" if /I not "%%~nxf"=="provision.c" if /I not "%%~nxf"=="qemu_virt_min.c" if /I not "%%~nxf"=="qemu_virt_walfs.c" (
+    if /I not "%%~nxf"=="bootstrap.c" if /I not "%%~nxf"=="provision.c" if /I not "%%~nxf"=="provision_revert.c" if /I not "%%~nxf"=="qemu_virt_min.c" if /I not "%%~nxf"=="qemu_virt_walfs.c" (
         echo Compiling %%~nf.c...
         "%CC%" %CFLAGS% -c "%%f" -o "build_qemu_full\%%~nf.o"
         if errorlevel 1 exit /b 1

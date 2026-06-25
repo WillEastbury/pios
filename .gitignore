@@ -56,3 +56,8 @@ wifi_config.h
 /wifi/
 sd_diff.txt
 fixup4.dat
+
+# QEMU debug capture artifacts
+qemu_vnet.pcap
+virt_dump.dtb
+*.pcap

@@ -18099,6 +18099,18 @@ static void core0_io_tick_hook(u32 core, u64 tick)
     }
 }
 
+/* Single unified per-core timer tick hook. Every core registers THIS one hook
+ * (core 0 in core0_main, user cores in their main() after proc_preempt_init),
+ * so there is exactly one tick_hook per core and the two responsibilities can
+ * never overwrite each other's slot:
+ *   - proc_timer_tick():   preemption accounting   (user cores; no-op on core 0)
+ *   - core0_io_tick_hook(): reactor IO-flag marking (core 0; no-op elsewhere) */
+static void pios_tick_hook(u32 core, u64 tick)
+{
+    proc_timer_tick(core, tick);
+    core0_io_tick_hook(core, tick);
+}
+
 static void core0_eth_irq_handler(void)
 {
     if (core0_eth_irq_oneshot)
@@ -18267,7 +18279,7 @@ NORETURN void core0_main(void) {
     uart_vt_reset();
     ui_console_prompt();
 
-    timer_set_tick_hook(core0_io_tick_hook);
+    timer_set_tick_hook(pios_tick_hook);
     core0_io_flags = CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART |
                      CORE0_IO_USB | CORE0_IO_MAINT | CORE0_IO_DASH | CORE0_IO_CPUCLK;
     core0_io_sched_start_ticks = sched_counter_ticks();
@@ -18275,11 +18287,18 @@ NORETURN void core0_main(void) {
     bool dash_fb_ok = fb_init(1920, 1080) || fb_init(1280, 720) || fb_init(1024, 768);
     uart_puts(dash_fb_ok ? "[fb] UEFI GOP framebuffer online\n" :
                            "[fb] UEFI GOP framebuffer unavailable\n");
-#endif
+    /* Only paint the dashboard if a framebuffer actually initialised; on a
+     * headless QEMU boot (no GOP bootinfo) there is no scanout to render to. */
+    if (dash_fb_ok && ui_mode == UI_MODE_NONE) {
+        hdmi_dashboard_render();
+        fb_present();
+    }
+#else
     if (ui_mode == UI_MODE_NONE) {
         hdmi_dashboard_render();
         fb_present();
     }
+#endif
 
     /* Auto-arm RP1 Ethernet RX → GIC HOST6 so inbound packets wake core 0 via
      * interrupt instead of relying solely on the periodic poll. The 31 Hz NET
@@ -18422,6 +18441,7 @@ NORETURN void core1_main(void) {
     timer_init(PROC_PREEMPT_TIMER_HZ);
     core_mark_online(CORE_USERM, 4);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
+    timer_set_tick_hook(pios_tick_hook);
     core_mark_online(CORE_USERM, 5);
     proc_schedule(); /* never returns */
     for (;;) wfe();
@@ -18448,6 +18468,7 @@ NORETURN void core2_main(void) {
     core_mark_online(CORE_USER0, 4);
     proc_mark_core_hosts_process(CORE_USER0);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
+    timer_set_tick_hook(pios_tick_hook);
     core_mark_online(CORE_USER0, 5);
     /* Launch the PicoScript VM-backed HTTP benchmark worker on port 82. */
     proc_exec_from_mem_el0("user/httpd-vm-el0", user_httpd_vm_start,
@@ -18469,6 +18490,7 @@ NORETURN void core3_main(void) {
     core_mark_online(CORE_USER1, 4);
     proc_mark_core_hosts_process(CORE_USER1);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
+    timer_set_tick_hook(pios_tick_hook);
     core_mark_online(CORE_USER1, 5);
     /* Launch a second PicoScript VM-backed HTTP worker on bridge 1 / port 83. */
     proc_exec_from_mem_el0("user/httpd-vm1-el0", user_httpd_native_start,
@@ -19172,41 +19194,61 @@ void kernel_main(void) {
     }
     watchdog_hw_pet();
 
-    /* ── Phase 5: NIC (Cadence MACB/GEM on RP1) ── */
+    /* ── Phase 5: NIC (runtime backend probe: macb / virtio-net / ...) ── */
     bp_active(5);
-#if PIOS_HAS_GENET
-    bp_log("[nic] nic_init (Cadence GEM)...");
+    bp_log("[nic] nic_init (probe backends)...");
     nic_ok = nic_init();
     if (!nic_ok) {
-        bp_err("[nic] MACB init FAILED"); bp_done(5, false);
+        bp_warn("[nic] no NIC hardware detected");
+        bp_done(5, true);
     } else {
-        bp_ok("[nic] MACB online");
-        if (nic_link_up()) bp_ok("[nic] PHY link UP");
-        else bp_warn("[nic] PHY link DOWN (use 'wifi init' for wireless)");
+        uart_puts("[nic] active backend: ");
+        uart_puts(nic_active_name());
+        uart_puts("\n");
+        bp_ok("[nic] online");
+        if (nic_link_up()) bp_ok("[nic] link UP");
+        else bp_warn("[nic] link DOWN");
         bp_done(5, true);
     }
-#else
-    bp_warn("[nic] GENET/MACB skipped on this platform");
-    bp_done(5, true);
-#endif
 
-    /* Init network stack */
-    bp_log("[net] net_init (static IP)...");
-    net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
-    /* Pin the dev host PC as a static neighbor so we never need ARP
-     * resolution to talk back to it, and unsolicited replies are valid. */
-    net_add_neighbor(HOST_PC_IP, HOST_PC_MAC);
-    (void)net_route_add(HOST_PC_IP, 0xFFFFFFFFU, 0, NET_ROUTE_F_CONNECTED);
-    uart_puts("[net] static neighbor 192.168.218.9 -> 04:bf:1b:e1:d7:78\n");
-    ui_cfg_ip = MY_IP;
-    ui_cfg_mask = MY_MASK;
-    ui_cfg_gw = MY_GW;
-    ui_cfg_dns = MY_GW;
-    ui_cfg_dhcp = false;
-    dns_init(ui_cfg_dns);
-    net_services_listen();
-    uart_puts("[net] HTTP:80 HTTPS:443 DBG:2323\n");
-    bp_ok("[net] IP stack ready");
+    /* Init network stack — only if a NIC was activated. */
+    if (nic_ok) {
+        bp_log("[net] net_init (static IP)...");
+        net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
+        /* Pin the dev host PC as a static neighbor so we never need ARP
+         * resolution to talk back to it, and unsolicited replies are valid. */
+        net_add_neighbor(HOST_PC_IP, HOST_PC_MAC);
+        (void)net_route_add(HOST_PC_IP, 0xFFFFFFFFU, 0, NET_ROUTE_F_CONNECTED);
+        uart_puts("[net] static neighbor 192.168.218.9 -> 04:bf:1b:e1:d7:78\n");
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+        /* QEMU user-mode (SLIRP) assigns its gateway a deterministic MAC of
+         * 52:55:<gateway-ipv4>. Pin it so the stack never has to ARP-resolve the
+         * gateway: SLIRP answers each ARP request with a single reply, which
+         * otherwise loses the race against the anti-spoof 2-reply consistency
+         * requirement (arp.c ARP_CONSISTENCY_COUNT) and the SYN-retransmit/curl
+         * timeout, so inbound connections never get a SYN-ACK. This is a QEMU
+         * test-harness convenience; real hardware resolves the gateway via ARP. */
+        {
+            u8 gwmac[6] = { 0x52, 0x55,
+                            (u8)(MY_GW >> 24), (u8)(MY_GW >> 16),
+                            (u8)(MY_GW >> 8),  (u8)MY_GW };
+            net_add_neighbor(MY_GW, gwmac);
+            uart_puts("[net] QEMU SLIRP gateway MAC pinned\n");
+        }
+#endif
+        ui_cfg_ip = MY_IP;
+        ui_cfg_mask = MY_MASK;
+        ui_cfg_gw = MY_GW;
+        ui_cfg_dns = MY_GW;
+        ui_cfg_dhcp = false;
+        dns_init(ui_cfg_dns);
+        net_services_listen();
+        uart_puts("[net] HTTP:80 HTTPS:443 DBG:2323\n");
+        bp_ok("[net] IP stack ready");
+    } else {
+        uart_puts("[net] no NIC detected — network disabled\n");
+        bp_warn("[net] disabled (no NIC)");
+    }
     watchdog_hw_pet();
 
     /* Native VideoCore visibility probe, then GPU + Tensor. */
