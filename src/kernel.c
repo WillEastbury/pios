@@ -44,6 +44,7 @@
 #include "bcache.h"
 #include "principal.h"
 #include "proc.h"
+#include "dtrace.h"
 #include "uhttp_bridge.h"
 #include "pix.h"
 #include "pcie.h"
@@ -2972,6 +2973,46 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " tx_recover=");
         http_append_u64(out, &len, max, md.tx_recover);
         http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "dtrace")) {
+        /* In-memory diagnostic trace control + dump.
+         *   dtrace            -> status
+         *   dtrace on|off     -> enable/disable capture
+         *   dtrace clear      -> reset rings
+         *   dtrace mask <hex> -> set category bitmask (0=all)
+         *   dtrace dump [n]   -> dump n most-recent records (default 256) */
+        const char *arg = cmd + 6;
+        while (*arg == ' ') arg++;
+        if (http_starts_with(arg, "on")) {
+            dtrace_set_enabled(true);
+            len += dtrace_status(out + len, max - len);
+        } else if (http_starts_with(arg, "off")) {
+            dtrace_set_enabled(false);
+            len += dtrace_status(out + len, max - len);
+        } else if (http_starts_with(arg, "clear")) {
+            dtrace_clear();
+            http_append(out, &len, max, "dtrace cleared\n");
+        } else if (http_starts_with(arg, "mask")) {
+            const char *h = arg + 4;
+            while (*h == ' ') h++;
+            u32 m = 0;
+            if (h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) h += 2;
+            while ((*h >= '0' && *h <= '9') || (*h >= 'a' && *h <= 'f') || (*h >= 'A' && *h <= 'F')) {
+                u32 d = (*h <= '9') ? (u32)(*h - '0') : ((*h | 0x20) - 'a' + 10U);
+                m = (m << 4) | d; h++;
+            }
+            dtrace_set_mask(m);
+            len += dtrace_status(out + len, max - len);
+        } else if (http_starts_with(arg, "dump")) {
+            const char *n = arg + 4;
+            while (*n == ' ') n++;
+            u32 cnt = 0;
+            while (*n >= '0' && *n <= '9') { cnt = cnt * 10U + (u32)(*n - '0'); n++; }
+            if (cnt == 0) cnt = 256;
+            len += dtrace_status(out + len, max - len);
+            len += dtrace_dump(out + len, max - len, cnt);
+        } else {
+            len += dtrace_status(out + len, max - len);
+        }
     } else if (http_streq(cmd, "stackdiag")) {
         /* Data-plane health across every layer that carries constant traffic:
          * IP stack, TCP, kernel TLS, the port FIFO forwarding bridges, and the
@@ -8407,6 +8448,9 @@ static void admin_service_poll(struct admin_http_service *svc)
     if (svc->listen_conn < 0 ||
         (svc->client_conn >= 0 && now - svc->last_activity_ms > ADMIN_CLIENT_STALL_MS) ||
         (now - svc->last_ok_ms > ADMIN_SERVICE_WATCHDOG_MS && svc->completions > 0)) {
+        if (svc->stream_mode)
+            DTRACE(DTRACE_CAT_OTA, DT_OTA_WATCHDOG, svc->stream_received,
+                   now - svc->last_activity_ms, svc->stream_total, svc->port);
         admin_service_restart(svc);
     }
 
@@ -8471,6 +8515,11 @@ static void admin_service_poll(struct admin_http_service *svc)
             if ((drain_spins & 0xFFU) == 0)
                 watchdog_hw_pet();
         }
+        DTRACE(DTRACE_CAT_OTA, DT_OTA_CHUNK, svc->stream_received, svc->stream_total,
+               drain_spins, tcp_readable(svc->client_conn));
+        if (drain_spins >= 4096U)
+            DTRACE(DTRACE_CAT_OTA, DT_OTA_DRAIN_SPIN, svc->stream_received, drain_spins,
+                   svc->stream_total, 0);
         if (svc->stream_received < svc->stream_total && readable == 0) {
             /* Waiting for more inbound data (typically the final sub-MSS tail).
              * Periodically re-advertise our receive window so a single lost
@@ -8495,6 +8544,7 @@ static void admin_service_poll(struct admin_http_service *svc)
             if (fok) {
                 ota_update.active = false;
                 ota_update.commits++;
+                DTRACE(DTRACE_CAT_OTA, DT_OTA_COMMIT, svc->stream_total, ota_update.commits, 0, 0);
                 pios_bootctrl_mark_pending(ota_update.target_slot);
                 http_log_event("ota-stream-commit", svc->stream_total, ota_update.commits);
                 http_append(svc->resp, &svc->resp_len, sizeof(svc->resp),
@@ -8563,6 +8613,7 @@ static void admin_service_poll(struct admin_http_service *svc)
                 svc->stream_total = total;
                 svc->stream_reboot = want_reboot;
                 svc->stream_received = 0;
+                DTRACE(DTRACE_CAT_OTA, DT_OTA_BEGIN, total, want_reboot ? 1U : 0U, svc->port, 0);
                 http_log_event("ota-stream-begin", total, want_reboot ? 1U : 0U);
                 /* Any body bytes already read in with the headers go to staging. */
                 if (body_off < svc->req_len) {
@@ -16437,6 +16488,35 @@ static void ui_console_exec(char *line)
         ui_cmd_nic(argc, argv);
     } else if (ui_streq(argv[0], "cachestats")) {
         ui_cmd_cachestats(argc, argv);
+    } else if (ui_streq(argv[0], "dtrace")) {
+        /* dtrace [on|off|clear|mask <hex>|dump [n]]  — in-memory trace control */
+        if (argc >= 2 && ui_streq(argv[1], "on")) {
+            dtrace_set_enabled(true);
+        } else if (argc >= 2 && ui_streq(argv[1], "off")) {
+            dtrace_set_enabled(false);
+        } else if (argc >= 2 && ui_streq(argv[1], "clear")) {
+            dtrace_clear();
+            ui_console_write("dtrace cleared\n");
+        } else if (argc >= 3 && ui_streq(argv[1], "mask")) {
+            u32 m = 0;
+            const char *h = argv[2];
+            if (h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) h += 2;
+            while ((*h >= '0' && *h <= '9') || ((*h | 0x20) >= 'a' && (*h | 0x20) <= 'f')) {
+                u32 d = (*h <= '9') ? (u32)(*h - '0') : ((*h | 0x20) - 'a' + 10U);
+                m = (m << 4) | d; h++;
+            }
+            dtrace_set_mask(m);
+        } else if (argc >= 2 && ui_streq(argv[1], "dump")) {
+            u32 n = 256;
+            if (argc >= 3) (void)ui_parse_u32(argv[2], &n);
+            dtrace_dump_uart(n);
+        }
+        {
+            char sb[160];
+            u32 sl = dtrace_status(sb, sizeof(sb) - 1U);
+            sb[sl] = 0;
+            ui_console_write(sb);
+        }
     } else if (ui_streq(argv[0], "reboot")) {
         if (argc >= 2 && ui_streq(argv[1], "confirm")) {
             ui_console_write("OK: rebooting via PSCI SYSTEM_RESET...\n");
@@ -18307,6 +18387,12 @@ NORETURN void core0_main(void) {
     core0_eth_irq_arm_host(false);
 #endif
 
+    /* Diagnostic-trace phase threshold: only record reactor phases that take
+     * longer than ~50us of work, so the trace ring captures the rare long
+     * (starving) phases instead of being flooded by empty 128Hz polls. */
+    u64 dt_phase_thresh;
+    { u64 f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); dt_phase_thresh = f / 20000U; }
+
     for (;;) {
         u32 flags = core0_io_take_flags();
         if (flags == 0) {
@@ -18329,6 +18415,7 @@ NORETURN void core0_main(void) {
 
         if (flags & CORE0_IO_NET) {
             u64 svc_start = ksvc_begin(ksvc_net_id);
+            u64 dt_t0 = sched_counter_ticks();
             net_poll();
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
             /* Self-heal a latched RX-overrun stall (BNA/OVR). A burst that
@@ -18343,6 +18430,9 @@ NORETURN void core0_main(void) {
                 core0_eth_irq_drain_and_quench(false);
                 core0_eth_irq_deferred_quench = false;
             }
+            u64 dt_net = sched_counter_ticks() - dt_t0;
+            if (dt_net > dt_phase_thresh)
+                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_NET, dt_net, flags, 0, 0);
             ksvc_end(ksvc_net_id, svc_start, false);
         }
 
@@ -18351,8 +18441,15 @@ NORETURN void core0_main(void) {
             /* Drain the admin services (incl. the OTA upload stream) FIRST and
              * independently of the heavy multi-connection :80 handler, so a bulk
              * OTA upload is never starved of core0 time by :80 load. */
+            u64 dt_a0 = sched_counter_ticks();
             admin_services_poll();
+            u64 dt_a1 = sched_counter_ticks();
+            if (dt_a1 - dt_a0 > dt_phase_thresh)
+                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_ADMIN, dt_a1 - dt_a0, 0, 0, 0);
             echo_tcp_poll();
+            u64 dt_echo = sched_counter_ticks() - dt_a1;
+            if (dt_echo > dt_phase_thresh)
+                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_ECHO, dt_echo, 0, 0, 0);
             uhttp_bridge_poll();   /* userland :81 request/response pump */
             ksvc_end(ksvc_tcp_id, svc_start, false);
             ksvc_run(ksvc_debug_id);
@@ -19092,6 +19189,7 @@ void kernel_main(void) {
     /* IPC */
     bp_log("[fifo] fifo_init_all...");
     fifo_init_all();
+    dtrace_init();
     bp_log("[ipc] ipc_queue_init...");
     ipc_queue_init();
     bp_log("[ipc] ipc_stream_init...");
