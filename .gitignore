@@ -64,3 +64,4 @@ virt_dump.dtb
 
 # host unit test build output
 tests/_build/
+tests/_cov/
