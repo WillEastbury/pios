@@ -18,6 +18,7 @@
 #include "uart.h"
 #include "timer.h"
 #include "highmem.h"
+#include "dtrace.h"
 
 /* Provided by net.c */
 extern u32 net_get_our_ip(void);
@@ -1636,8 +1637,10 @@ void tcp_advertise_window(tcp_conn_t conn) {
     if (!tcb_valid(conn)) return;
     struct tcb *t = &tcbs[conn];
     if (t->state != TCP_ESTABLISHED) return;
+    u32 old_wnd = t->rcv_wnd;
     t->rcv_wnd = ring_free(&t->rx_buf);
     tcp_send_ack(t);
+    DTRACE(DTRACE_CAT_TCP, DT_TCP_WNDUPD, (u64)conn, old_wnd, t->rcv_wnd, 0xFFFFFFFFU);
 }
 
 u32 tcp_read(tcp_conn_t conn, void *data, u32 len) {
@@ -1655,8 +1658,10 @@ u32 tcp_read(tcp_conn_t conn, void *data, u32 len) {
      * resets the connection (host sees WinError 10054 mid-upload). This is the
      * standard receiver-side window-update every TCP must send. */
     if (n > 0 && t->state == TCP_ESTABLISHED &&
-        old_wnd < TCP_MSS && t->rcv_wnd >= TCP_MSS)
+        old_wnd < TCP_MSS && t->rcv_wnd >= TCP_MSS) {
         tcp_send_ack(t);
+        DTRACE(DTRACE_CAT_TCP, DT_TCP_WNDUPD, (u64)conn, old_wnd, t->rcv_wnd, n);
+    }
     return n;
 }
 

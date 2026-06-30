@@ -173,12 +173,14 @@ static const char *ev_name(u8 log2, u16 ev)
         case DT_OTA_BEGIN: return "begin"; case DT_OTA_CHUNK: return "chunk";
         case DT_OTA_DRAIN_SPIN: return "drain"; case DT_OTA_WATCHDOG: return "watchdog";
         case DT_OTA_COMMIT: return "commit"; case DT_OTA_RESET: return "reset";
+        case DT_OTA_WADV: return "wadv"; case DT_OTA_REACTOR_GAP: return "gap";
         } break;
     case DTRACE_CAT_REACTOR:
         switch (ev) {
         case DT_RX_PHASE_NET: return "net"; case DT_RX_PHASE_TCP: return "tcp";
         case DT_RX_PHASE_ADMIN: return "admin"; case DT_RX_PHASE_ECHO: return "echo";
-        case DT_RX_WFE: return "wfe"; case DT_RX_WAKE: return "wake";
+        case DT_RX_PHASE_HTTP: return "http";
+        case DT_RX_WAKE: return "wake";
         } break;
     }
     return "?";

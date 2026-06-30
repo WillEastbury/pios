@@ -382,7 +382,9 @@ struct admin_http_service {
     bool stream_reboot;
     u32  stream_total;
     u32  stream_received;
-    u64  stream_wadv_ms;   /* last window re-advertise while waiting for tail */
+    u64  stream_wadv_ms;     /* last window re-advertise while waiting for tail */
+    u64  stream_wadv_count;  /* total re-advertises sent this stream */
+    u64  stream_last_drain;  /* sched_counter_ticks() at last drain entry */
 };
 
 static struct admin_http_service admin_status_svc = {
@@ -8613,6 +8615,17 @@ static void admin_service_poll(struct admin_http_service *svc)
      * and (optionally) reboot into it. */
     if (svc->stream_mode) {
         u32 readable = tcp_readable(svc->client_conn);
+        /* REACTOR_GAP: trace how long since the last time we ran this drain block.
+         * A large gap during OTA is the starvation signature we are hunting. */
+        u64 t_now; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t_now));
+        if (svc->stream_last_drain) {
+            u64 gap = t_now - svc->stream_last_drain;
+            u64 cntfrq; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
+            if (gap > cntfrq / 2000U) /* >~0.5ms = interesting */
+                DTRACE(DTRACE_CAT_OTA, DT_OTA_REACTOR_GAP, gap,
+                       svc->stream_received, svc->stream_total, 0);
+        }
+        svc->stream_last_drain = t_now;
         /* Tight drain: while the stream is active, pump the NIC RX + drain this
          * connection in a bounded inner loop so the upload runs at wire speed
          * regardless of the core0 reactor cadence or :80 load. The board has no
@@ -8658,6 +8671,11 @@ static void admin_service_poll(struct admin_http_service *svc)
             if (now - svc->stream_wadv_ms > 200ULL) {
                 tcp_advertise_window(svc->client_conn);
                 svc->stream_wadv_ms = now;
+                svc->stream_wadv_count++;
+                DTRACE(DTRACE_CAT_OTA, DT_OTA_WADV,
+                       svc->stream_received, svc->stream_total,
+                       (u64)tcp_readable(svc->client_conn),
+                       svc->stream_wadv_count);
             }
         }
         if (svc->stream_received >= svc->stream_total) {
@@ -8741,6 +8759,9 @@ static void admin_service_poll(struct admin_http_service *svc)
                 svc->stream_total = total;
                 svc->stream_reboot = want_reboot;
                 svc->stream_received = 0;
+                svc->stream_wadv_ms = 0;
+                svc->stream_wadv_count = 0;
+                svc->stream_last_drain = 0;
                 DTRACE(DTRACE_CAT_OTA, DT_OTA_BEGIN, total, want_reboot ? 1U : 0U, svc->port, 0);
                 http_log_event("ota-stream-begin", total, want_reboot ? 1U : 0U);
                 /* Any body bytes already read in with the headers go to staging. */
@@ -18578,7 +18599,11 @@ NORETURN void core0_main(void) {
             u64 dt_echo = sched_counter_ticks() - dt_a1;
             if (dt_echo > dt_phase_thresh)
                 DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_ECHO, dt_echo, 0, 0, 0);
+            u64 dt_http0 = sched_counter_ticks();
             uhttp_bridge_poll();   /* userland :81 request/response pump */
+            u64 dt_http = sched_counter_ticks() - dt_http0;
+            if (dt_http > dt_phase_thresh)
+                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_HTTP, dt_http, 0, 0, 0);
             ksvc_end(ksvc_tcp_id, svc_start, false);
             ksvc_run(ksvc_debug_id);
         }

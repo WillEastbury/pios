@@ -60,17 +60,20 @@
 #define DT_IRQ_DISPATCH     1   /* a0=intid */
 /* OTA / admin stream */
 #define DT_OTA_BEGIN        1   /* a0=total */
-#define DT_OTA_CHUNK        2   /* a0=received a1=total */
+#define DT_OTA_CHUNK        2   /* a0=received a1=total a2=drain_spins a3=readable */
 #define DT_OTA_DRAIN_SPIN   3   /* a0=received a1=spins */
 #define DT_OTA_WATCHDOG     4   /* a0=received a1=idle_ms */
 #define DT_OTA_COMMIT       5   /* a0=total */
 #define DT_OTA_RESET        6   /* a0=received */
+#define DT_OTA_WADV         7   /* window re-adv sent; a0=received a1=total a2=wnd_free a3=wadv_count */
+#define DT_OTA_REACTOR_GAP  8   /* gap since last drain pass; a0=gap_ticks a1=received a2=total */
 /* REACTOR (core 0 service loop) */
 #define DT_RX_PHASE_NET     1   /* a0=dur_ticks */
 #define DT_RX_PHASE_TCP     2   /* a0=dur_ticks */
 #define DT_RX_PHASE_ADMIN   3   /* a0=dur_ticks */
 #define DT_RX_PHASE_ECHO    4   /* a0=dur_ticks */
-#define DT_RX_WFE           5   /* a0=idle_ticks */
+#define DT_RX_PHASE_HTTP    5   /* a0=dur_ticks (uhttp_bridge_poll — the :80 handler) */
+#define DT_RX_WFE           5   /* a0=idle_ticks — keep old ID in case code refs it */
 #define DT_RX_WAKE          6   /* a0=flags */
 
 struct dtrace_rec {
