@@ -245,36 +245,21 @@ struct dhcp_parsed {
     u32 t2;
 };
 
-static u32 read_u32_be(const u8 *p) {
-    return ((u32)p[0]<<24) | ((u32)p[1]<<16) | ((u32)p[2]<<8) | p[3];
-}
-
+/* Thin wrapper so the rest of dhcp.c uses the same parser logic that the host
+ * unit test exercises via dhcp_parse_options_test() (src/dhcp_options.c). */
 static bool parse_dhcp_options(const u8 *opts, u32 opts_len, struct dhcp_parsed *out) {
-    simd_zero(out, sizeof(*out));
-    u32 i = 0;
-
-    while (i < opts_len) {
-        u8 code = opts[i++];
-        if (code == OPT_PAD) continue;
-        if (code == OPT_END) break;
-        if (i >= opts_len) return false;
-        u8 len = opts[i++];
-        if (i + len > opts_len) return false; /* bounds check */
-
-        switch (code) {
-        case OPT_MSG_TYPE:  if (len >= 1) out->msg_type = opts[i]; break;
-        case OPT_SUBNET:    if (len >= 4) out->subnet = read_u32_be(opts+i); break;
-        case OPT_ROUTER:    if (len >= 4) out->router = read_u32_be(opts+i); break;
-        case OPT_DNS:       if (len >= 4) out->dns = read_u32_be(opts+i); break;
-        case OPT_LEASE_TIME:if (len >= 4) out->lease_time = read_u32_be(opts+i); break;
-        case OPT_SERVER_ID: if (len >= 4) out->server_id = read_u32_be(opts+i); break;
-        case OPT_T1:        if (len >= 4) out->t1 = read_u32_be(opts+i); break;
-        case OPT_T2:        if (len >= 4) out->t2 = read_u32_be(opts+i); break;
-        default: break;
-        }
-        i += len;
-    }
-    return out->msg_type != 0;
+    dhcp_parsed_test_t t;
+    if (!dhcp_parse_options_test(opts, opts_len, &t)) return false;
+    out->msg_type   = t.msg_type;
+    out->server_id  = t.server_id;
+    out->offered_ip = t.offered_ip;
+    out->subnet     = t.subnet;
+    out->router     = t.router;
+    out->dns        = t.dns;
+    out->lease_time = t.lease_time;
+    out->t1         = t.t1;
+    out->t2         = t.t2;
+    return true;
 }
 
 /* ---- UDP callback for DHCP responses ---- */

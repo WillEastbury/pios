@@ -1,5 +1,9 @@
-#pragma once
-
+/* If a host-test shim was already included (tests/stubinc/types.h sets this
+ * guard), skip the bare-metal AArch64 definitions that won't compile on the
+ * host. The shim provides equivalent typedefs and no-op barrier inlines. */
+#ifndef PIOS_HOST_TYPES_SHIM
+#ifndef PIOS_TYPES_H
+#define PIOS_TYPES_H
 typedef unsigned char       u8;
 typedef unsigned short      u16;
 typedef unsigned int        u32;
@@ -68,3 +72,5 @@ void *memset(void *dst, int c, usize n);
 void *memcpy(void *dst, const void *src, usize n);
 int   memcmp(const void *a, const void *b, usize n);
 u32   pios_strlen(const char *s);
+#endif /* PIOS_TYPES_H */
+#endif /* PIOS_HOST_TYPES_SHIM */

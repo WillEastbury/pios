@@ -29,6 +29,9 @@ OUT = TESTS / "_build"
 # test file -> kernel source files it links against
 TESTS_MANIFEST = {
     "test_picocompress.c": ["src/picocompress.c"],
+    # DHCP option parser: compiled from src/dhcp_options.c (the standalone
+    # parser extracted from dhcp.c, pure logic, no MMIO/asm/network deps).
+    "test_dhcp.c": ["src/dhcp_options.c"],
 }
 
 
@@ -44,7 +47,7 @@ def main() -> int:
     cc = find_clang()
     OUT.mkdir(exist_ok=True)
     inc = ["-I", str(TESTS / "stubinc"), "-I", str(REPO / "include")]
-    cflags = ["-std=gnu11", "-O1", "-g", "-Wall", "-Wextra",
+    cflags = ["-std=gnu11", "-O2", "-g", "-Wall", "-Wextra",
               "-Wno-unused-parameter", "-fno-strict-aliasing"]
 
     total_fail = 0

@@ -5,9 +5,10 @@
  * kernel modules (which do `#include "types.h"`) pick up these host-safe
  * typedefs instead of the real bare-metal header (which contains AArch64
  * inline asm that will not compile on the host). Only modules that touch no
- * MMIO/asm can be unit-tested this way (e.g. picocompress).
+ * MMIO/asm can be unit-tested this way (e.g. picocompress, dhcp_options).
  */
 #pragma once
+#define PIOS_HOST_TYPES_SHIM  1   /* suppress bare-metal defs in include/types.h */
 
 #include <stdint.h>
 #include <stddef.h>
