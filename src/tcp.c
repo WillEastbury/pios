@@ -1023,6 +1023,21 @@ static u32 tcp_rx_ingest_in_order(struct tcb *t, u32 seg_seq, const u8 *data, u3
 {
     if (data_len == 0 || seg_seq != t->rcv_nxt)
         return 0;
+    /* Atomic accept: never PARTIALLY buffer a segment. If the whole segment
+     * does not fit in the receive ring, drop it entirely and leave rcv_nxt on
+     * the segment boundary. Advancing rcv_nxt by a partial amount (what a
+     * truncating ring_write would do) desyncs us from the sender's MSS
+     * boundaries: the sender keeps retransmitting full segments at the old
+     * boundary, every one now has seg_seq != rcv_nxt, so none are ever ingested
+     * and the transfer freezes forever mid-segment (observed: a 2.5MB OTA froze
+     * at rcv_nxt=18224 = 12*1448 + 848, i.e. a 1448B segment truncated to 848).
+     * The advertised window (rcv_wnd = ring_free, sent on every ACK) throttles
+     * the sender; this full-fit check is the safety net for the lag between
+     * advertising the window and the sender's in-flight data arriving. The
+     * dropped segment is dup-ACKed by handle_established, so the sender
+     * retransmits it whole once the window reopens. */
+    if (ring_free(&t->rx_buf) < data_len)
+        return 0;
     u32 written = ring_write(&t->rx_buf, data, data_len);
     t->rcv_nxt += written;
     t->rcv_wnd = ring_free(&t->rx_buf);
