@@ -153,8 +153,12 @@ static u32 discover_kernel_slot_lba(void)
     if (mbr[510] != 0x55 || mbr[511] != 0xAA)
         return BOOT_FALLBACK_LBA;
     u32 p2_start = read_le32(&mbr[0x1CE + 8]);
-    u32 p2_size = read_le32(&mbr[0x1CE + 12]);
-    if (p2_start == 0 || p2_size < BOOT_SLOT_BLOCKS)
+    u32 p2_size  = read_le32(&mbr[0x1CE + 12]);
+    /* Accept any partition 2 that is at least 1MB — the actual payload size
+     * check is in write_slot(); refusing here based on BOOT_SLOT_BLOCKS causes
+     * fallback to LBA 2048 (FAT32 start) and corrupts the boot partition when
+     * the slot was expanded beyond the original partition size. */
+    if (p2_start == 0 || p2_size < 2048U)
         return BOOT_FALLBACK_LBA;
     return p2_start;
 }
