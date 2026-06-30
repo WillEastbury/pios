@@ -61,3 +61,6 @@ fixup4.dat
 qemu_vnet.pcap
 virt_dump.dtb
 *.pcap
+
+# host unit test build output
+tests/_build/
