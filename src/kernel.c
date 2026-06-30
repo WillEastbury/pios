@@ -3069,6 +3069,41 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else {
             http_append(out, &len, max, "usage: cdump snap a|b | show a|b | diff\n");
         }
+    } else if (http_starts_with(cmd, "selftest")) {
+        /* Unified self-test battery: run the QEMU-safe pure in-kernel selftests
+         * and report a PASS/FAIL summary. Used by the QEMU smoke harness as a
+         * pre-deploy gate. Hardware-dependent tests (dma, v3d/tensor variants,
+         * and the cert tests x509/acme which need on-device entropy/time) are
+         * excluded here — they have their own on-hardware commands. NOTE: the
+         * tensor V3D variants (tensor_vector16/etc) can HANG with no NIC/V3D on
+         * QEMU, so they must never be in this QEMU-facing battery. */
+        struct { const char *name; bool (*fn)(void); } bat[] = {
+            { "crypto",      crypto_selftest },
+            { "tls",         tls_selftest },
+            { "brotli",      brotli_selftest },
+            { "picocompress",pc_selftest },
+            { "picoweb",     picoweb_selftest },
+            { "lease",       lease_selftest },
+            { "abi",         abi_selftest },
+            { "irq_diag",    irq_diag_selftest },
+            { "proc_svc",    proc_svc_selftest },
+            { "proc_entry",  proc_entry_contract_selftest },
+            { "tensor_neon", tensor_selftest },
+        };
+        u32 nt = (u32)(sizeof(bat) / sizeof(bat[0]));
+        u32 passed = 0;
+        for (u32 i = 0; i < nt; i++) {
+            bool ok = bat[i].fn ? bat[i].fn() : false;
+            if (ok) passed++;
+            http_append(out, &len, max, ok ? "PASS " : "FAIL ");
+            http_append(out, &len, max, bat[i].name);
+            http_append(out, &len, max, "\n");
+        }
+        http_append(out, &len, max, "selftest summary ");
+        http_append_u64(out, &len, max, passed);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, nt);
+        http_append(out, &len, max, (passed == nt) ? " ALL PASS\n" : " SOME FAILED\n");
     } else if (http_streq(cmd, "stackdiag")) {
         /* Data-plane health across every layer that carries constant traffic:
          * IP stack, TCP, kernel TLS, the port FIFO forwarding bridges, and the
