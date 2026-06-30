@@ -34,7 +34,14 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 
 echo Compiling one-off provisioner...
-"%CC%" %ASFLAGS% -c src\start.S -o build_boot\start.o
+REM The provisioner is a MINIMAL binary that does raw SD writes via sd.c before
+REM jumping to the embedded kernel. It must boot Non-Cacheable (low 1GB NC) so
+REM the SD controller DMA stays coherent. PIOS_CACHE_WB_FROM_BOOT=1 (the kernel
+REM default, a perf win) makes the provisioner's early SD DMA incoherent and it
+REM crashes mid-write -> blank screen (see checkpoint 082). The embedded
+REM real_kernel.img above keeps WB-from-boot for performance; only the
+REM provisioner's own start.o is forced NC here.
+"%CC%" %ASFLAGS% -DPIOS_CACHE_WB_FROM_BOOT=0 -DPIOS_CACHE_BRINGUP_FIX=0 -c src\start.S -o build_boot\start.o
 if errorlevel 1 exit /b 1
 "%CC%" %ASFLAGS% -c src\vectors.S -o build_boot\vectors.o
 if errorlevel 1 exit /b 1
