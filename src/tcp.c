@@ -265,7 +265,7 @@ struct tcb {
  * the board still boots. TCP_MAX_CONNECTIONS (tcp.h) is unchanged — it remains
  * the *snapshot/display* cap used by external stack arrays. */
 #define TCP_TABLE_TARGET    16384U   /* highmem table capacity (network-first) */
-#define TCP_TABLE_FALLBACK  128U     /* static .bss table if highmem unavailable */
+#define TCP_TABLE_FALLBACK    8U     /* static .bss table if highmem unavailable */
 #define TCP_MAX_LISTENERS   32U
 
 static struct tcb  tcbs_fallback[TCP_TABLE_FALLBACK];

@@ -62,12 +62,12 @@
 #define PIOS_HDR_FUTURE_OFF             64U
 #define PIOS_HDR_WALFS_OFF              68U
 #define PIOS_STAGE2_OFFSET              0x000200U
-#define PIOS_STAGE2_END_OFFSET          0x1FFFFFU
+#define PIOS_STAGE2_END_OFFSET          0x37FFFFU  /* 3.5MB slot (was 2MB) */
 #define PIOS_STAGE2_ZONE_BYTES          (PIOS_STAGE2_END_OFFSET - PIOS_STAGE2_OFFSET + 1U)
 #define PIOS_BOOT_SLOT_BYTES            (PIOS_STAGE2_END_OFFSET + 1U)
 #define PIOS_BOOT_SLOT_A_OFFSET         0x000000U
-#define PIOS_BOOTCTRL_OFFSET            0x200000U
-#define PIOS_BOOT_SLOT_B_OFFSET         0x300000U
+#define PIOS_BOOTCTRL_OFFSET            0x380000U  /* moved: was 0x200000 */
+#define PIOS_BOOT_SLOT_B_OFFSET         0x400000U  /* moved: was 0x300000 */
 #define PIOS_BOOTCTRL_MAGIC             0x50424330U  /* 'PBC0' */
 #define PIOS_BOOTCTRL_VERSION           1U
 #define PIOS_BOOTCTRL_SLOT_A            0U
