@@ -265,7 +265,14 @@ struct tcb {
  * the board still boots. TCP_MAX_CONNECTIONS (tcp.h) is unchanged — it remains
  * the *snapshot/display* cap used by external stack arrays. */
 #define TCP_TABLE_TARGET    16384U   /* highmem table capacity (network-first) */
-#define TCP_TABLE_FALLBACK    8U     /* static .bss table if highmem unavailable */
+#define TCP_TABLE_FALLBACK  128U     /* static .bss table when highmem is
+                                      * unavailable (QEMU has no highmem, so this
+                                      * IS the live table there). Must be large
+                                      * enough for all listeners (:80/:443/:2323/
+                                      * admin :8081/:8082...) PLUS concurrent
+                                      * connections, or QEMU can't accept HTTP.
+                                      * .bss is NOLOAD so this costs ZERO binary
+                                      * size — only runtime RAM. */
 #define TCP_MAX_LISTENERS   32U
 
 static struct tcb  tcbs_fallback[TCP_TABLE_FALLBACK];
@@ -1062,8 +1069,18 @@ static void handle_established(struct tcb *t, u32 seg_seq, u32 seg_ack,
     /* Update send window */
     t->snd_wnd = seg_wnd;
 
-    /* Process data (direct ingest fast path) */
-    if (tcp_rx_ingest_in_order(t, seg_seq, data, data_len) > 0) {
+    /* Process data. ALWAYS ACK a data-bearing segment: an in-order segment is
+     * ingested and ACKed (advancing rcv_nxt); a retransmit whose tail overlaps
+     * the window (seg_seq < rcv_nxt <= seg_seq+seg_len-1) passes seq_acceptable
+     * but is NOT ingested (seg_seq != rcv_nxt) — it MUST still get a duplicate
+     * ACK so the sender learns our current rcv_nxt + window and resyncs. Without
+     * this, the peer retransmits forever with exponential backoff and a bulk
+     * inbound transfer deadlocks (OTA stream froze ~18KB: MAC delivered 561
+     * frames but only 94 were ACKed). The ACK also re-advertises the receive
+     * window, so a window that reopened after the app drained the ring is
+     * promptly communicated. */
+    if (data_len > 0) {
+        tcp_rx_ingest_in_order(t, seg_seq, data, data_len);
         tcp_send_ack(t);
     }
 
