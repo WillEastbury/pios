@@ -204,7 +204,7 @@ class Smoke:
     def run_load_battery(self) -> int:
         """Run the load test battery against the already-running QEMU instance.
         Uses short durations (8s each) so the gate completes in ~2 minutes."""
-        print("\n── load battery ──────────────────────────────")
+        print("\n-- load battery " + "-" * 30)
         loadtest = REPO / "tools" / "qemu_loadtest.py"
         r = subprocess.run(
             [sys.executable, str(loadtest),

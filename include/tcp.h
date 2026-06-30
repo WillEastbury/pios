@@ -12,9 +12,18 @@
 #include "types.h"
 
 #define TCP_MAX_CONNECTIONS 128
-#define TCP_BUF_SIZE        4096
+#define TCP_BUF_SIZE        65536   /* 64KB rx/tx ring per conn — 45x MSS. Without
+                                     * window scaling the advertised window is a
+                                     * 16-bit field (max 65535); ring_free maxes at
+                                     * TCP_BUF_SIZE-1 = 65535 = exactly that limit,
+                                     * so a 64KB ring fully utilises the window for
+                                     * max bulk throughput. Must stay a power of two
+                                     * (ring uses & (TCP_BUF_SIZE-1)). */
 #define TCP_MSS             1460
-#define TCP_DEFAULT_WINDOW  TCP_BUF_SIZE
+#define TCP_DEFAULT_WINDOW  (TCP_BUF_SIZE - 1)  /* 65535 — fits the 16-bit window
+                                     * field. NEVER set this to TCP_BUF_SIZE: the
+                                     * SYN-ACK path htons()es it unclamped, and
+                                     * htons(65536)=0 would advertise a zero window. */
 
 /* TCP connection states (RFC 793) */
 #define TCP_CLOSED          0

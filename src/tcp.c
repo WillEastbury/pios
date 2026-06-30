@@ -264,8 +264,14 @@ struct tcb {
  * unavailable (e.g. QEMU/probe-fail) we fall back to a small static table so
  * the board still boots. TCP_MAX_CONNECTIONS (tcp.h) is unchanged — it remains
  * the *snapshot/display* cap used by external stack arrays. */
-#define TCP_TABLE_TARGET    16384U   /* highmem table capacity (network-first) */
-#define TCP_TABLE_FALLBACK  128U     /* static .bss table when highmem is
+#define TCP_TABLE_TARGET    2048U    /* highmem table capacity. Shrunk from 16384
+                                      * because each TCB now carries 64KB rx + 64KB
+                                      * tx inline (TCP_BUF_SIZE=65536), so the table
+                                      * is 2048 * ~131KB ~= 269MB of highmem (3GB
+                                      * available). 2048 concurrent connections is
+                                      * far more than a Pi5 needs; the big window is
+                                      * the throughput win, not the connection count. */
+#define TCP_TABLE_FALLBACK  64U      /* static .bss table when highmem is
                                       * unavailable (QEMU has no highmem, so this
                                       * IS the live table there). Must be large
                                       * enough for all listeners (:80/:443/:2323/
