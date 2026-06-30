@@ -16,9 +16,11 @@ Assertions:
   - `cdump` snapshot + diff works
   - an OTA stream upload completes with {"ok":true}
   - a 20-request HTTP burst is 20/20
+  - DNS async resolve of 8.8.8.8 completes (state=2/DONE, result != 0.0.0.0)
+  - load battery (idle/sequential/parallel/bursty/malformed/intermixed at 8s each)
 
 Usage:
-  python tools/qemu_smoke.py [--build] [--kernel PATH] [--keep-log]
+  python tools/qemu_smoke.py [--build] [--kernel PATH] [--keep-log] [--no-load]
 """
 
 from __future__ import annotations
@@ -168,10 +170,43 @@ class Smoke:
                 pass
         self.check("HTTP burst 20/20", ok == 20, f"{ok}/20")
 
+        # DNS resolve: async lookup of 8.8.8.8 (SLIRP gateway acts as resolver)
+        try:
+            term("dns flush")
+            term("dns resolve 8.8.8.8")
+            # Poll up to 6s for state=2 (DNS_ASYNC_DONE)
+            dns_ok = False
+            dns_detail = ""
+            for _ in range(12):
+                time.sleep(0.5)
+                out = term("dns status")
+                dns_detail = out.strip().splitlines()[0] if out.strip() else ""
+                if "state=2" in out and "result=0.0.0.0" not in out:
+                    dns_ok = True
+                    break
+            self.check("DNS resolve completes (state=DONE, result≠0)", dns_ok, dns_detail)
+        except Exception as e:
+            self.check("DNS resolve completes (state=DONE, result≠0)", False, str(e))
+
         total = self.passed + self.failed
         color = GREEN if self.failed == 0 else RED
         print(f"\n{color}SMOKE: {self.passed}/{total} passed{RST}")
         return 0 if self.failed == 0 else 1
+
+    def run_load_battery(self) -> int:
+        """Run the load test battery against the already-running QEMU instance.
+        Uses short durations (8s each) so the gate completes in ~2 minutes."""
+        print("\n── load battery ──────────────────────────────")
+        loadtest = REPO / "tools" / "qemu_loadtest.py"
+        r = subprocess.run(
+            [sys.executable, str(loadtest),
+             "--profile", "all", "--duration", "8", "--concurrency", "4"],
+            capture_output=False
+        )
+        ok = r.returncode == 0
+        color = GREEN if ok else RED
+        print(f"\n{color}LOAD BATTERY: {'PASS' if ok else 'FAIL'}{RST}")
+        return 0 if ok else 1
 
 
 def wait_boot(timeout: float = 60.0) -> bool:
@@ -190,6 +225,8 @@ def main() -> int:
     ap.add_argument("--build", action="store_true", help="build the QEMU kernel first")
     ap.add_argument("--kernel", default=str(KERNEL))
     ap.add_argument("--keep-log", action="store_true")
+    ap.add_argument("--no-load", action="store_true",
+                    help="skip the load battery (faster, assertions-only run)")
     args = ap.parse_args()
 
     if args.build:
@@ -220,7 +257,11 @@ def main() -> int:
             print(f"{RED}[smoke] board never reached /api/status (boot hang){RST}")
             return 3
         print("[smoke] board up — running assertions:\n")
-        rc = Smoke().run()
+        smoke = Smoke()
+        rc = smoke.run()
+        if not args.no_load:
+            load_rc = smoke.run_load_battery()
+            rc = rc or load_rc
     finally:
         proc.terminate()
         try:

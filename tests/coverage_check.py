@@ -37,7 +37,7 @@ TESTS = REPO / "tests"
 LLVM = pathlib.Path(r"C:\Program Files\LLVM\bin")
 
 # Modules with a host unit test (kept in sync with run_host_tests.py manifest).
-HOST_TESTED = {"src/picocompress.c"}
+HOST_TESTED = {"src/picocompress.c", "src/dhcp_options.c"}
 
 # The selftests actually wired into the QEMU `selftest` battery (kernel.c).
 def battery_selftests() -> set[str]:
@@ -66,8 +66,10 @@ SUBSYSTEMS = {
                     "smoke": "HTTP burst + OTA stream + stackdiag"},
     "ARP":         {"src": ["src/arp.c"],
                     "smoke": "boot announce + gateway resolution"},
-    "DNS":         {"src": ["src/dns.c"], "smoke": None},
-    "DHCP":        {"src": ["src/dhcp.c"], "smoke": None},
+    "DNS":         {"src": ["src/dns.c"],
+                    "smoke": "DNS resolve assertion in smoke gate"},
+    "DHCP":        {"src": ["src/dhcp.c", "src/dhcp_options.c"],
+                    "smoke": "option parser unit-tested (19/19); state-machine SMOKE via boot"},
     "socket":      {"src": ["src/socket.c"], "smoke": "userland HTTP bridge"},
     "IPC":         {"src": ["src/ipc_queue.c", "src/ipc_stream.c",
                             "src/ipc_proc.c", "src/pipe.c"],
@@ -156,29 +158,42 @@ def llvm_cov() -> int:
     out = TESTS / "_cov"
     out.mkdir(exist_ok=True)
     cc = str(LLVM / "clang.exe")
-    exe = out / "cov_picocompress.exe"
-    prof = out / "pico.profraw"
-    profd = out / "pico.profdata"
-    cmd = [cc, "-std=gnu11", "-O0", "-g",
-           "-fprofile-instr-generate", "-fcoverage-mapping",
-           "-I", str(TESTS / "stubinc"), "-I", str(REPO / "include"),
-           str(TESTS / "test_picocompress.c"), str(REPO / "src" / "picocompress.c"),
-           "-o", str(exe)]
-    if subprocess.run(cmd, capture_output=True, text=True).returncode != 0:
-        print("llvm-cov: build failed")
-        return 1
-    env = {"LLVM_PROFILE_FILE": str(prof)}
-    import os
-    e = dict(os.environ); e.update(env)
-    subprocess.run([str(exe)], capture_output=True, text=True, env=e)
-    subprocess.run([str(LLVM / "llvm-profdata.exe"), "merge", "-sparse",
-                    str(prof), "-o", str(profd)], capture_output=True, text=True)
-    r = subprocess.run([str(LLVM / "llvm-cov.exe"), "report", str(exe),
-                        f"-instr-profile={profd}", str(REPO / "src" / "picocompress.c")],
-                       capture_output=True, text=True)
+
+    COV_MODULES = [
+        ("picocompress", "test_picocompress.c", ["src/picocompress.c"]),
+        ("dhcp_options",  "test_dhcp.c",         ["src/dhcp_options.c"]),
+    ]
+
     print("\nReal line coverage (host unit tests):")
-    print(r.stdout or r.stderr)
-    return 0
+    any_fail = 0
+    for mod, test, srcs in COV_MODULES:
+        exe  = out / f"cov_{mod}.exe"
+        prof = out / f"{mod}.profraw"
+        profd = out / f"{mod}.profdata"
+        cmd = [cc, "-std=gnu11", "-O2", "-g",
+               "-fprofile-instr-generate", "-fcoverage-mapping",
+               "-I", str(TESTS / "stubinc"), "-I", str(REPO / "include"),
+               str(TESTS / test),
+               *[str(REPO / s) for s in srcs],
+               "-o", str(exe)]
+        if subprocess.run(cmd, capture_output=True, text=True).returncode != 0:
+            print(f"  llvm-cov: build failed for {mod}")
+            any_fail = 1
+            continue
+        import os
+        e = dict(os.environ)
+        e["LLVM_PROFILE_FILE"] = str(prof)
+        subprocess.run([str(exe)], capture_output=True, text=True, env=e)
+        subprocess.run([str(LLVM / "llvm-profdata.exe"), "merge", "-sparse",
+                        str(prof), "-o", str(profd)], capture_output=True, text=True)
+        r = subprocess.run([str(LLVM / "llvm-cov.exe"), "report", str(exe),
+                            f"-instr-profile={profd}",
+                            *[str(REPO / s) for s in srcs]],
+                           capture_output=True, text=True)
+        print(f"\n  {mod}:")
+        for ln in (r.stdout or r.stderr).splitlines():
+            print(f"    {ln}")
+    return any_fail
 
 
 def main() -> int:
