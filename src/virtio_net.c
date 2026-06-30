@@ -13,6 +13,7 @@
 #include "mmu.h"
 #include "simd.h"
 #include "uart.h"
+#include "dtrace.h"
 
 /* ---- virtio-mmio register offsets ---- */
 #define VIRTIO_MMIO_MAGIC       0x74726976U   /* "virt" */
@@ -119,6 +120,11 @@ static u16 rx_used_seen;
 /* TX: producer cursor and reclaim cursor (free in-flight descriptors). */
 static u16 tx_prod;
 static u16 tx_used_seen;
+static u64 g_vnet_tx_ok;
+static u64 g_vnet_tx_drop;
+static u64 g_vnet_rx_ok;
+static u64 g_vnet_rx_starve;   /* times the RX backlog hit the full ring (device may have dropped) */
+static u16 g_vnet_rx_backlog_max;
 
 static inline struct vq_desc  *rx_d(void) { return vnet_legacy ? rx_legacy.desc : rx_desc; }
 static inline struct vq_avail *rx_a(void) { return vnet_legacy ? &rx_legacy.avail : &rx_avail; }
@@ -302,9 +308,14 @@ bool virtio_net_send(const u8 *frame, u32 len)
         return false;
 
     tx_reclaim();
-    /* In-flight = tx_prod - tx_used_seen. Block-free: drop if the ring is full. */
-    if ((u16)(tx_prod - tx_used_seen) >= VQ_SIZE)
+    /* In-flight = tx_prod - tx_used_seen. Block-free: drop if the ring is full.
+     * A drop here loses a TCP segment -> peer retransmits after its RTO (~1s),
+     * so this counter is the prime suspect for latency stalls under load. */
+    if ((u16)(tx_prod - tx_used_seen) >= VQ_SIZE) {
+        g_vnet_tx_drop++;
+        DTRACE(DTRACE_CAT_MAC, DT_MAC_TX, len, tx_prod, (u16)(tx_prod - tx_used_seen), 1);
         return false;
+    }
 
     u32 slot = tx_prod & (VQ_SIZE - 1);
     u8 *buf = tx_buf[slot];
@@ -328,7 +339,17 @@ bool virtio_net_send(const u8 *frame, u32 len)
     tx_prod++;
 
     vnet_notify(VQ_TX);
+    g_vnet_tx_ok++;
+    DTRACE(DTRACE_CAT_MAC, DT_MAC_TX, len, tx_prod, (u16)(tx_prod - tx_used_seen), 0);
     return true;
+}
+
+void virtio_net_counters(u64 *tx_ok, u64 *tx_drop, u64 *rx_ok, u64 *rx_starve)
+{
+    if (tx_ok) *tx_ok = g_vnet_tx_ok;
+    if (tx_drop) *tx_drop = g_vnet_tx_drop;
+    if (rx_ok) *rx_ok = g_vnet_rx_ok;
+    if (rx_starve) *rx_starve = g_vnet_rx_starve;
 }
 
 bool virtio_net_recv(u8 *frame, u32 *len)
@@ -348,6 +369,16 @@ bool virtio_net_recv(u8 *frame, u32 *len)
     if (ru->idx == rx_used_seen)
         return false;   /* nothing new */
 
+    /* RX-side coverage: how far behind are we? If the device has filled the
+     * whole ring before we drained it, inbound frames may have been dropped at
+     * the device for lack of free buffers (the RX equivalent of the TX-drop
+     * stall). Track the worst backlog + a starvation count. */
+    u16 backlog = (u16)(ru->idx - rx_used_seen);
+    if (backlog > g_vnet_rx_backlog_max)
+        g_vnet_rx_backlog_max = backlog;
+    if (backlog >= VQ_SIZE)
+        g_vnet_rx_starve++;
+
     u32 slot = rx_used_seen & (VQ_SIZE - 1);
     struct vq_used_elem *e = &ru->ring[slot];
     u32 id = e->id & (VQ_SIZE - 1);
@@ -362,6 +393,8 @@ bool virtio_net_recv(u8 *frame, u32 *len)
         simd_memcpy(frame, rx_buf[id] + vnet_hdr_len, payload);
         *len = payload;
         ok = true;
+        g_vnet_rx_ok++;
+        DTRACE(DTRACE_CAT_MAC, DT_MAC_RX, payload, g_vnet_rx_ok, backlog, 0);
     }
 
     /* Re-publish this RX buffer to the device. */
@@ -393,5 +426,12 @@ bool virtio_net_send(const u8 *frame, u32 len) { (void)frame; (void)len; return 
 bool virtio_net_recv(u8 *frame, u32 *len) { (void)frame; (void)len; return false; }
 void virtio_net_get_mac(u8 *mac) { if (mac) { for (u32 i = 0; i < 6; i++) mac[i] = 0; } }
 bool virtio_net_link_up(void) { return false; }
+void virtio_net_counters(u64 *tx_ok, u64 *tx_drop, u64 *rx_ok, u64 *rx_starve)
+{
+    if (tx_ok) *tx_ok = 0;
+    if (tx_drop) *tx_drop = 0;
+    if (rx_ok) *rx_ok = 0;
+    if (rx_starve) *rx_starve = 0;
+}
 
 #endif

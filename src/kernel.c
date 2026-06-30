@@ -46,6 +46,7 @@
 #include "proc.h"
 #include "dtrace.h"
 #include "coredump.h"
+#include "virtio_net.h"
 #include "uhttp_bridge.h"
 #include "pix.h"
 #include "pcie.h"
@@ -2941,6 +2942,14 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         /* P1 live wedge diagnosis: poll this while ramping load. If rx_owned
          * climbs to 32 the RX ring is full (overrun); if rx_recv/tx_send stop
          * climbing the MAC engine has stalled; RSR/TSR carry overrun/HRESP. */
+#if !PIOS_HAS_GENET
+        /* macb is not the active NIC on this platform (e.g. QEMU uses
+         * virtio-net), so macb_init() never ran — its RX ring pointer/size are
+         * uninitialised and scanning them would wedge core 0. Fail closed and
+         * point at the right command instead. */
+        http_append(out, &len, max,
+            "macbdiag unavailable: macb/GEM not active on this platform (use 'vnetdiag')\n");
+#else
         struct macb_diag md;
         macb_diag(&md);
         http_append(out, &len, max, "macbdiag rx_owned=");
@@ -2974,6 +2983,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, " tx_recover=");
         http_append_u64(out, &len, max, md.tx_recover);
         http_append(out, &len, max, "\n");
+#endif
     } else if (http_starts_with(cmd, "dtrace")) {
         /* In-memory diagnostic trace control + dump.
          *   dtrace            -> status
@@ -3104,6 +3114,21 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append(out, &len, max, "/");
         http_append_u64(out, &len, max, nt);
         http_append(out, &len, max, (passed == nt) ? " ALL PASS\n" : " SOME FAILED\n");
+    } else if (http_streq(cmd, "vnetdiag")) {
+        /* virtio-net TX/RX drop visibility (QEMU). tx_drop>0 means the TX ring
+         * filled and a segment was lost -> peer retransmit (~1s latency stall);
+         * rx_starve>0 means net_poll fell behind and the device ring filled. */
+        u64 tx_ok = 0, tx_drop = 0, rx_ok = 0, rx_starve = 0;
+        virtio_net_counters(&tx_ok, &tx_drop, &rx_ok, &rx_starve);
+        http_append(out, &len, max, "vnetdiag tx_ok=");
+        http_append_u64(out, &len, max, tx_ok);
+        http_append(out, &len, max, " tx_drop=");
+        http_append_u64(out, &len, max, tx_drop);
+        http_append(out, &len, max, " rx_ok=");
+        http_append_u64(out, &len, max, rx_ok);
+        http_append(out, &len, max, " rx_starve=");
+        http_append_u64(out, &len, max, rx_starve);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "stackdiag")) {
         /* Data-plane health across every layer that carries constant traffic:
          * IP stack, TCP, kernel TLS, the port FIFO forwarding bridges, and the

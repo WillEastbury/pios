@@ -25,3 +25,7 @@ bool virtio_net_send(const u8 *frame, u32 len);
 bool virtio_net_recv(u8 *frame, u32 *len);
 void virtio_net_get_mac(u8 *mac);
 bool virtio_net_link_up(void);
+
+/* Diagnostic counters: TX completed / TX dropped (ring full -> peer retransmit),
+ * RX delivered / RX starvation events (device ring filled before drain). */
+void virtio_net_counters(u64 *tx_ok, u64 *tx_drop, u64 *rx_ok, u64 *rx_starve);
