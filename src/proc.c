@@ -17,6 +17,7 @@
 #include "tensor.h"
 #include "v3d.h"
 #include "fifo.h"
+#include "dtrace.h"
 #include "mmu.h"
 #include "ipc_queue.h"
 #include "ipc_stream.h"
@@ -2420,6 +2421,8 @@ void proc_schedule(void)
                     preempt_armed(uc) = true;
                 }
                 proc_sched_note_ctx_enter(procs[chosen].pid);
+                DTRACE(DTRACE_CAT_SCHED, DT_SCHED_SWITCH, procs[chosen].pid, chosen,
+                       procs[chosen].capsule_id, core_id());
                 ctx_switch(&scheduler_ctx, &procs[chosen].ctx);
                 proc_sched_note_ctx_exit();
                 proc_sched_stage(51);
@@ -2716,6 +2719,7 @@ void proc_irq_maybe_preempt(struct irq_frame *frame)
     p->preemptions++;
     sched_diag[uc].preempt_count++;
     diag_clean_word(&sched_diag[uc]);
+    DTRACE(DTRACE_CAT_SCHED, DT_SCHED_PREEMPT, p->pid, uc, p->preemptions, core_id());
     proc_note_desched(3U);
     frame->x[30] = frame->elr;
     frame->elr = (u64)(usize)proc_preempt_trampoline;
@@ -2755,6 +2759,7 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
     proc_wake_pending[(u32)slot].v = 1U;
     if (p->state == PROC_BLOCKED)
         p->state = PROC_READY;
+    DTRACE(DTRACE_CAT_SCHED, DT_SCHED_WAKE, target_pid, slot, p->state, core_id());
     if (boost && (p->state == PROC_READY || p->state == PROC_RUNNING)) {
         rr_cursor = ((u32)slot + MAX_PROCS_PER_CORE - 1U) % MAX_PROCS_PER_CORE;
         sched_diag[uc].soft_boost_count++;
@@ -3194,6 +3199,7 @@ void proc_park(void) {
     p->state = PROC_BLOCKED;
     proc_park_note(2U); /* park_block++ */
     proc_note_desched(1U);
+    DTRACE(DTRACE_CAT_SCHED, DT_SCHED_PARK, p->pid, current_proc, core_id(), 0);
     ctx_switch(&p->ctx, &scheduler_ctx);
     proc_park_note(3U); /* park_resume++ */
     proc_wake_pending[current_proc].v = 0;   /* consume the wake that dispatched us */

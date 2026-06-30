@@ -10,6 +10,7 @@
 #include "proc.h"
 #include "fifo.h"
 #include "timer.h"
+#include "dtrace.h"
 #include "sd.h"
 
 /* IRQ trace via raw SD blocks.
@@ -357,6 +358,7 @@ void irq_dispatch(struct irq_frame *frame) {
     irq_diag.last_intid = intid;
     irq_diag.last_core = c;
     irq_diag.last_tick = timer_ticks();
+    DTRACE(DTRACE_CAT_IRQ, DT_IRQ_DISPATCH, intid, c, 0, 0);
     if (irq_trace->magic == IRQ_TRACE_MAGIC)
         irq_trace->last_intid = intid;
 

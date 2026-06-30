@@ -45,6 +45,7 @@
 #include "principal.h"
 #include "proc.h"
 #include "dtrace.h"
+#include "coredump.h"
 #include "uhttp_bridge.h"
 #include "pix.h"
 #include "pcie.h"
@@ -3012,6 +3013,61 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             len += dtrace_dump(out + len, max - len, cnt);
         } else {
             len += dtrace_status(out + len, max - len);
+        }
+    } else if (http_streq(cmd, "schedquanta") || http_streq(cmd, "starvation")) {
+        /* Scheduling quantum + per-core CPU/starvation snapshot. The quantum is
+         * the preemption budget; busy_permille shows per-core CPU utilisation,
+         * and a core pinned near 1000 (100%) with low wake_count is starving. */
+        http_append(out, &len, max, "quantum_ms=");
+        http_append_u64(out, &len, max, PROC_PREEMPT_QUANTUM_MS);
+        http_append(out, &len, max, " timer_hz=");
+        http_append_u64(out, &len, max, PROC_PREEMPT_TIMER_HZ);
+        http_append(out, &len, max, " quantum_ticks=");
+        http_append_u64(out, &len, max,
+            ((u64)PROC_PREEMPT_TIMER_HZ * PROC_PREEMPT_QUANTUM_MS + 999U) / 1000U);
+        http_append(out, &len, max, "\nCORE BUSY%o IDLE WAKE PREEMPT SOFT STARVING\n");
+        struct proc_sched_core_snapshot ss[NUM_CORES];
+        u32 n = proc_sched_snapshot(ss, NUM_CORES);
+        for (u32 i = 0; i < n; i++) {
+            http_append_u64(out, &len, max, ss[i].core);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ss[i].busy_permille);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ss[i].idle_count);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ss[i].wake_count);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ss[i].preemptions);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ss[i].soft_events);
+            http_append(out, &len, max, " ");
+            /* Starving = pinned busy with almost no wakes (stuck in a phase). */
+            http_append(out, &len, max,
+                (ss[i].busy_permille >= 950U && ss[i].wake_count < 4U) ? "YES" : "no");
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "cdump")) {
+        /* Live core-dump snapshot + compare (distinct from the crash 'coredump'):
+         *   cdump snap a|b   -> capture CPU/system regs + region CRCs into a slot
+         *   cdump show a|b   -> print a slot
+         *   cdump diff       -> list reg/region differences between A and B */
+        const char *arg = cmd + 5;
+        while (*arg == ' ') arg++;
+        if (http_starts_with(arg, "snap")) {
+            const char *s = arg + 4; while (*s == ' ') s++;
+            u32 slot = (*s == 'b' || *s == 'B') ? COREDUMP_SLOT_B : COREDUMP_SLOT_A;
+            coredump_take(slot);
+            http_append(out, &len, max, "captured slot ");
+            if (len < max) out[len++] = (char)('A' + slot);
+            http_append(out, &len, max, "\n");
+        } else if (http_starts_with(arg, "show")) {
+            const char *s = arg + 4; while (*s == ' ') s++;
+            u32 slot = (*s == 'b' || *s == 'B') ? COREDUMP_SLOT_B : COREDUMP_SLOT_A;
+            len += coredump_format(slot, out + len, max - len);
+        } else if (http_starts_with(arg, "diff")) {
+            len += coredump_diff(out + len, max - len);
+        } else {
+            http_append(out, &len, max, "usage: cdump snap a|b | show a|b | diff\n");
         }
     } else if (http_streq(cmd, "stackdiag")) {
         /* Data-plane health across every layer that carries constant traffic:
@@ -7338,11 +7394,23 @@ static void ota_staging_init(void)
         return;
     struct highmem_status hm;
     highmem_status(&hm);
-    if (!hm.ready)
+    if (hm.ready) {
+        ota_stage_buf = (u8 *)highmem_alloc(PIOS_STAGE2_ZONE_BYTES, 64);
+        if (ota_stage_buf)
+            ota_stage_cap = PIOS_STAGE2_ZONE_BYTES;
         return;
-    ota_stage_buf = (u8 *)highmem_alloc(PIOS_STAGE2_ZONE_BYTES, 64);
-    if (ota_stage_buf)
-        ota_stage_cap = PIOS_STAGE2_ZONE_BYTES;
+    }
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    /* QEMU has no Pi highmem allocator, so the OTA stream would always be
+     * rejected ("stream unavailable") and the core0-starvation stall could
+     * never be reproduced in a VM. Provide a static staging buffer here so the
+     * upload stream runs end to end; the stall manifests mid-stream, before any
+     * SD commit, so this is enough to debug it. Gated to QEMU so the Pi5 .bss
+     * is not bloated by the ~2MB zone. */
+    static u8 qemu_ota_stage[PIOS_STAGE2_ZONE_BYTES] ALIGNED(64);
+    ota_stage_buf = qemu_ota_stage;
+    ota_stage_cap = (u32)sizeof(qemu_ota_stage);
+#endif
 }
 
 /* Allocate the multi-connection HTTP :80 pool from highmem at boot (each slot
@@ -19190,6 +19258,7 @@ void kernel_main(void) {
     bp_log("[fifo] fifo_init_all...");
     fifo_init_all();
     dtrace_init();
+    coredump_init();
     bp_log("[ipc] ipc_queue_init...");
     ipc_queue_init();
     bp_log("[ipc] ipc_stream_init...");

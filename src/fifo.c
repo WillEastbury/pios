@@ -8,6 +8,7 @@
 #include "simd.h"
 #include "core_env.h"
 #include "fb.h"
+#include "dtrace.h"
 
 struct fifo_core_seq {
     volatile u32 seq;
@@ -68,6 +69,7 @@ bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {
     f->head = next;
     dsb();              /* head visible before event signal */
     fifo_note_activity(1);
+    DTRACE(DTRACE_CAT_FIFO, DT_FIFO_PUSH, (src << 8) | dst, msg->type, next, msg->tag);
     sev();              /* wake sleeping cores */
     return true;
 }
@@ -110,6 +112,7 @@ bool fifo_pop(u32 dst, u32 src, struct fifo_msg *msg) {
     dmb();              /* msg consumed before tail advance */
     f->tail = (tail + 1) & (FIFO_CAPACITY - 1);
     fifo_note_activity(1);
+    DTRACE(DTRACE_CAT_FIFO, DT_FIFO_POP, (dst << 8) | src, msg->type, f->tail, msg->tag);
     return true;
 }
 
