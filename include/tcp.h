@@ -20,6 +20,16 @@
                                      * max bulk throughput. Must stay a power of two
                                      * (ring uses & (TCP_BUF_SIZE-1)). */
 #define TCP_MSS             1460
+#define TCP_REASM_SEGS      32      /* out-of-order segments buffered per conn.
+                                     * Segments that arrive within the receive
+                                     * window but ahead of rcv_nxt (a gap from a
+                                     * lost/reordered segment on the path) are held
+                                     * here and coalesced into rx_buf when the gap
+                                     * fills. Covers ~46KB (32*MSS) of the 64KB
+                                     * window; beyond that, excess is dropped and
+                                     * retransmitted (correct, just slower). Without
+                                     * ANY reassembly a single lost/reordered
+                                     * segment permanently stalls a bulk transfer. */
 #define TCP_DEFAULT_WINDOW  (TCP_BUF_SIZE - 1)  /* 65535 — fits the 16-bit window
                                      * field. NEVER set this to TCP_BUF_SIZE: the
                                      * SYN-ACK path htons()es it unclamped, and
