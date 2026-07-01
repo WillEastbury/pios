@@ -56,6 +56,7 @@ struct macb_diag {
     u32 ring_size;      /* RX ring depth (NUM_RX) */
     u32 tx_drop;        /* lifetime TX frames dropped (ring full) */
     u32 tx_recover;     /* lifetime TX ring recoveries performed */
+    u32 rx_live_recover;/* lifetime RX-liveness (silence) recoveries performed */
 } PACKED;
 void macb_diag(struct macb_diag *out);
 
@@ -63,6 +64,14 @@ void macb_diag(struct macb_diag *out);
  * ring so the polling driver recovers instead of staying wedged. Cheap to call
  * every poll; returns true only when it actually performed a recovery. */
 bool macb_rx_recover(void);
+
+/* RX-liveness watchdog. Some RX wedges halt the RX DMA WITHOUT latching
+ * RSR.BNA/OVR, so macb_rx_recover()'s status check never fires and the polling
+ * driver stays dark for minutes. On any live LAN there is always some inbound
+ * broadcast/multicast traffic, so a multi-second gap with ZERO delivered frames
+ * is a reliable wedge signal: force the same proven ring rebuild to restart RX.
+ * Cheap to call every poll; returns true only when it performed a recovery. */
+bool macb_rx_liveness_recover(u64 now_ms);
 
 /* Try to recover a stalled MAC: clear latched status bits, halt+restart TX,
  * dump ETH_CFG_STAT for AXI bus errors. Returns true if it did anything. */

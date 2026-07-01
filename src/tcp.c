@@ -86,13 +86,6 @@ struct ring_buf {
     u32 tail;       /* read position */
 };
 
-/* One buffered out-of-order segment (see tcp_reasm_* and struct tcb.reasm). */
-struct reasm_seg {
-    u32 seq;              /* sequence number of first buffered byte */
-    u32 len;              /* bytes held; 0 = free slot */
-    u8  data[TCP_MSS];    /* up to one MSS of out-of-order payload */
-};
-
 static u32 ring_used(const struct ring_buf *r) {
     return (r->head - r->tail) & (TCP_BUF_SIZE - 1);
 }
@@ -223,13 +216,6 @@ struct tcb {
     struct ring_buf tx_buf;
     struct ring_buf rx_buf;
 
-    /* Out-of-order reassembly queue. Segments that arrive within the receive
-     * window but ahead of rcv_nxt (a gap from a lost or reordered segment on
-     * the path) are buffered here and coalesced into rx_buf when the gap fills.
-     * Without this, one lost/reordered segment permanently stalls a bulk
-     * inbound transfer (the OTA stall, worse with larger windows/bursts). */
-    struct reasm_seg reasm[TCP_REASM_SEGS];
-
     /* Retransmit */
     u64 rto_ms;
     u64 rto_deadline;   /* monotonic ms when we should retransmit */
@@ -278,14 +264,8 @@ struct tcb {
  * unavailable (e.g. QEMU/probe-fail) we fall back to a small static table so
  * the board still boots. TCP_MAX_CONNECTIONS (tcp.h) is unchanged — it remains
  * the *snapshot/display* cap used by external stack arrays. */
-#define TCP_TABLE_TARGET    2048U    /* highmem table capacity. Shrunk from 16384
-                                      * because each TCB now carries 64KB rx + 64KB
-                                      * tx inline (TCP_BUF_SIZE=65536), so the table
-                                      * is 2048 * ~131KB ~= 269MB of highmem (3GB
-                                      * available). 2048 concurrent connections is
-                                      * far more than a Pi5 needs; the big window is
-                                      * the throughput win, not the connection count. */
-#define TCP_TABLE_FALLBACK  64U      /* static .bss table when highmem is
+#define TCP_TABLE_TARGET    16384U   /* highmem table capacity (network-first) */
+#define TCP_TABLE_FALLBACK  128U     /* static .bss table when highmem is
                                       * unavailable (QEMU has no highmem, so this
                                       * IS the live table there). Must be large
                                       * enough for all listeners (:80/:443/:2323/
@@ -351,7 +331,6 @@ static u32 min32(u32 a, u32 b) { return a < b ? a : b; }
 static bool seq_lt(u32 a, u32 b)  { return (i32)(a - b) < 0; }
 static bool seq_le(u32 a, u32 b)  { return (i32)(a - b) <= 0; }
 static bool seq_gt(u32 a, u32 b)  { return (i32)(a - b) > 0; }
-static bool seq_geq(u32 a, u32 b) { return (i32)(a - b) >= 0; }
 
 static i32 tcb_index(const struct tcb *t) {
     return (i32)(t - tcbs);
@@ -1065,119 +1044,6 @@ static u32 tcp_rx_ingest_in_order(struct tcb *t, u32 seg_seq, const u8 *data, u3
     return written;
 }
 
-/* ── Out-of-order reassembly ──────────────────────────────────────────────
- * A TCP receiver that only accepts seg_seq == rcv_nxt and discards everything
- * else is permanently stalled by a single lost or reordered segment: the
- * segments that arrived AFTER the gap are thrown away, so even when the missing
- * segment is retransmitted the receiver cannot catch up. On a routed/lossy path
- * this froze bulk OTA uploads (worse with larger windows, which put more
- * segments in flight = more reorder/loss exposure). These helpers buffer
- * in-window out-of-order segments and coalesce them once the gap fills.
- * All run on core 0 only (net_poll / tcp_read), so no locking is needed. */
-
-/* Coalesce buffered out-of-order segments that are now contiguous with rcv_nxt
- * into the receive ring, advancing rcv_nxt. Idempotent; safe to call whenever
- * rcv_nxt advances or ring space is freed. */
-static void tcp_reasm_drain(struct tcb *t)
-{
-    bool progress = true;
-    while (progress) {
-        progress = false;
-        for (u32 i = 0; i < TCP_REASM_SEGS; i++) {
-            struct reasm_seg *rs = &t->reasm[i];
-            if (rs->len == 0)
-                continue;
-            u32 end = rs->seq + rs->len;
-            if (seq_le(end, t->rcv_nxt)) {   /* wholly delivered already */
-                rs->len = 0;
-                continue;
-            }
-            if (seq_gt(rs->seq, t->rcv_nxt))  /* still a gap before this seg */
-                continue;
-            /* rs->seq <= rcv_nxt < end : contributes bytes [rcv_nxt, end). */
-            u32 off = t->rcv_nxt - rs->seq;   /* 0 <= off < rs->len */
-            u32 n = rs->len - off;
-            if (ring_free(&t->rx_buf) < n)    /* no room now; keep buffered */
-                return;
-            ring_write(&t->rx_buf, rs->data + off, n);
-            t->rcv_nxt += n;
-            rs->len = 0;                      /* free slot */
-            progress = true;
-        }
-    }
-}
-
-/* Buffer an out-of-order, in-window segment (seg_seq > rcv_nxt) for later
- * coalescing. Bounded pool: drops (safe) if the segment is larger than one MSS
- * or the pool is full — the sender retransmits, so correctness is preserved. */
-static void tcp_reasm_store(struct tcb *t, u32 seg_seq, const u8 *data, u32 data_len)
-{
-    if (data_len == 0 || data_len > TCP_MSS)
-        return;
-    i32 free_slot = -1;
-    for (u32 i = 0; i < TCP_REASM_SEGS; i++) {
-        struct reasm_seg *rs = &t->reasm[i];
-        if (rs->len == 0) {
-            if (free_slot < 0)
-                free_slot = (i32)i;
-            continue;
-        }
-        if (rs->seq == seg_seq) {             /* dedup a retransmit; keep longer */
-            if (data_len > rs->len) {
-                tcp_memcpy_accel(rs->data, data, data_len);
-                rs->len = data_len;
-            }
-            return;
-        }
-    }
-    if (free_slot < 0)
-        return;                               /* pool full — sender retransmits */
-    struct reasm_seg *rs = &t->reasm[(u32)free_slot];
-    tcp_memcpy_accel(rs->data, data, data_len);
-    rs->seq = seg_seq;
-    rs->len = data_len;
-}
-
-/* Deliver inbound stream data: ingest in-order bytes into rx_buf, buffer
- * out-of-order in-window bytes for reassembly, and coalesce when gaps fill.
- * The segment has already passed seq_acceptable (at least partly in window). */
-static void tcp_rx_deliver(struct tcb *t, u32 seg_seq, const u8 *data, u32 data_len)
-{
-    if (data_len == 0)
-        return;
-    /* Trim any prefix at/below rcv_nxt (old bytes or a partial duplicate). */
-    if (seq_lt(seg_seq, t->rcv_nxt)) {
-        u32 skip = t->rcv_nxt - seg_seq;
-        if (skip >= data_len)
-            return;                           /* wholly old */
-        data += skip;
-        data_len -= skip;
-        seg_seq = t->rcv_nxt;
-    }
-    /* Clip the tail to the advertised window. */
-    u32 win = t->rcv_wnd;
-    if (win == 0)
-        return;
-    u32 win_end = t->rcv_nxt + win;
-    if (seq_geq(seg_seq, win_end))
-        return;                               /* fully beyond the window */
-    if (seq_gt(seg_seq + data_len, win_end))
-        data_len = win_end - seg_seq;
-    if (data_len == 0)
-        return;
-
-    if (seg_seq == t->rcv_nxt) {
-        /* In-order: atomic ingest, then coalesce now-contiguous OOO segments. */
-        if (tcp_rx_ingest_in_order(t, seg_seq, data, data_len) > 0) {
-            tcp_reasm_drain(t);
-            t->rcv_wnd = ring_free(&t->rx_buf);
-        }
-    } else {
-        /* Ahead of rcv_nxt (a gap): buffer for reassembly. */
-        tcp_reasm_store(t, seg_seq, data, data_len);
-    }
-}
-
 static void handle_established(struct tcb *t, u32 seg_seq, u32 seg_ack,
                                u8 flags, u16 seg_wnd,
                                const u8 *data, u32 data_len) {
@@ -1218,17 +1084,18 @@ static void handle_established(struct tcb *t, u32 seg_seq, u32 seg_ack,
     /* Update send window */
     t->snd_wnd = seg_wnd;
 
-    /* Process data. tcp_rx_deliver ingests in-order bytes, buffers out-of-order
-     * in-window bytes for reassembly, and coalesces when gaps fill. ALWAYS ACK a
-     * data-bearing segment: an in-order segment advances rcv_nxt and is ACKed; a
-     * retransmit or out-of-order segment gets a duplicate ACK carrying our
-     * current rcv_nxt + window, which drives the sender's fast-retransmit and
-     * re-advertises a reopened window. Without the always-ACK the peer would
-     * retransmit forever with exponential backoff (a bulk inbound transfer
-     * deadlocks); without reassembly a single lost/reordered segment would
-     * permanently stall it even though we ACK. Both are needed. */
+    /* Process data. ALWAYS ACK a data-bearing segment: an in-order segment is
+     * ingested and ACKed (advancing rcv_nxt); a retransmit whose tail overlaps
+     * the window (seg_seq < rcv_nxt <= seg_seq+seg_len-1) passes seq_acceptable
+     * but is NOT ingested (seg_seq != rcv_nxt) — it MUST still get a duplicate
+     * ACK so the sender learns our current rcv_nxt + window and resyncs. Without
+     * this, the peer retransmits forever with exponential backoff and a bulk
+     * inbound transfer deadlocks (OTA stream froze ~18KB: MAC delivered 561
+     * frames but only 94 were ACKed). The ACK also re-advertises the receive
+     * window, so a window that reopened after the app drained the ring is
+     * promptly communicated. */
     if (data_len > 0) {
-        tcp_rx_deliver(t, seg_seq, data, data_len);
+        tcp_rx_ingest_in_order(t, seg_seq, data, data_len);
         tcp_send_ack(t);
     }
 
@@ -1812,24 +1679,18 @@ u32 tcp_read(tcp_conn_t conn, void *data, u32 len) {
     if (!tcb_valid(conn)) return 0;
     struct tcb *t = &tcbs[conn];
     u32 old_wnd = t->rcv_wnd;
-    u32 rcv_before = t->rcv_nxt;
     u32 n = ring_read(&t->rx_buf, data, len);
-    /* Freeing ring space may let buffered out-of-order segments now coalesce in
-     * (they were held because the ring was full while a gap was outstanding). */
-    if (t->state == TCP_ESTABLISHED)
-        tcp_reasm_drain(t);
     t->rcv_wnd = ring_free(&t->rx_buf);
     /* Window-update ACK: when the application drains the receive buffer and the
      * advertised window reopens past one MSS after having been (near-)closed,
      * proactively ACK so the peer resumes immediately. Without this, a bulk
-     * inbound transfer stalls: the window hits 0, the peer enters
-     * exponentially-backed-off zero-window probing, and once a probe gap exceeds
-     * the admin stall watchdog the board resets the connection (host sees
-     * WinError 10054 mid-upload). Also ACK if reassembly advanced rcv_nxt here,
-     * so the peer promptly learns the new left edge. */
-    bool advanced = (t->rcv_nxt != rcv_before);
-    if (t->state == TCP_ESTABLISHED &&
-        (advanced || (n > 0 && old_wnd < TCP_MSS && t->rcv_wnd >= TCP_MSS))) {
+     * inbound transfer (e.g. an OTA upload into the 4KB rx ring) stalls: the
+     * window hits 0, the peer enters exponentially-backed-off zero-window
+     * probing, and once a probe gap exceeds the admin stall watchdog the board
+     * resets the connection (host sees WinError 10054 mid-upload). This is the
+     * standard receiver-side window-update every TCP must send. */
+    if (n > 0 && t->state == TCP_ESTABLISHED &&
+        old_wnd < TCP_MSS && t->rcv_wnd >= TCP_MSS) {
         tcp_send_ack(t);
         DTRACE(DTRACE_CAT_TCP, DT_TCP_WNDUPD, (u64)conn, old_wnd, t->rcv_wnd, n);
     }

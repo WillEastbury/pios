@@ -2984,6 +2984,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, md.tx_drop);
         http_append(out, &len, max, " tx_recover=");
         http_append_u64(out, &len, max, md.tx_recover);
+        http_append(out, &len, max, " rx_live_recover=");
+        http_append_u64(out, &len, max, md.rx_live_recover);
         http_append(out, &len, max, "\n");
 #endif
     } else if (http_starts_with(cmd, "dtrace")) {
@@ -18572,6 +18574,11 @@ NORETURN void core0_main(void) {
              * without this the NIC stays wedged (rx_idx frozen) even after the
              * load stops. Recover, then drain the freshly-restarted ring. */
             if (macb_rx_recover())
+                net_poll();
+            /* Also self-heal a non-BNA/OVR RX halt (which the status check above
+             * cannot see): if no frame has arrived for several seconds on this
+             * live LAN the RX DMA is wedged — rebuild the ring and re-drain. */
+            else if (macb_rx_liveness_recover(timer_monotonic_ms()))
                 net_poll();
 #endif
             dns_poll();

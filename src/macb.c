@@ -1028,11 +1028,12 @@ bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
  *
  * Cheap to call every poll: it reads RSR and returns immediately unless a real
  * BNA/OVR stall is latched. Returns true if it performed a recovery. */
-bool macb_rx_recover(void) {
-    u32 rsr = mr(RSR);
-    if (!(rsr & (RSR_BNA | RSR_OVR)))
-        return false;
-
+/* Stop RX, hand the whole ring back to the MAC (clear OWN, preserve buffer
+ * addr + WRAP), reset the CPU cursor + queue pointer to the ring base, W1C-clear
+ * the latched RX status, and re-enable RX. This is the canonical GEM RX restart;
+ * toggling NCR.RE restarts a halted RX DMA regardless of what halted it. Shared
+ * by the BNA/OVR recovery and the RX-liveness watchdog. */
+static void macb_rx_ring_rebuild(void) {
     /* Stop RX while we rebuild the ring. */
     u32 ncr = mr(NCR);
     mw(NCR, ncr & ~NCR_RE);
@@ -1063,15 +1064,50 @@ bool macb_rx_recover(void) {
 #endif
 
     /* W1C-clear the latched RX status (BNA/OVR/etc). */
-    mw(RSR, rsr);
+    mw(RSR, mr(RSR));
     __asm__ volatile("dsb sy" ::: "memory");
 
     /* Re-enable RX and force the writes out to the device. */
     mw(NCR, mr(NCR) | NCR_RE);
     __asm__ volatile("dsb sy" ::: "memory");
     (void)mr(NCR);
+}
 
+bool macb_rx_recover(void) {
+    u32 rsr = mr(RSR);
+    if (!(rsr & (RSR_BNA | RSR_OVR)))
+        return false;
+
+    macb_rx_ring_rebuild();
     rx_recover_count++;
+    return true;
+}
+
+/* RX-liveness watchdog — see macb.h. Detects an RX DMA halt that does NOT latch
+ * RSR.BNA/OVR (which macb_rx_recover cannot see) by watching for a multi-second
+ * gap with zero delivered frames. On a live LAN inbound broadcast/multicast
+ * keeps rx_recv_count advancing, so a stall this long is a genuine wedge, not a
+ * quiet moment. Uses the same proven ring rebuild to restart RX. */
+#define MACB_RX_LIVENESS_TIMEOUT_MS 4000ULL
+static u32 rx_live_last_count;
+static u64 rx_live_last_ms;
+static u32 rx_live_recover_count;
+
+bool macb_rx_liveness_recover(u64 now_ms) {
+    /* Progress since last check (or first call): re-arm and return. */
+    if (rx_live_last_ms == 0 || rx_recv_count != rx_live_last_count) {
+        rx_live_last_count = rx_recv_count;
+        rx_live_last_ms = now_ms;
+        return false;
+    }
+    if (now_ms - rx_live_last_ms < MACB_RX_LIVENESS_TIMEOUT_MS)
+        return false;
+
+    /* No frame delivered for the whole window: assume the RX DMA is wedged. */
+    macb_rx_ring_rebuild();
+    rx_live_recover_count++;
+    rx_live_last_count = rx_recv_count;
+    rx_live_last_ms = now_ms;
     return true;
 }
 
@@ -1104,6 +1140,7 @@ void macb_diag(struct macb_diag *out)
     out->ring_size = NUM_RX;
     out->tx_drop = tx_drop_count;
     out->tx_recover = tx_recover_count;
+    out->rx_live_recover = rx_live_recover_count;
 }
 
 void macb_irq_snapshot(struct macb_irq_snapshot *out, bool read_clear_isr)

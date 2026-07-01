@@ -12,28 +12,9 @@
 #include "types.h"
 
 #define TCP_MAX_CONNECTIONS 128
-#define TCP_BUF_SIZE        65536   /* 64KB rx/tx ring per conn — 45x MSS. Without
-                                     * window scaling the advertised window is a
-                                     * 16-bit field (max 65535); ring_free maxes at
-                                     * TCP_BUF_SIZE-1 = 65535 = exactly that limit,
-                                     * so a 64KB ring fully utilises the window for
-                                     * max bulk throughput. Must stay a power of two
-                                     * (ring uses & (TCP_BUF_SIZE-1)). */
+#define TCP_BUF_SIZE        4096
 #define TCP_MSS             1460
-#define TCP_REASM_SEGS      32      /* out-of-order segments buffered per conn.
-                                     * Segments that arrive within the receive
-                                     * window but ahead of rcv_nxt (a gap from a
-                                     * lost/reordered segment on the path) are held
-                                     * here and coalesced into rx_buf when the gap
-                                     * fills. Covers ~46KB (32*MSS) of the 64KB
-                                     * window; beyond that, excess is dropped and
-                                     * retransmitted (correct, just slower). Without
-                                     * ANY reassembly a single lost/reordered
-                                     * segment permanently stalls a bulk transfer. */
-#define TCP_DEFAULT_WINDOW  (TCP_BUF_SIZE - 1)  /* 65535 — fits the 16-bit window
-                                     * field. NEVER set this to TCP_BUF_SIZE: the
-                                     * SYN-ACK path htons()es it unclamped, and
-                                     * htons(65536)=0 would advertise a zero window. */
+#define TCP_DEFAULT_WINDOW  TCP_BUF_SIZE
 
 /* TCP connection states (RFC 793) */
 #define TCP_CLOSED          0
