@@ -184,6 +184,8 @@ struct pv_ctx {
     int       me_count;
     uint8_t   map_pool[PV_MAP_POOL];
     uint32_t  map_pool_top;
+    uint8_t   bso1_key[64];                 /* BSO1 HMAC-SHA256 signing key (Binary.SetKey) */
+    int       bso1_key_len;
 
     pv_host_fn host;
 };

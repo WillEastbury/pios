@@ -331,4 +331,11 @@
 #define PV_HOOK_BINARY_PARSECARD                 0x341
 #define PV_HOOK_BINARY_SERIALIZECARD             0x342
 
+
+/* BSO1 (BareMetal.Binary) entity <-> Map, signed (0x343-0x346); docs/MAP.md */
+#define PV_HOOK_BINARY_PARSEENTITY               0x343
+#define PV_HOOK_BINARY_SERIALIZEENTITY           0x344
+#define PV_HOOK_BINARY_SETKEY                    0x345
+#define PV_HOOK_BINARY_VERIFY                    0x346
+
 #endif

@@ -1463,9 +1463,115 @@ static int pv_psc1_serialize(pv_ctx *ctx, int mi)
     }
     return pv_arena_finish(ctx, k);
 }
+/* ---- BSO1 (BareMetal.Binary): schema-driven, LE, HMAC-SHA256 signed ---------
+ * Wire-compatible with BareMetalJsTools/src/BareMetal.Binary.js. 64-bit/float/
+ * temporal values stored as raw LE bytes (string) in the Map. */
+static const int PV_BSO1_SZ[23] = { 0, 1, 1, 1, 2, 2, 4, 4, 8, 8, 4, 8, 16, 2, 0, 16, 9, 4, 8, 10, 8, 16, 4 };
+static int pv_bso1_intkind(int wt) {  /* 0=raw/string, 1=uint, 2=signed */
+    switch (wt) { case 1: case 2: case 5: case 7: case 13: return 1;
+                  case 3: case 4: case 6: case 17: case 22: return 2; }
+    return 0;
+}
+static int32_t pv_le_read(pv_ctx *ctx, uint32_t sp, int pos, int size, int signd) {
+    uint32_t v = 0; int i;
+    for (i = 0; i < size; i++) v |= (uint32_t)pv_arena_get(ctx, sp + (uint32_t)(pos + i)) << (8 * i);
+    if (signd && size < 4) { uint32_t lim = 1u << (size * 8 - 1); if (v >= lim) v -= (lim << 1); }
+    return (int32_t)v;
+}
+static void pv_hmac_arena2(pv_ctx *ctx, const uint8_t *key, int keylen, uint32_t sp, int o1, int l1, int o2, int l2, uint8_t out[32]) {
+    uint8_t k[64], ipad[64], opad[64], inner[32]; int i;
+    for (i = 0; i < 64; i++) k[i] = 0;
+    for (i = 0; i < keylen && i < 64; i++) k[i] = key[i];
+    for (i = 0; i < 64; i++) { ipad[i] = (uint8_t)(k[i] ^ 0x36); opad[i] = (uint8_t)(k[i] ^ 0x5c); }
+    { pv_sha256_stream s; pv_sha256_s_init(&s);
+      for (i = 0; i < 64; i++) pv_sha256_s_push(&s, ipad[i]);
+      for (i = 0; i < l1; i++) pv_sha256_s_push(&s, pv_arena_get(ctx, sp + (uint32_t)(o1 + i)));
+      for (i = 0; i < l2; i++) pv_sha256_s_push(&s, pv_arena_get(ctx, sp + (uint32_t)(o2 + i)));
+      pv_sha256_s_final(&s, inner); }
+    { pv_sha256_stream s2; pv_sha256_s_init(&s2);
+      for (i = 0; i < 64; i++) pv_sha256_s_push(&s2, opad[i]);
+      for (i = 0; i < 32; i++) pv_sha256_s_push(&s2, inner[i]);
+      pv_sha256_s_final(&s2, out); }
+}
+static int pv_bso1_is_pseudo(pv_ctx *ctx, int e) { return (ctx->me_klen[e] > 0 && ctx->map_pool[ctx->me_koff[e]] == ':'); }
+static int pv_bso1_version(pv_ctx *ctx, int smi) {
+    static const char VER[8] = { ':', 'v', 'e', 'r', 's', 'i', 'o', 'n' };
+    int e, i, ok;
+    for (e = ctx->map_head[smi]; e >= 0; e = ctx->me_next[e]) {
+        if (ctx->me_klen[e] != 8 || ctx->me_kk[e] != 1) continue;
+        ok = 1; for (i = 0; i < 8; i++) if (ctx->map_pool[ctx->me_koff[e] + (uint32_t)i] != (uint8_t)VER[i]) { ok = 0; break; }
+        if (ok && ctx->me_vk[e] == 0) return ctx->me_vi[e];
+    }
+    return 1;
+}
+static void pv_bso1_read(pv_ctx *ctx, uint32_t sp, int32_t n, int smi, int rmi) {
+    int pos = 45, e, ik;
+    uint8_t present;
+    if (pos >= n) return;
+    present = pv_arena_get(ctx, sp + (uint32_t)pos); pos++;
+    if (present == 0) return;
+    for (e = ctx->map_head[smi]; e >= 0; e = ctx->me_next[e]) {
+        int code, wt, nullable; uint32_t koff; int32_t klen;
+        if (pv_bso1_is_pseudo(ctx, e)) continue;
+        code = (ctx->me_vk[e] == 0) ? ctx->me_vi[e] : 0;
+        wt = code & 0xFF; nullable = (code & 0x100) != 0;
+        koff = ctx->me_koff[e]; klen = ctx->me_klen[e];
+        if (nullable) { if (pv_arena_get(ctx, sp + (uint32_t)pos) == 0) { pos++; pv_map_put_s_bytes(ctx, rmi, koff, klen, 2, 0, 0, 0); continue; } pos++; }
+        if (wt == 14) {
+            int32_t len = pv_le_read(ctx, sp, pos, 4, 1); pos += 4;
+            if (len < 0) pv_map_put_s_bytes(ctx, rmi, koff, klen, 2, 0, 0, 0);
+            else { uint32_t vo = ctx->map_pool_top; int k; for (k = 0; k < len; k++) pv_pool_put(ctx, pv_arena_get(ctx, sp + (uint32_t)(pos + k))); pos += len; pv_map_put_s_bytes(ctx, rmi, koff, klen, 1, 0, vo, len); }
+        } else if ((ik = pv_bso1_intkind(wt)) != 0) {
+            int sz = PV_BSO1_SZ[wt]; int32_t val = pv_le_read(ctx, sp, pos, sz, ik == 2); pos += sz;
+            pv_map_put_s_bytes(ctx, rmi, koff, klen, 0, val, 0, 0);
+        } else {
+            int sz = PV_BSO1_SZ[wt], k; uint32_t vo = ctx->map_pool_top;
+            for (k = 0; k < sz; k++) pv_pool_put(ctx, pv_arena_get(ctx, sp + (uint32_t)(pos + k))); pos += sz;
+            pv_map_put_s_bytes(ctx, rmi, koff, klen, 1, 0, vo, sz);
+        }
+    }
+}
+static int pv_bso1_write(pv_ctx *ctx, int dmi, int smi) {
+    uint32_t kk = 0, magic = 0x314F5342u; int e, ver = pv_bso1_version(ctx, smi), i, h; uint32_t sp; int32_t n;
+    pv_arena_put(ctx, &kk, (uint8_t)(magic & 255)); pv_arena_put(ctx, &kk, (uint8_t)((magic >> 8) & 255)); pv_arena_put(ctx, &kk, (uint8_t)((magic >> 16) & 255)); pv_arena_put(ctx, &kk, (uint8_t)((magic >> 24) & 255));
+    pv_arena_put(ctx, &kk, 3); pv_arena_put(ctx, &kk, 0); pv_arena_put(ctx, &kk, 0); pv_arena_put(ctx, &kk, 0);
+    pv_arena_put(ctx, &kk, (uint8_t)(ver & 255)); pv_arena_put(ctx, &kk, (uint8_t)((ver >> 8) & 255)); pv_arena_put(ctx, &kk, (uint8_t)((ver >> 16) & 255)); pv_arena_put(ctx, &kk, (uint8_t)((ver >> 24) & 255));
+    pv_arena_put(ctx, &kk, 0);
+    for (i = 0; i < 32; i++) pv_arena_put(ctx, &kk, 0);
+    pv_arena_put(ctx, &kk, 1);
+    for (e = ctx->map_head[smi]; e >= 0; e = ctx->me_next[e]) {
+        int code, wt, nullable, ik, de, is_null;
+        if (pv_bso1_is_pseudo(ctx, e)) continue;
+        code = (ctx->me_vk[e] == 0) ? ctx->me_vi[e] : 0; wt = code & 0xFF; nullable = (code & 0x100) != 0;
+        de = pv_map_find_s_bytes(ctx, dmi, ctx->me_koff[e], ctx->me_klen[e]);
+        is_null = (de < 0) || (ctx->me_vk[de] == 2);
+        if (nullable) { if (is_null) { pv_arena_put(ctx, &kk, 0); continue; } pv_arena_put(ctx, &kk, 1); }
+        if (wt == 14) {
+            if (is_null) { pv_arena_put(ctx, &kk, 255); pv_arena_put(ctx, &kk, 255); pv_arena_put(ctx, &kk, 255); pv_arena_put(ctx, &kk, 255); }
+            else { int32_t len = (ctx->me_vk[de] == 1) ? ctx->me_vlen[de] : 0, j;
+                pv_arena_put(ctx, &kk, (uint8_t)(len & 255)); pv_arena_put(ctx, &kk, (uint8_t)((len >> 8) & 255)); pv_arena_put(ctx, &kk, (uint8_t)((len >> 16) & 255)); pv_arena_put(ctx, &kk, (uint8_t)((len >> 24) & 255));
+                for (j = 0; j < len; j++) pv_arena_put(ctx, &kk, ctx->map_pool[ctx->me_voff[de] + (uint32_t)j]); }
+        } else if ((ik = pv_bso1_intkind(wt)) != 0) {
+            int sz = PV_BSO1_SZ[wt], j; int32_t val = (de >= 0 && ctx->me_vk[de] == 0) ? ctx->me_vi[de] : 0;
+            for (j = 0; j < sz; j++) pv_arena_put(ctx, &kk, (uint8_t)((val >> (8 * j)) & 255));
+        } else {
+            int sz = PV_BSO1_SZ[wt], j;
+            for (j = 0; j < sz; j++) { uint8_t bb = (de >= 0 && ctx->me_vk[de] == 1 && j < ctx->me_vlen[de]) ? ctx->map_pool[ctx->me_voff[de] + (uint32_t)j] : 0; pv_arena_put(ctx, &kk, bb); }
+        }
+    }
+    h = pv_arena_finish(ctx, kk); sp = pv_span_p(ctx, h); n = pv_span_n(ctx, h);
+    if (ctx->bso1_key_len > 0) { uint8_t sig[32]; pv_hmac_arena2(ctx, ctx->bso1_key, ctx->bso1_key_len, sp, 0, 13, 45, n - 45, sig); for (i = 0; i < 32; i++) ctx->mem[sp + 13 + (uint32_t)i] = sig[i]; }
+    return h;
+}
+static int pv_bso1_verify(pv_ctx *ctx, uint32_t sp, int32_t n) {
+    uint8_t sig[32]; int i;
+    if (ctx->bso1_key_len <= 0 || n < 45) return 0;
+    pv_hmac_arena2(ctx, ctx->bso1_key, ctx->bso1_key_len, sp, 0, 13, 45, n - 45, sig);
+    for (i = 0; i < 32; i++) if (pv_arena_get(ctx, sp + (uint32_t)(13 + i)) != sig[i]) return 0;
+    return 1;
+}
 static int pv_parse_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
 {
-    (void)rs2;
     if (hook == PV_HOOK_JSON_PARSE || hook == PV_HOOK_BINARY_PARSECARD) {
         int sh = ctx->regs[rs1]; uint32_t sp = pv_span_p(ctx, sh); int32_t n = pv_span_n(ctx, sh);
         int mi = pv_new_active_map(ctx);
@@ -1479,6 +1585,29 @@ static int pv_parse_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
         if (mi > 0 && mi < ctx->map_nmaps && ctx->map_used[mi]) ctx->regs[rd] = pv_psc1_serialize(ctx, mi);
         else ctx->regs[rd] = pv_map_span_from_pool(ctx, 0, 0);
         return 1;
+    }
+    if (hook == PV_HOOK_BINARY_SETKEY) {
+        int sh = ctx->regs[rs1]; uint32_t sp = pv_span_p(ctx, sh); int32_t n = pv_span_n(ctx, sh), i;
+        if (n > 64) n = 64; if (n < 0) n = 0; ctx->bso1_key_len = n;
+        for (i = 0; i < n; i++) ctx->bso1_key[i] = pv_arena_get(ctx, sp + (uint32_t)i);
+        return 1;
+    }
+    if (hook == PV_HOOK_BINARY_PARSEENTITY) {
+        int sh = ctx->regs[rs1]; uint32_t sp = pv_span_p(ctx, sh); int32_t n = pv_span_n(ctx, sh);
+        int smi = ctx->regs[rs2]; int rmi = pv_new_active_map(ctx);
+        if (rmi == 0) { ctx->regs[rd] = 0; return 1; }
+        if (smi > 0 && smi < ctx->map_nmaps && ctx->map_used[smi]) pv_bso1_read(ctx, sp, n, smi, rmi);
+        ctx->regs[rd] = rmi; return 1;
+    }
+    if (hook == PV_HOOK_BINARY_SERIALIZEENTITY) {
+        int dmi = ctx->regs[rs1], smi = ctx->regs[rs2];
+        if (smi > 0 && smi < ctx->map_nmaps && ctx->map_used[smi]) ctx->regs[rd] = pv_bso1_write(ctx, dmi, smi);
+        else ctx->regs[rd] = pv_map_span_from_pool(ctx, 0, 0);
+        return 1;
+    }
+    if (hook == PV_HOOK_BINARY_VERIFY) {
+        int sh = ctx->regs[rs1]; uint32_t sp = pv_span_p(ctx, sh); int32_t n = pv_span_n(ctx, sh);
+        ctx->regs[rd] = pv_bso1_verify(ctx, sp, n); return 1;
     }
     return 0;
 }
@@ -1494,7 +1623,7 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
         if (pv_map_hook(ctx, hook, rd, rs1, rs2)) return;
     }
     /* Parsers: Json.Parse / Binary.ParseCard|SerializeCard -> Map. */
-    if (hook >= PV_HOOK_JSON_PARSE && hook <= PV_HOOK_BINARY_SERIALIZECARD) {
+    if (hook >= PV_HOOK_JSON_PARSE && hook <= PV_HOOK_BINARY_VERIFY) {
         if (pv_parse_hook(ctx, hook, rd, rs1, rs2)) return;
     }
     if (hook == PV_HOOK_RANDOM_U32) {
