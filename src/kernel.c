@@ -428,6 +428,18 @@ static struct ota_update_state ota_update;
 static u8 *ota_stage_buf;
 static u32 ota_stage_cap;
 static bool ota_stage_ready;
+
+static void ota_update_reset_state(void)
+{
+    ota_update.active = false;
+    ota_update.total = 0;
+    ota_update.received = 0;
+    ota_update.chunks = 0;
+    ota_update.errors = 0;
+    ota_update.last_error = NULL;
+    ota_stage_ready = false;
+}
+
 static tcp_conn_t debug_listen_conn = -1;
 static tcp_conn_t debug_client_conn = -1;
 static bool debug_tcp_unlocked;
@@ -1457,6 +1469,7 @@ struct perf_counter_snapshot {
     u32 nic_tx_mbps_x1000;
     u32 nic_rx_peak_mbps_x1000;
     u32 nic_tx_peak_mbps_x1000;
+    u32 nic_rx_wedge;
     u32 nic_link_mbps;
     bool nic_link_full_duplex;
     u32 nic_rx_capacity_mbps;
@@ -1710,6 +1723,15 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
     p->nic_tx_mbps_x1000 = rate_nic_tx;
     p->nic_rx_peak_mbps_x1000 = peak_nic_rx;
     p->nic_tx_peak_mbps_x1000 = peak_nic_tx;
+#if PIOS_HAS_GENET
+    {
+        struct macb_diag md;
+        macb_diag(&md);
+        p->nic_rx_wedge = md.rx_wedge;
+    }
+#else
+    p->nic_rx_wedge = 0;
+#endif
     p->nic_link_mbps = nic_link_mbps();
     p->nic_link_full_duplex = nic_link_full_duplex();
     p->nic_rx_capacity_mbps = p->nic_link_mbps;
@@ -1873,6 +1895,7 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "nic_tx_mbps_x1000", perf.nic_tx_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "nic_rx_peak_mbps_x1000", perf.nic_rx_peak_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "nic_tx_peak_mbps_x1000", perf.nic_tx_peak_mbps_x1000, true);
+    http_append_json_metric(out, &len, max, "nic_rx_wedge", perf.nic_rx_wedge, true);
     http_append_json_metric(out, &len, max, "nic_link_mbps", perf.nic_link_mbps, true);
     http_append_json_metric(out, &len, max, "nic_link_full_duplex", perf.nic_link_full_duplex ? 1U : 0U, true);
     http_append_json_metric(out, &len, max, "nic_rx_capacity_mbps", perf.nic_rx_capacity_mbps, true);
@@ -2986,6 +3009,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, md.tx_recover);
         http_append(out, &len, max, " rx_live_recover=");
         http_append_u64(out, &len, max, md.rx_live_recover);
+        http_append(out, &len, max, " rx_wedge=");
+        http_append_u64(out, &len, max, md.rx_wedge);
         http_append(out, &len, max, "\n");
 #endif
     } else if (http_starts_with(cmd, "dtrace")) {
@@ -7680,8 +7705,14 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
         ota_update.last_error = "cancelled";
         ok = true;
         http_log_event("ota-cancel", ota_update.received, ota_update.total);
+    } else if (http_streq(action, "reset")) {
+        u32 old_received = ota_update.received;
+        u32 old_total = ota_update.total;
+        ota_update_reset_state();
+        ok = true;
+        http_log_event("ota-reset", old_received, old_total);
     } else {
-        error = "unknown action; use status, begin, chunk, commit, writeandreboot, cancel, or self";
+        error = "unknown action; use status, begin, chunk, commit, writeandreboot, cancel, reset, or self";
     }
 
     if (!ok && error) {
@@ -17904,6 +17935,15 @@ static void hdmi_dashboard_render(void)
         fb_printf("%u", md.tx_recover);
         fb_set_cursor(dc, dr++);
         fb_set_color(C_GRY, 0x00000000);
+        fb_puts("rx_wedge=");
+        fb_set_color(md.rx_wedge ? C_YEL : C_WHT, 0x00000000);
+        fb_printf("%u", md.rx_wedge);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts(" rx_live_rec=");
+        fb_set_color(md.rx_live_recover ? C_YEL : C_WHT, 0x00000000);
+        fb_printf("%u", md.rx_live_recover);
+        fb_set_cursor(dc, dr++);
+        fb_set_color(C_GRY, 0x00000000);
         fb_puts("RBQP=0x");
         fb_set_color(C_WHT, 0x00000000);
         fb_printf("%x", md.rbqp);
@@ -18576,8 +18616,8 @@ NORETURN void core0_main(void) {
             if (macb_rx_recover())
                 net_poll();
             /* Also self-heal a non-BNA/OVR RX halt (which the status check above
-             * cannot see): if no frame has arrived for several seconds on this
-             * live LAN the RX DMA is wedged — rebuild the ring and re-drain. */
+             * cannot see): if the RX-liveness watchdog (activity-gated) fires,
+             * rebuild the ring and re-drain. */
             else if (macb_rx_liveness_recover(timer_monotonic_ms()))
                 net_poll();
 #endif

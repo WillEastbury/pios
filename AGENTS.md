@@ -44,16 +44,34 @@ attempted this session (always-ACK, atomic-accept, 64KB window, reassembly) targ
 - [x] QEMU smoke **8/8** (`python tools/qemu_smoke.py --no-load`, DNS WARN is soft/expected).
 - [x] Provisioner payload rebuilt (jump-only mode, `PROVISION_WRITE_SLOT 0`); `rx_live_recover`
       string confirmed present in `real_kernel.img`.
+- [x] **RX-liveness watchdog now activity-gated** (arms on RX progress), disarms after idle
+      (`30s`), and uses exponential recovery backoff (`4s`→`8s`→`16s`→`32s`→cap `60s`) to avoid
+      quiet-link false recover loops. Also added a `rx_wedge` lifetime counter (distinct from
+      `rx_live_recover`: counts non-latched wedges specifically), surfaced through
+      `macb_diag`/`/status` JSON/`macbdiag` terminal command/HDMI dashboard. Fixed a real
+      cache-coherency gap along the way: RX descriptor reclaim used `dcache_clean_range` (clean
+      only) instead of `dcache_clean_invalidate_range`, unlike the TX side's already-correct
+      contract -- a later CPU touch of that 64-byte-shared descriptor line could otherwise
+      re-clean a stale value over a DMA update. Also added an `ota reset` action
+      (`http_build_kernel_update_response`) to clear stuck OTA state without a reboot, and
+      `provision_revert_payload.S` is now correctly excluded from the two main build scripts'
+      generic `src/*.S` compile loop (it has its own dedicated `build_provision_revert.bat`).
+      **Built clean** (`build_qemu_full.bat`, zero errors/warnings in the changed files -- the
+      only warnings in the full build are pre-existing unused-variable warnings in unrelated
+      `v3d.c`) and **QEMU smoke 8/8 green** (`tools/qemu_smoke.py --no-load`). Committed and
+      pushed to `main`.
 - [ ] **NOT yet deployed to hardware.** The SD card was in the USB reader awaiting a write when we
       stopped. Deploy artifacts (`kernel8.img` / `provisioner_kernel8.img`) are gitignored (`*.img`)
       and regenerable — rebuild after the machine rebuild.
 
 ### Next steps
-1. Rebuild: `build_provisioner.bat` (Pi5 jump-only test) and `build_qemu_full.bat` (QEMU validate).
+1. Rebuild: `build_provisioner.bat` (Pi5 jump-only test) -- `build_qemu_full.bat` already
+   confirmed green above, no need to redo unless further source changes are made.
 2. Deploy via SD-swap: write `kernel8.img` to the **`PIOS BOOT`** FAT32 volume (Realtek CardReader,
    Disk 1). **Never write to `D:`** (NVMe scratch). Verify SHA256, `Write-VolumeCache`, reseat, boot.
 3. Under bulk load (OTA upload + `/picoscript` download), confirm the board **stays reachable** and
-   watch `macbdiag` `rx_live_recover` climb (proves the watchdog is catching the wedge). Confirm ARP
+   watch `macbdiag` `rx_live_recover` AND the new `rx_wedge` counter (proves the watchdog is
+   catching the wedge specifically, distinct from other recovery paths). Confirm ARP
    who-has is answered throughout (re-run `tools/capture_stall2.ps1` elevated).
 4. If reachability holds but throughput is low, the watchdog is a backstop — investigate *why* the
    RX DMA halts (RP1/PCIe-bridge coherency under burst; macb has no dtrace events yet — consider

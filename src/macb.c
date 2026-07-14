@@ -990,7 +990,10 @@ bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
     if (flen == 0 || flen > BUF_SIZE) {
         /* Reclaim descriptor */
         rx_ring[rx_idx].addr &= ~RX_ADDR_OWN;
-        dcache_clean_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
+        /* 16-byte RX descriptors share 64-byte cache lines. Match the TX-side
+         * contract: evict the line after returning ownership so later CPU
+         * touches cannot clean a stale sibling descriptor over DMA updates. */
+        dcache_clean_invalidate_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
         rx_idx = (rx_idx + 1) % NUM_RX;
         return false;
     }
@@ -1005,7 +1008,9 @@ bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
 
     /* Reclaim: clear ownership bit and flush back to RAM */
     rx_ring[rx_idx].addr &= ~RX_ADDR_OWN;
-    dcache_clean_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
+    /* See invalid-frame reclaim above: never leave a descriptor line cached
+     * after publishing ownership back to the MAC. */
+    dcache_clean_invalidate_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
     dsb();
 
     rx_idx = (rx_idx + 1) % NUM_RX;
@@ -1084,30 +1089,79 @@ bool macb_rx_recover(void) {
 }
 
 /* RX-liveness watchdog — see macb.h. Detects an RX DMA halt that does NOT latch
- * RSR.BNA/OVR (which macb_rx_recover cannot see) by watching for a multi-second
- * gap with zero delivered frames. On a live LAN inbound broadcast/multicast
- * keeps rx_recv_count advancing, so a stall this long is a genuine wedge, not a
- * quiet moment. Uses the same proven ring rebuild to restart RX. */
-#define MACB_RX_LIVENESS_TIMEOUT_MS 4000ULL
+ * RSR.BNA/OVR (which macb_rx_recover cannot see) by watching for a sustained
+ * no-RX window while the NIC has recently been active. To avoid false positives
+ * on a quiet link, it arms only after observed RX progress, disarms after an
+ * extended idle period, and exponentially backs off repeated recoveries. */
+#define MACB_RX_LIVENESS_TIMEOUT_MS      4000ULL
+#define MACB_RX_LIVENESS_IDLE_DISARM_MS 30000ULL
+#define MACB_RX_LIVENESS_BACKOFF_MAX_MS 60000ULL
 static u32 rx_live_last_count;
-static u64 rx_live_last_ms;
+static u32 rx_live_last_tx_count;
+static u64 rx_live_last_rx_ms;
+static u64 rx_live_last_activity_ms;
 static u32 rx_live_recover_count;
+static u32 rx_wedge_count;
+static u32 rx_live_streak;
+static bool rx_live_armed;
 
 bool macb_rx_liveness_recover(u64 now_ms) {
-    /* Progress since last check (or first call): re-arm and return. */
-    if (rx_live_last_ms == 0 || rx_recv_count != rx_live_last_count) {
+    if (rx_live_last_activity_ms == 0) {
         rx_live_last_count = rx_recv_count;
-        rx_live_last_ms = now_ms;
+        rx_live_last_tx_count = tx_send_count;
+        rx_live_last_rx_ms = now_ms;
+        rx_live_last_activity_ms = now_ms;
+        rx_live_streak = 0;
+        rx_live_armed = false;
         return false;
     }
-    if (now_ms - rx_live_last_ms < MACB_RX_LIVENESS_TIMEOUT_MS)
+
+    bool rx_progress = (rx_recv_count != rx_live_last_count);
+    bool tx_progress = (tx_send_count != rx_live_last_tx_count);
+
+    if (tx_progress) {
+        rx_live_last_tx_count = tx_send_count;
+        rx_live_last_activity_ms = now_ms;
+    }
+
+    /* Any RX progress proves the lane is live: (re)arm and clear backoff. */
+    if (rx_progress) {
+        rx_live_last_count = rx_recv_count;
+        rx_live_last_rx_ms = now_ms;
+        rx_live_last_activity_ms = now_ms;
+        rx_live_streak = 0;
+        rx_live_armed = true;
+        return false;
+    }
+
+    /* Quiet link: stop probing until RX resumes, to avoid idle false positives. */
+    if (now_ms - rx_live_last_activity_ms >= MACB_RX_LIVENESS_IDLE_DISARM_MS) {
+        rx_live_armed = false;
+        rx_live_streak = 0;
+        rx_live_last_rx_ms = now_ms;
+        return false;
+    }
+
+    if (!rx_live_armed)
         return false;
 
-    /* No frame delivered for the whole window: assume the RX DMA is wedged. */
+    u64 timeout = MACB_RX_LIVENESS_TIMEOUT_MS;
+    u32 shift = rx_live_streak;
+    if (shift > 4U)
+        shift = 4U; /* 4s * 16 = 64s; cap below to 60s. */
+    timeout <<= shift;
+    if (timeout > MACB_RX_LIVENESS_BACKOFF_MAX_MS)
+        timeout = MACB_RX_LIVENESS_BACKOFF_MAX_MS;
+
+    if (now_ms - rx_live_last_rx_ms < timeout)
+        return false;
+
+    /* No RX for the active watchdog window: assume RX DMA is wedged. */
+    rx_wedge_count++;
     macb_rx_ring_rebuild();
     rx_live_recover_count++;
-    rx_live_last_count = rx_recv_count;
-    rx_live_last_ms = now_ms;
+    rx_live_streak++;
+    rx_live_last_rx_ms = now_ms;
     return true;
 }
 
@@ -1141,6 +1195,7 @@ void macb_diag(struct macb_diag *out)
     out->tx_drop = tx_drop_count;
     out->tx_recover = tx_recover_count;
     out->rx_live_recover = rx_live_recover_count;
+    out->rx_wedge = rx_wedge_count;
 }
 
 void macb_irq_snapshot(struct macb_irq_snapshot *out, bool read_clear_isr)

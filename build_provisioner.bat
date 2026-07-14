@@ -14,7 +14,7 @@ mkdir build_boot
 
 echo Building full kernel payload as real_kernel.img...
 for %%f in (src\*.S) do (
-    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" (
+    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="provision_revert_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" (
         echo Compiling %%~nf.S...
         "%CC%" %ASFLAGS% -c "%%f" -o "build\%%~nf.o"
         if errorlevel 1 exit /b 1
