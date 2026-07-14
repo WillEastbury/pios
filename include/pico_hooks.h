@@ -325,4 +325,10 @@
 #define PV_HOOK_MAP_VALISSPAN                    0x339
 #define PV_HOOK_MAP_USE                          0x33A
 
+
+/* Parsers: Json.Parse + Binary card <-> Map (0x340-0x342); see docs/MAP.md */
+#define PV_HOOK_JSON_PARSE                       0x340
+#define PV_HOOK_BINARY_PARSECARD                 0x341
+#define PV_HOOK_BINARY_SERIALIZECARD             0x342
+
 #endif

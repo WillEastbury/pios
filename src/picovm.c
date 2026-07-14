@@ -1301,6 +1301,188 @@ static int pv_map_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
     }
 }
 
+/* ---- parsers: string/bytes -> Map (mirror picovm.js/.py; docs/MAP.md) ------
+ * Byte scanners identical to the JS/Python reference VMs so a parsed Map is
+ * bit-identical. Keys/values intern into map_pool; nested JSON is captured raw. */
+static int pv_pool_put(pv_ctx *ctx, uint8_t b)
+{
+    if (ctx->map_pool_top >= PV_MAP_POOL) return 0;
+    ctx->map_pool[ctx->map_pool_top++] = b; return 1;
+}
+static int pv_hexv_c(uint8_t c) { if (c >= 48 && c <= 57) return c - 48; if (c >= 97 && c <= 102) return c - 87; if (c >= 65 && c <= 70) return c - 55; return 0; }
+static void pv_pool_utf8(pv_ctx *ctx, int cp)
+{
+    if (cp < 0x80) pv_pool_put(ctx, (uint8_t)cp);
+    else if (cp < 0x800) { pv_pool_put(ctx, (uint8_t)(0xC0 | (cp >> 6))); pv_pool_put(ctx, (uint8_t)(0x80 | (cp & 0x3F))); }
+    else { pv_pool_put(ctx, (uint8_t)(0xE0 | (cp >> 12))); pv_pool_put(ctx, (uint8_t)(0x80 | ((cp >> 6) & 0x3F))); pv_pool_put(ctx, (uint8_t)(0x80 | (cp & 0x3F))); }
+}
+static int pv_map_find_s_bytes(pv_ctx *ctx, int mi, uint32_t off, int32_t len)
+{
+    int e = ctx->map_head[mi], i;
+    while (e >= 0) {
+        if (ctx->me_kk[e] == 1 && ctx->me_klen[e] == len) {
+            int eq = 1;
+            for (i = 0; i < len; i++) if (ctx->map_pool[ctx->me_koff[e] + (uint32_t)i] != ctx->map_pool[off + (uint32_t)i]) { eq = 0; break; }
+            if (eq) return e;
+        }
+        e = ctx->me_next[e];
+    }
+    return -1;
+}
+static void pv_map_put_s_bytes(pv_ctx *ctx, int mi, uint32_t koff, int32_t klen, uint8_t vk, int32_t vi, uint32_t voff, int32_t vlen)
+{
+    int e = pv_map_find_s_bytes(ctx, mi, koff, klen);
+    if (e < 0) { e = pv_map_new_entry(ctx, mi); if (e < 0) return; ctx->me_kk[e] = 1; ctx->me_koff[e] = koff; ctx->me_klen[e] = klen; }
+    ctx->me_vk[e] = vk; ctx->me_vi[e] = vi; ctx->me_voff[e] = voff; ctx->me_vlen[e] = vlen;
+}
+static int pv_new_active_map(pv_ctx *ctx)
+{
+    int h;
+    if (ctx->map_nmaps >= PV_MAX_MAPS) return 0;
+    h = ctx->map_nmaps++;
+    ctx->map_used[h] = 1; ctx->map_head[h] = -1; ctx->map_tail[h] = -1; ctx->map_count[h] = 0;
+    ctx->map_active = h; return h;
+}
+static void pv_json_str(pv_ctx *ctx, uint32_t sp, int32_t n, int *i, uint32_t *off, int32_t *len)
+{
+    int p = *i + 1; uint32_t start = ctx->map_pool_top;
+    while (p < n) {
+        uint8_t c = pv_arena_get(ctx, sp + (uint32_t)p); p++;
+        if (c == 34) break;
+        if (c == 92) {
+            uint8_t e = pv_arena_get(ctx, sp + (uint32_t)p); p++;
+            if (e == 34) pv_pool_put(ctx, 34); else if (e == 92) pv_pool_put(ctx, 92); else if (e == 47) pv_pool_put(ctx, 47);
+            else if (e == 110) pv_pool_put(ctx, 10); else if (e == 116) pv_pool_put(ctx, 9); else if (e == 114) pv_pool_put(ctx, 13);
+            else if (e == 98) pv_pool_put(ctx, 8); else if (e == 102) pv_pool_put(ctx, 12);
+            else if (e == 117) { int cp = 0, k; for (k = 0; k < 4; k++) { cp = (cp << 4) | pv_hexv_c(pv_arena_get(ctx, sp + (uint32_t)p)); p++; } pv_pool_utf8(ctx, cp); }
+            else pv_pool_put(ctx, e);
+        } else pv_pool_put(ctx, c);
+    }
+    *off = start; *len = (int32_t)(ctx->map_pool_top - start); *i = p;
+}
+static void pv_json_parse(pv_ctx *ctx, uint32_t sp, int32_t n, int mi)
+{
+    int i = 0;
+#define JIN(k) pv_arena_get(ctx, sp + (uint32_t)(k))
+#define JWS(c) ((c) == 32 || (c) == 9 || (c) == 10 || (c) == 13)
+    while (i < n && JWS(JIN(i))) i++;
+    if (i >= n || JIN(i) != 123) return; i++;
+    while (i < n) {
+        uint32_t koff; int32_t klen; uint8_t c;
+        while (i < n && JWS(JIN(i))) i++;
+        if (i < n && JIN(i) == 125) { i++; break; }
+        if (i >= n || JIN(i) != 34) break;
+        pv_json_str(ctx, sp, n, &i, &koff, &klen);
+        while (i < n && JWS(JIN(i))) i++;
+        if (i >= n || JIN(i) != 58) break; i++;
+        while (i < n && JWS(JIN(i))) i++;
+        if (i >= n) break;
+        c = JIN(i);
+        if (c == 34) { uint32_t vo; int32_t vl; pv_json_str(ctx, sp, n, &i, &vo, &vl); pv_map_put_s_bytes(ctx, mi, koff, klen, 1, 0, vo, vl); }
+        else if (c == 123 || c == 91) {
+            int start = i, depth = 0, instr = 0, k; uint32_t vo; int32_t vl;
+            while (i < n) { uint8_t d = JIN(i);
+                if (instr) { if (d == 92) { i += 2; continue; } if (d == 34) instr = 0; i++; continue; }
+                if (d == 34) { instr = 1; i++; continue; }
+                if (d == 123 || d == 91) depth++;
+                else if (d == 125 || d == 93) { depth--; if (depth == 0) { i++; break; } }
+                i++;
+            }
+            vo = ctx->map_pool_top; for (k = start; k < i; k++) pv_pool_put(ctx, JIN(k));
+            vl = (int32_t)(ctx->map_pool_top - vo);
+            pv_map_put_s_bytes(ctx, mi, koff, klen, 1, 0, vo, vl);
+        }
+        else if (c == 116) { i += 4; pv_map_put_s_bytes(ctx, mi, koff, klen, 0, 1, 0, 0); }
+        else if (c == 102) { i += 5; pv_map_put_s_bytes(ctx, mi, koff, klen, 0, 0, 0, 0); }
+        else if (c == 110) { i += 4; pv_map_put_s_bytes(ctx, mi, koff, klen, 2, 0, 0, 0); }
+        else {
+            int neg = (JIN(i) == 45); int32_t val = 0;
+            if (JIN(i) == 45 || JIN(i) == 43) i++;
+            while (i < n && JIN(i) >= 48 && JIN(i) <= 57) { val = val * 10 + (JIN(i) - 48); i++; }
+            if (i < n && (JIN(i) == 46 || JIN(i) == 101 || JIN(i) == 69)) { i++; while (i < n) { uint8_t d = JIN(i); if ((d >= 48 && d <= 57) || d == 46 || d == 101 || d == 69 || d == 45 || d == 43) i++; else break; } }
+            pv_map_put_s_bytes(ctx, mi, koff, klen, 0, neg ? -val : val, 0, 0);
+        }
+        while (i < n && JWS(JIN(i))) i++;
+        if (i < n && JIN(i) == 44) { i++; continue; }
+        if (i < n && JIN(i) == 125) { i++; break; }
+        break;
+    }
+#undef JIN
+#undef JWS
+}
+static void pv_psc1_parse(pv_ctx *ctx, uint32_t sp, int32_t n, int mi)
+{
+    uint32_t magic; int count, pos, c;
+    if (n < 6) return;
+    magic = ((uint32_t)pv_arena_get(ctx, sp) << 24) | ((uint32_t)pv_arena_get(ctx, sp + 1) << 16) | ((uint32_t)pv_arena_get(ctx, sp + 2) << 8) | pv_arena_get(ctx, sp + 3);
+    if (magic != 0x50534331u) return;
+    count = (pv_arena_get(ctx, sp + 4) << 8) | pv_arena_get(ctx, sp + 5); pos = 6;
+    for (c = 0; c < count; c++) {
+        int nlen = pv_arena_get(ctx, sp + (uint32_t)pos), k, t; uint32_t koff;
+        pos++;
+        koff = ctx->map_pool_top;
+        for (k = 0; k < nlen; k++) pv_pool_put(ctx, pv_arena_get(ctx, sp + (uint32_t)(pos + k)));
+        pos += nlen;
+        t = pv_arena_get(ctx, sp + (uint32_t)pos); pos++;
+        if (t == 1) {
+            int32_t x = (int32_t)(((uint32_t)pv_arena_get(ctx, sp + (uint32_t)pos) << 24) | ((uint32_t)pv_arena_get(ctx, sp + (uint32_t)(pos + 1)) << 16) | ((uint32_t)pv_arena_get(ctx, sp + (uint32_t)(pos + 2)) << 8) | pv_arena_get(ctx, sp + (uint32_t)(pos + 3)));
+            pos += 4; pv_map_put_s_bytes(ctx, mi, koff, (int32_t)nlen, 0, x, 0, 0);
+        } else if (t == 2) {
+            int vlen = (pv_arena_get(ctx, sp + (uint32_t)pos) << 8) | pv_arena_get(ctx, sp + (uint32_t)(pos + 1)), j; uint32_t voff;
+            pos += 2; voff = ctx->map_pool_top;
+            for (j = 0; j < vlen; j++) pv_pool_put(ctx, pv_arena_get(ctx, sp + (uint32_t)(pos + j)));
+            pos += vlen; pv_map_put_s_bytes(ctx, mi, koff, (int32_t)nlen, 1, 0, voff, (int32_t)vlen);
+        } else break;
+    }
+}
+static int pv_key_cmp(pv_ctx *ctx, int a, int b)
+{
+    int32_t la = ctx->me_klen[a], lb = ctx->me_klen[b], m = la < lb ? la : lb, i;
+    for (i = 0; i < m; i++) { int d = ctx->map_pool[ctx->me_koff[a] + (uint32_t)i] - ctx->map_pool[ctx->me_koff[b] + (uint32_t)i]; if (d) return d; }
+    return la - lb;
+}
+static int pv_psc1_serialize(pv_ctx *ctx, int mi)
+{
+    int idx[PV_MAX_MAP_ENTRIES], cnt = 0, e, i, j; uint32_t k = 0;
+    for (e = ctx->map_head[mi]; e >= 0; e = ctx->me_next[e]) if (ctx->me_kk[e] == 1) idx[cnt++] = e;
+    for (i = 1; i < cnt; i++) { int v = idx[i]; j = i - 1; while (j >= 0 && pv_key_cmp(ctx, idx[j], v) > 0) { idx[j + 1] = idx[j]; j--; } idx[j + 1] = v; }
+    pv_arena_put(ctx, &k, 0x50); pv_arena_put(ctx, &k, 0x53); pv_arena_put(ctx, &k, 0x43); pv_arena_put(ctx, &k, 0x31);
+    pv_arena_put(ctx, &k, (uint8_t)((cnt >> 8) & 255)); pv_arena_put(ctx, &k, (uint8_t)(cnt & 255));
+    for (i = 0; i < cnt; i++) {
+        e = idx[i];
+        pv_arena_put(ctx, &k, (uint8_t)(ctx->me_klen[e] & 255));
+        for (j = 0; j < ctx->me_klen[e]; j++) pv_arena_put(ctx, &k, ctx->map_pool[ctx->me_koff[e] + (uint32_t)j]);
+        if (ctx->me_vk[e] == 1) {
+            int32_t vl = ctx->me_vlen[e];
+            pv_arena_put(ctx, &k, 2); pv_arena_put(ctx, &k, (uint8_t)((vl >> 8) & 255)); pv_arena_put(ctx, &k, (uint8_t)(vl & 255));
+            for (j = 0; j < vl; j++) pv_arena_put(ctx, &k, ctx->map_pool[ctx->me_voff[e] + (uint32_t)j]);
+        } else {
+            int32_t x = (ctx->me_vk[e] == 0 ? ctx->me_vi[e] : 0);
+            pv_arena_put(ctx, &k, 1); pv_arena_put(ctx, &k, (uint8_t)((x >> 24) & 255)); pv_arena_put(ctx, &k, (uint8_t)((x >> 16) & 255)); pv_arena_put(ctx, &k, (uint8_t)((x >> 8) & 255)); pv_arena_put(ctx, &k, (uint8_t)(x & 255));
+        }
+    }
+    return pv_arena_finish(ctx, k);
+}
+static int pv_parse_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
+{
+    (void)rs2;
+    if (hook == PV_HOOK_JSON_PARSE || hook == PV_HOOK_BINARY_PARSECARD) {
+        int sh = ctx->regs[rs1]; uint32_t sp = pv_span_p(ctx, sh); int32_t n = pv_span_n(ctx, sh);
+        int mi = pv_new_active_map(ctx);
+        if (mi == 0) { ctx->regs[rd] = 0; return 1; }
+        if (hook == PV_HOOK_JSON_PARSE) pv_json_parse(ctx, sp, n, mi);
+        else pv_psc1_parse(ctx, sp, n, mi);
+        ctx->regs[rd] = mi; return 1;
+    }
+    if (hook == PV_HOOK_BINARY_SERIALIZECARD) {
+        int mi = ctx->map_active;
+        if (mi > 0 && mi < ctx->map_nmaps && ctx->map_used[mi]) ctx->regs[rd] = pv_psc1_serialize(ctx, mi);
+        else ctx->regs[rd] = pv_map_span_from_pool(ctx, 0, 0);
+        return 1;
+    }
+    return 0;
+}
+
 void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
 {
     (void)imm16;
@@ -1310,6 +1492,10 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
     /* Map.* first-class dictionary (active-handle model; see docs/MAP.md). */
     if (hook >= PV_HOOK_MAP_NEW && hook <= PV_HOOK_MAP_USE) {
         if (pv_map_hook(ctx, hook, rd, rs1, rs2)) return;
+    }
+    /* Parsers: Json.Parse / Binary.ParseCard|SerializeCard -> Map. */
+    if (hook >= PV_HOOK_JSON_PARSE && hook <= PV_HOOK_BINARY_SERIALIZECARD) {
+        if (pv_parse_hook(ctx, hook, rd, rs1, rs2)) return;
     }
     if (hook == PV_HOOK_RANDOM_U32) {
         uint64_t x = ctx->rng_state;
