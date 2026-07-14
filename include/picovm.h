@@ -22,6 +22,15 @@
 #define PV_MAX_SPANS  1024      /* span table: handle = 1-based index, 0 = null */
 #define PV_MAX_WRITERS 16       /* Utf8Writer / Json / Xml handles */
 #define PV_MAX_READERS 16       /* Utf8Reader handles */
+#ifndef PV_MAX_MAPS
+#define PV_MAX_MAPS   16        /* Map.* handles (1-based; 0 = null) */
+#endif
+#ifndef PV_MAX_MAP_ENTRIES
+#define PV_MAX_MAP_ENTRIES 256  /* total map entries across all maps */
+#endif
+#ifndef PV_MAP_POOL
+#define PV_MAP_POOL   8192      /* byte pool for map key/value spans */
+#endif
 #define PV_JSON_DEPTH  32       /* nested object/array depth per writer */
 
 /* ---- 16 core opcodes (bits [31:28]) ---------------------------------- */
@@ -152,6 +161,29 @@ struct pv_ctx {
     uint32_t  r_len[PV_MAX_READERS];
     uint32_t  r_pos[PV_MAX_READERS];
     int       r_count;
+
+    /* Map.* first-class dictionary (active-handle model; see docs/MAP.md).
+     * Entries live in a shared pool, singly linked per map to preserve insertion
+     * order; key/value bytes bump-allocate into map_pool. FNV-1a hash is fixed
+     * (offset 0x811c9dc5, prime 0x01000193) identically across all VMs. */
+    uint8_t   map_used[PV_MAX_MAPS];
+    int       map_head[PV_MAX_MAPS];
+    int       map_tail[PV_MAX_MAPS];
+    int       map_count[PV_MAX_MAPS];
+    int       map_nmaps;                    /* 1-based handle high-water (0 reserved) */
+    int       map_active;
+    int       me_next[PV_MAX_MAP_ENTRIES];  /* insertion-order link, -1 = end */
+    uint8_t   me_kk[PV_MAX_MAP_ENTRIES];    /* key kind: 0=int, 1=string */
+    int32_t   me_ki[PV_MAX_MAP_ENTRIES];
+    uint32_t  me_koff[PV_MAX_MAP_ENTRIES];
+    int32_t   me_klen[PV_MAX_MAP_ENTRIES];
+    uint8_t   me_vk[PV_MAX_MAP_ENTRIES];    /* val kind: 0=int, 1=string, 2=null */
+    int32_t   me_vi[PV_MAX_MAP_ENTRIES];
+    uint32_t  me_voff[PV_MAX_MAP_ENTRIES];
+    int32_t   me_vlen[PV_MAX_MAP_ENTRIES];
+    int       me_count;
+    uint8_t   map_pool[PV_MAP_POOL];
+    uint32_t  map_pool_top;
 
     pv_host_fn host;
 };

@@ -291,4 +291,38 @@
 #define PV_HOOK_FIFO_RECV                        0x166
 #define PV_HOOK_FIFO_POLL                        0x167
 
+
+/* Map.* dictionary (0x320-0x33A) + Http transport (0x138-0x13B); see docs/MAP.md */
+#define PV_HOOK_HTTP_REQUEST                     0x138
+#define PV_HOOK_HTTP_RESPSTATUS                  0x139
+#define PV_HOOK_HTTP_RESPHEADERS                 0x13A
+#define PV_HOOK_HTTP_RESPBODY                    0x13B
+#define PV_HOOK_MAP_NEW                          0x320
+#define PV_HOOK_MAP_FREE                         0x321
+#define PV_HOOK_MAP_CLEAR                        0x322
+#define PV_HOOK_MAP_COUNT                        0x323
+#define PV_HOOK_MAP_HASH                         0x324
+#define PV_HOOK_MAP_PUTII                        0x325
+#define PV_HOOK_MAP_GETII                        0x326
+#define PV_HOOK_MAP_HASI                         0x327
+#define PV_HOOK_MAP_DELI                         0x328
+#define PV_HOOK_MAP_PUTIS                        0x329
+#define PV_HOOK_MAP_GETIS                        0x32A
+#define PV_HOOK_MAP_PUTNULLI                     0x32B
+#define PV_HOOK_MAP_ISNULLI                      0x32C
+#define PV_HOOK_MAP_PUTSI                        0x32D
+#define PV_HOOK_MAP_GETSI                        0x32E
+#define PV_HOOK_MAP_HASS                         0x32F
+#define PV_HOOK_MAP_DELS                         0x330
+#define PV_HOOK_MAP_PUTSS                        0x331
+#define PV_HOOK_MAP_GETSS                        0x332
+#define PV_HOOK_MAP_PUTNULLS                     0x333
+#define PV_HOOK_MAP_ISNULLS                      0x334
+#define PV_HOOK_MAP_KEYAT                        0x335
+#define PV_HOOK_MAP_KEYSPANAT                    0x336
+#define PV_HOOK_MAP_VALAT                        0x337
+#define PV_HOOK_MAP_VALSPANAT                    0x338
+#define PV_HOOK_MAP_VALISSPAN                    0x339
+#define PV_HOOK_MAP_USE                          0x33A
+
 #endif

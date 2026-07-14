@@ -1121,12 +1121,196 @@ static void pv_aes256_encrypt_block(const uint8_t in[16], const uint8_t rk[240],
     for (i = 0; i < 16; i++) out[i] = t[i] ^ rk[14 * 16 + i];
 }
 
+/* ---- Map.* first-class dictionary (active-handle model; docs/MAP.md) -------
+ * Entries live in a shared pool, singly linked per map for insertion-order
+ * enumeration; key/value bytes intern into map_pool. FNV-1a (offset 0x811c9dc5,
+ * prime 0x01000193) is identical to the JS/Python/C# implementations. */
+static uint32_t pv_fnv1a_span(pv_ctx *ctx, int span_h)
+{
+    uint32_t p = pv_span_p(ctx, span_h); int32_t n = pv_span_n(ctx, span_h), i;
+    uint32_t h = 0x811c9dc5u;
+    for (i = 0; i < n; i++) { h ^= (uint32_t)pv_arena_get(ctx, p + (uint32_t)i); h *= 0x01000193u; }
+    return h;
+}
+static int pv_map_intern(pv_ctx *ctx, int span_h, uint32_t *off, int32_t *len)
+{
+    uint32_t p = pv_span_p(ctx, span_h); int32_t n = pv_span_n(ctx, span_h), i;
+    if (ctx->map_pool_top + (uint32_t)n > PV_MAP_POOL) return 0;
+    *off = ctx->map_pool_top; *len = n;
+    for (i = 0; i < n; i++) ctx->map_pool[ctx->map_pool_top + (uint32_t)i] = pv_arena_get(ctx, p + (uint32_t)i);
+    ctx->map_pool_top += (uint32_t)n;
+    return 1;
+}
+static int pv_map_span_from_pool(pv_ctx *ctx, uint32_t off, int32_t len)
+{
+    uint32_t k = 0; int32_t i;
+    for (i = 0; i < len; i++) pv_arena_put(ctx, &k, ctx->map_pool[off + (uint32_t)i]);
+    return pv_arena_finish(ctx, k);
+}
+static int pv_map_key_eq_span(pv_ctx *ctx, int e, int span_h)
+{
+    int32_t n = pv_span_n(ctx, span_h), i; uint32_t p = pv_span_p(ctx, span_h);
+    if (ctx->me_kk[e] != 1 || ctx->me_klen[e] != n) return 0;
+    for (i = 0; i < n; i++) if (ctx->map_pool[ctx->me_koff[e] + (uint32_t)i] != pv_arena_get(ctx, p + (uint32_t)i)) return 0;
+    return 1;
+}
+static int pv_map_find_i(pv_ctx *ctx, int mi, int32_t k)
+{
+    int e = ctx->map_head[mi];
+    while (e >= 0) { if (ctx->me_kk[e] == 0 && ctx->me_ki[e] == k) return e; e = ctx->me_next[e]; }
+    return -1;
+}
+static int pv_map_find_s(pv_ctx *ctx, int mi, int span_h)
+{
+    int e = ctx->map_head[mi];
+    while (e >= 0) { if (pv_map_key_eq_span(ctx, e, span_h)) return e; e = ctx->me_next[e]; }
+    return -1;
+}
+static int pv_map_new_entry(pv_ctx *ctx, int mi)
+{
+    int e;
+    if (ctx->me_count >= PV_MAX_MAP_ENTRIES) return -1;
+    e = ctx->me_count++;
+    ctx->me_next[e] = -1;
+    if (ctx->map_tail[mi] >= 0) ctx->me_next[ctx->map_tail[mi]] = e;
+    else ctx->map_head[mi] = e;
+    ctx->map_tail[mi] = e;
+    ctx->map_count[mi]++;
+    return e;
+}
+static int pv_map_entry_at(pv_ctx *ctx, int mi, int32_t idx)
+{
+    int e = ctx->map_head[mi]; int32_t i = 0;
+    while (e >= 0 && i < idx) { e = ctx->me_next[e]; i++; }
+    return (i == idx) ? e : -1;
+}
+static void pv_map_unlink(pv_ctx *ctx, int mi, int match_e)
+{
+    int prev = -1, e = ctx->map_head[mi];
+    while (e >= 0) {
+        if (e == match_e) {
+            int nx = ctx->me_next[e];
+            if (prev < 0) ctx->map_head[mi] = nx; else ctx->me_next[prev] = nx;
+            if (ctx->map_tail[mi] == e) ctx->map_tail[mi] = prev;
+            ctx->map_count[mi]--; return;
+        }
+        prev = e; e = ctx->me_next[e];
+    }
+}
+static int pv_map_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
+{
+    int mi = ctx->map_active;
+    int active_ok = (mi > 0 && mi < ctx->map_nmaps && ctx->map_used[mi]);
+    switch (hook) {
+    case PV_HOOK_MAP_NEW: {
+        int h;
+        if (ctx->map_nmaps >= PV_MAX_MAPS) { ctx->regs[rd] = 0; return 1; }
+        h = ctx->map_nmaps++;
+        ctx->map_used[h] = 1; ctx->map_head[h] = -1; ctx->map_tail[h] = -1; ctx->map_count[h] = 0;
+        ctx->map_active = h; ctx->regs[rd] = h; return 1;
+    }
+    case PV_HOOK_MAP_USE: {
+        int h = ctx->regs[rs1];
+        ctx->map_active = (h > 0 && h < ctx->map_nmaps && ctx->map_used[h]) ? h : 0; return 1;
+    }
+    case PV_HOOK_MAP_FREE: {
+        int h = ctx->regs[rs1];
+        if (h > 0 && h < ctx->map_nmaps) { ctx->map_used[h] = 0; ctx->map_head[h] = -1; ctx->map_tail[h] = -1; ctx->map_count[h] = 0; if (ctx->map_active == h) ctx->map_active = 0; }
+        return 1;
+    }
+    case PV_HOOK_MAP_HASH: ctx->regs[rd] = (int32_t)pv_fnv1a_span(ctx, ctx->regs[rs1]); return 1;
+    default: break;
+    }
+    if (!active_ok) {
+        switch (hook) {
+        case PV_HOOK_MAP_GETIS: case PV_HOOK_MAP_GETSS: case PV_HOOK_MAP_KEYSPANAT:
+        case PV_HOOK_MAP_VALSPANAT: ctx->regs[rd] = pv_map_span_from_pool(ctx, 0, 0); return 1;
+        default: ctx->regs[rd] = 0; return 1;
+        }
+    }
+    switch (hook) {
+    case PV_HOOK_MAP_CLEAR: ctx->map_head[mi] = -1; ctx->map_tail[mi] = -1; ctx->map_count[mi] = 0; return 1;
+    case PV_HOOK_MAP_COUNT: ctx->regs[rd] = ctx->map_count[mi]; return 1;
+    case PV_HOOK_MAP_PUTII: {
+        int32_t k = ctx->regs[rs1]; int e = pv_map_find_i(ctx, mi, k);
+        if (e < 0) { e = pv_map_new_entry(ctx, mi); if (e < 0) return 1; ctx->me_kk[e] = 0; ctx->me_ki[e] = k; }
+        ctx->me_vk[e] = 0; ctx->me_vi[e] = ctx->regs[rs2]; return 1;
+    }
+    case PV_HOOK_MAP_GETII: {
+        int e = pv_map_find_i(ctx, mi, ctx->regs[rs1]);
+        ctx->regs[rd] = (e >= 0 && ctx->me_vk[e] == 0) ? ctx->me_vi[e] : 0;
+        ctx->host_status = (e >= 0) ? 0 : 1; return 1;
+    }
+    case PV_HOOK_MAP_HASI: ctx->regs[rd] = (pv_map_find_i(ctx, mi, ctx->regs[rs1]) >= 0) ? 1 : 0; return 1;
+    case PV_HOOK_MAP_DELI: { int e = pv_map_find_i(ctx, mi, ctx->regs[rs1]); if (e >= 0) pv_map_unlink(ctx, mi, e); return 1; }
+    case PV_HOOK_MAP_PUTIS: {
+        int32_t k = ctx->regs[rs1]; uint32_t off; int32_t len;
+        if (!pv_map_intern(ctx, ctx->regs[rs2], &off, &len)) return 1;
+        int e = pv_map_find_i(ctx, mi, k);
+        if (e < 0) { e = pv_map_new_entry(ctx, mi); if (e < 0) return 1; ctx->me_kk[e] = 0; ctx->me_ki[e] = k; }
+        ctx->me_vk[e] = 1; ctx->me_voff[e] = off; ctx->me_vlen[e] = len; return 1;
+    }
+    case PV_HOOK_MAP_GETIS: {
+        int e = pv_map_find_i(ctx, mi, ctx->regs[rs1]);
+        if (e >= 0 && ctx->me_vk[e] == 1) { ctx->regs[rd] = pv_map_span_from_pool(ctx, ctx->me_voff[e], ctx->me_vlen[e]); ctx->host_status = 0; }
+        else { ctx->regs[rd] = pv_map_span_from_pool(ctx, 0, 0); ctx->host_status = 1; }
+        return 1;
+    }
+    case PV_HOOK_MAP_PUTNULLI: {
+        int32_t k = ctx->regs[rs1]; int e = pv_map_find_i(ctx, mi, k);
+        if (e < 0) { e = pv_map_new_entry(ctx, mi); if (e < 0) return 1; ctx->me_kk[e] = 0; ctx->me_ki[e] = k; }
+        ctx->me_vk[e] = 2; return 1;
+    }
+    case PV_HOOK_MAP_ISNULLI: { int e = pv_map_find_i(ctx, mi, ctx->regs[rs1]); ctx->regs[rd] = (e >= 0 && ctx->me_vk[e] == 2) ? 1 : 0; return 1; }
+    case PV_HOOK_MAP_PUTSI: {
+        int e = pv_map_find_s(ctx, mi, ctx->regs[rs1]);
+        if (e < 0) { uint32_t ko; int32_t kl; if (!pv_map_intern(ctx, ctx->regs[rs1], &ko, &kl)) return 1; e = pv_map_new_entry(ctx, mi); if (e < 0) return 1; ctx->me_kk[e] = 1; ctx->me_koff[e] = ko; ctx->me_klen[e] = kl; }
+        ctx->me_vk[e] = 0; ctx->me_vi[e] = ctx->regs[rs2]; return 1;
+    }
+    case PV_HOOK_MAP_GETSI: {
+        int e = pv_map_find_s(ctx, mi, ctx->regs[rs1]);
+        ctx->regs[rd] = (e >= 0 && ctx->me_vk[e] == 0) ? ctx->me_vi[e] : 0;
+        ctx->host_status = (e >= 0) ? 0 : 1; return 1;
+    }
+    case PV_HOOK_MAP_HASS: ctx->regs[rd] = (pv_map_find_s(ctx, mi, ctx->regs[rs1]) >= 0) ? 1 : 0; return 1;
+    case PV_HOOK_MAP_DELS: { int e = pv_map_find_s(ctx, mi, ctx->regs[rs1]); if (e >= 0) pv_map_unlink(ctx, mi, e); return 1; }
+    case PV_HOOK_MAP_PUTSS: {
+        int e = pv_map_find_s(ctx, mi, ctx->regs[rs1]);
+        if (e < 0) { uint32_t ko; int32_t kl; if (!pv_map_intern(ctx, ctx->regs[rs1], &ko, &kl)) return 1; e = pv_map_new_entry(ctx, mi); if (e < 0) return 1; ctx->me_kk[e] = 1; ctx->me_koff[e] = ko; ctx->me_klen[e] = kl; }
+        { uint32_t vo; int32_t vl; if (!pv_map_intern(ctx, ctx->regs[rs2], &vo, &vl)) return 1; ctx->me_vk[e] = 1; ctx->me_voff[e] = vo; ctx->me_vlen[e] = vl; }
+        return 1;
+    }
+    case PV_HOOK_MAP_GETSS: {
+        int e = pv_map_find_s(ctx, mi, ctx->regs[rs1]);
+        if (e >= 0 && ctx->me_vk[e] == 1) { ctx->regs[rd] = pv_map_span_from_pool(ctx, ctx->me_voff[e], ctx->me_vlen[e]); ctx->host_status = 0; }
+        else { ctx->regs[rd] = pv_map_span_from_pool(ctx, 0, 0); ctx->host_status = 1; }
+        return 1;
+    }
+    case PV_HOOK_MAP_PUTNULLS: {
+        int e = pv_map_find_s(ctx, mi, ctx->regs[rs1]);
+        if (e < 0) { uint32_t ko; int32_t kl; if (!pv_map_intern(ctx, ctx->regs[rs1], &ko, &kl)) return 1; e = pv_map_new_entry(ctx, mi); if (e < 0) return 1; ctx->me_kk[e] = 1; ctx->me_koff[e] = ko; ctx->me_klen[e] = kl; }
+        ctx->me_vk[e] = 2; return 1;
+    }
+    case PV_HOOK_MAP_ISNULLS: { int e = pv_map_find_s(ctx, mi, ctx->regs[rs1]); ctx->regs[rd] = (e >= 0 && ctx->me_vk[e] == 2) ? 1 : 0; return 1; }
+    case PV_HOOK_MAP_KEYAT: { int e = pv_map_entry_at(ctx, mi, ctx->regs[rs1]); ctx->regs[rd] = (e >= 0 && ctx->me_kk[e] == 0) ? ctx->me_ki[e] : 0; return 1; }
+    case PV_HOOK_MAP_KEYSPANAT: { int e = pv_map_entry_at(ctx, mi, ctx->regs[rs1]); ctx->regs[rd] = (e >= 0 && ctx->me_kk[e] == 1) ? pv_map_span_from_pool(ctx, ctx->me_koff[e], ctx->me_klen[e]) : pv_map_span_from_pool(ctx, 0, 0); return 1; }
+    case PV_HOOK_MAP_VALAT: { int e = pv_map_entry_at(ctx, mi, ctx->regs[rs1]); ctx->regs[rd] = (e >= 0 && ctx->me_vk[e] == 0) ? ctx->me_vi[e] : 0; return 1; }
+    case PV_HOOK_MAP_VALSPANAT: { int e = pv_map_entry_at(ctx, mi, ctx->regs[rs1]); ctx->regs[rd] = (e >= 0 && ctx->me_vk[e] == 1) ? pv_map_span_from_pool(ctx, ctx->me_voff[e], ctx->me_vlen[e]) : pv_map_span_from_pool(ctx, 0, 0); return 1; }
+    case PV_HOOK_MAP_VALISSPAN: { int e = pv_map_entry_at(ctx, mi, ctx->regs[rs1]); ctx->regs[rd] = (e >= 0 && ctx->me_vk[e] == 1) ? 1 : 0; return 1; }
+    default: return 0;
+    }
+}
+
 void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
 {
     (void)imm16;
     /* INV-17: bindings are not ambient -- deny the hook unless its class is granted. */
     uint32_t need = pv_hook_cap(hook);
     if (need && !(ctx->caps & need)) { pv_set_fault(ctx, PV_FAULT_CAPABILITY, ctx->cur_pc, hook); return; }
+    /* Map.* first-class dictionary (active-handle model; see docs/MAP.md). */
+    if (hook >= PV_HOOK_MAP_NEW && hook <= PV_HOOK_MAP_USE) {
+        if (pv_map_hook(ctx, hook, rd, rs1, rs2)) return;
+    }
     if (hook == PV_HOOK_RANDOM_U32) {
         uint64_t x = ctx->rng_state;
         x ^= (x << 13) & MASK32;
@@ -1761,6 +1945,7 @@ void pv_init(pv_ctx *ctx)
     ctx->arena_top = 0x8000;    /* bump pointer for span results (matches PicoVM) */
     ctx->w_count = 1;           /* Utf8Writer/Json/Xml: handle 0 reserved */
     ctx->r_count = 1;           /* Utf8Reader: handle 0 reserved */
+    ctx->map_nmaps = 1;         /* Map.*: handle 0 reserved as the null map */
     ctx->host = pv_default_host;
     ctx->cur_pc = 0;
 }
