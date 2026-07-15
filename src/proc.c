@@ -4999,12 +4999,61 @@ static i32 sys_sock_close(i32 fd)
 
 /* ---- DNS ---- */
 
+/* Route resolves to Core 0 via FIFO (MSG_DNS_RESOLVE) instead of calling
+ * dns_resolve()/net_poll() directly. dns.c/net.c/macb.c state (UDP callback,
+ * RX/TX descriptor rings, NIC MMIO registers) is owned exclusively by Core 0's
+ * reactor loop -- see "Core Assignment" in AGENTS.md. A user core calling into
+ * it directly would race Core 0 on the same non-coherent DMA rings/registers
+ * with no synchronization, which is the real root cause of the "auto-recovers
+ * but wedgy" NIC behaviour this was reviewed for: the recovery watchdogs in
+ * macb.c paper over the corruption by resetting the ring, but the race itself
+ * was never fixed. DNS_RESOLVE_TIMEOUT_MS bounds the wait so a lost reply
+ * cannot hang the calling core forever; dns.c's own retry logic already
+ * bounds itself to a few seconds, so this is a generous outer backstop. */
+#define DNS_RESOLVE_TIMEOUT_MS 12000ULL
+
 static i32 sys_resolve(const char *hostname, u32 *ip_out)
 {
     if (!has_net_cap()) return -1;
     if (!ptr_valid_cstr(hostname, 254)) return -1;
     if (!ptr_valid(ip_out, sizeof(u32))) return -1;
-    return dns_resolve(hostname, ip_out) ? 0 : -1;
+
+    u32 core = core_id();
+    u32 len = 0;
+    while (len < 254 && hostname[len] != 0) len++;
+    len++; /* include NUL so Core 0 can bound its copy */
+
+    struct fifo_msg msg;
+    msg.type   = MSG_DNS_RESOLVE;
+    msg.param  = 0;
+    msg.buffer = (u64)(usize)hostname;
+    msg.length = len;
+    msg.tag    = ((u64)core << 32) | (u64)(u32)timer_monotonic_ms();
+    fifo_push(core, CORE_NET, &msg);
+
+    u64 deadline = timer_monotonic_ms() + DNS_RESOLVE_TIMEOUT_MS;
+    struct fifo_msg reply;
+    for (;;) {
+        if (fifo_pop(core, CORE_NET, &reply)) {
+            if (reply.type == MSG_DNS_RESOLVE_DONE && reply.tag == msg.tag) {
+                if (reply.status == 2U) {
+                    /* Core 0's pending queue was full: resend and keep waiting
+                     * instead of failing a resolvable lookup. */
+                    fifo_push(core, CORE_NET, &msg);
+                    deadline = timer_monotonic_ms() + DNS_RESOLVE_TIMEOUT_MS;
+                    continue;
+                }
+                if (reply.status != 0U) return -1;
+                *ip_out = reply.param;
+                return 0;
+            }
+            /* Not our reply (e.g. a disk/socket reply sharing this core-0
+             * channel since CORE_DISK == CORE_NET) -- drop and keep waiting. */
+            continue;
+        }
+        if (timer_monotonic_ms() >= deadline) return -1;
+        wfe();
+    }
 }
 
 /* ---- Identity ---- */

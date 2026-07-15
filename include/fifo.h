@@ -29,6 +29,12 @@
 #define MSG_NET_STATS       13  /* buffer=pointer to net_stats_t */
 #define MSG_NET_LINK_UP     14
 #define MSG_NET_LINK_DOWN   15
+#define MSG_DNS_RESOLVE      16  /* buffer=hostname cstring ptr (sender core RAM),
+                                    length=strlen+1, tag=request id (echoed back).
+                                    Core 0 owns dns.c state; never call dns_resolve()
+                                    or net_poll() directly from a user core. */
+#define MSG_DNS_RESOLVE_DONE 17  /* status=0 ok/1 fail/2 busy(retry), param=host-order
+                                    IPv4 result, tag=echoed request id */
 
 /* Generic */
 #define MSG_BENCH_BATCH     252

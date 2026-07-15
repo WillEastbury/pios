@@ -22,6 +22,7 @@
 #include "pcie.h"
 #include "mmio.h"
 #include "macb.h"
+#include "dns.h"
 
 #define NET_ICMP_DIAG_VERBOSE 0
 
@@ -802,6 +803,85 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
 }
 
 /* ================================================================== */
+/*  DNS FIFO integration - user cores must never call dns_resolve() or */
+/*  net_poll() directly: dns.c/net.c/macb.c state is owned exclusively */
+/*  by Core 0. A user core that touched it directly would race Core 0  */
+/*  on the same non-coherent NIC descriptor rings/registers. Route     */
+/*  resolves through a small pending queue drained on Core 0.          */
+/* ================================================================== */
+
+#define DNS_FIFO_QUEUE_MAX 4U
+struct dns_fifo_req {
+    bool used;
+    u32  requester_core;
+    u64  tag;
+    char hostname[DNS_HOST_MAX];
+};
+static struct dns_fifo_req dns_fifo_queue[DNS_FIFO_QUEUE_MAX];
+static bool dns_fifo_active;
+static u32  dns_fifo_active_core;
+static u64  dns_fifo_active_tag;
+
+static void dns_fifo_reply(u32 requester_core, u64 tag, u32 status, u32 ip) {
+    struct fifo_msg reply;
+    reply.type   = MSG_DNS_RESOLVE_DONE;
+    reply.status = status;
+    reply.param  = ip;
+    reply.tag    = tag;
+    fifo_push(CORE_NET, requester_core, &reply);
+}
+
+static void dns_fifo_enqueue(u32 requester_core, u64 tag, const u8 *hostbuf, u32 len) {
+    for (u32 i = 0; i < DNS_FIFO_QUEUE_MAX; i++) {
+        if (dns_fifo_queue[i].used)
+            continue;
+        struct dns_fifo_req *r = &dns_fifo_queue[i];
+        u32 n = (len < DNS_HOST_MAX - 1U) ? len : DNS_HOST_MAX - 1U;
+        u32 j = 0;
+        for (; j < n && hostbuf[j] != 0; j++)
+            r->hostname[j] = (char)hostbuf[j];
+        r->hostname[j] = 0;
+        r->requester_core = requester_core;
+        r->tag = tag;
+        r->used = true;
+        return;
+    }
+    /* Queue full: reply busy immediately so the caller can retry rather
+     * than block forever waiting for a slot that will never open. */
+    dns_fifo_reply(requester_core, tag, 2U, 0U);
+}
+
+/* Advance at most one in-flight resolve + one queued start per call.
+ * Never blocks: dns_resolve_async_start()/dns_async_status() are the
+ * non-blocking async DNS primitives, unlike dns_resolve(). */
+static void dns_fifo_poll(void) {
+    if (dns_fifo_active) {
+        struct dns_async_status st;
+        dns_async_status(&st);
+        if (st.state == DNS_ASYNC_DONE || st.state == DNS_ASYNC_FAILED) {
+            dns_fifo_reply(dns_fifo_active_core, dns_fifo_active_tag,
+                           (st.state == DNS_ASYNC_DONE) ? 0U : 1U, st.result_ip);
+            dns_fifo_active = false;
+        } else {
+            return; /* still resolving; revisit next poll */
+        }
+    }
+
+    for (u32 i = 0; i < DNS_FIFO_QUEUE_MAX; i++) {
+        if (!dns_fifo_queue[i].used)
+            continue;
+        dns_fifo_active_core = dns_fifo_queue[i].requester_core;
+        dns_fifo_active_tag  = dns_fifo_queue[i].tag;
+        dns_fifo_queue[i].used = false;
+        if (dns_resolve_async_start(dns_fifo_queue[i].hostname))
+            dns_fifo_active = true;
+        else
+            dns_fifo_reply(dns_fifo_active_core, dns_fifo_active_tag, 1U, 0U);
+        break;
+    }
+}
+
+/* ================================================================== */
 /*  FIFO integration - user cores send UDP via messages                */
 /* ================================================================== */
 
@@ -824,6 +904,13 @@ void net_handle_fifo_request(void) {
             reply.status = ok ? 0 : 1;
             reply.tag    = msg.tag;
             fifo_push(CORE_NET, CORE_USER0, &reply);
+        } else if (msg.type == MSG_DNS_RESOLVE && msg.buffer && msg.length <= 256U) {
+            if (!ptr_in_core_ram(CORE_USER0, msg.buffer, msg.length)) {
+                dns_fifo_reply(CORE_USER0, msg.tag, 1U, 0U);
+                continue;
+            }
+            dns_fifo_enqueue(CORE_USER0, msg.tag,
+                             (const u8 *)(usize)msg.buffer, msg.length);
         }
     }
 
@@ -841,6 +928,13 @@ void net_handle_fifo_request(void) {
             reply.status = ok ? 0 : 1;
             reply.tag    = msg.tag;
             fifo_push(CORE_NET, CORE_USER1, &reply);
+        } else if (msg.type == MSG_DNS_RESOLVE && msg.buffer && msg.length <= 256U) {
+            if (!ptr_in_core_ram(CORE_USER1, msg.buffer, msg.length)) {
+                dns_fifo_reply(CORE_USER1, msg.tag, 1U, 0U);
+                continue;
+            }
+            dns_fifo_enqueue(CORE_USER1, msg.tag,
+                             (const u8 *)(usize)msg.buffer, msg.length);
         }
     }
 
@@ -849,6 +943,8 @@ void net_handle_fifo_request(void) {
         socket_handle_fifo(CORE_USER0);
     for (u32 i = 0; i < NET_FIFO_BURST_MAX; i++)
         socket_handle_fifo(CORE_USER1);
+
+    dns_fifo_poll();
 }
 
 /* ================================================================== */
