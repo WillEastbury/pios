@@ -7,6 +7,14 @@ set FULL_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 
 set BOOT_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2
 set ASFLAGS=-march=armv8.2-a+simd+crc+crypto
 
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyyyMMdd.HHmmss'"') do set BUILD_STAMP=%%i
+> include\build_version.h echo #pragma once
+>> include\build_version.h echo #define PIOS_BUILD_STAMP "%BUILD_STAMP%"
+>> include\build_version.h echo #define PIOS_VERSION "v%BUILD_STAMP%"
+>> include\build_version.h echo #define PIOS_BUILD_NAME "PIOS Kernel"
+>> include\build_version.h echo #define PIOS_BUILD_LABEL "PIOS Kernel Booted and Running -> Version v%BUILD_STAMP%"
+echo Build version: PIOS Kernel v%BUILD_STAMP%
+
 if exist build rmdir /S /Q build
 if exist build_boot rmdir /S /Q build_boot
 mkdir build
