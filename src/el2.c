@@ -133,8 +133,14 @@ static void el2_stage2_build_table(u32 id)
     u64 ipa = p->ipa_base;
     u64 pa = p->pa_base;
     for (u64 i = 0; i < blocks; i++, ipa += S2_L2_BLOCK_SIZE, pa += S2_L2_BLOCK_SIZE) {
+        /* el2_stage2_plan_set() already rejects any range that would reach
+         * here, since this single L2 table only covers the first 1GB IPA
+         * (one L1 entry). This is a belt-and-braces bound, not the primary
+         * enforcement -- a config that needed a second L1 entry must be
+         * rejected at plan_set() time (fail closed), not silently
+         * truncated here. */
         if (ipa >= S2_L1_BLOCK_SIZE)
-            break; /* groundwork: first 1GB IPA only */
+            break;
         u32 idx = (u32)(ipa / S2_L2_BLOCK_SIZE);
         l2[idx] = (pa & ~(S2_L2_BLOCK_SIZE - 1)) |
                   S2_PTE_VALID | S2_PTE_BLOCK | S2_PTE_AF |
@@ -276,8 +282,34 @@ i32 el2_stage2_plan_set(u32 id, u64 ipa_base, u64 ipa_size, u64 pa_base, u64 fla
     if ((ipa_base & ((1UL << 21) - 1)) != 0 || (pa_base & ((1UL << 21) - 1)) != 0 ||
         (ipa_size & ((1UL << 21) - 1)) != 0)
         return -1;
+    /* el2_stage2_build_table() only populates a single L2 table under one
+     * L1 entry -- the first 1GB of IPA space. Reject any range that does
+     * not fit entirely inside that window instead of silently building a
+     * table that maps only the leading portion and leaves the remainder
+     * untranslated; malformed/oversized descriptors must fail closed at
+     * configuration time, not surface later as an unexpected stage-2
+     * fault deep into the capsule's execution. */
+    if (ipa_base >= S2_L1_BLOCK_SIZE || ipa_size > S2_L1_BLOCK_SIZE - ipa_base)
+        return -1;
     if (!el2_stage2_pa_range_is_normal_wb(pa_base, ipa_size))
         return -1;
+    /* Defense in depth: reject a plan whose PA range intersects any other
+     * currently-configured capsule's PA range. A capsule is normally bound
+     * to its own private-RAM slot (el2_capsule_bind_slot), so this should
+     * never trigger in practice -- but a duplicate or malicious
+     * registration must fail closed here rather than rely solely on the
+     * slot-allocation caller getting it right. */
+    {
+        u64 end = pa_base + ipa_size;
+        for (u32 other = 0; other < EL2_CAPSULE_MAX; other++) {
+            if (other == id || !g_stage2[other].configured)
+                continue;
+            u64 other_base = g_stage2[other].pa_base;
+            u64 other_end = other_base + g_stage2[other].ipa_size;
+            if (pa_base < other_end && other_base < end)
+                return -1;
+        }
+    }
     struct el2_stage2_plan *p = &g_stage2[id];
     p->configured = true;
     p->enabled = false;
