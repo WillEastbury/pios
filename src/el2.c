@@ -2,6 +2,7 @@
 #include "simd.h"
 #include "proc.h"
 #include "core_env.h"
+#include "uart.h"
 
 __asm__(".global __el2_integrity_start\n__el2_integrity_start:");
 
@@ -127,21 +128,30 @@ static void el2_stage2_build_table(u32 id)
 
     u64 *l1 = g_stage2_root[id];
     u64 *l2 = g_stage2_l2[id];
-    l1[0] = ((u64)(usize)l2) | S2_PTE_VALID | S2_PTE_TABLE;
+    /* The capsule's IPA range is identity-mapped from its PA (see
+     * el2_capsule_bind_slot: ipa_base == pa_base always), and physical RAM
+     * does not universally sit below 1GB -- e.g. QEMU_VIRT's per-core RAM
+     * lives at 0x42000000+ (~1.03GB), which is already past a hardcoded
+     * L1 slot 0. Index the L1 entry that actually covers ipa_base instead
+     * of assuming slot 0; el2_stage2_plan_set() guarantees the whole range
+     * fits within this single 1GB-aligned L1 block before we get here. */
+    u32 l1_idx = (u32)(p->ipa_base / S2_L1_BLOCK_SIZE);
+    u64 l1_block_base = (u64)l1_idx * S2_L1_BLOCK_SIZE;
+    l1[l1_idx] = ((u64)(usize)l2) | S2_PTE_VALID | S2_PTE_TABLE;
 
     u64 blocks = p->ipa_size / S2_L2_BLOCK_SIZE;
     u64 ipa = p->ipa_base;
     u64 pa = p->pa_base;
     for (u64 i = 0; i < blocks; i++, ipa += S2_L2_BLOCK_SIZE, pa += S2_L2_BLOCK_SIZE) {
         /* el2_stage2_plan_set() already rejects any range that would reach
-         * here, since this single L2 table only covers the first 1GB IPA
-         * (one L1 entry). This is a belt-and-braces bound, not the primary
+         * here, since this single L2 table only covers one 1GB-aligned L1
+         * block. This is a belt-and-braces bound, not the primary
          * enforcement -- a config that needed a second L1 entry must be
          * rejected at plan_set() time (fail closed), not silently
          * truncated here. */
-        if (ipa >= S2_L1_BLOCK_SIZE)
+        if (ipa - l1_block_base >= S2_L1_BLOCK_SIZE)
             break;
-        u32 idx = (u32)(ipa / S2_L2_BLOCK_SIZE);
+        u32 idx = (u32)((ipa - l1_block_base) / S2_L2_BLOCK_SIZE);
         l2[idx] = (pa & ~(S2_L2_BLOCK_SIZE - 1)) |
                   S2_PTE_VALID | S2_PTE_BLOCK | S2_PTE_AF |
                   S2_MEMATTR_NORMAL | S2_SH_INNER | S2_S2AP_RW;
@@ -283,14 +293,21 @@ i32 el2_stage2_plan_set(u32 id, u64 ipa_base, u64 ipa_size, u64 pa_base, u64 fla
         (ipa_size & ((1UL << 21) - 1)) != 0)
         return -1;
     /* el2_stage2_build_table() only populates a single L2 table under one
-     * L1 entry -- the first 1GB of IPA space. Reject any range that does
-     * not fit entirely inside that window instead of silently building a
-     * table that maps only the leading portion and leaves the remainder
-     * untranslated; malformed/oversized descriptors must fail closed at
-     * configuration time, not surface later as an unexpected stage-2
-     * fault deep into the capsule's execution. */
-    if (ipa_base >= S2_L1_BLOCK_SIZE || ipa_size > S2_L1_BLOCK_SIZE - ipa_base)
-        return -1;
+     * L1 entry -- one 1GB-aligned block of IPA space, wherever ipa_base
+     * falls (physical RAM is not universally below 1GB -- e.g. QEMU_VIRT's
+     * per-core RAM sits at 0x42000000+). Reject any range that would cross
+     * into a second 1GB-aligned L1 block, or that would index past the
+     * fixed 512-entry L1 table, instead of silently building a table that
+     * maps only the leading portion and leaves the remainder untranslated;
+     * malformed/oversized descriptors must fail closed at configuration
+     * time, not surface later as an unexpected stage-2 fault deep into the
+     * capsule's execution. */
+    {
+        u64 l1_idx_base = ipa_base / S2_L1_BLOCK_SIZE;
+        u64 l1_idx_end = (ipa_base + ipa_size - 1) / S2_L1_BLOCK_SIZE;
+        if (l1_idx_base != l1_idx_end || l1_idx_base >= 512UL)
+            return -1;
+    }
     if (!el2_stage2_pa_range_is_normal_wb(pa_base, ipa_size))
         return -1;
     /* Defense in depth: reject a plan whose PA range intersects any other
@@ -602,6 +619,97 @@ i32 el2_hvc_call(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0)
     }
     if (ret0) *ret0 = r0;
     return (r0 == ~0ULL) ? -1 : 0;
+}
+
+/* Pure-logic validation of the three correctness properties fixed in this
+ * branch: per-core activation state, fail-closed IPA bounds, and cross-
+ * capsule PA overlap rejection. Deliberately does NOT dereference any of
+ * the dummy PA ranges it plans -- el2_stage2_plan_set()/build_table() only
+ * ever encode a PA into a descriptor word, never read/write through it --
+ * so this is safe to run against live physical-RAM addresses without
+ * touching whatever is actually resident there. Uses three reserved
+ * capsule ids at the top of the id space, snapshotting and restoring their
+ * prior state so a real production capsule that happens to occupy one of
+ * those ids is left exactly as it was. Registered in the QEMU-safe
+ * selftest battery (kernel.c). */
+bool el2_stage2_selftest(void)
+{
+    const u32 IDA = EL2_CAPSULE_MAX - 1U; /* 7 */
+    const u32 IDB = EL2_CAPSULE_MAX - 2U; /* 6 */
+    const u32 IDC = EL2_CAPSULE_MAX - 3U; /* 5: left unconfigured, "never armed" case */
+
+    struct el2_capsule_desc save_ca, save_cb, save_cc;
+    struct el2_stage2_plan save_pa, save_pb, save_pc;
+    static u64 save_l1a[512], save_l2a[512], save_l1b[512], save_l2b[512];
+    simd_memcpy(&save_ca, &g_capsules[IDA], sizeof(save_ca));
+    simd_memcpy(&save_cb, &g_capsules[IDB], sizeof(save_cb));
+    simd_memcpy(&save_cc, &g_capsules[IDC], sizeof(save_cc));
+    simd_memcpy(&save_pa, &g_stage2[IDA], sizeof(save_pa));
+    simd_memcpy(&save_pb, &g_stage2[IDB], sizeof(save_pb));
+    simd_memcpy(&save_pc, &g_stage2[IDC], sizeof(save_pc));
+    simd_memcpy(save_l1a, g_stage2_root[IDA], sizeof(save_l1a));
+    simd_memcpy(save_l2a, g_stage2_l2[IDA], sizeof(save_l2a));
+    simd_memcpy(save_l1b, g_stage2_root[IDB], sizeof(save_l1b));
+    simd_memcpy(save_l2b, g_stage2_l2[IDB], sizeof(save_l2b));
+    bool ca_was_configured = g_stage2[IDC].configured;
+    bool ca_was_enabled = g_stage2[IDC].enabled;
+
+    bool ok = true;
+    /* Use the free tail of core2/core3 private RAM as dummy PA windows:
+     * slots occupy [core_base+PROC_SLOT_OFFSET, core_base+PROC_SLOT_OFFSET+
+     * MAX_PROCS_PER_CORE*PROC_SLOT_SIZE) = [+1MB, +13MB) on each core, so
+     * +14MB is guaranteed clear of any real, currently-configured capsule
+     * (now that isolation is mandatory by default, real boot processes do
+     * occupy real stage-2 ranges at the low end of each core's RAM -- an
+     * earlier version of this test collided with one of those and the new
+     * overlap check correctly rejected it). Using two different cores'
+     * RAM keeps the two windows trivially disjoint from each other too. */
+    u64 pa_a = CORE2_RAM_BASE + (14UL << 20);
+    u64 pa_b = CORE3_RAM_BASE + (14UL << 20);
+
+    if (el2_capsule_register(IDA, 0xFFFFFFFEU, 0xE1517E57U, 1, pa_a, (2UL << 20)) != 0) { ok = false; uart_puts("[e2t] fail: register A\n"); }
+    if (el2_capsule_register(IDB, 0xFFFFFFFEU, 0xE1517E58U, 1, pa_b, (2UL << 20)) != 0) { ok = false; uart_puts("[e2t] fail: register B\n"); }
+    g_stage2[IDC].configured = false;
+    g_stage2[IDC].enabled = false;
+
+    /* Disjoint ranges: both must be accepted. */
+    if (el2_stage2_plan_set(IDA, pa_a, (2UL << 20), pa_a, 0) != 0) { ok = false; uart_puts("[e2t] fail: plan A disjoint\n"); }
+    if (el2_stage2_plan_set(IDB, pa_b, (2UL << 20), pa_b, 0) != 0) { ok = false; uart_puts("[e2t] fail: plan B disjoint\n"); }
+
+    /* Overlapping range must be rejected (cross-capsule PA overlap check). */
+    if (el2_stage2_plan_set(IDB, pa_a, (2UL << 20), pa_a, 0) == 0) { ok = false; uart_puts("[e2t] fail: overlap not rejected\n"); }
+    /* Restore IDB to its disjoint range for the rest of the test. */
+    if (el2_stage2_plan_set(IDB, pa_b, (2UL << 20), pa_b, 0) != 0) { ok = false; uart_puts("[e2t] fail: plan B restore\n"); }
+
+    /* Oversized IPA range (would need a second L1 entry) must be rejected. */
+    if (el2_stage2_plan_set(IDA, pa_a, (2UL << 30), pa_a, 0) == 0) { ok = false; uart_puts("[e2t] fail: oversized not rejected\n"); }
+    /* Restore IDA's valid plan after the rejected oversized attempt. */
+    if (el2_stage2_plan_set(IDA, pa_a, (2UL << 20), pa_a, 0) != 0) { ok = false; uart_puts("[e2t] fail: plan A restore\n"); }
+
+    if (el2_stage2_enable(IDA, true) != 0) { ok = false; uart_puts("[e2t] fail: enable A\n"); }
+    if (el2_stage2_enable(IDB, true) != 0) { ok = false; uart_puts("[e2t] fail: enable B\n"); }
+
+    /* Per-core activation bookkeeping: valid enabled capsules must activate,
+     * and an id that was never configured/enabled must be rejected. */
+    if (el2_stage2_activate(IDA) != 0) { ok = false; uart_puts("[e2t] fail: activate A\n"); }
+    if (el2_stage2_activate(IDB) != 0) { ok = false; uart_puts("[e2t] fail: activate B\n"); }
+    if (el2_stage2_activate(IDC) == 0) { ok = false; uart_puts("[e2t] fail: activate C not rejected\n"); }
+    (void)el2_stage2_activate(PROC_CAPSULE_ID_NONE); /* leave this core clean */
+
+    simd_memcpy(&g_capsules[IDA], &save_ca, sizeof(save_ca));
+    simd_memcpy(&g_capsules[IDB], &save_cb, sizeof(save_cb));
+    simd_memcpy(&g_capsules[IDC], &save_cc, sizeof(save_cc));
+    simd_memcpy(&g_stage2[IDA], &save_pa, sizeof(save_pa));
+    simd_memcpy(&g_stage2[IDB], &save_pb, sizeof(save_pb));
+    simd_memcpy(&g_stage2[IDC], &save_pc, sizeof(save_pc));
+    simd_memcpy(g_stage2_root[IDA], save_l1a, sizeof(save_l1a));
+    simd_memcpy(g_stage2_l2[IDA], save_l2a, sizeof(save_l2a));
+    simd_memcpy(g_stage2_root[IDB], save_l1b, sizeof(save_l1b));
+    simd_memcpy(g_stage2_l2[IDB], save_l2b, sizeof(save_l2b));
+    g_stage2[IDC].configured = ca_was_configured;
+    g_stage2[IDC].enabled = ca_was_enabled;
+
+    return ok;
 }
 
 __asm__(".global __el2_integrity_end\n__el2_integrity_end:");

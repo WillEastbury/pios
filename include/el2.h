@@ -67,3 +67,8 @@ i32 el2_hvc_call(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0);
 /* EL2 trap entry helper called from vectors.S. */
 u64 el2_hvc_trap(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4);
 u64 el2_sync_fault_trap(u64 esr, u64 elr);
+
+/* QEMU-safe pure-logic selftest: per-core activation state, fail-closed IPA
+ * bounds, and cross-capsule PA overlap rejection. See kernel.c selftest
+ * battery. */
+bool el2_stage2_selftest(void);

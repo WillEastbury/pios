@@ -3134,6 +3134,7 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
             { "proc_svc",    proc_svc_selftest },
             { "proc_entry",  proc_entry_contract_selftest },
             { "tensor_neon", tensor_selftest },
+            { "el2_stage2",  el2_stage2_selftest },
         };
         u32 nt = (u32)(sizeof(bat) / sizeof(bat[0]));
         u32 passed = 0;
