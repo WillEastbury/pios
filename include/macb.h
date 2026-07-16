@@ -57,7 +57,8 @@ struct macb_diag {
     u32 tx_drop;        /* lifetime TX frames dropped (ring full) */
     u32 tx_recover;     /* lifetime TX ring recoveries performed */
     u32 rx_live_recover;/* lifetime RX-liveness (silence) recoveries performed */
-    u32 rx_wedge;       /* lifetime non-latched RX wedges detected */
+    u32 rx_wedge;       /* lifetime real wedges: silence + unmet demand */
+    u32 rx_idle;        /* lifetime extended RX-silence periods (informational, not faults) */
 } PACKED;
 void macb_diag(struct macb_diag *out);
 

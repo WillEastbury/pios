@@ -1088,22 +1088,44 @@ bool macb_rx_recover(void) {
     return true;
 }
 
-/* RX-liveness watchdog — see macb.h. Detects an RX DMA halt that does NOT latch
- * RSR.BNA/OVR (which macb_rx_recover cannot see) by watching for a sustained
- * no-RX window while the NIC has recently been active. To avoid false positives
- * on a quiet link, it arms only after observed RX progress, disarms after an
- * extended idle period, and exponentially backs off repeated recoveries. */
-#define MACB_RX_LIVENESS_TIMEOUT_MS      4000ULL
-#define MACB_RX_LIVENESS_IDLE_DISARM_MS 30000ULL
-#define MACB_RX_LIVENESS_BACKOFF_MAX_MS 60000ULL
+/* RX-liveness watchdog — see macb.h. Distinguishes ordinary RX-silence
+ * ("idle") from a genuine RX DMA halt that does NOT latch RSR.BNA/OVR (which
+ * macb_rx_recover cannot see). This LAN is reasonably noisy -- there is
+ * usually SOME traffic, just not necessarily traffic PIOS cares about -- so
+ * an extended RX-silence window by itself is common and not a fault. Only
+ * escalate to a real "wedge" (ring rebuild + rx_wedge counter) when there is
+ * also corroborating evidence of unmet demand: our own stack has actively
+ * transmitted (tx_progress) during the silence window (e.g. mid-connection
+ * retries/ACKs/replies expecting a peer response) and RX still produced
+ * nothing back. Plain silence with no such demand is just idle -- tracked
+ * separately via rx_idle for dashboards/diagnostics, never rebuilt for.
+ *
+ * TIMEOUT TUNING (2026-07-16 field observation): the original 4000ms base
+ * timeout produced repeated false-positive "wedge" recoveries -- macb_diag
+ * showed rx_recover=0 (BNA/OVR never latched) and RSR=0 (no hardware overrun
+ * ever observed) alongside a steadily climbing wedge counter, i.e. the ring
+ * was never actually stuck. Raising the base to 15000ms alone did not change
+ * the observed false-trip cadence (~1 per 60-70s before AND after), showing
+ * the natural inbound gap on this LAN is itself ~60-70s -- so the demand-
+ * gated design above is the real fix; the larger 90s base timeout plus
+ * IDLE_DISARM_MS kept below it (so a link with neither RX nor TX activity
+ * disarms itself instead of always losing the race to the wedge check) is a
+ * belt-and-braces second layer. */
+#define MACB_RX_LIVENESS_IDLE_REPORT_MS  15000ULL
+#define MACB_RX_LIVENESS_TIMEOUT_MS      90000ULL
+#define MACB_RX_LIVENESS_IDLE_DISARM_MS  30000ULL
+#define MACB_RX_LIVENESS_BACKOFF_MAX_MS 180000ULL
 static u32 rx_live_last_count;
 static u32 rx_live_last_tx_count;
 static u64 rx_live_last_rx_ms;
 static u64 rx_live_last_activity_ms;
 static u32 rx_live_recover_count;
-static u32 rx_wedge_count;
+static u32 rx_wedge_count;         /* real wedges: silence + unmet demand */
+static u32 rx_idle_count;          /* informational: extended RX-silence periods (not faults) */
 static u32 rx_live_streak;
 static bool rx_live_armed;
+static bool rx_tx_since_last_rx;   /* our stack transmitted during the current silence window */
+static bool rx_idle_reported;      /* idle already counted for the current silence window */
 
 bool macb_rx_liveness_recover(u64 now_ms) {
     if (rx_live_last_activity_ms == 0) {
@@ -1113,6 +1135,8 @@ bool macb_rx_liveness_recover(u64 now_ms) {
         rx_live_last_activity_ms = now_ms;
         rx_live_streak = 0;
         rx_live_armed = false;
+        rx_tx_since_last_rx = false;
+        rx_idle_reported = false;
         return false;
     }
 
@@ -1122,19 +1146,24 @@ bool macb_rx_liveness_recover(u64 now_ms) {
     if (tx_progress) {
         rx_live_last_tx_count = tx_send_count;
         rx_live_last_activity_ms = now_ms;
+        rx_tx_since_last_rx = true;
     }
 
-    /* Any RX progress proves the lane is live: (re)arm and clear backoff. */
+    /* Any RX progress proves the lane is live: (re)arm, clear backoff, and
+     * start a fresh silence window (clear the demand/idle-reported flags). */
     if (rx_progress) {
         rx_live_last_count = rx_recv_count;
         rx_live_last_rx_ms = now_ms;
         rx_live_last_activity_ms = now_ms;
         rx_live_streak = 0;
         rx_live_armed = true;
+        rx_tx_since_last_rx = false;
+        rx_idle_reported = false;
         return false;
     }
 
-    /* Quiet link: stop probing until RX resumes, to avoid idle false positives. */
+    /* Fully quiet link (neither RX nor TX activity): stop probing to avoid
+     * idle false positives. */
     if (now_ms - rx_live_last_activity_ms >= MACB_RX_LIVENESS_IDLE_DISARM_MS) {
         rx_live_armed = false;
         rx_live_streak = 0;
@@ -1145,16 +1174,33 @@ bool macb_rx_liveness_recover(u64 now_ms) {
     if (!rx_live_armed)
         return false;
 
+    u64 idle_ms = now_ms - rx_live_last_rx_ms;
+
+    /* Informational only: note an extended RX-silence window once per
+     * window. This is expected/common on a noisy-but-not-for-us LAN and is
+     * NOT by itself evidence of a fault. */
+    if (idle_ms >= MACB_RX_LIVENESS_IDLE_REPORT_MS && !rx_idle_reported) {
+        rx_idle_count++;
+        rx_idle_reported = true;
+    }
+
     u64 timeout = MACB_RX_LIVENESS_TIMEOUT_MS;
     u32 shift = rx_live_streak;
     if (shift > 4U)
-        shift = 4U; /* 4s * 16 = 64s; cap below to 60s. */
+        shift = 4U; /* 90s * 16 = 1440s; cap below to 180s. */
     timeout <<= shift;
     if (timeout > MACB_RX_LIVENESS_BACKOFF_MAX_MS)
         timeout = MACB_RX_LIVENESS_BACKOFF_MAX_MS;
 
-    if (now_ms - rx_live_last_rx_ms < timeout)
+    if (idle_ms < timeout)
         return false;
+
+    if (!rx_tx_since_last_rx) {
+        /* Extended silence with no corroborating demand: just an idle link,
+         * not a fault. Keep waiting instead of rebuilding a ring that was
+         * never actually stuck. */
+        return false;
+    }
 
     /* No RX for the active watchdog window: assume RX DMA is wedged. */
     rx_wedge_count++;
@@ -1196,6 +1242,7 @@ void macb_diag(struct macb_diag *out)
     out->tx_recover = tx_recover_count;
     out->rx_live_recover = rx_live_recover_count;
     out->rx_wedge = rx_wedge_count;
+    out->rx_idle = rx_idle_count;
 }
 
 void macb_irq_snapshot(struct macb_irq_snapshot *out, bool read_clear_isr)

@@ -1470,6 +1470,7 @@ struct perf_counter_snapshot {
     u32 nic_rx_peak_mbps_x1000;
     u32 nic_tx_peak_mbps_x1000;
     u32 nic_rx_wedge;
+    u32 nic_rx_idle;
     u32 nic_link_mbps;
     bool nic_link_full_duplex;
     u32 nic_rx_capacity_mbps;
@@ -1728,9 +1729,11 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
         struct macb_diag md;
         macb_diag(&md);
         p->nic_rx_wedge = md.rx_wedge;
+        p->nic_rx_idle = md.rx_idle;
     }
 #else
     p->nic_rx_wedge = 0;
+    p->nic_rx_idle = 0;
 #endif
     p->nic_link_mbps = nic_link_mbps();
     p->nic_link_full_duplex = nic_link_full_duplex();
@@ -1896,6 +1899,7 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "nic_rx_peak_mbps_x1000", perf.nic_rx_peak_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "nic_tx_peak_mbps_x1000", perf.nic_tx_peak_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "nic_rx_wedge", perf.nic_rx_wedge, true);
+    http_append_json_metric(out, &len, max, "nic_rx_idle", perf.nic_rx_idle, true);
     http_append_json_metric(out, &len, max, "nic_link_mbps", perf.nic_link_mbps, true);
     http_append_json_metric(out, &len, max, "nic_link_full_duplex", perf.nic_link_full_duplex ? 1U : 0U, true);
     http_append_json_metric(out, &len, max, "nic_rx_capacity_mbps", perf.nic_rx_capacity_mbps, true);
@@ -3011,6 +3015,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, md.rx_live_recover);
         http_append(out, &len, max, " rx_wedge=");
         http_append_u64(out, &len, max, md.rx_wedge);
+        http_append(out, &len, max, " rx_idle=");
+        http_append_u64(out, &len, max, md.rx_idle);
         http_append(out, &len, max, "\n");
 #endif
     } else if (http_starts_with(cmd, "dtrace")) {
@@ -17942,6 +17948,10 @@ static void hdmi_dashboard_render(void)
         fb_puts(" rx_live_rec=");
         fb_set_color(md.rx_live_recover ? C_YEL : C_WHT, 0x00000000);
         fb_printf("%u", md.rx_live_recover);
+        fb_set_color(C_GRY, 0x00000000);
+        fb_puts(" rx_idle=");
+        fb_set_color(C_WHT, 0x00000000);
+        fb_printf("%u", md.rx_idle);
         fb_set_cursor(dc, dr++);
         fb_set_color(C_GRY, 0x00000000);
         fb_puts("RBQP=0x");
