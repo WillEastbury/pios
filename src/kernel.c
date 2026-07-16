@@ -22,6 +22,7 @@
 #include "sd.h"
 #include "nic.h"
 #include "macb.h"
+#include "pioscap.h"
 #include "net.h"
 #include "arp.h"
 #include "tcp.h"
@@ -195,6 +196,7 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HTTP_ROUTE_STATIC     13U
 #define HTTP_ROUTE_STATIC_PUT 14U
 #define HTTP_ROUTE_CAPSULE    15U
+#define HTTP_ROUTE_PCAP       16U
 
 #define HTTP_ERR_NONE         0U
 #define HTTP_ERR_RESP_TIMEOUT 1U
@@ -242,6 +244,7 @@ static const char *http_route_name(u32 route)
     case HTTP_ROUTE_STATIC: return "static";
     case HTTP_ROUTE_STATIC_PUT: return "static-put";
     case HTTP_ROUTE_CAPSULE: return "capsule";
+    case HTTP_ROUTE_PCAP: return "pcap";
     default: return "?";
     }
 }
@@ -470,6 +473,7 @@ static void http_log_event(const char *event, u32 a, u32 b);
 static u32 http_build_no_content_response(char *out, u32 max);
 static u32 http_build_picoscript_response(char *out, u32 max);
 static u32 http_build_static_file_response(char *out, u32 max, const u8 *req, u32 req_len);
+static u32 http_build_pcap_response(char *out, u32 max, const u8 *req, u32 req_len);
 static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, u32 req_len);
 static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len);
 static void pios_bootctrl_mark_success(void);
@@ -1174,6 +1178,8 @@ static u32 http_route_id(const u8 *req, u32 len)
         return HTTP_ROUTE_PLACEHOLDER;
     if (http_request_path_is(req, len, "/api/capsule"))
         return HTTP_ROUTE_CAPSULE;
+    if (http_request_path_is(req, len, "/api/admin/pcap"))
+        return HTTP_ROUTE_PCAP;
     if (http_request_is_root_get(req, len))
         return HTTP_ROUTE_ROOT;
     return HTTP_ROUTE_NOT_FOUND;
@@ -7905,6 +7911,12 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
         http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
         return len;
     }
+    if (route == HTTP_ROUTE_PCAP) {
+        len = http_build_pcap_response(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
     if (http_request_path_is(req, req_len, "/api/terminal")) {
         len = http_build_terminal_response(out, max, req, req_len);
         http_diag.build_len = len;
@@ -8205,6 +8217,75 @@ static u32 http_build_static_file_response(char *out, u32 max, const u8 *req, u3
     http_append(out, &len, max, "\r\nCache-Control: max-age=3600\r\nContent-Length: ");
     http_append_u64(out, &len, max, http_file_len);
     http_append(out, &len, max, "\r\nConnection: close\r\n\r\n");
+    return len;
+}
+
+/* On-device packet capture -- see pioscap.h. No host-side capture driver
+ * required: exports a standard PCAP file that Wireshark can open directly.
+ * GET /api/admin/pcap?action=status|start|stop|clear|dump (default status). */
+static u32 http_build_pcap_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    char action[16];
+    action[0] = 0;
+    (void)http_query_value(req, req_len, "/api/admin/pcap", "action", action, sizeof(action));
+
+    if (http_streq(action, "start")) {
+        pioscap_enable(true);
+        http_append(out, &len, max,
+            "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n{\"ok\":true,\"action\":\"start\"}\n");
+        return len;
+    }
+    if (http_streq(action, "stop")) {
+        pioscap_enable(false);
+        http_append(out, &len, max,
+            "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n{\"ok\":true,\"action\":\"stop\"}\n");
+        return len;
+    }
+    if (http_streq(action, "clear")) {
+        pioscap_clear();
+        http_append(out, &len, max,
+            "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n{\"ok\":true,\"action\":\"clear\"}\n");
+        return len;
+    }
+    if (http_streq(action, "dump")) {
+        /* Ring is sized (128 * (16 + 96) + 24 = 14360B) to always fit in one
+         * response; export to a scratch buffer first so Content-Length can
+         * be computed before the headers are written. */
+        static u8 pcap_scratch[15000];
+        u32 pcap_len = pioscap_export(pcap_scratch, sizeof(pcap_scratch));
+        http_append(out, &len, max,
+            "HTTP/1.0 200 OK\r\nContent-Type: application/vnd.tcpdump.pcap\r\n"
+            "Content-Disposition: attachment; filename=\"pios_capture.pcap\"\r\n"
+            "Cache-Control: no-store\r\nContent-Length: ");
+        http_append_u64(out, &len, max, pcap_len);
+        http_append(out, &len, max, "\r\nConnection: close\r\n\r\n");
+        http_append_bytes(out, &len, max, pcap_scratch, pcap_len);
+        return len;
+    }
+
+    /* Default: status */
+    struct pioscap_status st;
+    pioscap_status(&st);
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    http_append(out, &len, max, "{\"enabled\":");
+    http_append(out, &len, max, st.enabled ? "true" : "false");
+    http_append(out, &len, max, ",\"count\":");
+    http_append_u64(out, &len, max, st.count);
+    http_append(out, &len, max, ",\"capacity\":");
+    http_append_u64(out, &len, max, st.capacity);
+    http_append(out, &len, max, ",\"dropped\":");
+    http_append_u64(out, &len, max, st.dropped);
+    http_append(out, &len, max, ",\"totalRx\":");
+    http_append_u64(out, &len, max, st.total_rx);
+    http_append(out, &len, max, ",\"totalTx\":");
+    http_append_u64(out, &len, max, st.total_tx);
+    http_append(out, &len, max, ",\"usage\":\"?action=start|stop|clear|status|dump\"}\n");
     return len;
 }
 

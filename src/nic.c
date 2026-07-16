@@ -16,6 +16,7 @@
 #include "timer.h"
 #include "core_env.h"
 #include "platform.h"
+#include "pioscap.h"
 
 static bool tx_checksum_offload;
 static bool rx_checksum_offload;
@@ -997,6 +998,7 @@ bool nic_init(void)
     simd_zero(&pkt_counts, sizeof(pkt_counts));
     simd_zero(flow_table, sizeof(flow_table));
     nic_filter_clear();
+    pioscap_init();
 
     g_nic = 0;
     for (u32 i = 0; i < sizeof(nic_backends) / sizeof(nic_backends[0]); i++) {
@@ -1037,6 +1039,7 @@ bool nic_send(const u8 *frame, u32 len)
     nic_count_packet(true, frame, len);
     if (packet_dump_enabled)
         fb_pkt_dump('T', 0x00FFFF80, frame, len);
+    pioscap_tx(frame, len);
     bool ok = (g_nic && g_nic->send) ? g_nic->send(frame, len) : false;
     if (ok) pkt_counts.processed++;
     else    pkt_counts.dropped++;
@@ -1066,6 +1069,7 @@ bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_l
     nic_count_packet(true, tx_frame, total);
     if (packet_dump_enabled)
         fb_pkt_dump('T', 0x00FFFF80, tx_frame, total);
+    pioscap_tx(tx_frame, total);
     bool ok = (g_nic && g_nic->send) ? g_nic->send(tx_frame, total) : false;
     if (ok) pkt_counts.processed++;
     else    pkt_counts.dropped++;
@@ -1117,6 +1121,7 @@ bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
 
         if (packet_dump_enabled)
             fb_pkt_dump('R', 0x0080C8FF, frame, *len);
+        pioscap_rx(frame, *len);
         pkt_counts.processed++;
         nic_render_counter_panel();
         return true;
