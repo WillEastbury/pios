@@ -9,11 +9,41 @@ volatile u32 el2_boot_el_state = 1U;
 
 static bool g_el2_active;
 static u32 g_boot_el;
-static u32 g_stage2_active_capsule = EL2_CAPSULE_MAX;
-static u64 g_stage2_fault_count;
-static u64 g_stage2_last_esr;
-static u64 g_stage2_last_elr;
-static u32 g_stage2_last_fault_capsule = EL2_CAPSULE_MAX;
+
+/* Per-core stage-2 activation/fault bookkeeping. VTTBR_EL2/HCR_EL2 are
+ * themselves banked per-PE in hardware, so each core already runs its own
+ * independent stage-2 translation -- but the fixed core-assignment table
+ * (kernel.c) runs application processes concurrently on cores 2 AND 3, and
+ * the software tracking of "which capsule is active"/fault attribution was a
+ * single global here, racing across cores exactly like the packed
+ * loops[4]/stage[4]/... arrays proc.c had to split into proc_rwake_percore
+ * (see the comment there). Each core gets its OWN 64-byte-aligned owner
+ * record so a core's activate/deactivate/fault write never shares a cache
+ * line with another core's, per the hard-invariant ban on packed per-core
+ * arrays of mutable state. */
+struct el2_stage2_core_state {
+    volatile u32 active_capsule;      /* EL2_CAPSULE_MAX == none active on this core */
+    volatile u32 fault_count;         /* lifetime stage-2 faults taken on this core */
+    volatile u64 last_esr;
+    volatile u64 last_elr;
+    volatile u32 last_fault_capsule;  /* EL2_CAPSULE_MAX == no fault recorded yet */
+    u32 _pad[9];                      /* fill out the 64-byte line */
+} ALIGNED(64);
+_Static_assert(sizeof(struct el2_stage2_core_state) == 64,
+               "el2_stage2_core_state must be exactly one cache line");
+
+#define EL2_STAGE2_CORE_INIT \
+    { .active_capsule = EL2_CAPSULE_MAX, .last_fault_capsule = EL2_CAPSULE_MAX }
+static struct el2_stage2_core_state g_stage2_core[4] ALIGNED(64) = {
+    EL2_STAGE2_CORE_INIT, EL2_STAGE2_CORE_INIT,
+    EL2_STAGE2_CORE_INIT, EL2_STAGE2_CORE_INIT
+};
+
+static inline struct el2_stage2_core_state *el2_core_state(u32 core)
+{
+    return &g_stage2_core[core & 3U];
+}
+
 static u32 g_el2_integrity_baseline;
 static bool g_boot_integrity_armed;
 static u64 g_boot_el1_text_start;
@@ -176,11 +206,13 @@ void el2_init(void)
     g_boot_el = el2_boot_el_state ? el2_boot_el_state : now;
     if (g_boot_el > 3U) g_boot_el = now;
     g_el2_active = (g_boot_el == 2U);
-    g_stage2_active_capsule = EL2_CAPSULE_MAX;
-    g_stage2_fault_count = 0;
-    g_stage2_last_esr = 0;
-    g_stage2_last_elr = 0;
-    g_stage2_last_fault_capsule = EL2_CAPSULE_MAX;
+    for (u32 i = 0; i < 4U; i++) {
+        g_stage2_core[i].active_capsule = EL2_CAPSULE_MAX;
+        g_stage2_core[i].fault_count = 0;
+        g_stage2_core[i].last_esr = 0;
+        g_stage2_core[i].last_elr = 0;
+        g_stage2_core[i].last_fault_capsule = EL2_CAPSULE_MAX;
+    }
     g_el2_integrity_baseline = el2_integrity_hash_now();
     g_boot_integrity_armed = false;
     g_boot_el1_text_start = 0;
@@ -351,24 +383,40 @@ i32 el2_hvc_dispatch(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0)
     }
     if (fid == EL2_HVC_STAGE2_ACTIVATE) {
         u32 id = (u32)x1;
+        struct el2_stage2_core_state *cs = el2_core_state(core_id());
         if (id >= EL2_CAPSULE_MAX) {
             (void)el2_stage2_deactivate_hw();
-            g_stage2_active_capsule = EL2_CAPSULE_MAX;
+            cs->active_capsule = EL2_CAPSULE_MAX;
             *ret0 = 0;
             return 0;
         }
         if (!g_stage2[id].configured || !g_stage2[id].enabled)
             return -1;
         (void)el2_stage2_program_hw(id);
-        g_stage2_active_capsule = id;
+        cs->active_capsule = id;
         *ret0 = 0;
         return 0;
     }
     if (fid == EL2_HVC_STAGE2_FAULTS) {
-        *ret0 = (g_stage2_fault_count & 0xFFFFFFFFULL) |
-                ((g_stage2_last_esr & 0xFFFFULL) << 32) |
-                ((g_stage2_active_capsule & 0xFFULL) << 48) |
-                ((g_stage2_last_fault_capsule & 0xFFULL) << 56);
+        /* System-wide aggregate view (external callers pass x1=0 and expect
+         * one packed summary, not a per-core drill-down): total fault count
+         * summed across all cores, with the ESR/active/last-fault fields
+         * taken from whichever core has accumulated the most faults (ties
+         * broken toward the lowest core id). Preserves the exact external
+         * call signature/behavior of kernel.c's existing callers while
+         * fixing the underlying per-core race. */
+        u64 total = 0;
+        u32 pick = 0;
+        for (u32 c = 1; c < 4U; c++)
+            if (g_stage2_core[c].fault_count > g_stage2_core[pick].fault_count)
+                pick = c;
+        for (u32 c = 0; c < 4U; c++)
+            total += g_stage2_core[c].fault_count;
+        struct el2_stage2_core_state *cs = &g_stage2_core[pick];
+        *ret0 = (total & 0xFFFFFFFFULL) |
+                ((cs->last_esr & 0xFFFFULL) << 32) |
+                ((cs->active_capsule & 0xFFULL) << 48) |
+                ((cs->last_fault_capsule & 0xFFULL) << 56);
         return 0;
     }
     if (fid == EL2_HVC_INTEGRITY_CHECK) {
@@ -487,16 +535,17 @@ u64 el2_hvc_trap(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4)
 
 u64 el2_sync_fault_trap(u64 esr, u64 elr)
 {
-    g_stage2_fault_count++;
-    g_stage2_last_esr = esr;
-    g_stage2_last_elr = elr;
-    g_stage2_last_fault_capsule = g_stage2_active_capsule;
-    if (g_stage2_active_capsule < EL2_CAPSULE_MAX) {
-        u32 id = g_stage2_active_capsule;
+    struct el2_stage2_core_state *cs = el2_core_state(core_id());
+    cs->fault_count++;
+    cs->last_esr = esr;
+    cs->last_elr = elr;
+    cs->last_fault_capsule = cs->active_capsule;
+    if (cs->active_capsule < EL2_CAPSULE_MAX) {
+        u32 id = cs->active_capsule;
         g_stage2[id].enabled = false;
         g_stage2[id].programmed = false;
         (void)el2_stage2_deactivate_hw();
-        g_stage2_active_capsule = EL2_CAPSULE_MAX;
+        cs->active_capsule = EL2_CAPSULE_MAX;
     }
     return ~0ULL;
 }
