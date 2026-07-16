@@ -1147,10 +1147,22 @@ static bool capsule_manifest_load(struct process *p, const char *path)
         copy_trim(key, sizeof(key), line, pios_strlen(line));
         copy_trim(val, sizeof(val), eq + 1, pios_strlen(eq + 1));
         if (str_eq(key, "capsule")) {
-            if (!(str_eq(val, "on") || str_eq(val, "true") || str_eq(val, "1") ||
-                  str_eq(val, "off") || str_eq(val, "false") || str_eq(val, "0")))
+            /* Stage-2 hardware isolation is mandatory for path-loaded
+             * processes and defaults on (capsule_manifest_defaults()). A
+             * manifest living at <path>.cap is authored by whoever placed
+             * <path> itself -- an ordinary, untrusted binary -- so honoring
+             * a self-declared "capsule=off" would let any process opt itself
+             * out of isolation with no privilege check. Accept the
+             * redundant on/true/1 confirmation; treat an attempt to disable
+             * isolation as a malformed manifest and fail closed instead of
+             * silently granting the escape. */
+            if (str_eq(val, "on") || str_eq(val, "true") || str_eq(val, "1")) {
+                p->capsule_enabled = true;
+            } else if (str_eq(val, "off") || str_eq(val, "false") || str_eq(val, "0")) {
                 return false;
-            p->capsule_enabled = str_eq(val, "on") || str_eq(val, "true") || str_eq(val, "1");
+            } else {
+                return false;
+            }
         } else if (str_eq(key, "spawn")) {
             if (!(str_eq(val, "allow") || str_eq(val, "true") || str_eq(val, "1") ||
                   str_eq(val, "deny") || str_eq(val, "false") || str_eq(val, "0")))
