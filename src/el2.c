@@ -27,8 +27,10 @@ struct el2_stage2_core_state {
     volatile u32 fault_count;         /* lifetime stage-2 faults taken on this core */
     volatile u64 last_esr;
     volatile u64 last_elr;
+    volatile u64 last_far_ipa;        /* HPFAR_EL2: faulting IPA (stage-2 abort) */
+    volatile u64 last_sp_el1;         /* faulting context's stack pointer */
     volatile u32 last_fault_capsule;  /* EL2_CAPSULE_MAX == no fault recorded yet */
-    u32 _pad[9];                      /* fill out the 64-byte line */
+    u32 _pad[5];                      /* fill out the 64-byte line */
 } ALIGNED(64);
 _Static_assert(sizeof(struct el2_stage2_core_state) == 64,
                "el2_stage2_core_state must be exactly one cache line");
@@ -227,6 +229,8 @@ void el2_init(void)
         g_stage2_core[i].fault_count = 0;
         g_stage2_core[i].last_esr = 0;
         g_stage2_core[i].last_elr = 0;
+        g_stage2_core[i].last_far_ipa = 0;
+        g_stage2_core[i].last_sp_el1 = 0;
         g_stage2_core[i].last_fault_capsule = EL2_CAPSULE_MAX;
     }
     g_el2_integrity_baseline = el2_integrity_hash_now();
@@ -584,10 +588,22 @@ u64 el2_hvc_trap(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4)
 
 u64 el2_sync_fault_trap(u64 esr, u64 elr)
 {
+    /* Still executing at EL2 here (this is the EL2 sync-exception handler's
+     * C callee, not a dropped-to-EL1 context), so HPFAR_EL2 (faulting IPA
+     * for a stage-2 abort) and SP_EL1 (the faulting context's stack
+     * pointer) are readable directly -- no vectors.S plumbing needed.
+     * Captures the fuller trap context the hard invariant asks for (core,
+     * capsule, syndrome, PC, SP, faulting address) beyond just esr/elr. */
+    u64 hpfar = 0, sp_el1 = 0;
+    __asm__ volatile("mrs %0, hpfar_el2" : "=r"(hpfar));
+    __asm__ volatile("mrs %0, sp_el1" : "=r"(sp_el1));
+
     struct el2_stage2_core_state *cs = el2_core_state(core_id());
     cs->fault_count++;
     cs->last_esr = esr;
     cs->last_elr = elr;
+    cs->last_far_ipa = hpfar;
+    cs->last_sp_el1 = sp_el1;
     cs->last_fault_capsule = cs->active_capsule;
     if (cs->active_capsule < EL2_CAPSULE_MAX) {
         u32 id = cs->active_capsule;
@@ -597,6 +613,29 @@ u64 el2_sync_fault_trap(u64 esr, u64 elr)
         cs->active_capsule = EL2_CAPSULE_MAX;
     }
     return ~0ULL;
+}
+
+/* Direct (non-HVC) diagnostic accessor for the fuller per-core fault
+ * context above -- this is plain kernel memory (both EL1 and EL2 share the
+ * same .data/.bss in this single-binary kernel), so unlike el2_stage2_
+ * activate/enable (which must reach real EL2 system registers), reading it
+ * needs no hypercall, matching the existing el2_stage2_status()/
+ * el2_capsule_get() plain-accessor pattern. */
+bool el2_stage2_fault_detail(u32 core, u32 *fault_count, u64 *esr, u64 *elr,
+                              u64 *far_ipa, u64 *sp_el1, u32 *active_capsule,
+                              u32 *last_fault_capsule)
+{
+    if (core >= 4U)
+        return false;
+    struct el2_stage2_core_state *cs = el2_core_state(core);
+    if (fault_count) *fault_count = cs->fault_count;
+    if (esr) *esr = cs->last_esr;
+    if (elr) *elr = cs->last_elr;
+    if (far_ipa) *far_ipa = cs->last_far_ipa;
+    if (sp_el1) *sp_el1 = cs->last_sp_el1;
+    if (active_capsule) *active_capsule = cs->active_capsule;
+    if (last_fault_capsule) *last_fault_capsule = cs->last_fault_capsule;
+    return true;
 }
 
 i32 el2_hvc_call(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0)

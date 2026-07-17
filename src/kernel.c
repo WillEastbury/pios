@@ -15030,6 +15030,18 @@ static void ui_cmd_capsule(u32 argc, char **argv)
         }
         (void)el2_hvc_call(EL2_HVC_STAGE2_FAULTS, 0, 0, 0, 0, &faults);
         fb_printf("capsule=%u st=0x%x faults=0x%x\n", id, st, faults);
+        {
+            u32 fc = 0, active = 0, last_cap = 0;
+            u64 esr = 0, elr = 0, far_ipa = 0, sp_el1 = 0;
+            u32 core = core_id();
+            if (el2_stage2_fault_detail(core, &fc, &esr, &elr, &far_ipa, &sp_el1,
+                                        &active, &last_cap)) {
+                fb_printf("core=%u active=%u last_fault_cap=%u count=%u\n",
+                          core, active, last_cap, fc);
+                fb_printf("esr=0x%x elr=0x%x far_ipa=0x%x sp_el1=0x%x\n",
+                          esr, elr, far_ipa, sp_el1);
+            }
+        }
         return;
     }
     if (ui_streq(argv[1], "check")) {

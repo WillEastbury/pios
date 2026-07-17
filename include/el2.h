@@ -68,6 +68,13 @@ i32 el2_hvc_call(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0);
 u64 el2_hvc_trap(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4);
 u64 el2_sync_fault_trap(u64 esr, u64 elr);
 
+/* Direct (non-HVC) accessor for the fuller per-core stage-2 fault context
+ * (core, syndrome, PC, SP, faulting IPA, capsule) captured by
+ * el2_sync_fault_trap. Returns false if core >= 4. */
+bool el2_stage2_fault_detail(u32 core, u32 *fault_count, u64 *esr, u64 *elr,
+                              u64 *far_ipa, u64 *sp_el1, u32 *active_capsule,
+                              u32 *last_fault_capsule);
+
 /* QEMU-safe pure-logic selftest: per-core activation state, fail-closed IPA
  * bounds, and cross-capsule PA overlap rejection. See kernel.c selftest
  * battery. */
