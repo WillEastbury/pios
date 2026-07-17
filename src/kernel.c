@@ -72,6 +72,7 @@
 #include "el2.h"
 #include "crypto.h"
 #include "watchdog.h"
+#include "stackprot.h"
 #include "fat32.h"
 #include "pios_addr.h"
 #include "picoscript.h"
@@ -19227,6 +19228,10 @@ static bool provision_write_payload_to_slot(void)
 #endif
 
 void kernel_main(void) {
+    /* Seed the stack-protector canary as early as possible, before any
+     * deeper subsystem init runs (see stackprot.h). */
+    stackprot_init();
+
     bool usb_ok = false;
     bool fb_ok = PIOS_HAS_BOOTINFO_FB ? false : true;  /* Pi FB is early; QEMU GOP is deferred. */
     bool sd_ok = false;
