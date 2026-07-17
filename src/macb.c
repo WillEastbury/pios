@@ -21,6 +21,8 @@
 #include "pcie.h"
 #include "simd.h"
 #include "core_env.h"   /* DMA_NET_BASE / DMA_NET_SIZE: dedicated NC DMA arena */
+#include "dtrace.h"
+#include "pioscap.h"
 
 /* PHY reset is on RP1 GPIO 32, funcsel 5, active LOW */
 #define PHY_RESET_GPIO  32
@@ -856,6 +858,8 @@ static void macb_tx_recover_silent(void)
     __asm__ volatile("dsb sy" ::: "memory");
     (void)mr(NCR);
     tx_recover_count++;
+    DTRACE(DTRACE_CAT_MAC, DT_MAC_TXRECOVER, tx_recover_count, tsr, tx_send_count, tx_drop_count);
+    pioscap_notify_event("tx-recover");
 }
 
 bool macb_send(const u8 *frame, u32 len) {
@@ -1085,6 +1089,12 @@ bool macb_rx_recover(void) {
 
     macb_rx_ring_rebuild();
     rx_recover_count++;
+    /* Dump enough context to reconstruct what the recovery saw without
+     * needing a live poll to race the event: which overrun bit(s) latched,
+     * the lifetime recovery count, and where RX/TX were in the ring at the
+     * moment of detection. */
+    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXRECOVER, rx_recover_count, rsr, rx_idx, tx_idx);
+    pioscap_notify_event("rx-overrun-recover");
     return true;
 }
 
@@ -1206,6 +1216,8 @@ bool macb_rx_liveness_recover(u64 now_ms) {
     rx_wedge_count++;
     macb_rx_ring_rebuild();
     rx_live_recover_count++;
+    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXLIVERECOVER, rx_wedge_count, idle_ms, rx_live_streak, tx_send_count);
+    pioscap_notify_event("rx-liveness-wedge");
     rx_live_streak++;
     rx_live_last_rx_ms = now_ms;
     return true;

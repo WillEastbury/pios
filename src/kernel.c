@@ -8252,15 +8252,34 @@ static u32 http_build_pcap_response(char *out, u32 max, const u8 *req, u32 req_l
         return len;
     }
     if (http_streq(action, "dump")) {
-        /* Ring is sized (128 * (16 + 96) + 24 = 14360B) to always fit in one
-         * response; export to a scratch buffer first so Content-Length can
-         * be computed before the headers are written. */
-        static u8 pcap_scratch[15000];
-        u32 pcap_len = pioscap_export(pcap_scratch, sizeof(pcap_scratch));
+        /* Paginated: the ring (4096 entries) is far bigger than one HTTP
+         * response can hold. ?start=N selects the page starting at logical
+         * entry N (oldest-first); only start=0 carries the 24-byte PCAP
+         * global header. Response headers X-Pcap-Written/X-Pcap-Total tell
+         * the caller how many entries this page held and how many exist in
+         * total, so a client can loop start += written until start >= total
+         * and concatenate the raw bytes into one .pcap file. */
+        u32 start_index = 0;
+        {
+            char start_str[16];
+            if (http_query_value(req, req_len, "/api/admin/pcap", "start", start_str, sizeof(start_str)))
+                (void)http_parse_u32(start_str, &start_index);
+        }
+        static u8 pcap_scratch[15800];
+        u32 written_count = 0, total_count = 0;
+        u32 pcap_len = pioscap_export_paged(pcap_scratch, sizeof(pcap_scratch),
+                                            start_index, PIOSCAP_PAGE_MAX,
+                                            &written_count, &total_count);
         http_append(out, &len, max,
             "HTTP/1.0 200 OK\r\nContent-Type: application/vnd.tcpdump.pcap\r\n"
             "Content-Disposition: attachment; filename=\"pios_capture.pcap\"\r\n"
-            "Cache-Control: no-store\r\nContent-Length: ");
+            "Cache-Control: no-store\r\nX-Pcap-Start: ");
+        http_append_u64(out, &len, max, start_index);
+        http_append(out, &len, max, "\r\nX-Pcap-Written: ");
+        http_append_u64(out, &len, max, written_count);
+        http_append(out, &len, max, "\r\nX-Pcap-Total: ");
+        http_append_u64(out, &len, max, total_count);
+        http_append(out, &len, max, "\r\nContent-Length: ");
         http_append_u64(out, &len, max, pcap_len);
         http_append(out, &len, max, "\r\nConnection: close\r\n\r\n");
         http_append_bytes(out, &len, max, pcap_scratch, pcap_len);
@@ -8275,6 +8294,12 @@ static u32 http_build_pcap_response(char *out, u32 max, const u8 *req, u32 req_l
         "Connection: close\r\n\r\n");
     http_append(out, &len, max, "{\"enabled\":");
     http_append(out, &len, max, st.enabled ? "true" : "false");
+    http_append(out, &len, max, ",\"frozen\":");
+    http_append(out, &len, max, st.frozen ? "true" : "false");
+    http_append(out, &len, max, ",\"freezeReason\":");
+    http_append_json_string(out, &len, max, st.freeze_reason ? st.freeze_reason : "");
+    http_append(out, &len, max, ",\"freezeTsMs\":");
+    http_append_u64(out, &len, max, st.freeze_ts_ms);
     http_append(out, &len, max, ",\"count\":");
     http_append_u64(out, &len, max, st.count);
     http_append(out, &len, max, ",\"capacity\":");
@@ -8285,7 +8310,8 @@ static u32 http_build_pcap_response(char *out, u32 max, const u8 *req, u32 req_l
     http_append_u64(out, &len, max, st.total_rx);
     http_append(out, &len, max, ",\"totalTx\":");
     http_append_u64(out, &len, max, st.total_tx);
-    http_append(out, &len, max, ",\"usage\":\"?action=start|stop|clear|status|dump\"}\n");
+    http_append(out, &len, max,
+        ",\"usage\":\"?action=start|stop|clear|status|dump[&start=N]\"}\n");
     return len;
 }
 
@@ -8698,9 +8724,11 @@ static void admin_service_poll(struct admin_http_service *svc)
     if (svc->listen_conn < 0 ||
         (svc->client_conn >= 0 && now - svc->last_activity_ms > ADMIN_CLIENT_STALL_MS) ||
         (now - svc->last_ok_ms > ADMIN_SERVICE_WATCHDOG_MS && svc->completions > 0)) {
-        if (svc->stream_mode)
+        if (svc->stream_mode) {
             DTRACE(DTRACE_CAT_OTA, DT_OTA_WATCHDOG, svc->stream_received,
                    now - svc->last_activity_ms, svc->stream_total, svc->port);
+            pioscap_notify_event("ota-stall-watchdog");
+        }
         admin_service_restart(svc);
     }
 
@@ -8759,6 +8787,35 @@ static void admin_service_poll(struct admin_http_service *svc)
             if (readable == 0) {
                 net_poll();   /* ingest more inbound frames into the TCP rx ring */
                 readable = tcp_readable(svc->client_conn);
+#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+                /* Unlike the main core0 reactor (which pairs every net_poll()
+                 * with a macb_rx_recover()/macb_rx_liveness_recover() check),
+                 * this tight drain loop used to call net_poll() alone. A
+                 * genuine hardware RX overrun triggered by the sustained
+                 * burst of a bulk transfer would then sit un-recovered until
+                 * the loop exhausted its spin budget (or the connection was
+                 * abandoned) and control finally returned to the outer
+                 * reactor -- long enough that the peer's TCP stack gave up
+                 * and reset the connection. Recover inline instead, and log
+                 * enough context (drain_spins, stream progress, lifetime
+                 * recovery count) to read back on the next capture/dtrace
+                 * dump without needing to catch it live. */
+                if (readable == 0) {
+                    bool recovered = macb_rx_recover();
+                    if (!recovered)
+                        recovered = macb_rx_liveness_recover(timer_monotonic_ms());
+                    if (recovered) {
+                        struct macb_diag md_post;
+                        macb_diag(&md_post);
+                        DTRACE(DTRACE_CAT_OTA, DT_OTA_RX_RECOVER, svc->stream_received,
+                               svc->stream_total, drain_spins,
+                               md_post.rx_recover + md_post.rx_live_recover);
+                        http_log_event("ota-rx-recover", svc->stream_received, drain_spins);
+                        net_poll();
+                        readable = tcp_readable(svc->client_conn);
+                    }
+                }
+#endif
                 if (readable == 0)
                     break;    /* genuinely nothing available right now */
             }

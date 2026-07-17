@@ -48,6 +48,7 @@
 #define DT_MAC_TXRECLAIM    3
 #define DT_MAC_RXRECOVER    4
 #define DT_MAC_TXRECOVER    5
+#define DT_MAC_RXLIVERECOVER 6  /* a0=rx_wedge_count a1=idle_ms a2=streak a3=tx_send_count */
 /* FIFO */
 #define DT_FIFO_PUSH        1   /* a0=(src<<8|dst) a1=type a2=seq */
 #define DT_FIFO_POP         2   /* a0=(dst<<8|src) a1=type a2=seq */
@@ -67,6 +68,8 @@
 #define DT_OTA_RESET        6   /* a0=received */
 #define DT_OTA_WADV         7   /* window re-adv sent; a0=received a1=total a2=wnd_free a3=wadv_count */
 #define DT_OTA_REACTOR_GAP  8   /* gap since last drain pass; a0=gap_ticks a1=received a2=total */
+#define DT_OTA_RX_RECOVER   9   /* recovery fired inside the tight drain loop;
+                                   a0=received a1=total a2=drain_spins a3=rx_recover_count */
 /* REACTOR (core 0 service loop) */
 #define DT_RX_PHASE_NET     1   /* a0=dur_ticks */
 #define DT_RX_PHASE_TCP     2   /* a0=dur_ticks */
