@@ -87,10 +87,16 @@ u64 shared_tcr;
     (2UL  << 32)      \
 )
 
-/* Helper: create a 1GB L1 block entry for normal cacheable RAM */
+/* Helper: create a 1GB L1 block entry for normal cacheable RAM.
+ * PXN|UXN: the kernel never executes instructions through this coarse
+ * block-level mapping (kernel .text lives only in the fine-grained block-0
+ * code window built by kimg_page_attrs()); everywhere else covered by this
+ * helper is process-slot storage, scratch RAM, or framebuffer memory that
+ * the kernel only ever reads/writes, never fetches instructions from under
+ * its own TTBR. Real W^X: never both writable and executable. */
 static inline u64 ram_block_1g(u64 addr) {
     return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
 }
 
 /* Helper: create a 1GB L1 block entry for device MMIO */
@@ -100,18 +106,22 @@ static inline u64 dev_block_1g(u64 addr) {
            PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
 }
 
-/* Helper: create a 2MB L2 block entry for normal cacheable RAM */
+/* Helper: create a 2MB L2 block entry for normal cacheable RAM (see
+ * ram_block_1g comment: PXN|UXN because the kernel never executes through
+ * this coarse mapping). */
 static inline u64 ram_block_2m(u64 addr) {
     return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
 }
 
 /* Helper: create a 2MB L2 block entry for Normal Non-Cacheable RAM.
  * Bit pattern (addr | 0x705) is identical to the NC block start.S installs
- * at l1_table[0], so NC regions keep their exact current attributes. */
+ * at l1_table[0], so NC regions keep their exact current attributes (the
+ * added PXN|UXN bits sit above bit 52 and don't disturb that low-bit
+ * invariant). */
 static inline u64 ram_block_2m_nc(u64 addr) {
     return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
 }
 
 /* Helper: create a 2MB L2 block entry for device MMIO */
@@ -119,6 +129,29 @@ static inline u64 dev_block_2m(u64 addr) {
     return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
            PTE_ATTR(MT_DEVICE_nGnRnE) |
            PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+}
+
+/* Kernel image page attributes (4KB granule), real W^X enforcement for
+ * block 0 (0x0-0x1FFFFF): a 3-way split matching the R E / RW ELF PHDRS
+ * split already applied to the link scripts.
+ *   [code_lo, rodata_hi)  .text.boot+.text+.stage2_manifest+.rodata
+ *                          -> read-only, executable (no PXN/UXN)
+ *   [rodata_hi, bss_lo)   .data (writable initialised globals)
+ *                          -> read-write, execute-never (PXN|UXN)
+ *   everything else       low RAM below the image + .bss head in block 0
+ *                          -> read-write, execute-never (PXN|UXN)
+ * No page is ever both writable and executable. Cacheability is unchanged
+ * from before (WB only inside [code_lo, bss_lo), NC elsewhere) so this is
+ * a pure permission tightening, not a behavior change to caching. */
+static inline u64 kimg_page_attrs(u64 page, u64 code_lo, u64 rodata_hi, u64 bss_lo)
+{
+    u64 memattr = (page >= code_lo && page < bss_lo)
+                      ? PTE_ATTR(MT_NORMAL) : PTE_ATTR(MT_NORMAL_NC);
+    if (page >= code_lo && page < rodata_hi)
+        return page | PTE_VALID | PTE_PAGE | PTE_AF | PTE_SH_INNER |
+               memattr | PTE_AP_RO_EL1;
+    return page | PTE_VALID | PTE_PAGE | PTE_AF | PTE_SH_INNER |
+           memattr | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
 }
 
 static void map_user_device_windows(u64 *l1)
@@ -159,7 +192,18 @@ static inline u64 user_ram_nc_attrs(void)
 
 static void map_user_kernel_low(u64 *l2)
 {
-    for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++) {
+    /* CORE0_RAM_BASE/L2_BLOCK_SIZE is 4 on real Pi5 hardware (CORE0_RAM_BASE=
+     * 0x800000) but 528 on QEMU_VIRT (CORE0_RAM_BASE=0x42000000) -- both
+     * l2_table_low[] and the per-slot l2 table passed in are fixed 512-entry
+     * arrays, so the unclamped loop read/wrote 16 entries past both arrays
+     * on QEMU_VIRT (confirmed: GCC -O2 flags "iteration 512 invokes undefined
+     * behavior"). Clamp to the actual table size; entries above 512 are the
+     * per-core private RAM window and beyond, which mmu_user_slot_pages()
+     * maps separately anyway. */
+    u32 count = (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE);
+    if (count > 512U)
+        count = 512U;
+    for (u32 b = 0; b < count; b++) {
         u64 pa = (u64)b * L2_BLOCK_SIZE;
         /* Mirror the live kernel low-RAM attributes EXACTLY by copying
          * l2_table_low. After cache enable, l2_table_low[0] points at the
@@ -320,18 +364,17 @@ void mmu_init(void) {
      * shared FIFO/DMA/IPC NC, framebuffer back buffer WB. */
     volatile u64 *l2 = l2_table_low;
     extern char __text_start[];
+    extern char __rodata_end[];
     extern char __bss_start[];
-    const u64 code_lo = (u64)(usize)__text_start & ~(L3_PAGE_SIZE - 1);
-    const u64 code_hi = (u64)(usize)__bss_start  & ~(L3_PAGE_SIZE - 1);
+    const u64 code_lo    = (u64)(usize)__text_start  & ~(L3_PAGE_SIZE - 1);
+    const u64 rodata_hi  = (u64)(usize)__rodata_end & ~(L3_PAGE_SIZE - 1);
+    const u64 code_hi    = (u64)(usize)__bss_start   & ~(L3_PAGE_SIZE - 1);
     for (u32 i = 0; i < 512; i++) {
         u64 addr = (u64)i * L2_BLOCK_SIZE;
         if (i == 0) {
             for (u32 p = 0; p < 512; p++) {
                 u64 page = (u64)p * L3_PAGE_SIZE;
-                u64 attr = (page >= code_lo && page < code_hi)
-                               ? PTE_ATTR(MT_NORMAL) : PTE_ATTR(MT_NORMAL_NC);
-                l3_block0[p] = page | PTE_VALID | PTE_PAGE | PTE_AF |
-                               PTE_SH_INNER | attr | PTE_AP_RW_EL1;
+                l3_block0[p] = kimg_page_attrs(page, code_lo, rodata_hi, code_hi);
             }
             l2[i] = (u64)(usize)l3_block0 | PTE_VALID | PTE_TABLE;
             continue;
@@ -449,17 +492,24 @@ void mmu_enable_caching(void) {
      * .bss (MACB rings/bufs, etc.) coherent with its DMA master: with the caches
      * now actually allocating (WB-from-boot fix), mapping that .bss WB caused the
      * NIC to wedge under load. The dedicated per-core DMA arena (follow-up) will
-     * let us reclaim .bss WB while keeping DMA memory NC. */
+     * let us reclaim .bss WB while keeping DMA memory NC.
+     *
+     * Real W^X on top of that same cacheability split (kimg_page_attrs, see its
+     * comment above): [__text_start, __rodata_end) is read-only + executable;
+     * [__rodata_end, __bss_start) (.data) and everything else in block 0 is
+     * read-write + execute-never. rodata_hi rounds DOWN like code_hi/code_lo --
+     * a page straddling the rodata/data boundary must come out writable, not
+     * read-only, or the first write to an early .data global page-sharing with
+     * the .rodata tail would fault. */
     extern char __text_start[];
+    extern char __rodata_end[];
     extern char __bss_start[];
-    const u64 code_lo = (u64)(usize)__text_start & ~(L3_PAGE_SIZE - 1);
-    const u64 code_hi = (u64)(usize)__bss_start  & ~(L3_PAGE_SIZE - 1);
+    const u64 code_lo   = (u64)(usize)__text_start  & ~(L3_PAGE_SIZE - 1);
+    const u64 rodata_hi = (u64)(usize)__rodata_end  & ~(L3_PAGE_SIZE - 1);
+    const u64 code_hi   = (u64)(usize)__bss_start   & ~(L3_PAGE_SIZE - 1);
     for (u32 i = 0; i < 512; i++) {
         u64 addr = (u64)i * L3_PAGE_SIZE;
-        u64 attr = (addr >= code_lo && addr < code_hi)
-                       ? PTE_ATTR(MT_NORMAL) : PTE_ATTR(MT_NORMAL_NC);
-        l3_block0[i] = addr | PTE_VALID | PTE_PAGE | PTE_AF |
-                       PTE_SH_INNER | attr | PTE_AP_RW_EL1;
+        l3_block0[i] = kimg_page_attrs(addr, code_lo, rodata_hi, code_hi);
     }
 
     for (u32 i = 0; i < 512; i++) {

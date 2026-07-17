@@ -7,6 +7,7 @@ SECTIONS {
   .text      : { *(.text*) } :text
   __text_end = .;
   .rodata    : { *(.rodata*) } :text
+  __rodata_end = .;
   .data      : { *(.data*) } :data
   . = ALIGN(16);
   .bss (NOLOAD) : { __bss_start = .; *(.bss*) *(COMMON) __bss_end = .; } :data

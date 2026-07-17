@@ -21,6 +21,7 @@ SECTIONS
         __stage2_manifest_end = .;
     } :text
     .rodata    : { *(.rodata*) } :text
+    __rodata_end = .;
     .data      : { *(.data*) } :data
 
     . = ALIGN(16);

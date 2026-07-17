@@ -12,6 +12,7 @@ SECTIONS
 
     .text.boot : { KEEP(*(.text.boot)) *(.text .text.* .gnu.linkonce.t*) } :text
     .rodata    : { *(.rodata .rodata.* .gnu.linkonce.r*) } :text
+    __rodata_end = .;
     PROVIDE(_data = .);
     .data      : { *(.data .data.* .gnu.linkonce.d*) } :data
     .bss (NOLOAD) : {

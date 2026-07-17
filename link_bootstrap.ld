@@ -13,6 +13,7 @@ SECTIONS
     .text.boot : { *(.text.boot) } :text
     .text      : { *(.text*) } :text
     .rodata    : { *(.rodata*) } :text
+    __rodata_end = .;
     .data      : { *(.data*) } :data
 
     . = ALIGN(16);

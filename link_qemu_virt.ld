@@ -19,6 +19,7 @@ SECTIONS
         KEEP(*(.stage2_manifest))
     } :text
     .rodata : { *(.rodata*) } :text
+    __rodata_end = .;
     .data : { *(.data*) } :data
     .bss (NOLOAD) : {
         . = ALIGN(8);
