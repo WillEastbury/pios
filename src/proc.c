@@ -1678,14 +1678,88 @@ static u8 *slot_base(u32 slot)
     return core_ram_base() + PROC_SLOT_OFFSET + (u64)slot * PROC_SLOT_SIZE;
 }
 
+/* Guards the scan-and-claim in find_empty_slot(): cores 2/3 (per the fixed
+ * core-assignment table) can both call proc_load_and_exec/proc_exec_from_mem
+ * concurrently, and procs[] is a single array shared across cores (not
+ * per-core) -- an unlocked scan let two cores both see the same index as
+ * PROC_EMPTY and both proceed to use it. This is the one shared mutable
+ * global in this file that genuinely needs a lock rather than message
+ * passing: process-slot allocation is rare (process creation, not the
+ * scheduler hot path) and needs a strict single-claimant guarantee that a
+ * FIFO round-trip can't cheaply give here. */
+static volatile u8 g_slot_alloc_lock;
+
 static i32 find_empty_slot(void)
 {
+    /* Per-core xorshift64* PRNG, lazily seeded once from the ARM generic
+     * timer counter. Not cryptographic -- just enough entropy that which
+     * of the MAX_PROCS_PER_CORE empty slots (and therefore which fixed
+     * load address, slot_base()) a new process lands in isn't perfectly
+     * predictable process-to-process the way always picking the lowest
+     * empty index was. A full ASLR redesign (randomizing the kernel image
+     * load address or the fixed per-core memory map itself) would be a
+     * much larger, riskier change given how much of core_env.h/mmu.c
+     * depends on those addresses being fixed -- this is the well-scoped,
+     * low-risk piece of it. */
+    static u64 prng_state[4];
+    u32 c = core_id() & 3U;
+
+    /* First check (unlocked, optimistic): skip the lock entirely on the
+     * common "definitely full" case without contending on it. */
+    bool maybe_free = false;
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
-        if (procs[i].state == PROC_EMPTY)
-            return (i32)i;
+        if (procs[i].state == PROC_EMPTY) { maybe_free = true; break; }
     }
-    return -1;
+    if (!maybe_free)
+        return -1;
+
+    /* Acquire: simple test-and-set spinlock. Process creation is rare and
+     * bounded (MAX_PROCS_PER_CORE slots), so a spin here is bounded too --
+     * this is not the scheduler hot path the "no locks in scheduler"
+     * invariant is about. */
+    while (__atomic_test_and_set(&g_slot_alloc_lock, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("yield");
+    }
+
+    /* Second check (locked, authoritative): re-scan under the lock -- the
+     * unlocked peek above could be stale by now -- and claim the chosen
+     * slot (PROC_EMPTY -> PROC_CLAIMED) before releasing, so no other core
+     * can observe it as still-empty. */
+    u32 empty[MAX_PROCS_PER_CORE];
+    u32 n = 0;
+    for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++)
+        if (procs[i].state == PROC_EMPTY)
+            empty[n++] = i;
+
+    if (n == 0) {
+        __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+        return -1; /* raced away between the two checks */
+    }
+
+    u32 pick;
+    if (n == 1) {
+        pick = 0;
+    } else {
+        if (prng_state[c] == 0) {
+            u64 t = read_cntvct();
+            prng_state[c] = t ^ ((u64)c << 32) ^ 0x9E3779B97F4A7C15ULL;
+            if (prng_state[c] == 0)
+                prng_state[c] = 0xA5A5A5A5A5A5A5A5ULL;
+        }
+        u64 x = prng_state[c];
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        prng_state[c] = x;
+        pick = (u32)(x % n);
+    }
+
+    i32 chosen = (i32)empty[pick];
+    procs[chosen].state = PROC_CLAIMED;
+    __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+    return chosen;
 }
+
 
 /* Trampoline: x19=&kernel_api_tab, x20=entry. First schedule lands here via LR. */
 static NORETURN void proc_trampoline(void)
@@ -1883,17 +1957,20 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
         uart_puts("[proc] file not found: ");
         uart_puts(path);
         uart_putc('\n');
+        proc_mark_empty((u32)slot);
         return -1;
     }
 
     struct walfs_inode info;
     if (!walfs_stat(inode, &info)) {
         uart_puts("[proc] stat failed\n");
+        proc_mark_empty((u32)slot);
         return -1;
     }
 
     if (info.size == 0 || info.size > PROC_SLOT_SIZE - 64) {
         uart_puts("[proc] invalid binary size\n");
+        proc_mark_empty((u32)slot);
         return -1;
     }
 
@@ -1902,6 +1979,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     u32 loaded = walfs_read(inode, 0, base, (u32)info.size);
     if (loaded != (u32)info.size) {
         uart_puts("[proc] load incomplete\n");
+        proc_mark_empty((u32)slot);
         return -1;
     }
     u32 exec_hash = hw_crc32c(base, loaded);
@@ -2034,6 +2112,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
      * match (would mean absolute relocations land at the wrong address). */
     if ((u64)(usize)base != PROC_EMBED_BASE) {
         uart_puts("[proc] mem-exec: slot base mismatch\n");
+        proc_mark_empty((u32)slot);
         return -1;
     }
     dma_zero(5, base, PROC_SLOT_SIZE);
