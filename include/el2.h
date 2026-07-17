@@ -1,7 +1,18 @@
 #pragma once
 #include "types.h"
 
-#define EL2_CAPSULE_MAX 8U
+/* Total concurrent process capacity is MAX_PROCS_PER_CORE(6) * 4 cores = 24
+ * (proc.h), so with mandatory-by-default stage-2 isolation (proc.c
+ * capsule_manifest_load), the old EL2_CAPSULE_MAX=8 was a hard ceiling
+ * BELOW the process capacity: the 9th concurrently-running process would
+ * always fail el2_capsule_bind_slot and fail process creation closed, even
+ * though a process slot was free. Raised to 32 (headroom above 24) -- the
+ * dominant per-capsule cost is g_stage2_root[]+g_stage2_l2[] at 8KB each
+ * (el2.c), so 32*8KB=256KB total, trivial next to actual RAM. Packed
+ * diagnostic fields (active_capsule/last_fault_capsule in the
+ * EL2_HVC_STAGE2_FAULTS return value, el2.c) mask to 8 bits (max 255), so
+ * this must stay under 255 as long as that packed format is unchanged. */
+#define EL2_CAPSULE_MAX 32U
 
 /* Hypercall IDs reserved for PIKEE capsule host services. */
 #define EL2_HVC_GET_EL            0x1000U
