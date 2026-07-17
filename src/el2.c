@@ -397,10 +397,25 @@ i32 el2_capsule_bind_slot(u32 owner_principal, u32 manifest_hash, u64 el0_slot_b
         __asm__ volatile("yield");
     }
 
+    /* Match on el0_slot_base too, not just owner_principal/manifest_hash
+     * (rubber-duck review finding #3): with ASLR randomizing which process
+     * slot a re-executed binary lands in (proc.c find_empty_slot()), the
+     * same principal+hash can legitimately occupy a DIFFERENT physical
+     * slot on a later run. Reusing a stale capsule entry keyed only on
+     * principal+hash would isolate/activate stage-2 protection for the
+     * OLD slot's PA range while the new process actually runs out of a
+     * different slot -- silently wrong isolation, not just a missed
+     * optimization. Requiring the slot base to also match means a
+     * genuine re-launch into the same slot (e.g. after el2_capsule_release()
+     * below has NOT yet run, or the same principal fast-relaunches into
+     * the slot it just vacated) still cheaply reuses the entry, while a
+     * relaunch into a different slot correctly falls through to
+     * registering a fresh capsule below. */
     for (u32 i = 0; i < EL2_CAPSULE_MAX; i++) {
         if (!g_capsules[i].used) continue;
         if (g_capsules[i].owner_principal == owner_principal &&
-            g_capsules[i].manifest_hash == manifest_hash) {
+            g_capsules[i].manifest_hash == manifest_hash &&
+            g_capsules[i].el0_slot_base == el0_slot_base) {
             *id_out = i;
             __atomic_clear(&g_capsule_bind_lock, __ATOMIC_RELEASE);
             return 0;
@@ -428,6 +443,60 @@ i32 el2_capsule_bind_slot(u32 owner_principal, u32 manifest_hash, u64 el0_slot_b
     }
     __atomic_clear(&g_capsule_bind_lock, __ATOMIC_RELEASE);
     return -1;
+}
+
+/* Release a capsule descriptor and its stage-2 plan so both the
+ * EL2_CAPSULE_MAX descriptor slot and the underlying PA range become
+ * available for reuse (rubber-duck review finding #3, part 2 of 2: no
+ * unregister/release path existed at all, so every el2_capsule_bind_slot()
+ * "register new" branch permanently consumed a descriptor slot, and
+ * el2_stage2_plan_set()'s cross-capsule PA overlap check treated every
+ * dead process's old PA range as still reserved forever -- meaning a
+ * process relaunched into a physical slot a prior (now-dead) process once
+ * occupied would spuriously fail to bind a capsule, since the overlap
+ * check would see the identical PA range as already "configured" by the
+ * stale, never-released entry. Called from proc.c's scheduler reaper when
+ * a process with a real capsule_id dies, before its physical slot is
+ * marked empty and becomes eligible for reuse. Idempotent / safe to call
+ * on an id that's already unused. The process that owned this capsule is
+ * by construction not currently running (it's being reaped as DEAD), and
+ * every proc.c desched/exit path already deactivates stage-2 hardware
+ * programming before a process stops running, so this is never expected
+ * to release the hardware-active capsule out from under a live context --
+ * but el2_stage2_deactivate_hw() is still called defensively if this
+ * capsule happens to be the active one on the calling core. */
+void el2_capsule_release(u32 id)
+{
+    if (id >= EL2_CAPSULE_MAX)
+        return;
+
+    while (__atomic_test_and_set(&g_capsule_bind_lock, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("yield");
+    }
+
+    struct el2_stage2_core_state *cs = el2_core_state(core_id());
+    if (cs->active_capsule == id) {
+        (void)el2_stage2_deactivate_hw();
+        cs->active_capsule = EL2_CAPSULE_MAX;
+    }
+
+    g_stage2[id].configured = false;
+    g_stage2[id].enabled = false;
+    g_stage2[id].programmed = false;
+    g_stage2[id].vmid = 0;
+    g_stage2[id].ipa_base = 0;
+    g_stage2[id].ipa_size = 0;
+    g_stage2[id].pa_base = 0;
+    g_stage2[id].flags = 0;
+
+    g_capsules[id].used = false;
+    g_capsules[id].owner_principal = 0;
+    g_capsules[id].manifest_hash = 0;
+    g_capsules[id].el1_entry = 0;
+    g_capsules[id].el0_slot_base = 0;
+    g_capsules[id].el0_slot_size = 0;
+
+    __atomic_clear(&g_capsule_bind_lock, __ATOMIC_RELEASE);
 }
 
 i32 el2_hvc_dispatch(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0)

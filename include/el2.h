@@ -70,6 +70,7 @@ bool el2_stage2_status(u32 id, struct el2_stage2_plan *out);
 i32  el2_stage2_activate(u32 id);
 i32  el2_capsule_bind_slot(u32 owner_principal, u32 manifest_hash, u64 el0_slot_base,
                            u64 el0_slot_size, u32 *id_out);
+void el2_capsule_release(u32 id);
 
 /* Minimal software dispatcher used while full HVC trap path is being wired. */
 i32 el2_hvc_dispatch(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0);

@@ -2476,6 +2476,16 @@ void proc_schedule(void)
                     u64 out = 0;
                     (void)el2_hvc_call(EL2_HVC_PORT_UNBIND_ALL, procs[i].pid, 0, 0, 0, &out);
                 }
+                /* Release the capsule descriptor/stage-2 plan (if any) before
+                 * freeing the slot, so a future process reusing this exact
+                 * physical slot doesn't spuriously fail el2_stage2_plan_set()'s
+                 * cross-capsule PA overlap check against this now-dead
+                 * process's stale, otherwise-never-released entry (rubber-duck
+                 * review finding #3). */
+                if (procs[i].capsule_id != PROC_CAPSULE_ID_NONE) {
+                    el2_capsule_release(procs[i].capsule_id);
+                    procs[i].capsule_id = PROC_CAPSULE_ID_NONE;
+                }
                 proc_mark_empty(i);
             }
         }
