@@ -73,6 +73,7 @@
 #include "crypto.h"
 #include "watchdog.h"
 #include "stackprot.h"
+#include "stack_canary.h"
 #include "fat32.h"
 #include "pios_addr.h"
 #include "picoscript.h"
@@ -19353,6 +19354,8 @@ void kernel_main(void) {
         bp_log("[wdog] watchdog_init(5s)...");
         watchdog_init(5000, false);
         bp_ok("[wdog] armed");
+
+        stack_canary_init();
 
         bp_log("[irq] unmasking IRQs...");
         __asm__ volatile("msr daifclr, #2");

@@ -4,6 +4,7 @@
 #include "mmio.h"
 #include "fb.h"
 #include "platform.h"
+#include "stack_canary.h"
 
 /* BCM2712 PM block (Linux DT watchdog@7d200000, Circle ARM_PM_BASE
  * = ARM_IO_BASE + 0x1200000). Pi 4 used PERIPH_BASE + 0x100000; using
@@ -153,6 +154,7 @@ void watchdog_poll(void)
     u64 now = timer_ticks();
     if (g_last_poll != 0 && (now - g_last_poll) < 100ULL) return;
     g_last_poll = now;
+    stack_canary_check();
     for (u32 c = 0; c < NUM_CORES; c++) {
         if ((now - g_wdog.last_touch[c]) > (u64)g_wdog.timeout_ticks)
             watchdog_trip(c, 0x40U);
