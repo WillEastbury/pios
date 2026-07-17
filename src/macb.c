@@ -1137,6 +1137,33 @@ bool macb_rx_recover(void) {
     if (!(rsr & (RSR_BNA | RSR_OVR)))
         return false;
 
+    /* Snapshot the OWN-bit pattern BEFORE macb_rx_ring_rebuild() wipes it, to
+     * distinguish a genuine sequential fill (every descriptor from rx_idx
+     * forward is owned, consistent with real traffic volume exhausting the
+     * ring) from a "hole" pattern (some descriptors in that span are NOT
+     * owned, i.e. already reclaimed, while later ones ARE owned) -- a hole
+     * would mean the ring reported "full" (BNA) while genuinely having spare
+     * capacity, pointing at a false/stale overrun signal (e.g. a stuck
+     * descriptor never getting reclaimed, or a hardware/cache-coherency
+     * confusion) rather than real traffic volume. Walk forward from rx_idx
+     * counting the contiguous owned run, then keep scanning to see if MORE
+     * owned descriptors exist beyond a gap. */
+    dcache_invalidate_range((u64)(usize)rx_ring, sizeof(rx_ring));
+    __asm__ volatile("dsb sy" ::: "memory");
+    u32 contig_owned = 0;
+    bool saw_gap = false;
+    u32 owned_after_gap = 0;
+    for (u32 i = 0; i < NUM_RX; i++) {
+        u32 idx = (rx_idx + i) % NUM_RX;
+        bool owned = (rx_ring[idx].addr & RX_ADDR_OWN) != 0;
+        if (!saw_gap) {
+            if (owned) contig_owned++;
+            else saw_gap = true;
+        } else if (owned) {
+            owned_after_gap++;
+        }
+    }
+
     macb_rx_ring_rebuild();
     rx_recover_count++;
     /* Dump enough context to reconstruct what the recovery saw without
@@ -1144,6 +1171,12 @@ bool macb_rx_recover(void) {
      * the lifetime recovery count, and where RX/TX were in the ring at the
      * moment of detection. */
     DTRACE(DTRACE_CAT_MAC, DT_MAC_RXRECOVER, rx_recover_count, rsr, rx_idx, tx_idx);
+    /* a0=contig_owned (owned run starting at rx_idx; NUM_RX means genuinely
+     * fully saturated), a1=owned_after_gap (nonzero means a hole pattern: a
+     * NOT-owned descriptor followed by MORE owned ones -- a real anomaly,
+     * since normal fill-up should never skip a descriptor), a2=rx_idx,
+     * a3=NUM_RX (for scale). */
+    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXRECOVER_PATTERN, contig_owned, owned_after_gap, rx_idx, NUM_RX);
     pioscap_notify_event("rx-overrun-recover");
     return true;
 }

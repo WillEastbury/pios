@@ -49,6 +49,12 @@
 #define DT_MAC_RXRECOVER    4
 #define DT_MAC_TXRECOVER    5
 #define DT_MAC_RXLIVERECOVER 6  /* a0=rx_wedge_count a1=idle_ms a2=streak a3=tx_send_count */
+#define DT_MAC_RXRECOVER_PATTERN 7 /* pre-rebuild OWN-bit snapshot; a0=contig_owned run
+                                    * starting at rx_idx (NUM_RX = genuinely saturated),
+                                    * a1=owned_after_gap (nonzero = hole/anomaly: a NOT-owned
+                                    * descriptor followed by more owned ones -- points at a
+                                    * false/stale overrun rather than real traffic volume),
+                                    * a2=rx_idx, a3=NUM_RX */
 /* FIFO */
 #define DT_FIFO_PUSH        1   /* a0=(src<<8|dst) a1=type a2=seq */
 #define DT_FIFO_POP         2   /* a0=(dst<<8|src) a1=type a2=seq */
