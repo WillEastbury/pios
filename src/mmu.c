@@ -744,7 +744,26 @@ bool mmu_switch_to_user(u32 core, u32 slot)
     if (!user_table_valid[uc][slot].v)
         return false;
 
-    u64 ttbr = (u64)(usize)user_l1[uc][slot];
+    /* Tag this process's table with a distinct 8-bit ASID (TCR_EL1.AS=0,
+     * the default here -- see TCR_VALUE -- selects 8-bit ASID in
+     * TTBR0_EL1[55:48]). ASID 0 is reserved for the shared kernel table
+     * (mmu_switch_to_kernel). Real physical addresses on this hardware
+     * never reach bit 48+, so OR-ing the ASID into that field cannot
+     * collide with the table's physical base.
+     *
+     * This is additive defense-in-depth, not a change to the isolation
+     * boundary itself: mmu_invalidate_tlb() below still does a full
+     * (all-ASID) invalidate on every switch, exactly as before, so
+     * correctness never depended on ASID tagging. But an untagged switch
+     * left every process's translations sharing ASID 0 -- if a future
+     * change ever dropped or narrowed that flush (e.g. for a legitimate
+     * perf optimization), stale cross-process TLB entries would have had
+     * no ASID to distinguish them. Tagging now means that failure mode
+     * would show up as one process's table walking into a completely
+     * different physical mapping (an immediate, loud fault or wrong-data
+     * bug), not a silent, exploitable stale-permission read/write. */
+    u64 asid = (u64)(1U + uc * MAX_PROCS_PER_CORE + slot);
+    u64 ttbr = (asid << 48) | (u64)(usize)user_l1[uc][slot];
     __asm__ volatile("msr ttbr0_el1, %0" :: "r"(ttbr));
     mmu_invalidate_tlb();
     return true;
@@ -752,6 +771,7 @@ bool mmu_switch_to_user(u32 core, u32 slot)
 
 void mmu_switch_to_kernel(void)
 {
+    /* ASID 0, reserved for the shared kernel table (see mmu_switch_to_user). */
     __asm__ volatile("msr ttbr0_el1, %0" :: "r"(shared_ttbr0));
     mmu_invalidate_tlb();
 }
