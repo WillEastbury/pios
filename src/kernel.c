@@ -18586,6 +18586,14 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
         }
     }
     core0_eth_irq_quench_passes = passes < 8U ? passes + 1U : passes;
+#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+    {
+        struct macb_diag md;
+        macb_diag(&md);
+        DTRACE(DTRACE_CAT_REACTOR, DT_RX_IRQ_QUENCH, core0_eth_irq_count,
+               core0_eth_irq_quench_passes, clear ? 1U : 0U, md.rx_recv);
+    }
+#endif
     /* Re-arm the RP1 endpoint so the next received frame produces a fresh
      * edge. Gating this behind the drain bounds the rate to the packet rate. */
     rp1_eth_irq_rearm();

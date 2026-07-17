@@ -78,6 +78,16 @@
 #define DT_RX_PHASE_HTTP    5   /* a0=dur_ticks (uhttp_bridge_poll — the :80 handler) */
 #define DT_RX_WFE           5   /* a0=idle_ticks — keep old ID in case code refs it */
 #define DT_RX_WAKE          6   /* a0=flags */
+#define DT_RX_IRQ_QUENCH    7   /* IRQ-driven RX quench outcome; a0=core0_eth_irq_count
+                                   a1=quench_passes a2=clear(0/1) a3=rx_recv_count.
+                                   Diagnoses receive-livelock risk: core0_eth_irq_
+                                   drain_and_quench() re-arms the IRQ unconditionally
+                                   even when clear==0 (still not caught up after its
+                                   8-pass budget); if this fires repeatedly with
+                                   clear==0 and irq_count climbing fast relative to
+                                   rx_recv_count, the IRQ is re-triggering faster than
+                                   the drain can keep up -- a livelock, not a hardware
+                                   fault. */
 
 struct dtrace_rec {
     u64 ts;          /* cntpct_el0 at emit */
