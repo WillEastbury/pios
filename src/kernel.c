@@ -449,12 +449,18 @@ static bool debug_tcp_unlocked;
 static char debug_tcp_line[DEBUG_TCP_LINE_MAX];
 static u32 debug_tcp_len;
 static u32 debug_tcp_iac_skip;
+#define CORE0_ETH_IRQ_STALL_THRESHOLD       4U     /* consecutive non-clearing quenches before poll fallback */
+#define CORE0_ETH_IRQ_FALLBACK_COOLDOWN_MS  5000ULL /* how long to stay poll-only before retrying IRQ mode */
 static volatile u64 core0_eth_irq_count;
 static volatile u32 core0_eth_irq_last_mip;
 static volatile u32 core0_eth_irq_last_macb_isr;
 static volatile bool core0_eth_irq_oneshot;
 static volatile bool core0_eth_irq_deferred_quench;
 static volatile u32 core0_eth_irq_quench_passes;
+static volatile u32 core0_eth_irq_stall_streak;   /* consecutive quenches that failed to clear */
+static volatile bool core0_eth_irq_poll_fallback; /* true: IRQ line masked, relying on poll only */
+static volatile u64 core0_eth_irq_fallback_since_ms;
+static volatile u32 core0_eth_irq_fallback_count;  /* lifetime fallback engagements (diagnostic) */
 static u32 core0_eth_source_diag[24];
 static volatile u32 core0_eth_source_diag_seq;
 
@@ -18594,10 +18600,70 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
                core0_eth_irq_quench_passes, clear ? 1U : 0U, md.rx_recv);
     }
 #endif
-    /* Re-arm the RP1 endpoint so the next received frame produces a fresh
-     * edge. Gating this behind the drain bounds the rate to the packet rate. */
-    rp1_eth_irq_rearm();
-    return clear;
+    if (clear) {
+        /* Close the check-then-arm race: RP1's MSI-X vector is a
+         * level-to-edge latch that only fires a fresh edge for a
+         * low->high transition of the MACB level line that occurs AFTER
+         * rp1_eth_irq_rearm() (IACK) is processed. If a new frame's DMA
+         * completes in the gap between our "raw line is low" observation
+         * above and the IACK write below, the level goes high again
+         * *before* we arm -- RP1 never sees a transition after arming, so
+         * no edge is generated and that frame's interrupt is silently
+         * lost until some later, cleanly-isolated transition happens to
+         * land outside the gap. Under bursty/light traffic the gap
+         * rarely overlaps a new frame (isolated requests "just work");
+         * under sustained bulk transfer frames arrive back-to-back, so
+         * the gap is hit routinely -- this is the actual mechanism behind
+         * "IRQ delivery is unreliable under load", not vague flakiness.
+         * Fix: after arming, re-check the raw line immediately. If a
+         * frame slipped in during the gap, drain it and arm again -- a
+         * bounded retry that keeps closing the window until a truly
+         * clean arm lands (or we give up and let the poll path/backstop
+         * catch it on the next tick). */
+        for (u32 rearm_try = 0; rearm_try < 4U; rearm_try++) {
+            rp1_eth_irq_rearm();
+            dsb();
+            if ((rp1_irq_status_l() & eth_bit) == 0)
+                break; /* line still low after IACK: no frame slipped in, truly armed */
+            net_poll();
+            macb_irq_ack_rx();
+            dsb();
+        }
+        core0_eth_irq_stall_streak = 0;
+        return true;
+    }
+
+    /* Did NOT catch up within the 8-pass budget: the raw ETH interrupt
+     * source is still asserted, meaning more frames arrived faster than we
+     * could drain. Re-arming unconditionally here (the previous behaviour)
+     * risks a receive livelock under sustained overload: IRQ fires, drain
+     * falls behind, re-arm anyway, IRQ fires again almost immediately,
+     * repeat -- burning core0's time in IRQ entry/exit rather than making
+     * steady draining progress (see DT_RX_IRQ_QUENCH; live testing showed
+     * rx_owned climbing into the mid-400s while RBQP kept advancing, i.e.
+     * hardware still receiving but software never catching up). After a
+     * few consecutive non-clearing quenches, mask the IRQ line instead of
+     * re-arming and fall back to poll-only: the main reactor's net_poll()
+     * plus macb_rx_recover()/macb_rx_liveness_recover() pairing (see
+     * CORE0_IO_NET handling) is the exact same drain path either way, but
+     * without an interrupt able to re-trigger before it has finished. */
+    core0_eth_irq_stall_streak++;
+    if (core0_eth_irq_stall_streak >= CORE0_ETH_IRQ_STALL_THRESHOLD &&
+        !core0_eth_irq_poll_fallback) {
+        core0_eth_irq_poll_fallback = true;
+        core0_eth_irq_fallback_since_ms = timer_monotonic_ms();
+        core0_eth_irq_fallback_count++;
+        gic_disable_irq(GIC_RP1_ETH_MSI);
+        DTRACE(DTRACE_CAT_REACTOR, DT_RX_IRQ_QUENCH, core0_eth_irq_count,
+               0xFFFFFFFFU /* sentinel: fallback engaged */,
+               core0_eth_irq_fallback_count, 0);
+        http_log_event("eth-irq-poll-fallback", core0_eth_irq_stall_streak,
+                       core0_eth_irq_fallback_count);
+        return false;
+    }
+    if (!core0_eth_irq_poll_fallback)
+        rp1_eth_irq_rearm();
+    return false;
 }
 
 static u32 core0_io_take_flags(void)
@@ -18782,6 +18848,21 @@ NORETURN void core0_main(void) {
                 core0_eth_irq_drain_and_quench(false);
                 core0_eth_irq_deferred_quench = false;
             }
+#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+            /* Recovered from a poll-only livelock fallback: after a cooldown
+             * (during which this same net_poll()/macb_rx_recover() pairing
+             * above is what's been draining the ring, IRQ-free), try
+             * IRQ-driven wake again. If the overload was transient this
+             * restores lower-latency wake; if it recurs immediately the
+             * stall-streak counter will just re-trip the fallback. */
+            if (core0_eth_irq_poll_fallback &&
+                timer_monotonic_ms() - core0_eth_irq_fallback_since_ms > CORE0_ETH_IRQ_FALLBACK_COOLDOWN_MS) {
+                core0_eth_irq_poll_fallback = false;
+                core0_eth_irq_stall_streak = 0;
+                core0_eth_irq_arm_host(false);
+                http_log_event("eth-irq-poll-fallback-end", core0_eth_irq_fallback_count, 0);
+            }
+#endif
             u64 dt_net = sched_counter_ticks() - dt_t0;
             if (dt_net > dt_phase_thresh)
                 DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_NET, dt_net, flags, 0, 0);
