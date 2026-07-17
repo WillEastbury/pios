@@ -32,6 +32,11 @@ TESTS_MANIFEST = {
     # DHCP option parser: compiled from src/dhcp_options.c (the standalone
     # parser extracted from dhcp.c, pure logic, no MMIO/asm/network deps).
     "test_dhcp.c": ["src/dhcp_options.c"],
+    # Capsule manifest/card text parser: compiled from
+    # src/capsule_manifest_parse.c (extracted from capsule_store.c, which
+    # also does WALFS I/O -- this half is pure logic, no MMIO/asm/WALFS
+    # deps). Also has a standalone libFuzzer harness: fuzz_capsule_manifest.c
+    "test_capsule_manifest.c": ["src/capsule_manifest_parse.c"],
 }
 
 
