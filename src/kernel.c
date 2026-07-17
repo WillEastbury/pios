@@ -18566,8 +18566,22 @@ static void core0_io_tick_hook(u32 core, u64 tick)
      * interrupt at all -- so CORE0_IO_NET must still be forced periodically
      * there, exactly as before, or RX is never drained. */
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
-    if ((tick & 7U) == 0)
+    if ((tick & 7U) == 0) {
         flags |= CORE0_IO_TCP;
+        /* Exception to "purely IRQ-driven": while the poll-only livelock
+         * fallback is engaged, the GIC ETH line is deliberately masked (see
+         * core0_eth_irq_drain_and_quench), so nothing else will ever set
+         * CORE0_IO_NET again -- including the cooldown-based re-arm check
+         * that lives inside that same branch and is what clears the
+         * fallback. Without this, engaging the fallback would be a
+         * permanent deadlock: masked IRQ + no periodic force = RX never
+         * drains again and the board never leaves fallback mode. Restore
+         * the fast poll cadence ONLY for the duration of this genuinely
+         * degraded window; normal healthy operation stays purely
+         * event-driven. */
+        if (core0_eth_irq_poll_fallback)
+            flags |= CORE0_IO_NET;
+    }
 #else
     if ((tick & 7U) == 0)
         flags |= CORE0_IO_NET | CORE0_IO_TCP;
