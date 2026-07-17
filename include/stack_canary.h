@@ -23,6 +23,10 @@ void stack_canary_init(void);
  * exception_pisod (crash-capture + SD-persist + PiSOD + halt-for-
  * watchdog-reset) rather than returning -- a kernel stack that has grown
  * into a neighbouring stack's memory is exactly the kind of impossible
- * state that must not attempt a best-effort continue. Wired into
- * watchdog_poll() (watchdog.c), which already rate-limits itself. */
+ * state that must not attempt a best-effort continue. Called directly
+ * (self-rate-limited) from core0_main()'s reactor loop in kernel.c, NOT
+ * routed through watchdog_poll() -- that function turned out to have zero
+ * callers anywhere in the tree (a pre-existing gap, found via rubber-duck
+ * review), and resurrecting it would also reactivate its own dormant,
+ * never-fed liveness-trip path. See watchdog.c's watchdog_poll() comment. */
 void stack_canary_check(void);

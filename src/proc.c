@@ -2101,11 +2101,40 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     if (!blob || blob_len == 0 || blob_len > PROC_SLOT_SIZE - 64U)
         return -1;
 
-    i32 slot = find_empty_slot();
-    if (slot < 0) {
-        uart_puts("[proc] mem-exec: no free slot\n");
+    /* The blob is linked at the fixed slot base PROC_EMBED_BASE; unlike
+     * proc_load_and_exec()'s WALFS loader, this can't use the randomized
+     * find_empty_slot() (a rubber-duck review caught this: with 6 slots,
+     * a random pick lands on the one whose slot_base() equals
+     * PROC_EMBED_BASE only ~1/6 of the time, and even worse, would
+     * previously have SPUN THROUGH randomly-claimed-then-released slots
+     * rather than deterministically finding the one that must be used).
+     * Compute the required slot directly from PROC_EMBED_BASE instead,
+     * matching the pattern proc_exec_from_mem_el0() already uses for its
+     * caller-supplied physical_base. This function currently has no
+     * callers (dead code), but a latent trap like this shouldn't ship. */
+    u64 expected_lo = (u64)(usize)core_ram_base() + PROC_SLOT_OFFSET;
+    if (PROC_EMBED_BASE < expected_lo || (PROC_EMBED_BASE - expected_lo) % PROC_SLOT_SIZE != 0)
+        return -1;
+    u32 required_slot = (u32)((PROC_EMBED_BASE - expected_lo) / PROC_SLOT_SIZE);
+    if (required_slot >= MAX_PROCS_PER_CORE)
+        return -1;
+
+    /* Claim under the same lock find_empty_slot() uses: this is a fixed,
+     * specific slot rather than a random pick from the free pool, but it's
+     * still a slot find_empty_slot() could independently pick for an
+     * unrelated process on another core -- close that TOCTOU window too. */
+    while (__atomic_test_and_set(&g_slot_alloc_lock, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("yield");
+    }
+    bool busy = (procs[required_slot].state != PROC_EMPTY);
+    if (!busy)
+        procs[required_slot].state = PROC_CLAIMED;
+    __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+    if (busy) {
+        uart_puts("[proc] mem-exec: required slot busy\n");
         return -1;
     }
+    i32 slot = (i32)required_slot;
 
     u8 *base = slot_base((u32)slot);
     /* The blob is linked at a fixed slot base; refuse if this slot doesn't

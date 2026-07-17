@@ -4,7 +4,6 @@
 #include "mmio.h"
 #include "fb.h"
 #include "platform.h"
-#include "stack_canary.h"
 
 /* BCM2712 PM block (Linux DT watchdog@7d200000, Circle ARM_PM_BASE
  * = ARM_IO_BASE + 0x1200000). Pi 4 used PERIPH_BASE + 0x100000; using
@@ -150,11 +149,26 @@ NORETURN void watchdog_reboot_now(u32 reason)
 
 void watchdog_poll(void)
 {
+    /* NOTE: this function has zero callers anywhere in the tree (verified
+     * via repo-wide search) -- watchdog_touch() likewise has zero callers,
+     * so g_wdog.last_touch[] sits at its watchdog_init() value forever.
+     * Wiring this in naively (e.g. calling it from a reactor loop) would
+     * immediately trip watchdog_trip() on every core ~g_wdog.timeout_ticks
+     * after boot, since nothing ever touches it. This whole software
+     * liveness-tracking layer (distinct from the real, live, hardware
+     * watchdog_hw_pet()/watchdog_hw_arm_seconds() calls elsewhere in
+     * kernel.c, which ARE exercised every reactor iteration) appears to
+     * predate this PR and was already incomplete/dormant. Left as-is;
+     * the stack-boundary canary check (stack_canary.h) is instead called
+     * directly from core0_main()'s real reactor loop in kernel.c, not
+     * routed through this dead function. Fixing this subsystem properly
+     * (wiring watchdog_touch() into every core's reactor loop with a
+     * correct per-core timeout) is a separate, pre-existing gap worth its
+     * own follow-up, not attempted here. */
     if (!g_wdog.armed) return;
     u64 now = timer_ticks();
     if (g_last_poll != 0 && (now - g_last_poll) < 100ULL) return;
     g_last_poll = now;
-    stack_canary_check();
     for (u32 c = 0; c < NUM_CORES; c++) {
         if ((now - g_wdog.last_touch[c]) > (u64)g_wdog.timeout_ticks)
             watchdog_trip(c, 0x40U);

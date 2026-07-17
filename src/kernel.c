@@ -18609,7 +18609,25 @@ NORETURN void core0_main(void) {
     u64 dt_phase_thresh;
     { u64 f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); dt_phase_thresh = f / 20000U; }
 
+    u64 stack_canary_last_check = 0;
     for (;;) {
+        /* Placed at the very top of the loop, before the idle branch's
+         * `continue`, so this runs every iteration regardless of whether
+         * core0 is idle or servicing IO -- self-rate-limited the same way
+         * watchdog_poll() throttles itself, since this is NOT wired through
+         * watchdog_poll() (see stack_canary.h/.c comment history: that
+         * function turned out to have zero callers anywhere in the tree,
+         * and resurrecting it would also reactivate its own dormant, never-
+         * fed g_wdog liveness-trip path -- watchdog_touch() likewise has no
+         * callers, so every core's last_touch would sit at its init value
+         * forever, and watchdog_poll() would spuriously trip ~5s after
+         * every boot. Call stack_canary_check() directly instead.) */
+        u64 now_ticks = timer_ticks();
+        if (now_ticks - stack_canary_last_check >= 100ULL) {
+            stack_canary_last_check = now_ticks;
+            stack_canary_check();
+        }
+
         u32 flags = core0_io_take_flags();
         if (flags == 0) {
             watchdog_hw_pet();
@@ -19342,6 +19360,23 @@ void kernel_main(void) {
         bp_log("[exc] exception_init...");
         exception_init();
         bp_ok("[exc] vectors installed");
+
+        /* g_boot_el/g_el2_active (el2.c) were never populated before this:
+         * el2_init() had no caller anywhere in the tree, so despite
+         * el2_boot_el_state being correctly recorded by boot assembly
+         * (vectors.S) when the core genuinely starts at real EL2,
+         * el2_hvc_call() always took the software-only fallback path
+         * (a plain C function call, never a real `hvc` trap), and
+         * el2_stage2_program_hw()'s read_current_el()!=2 check always
+         * failed silently -- meaning VTTBR_EL2/HCR_EL2 were NEVER actually
+         * programmed, on any platform, regardless of capsule bookkeeping
+         * reporting success. Found via rubber-duck review. This activates
+         * that dormant hardware path for the first time; see AGENTS.md
+         * continuation note before trusting stage-2 as a real boundary on
+         * physical Pi5 hardware -- it has only been exercised on QEMU here. */
+        el2_init();
+        bp_log(el2_active() ? "[el2] real EL2 active, stage-2 HW path live"
+                             : "[el2] not at EL2 (boot_el != 2); stage-2 stays software-only");
 
         bp_log("[gic] gic_init...");
         gic_init();
