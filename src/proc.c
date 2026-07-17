@@ -2002,7 +2002,14 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     proc_bump_generation((u32)slot);
     p->pid = next_pid++;
     p->parent_pid = 0;
-    p->state = PROC_READY;
+    /* p->state stays PROC_CLAIMED (set by find_empty_slot()) through the rest
+     * of setup -- a rubber-duck review caught that publishing PROC_READY
+     * this early let a same-core interrupt handler or another core's
+     * diagnostics/IPC code observe a "ready" process before its arena,
+     * capsule binding, entry contract, register context, or (critically)
+     * its MMU page tables were actually built. PROC_READY is now the last
+     * field written, right before proc_publish_control(), once the process
+     * is genuinely safe to schedule or address. */
     proc_wake_pending[slot].v = 0;
     p->principal_id = principal_current();
     p->affinity_core = affinity_core;
@@ -2090,6 +2097,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     uart_puts(path);
     uart_putc('\n');
 
+    p->state = PROC_READY;
     proc_publish_control((u32)slot);
     return (i32)p->pid;
 }
@@ -2167,7 +2175,9 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     proc_bump_generation((u32)slot);
     p->pid = next_pid++;
     p->parent_pid = 0;
-    p->state = PROC_READY;
+    /* p->state stays PROC_CLAIMED through setup; see the identical note in
+     * proc_exec_with_policy() above -- PROC_READY is now published only
+     * right before proc_publish_control(), once setup fully succeeds. */
     proc_wake_pending[slot].v = 0;
     p->principal_id = PRINCIPAL_ROOT;   /* trusted: embedded in kernel image */
     p->affinity_core = affinity_core;
@@ -2244,6 +2254,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     uart_puts(name ? name : "?");
     uart_putc('\n');
 
+    p->state = PROC_READY;
     proc_publish_control((u32)slot);
     return (i32)p->pid;
 }
@@ -2306,7 +2317,9 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     proc_bump_generation((u32)slot);
     p->pid = next_pid++;
     p->parent_pid = 0;
-    p->state = PROC_READY;
+    /* p->state stays PROC_EMPTY->(implicitly claimed by the busy-check above)
+     * through setup; see the identical note in proc_exec_with_policy() --
+     * PROC_READY is now published only right before proc_publish_control(). */
     proc_wake_pending[slot].v = 0;
     p->principal_id = PRINCIPAL_ROOT;
     p->affinity_core = affinity_core;
@@ -2376,6 +2389,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     el0_launch_status = 1;
     el0_launch_pid = p->pid;
 
+    p->state = PROC_READY;
     proc_publish_control((u32)slot);
     return (i32)p->pid;
 }
