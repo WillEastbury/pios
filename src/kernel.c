@@ -443,6 +443,72 @@ static void ota_update_reset_state(void)
     ota_stage_ready = false;
 }
 
+/* ── UART-based firmware flash (no network required) ──
+ * At 115200 baud (~11.5 KB/s raw), a FULL kernel image takes a couple of
+ * minutes -- slow, but it works even when the NIC is completely wedged,
+ * which is exactly the scenario this was built for.
+ *
+ * Two modes, both reusing the exact same commit path as the network OTA
+ * flow (http_write_kernel_payload_range + http_write_kernel_slot_header +
+ * pios_bootctrl_mark_pending):
+ *
+ * FULL mode (fallback, e.g. first-ever flash of a slot):
+ *   "uartflash begin <total>", then repeated fixed-size binary chunks
+ *   (UARTFLASH_CHUNK_SIZE bytes, final chunk shorter), each acked with
+ *   "ACK <received> <checksum_hex>\n" (or "TIMEOUT <received>\n" if a chunk
+ *   stalls mid-transfer -- resend from <received> either way).
+ *
+ * PATCH mode ("zap" -- delta update, per user request): since most builds
+ * only change a small fraction of the image, sending the WHOLE thing every
+ * time wastes most of a ~2-minute transfer on bytes that didn't change.
+ * The diff itself is computed entirely on the BUILD/HOST side (which has
+ * both the old and new images and real compute power for a proper
+ * byte-level diff, e.g. Python's difflib) -- the device does no hashing or
+ * comparison at all, it just:
+ *   1. "uartflash patchbegin <base_len>" -- reads its OWN current target
+ *      slot content back off the SD card as the patch base (ground truth,
+ *      not trusting any host-side cache to be accurate).
+ *   2. "uartflash patch <offset> <length>" (length <= UARTFLASH_CHUNK_SIZE),
+ *      then <length> raw bytes -- overwrites that one changed region in the
+ *      staged copy, acked with "PACK <offset> <checksum_hex>\n". Repeated
+ *      once per changed region.
+ *   3. "uartflash finalize <total>" -- sets the final image length (which
+ *      may differ slightly from the base if size changed).
+ * Then "uartflash commit [reboot]" in either mode, same as before.
+ *
+ * Function bodies are defined later in this file (after
+ * http_append/ui_console_write), see uartflash_feed_byte / uartflash_poll /
+ * ui_cmd_uartflash. */
+#define UARTFLASH_CHUNK_SIZE   1024U
+#define UARTFLASH_TIMEOUT_MS   3000ULL
+enum uartflash_mode { UARTFLASH_MODE_NONE = 0, UARTFLASH_MODE_FULL, UARTFLASH_MODE_PATCH_REGION };
+static enum uartflash_mode uartflash_mode;
+static u32 uartflash_patch_offset;
+static u32 uartflash_patch_length;
+static bool uartflash_active;
+static u32 uartflash_chunk_progress;
+static u64 uartflash_last_byte_ms;
+
+/* True only while genuinely mid-stream expecting raw bytes right now --
+ * NOT simply "a uartflash session is open" (uartflash_active stays true
+ * across the whole begin/patchbegin..commit/abort session, including gaps
+ * between commands). Reactor code must divert incoming UART bytes to
+ * uartflash_feed_byte() ONLY when this is true; otherwise text commands
+ * like "uartflash status"/"commit"/"patch <off> <len>" sent *during* a
+ * session (e.g. between two patch regions, or after a FULL transfer
+ * finishes but before commit) would be silently swallowed as bogus binary
+ * data instead of being parsed as console commands. */
+static bool uartflash_expecting_bytes(void)
+{
+    if (!uartflash_active)
+        return false;
+    if (uartflash_mode == UARTFLASH_MODE_FULL)
+        return ota_update.received < ota_update.total;
+    if (uartflash_mode == UARTFLASH_MODE_PATCH_REGION)
+        return true;
+    return false; /* UARTFLASH_MODE_NONE: awaiting the next text command */
+}
+
 static tcp_conn_t debug_listen_conn = -1;
 static tcp_conn_t debug_client_conn = -1;
 static bool debug_tcp_unlocked;
@@ -9513,6 +9579,7 @@ static void ui_cmd_edit(const char *path);
 static void ui_cmd_capsule(u32 argc, char **argv);
 static void ui_cmd_obs(u32 argc, char **argv);
 static void ui_cmd_update(u32 argc, char **argv);
+static void ui_cmd_uartflash(u32 argc, char **argv);
 static void ui_cmd_watchdog(u32 argc, char **argv);
 static void ui_cmd_bootctrl(u32 argc, char **argv);
 static void ui_cmd_dma(u32 argc, char **argv);
@@ -15353,6 +15420,308 @@ static void ui_cmd_update(u32 argc, char **argv)
     ui_console_write("ERR: unknown update subcommand\n");
 }
 
+static void uartflash_send_line(const char *prefix, u32 a, u32 b, bool has_b)
+{
+    char line[64];
+    u32 l = 0;
+    http_append(line, &l, sizeof(line), prefix);
+    http_append_u64(line, &l, sizeof(line), a);
+    if (has_b) {
+        http_append(line, &l, sizeof(line), " ");
+        char hex[16];
+        u32 hl = 0;
+        for (i32 shift = 28; shift >= 0; shift -= 4) {
+            u32 nib = (b >> shift) & 0xFU;
+            hex[hl++] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10);
+        }
+        hex[hl] = 0;
+        http_append(line, &l, sizeof(line), hex);
+    }
+    http_append(line, &l, sizeof(line), "\n");
+    ui_console_write(line);
+}
+
+/* Reads `len` bytes (rounded up to SD block granularity) from the given
+ * slot's raw storage into ota_stage_buf, used as the patch base for
+ * PATCH-mode transfers: the device reads its OWN actual flash content as
+ * ground truth rather than trusting any host-side cache to be accurate. */
+static bool uartflash_read_slot_into_stage(u32 slot_offset, u32 len)
+{
+    if (!ota_stage_buf || len > ota_stage_cap)
+        return false;
+    u32 lba_base = walfs_partition_lba() + (slot_offset / SD_BLOCK_SIZE);
+    u32 nblocks = (len + SD_BLOCK_SIZE - 1U) / SD_BLOCK_SIZE;
+    for (u32 i = 0; i < nblocks; i++) {
+        if (!sd_read_block(lba_base + i, ota_stage_buf + (u64)i * SD_BLOCK_SIZE))
+            return false;
+    }
+    return true;
+}
+
+/* Called once per received UART byte while a transfer is in progress
+ * (bypasses the normal ASCII-filtering console line editor, which would
+ * corrupt binary data). FULL mode writes straight into the staging buffer
+ * at the cumulative offset; PATCH_REGION mode writes at the fixed
+ * offset/length given by the preceding "uartflash patch" command. */
+static void uartflash_feed_byte(u8 b)
+{
+    if (!uartflash_active || !ota_stage_buf)
+        return;
+    if (uartflash_mode == UARTFLASH_MODE_FULL) {
+        if (ota_update.received >= ota_update.total)
+            return;
+        u32 remaining = ota_update.total - ota_update.received;
+        u32 want = remaining < UARTFLASH_CHUNK_SIZE ? remaining : UARTFLASH_CHUNK_SIZE;
+        ota_stage_buf[ota_update.received + uartflash_chunk_progress] = b;
+        uartflash_chunk_progress++;
+        uartflash_last_byte_ms = timer_monotonic_ms();
+        if (uartflash_chunk_progress >= want) {
+            u32 sum = 0;
+            for (u32 i = 0; i < want; i++)
+                sum = (sum * 31U) + ota_stage_buf[ota_update.received + i];
+            ota_update.received += want;
+            ota_update.chunks++;
+            uartflash_chunk_progress = 0;
+            uartflash_send_line("ACK ", ota_update.received, sum, true);
+        }
+    } else if (uartflash_mode == UARTFLASH_MODE_PATCH_REGION) {
+        if ((u64)uartflash_patch_offset + uartflash_chunk_progress >= ota_stage_cap)
+            return; /* out-of-bounds safety net; the "patch" command already validates this */
+        ota_stage_buf[uartflash_patch_offset + uartflash_chunk_progress] = b;
+        uartflash_chunk_progress++;
+        uartflash_last_byte_ms = timer_monotonic_ms();
+        if (uartflash_chunk_progress >= uartflash_patch_length) {
+            u32 sum = 0;
+            for (u32 i = 0; i < uartflash_patch_length; i++)
+                sum = (sum * 31U) + ota_stage_buf[uartflash_patch_offset + i];
+            ota_update.chunks++;
+            uartflash_chunk_progress = 0;
+            uartflash_mode = UARTFLASH_MODE_NONE; /* region done; awaiting next "uartflash patch" */
+            uartflash_send_line("PACK ", uartflash_patch_offset, sum, true);
+        }
+    }
+}
+
+/* Called every reactor tick while a transfer is in progress: detects a
+ * stalled chunk (host stopped sending mid-chunk, e.g. dropped bytes or a
+ * crashed sender) and tells the host to resend from the last fully-acked
+ * offset, rather than waiting forever with partial, uncounted bytes sitting
+ * in the staging buffer. */
+static void uartflash_poll(void)
+{
+    if (!uartflash_active || uartflash_chunk_progress == 0)
+        return;
+    if (timer_monotonic_ms() - uartflash_last_byte_ms > UARTFLASH_TIMEOUT_MS) {
+        uartflash_chunk_progress = 0;
+        if (uartflash_mode == UARTFLASH_MODE_PATCH_REGION) {
+            uartflash_mode = UARTFLASH_MODE_NONE;
+            uartflash_send_line("TIMEOUT ", uartflash_patch_offset, 0, false);
+        } else {
+            uartflash_send_line("TIMEOUT ", ota_update.received, 0, false);
+        }
+    }
+}
+
+static void ui_cmd_uartflash(u32 argc, char **argv)
+{
+    if (!principal_has_cap(principal_current(), PRINCIPAL_ADMIN)) {
+        ui_console_write("ERR: admin required\n");
+        return;
+    }
+    if (argc < 2 || ui_streq(argv[1], "help")) {
+        ui_console_write("uartflash begin <total> | uartflash patchbegin <base_len> | "
+                         "uartflash patch <offset> <length> | uartflash finalize <total> | "
+                         "uartflash commit [reboot] | uartflash abort | uartflash status\n");
+        return;
+    }
+    if (ui_streq(argv[1], "begin")) {
+        if (uartflash_active) {
+            ui_console_write("ERR: a transfer is already in progress; uartflash abort first\n");
+            return;
+        }
+        u32 total = 0;
+        if (argc < 3 || !ui_parse_u32(argv[2], &total) || total == 0 ||
+            total > PIOS_STAGE2_ZONE_BYTES) {
+            ui_console_write("ERR: usage uartflash begin <total>; total must fit the raw payload slot\n");
+            return;
+        }
+        if (!ota_stage_buf) {
+            struct highmem_status hm;
+            highmem_status(&hm);
+            if (hm.ready)
+                ota_stage_buf = (u8 *)highmem_alloc(PIOS_STAGE2_ZONE_BYTES, 64);
+            if (ota_stage_buf)
+                ota_stage_cap = PIOS_STAGE2_ZONE_BYTES;
+        }
+        if (!ota_stage_buf || total > ota_stage_cap) {
+            ui_console_write("ERR: no staging buffer available (highmem not ready)\n");
+            return;
+        }
+        ota_update.target_slot = pios_bootctrl_target_slot();
+        ota_update.target_slot_offset = pios_boot_slot_offset(ota_update.target_slot);
+        ota_update.active = true;
+        ota_update.total = total;
+        ota_update.received = 0;
+        ota_update.chunks = 0;
+        ota_update.errors = 0;
+        ota_stage_ready = true;
+        uartflash_active = true;
+        uartflash_mode = UARTFLASH_MODE_FULL;
+        uartflash_chunk_progress = 0;
+        uartflash_last_byte_ms = timer_monotonic_ms();
+        http_log_event("uartflash-begin", total, ota_update.target_slot);
+        char line[80];
+        u32 l = 0;
+        http_append(line, &l, sizeof(line), "READY chunk=");
+        http_append_u64(line, &l, sizeof(line), UARTFLASH_CHUNK_SIZE);
+        http_append(line, &l, sizeof(line), " slot=");
+        http_append_u64(line, &l, sizeof(line), ota_update.target_slot);
+        http_append(line, &l, sizeof(line), "\n");
+        ui_console_write(line);
+        return;
+    }
+    if (ui_streq(argv[1], "patchbegin")) {
+        if (uartflash_active) {
+            ui_console_write("ERR: a transfer is already in progress; uartflash abort first\n");
+            return;
+        }
+        u32 base_len = 0;
+        if (argc < 3 || !ui_parse_u32(argv[2], &base_len) || base_len == 0 ||
+            base_len > PIOS_STAGE2_ZONE_BYTES) {
+            ui_console_write("ERR: usage uartflash patchbegin <base_len>\n");
+            return;
+        }
+        if (!ota_stage_buf) {
+            struct highmem_status hm;
+            highmem_status(&hm);
+            if (hm.ready)
+                ota_stage_buf = (u8 *)highmem_alloc(PIOS_STAGE2_ZONE_BYTES, 64);
+            if (ota_stage_buf)
+                ota_stage_cap = PIOS_STAGE2_ZONE_BYTES;
+        }
+        if (!ota_stage_buf) {
+            ui_console_write("ERR: no staging buffer available (highmem not ready)\n");
+            return;
+        }
+        ota_update.target_slot = pios_bootctrl_target_slot();
+        ota_update.target_slot_offset = pios_boot_slot_offset(ota_update.target_slot);
+        /* Read the CURRENT target-slot content back off the SD card as the
+         * patch base. Ground truth from the device's own flash, not a
+         * host-side cache -- if the host's assumption about what's on the
+         * slot is stale/wrong, the patch offsets would corrupt an
+         * unrelated region, so this only ever reads real, current bytes. */
+        if (!uartflash_read_slot_into_stage(ota_update.target_slot_offset, base_len)) {
+            ui_console_write("ERR: failed to read current slot content as patch base\n");
+            return;
+        }
+        ota_update.active = true;
+        ota_update.total = base_len;   /* provisional; "finalize" sets the real final length */
+        ota_update.received = base_len;
+        ota_update.chunks = 0;
+        ota_update.errors = 0;
+        ota_stage_ready = true;
+        uartflash_active = true;
+        uartflash_mode = UARTFLASH_MODE_NONE;
+        uartflash_chunk_progress = 0;
+        http_log_event("uartflash-patchbegin", base_len, ota_update.target_slot);
+        ui_console_write("OK: patch base loaded\n");
+        return;
+    }
+    if (ui_streq(argv[1], "patch")) {
+        if (!uartflash_active) {
+            ui_console_write("ERR: uartflash patchbegin first\n");
+            return;
+        }
+        u32 poff = 0, plen = 0;
+        if (argc < 4 || !ui_parse_u32(argv[2], &poff) || !ui_parse_u32(argv[3], &plen) ||
+            plen == 0 || plen > UARTFLASH_CHUNK_SIZE || (u64)poff + plen > ota_stage_cap) {
+            ui_console_write("ERR: usage uartflash patch <offset> <length>; length must be <= 1024\n");
+            return;
+        }
+        uartflash_mode = UARTFLASH_MODE_PATCH_REGION;
+        uartflash_patch_offset = poff;
+        uartflash_patch_length = plen;
+        uartflash_chunk_progress = 0;
+        uartflash_last_byte_ms = timer_monotonic_ms();
+        ui_console_write("OK: awaiting patch bytes\n");
+        return;
+    }
+    if (ui_streq(argv[1], "finalize")) {
+        if (!uartflash_active) {
+            ui_console_write("ERR: uartflash patchbegin first\n");
+            return;
+        }
+        u32 total = 0;
+        if (argc < 3 || !ui_parse_u32(argv[2], &total) || total == 0 || total > ota_stage_cap) {
+            ui_console_write("ERR: usage uartflash finalize <total>\n");
+            return;
+        }
+        ota_update.total = total;
+        ota_update.received = total;
+        uartflash_mode = UARTFLASH_MODE_NONE;
+        ui_console_write("OK: finalized\n");
+        return;
+    }
+    if (ui_streq(argv[1], "status")) {
+        char line[96];
+        u32 l = 0;
+        http_append(line, &l, sizeof(line), "uartflash active=");
+        http_append(line, &l, sizeof(line), uartflash_active ? "1" : "0");
+        http_append(line, &l, sizeof(line), " received=");
+        http_append_u64(line, &l, sizeof(line), ota_update.received);
+        http_append(line, &l, sizeof(line), " total=");
+        http_append_u64(line, &l, sizeof(line), ota_update.total);
+        http_append(line, &l, sizeof(line), " chunks=");
+        http_append_u64(line, &l, sizeof(line), ota_update.chunks);
+        http_append(line, &l, sizeof(line), "\n");
+        ui_console_write(line);
+        return;
+    }
+    if (ui_streq(argv[1], "abort")) {
+        uartflash_active = false;
+        uartflash_mode = UARTFLASH_MODE_NONE;
+        uartflash_chunk_progress = 0;
+        ota_update_reset_state();
+        ui_console_write("OK: uartflash aborted\n");
+        return;
+    }
+    if (ui_streq(argv[1], "commit")) {
+        if (!uartflash_active || !ota_update.active) {
+            ui_console_write("ERR: no uartflash transfer active\n");
+            return;
+        }
+        if (ota_update.received != ota_update.total) {
+            ui_console_write("ERR: transfer incomplete; use uartflash status to check progress\n");
+            return;
+        }
+        u32 written = 0;
+        if (!ota_stage_ready ||
+            !http_write_kernel_payload_range(ota_update.target_slot_offset, 0,
+                                             ota_stage_buf, ota_update.total, &written)) {
+            ui_console_write("ERR: failed to flush staged image to slot\n");
+            return;
+        }
+        if (!http_write_kernel_slot_header(ota_update.target_slot_offset,
+                                           ota_update.received, true)) {
+            ui_console_write("ERR: failed to commit slot header\n");
+            return;
+        }
+        ota_update.active = false;
+        ota_update.commits++;
+        uartflash_active = false;
+        pios_bootctrl_mark_pending(ota_update.target_slot);
+        http_log_event("uartflash-commit", ota_update.received, ota_update.commits);
+        bool reboot = argc >= 3 && ui_streq(argv[2], "reboot");
+        ui_console_write(reboot ? "OK: committed, rebooting...\n" : "OK: committed\n");
+        if (reboot) {
+            timer_delay_ms(100);
+            watchdog_reboot_now(0x55415246U); /* "UARF" */
+        }
+        return;
+    }
+    ui_console_write("ERR: unknown uartflash subcommand\n");
+}
+
 static void ui_cmd_watchdog(u32 argc, char **argv)
 {
     if (!principal_has_cap(principal_current(), PRINCIPAL_ADMIN)) {
@@ -16856,6 +17225,8 @@ static void ui_console_exec(char *line)
         ui_cmd_obs(argc, argv);
     } else if (ui_streq(argv[0], "update")) {
         ui_cmd_update(argc, argv);
+    } else if (ui_streq(argv[0], "uartflash")) {
+        ui_cmd_uartflash(argc, argv);
     } else if (ui_streq(argv[0], "watchdog")) {
         ui_cmd_watchdog(argc, argv);
     } else if (ui_streq(argv[0], "bootctrl")) {
@@ -16911,10 +17282,36 @@ static void ui_console_exec(char *line)
     }
 }
 
+static i32 ui_console_last_term_char = -1;  /* value of the last \r or \n
+                                          processed as a line terminator (-1
+                                          if none pending), so the OPPOSITE
+                                          half of a \r\n (or \n\r) pair
+                                          arriving as the very next byte can
+                                          be swallowed instead of being
+                                          treated as a second, empty line --
+                                          while a REPEATED same terminator
+                                          (e.g. two bare \r from pressing
+                                          Enter twice) still executes twice. */
+
 static void ui_console_feed_char(i32 c)
 {
     if (c < 0) return;
     if (c == '\r' || c == '\n') {
+        /* A CRLF (or LFCR) pair is ONE line terminator, not two. Without
+         * this, a client that sends "\r\n" (the common convention) causes
+         * the first byte to execute the command -- which can synchronously
+         * flip the console into a raw byte-consuming mode (e.g. uartflash's
+         * PATCH_REGION/FULL transfer) -- and the second byte then gets
+         * misrouted as the FIRST byte of that raw stream instead of being
+         * recognised as terminator noise, corrupting the transfer by
+         * exactly one byte. Swallow the paired opposite half here instead;
+         * a repeated identical terminator (e.g. two bare \r) still executes
+         * as two separate (empty) lines. */
+        if (ui_console_last_term_char >= 0 && ui_console_last_term_char != c) {
+            ui_console_last_term_char = -1;
+            return;
+        }
+        ui_console_last_term_char = c;
         ui_console_write("\n");
         ui_console_line[ui_console_len] = 0;
         ui_console_exec(ui_console_line);
@@ -16922,6 +17319,7 @@ static void ui_console_feed_char(i32 c)
         ui_console_prompt();
         return;
     }
+    ui_console_last_term_char = -1;
     if (c == '\b' || c == 127) {
         if (ui_console_len > 0) {
             ui_console_len--;
@@ -18540,8 +18938,11 @@ static void core0_io_tick_hook(u32 core, u64 tick)
     u32 flags = 0;
     /* UART/USB stay responsive (~31Hz, cheap polls). DASH is framebuffer-heavy
      * but cheap now that caches are alive, so refresh it at 1Hz (see offset
-     * note below). */
-    if ((tick & 31U) == 0)
+     * note below). While a uartflash transfer is active, service every tick
+     * instead: the PL011 hardware RX FIFO is shallow (16/32 bytes), and at
+     * 115200 baud (~11.5 KB/s) a 31-tick gap between services can accumulate
+     * far more than that, silently dropping bytes on overflow. */
+    if ((tick & 31U) == 0 || uartflash_active)
         flags |= CORE0_IO_UART | CORE0_IO_USB;
     /* CORE0_IO_NET is now driven PURELY by the ETH IRQ handler
      * (core0_eth_irq_handler sets it directly) plus the deferred-quench
@@ -18997,11 +19398,53 @@ NORETURN void core0_main(void) {
 
         if (flags & (CORE0_IO_UART | CORE0_IO_USB)) {
             u64 svc_start = ksvc_begin(ksvc_ui_id);
-            for (u32 i = 0; i < 16; i++) {
-                i32 rx = uart_try_getc();
-                if (rx < 0)
-                    break;
-                ui_console_feed_char(rx);
+            if (uartflash_active) {
+                /* Drain the WHOLE FIFO this tick for throughput regardless of
+                 * whether we're mid-region or between commands right now --
+                 * the PL011 hardware RX FIFO is shallow and a slow drain
+                 * risks losing bytes either way. Route each byte based on
+                 * whether we're genuinely expecting raw data RIGHT NOW:
+                 * mid-transfer bytes go to uartflash_feed_byte(), but bytes
+                 * arriving between regions (e.g. a "uartflash
+                 * status"/"commit"/next "patch <off> <len>" command) must
+                 * still reach the normal text console parser, or they'd be
+                 * silently swallowed as bogus binary data. Checking this
+                 * per-byte (not once before the loop) matters: the last byte
+                 * of a chunk/region can flip expecting-bytes from true to
+                 * false mid-drain, and the very next byte in the same FIFO
+                 * burst could already be the start of a text command. */
+                i32 rx;
+                while ((rx = uart_try_getc()) >= 0) {
+                    /* A command that just executed (via '\r' or '\n') may
+                     * have synchronously flipped us into a raw-byte-
+                     * consuming mode (uartflash begin/patch). If the client
+                     * sent the conventional "\r\n" pair, the second half
+                     * arrives here as the very next byte and would
+                     * otherwise be misrouted as the FIRST byte of that raw
+                     * stream, corrupting the transfer by one byte. Swallow
+                     * the paired opposite terminator before the mode check
+                     * even runs; a repeated identical terminator (e.g. two
+                     * bare \r) still reaches ui_console_feed_char()
+                     * untouched and executes as two separate lines. */
+                    if ((rx == '\r' || rx == '\n') &&
+                        ui_console_last_term_char >= 0 &&
+                        ui_console_last_term_char != rx) {
+                        ui_console_last_term_char = -1;
+                        continue;
+                    }
+                    if (uartflash_expecting_bytes())
+                        uartflash_feed_byte((u8)rx);
+                    else
+                        ui_console_feed_char(rx);
+                }
+                uartflash_poll();
+            } else {
+                for (u32 i = 0; i < 16; i++) {
+                    i32 rx = uart_try_getc();
+                    if (rx < 0)
+                        break;
+                    ui_console_feed_char(rx);
+                }
             }
 
             ui_handle_keys();
