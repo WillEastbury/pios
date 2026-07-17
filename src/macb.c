@@ -83,6 +83,8 @@ static inline void ecw(u32 off, u32 val) { mmio_write(ETH_CFG_BASE + off, val); 
 #define GEM_OCT_TX_HI       0x0104  /* Octets transmitted high */
 #define GEM_FRAMES_TX       0x0108  /* Frames transmitted */
 #define GEM_TX_UNDERRUNS    0x0134  /* TX FIFO underruns */
+#define GEM_TXPAUSECNT      0x0114  /* Pause Frames Transmitted Counter (lifetime, clears on read) */
+#define GEM_RXPAUSECNT      0x0164  /* Pause Frames Received Counter (lifetime, clears on read) */
 #define GEM_LATE_COLL       0x0144  /* Late collisions */
 #define GEM_CARRIER_ERR     0x0148  /* Carrier sense errors */
 #define GEM_FRAMES_RX       0x0158  /* Frames received */
@@ -580,26 +582,19 @@ bool macb_init(void) {
     mw(SA1T, (u32)mac_addr[4] | ((u32)mac_addr[5] << 8));
 
     /* Initial NCFGR: MDC clock + data bus width from DCFG1 + discard FCS
-     * (Circle: minimal config before PHY, full config after negotiation) */
+     * (Circle: minimal config before PHY, full config after negotiation).
+     * NCFGR_PAE is deliberately NOT set here: duplex is not yet known at this
+     * point, and 802.3x PAUSE flow control is only meaningful/defined for
+     * full-duplex operation. It's set conditionally below, after
+     * autonegotiation confirms full duplex. */
     {
         u32 dbwdef = (mr(DCFG1) >> 25) & 0x7;
         u32 dbw;
         if (dbwdef >= 4) dbw = 2;       /* 128-bit */
         else if (dbwdef >= 2) dbw = 1;   /* 64-bit */
         else dbw = 0;                     /* 32-bit */
-        mw(NCFGR, NCFGR_CLK_DIV64 | (dbw << 21) | (1 << 17) /* DRFCS */ | NCFGR_PAE);
+        mw(NCFGR, NCFGR_CLK_DIV64 | (dbw << 21) | (1 << 17) /* DRFCS */);
     }
-
-    /* 802.3x flow control quantum for auto-generated PAUSE frames (units of
-     * 512 bit-times at the negotiated link speed). Missing entirely before
-     * this fix -- the MAC had no ability to ask the peer/switch to back off
-     * before its own RX FIFO/ring filled up, unlike Linux's macb/GEM driver
-     * (which negotiates this via phylink) and every other 802.3x-capable
-     * stack. 0xFFFF is the max quantum: a conservative, safe choice since the
-     * MAC re-asserts PAUSE continuously while still congested and we don't
-     * yet send an explicit zero-quantum resume (TZQ), so a short quantum
-     * could let the peer resume before we've actually drained. */
-    mw(PTR, 0xFFFFU);
 
     /* Disable all interrupts (polling mode) then clear ISR */
     mw(IDR, 0xFFFFFFFF);
@@ -764,14 +759,32 @@ bool macb_init(void) {
         else if (dbwdef2 >= 2) dbw2 = 1;   /* 64-bit */
         else dbw2 = 0;                     /* 32-bit */
         u32 ncfgr = NCFGR_BIG | NCFGR_CLK_DIV64
-                   | (dbw2 << 21) | (1 << 17) /* DRFCS */ | NCFGR_PAE;
+                   | (dbw2 << 21) | (1 << 17) /* DRFCS */;
         if (rx_csum_enabled)
             ncfgr |= NCFGR_RXCOEN;
         if (gig)    ncfgr |= NCFGR_GBE;
         if (spd100) ncfgr |= NCFGR_SPD;
-        if (fd)     ncfgr |= NCFGR_FD;
+        if (fd) {
+            ncfgr |= NCFGR_FD;
+            /* 802.3x PAUSE flow control: only meaningful/defined for
+             * full-duplex operation, hence gated strictly on `fd`. Enables
+             * the MAC to autonomously emit real PAUSE frames to the link
+             * partner when its own RX FIFO nears full (proactive link-layer
+             * backpressure before the RX ring/DMA ever has to drop/overrun)
+             * and to honor PAUSE frames received from the partner. This was
+             * entirely absent before this fix; see Linux's macb/GEM driver
+             * (drivers/net/ethernet/cadence/macb_main.c) for the equivalent
+             * technique, there negotiated via phylink capability exchange.
+             * PIOS does not yet negotiate PAUSE capability via ANAR/ANLPAR --
+             * this enables it unconditionally whenever full-duplex is
+             * confirmed, which is a coarser (but standards-conformant: any
+             * 802.3x-unaware peer simply never receives/emits PAUSE and
+             * this has no effect) gate than a real capability negotiation. */
+            ncfgr |= NCFGR_PAE;
+        }
         mw(NCFGR, ncfgr);
-        mw(PTR, 0xFFFFU);   /* re-assert pause quantum (NCFGR write doesn't clear it, but cheap insurance) */
+        if (fd)
+            mw(PTR, 0xFFFFU);   /* pause quantum, units of 512 bit-times at link speed */
         link_mbps = gig ? 1000U : (spd100 ? 100U : 10U);
         link_full_duplex = fd;
 
@@ -1292,6 +1305,19 @@ void macb_diag(struct macb_diag *out)
     out->rx_live_recover = rx_live_recover_count;
     out->rx_wedge = rx_wedge_count;
     out->rx_idle = rx_idle_count;
+    /* GEM_TXPAUSECNT/RXPAUSECNT are lifetime hardware counters that clear on
+     * read, so accumulate into static software totals here (macb_diag is
+     * currently the only reader) rather than reporting a raw read that would
+     * silently reset to near-zero between diag polls. Added purely for
+     * visibility into the new PAE-gated 802.3x flow control (see macb_init):
+     * with zero prior telemetry on this mechanism, there was no way to tell
+     * whether PAUSE was ever generated/received without this. */
+    static u32 tx_pause_total;
+    static u32 rx_pause_total;
+    tx_pause_total += mr(GEM_TXPAUSECNT);
+    rx_pause_total += mr(GEM_RXPAUSECNT);
+    out->tx_pause = tx_pause_total;
+    out->rx_pause = rx_pause_total;
 }
 
 void macb_irq_snapshot(struct macb_irq_snapshot *out, bool read_clear_isr)

@@ -3029,6 +3029,10 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         http_append_u64(out, &len, max, md.rx_wedge);
         http_append(out, &len, max, " rx_idle=");
         http_append_u64(out, &len, max, md.rx_idle);
+        http_append(out, &len, max, " tx_pause=");
+        http_append_u64(out, &len, max, md.tx_pause);
+        http_append(out, &len, max, " rx_pause=");
+        http_append_u64(out, &len, max, md.rx_pause);
         http_append(out, &len, max, "\n");
 #endif
     } else if (http_starts_with(cmd, "dtrace")) {
@@ -18534,22 +18538,40 @@ static void core0_io_tick_hook(u32 core, u64 tick)
         return;
 
     u32 flags = 0;
-    /* UART/USB stay responsive (~31Hz, cheap polls). NET/TCP drop to ~8Hz as a
-     * safety net now that RX is interrupt-driven. DASH is framebuffer-heavy but
-     * cheap now that caches are alive, so refresh it at 1Hz (see offset note
-     * below). */
+    /* UART/USB stay responsive (~31Hz, cheap polls). DASH is framebuffer-heavy
+     * but cheap now that caches are alive, so refresh it at 1Hz (see offset
+     * note below). */
     if ((tick & 31U) == 0)
         flags |= CORE0_IO_UART | CORE0_IO_USB;
-    /* NET/TCP at a single fixed 128Hz. ONE deterministic cadence — no hot/idle
-     * state machine (that would add a second mode whose transition timing makes
-     * load behaviour non-reproducible and hard to diagnose). The RP1 ETH RX IRQ
-     * is meant to wake these per-packet but its delivery is unreliable under
-     * load, so this timer poll is the real driver. 8Hz capped HTTP at ~3-8 req/s
-     * and let SYNs sit in the ring under concurrency (connect failures + 2-4s
-     * latency); 128Hz cuts per-request latency ~16x and drains RX 16x more
-     * often. The empty-ring poll is cheap, so idle CPU stays low. */
+    /* CORE0_IO_NET is now driven PURELY by the ETH IRQ handler
+     * (core0_eth_irq_handler sets it directly) plus the deferred-quench
+     * consumer's poll-fallback backstop -- deliberately NOT forced here
+     * anymore -- ONLY on real RP1/GEM hardware, where core0_eth_irq_arm_host()
+     * actually arms that IRQ path at boot (see PIOS_HAS_RP1 && PIOS_HAS_GENET
+     * gating there). The previous unconditional 128Hz force existed only
+     * because RX IRQ delivery was believed unreliable under load; that belief
+     * was based on an unverified "check-then-arm" race theory that RP1SPEC.md
+     * 6.2 actually contradicts (IACK-while-still-asserted is documented to
+     * generate a fresh MSI), and the REAL bug was a software lost-wakeup race
+     * in how core0_eth_irq_deferred_quench was consumed (see the fixed
+     * clear-before-drain loop below) -- not an inherent IRQ reliability
+     * problem. Brute-force timer polling was masking that bug rather than
+     * fixing it, at the cost of never trusting/exercising the IRQ path under
+     * real load. Genuine hardware-wedge detection (RSR.BNA/OVR latch, RX
+     * silence) does NOT depend on this and still runs unconditionally on the
+     * CORE0_IO_MAINT cadence below, so a total IRQ failure (as opposed to a
+     * missed individual wake) still self-heals.
+     * On platforms without that IRQ path (e.g. QEMU's virtio-net, or any
+     * build where PIOS_HAS_RP1/PIOS_HAS_GENET is 0), nothing ever arms an RX
+     * interrupt at all -- so CORE0_IO_NET must still be forced periodically
+     * there, exactly as before, or RX is never drained. */
+#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+    if ((tick & 7U) == 0)
+        flags |= CORE0_IO_TCP;
+#else
     if ((tick & 7U) == 0)
         flags |= CORE0_IO_NET | CORE0_IO_TCP;
+#endif
     if ((tick % 100U) == 0)
         flags |= CORE0_IO_MAINT;
     /* Dashboard renders at 1Hz. The CPU-clock perf measurement also samples at
@@ -18645,34 +18667,20 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
     }
 #endif
     if (clear) {
-        /* Close the check-then-arm race: RP1's MSI-X vector is a
-         * level-to-edge latch that only fires a fresh edge for a
-         * low->high transition of the MACB level line that occurs AFTER
-         * rp1_eth_irq_rearm() (IACK) is processed. If a new frame's DMA
-         * completes in the gap between our "raw line is low" observation
-         * above and the IACK write below, the level goes high again
-         * *before* we arm -- RP1 never sees a transition after arming, so
-         * no edge is generated and that frame's interrupt is silently
-         * lost until some later, cleanly-isolated transition happens to
-         * land outside the gap. Under bursty/light traffic the gap
-         * rarely overlaps a new frame (isolated requests "just work");
-         * under sustained bulk transfer frames arrive back-to-back, so
-         * the gap is hit routinely -- this is the actual mechanism behind
-         * "IRQ delivery is unreliable under load", not vague flakiness.
-         * Fix: after arming, re-check the raw line immediately. If a
-         * frame slipped in during the gap, drain it and arm again -- a
-         * bounded retry that keeps closing the window until a truly
-         * clean arm lands (or we give up and let the poll path/backstop
-         * catch it on the next tick). */
-        for (u32 rearm_try = 0; rearm_try < 4U; rearm_try++) {
-            rp1_eth_irq_rearm();
-            dsb();
-            if ((rp1_irq_status_l() & eth_bit) == 0)
-                break; /* line still low after IACK: no frame slipped in, truly armed */
-            net_poll();
-            macb_irq_ack_rx();
-            dsb();
-        }
+        /* Per RP1SPEC.md 6.2 (MSIx configuration registers): "If a peripheral
+         * interrupt is still asserted at the time the IACK register is
+         * written, a new MSIx write is generated." So a frame that completes
+         * DMA in the gap between our "raw line is low" observation and the
+         * IACK write is NOT lost -- RP1 guarantees IACK-while-asserted
+         * produces a fresh MSI. There is no check-then-arm race to close
+         * here; a single unconditional rearm after the drain loop is the
+         * documented-correct sequence. (An earlier version of this function
+         * added a bounded retry loop around this rearm based on an
+         * inferred-not-verified "edge only fires for transitions after
+         * arming" model; that model contradicts the datasheet, and the retry
+         * loop could itself exit on its last iteration without a final
+         * rearm if the line was still high -- a real regression. Removed.) */
+        rp1_eth_irq_rearm();
         core0_eth_irq_stall_streak = 0;
         return true;
     }
@@ -18765,6 +18773,19 @@ static bool ksvc_timer_poll(void *ctx)
     (void)ctx;
     arp_tick();
     tcp_tick();
+#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+    /* Guaranteed-cadence hardware-wedge safety net, independent of RX IRQ
+     * activity. CORE0_IO_NET (which also runs these two checks inline) is now
+     * purely event-driven off the ETH IRQ handler -- if the IRQ path ever
+     * fails completely (a genuine hardware wedge, as opposed to a single
+     * missed software wake), CORE0_IO_NET would never fire again and these
+     * checks would never run from there. Running them here too, on the
+     * unconditional CORE0_IO_MAINT tick, preserves self-healing for a real
+     * MAC/DMA fault regardless of whether IRQ-driven wake is currently
+     * working at all. */
+    if (!macb_rx_recover())
+        macb_rx_liveness_recover(timer_monotonic_ms());
+#endif
     return true;
 }
 
@@ -18873,24 +18894,48 @@ NORETURN void core0_main(void) {
         if (flags & CORE0_IO_NET) {
             u64 svc_start = ksvc_begin(ksvc_net_id);
             u64 dt_t0 = sched_counter_ticks();
-            net_poll();
+            u32 got = net_poll();
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
             /* Self-heal a latched RX-overrun stall (BNA/OVR). A burst that
              * outran the drain leaves GEM with the ring full and RX DMA halted;
              * without this the NIC stays wedged (rx_idx frozen) even after the
              * load stops. Recover, then drain the freshly-restarted ring. */
             if (macb_rx_recover())
-                net_poll();
+                got += net_poll();
             /* Also self-heal a non-BNA/OVR RX halt (which the status check above
              * cannot see): if the RX-liveness watchdog (activity-gated) fires,
              * rebuild the ring and re-drain. */
             else if (macb_rx_liveness_recover(timer_monotonic_ms()))
-                net_poll();
+                got += net_poll();
 #endif
+            /* Chain CORE0_IO_TCP directly off real MAC-layer completion
+             * (hardirq -> softirq handoff), rather than waiting for TCP's own
+             * independent periodic tick: if net_poll() actually delivered new
+             * frames this pass, the TCP-level connection/app-layer services
+             * (admin/OTA, echo, :81 bridge) have new segment data to react to
+             * right now, and the periodic tick could be up to 8 ticks away.
+             * This mirrors what core0_eth_irq_handler already does for the
+             * IRQ-driven wake path (it sets both bits together in one step);
+             * this closes the same gap for the poll/deferred-quench-driven
+             * path. TCP's own periodic tick (see core0_io_tick_hook) is still
+             * needed independently for TX-side pumping when there's pending
+             * output but no new RX to chain off of. */
+            if (got > 0)
+                core0_io_flags |= CORE0_IO_TCP;
             dns_poll();
-            if (core0_eth_irq_deferred_quench) {
-                core0_eth_irq_drain_and_quench(false);
+            /* Consume the deferred-quench request clear-before-work, not
+             * clear-after: the old order (drain, then unconditionally clear)
+             * has a real lost-wakeup window -- core0_eth_irq_handler runs on
+             * this same core and can fire between the drain call returning
+             * and the "= false" store, setting the flag true only for it to
+             * be immediately clobbered back to false by mainline, silently
+             * dropping that request. Clearing first and looping while the
+             * flag keeps getting re-set (by a fresh IRQ arriving mid-drain)
+             * closes that window: any such IRQ causes another drain pass
+             * instead of being lost. */
+            while (core0_eth_irq_deferred_quench) {
                 core0_eth_irq_deferred_quench = false;
+                core0_eth_irq_drain_and_quench(false);
             }
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
             /* Recovered from a poll-only livelock fallback: after a cooldown

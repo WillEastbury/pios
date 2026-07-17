@@ -59,6 +59,8 @@ struct macb_diag {
     u32 rx_live_recover;/* lifetime RX-liveness (silence) recoveries performed */
     u32 rx_wedge;       /* lifetime real wedges: silence + unmet demand */
     u32 rx_idle;        /* lifetime extended RX-silence periods (informational, not faults) */
+    u32 tx_pause;       /* lifetime 802.3x PAUSE frames we generated (visibility for PAE) */
+    u32 rx_pause;       /* lifetime 802.3x PAUSE frames received from the link partner */
 } PACKED;
 void macb_diag(struct macb_diag *out);
 
