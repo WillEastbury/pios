@@ -972,9 +972,15 @@ static u32 rx_recv_count;
 static u32 rx_recover_count;
 
 bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
-    /* Invalidate RX descriptor to see MAC's DMA writes (non-coherent PCIe) */
+    /* Invalidate RX descriptor to see MAC's DMA writes (non-coherent PCIe).
+     * dcache_invalidate_range() already ends with its own dsb(); a second
+     * unconditional barrier here fired on every single poll -- even the vast
+     * majority that find no new frame ready -- for no extra ordering benefit.
+     * Removed as part of reducing per-poll/per-frame reclaim overhead (see
+     * the buffer-invalidate fix below): a slow reclaim path is what lets
+     * rx_owned climb toward NUM_RX under sustained load until RSR.BNA
+     * latches and the MAC halts entirely. */
     dcache_invalidate_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
-    __asm__ volatile("dsb sy" ::: "memory");
 
     /* Read descriptor */
     u32 addr_val = rx_ring[rx_idx].addr;
@@ -1002,8 +1008,18 @@ bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
         return false;
     }
 
-    /* Invalidate RX buffer to see data written by MAC via DMA */
-    dcache_invalidate_range((u64)(usize)rx_bufs[rx_idx], BUF_SIZE);
+    /* Invalidate only the bytes the MAC actually wrote (flen), not the full
+     * BUF_SIZE (2048) buffer. Under sustained high-rate bursts, unconditionally
+     * invalidating all 32 cache lines of BUF_SIZE regardless of actual frame
+     * size (e.g. a 60-byte ARP frame only needs 1 line) measurably slows down
+     * per-frame reclaim -- and since RX descriptor reclaim is the only thing
+     * that hands ring space back to the MAC, a slow reclaim path is exactly
+     * what lets rx_owned climb toward NUM_RX under load until RSR.BNA latches
+     * and the MAC halts (observed live: rx_owned climbing past 450/512 before
+     * a stall). We only ever read `flen` bytes via simd_memcpy below, so
+     * invalidating exactly that (rounded up to the enclosing cache lines by
+     * dcache_invalidate_range itself) is correct and sufficient. */
+    dcache_invalidate_range((u64)(usize)rx_bufs[rx_idx], flen);
 
     /* Copy frame out (NEON for throughput) */
     u8 *src = rx_bufs[rx_idx];
@@ -1013,9 +1029,10 @@ bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
     /* Reclaim: clear ownership bit and flush back to RAM */
     rx_ring[rx_idx].addr &= ~RX_ADDR_OWN;
     /* See invalid-frame reclaim above: never leave a descriptor line cached
-     * after publishing ownership back to the MAC. */
+     * after publishing ownership back to the MAC. dcache_clean_invalidate_range
+     * already ends with its own dsb(); a second unconditional barrier here was
+     * pure per-frame overhead with no additional ordering guarantee. */
     dcache_clean_invalidate_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
-    dsb();
 
     rx_idx = (rx_idx + 1) % NUM_RX;
     rx_recv_count++;
