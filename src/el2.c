@@ -92,6 +92,20 @@ static struct el2_stage2_plan g_stage2[EL2_CAPSULE_MAX];
 static u64 g_stage2_root[EL2_CAPSULE_MAX][512] ALIGNED(4096);
 static u64 g_stage2_l2[EL2_CAPSULE_MAX][512] ALIGNED(4096);
 
+/* Guards the scan-and-claim in el2_capsule_bind_slot(): the only caller
+ * (proc.c's proc_exec_with_policy, itself reachable from proc_schedule()'s
+ * per-core loop via proc_handle_launch_request) can run concurrently on
+ * cores 2/3 (the fixed user-core assignment), and el2_capsule_bind_slot
+ * scans/mutates g_capsules[]/g_stage2[]/the stage-2 page tables with no
+ * synchronization of its own -- a rubber-duck review caught this as a
+ * separate race from the g_slot_alloc_lock added earlier (which only
+ * guards procs[]). Two cores racing here could both see the same g_capsules
+ * slot as free and both claim/program it, corrupting one another's stage-2
+ * table. The critical section (a fixed EL2_CAPSULE_MAX-entry scan, one
+ * register + stage-2 plan build + hardware program, all bounded, no I/O)
+ * is short, so a simple spinlock held across the whole function is safe. */
+static volatile u8 g_capsule_bind_lock;
+
 #define S2_L1_BLOCK_SIZE   (1UL << 30)
 #define S2_L2_BLOCK_SIZE   (1UL << 21)
 #define S2_PTE_VALID       (1UL << 0)
@@ -378,27 +392,41 @@ i32 el2_capsule_bind_slot(u32 owner_principal, u32 manifest_hash, u64 el0_slot_b
 {
     if (!id_out || manifest_hash == 0 || el0_slot_size == 0)
         return -1;
+
+    while (__atomic_test_and_set(&g_capsule_bind_lock, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("yield");
+    }
+
     for (u32 i = 0; i < EL2_CAPSULE_MAX; i++) {
         if (!g_capsules[i].used) continue;
         if (g_capsules[i].owner_principal == owner_principal &&
             g_capsules[i].manifest_hash == manifest_hash) {
             *id_out = i;
+            __atomic_clear(&g_capsule_bind_lock, __ATOMIC_RELEASE);
             return 0;
         }
     }
     for (u32 i = 0; i < EL2_CAPSULE_MAX; i++) {
         if (g_capsules[i].used) continue;
         if (el2_capsule_register(i, owner_principal, manifest_hash, el0_slot_base,
-                                 el0_slot_base, el0_slot_size) != 0)
+                                 el0_slot_base, el0_slot_size) != 0) {
+            __atomic_clear(&g_capsule_bind_lock, __ATOMIC_RELEASE);
             return -1;
+        }
         if (el2_stage2_plan_set(i, el0_slot_base, el0_slot_size, el0_slot_base,
-                                EL2_STAGE2_F_ACTIVATE_VM) != 0)
+                                EL2_STAGE2_F_ACTIVATE_VM) != 0) {
+            __atomic_clear(&g_capsule_bind_lock, __ATOMIC_RELEASE);
             return -1;
-        if (el2_stage2_enable(i, true) != 0)
+        }
+        if (el2_stage2_enable(i, true) != 0) {
+            __atomic_clear(&g_capsule_bind_lock, __ATOMIC_RELEASE);
             return -1;
+        }
         *id_out = i;
+        __atomic_clear(&g_capsule_bind_lock, __ATOMIC_RELEASE);
         return 0;
     }
+    __atomic_clear(&g_capsule_bind_lock, __ATOMIC_RELEASE);
     return -1;
 }
 
