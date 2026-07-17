@@ -2,14 +2,17 @@
  * libFuzzer harness for the capsule manifest/card text parser
  * (src/capsule_manifest_parse.c).
  *
- * capsule_manifest_parse() is the parser behind proc.c's mandatory-by-default
- * stage-2 hardware isolation (capsule_manifest_load) and
- * capsule_store_load_manifest() -- a storage-facing text parser that decides
- * whether a process gets isolated is exactly the kind of surface the hard
- * scan invariants ask for a standalone fuzz harness on. Malformed/adversarial
- * input must be rejected (return false) without crashing, corrupting adjacent
- * memory, or reading out of bounds -- never silently succeed with garbage
- * fields.
+ * capsule_manifest_parse() is the parser behind capsule_store_load_manifest()
+ * -- the "capsule pack" loader used by kernel.c console commands and
+ * uhttp_bridge.c. NOTE: it is NOT the parser proc.c's mandatory-by-default
+ * stage-2 isolation (capsule_manifest_load) uses -- that is a separate,
+ * hand-rolled <path>.cap parser in proc.c writing into struct process
+ * directly, not covered by this harness (an earlier version of this comment
+ * incorrectly conflated the two). This is still a real storage/network-
+ * facing text parser worth fuzzing in its own right: malformed/adversarial
+ * input must be rejected (return false) without crashing, corrupting
+ * adjacent memory, or reading out of bounds -- never silently succeed with
+ * garbage fields.
  *
  * Build (once clang/LLVM is available):
  *   clang -fsanitize=fuzzer,address,undefined -g -O1 -std=gnu11 \

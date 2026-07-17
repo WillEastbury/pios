@@ -15033,14 +15033,15 @@ static void ui_cmd_capsule(u32 argc, char **argv)
         fb_printf("capsule=%u st=0x%x faults=0x%x\n", id, st, faults);
         {
             u32 fc = 0, active = 0, last_cap = 0;
-            u64 esr = 0, elr = 0, far_ipa = 0, sp_el1 = 0;
+            u64 esr = 0, elr = 0, far_ipa = 0, sp = 0;
+            bool faulted_el0 = false;
             u32 core = core_id();
-            if (el2_stage2_fault_detail(core, &fc, &esr, &elr, &far_ipa, &sp_el1,
-                                        &active, &last_cap)) {
+            if (el2_stage2_fault_detail(core, &fc, &esr, &elr, &far_ipa, &sp,
+                                        &faulted_el0, &active, &last_cap)) {
                 fb_printf("core=%u active=%u last_fault_cap=%u count=%u\n",
                           core, active, last_cap, fc);
-                fb_printf("esr=0x%x elr=0x%x far_ipa=0x%x sp_el1=0x%x\n",
-                          esr, elr, far_ipa, sp_el1);
+                fb_printf("esr=0x%x elr=0x%x far_ipa=0x%x sp_%s=0x%x\n",
+                          esr, elr, far_ipa, faulted_el0 ? "el0" : "el1", sp);
             }
         }
         return;

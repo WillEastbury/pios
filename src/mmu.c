@@ -218,22 +218,33 @@ static void map_user_kernel_low(u64 *l2)
     }
 }
 
+/* PTE_NG (not global) on all three of these: they map per-process, per-slot
+ * private code/data pages (user_l3_proc[uc][slot], reachable only via this
+ * process's own TTBR0). Without NG these entries are TLB-global, so a stale
+ * translation could in principle outlive a slot's reuse by ASID alone --
+ * a rubber-duck review caught that the EL1-side variants here lacked PTE_NG
+ * while the EL0-side ones (user_page_el0_*_attrs below) already had it.
+ * Correctness never depended on this: mmu_switch_to_user/_kernel always do a
+ * full, all-ASID TLB invalidate on every switch regardless of tagging (see
+ * the ASID comment on mmu_switch_to_user), so no stale entry has ever
+ * actually survived a switch. This closes the gap so the ASID tagging is
+ * also real defense-in-depth here, not just on the EL0 mappings. */
 static inline u64 user_page_rwx_attrs(void)
 {
     return PTE_VALID | PTE_PAGE | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_NG;
 }
 
 static inline u64 user_page_rx_attrs(void)
 {
     return PTE_VALID | PTE_PAGE | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RO_EL1 | PTE_UXN;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RO_EL1 | PTE_UXN | PTE_NG;
 }
 
 static inline u64 user_page_rw_xn_attrs(void)
 {
     return PTE_VALID | PTE_PAGE | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN | PTE_NG;
 }
 
 static inline u64 user_page_el0_rx_attrs(void)
@@ -500,7 +511,24 @@ void mmu_enable_caching(void) {
      * read-write + execute-never. rodata_hi rounds DOWN like code_hi/code_lo --
      * a page straddling the rodata/data boundary must come out writable, not
      * read-only, or the first write to an early .data global page-sharing with
-     * the .rodata tail would fault. */
+     * the .rodata tail would fault.
+     *
+     * IMPORTANT (corrected after rubber-duck review): this whole mechanism only
+     * covers block 0, physical [0x0, 0x1FFFFF] via l2_table_low/l3_block0 -- it
+     * assumes __text_start falls inside that first 2MB, which is true for real
+     * Pi5 hardware (link.ld links at 0x80000) but NOT for QEMU (link_qemu_full.ld
+     * links at 0x40080000, inside L1[1]'s separate 1GB block, untouched by this
+     * function). So even when force-enabled on QEMU for a one-off test
+     * (PIOS_ENABLE_CACHE_REMAP=1), this loop still runs and correctly enforces
+     * RO+X/RW+XN over the *unused* low-2MB region, but it does NOT touch the
+     * QEMU kernel's own .text/.rodata/.data at 0x40080000+, which stays whatever
+     * start.S's coarse 1GB block left it as (WB, RWX, no PXN/UXN). A QEMU-forced
+     * run of this path therefore does not prove W^X actually protects the
+     * running kernel's own code -- only a real Pi5 hardware boot (where
+     * PIOS_ENABLE_CACHE_REMAP defaults to 1 and __text_start genuinely sits in
+     * block 0) exercises that. Verify via readelf -l on real_kernel.elf (PT_LOAD
+     * R E vs RW segments) and, ideally, an on-device page-table dump rather than
+     * a QEMU run. */
     extern char __text_start[];
     extern char __rodata_end[];
     extern char __bss_start[];

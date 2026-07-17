@@ -81,10 +81,13 @@ u64 el2_sync_fault_trap(u64 esr, u64 elr);
 
 /* Direct (non-HVC) accessor for the fuller per-core stage-2 fault context
  * (core, syndrome, PC, SP, faulting IPA, capsule) captured by
- * el2_sync_fault_trap. Returns false if core >= 4. */
+ * el2_sync_fault_trap. far_ipa is the full IPA (HPFAR_EL2+FAR_EL2
+ * combined, not raw HPFAR_EL2); sp is SP_EL0 or SP_EL1 depending on
+ * faulted_el0 (which EL the faulting context was running at). Returns
+ * false if core >= 4. */
 bool el2_stage2_fault_detail(u32 core, u32 *fault_count, u64 *esr, u64 *elr,
-                              u64 *far_ipa, u64 *sp_el1, u32 *active_capsule,
-                              u32 *last_fault_capsule);
+                              u64 *far_ipa, u64 *sp, bool *faulted_el0,
+                              u32 *active_capsule, u32 *last_fault_capsule);
 
 /* QEMU-safe pure-logic selftest: per-core activation state, fail-closed IPA
  * bounds, and cross-capsule PA overlap rejection. See kernel.c selftest

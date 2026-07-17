@@ -1684,9 +1684,21 @@ static u8 *slot_base(u32 slot)
  * per-core) -- an unlocked scan let two cores both see the same index as
  * PROC_EMPTY and both proceed to use it. This is the one shared mutable
  * global in this file that genuinely needs a lock rather than message
- * passing: process-slot allocation is rare (process creation, not the
- * scheduler hot path) and needs a strict single-claimant guarantee that a
- * FIFO round-trip can't cheaply give here. */
+ * passing, and needs a strict single-claimant guarantee that a FIFO
+ * round-trip can't cheaply give here.
+ *
+ * NOTE (corrected after rubber-duck review): find_empty_slot() IS reachable
+ * from proc_schedule()'s per-core for(;;) loop, via
+ * proc_handle_launch_request() -> proc_exec_with_policy() -- it is not
+ * purely a cold, out-of-band process-creation path as an earlier version of
+ * this comment claimed. What keeps this safe is that the lock is only
+ * actually taken when (a) the unlocked "maybe_free" peek below finds a free
+ * slot AND (b) a genuine new-process launch request is pending (i.e.
+ * proc_handle_launch_request's own seq/done_seq gate already passed) --
+ * both rare, bounded events, not a per-tick occurrence. The critical
+ * section itself is a fixed MAX_PROCS_PER_CORE-element scan plus one write,
+ * with no I/O or nested locking, so the spin is short and bounded even
+ * though it executes inside the scheduler loop's call tree. */
 static volatile u8 g_slot_alloc_lock;
 
 static i32 find_empty_slot(void)
@@ -1713,10 +1725,12 @@ static i32 find_empty_slot(void)
     if (!maybe_free)
         return -1;
 
-    /* Acquire: simple test-and-set spinlock. Process creation is rare and
-     * bounded (MAX_PROCS_PER_CORE slots), so a spin here is bounded too --
-     * this is not the scheduler hot path the "no locks in scheduler"
-     * invariant is about. */
+    /* Acquire: simple test-and-set spinlock. Reached from proc_schedule()'s
+     * call tree (see the note on g_slot_alloc_lock's declaration above), but
+     * only actually taken on the rare/bounded "free slot exists and a launch
+     * is pending" path, with a fixed MAX_PROCS_PER_CORE-element critical
+     * section and no I/O -- not the kind of unbounded/blocking lock the
+     * "no locks in scheduler" invariant is meant to rule out. */
     while (__atomic_test_and_set(&g_slot_alloc_lock, __ATOMIC_ACQUIRE)) {
         __asm__ volatile("yield");
     }

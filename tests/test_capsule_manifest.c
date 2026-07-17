@@ -3,10 +3,14 @@
  * src/capsule_manifest_parse.c (extracted from capsule_store.c so it can be
  * built and fuzzed on the host without pulling in WALFS).
  *
- * capsule_manifest_parse() is the parser behind proc.c's mandatory-by-default
- * stage-2 isolation (capsule_manifest_load) and capsule_store_load_manifest()
- * -- a storage-facing text parser that decides whether a process gets
- * hardware-isolated, so bounds/behavior correctness here is security-relevant.
+ * capsule_manifest_parse() is the parser behind capsule_store_load_manifest()
+ * -- the "capsule pack" loader used by kernel.c console commands and
+ * uhttp_bridge.c. NOTE: it is NOT the parser proc.c's mandatory-by-default
+ * stage-2 isolation (capsule_manifest_load) uses -- that is a separate,
+ * hand-rolled <path>.cap parser in proc.c writing into struct process
+ * directly (an earlier version of this comment incorrectly conflated the
+ * two). Bounds/behavior correctness here is still security-relevant for the
+ * capsule-pack loading path this parser actually serves.
  *
  * Compiled natively (see tests/run_host_tests.py). tests/stubinc is on the
  * include path ahead of include/ so types.h and simd.h resolve to host shims.

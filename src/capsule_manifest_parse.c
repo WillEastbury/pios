@@ -8,11 +8,21 @@
  * was carved out of dhcp.c for the same reason (see tests/run_host_tests.py,
  * tests/fuzz_capsule_manifest.c).
  *
- * capsule_manifest_parse() is the authorization-relevant parser behind
- * proc.c's capsule_manifest_load() (mandatory-by-default stage-2 isolation)
- * and capsule_store_load_manifest() -- a network- or storage-facing text
- * parser is exactly the kind of surface the hard scan invariants ask for a
- * standalone fuzz harness on.
+ * CORRECTION (post rubber-duck-review): capsule_manifest_parse() is the
+ * parser behind capsule_store_load_manifest() only -- the "capsule pack"
+ * loader used by kernel.c's console commands and uhttp_bridge.c. It is
+ * NOT used by proc.c's capsule_manifest_load(), which is a separate,
+ * hand-rolled <path>.cap line/key=value parser that writes directly into
+ * struct process fields (quotas, capsule_group, capsule_vfs_root, fs/ipc/
+ * pipe prefixes, card/port ranges) rather than the struct capsule_manifest
+ * this file parses into. An earlier version of this comment incorrectly
+ * claimed the two were the same code path; they are not, so this fuzz
+ * harness's coverage does not extend to the mandatory-by-default per-
+ * process stage-2 isolation parser in proc.c. That parser remains
+ * untested by fuzzing -- unifying the two would require reconciling two
+ * different target structs and is a larger, separately-scoped refactor,
+ * not a safe surgical fix for this pass. This file is still a real,
+ * network/storage-facing text parser worth fuzzing in its own right.
  */
 
 #include "capsule_store.h"
