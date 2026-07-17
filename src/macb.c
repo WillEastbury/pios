@@ -42,6 +42,7 @@
 #define IDR         0x002C  /* Interrupt Disable */
 #define IMR         0x0030  /* Interrupt Mask */
 #define MAN         0x0034  /* PHY Maintenance (MDIO) */
+#define PTR         0x0038  /* Pause Time (802.3x flow control quantum) */
 #define SA1B        0x0088  /* Specific Address 1 Bottom (GEM) */
 #define SA1T        0x008C  /* Specific Address 1 Top (GEM) */
 #define USRIO       0x00C0  /* User I/O (GEM — not 0x0C which is MACB) */
@@ -101,6 +102,13 @@ static inline void ecw(u32 off, u32 val) { mmio_write(ETH_CFG_BASE + off, val); 
 #define NCFGR_CAF       (1 << 4)   /* Copy all frames */
 #define NCFGR_BIG       (1 << 8)   /* Receive 1536 byte frames */
 #define NCFGR_GBE       (1 << 10)  /* Gigabit mode (GEM) */
+#define NCFGR_PAE       (1 << 13)  /* Pause Enable: MAC auto-generates 802.3x
+                                     * PAUSE frames when the RX FIFO nears full
+                                     * (proactive link-layer backpressure on
+                                     * the peer, before our own RX ring/DMA
+                                     * ever has to drop/overrun). Also makes
+                                     * TX honor PAUSE frames received from the
+                                     * peer. See PTR (Pause Time Register). */
 #define NCFGR_CLK_MASK  (7 << 18)  /* MDC clock divider (GEM) */
 #define NCFGR_CLK_DIV64 (3 << 18)
 #define NCFGR_DBW_MASK  (3 << 21)  /* Data bus width */
@@ -579,8 +587,19 @@ bool macb_init(void) {
         if (dbwdef >= 4) dbw = 2;       /* 128-bit */
         else if (dbwdef >= 2) dbw = 1;   /* 64-bit */
         else dbw = 0;                     /* 32-bit */
-        mw(NCFGR, NCFGR_CLK_DIV64 | (dbw << 21) | (1 << 17) /* DRFCS */);
+        mw(NCFGR, NCFGR_CLK_DIV64 | (dbw << 21) | (1 << 17) /* DRFCS */ | NCFGR_PAE);
     }
+
+    /* 802.3x flow control quantum for auto-generated PAUSE frames (units of
+     * 512 bit-times at the negotiated link speed). Missing entirely before
+     * this fix -- the MAC had no ability to ask the peer/switch to back off
+     * before its own RX FIFO/ring filled up, unlike Linux's macb/GEM driver
+     * (which negotiates this via phylink) and every other 802.3x-capable
+     * stack. 0xFFFF is the max quantum: a conservative, safe choice since the
+     * MAC re-asserts PAUSE continuously while still congested and we don't
+     * yet send an explicit zero-quantum resume (TZQ), so a short quantum
+     * could let the peer resume before we've actually drained. */
+    mw(PTR, 0xFFFFU);
 
     /* Disable all interrupts (polling mode) then clear ISR */
     mw(IDR, 0xFFFFFFFF);
@@ -745,13 +764,14 @@ bool macb_init(void) {
         else if (dbwdef2 >= 2) dbw2 = 1;   /* 64-bit */
         else dbw2 = 0;                     /* 32-bit */
         u32 ncfgr = NCFGR_BIG | NCFGR_CLK_DIV64
-                   | (dbw2 << 21) | (1 << 17) /* DRFCS */;
+                   | (dbw2 << 21) | (1 << 17) /* DRFCS */ | NCFGR_PAE;
         if (rx_csum_enabled)
             ncfgr |= NCFGR_RXCOEN;
         if (gig)    ncfgr |= NCFGR_GBE;
         if (spd100) ncfgr |= NCFGR_SPD;
         if (fd)     ncfgr |= NCFGR_FD;
         mw(NCFGR, ncfgr);
+        mw(PTR, 0xFFFFU);   /* re-assert pause quantum (NCFGR write doesn't clear it, but cheap insurance) */
         link_mbps = gig ? 1000U : (spd100 ? 100U : 10U);
         link_full_duplex = fd;
 

@@ -3383,7 +3383,8 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     } else if (http_streq(cmd, "rp1 irq") || http_streq(cmd, "rp1 irq clear") ||
                http_streq(cmd, "rp1 irq arm-eth") || http_streq(cmd, "rp1 irq raise-eth") ||
                http_streq(cmd, "rp1 irq pend-gic") || http_streq(cmd, "rp1 irq arm-host6") ||
-               http_streq(cmd, "rp1 irq arm-host6-1") || http_streq(cmd, "rp1 irq source-diag")) {
+               http_streq(cmd, "rp1 irq arm-host6-1") || http_streq(cmd, "rp1 irq source-diag") ||
+               http_starts_with(cmd, "rp1 irq storm")) {
         if (http_streq(cmd, "rp1 irq clear")) {
             core0_eth_irq_drain_and_quench(false);
             http_append(out, &len, max, "rp1 eth irq quench\n");
@@ -3432,6 +3433,49 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
         } else if (http_streq(cmd, "rp1 irq raise-eth")) {
             rp1_eth_irq_raise_test();
             http_append(out, &len, max, "rp1 eth mip raise sent\n");
+        } else if (http_starts_with(cmd, "rp1 irq storm")) {
+            /* Synthetic IRQ-storm harness: fire the same MIP INT_RAISE edge
+             * used by "raise-eth" in a tight, bounded loop, entirely
+             * independent of real MAC/network activity. Interrupts stay
+             * unmasked across the loop (this handler doesn't mask them), so
+             * each raise is serviced synchronously by core0_eth_irq_handler
+             * before the next iteration -- the worst-case back-to-back
+             * inter-arrival gap the real IRQ-arm race and the poll-fallback
+             * backstop are meant to survive. Isolates "does pure IRQ rate
+             * alone reproduce/stress the problem" from "does it need real RX
+             * ring backlog too". Bounded to 100000 to keep this HTTP request
+             * from hanging indefinitely on a misbehaving build. */
+            const char *narg = cmd + 13;
+            while (*narg == ' ') narg++;
+            u32 n = 0;
+            while (*narg >= '0' && *narg <= '9') { n = n * 10U + (u32)(*narg - '0'); narg++; }
+            if (n == 0) n = 1000;
+            if (n > 100000U) n = 100000U;
+            u64 before = core0_eth_irq_count;
+            u32 stall_before = core0_eth_irq_stall_streak;
+            u32 fallback_before = core0_eth_irq_fallback_count;
+            bool poll_fallback_before = core0_eth_irq_poll_fallback;
+            for (u32 i = 0; i < n; i++)
+                rp1_eth_irq_raise_test();
+            http_append(out, &len, max, "rp1 eth irq storm n=");
+            http_append_u64(out, &len, max, n);
+            http_append(out, &len, max, " count_before=");
+            http_append_u64(out, &len, max, before);
+            http_append(out, &len, max, " count_after=");
+            http_append_u64(out, &len, max, core0_eth_irq_count);
+            http_append(out, &len, max, " stall_streak_before=");
+            http_append_u64(out, &len, max, stall_before);
+            http_append(out, &len, max, " stall_streak_after=");
+            http_append_u64(out, &len, max, core0_eth_irq_stall_streak);
+            http_append(out, &len, max, " poll_fallback_before=");
+            http_append(out, &len, max, poll_fallback_before ? "1" : "0");
+            http_append(out, &len, max, " poll_fallback_after=");
+            http_append(out, &len, max, core0_eth_irq_poll_fallback ? "1" : "0");
+            http_append(out, &len, max, " fallback_count_before=");
+            http_append_u64(out, &len, max, fallback_before);
+            http_append(out, &len, max, " fallback_count_after=");
+            http_append_u64(out, &len, max, core0_eth_irq_fallback_count);
+            http_append(out, &len, max, "\n");
         } else if (http_streq(cmd, "rp1 irq pend-gic")) {
             u64 before = core0_eth_irq_count;
             __asm__ volatile("msr daifset, #2" ::: "memory");
