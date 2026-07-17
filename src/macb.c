@@ -178,7 +178,22 @@ static inline void ecw(u32 off, u32 val) { mmio_write(ETH_CFG_BASE + off, val); 
  * and stalling the MAC. PIOS is network-first, so RX is sized generously: 512
  * descriptors (16x the original 32). TX 64 covers many in-flight responses.
  * macb_rx_recover() remains the backstop if a ring still overruns. */
-#define NUM_RX  512
+/* NUM_RX bumped 512->896 (2026-07-17, live-hardware wrap-boundary diagnosis):
+ * dtrace evidence from 6 consecutive real overrun events ALL showed rx_idx=0
+ * exactly at detection (a ~1-in-512^6 coincidence if random) with a clean
+ * contiguous OWN-bit run from index 0 (never a "hole" pattern), pointing at a
+ * bug specifically tied to the ring wrap boundary (descriptor NUM_RX-1 -> 0)
+ * rather than raw traffic volume (one captured episode overran with only ~38
+ * trivial ARP-keepalive frames in the whole preceding minute). Bumping ring
+ * size is a diagnostic test as much as a mitigation: if wrap frequency (and
+ * therefore freeze frequency) drops roughly in proportion to the size
+ * increase, that confirms the wrap-boundary theory. 896 is the largest value
+ * that still fits the existing 2MB DMA_NET arena without touching the
+ * physical memory map (see the _Static_assert below and MACB_DMA_POOL_BYTES);
+ * expanding the arena itself would require re-laying-out DMA_NET/DMA_DISK/IPC
+ * SHM base addresses, a materially riskier change given this SoC's history of
+ * boot-bricking from memory-map mistakes (see AGENTS.md "checkpoint 082"). */
+#define NUM_RX  896
 #define NUM_TX  64
 #define BUF_SIZE 2048
 

@@ -74,10 +74,11 @@ static u8 tx_frame[2048] ALIGNED(64);
  * and frames waited seconds before being processed -> multi-second ICMP/HTTP
  * latency that looked like a wedge. Draining the whole ring per poll keeps the
  * ring empty under load while staying bounded by the ring depth. Must be >=
- * NUM_RX (macb.c) so one poll can clear a full ring; the deeper ring (512) plus
- * the macb_rx_recover() overrun safety net is what keeps concurrent-connection
- * bursts from wedging the NIC. */
-#define NET_RX_BURST_MAX 512U
+ * NUM_RX (macb.c) so one poll can clear a full ring; the deeper ring (896,
+ * bumped from 512 on 2026-07-17 for a wrap-boundary diagnostic -- see macb.c
+ * NUM_RX comment) plus the macb_rx_recover() overrun safety net is what keeps
+ * concurrent-connection bursts from wedging the NIC. */
+#define NET_RX_BURST_MAX 896U
 #define NET_FIFO_BURST_MAX 4U
 #define NET_MAX_MULTICAST_MACS 8U
 
