@@ -51,13 +51,28 @@ void uart_init(void) {
     uart_hex(*uart_cr);
     uart_puts("\r\n");
 #endif
+    (void)gpio14_ctrl;
+    (void)pad14;
 
-    /* Strategy: copy GPIO14's exact config to GPIO15 + enable IE */
-    u32 g14_fsel = *gpio14_ctrl & 0x1F;
-    *gpio15_ctrl = (*gpio15_ctrl & ~0x1F) | g14_fsel;
+    /* GPIO15 RX: explicit ALT4 + pull-up-enable + pull-down-clear +
+     * input-enable, per Circle's proven Pi5 UART research (commit 20ec8f4).
+     * A later "debug" commit (acfcc67) replaced this with a "copy GPIO14's
+     * pad/funcsel config to GPIO15" strategy that silently DROPPED the
+     * pull-up-enable (PUE) bit: GPIO14 is an output (TX) pin and has no
+     * reason to carry pull-up/pull-down configuration, so blindly copying
+     * its pad bits onto GPIO15 (an input/RX pin, which genuinely needs a
+     * pull-up to avoid a floating line) left RX non-functional -- this was a
+     * real regression, not a working alternative approach. Restored the
+     * explicit, known-good configuration here. */
+    u32 ctrl = *gpio15_ctrl;
+    ctrl = (ctrl & ~0x1FU) | 4U;  /* funcsel = 4 (ALT4 = UART0 RX) */
+    *gpio15_ctrl = ctrl;
 
-    /* Copy pad14 config to pad15 + force IE (input enable) */
-    *pad15 = *pad14 | (1 << 6);
+    u32 pad = *pad15;
+    pad |= (1U << 6);   /* IE  — input enable */
+    pad |= (1U << 3);   /* PUE — pull-up enable */
+    pad &= ~(1U << 2);  /* PDE — clear pull-down */
+    *pad15 = pad;
 
     /* Enable RXE in UART control register */
     *uart_cr = *uart_cr | (1 << 9);
