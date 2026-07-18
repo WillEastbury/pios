@@ -957,6 +957,7 @@ u32 net_poll(void) {
     bool checksum_trusted;
     u32 got = 0;
 
+    stats.poll_calls++;
     prefetch_r(rx_frame);
 
     for (u32 burst = 0; burst < NET_RX_BURST_MAX; burst++) {
@@ -990,11 +991,22 @@ u32 net_poll(void) {
         u16 etype = ntohs(eth->ethertype);
 
         /* Dispatch by EtherType */
-        if (likely(etype == ETH_P_IP))
+        if (likely(etype == ETH_P_IP)) {
             handle_ip(rx_frame, len, checksum_trusted);
-        else if (etype == ETH_P_ARP)
+            stats.rx_dispatched++;
+        } else if (etype == ETH_P_ARP) {
             arp_input(rx_frame, len);
+            stats.rx_dispatched++;
+        } else {
+            stats.rx_unsupported++;
+        }
     }
+
+    stats.poll_last_frames = got;
+    if (got == 0)
+        stats.poll_empty++;
+    if (got == NET_RX_BURST_MAX)
+        stats.poll_budget_hits++;
 
     net_handle_fifo_request();
 

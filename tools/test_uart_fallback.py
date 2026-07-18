@@ -64,8 +64,11 @@ def main():
         checks = {
             "boguscmdxyz": "ERR: unknown command",
             "macbdiag": "macbdiag unavailable",
+            "rxdiag": "NET  ingress=",
             "irq status": "irq total=",
             "stackdiag": "IP   rx=",
+            "arp status": "arp requests_sent=",
+            "nic counters": "rx_total=",
         }
         failures = []
         for cmd, expect in checks.items():
@@ -171,4 +174,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

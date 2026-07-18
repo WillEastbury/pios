@@ -527,6 +527,7 @@ static volatile u32 core0_eth_irq_stall_streak;   /* consecutive quenches that f
 static volatile bool core0_eth_irq_poll_fallback; /* true: IRQ line masked, relying on poll only */
 static volatile u64 core0_eth_irq_fallback_since_ms;
 static volatile u32 core0_eth_irq_fallback_count;  /* lifetime fallback engagements (diagnostic) */
+static volatile u32 core0_io_flags;
 static u32 core0_eth_source_diag[24];
 static volatile u32 core0_eth_source_diag_seq;
 
@@ -2401,6 +2402,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, "processes\n  Show process snapshot with PPID, arena/span telemetry, and process graph roots/children.\n");
         } else if (http_streq(topic, "netstat")) {
             http_append(out, &len, max, "netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
+        } else if (http_streq(topic, "rxdiag")) {
+            http_append(out, &len, max, "rxdiag\n  Correlate MAC DMA drain, NIC filtering, NET dispatch, poll cadence, and Ethernet IRQ handoff.\n");
         } else if (http_streq(topic, "netcfg")) {
             http_append(out, &len, max, "netcfg | netcfg routes | netcfg neighbors | netcfg trace\n  Show network summary, route table, ARP/neighbor table, and last outbound route/MAC/UDP decision.\n");
         } else if (http_streq(topic, "dns")) {
@@ -6177,6 +6180,11 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, c.rx_arp_not_us);
         http_append(out, &len, max, " flood_blocked=");
         http_append_u64(out, &len, max, c.flood_blocked);
+        /* Direction-specific totals avoid the legacy mixed RX/TX counters. */
+        http_append(out, &len, max, " rx_total=");
+        http_append_u64(out, &len, max, c.rx_total);
+        http_append(out, &len, max, " tx_total=");
+        http_append_u64(out, &len, max, c.tx_total);
         http_append(out, &len, max, " tx_csum_hw=");
         http_append_u64(out, &len, max, c.tx_csum_offloaded);
         http_append(out, &len, max, " tx_csum_sw=");
@@ -6185,6 +6193,62 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, c.rx_csum_trusted);
         http_append(out, &len, max, " rx_csum_untrusted=");
         http_append_u64(out, &len, max, c.rx_csum_untrusted);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "rxdiag")) {
+        nic_packet_counters_t nc;
+        const net_stats_t *ns = net_get_stats();
+        nic_packet_counters(&nc);
+
+#if PIOS_HAS_GENET
+        struct macb_diag md;
+        macb_diag(&md);
+        http_append(out, &len, max, "MAC  rx_recv=");
+        http_append_u64(out, &len, max, md.rx_recv);
+        http_append(out, &len, max, " owned=");
+        http_append_u64(out, &len, max, md.rx_owned);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, md.ring_size);
+        http_append(out, &len, max, " recover=");
+        http_append_u64(out, &len, max, md.rx_recover);
+        http_append(out, &len, max, " live_recover=");
+        http_append_u64(out, &len, max, md.rx_live_recover);
+#else
+        http_append(out, &len, max, "MAC  unavailable (non-GEM platform)");
+#endif
+        http_append(out, &len, max, "\nNIC  rx_accept=");
+        http_append_u64(out, &len, max, nc.rx_total);
+        http_append(out, &len, max, " arp_early_drop=");
+        http_append_u64(out, &len, max, nc.rx_arp_not_us);
+        http_append(out, &len, max, " filter_drop=");
+        http_append_u64(out, &len, max, nc.rx_filter_drop);
+        http_append(out, &len, max, "\nNET  ingress=");
+        http_append_u64(out, &len, max, ns->rx_packets);
+        http_append(out, &len, max, " dispatched=");
+        http_append_u64(out, &len, max, ns->rx_dispatched);
+        http_append(out, &len, max, " unsupported=");
+        http_append_u64(out, &len, max, ns->rx_unsupported);
+        http_append(out, &len, max, " polls=");
+        http_append_u64(out, &len, max, ns->poll_calls);
+        http_append(out, &len, max, " empty=");
+        http_append_u64(out, &len, max, ns->poll_empty);
+        http_append(out, &len, max, " budget_hits=");
+        http_append_u64(out, &len, max, ns->poll_budget_hits);
+        http_append(out, &len, max, " last_frames=");
+        http_append_u64(out, &len, max, ns->poll_last_frames);
+        http_append(out, &len, max, "\nIRQ  eth=");
+        http_append_u64(out, &len, max, core0_eth_irq_count);
+        http_append(out, &len, max, " pending_flags=");
+        http_append_hex32(out, &len, max, core0_io_flags);
+        http_append(out, &len, max, " deferred=");
+        http_append_u64(out, &len, max, core0_eth_irq_deferred_quench ? 1U : 0U);
+        http_append(out, &len, max, " quench_passes=");
+        http_append_u64(out, &len, max, core0_eth_irq_quench_passes);
+        http_append(out, &len, max, " stall_streak=");
+        http_append_u64(out, &len, max, core0_eth_irq_stall_streak);
+        http_append(out, &len, max, " fallback=");
+        http_append_u64(out, &len, max, core0_eth_irq_poll_fallback ? 1U : 0U);
+        http_append(out, &len, max, " fallback_count=");
+        http_append_u64(out, &len, max, core0_eth_irq_fallback_count);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "arp status")) {
         /* Full ARP subsystem diagnostics: reply/request rate-limit drops
@@ -8295,18 +8359,6 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
     http_diag.build_len = len;
     http_trace(HTTP_EVT_BUILD_EXIT, HTTP_ROUTE_ROOT, len, 200);
     return len;
-}
-
-static bool http_headers_complete(const u8 *buf, u32 len)
-{
-    if (!buf || len < 4)
-        return false;
-    for (u32 i = 0; i + 3 < len; i++) {
-        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
-            buf[i + 2] == '\r' && buf[i + 3] == '\n')
-            return true;
-    }
-    return false;
 }
 
 static u32 http_header_body_offset(const u8 *buf, u32 len)
@@ -16689,7 +16741,24 @@ static void ui_cmd_arp(u32 argc, char **argv)
         ui_console_write("\n");
         return;
     }
-    ui_console_write("usage: arp probe\n");
+    if (argc >= 2 && ui_streq(argv[1], "status")) {
+        const arp_stats_t *st = arp_get_stats();
+        ui_console_write("arp requests_sent=");
+        ui_console_u64_dec(st->requests_sent);
+        ui_console_write(" replies_sent=");
+        ui_console_u64_dec(st->replies_sent);
+        ui_console_write(" learned=");
+        ui_console_u64_dec(st->learned);
+        ui_console_write(" drop_spoof=");
+        ui_console_u64_dec(st->drop_spoof);
+        ui_console_write(" drop_ratelimit=");
+        ui_console_u64_dec(st->drop_ratelimit);
+        ui_console_write(" conflicts=");
+        ui_console_u64_dec(st->conflicts);
+        ui_console_write("\n");
+        return;
+    }
+    ui_console_write("usage: arp probe | arp status\n");
 }
 
 static void ui_cmd_nic(u32 argc, char **argv)
@@ -16712,6 +16781,15 @@ static void ui_cmd_nic(u32 argc, char **argv)
         ui_console_u64_dec(c.firewalled);
         ui_console_write(" rate_limited=");
         ui_console_u64_dec(c.rate_limited);
+        ui_console_write(" rx_arp_not_us=");
+        ui_console_u64_dec(c.rx_arp_not_us);
+        ui_console_write(" flood_blocked=");
+        ui_console_u64_dec(c.flood_blocked);
+        /* Direction-specific totals avoid the legacy mixed RX/TX counters. */
+        ui_console_write(" rx_total=");
+        ui_console_u64_dec(c.rx_total);
+        ui_console_write(" tx_total=");
+        ui_console_u64_dec(c.tx_total);
         ui_console_write(" tx_csum_hw=");
         ui_console_u64_dec(c.tx_csum_offloaded);
         ui_console_write(" tx_csum_sw=");
@@ -19103,7 +19181,6 @@ static void hdmi_dashboard_render(void)
 
 /* Core 0 I/O reactor: timer IRQ only marks work due and wakes the service
  * loop. Real I/O stays in thread context so IRQ latency remains bounded. */
-static volatile u32 core0_io_flags;
 static volatile u64 core0_io_wfi_count;
 static volatile u64 core0_io_wake_count;
 static volatile u64 core0_io_idle_ticks;

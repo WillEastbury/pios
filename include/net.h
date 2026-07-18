@@ -191,6 +191,12 @@ typedef struct {
     u64 drop_udp_malformed; /* UDP length mismatch */
     u64 drop_oversized;     /* frame > MTU */
     u64 drop_udp_bad_cksum;  /* UDP checksum failed */
+    u64 rx_dispatched;      /* accepted frames whose protocol handler returned */
+    u64 rx_unsupported;     /* accepted EtherTypes with no protocol handler */
+    u64 poll_calls;         /* lifetime net_poll() invocations */
+    u64 poll_empty;         /* net_poll() calls that received no frames */
+    u64 poll_budget_hits;   /* calls that consumed the full RX burst budget */
+    u32 poll_last_frames;   /* frames received by the most recent net_poll() */
 } net_stats_t;
 
 const net_stats_t *net_get_stats(void);
