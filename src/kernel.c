@@ -2374,19 +2374,18 @@ static void http_bench_row(char *out, u32 *len, u32 max, const char *label,
     http_append(out, len, max, "\n");
 }
 
-static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 req_len)
+/* The single, shared implementation of every "terminal" command (~150+
+ * commands: status/netstat/macbdiag/rp1 irq/stackdiag/processes/... -- the
+ * full diagnostic surface). Both the HTTP /api/terminal handler and the
+ * UART/F3 console (ui_console_exec()'s fallback, see below) dispatch into
+ * this ONE function so the two front-ends never drift out of sync and
+ * never duplicate command logic. Appends output to out/len/max using the
+ * same http_append() idiom used throughout the codebase; callers own the
+ * buffer and any header/prefix that precedes it. */
+static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *cmd)
 {
-    u32 len = 0;
-    char cmd[128];
-    http_append(out, &len, max,
-        "HTTP/1.0 200 OK\r\n"
-        "Content-Type: text/plain\r\n"
-        "Cache-Control: no-store\r\n"
-        "Connection: close\r\n\r\n");
-
-    if (!http_query_cmd(req, req_len, cmd, sizeof(cmd)))
-        http_append(out, &len, max, "usage: /api/terminal?cmd=<help|status|netstat|processes|users|ls /|firewall list|addr spec|kill pid|restart pid>\n");
-    else if (http_streq(cmd, "help")) {
+    u32 len = *len_ptr;
+    if (http_streq(cmd, "help")) {
         http_append(out, &len, max,
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
@@ -6240,6 +6239,23 @@ static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 r
     } else {
         http_append(out, &len, max, "unknown command\n");
     }
+    *len_ptr = len;
+}
+
+static u32 http_build_terminal_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    u32 len = 0;
+    char cmd[128];
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+
+    if (!http_query_cmd(req, req_len, cmd, sizeof(cmd)))
+        http_append(out, &len, max, "usage: /api/terminal?cmd=<help|status|netstat|processes|users|ls /|firewall list|addr spec|kill pid|restart pid>\n");
+    else
+        http_exec_terminal_command(out, &len, max, cmd);
     return len;
 }
 
@@ -16627,6 +16643,39 @@ static void ui_cmd_nic(u32 argc, char **argv)
     ui_console_write("usage: nic dump <on|off> | nic counters | nic offload\n");
 }
 
+/* Fallback for the UART/F3 console: when ui_console_exec()'s own argv-based
+ * dispatch doesn't recognise argv[0], reconstruct a flat space-separated
+ * command string and hand it to the SAME shared handler the HTTP
+ * /api/terminal endpoint uses (http_exec_terminal_command()) -- this is
+ * what closes the gap for commands like "macbdiag"/"rp1 irq"/"stackdiag"
+ * that previously only existed over HTTP, without duplicating any of
+ * their ~150-command logic. Uses static buffers (not stack) since the
+ * reconstructed command / rendered output can be sizeable and this runs
+ * on the shared core0 console context, not a recursive/re-entrant path. */
+static void ui_console_exec_shared_fallback(u32 argc, char **argv)
+{
+    static char joined[UI_CONSOLE_LINE_MAX];
+    static char rendered[8192];
+    u32 jl = 0;
+    for (u32 i = 0; i < argc; i++) {
+        if (i > 0 && jl + 1 < sizeof(joined))
+            joined[jl++] = ' ';
+        u32 tl = 0;
+        while (argv[i][tl] && jl + 1 < sizeof(joined)) {
+            joined[jl++] = argv[i][tl++];
+        }
+    }
+    joined[jl] = 0;
+
+    u32 len = 0;
+    http_exec_terminal_command(rendered, &len, sizeof(rendered), joined);
+    rendered[len < sizeof(rendered) ? len : sizeof(rendered) - 1] = 0;
+    if (ui_streq(rendered, "unknown command\n"))
+        ui_console_write("ERR: unknown command\n");
+    else
+        ui_console_write(rendered);
+}
+
 static void ui_cmd_cachestats(u32 argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -17303,7 +17352,7 @@ static void ui_console_exec(char *line)
             ui_console_write("ERR: usage reboot confirm\n");
         }
     } else {
-        ui_console_write("ERR: unknown command\n");
+        ui_console_exec_shared_fallback(argc, argv);
     }
 }
 
