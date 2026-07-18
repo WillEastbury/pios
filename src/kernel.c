@@ -6173,6 +6173,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, c.firewalled);
         http_append(out, &len, max, " rate_limited=");
         http_append_u64(out, &len, max, c.rate_limited);
+        http_append(out, &len, max, " rx_arp_not_us=");
+        http_append_u64(out, &len, max, c.rx_arp_not_us);
+        http_append(out, &len, max, " flood_blocked=");
+        http_append_u64(out, &len, max, c.flood_blocked);
         http_append(out, &len, max, " tx_csum_hw=");
         http_append_u64(out, &len, max, c.tx_csum_offloaded);
         http_append(out, &len, max, " tx_csum_sw=");
@@ -6182,6 +6186,115 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " rx_csum_untrusted=");
         http_append_u64(out, &len, max, c.rx_csum_untrusted);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "arp status")) {
+        /* Full ARP subsystem diagnostics: reply/request rate-limit drops
+         * (arp.c's ARP_REPLY_INTERVAL_MS is a GLOBAL, not per-source, 100ms
+         * window -- drop_ratelimit climbing under concurrent LAN ARP traffic
+         * is the leading suspect for the "board unreachable but MAC/DMA and
+         * firewall both look healthy" wedge symptom), spoof drops, and
+         * conflicts, alongside the early nic.c broadcast-not-for-us filter
+         * counter (rx_arp_not_us above in 'nic counters') for the OTHER
+         * candidate explanation. Both counters together let a single
+         * 'inspect' snapshot distinguish which path is actually dropping
+         * legitimate ARP traffic during a live wedge. */
+        const arp_stats_t *a = arp_get_stats();
+        http_append(out, &len, max, "arp requests_sent=");
+        http_append_u64(out, &len, max, a->requests_sent);
+        http_append(out, &len, max, " replies_sent=");
+        http_append_u64(out, &len, max, a->replies_sent);
+        http_append(out, &len, max, " learned=");
+        http_append_u64(out, &len, max, a->learned);
+        http_append(out, &len, max, " drop_spoof=");
+        http_append_u64(out, &len, max, a->drop_spoof);
+        http_append(out, &len, max, " drop_ratelimit=");
+        http_append_u64(out, &len, max, a->drop_ratelimit);
+        http_append(out, &len, max, " conflicts=");
+        http_append_u64(out, &len, max, a->conflicts);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "break") || http_starts_with(cmd, "break ")) {
+        /* Stop-the-world debug freeze: request a freeze on every OTHER core
+         * (never core_id() itself -- freezing your own console core would
+         * strand the very command session you're using to inspect/resume
+         * it). "break <core>" targets a single core instead. The target
+         * actually stops on whatever interrupt next fires there (typically
+         * the periodic timer) -- see irq_dispatch() in exception.c. */
+        u32 self = core_id() & 3U;
+        char *sp = cmd + 5;
+        while (*sp == ' ') sp++;
+        u32 target = 0xFFFFFFFFU;
+        if (*sp)
+            (void)http_parse_u32(sp, &target);
+        u32 requested = 0;
+        for (u32 core = 0; core < DEBUG_FREEZE_MAX_CORES; core++) {
+            if (core == self) continue;
+            if (target != 0xFFFFFFFFU && core != target) continue;
+            debug_freeze_request(core);
+            requested++;
+        }
+        http_append(out, &len, max, "break: requested freeze on ");
+        http_append_u64(out, &len, max, requested);
+        http_append(out, &len, max, " core(s) (self=core");
+        http_append_u64(out, &len, max, self);
+        http_append(out, &len, max, " stays live); poll 'freeze status' until frozen=1, then 'regs <core>'\n");
+    } else if (http_streq(cmd, "resume") || http_starts_with(cmd, "resume ")) {
+        char *sp = cmd + 6;
+        while (*sp == ' ') sp++;
+        u32 target = 0xFFFFFFFFU;
+        if (*sp)
+            (void)http_parse_u32(sp, &target);
+        u32 cleared = 0;
+        for (u32 core = 0; core < DEBUG_FREEZE_MAX_CORES; core++) {
+            if (target != 0xFFFFFFFFU && core != target) continue;
+            debug_freeze_clear(core);
+            cleared++;
+        }
+        http_append(out, &len, max, "resume: cleared freeze request on ");
+        http_append_u64(out, &len, max, cleared);
+        http_append(out, &len, max, " core(s)\n");
+    } else if (http_streq(cmd, "freeze status")) {
+        for (u32 core = 0; core < DEBUG_FREEZE_MAX_CORES; core++) {
+            http_append(out, &len, max, "core");
+            http_append_u64(out, &len, max, core);
+            http_append(out, &len, max, ": requested=");
+            http_append(out, &len, max, debug_freeze_is_requested(core) ? "1" : "0");
+            http_append(out, &len, max, " frozen=");
+            http_append(out, &len, max, debug_freeze_is_frozen(core) ? "1" : "0");
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "regs")) {
+        char *sp = cmd + 4;
+        while (*sp == ' ') sp++;
+        u32 core = 0;
+        if (!*sp || !http_parse_u32(sp, &core)) {
+            http_append(out, &len, max, "usage: regs <core>\n");
+        } else {
+            struct debug_freeze_slot snap;
+            if (!debug_freeze_snapshot(core, &snap)) {
+                http_append(out, &len, max, "core");
+                http_append_u64(out, &len, max, core);
+                http_append(out, &len, max, " is not frozen (use 'break' first, then wait for frozen=1)\n");
+            } else {
+                http_append(out, &len, max, "core");
+                http_append_u64(out, &len, max, core);
+                http_append(out, &len, max, " frozen at tick=");
+                http_append_u64(out, &len, max, snap.freeze_tick);
+                http_append(out, &len, max, " last_intid=");
+                http_append_u64(out, &len, max, snap.last_intid);
+                http_append(out, &len, max, "\nelr=");
+                http_append_hex64(out, &len, max, snap.elr);
+                http_append(out, &len, max, " spsr=");
+                http_append_hex64(out, &len, max, snap.spsr);
+                http_append(out, &len, max, "\n");
+                for (u32 i = 0; i < 31U; i++) {
+                    http_append(out, &len, max, "x");
+                    http_append_u64(out, &len, max, i);
+                    http_append(out, &len, max, "=");
+                    http_append_hex64(out, &len, max, snap.x[i]);
+                    http_append(out, &len, max, (i % 4U == 3U) ? "\n" : " ");
+                }
+                http_append(out, &len, max, "\n");
+            }
+        }
     } else if (http_streq(cmd, "nic offload")) {
         nic_offload_status_t s;
         nic_offload_status(&s);

@@ -139,3 +139,47 @@ bool exception_crash_sd_read(struct exception_crash_record *out);
 void exception_crash_sd_clear(void);
 
 NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far);
+
+/* ==================================================================
+ * Stop-the-world debug freeze: a lightweight remote-inspection tool.
+ *
+ * Rather than a new SGI + handler-registration plumb-through, this piggy-
+ * backs on whatever interrupt already fires periodically on the TARGET
+ * core (the timer, on every core, or the RP1 ETH MSI on core0) --
+ * irq_dispatch() checks a per-core "freeze requested" flag right after
+ * its own EOI (so the GIC's IAR/EOIR pairing is never disturbed) and, if
+ * set, saves the interrupted register frame into a dedicated per-core
+ * slot and spins there (wfe, DAIF-masked) until told to resume, instead
+ * of returning to whatever the core was doing. This never touches
+ * vectors.S, the handler table, or any existing handler's calling
+ * convention.
+ *
+ * One writer per field: only the requesting (console) core ever writes
+ * `requested`; only the target core itself ever writes `frozen`/the
+ * saved register fields. Each slot is padded to a 64-byte stride so
+ * consecutive cores' slots never share a cache line. */
+#define DEBUG_FREEZE_MAX_CORES 4U
+
+struct debug_freeze_slot {
+    volatile u32 requested;   /* written only by the requesting core */
+    volatile u32 frozen;      /* written only by the target core itself */
+    u64 x[31];                /* x0-x30 at the moment of freeze */
+    u64 elr;
+    u64 spsr;
+    u64 freeze_tick;
+    u32 last_intid;
+    u8  _pad[36];             /* raw size 284B -> rounds up to 320B (5*64) */
+} ALIGNED(64);
+
+/* Request/clear a freeze on the given core (called by the controller,
+ * i.e. whatever core is currently running the inspect console -- never
+ * targets its own core_id() from the shared command handler, see
+ * ui_cmd_break in kernel.c). */
+void debug_freeze_request(u32 core);
+void debug_freeze_clear(u32 core);
+bool debug_freeze_is_frozen(u32 core);
+bool debug_freeze_is_requested(u32 core);
+/* Snapshot the saved frame for a frozen core. Returns false if that core
+ * isn't currently frozen (nothing meaningful to read yet). */
+bool debug_freeze_snapshot(u32 core, struct debug_freeze_slot *out);
+

@@ -49,6 +49,68 @@ static struct irq_diag_snapshot irq_diag;
 static volatile bool crash_record_valid;
 static volatile struct exception_crash_record crash_record_last;
 
+/* Stop-the-world debug freeze slots -- see the design note in exception.h.
+ * One writer per field: `requested` is only ever written by the controller
+ * (whatever core is running the inspect console); `frozen` and the saved
+ * register fields are only ever written by the target core itself, from
+ * inside irq_dispatch(). */
+static struct debug_freeze_slot g_debug_freeze[DEBUG_FREEZE_MAX_CORES] ALIGNED(64);
+
+void debug_freeze_request(u32 core)
+{
+    if (core >= DEBUG_FREEZE_MAX_CORES)
+        return;
+    g_debug_freeze[core].requested = 1U;
+    dsb_ishst();
+    /* Non-hosting user cores (the common case: CORE_USERM/CORE_USER1, and
+     * CORE_USER0 whenever idle) deliberately disable their periodic timer
+     * PPI and event stream to save power (see proc_preempt_init()), waking
+     * ONLY on-demand via the GIC_SGI_WAKE doorbell. Piggybacking purely on
+     * "whatever interrupt fires next" would then never fire on an idle
+     * core. Reuse that already-armed doorbell to force one prompt IRQ so
+     * irq_dispatch()'s freeze-check actually gets a chance to run; the SGI
+     * itself is otherwise a routine, harmless wake (the scheduler just
+     * finds nothing new to run and goes back to WFE if we hadn't set the
+     * freeze flag first). */
+    gic_send_sgi((u8)(1U << core), GIC_SGI_WAKE);
+    sev(); /* also cover the hosting core's plain cooperative WFE idle path */
+}
+
+void debug_freeze_clear(u32 core)
+{
+    if (core >= DEBUG_FREEZE_MAX_CORES)
+        return;
+    g_debug_freeze[core].requested = 0U;
+    dsb_ishst();
+    sev();
+}
+
+bool debug_freeze_is_frozen(u32 core)
+{
+    if (core >= DEBUG_FREEZE_MAX_CORES)
+        return false;
+    dmb_ishld();
+    return g_debug_freeze[core].frozen != 0U;
+}
+
+bool debug_freeze_is_requested(u32 core)
+{
+    if (core >= DEBUG_FREEZE_MAX_CORES)
+        return false;
+    return g_debug_freeze[core].requested != 0U;
+}
+
+bool debug_freeze_snapshot(u32 core, struct debug_freeze_slot *out)
+{
+    if (core >= DEBUG_FREEZE_MAX_CORES || !out)
+        return false;
+    dmb_ishld();
+    if (!g_debug_freeze[core].frozen)
+        return false;
+    *out = g_debug_freeze[core];
+    return true;
+}
+
 static void crash_capture(u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
 {
     u32 pid = 0, capsule = 0, generation = 0, owner = 0;
@@ -402,6 +464,31 @@ void irq_dispatch(struct irq_frame *frame) {
     }
     if (irq_trace->magic == IRQ_TRACE_MAGIC)
         irq_trace->post_eoi++;
+
+    /* Stop-the-world debug freeze: check AFTER EOI so the GIC's IAR/EOIR
+     * pairing for THIS interrupt is already closed out cleanly, then never
+     * return to whatever this core was doing until told to resume. Runs on
+     * whatever interrupt happens to fire next on the target core (timer,
+     * typically) -- no new SGI/handler plumbing needed. DAIF-mask while
+     * spinning so no nested IRQ reentrancy has to be reasoned about; a
+     * frozen core genuinely does nothing else at all until resumed. */
+    if (c < DEBUG_FREEZE_MAX_CORES && g_debug_freeze[c].requested) {
+        for (u32 i = 0; i < 31U; i++)
+            g_debug_freeze[c].x[i] = frame->x[i];
+        g_debug_freeze[c].elr = frame->elr;
+        g_debug_freeze[c].spsr = frame->spsr;
+        g_debug_freeze[c].freeze_tick = timer_ticks();
+        g_debug_freeze[c].last_intid = intid;
+        dmb_ishst();
+        g_debug_freeze[c].frozen = 1U;
+        dsb_ishst();
+        __asm__ volatile("msr daifset, #2" ::: "memory"); /* mask IRQ while parked */
+        while (g_debug_freeze[c].requested)
+            wfe();
+        __asm__ volatile("msr daifclr, #2" ::: "memory");
+        g_debug_freeze[c].frozen = 0U;
+        dmb_ishst();
+    }
 }
 
 void irq_diag_snapshot(struct irq_diag_snapshot *out)
