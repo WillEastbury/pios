@@ -15,8 +15,34 @@
 
 /* External: secondary core entry point in start.S */
 extern void secondary_entry(void);
-static volatile i64 core_psci_ret[NUM_CORES];
-static volatile u32 core_stage[NUM_CORES];
+
+/* Per-core boot-progress state, isolated onto its OWN 64-byte cache line.
+ * core_stage[id]/core_psci_ret[id] were previously packed u32[4]/i64[4]
+ * arrays -- exactly the anti-pattern already root-caused and fixed
+ * elsewhere in this codebase for sched_diag_percore/proc_rwake_percore/
+ * proc_preempt_core (see proc.c's extensive comments on the topic: "inter-
+ * core snoop coherency is inactive on this A76", so a writer core's
+ * `dc cvac`/plain write to a packed array can collide with a DIFFERENT
+ * core's concurrent write to a neighbouring element of the SAME cache
+ * line). Cores 1-3 each call core_mark_online() for their OWN id during
+ * concurrent early boot -- exactly the concurrent-write pattern that
+ * caused corruption/lost-update bugs elsewhere. Isolating this (like the
+ * already-proven per-core structs) is a real, precedented, low-risk fix
+ * -- NOT a new invention -- for a genuine gap that was simply never
+ * applied to this particular piece of shared state. core_asm_stage[]
+ * (start.S) is deliberately left as a packed array: it's only relevant
+ * for the first few instructions of secondary bring-up before any C code
+ * (and thus core_mark_online) runs, a far narrower contention window, and
+ * isolating it would require reworking the asm indexing stride for
+ * comparatively little benefit. */
+struct core_boot_status {
+    volatile i64 psci_ret;
+    volatile u32 stage;
+    u32 _pad[13];   /* 8 + 4 + 13*4 = 64 bytes exactly */
+} ALIGNED(64);
+_Static_assert(sizeof(struct core_boot_status) == 64,
+               "core boot status must be one cache line");
+static struct core_boot_status core_boot[NUM_CORES] ALIGNED(64);
 extern volatile u32 core_asm_stage[NUM_CORES];
 
 /* Invalidate our own cached copy before reading cross-core state written by
@@ -34,8 +60,11 @@ static inline void core_diag_inval_word(const volatile void *p) {
 
 void core_mark_online(u32 id, u32 stage)
 {
-    if (id < NUM_CORES)
-        core_stage[id] = stage;
+    if (id < NUM_CORES) {
+        core_boot[id].stage = stage;
+        __asm__ volatile("dc cvac, %0" :: "r"(&core_boot[id]) : "memory");
+        __asm__ volatile("dsb ish" ::: "memory");
+    }
 }
 
 u32 core_status_snapshot(struct core_status_entry *out, u32 max_entries)
@@ -44,12 +73,11 @@ u32 core_status_snapshot(struct core_status_entry *out, u32 max_entries)
         return 0;
     u32 n = max_entries < NUM_CORES ? max_entries : NUM_CORES;
     for (u32 i = 0; i < n; i++) {
-        core_diag_inval_word(&core_psci_ret[i]);
-        core_diag_inval_word(&core_stage[i]);
+        core_diag_inval_word(&core_boot[i]);
         core_diag_inval_word(&core_asm_stage[i]);
         out[i].core = i;
-        out[i].psci_ret = core_psci_ret[i];
-        out[i].stage = core_stage[i] ? core_stage[i] : core_asm_stage[i];
+        out[i].psci_ret = core_boot[i].psci_ret;
+        out[i].stage = core_boot[i].stage ? core_boot[i].stage : core_asm_stage[i];
     }
     return n;
 }
@@ -78,8 +106,11 @@ void core_start_secondary(u32 id, void (*entry)(void)) {
     /* MPIDR affinity layout is platform-specific: Pi 5 (Cortex-A76) carries the
      * core index in Aff1 (id << 8); QEMU virt carries it in Aff0 (id). */
     i64 ret = psci_cpu_on((u64)id << PIOS_PSCI_AFF_SHIFT, (u64)(usize)secondary_entry, (u64)id);
-    if (id < NUM_CORES)
-        core_psci_ret[id] = ret;
+    if (id < NUM_CORES) {
+        core_boot[id].psci_ret = ret;
+        __asm__ volatile("dc cvac, %0" :: "r"(&core_boot[id]) : "memory");
+        __asm__ volatile("dsb ish" ::: "memory");
+    }
     if (ret == 0) {
         uart_puts("[core] Started core ");
         uart_putc('0' + (char)id);
@@ -107,8 +138,8 @@ static void core_wait_online(u32 id) {
     if (id >= NUM_CORES)
         return;
     for (u32 ms = 0; ms < 750U; ms++) {
-        core_diag_inval_word(&core_stage[id]);
-        if (core_stage[id] >= 6U)
+        core_diag_inval_word(&core_boot[id]);
+        if (core_boot[id].stage >= 6U)
             return;
         watchdog_hw_pet();
         timer_delay_ms(1);
