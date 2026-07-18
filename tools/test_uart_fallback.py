@@ -118,6 +118,16 @@ def main():
                     break
             return strip_ansi(resp.decode("ascii", "replace"))
 
+        print("\n=== core status (cache-invalidate fix applied) ===")
+        r0 = send("core status")
+        print(f"[core status] {r0.strip()!r}")
+
+        print("\n=== raw SGI delivery test (pre-existing 'sgi test' diagnostic) ===")
+        r = send("sgi stat")
+        print(f"[sgi stat before] {r.strip()!r}")
+        r = send("sgi test 1 5")
+        print(f"[sgi test 1 5] {r.strip()!r}")
+
         print("\n=== debug freeze: request/resume/self-safety (verified working) ===")
         r = send("break 1")
         ok = "requested freeze on 1 core" in r

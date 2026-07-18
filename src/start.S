@@ -377,10 +377,32 @@ el2_crash_vectors:
 
 /*
  * Secondary core entry point.
+ *
+ * Extract the core index from MPIDR_EL1 using the SAME platform-aware
+ * convention as core_id() in types.h: real Pi 5 hardware (Cortex-A76)
+ * carries the core index in Aff1 (bits 15:8); QEMU's virt machine carries
+ * it in Aff0 (bits 1:0) with Aff1=0 for every vCPU (matching
+ * PIOS_PSCI_AFF_SHIFT=0 for the QEMU PSCI CPU_ON target_mpidr in core.c).
+ * Previously this unconditionally read Aff1 only -- under QEMU every
+ * secondary vCPU read Aff1=0, failed all three cmp checks below, and fell
+ * straight through to .Lhalt without ever reaching SECONDARY_SETUP: PSCI
+ * CPU_ON reported success (the vCPU genuinely started), but the core wrote
+ * no core_asm_stage/core_stage progress and could receive no interrupts
+ * (GIC CPU interface never brought up), because it parked itself in the
+ * first few instructions. Real Pi 5 hardware was unaffected since Aff1 is
+ * genuinely nonzero there. Confirmed via 'sgi test'/'core status' showing
+ * zero delivery and zero stage progress on cores 1-3 under QEMU even after
+ * fixing core_status_snapshot()'s cache-invalidate-before-read (ruling out
+ * a stale-read diagnostic artifact) -- the cores were never truly running
+ * kernel code at all.
  */
 secondary_entry:
     mrs     x0, mpidr_el1
-    ubfx    x0, x0, #8, #8
+    ubfx    x1, x0, #8, #8      /* Aff1 */
+    cbnz    x1, .Lhave_core_id
+    and     x1, x0, #3          /* Aff0 fallback (QEMU) */
+.Lhave_core_id:
+    mov     x0, x1
     cmp     x0, #1
     b.eq    .Lstack1
     cmp     x0, #2

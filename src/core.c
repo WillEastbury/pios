@@ -19,6 +19,19 @@ static volatile i64 core_psci_ret[NUM_CORES];
 static volatile u32 core_stage[NUM_CORES];
 extern volatile u32 core_asm_stage[NUM_CORES];
 
+/* Invalidate our own cached copy before reading cross-core state written by
+ * another core. On a real coherent SMP cluster this shouldn't be strictly
+ * necessary (hardware snooping keeps shared memory in sync automatically),
+ * but the un-invalidated reads here previously always reported stage=0 for
+ * secondary cores -- matching the pattern already proven correct/necessary
+ * elsewhere (proc.c's proc_sgi_wake_count()) to rule out a stale-read
+ * diagnostic artifact before concluding anything about actual core
+ * execution progress. */
+static inline void core_diag_inval_word(const volatile void *p) {
+    __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
 void core_mark_online(u32 id, u32 stage)
 {
     if (id < NUM_CORES)
@@ -31,6 +44,9 @@ u32 core_status_snapshot(struct core_status_entry *out, u32 max_entries)
         return 0;
     u32 n = max_entries < NUM_CORES ? max_entries : NUM_CORES;
     for (u32 i = 0; i < n; i++) {
+        core_diag_inval_word(&core_psci_ret[i]);
+        core_diag_inval_word(&core_stage[i]);
+        core_diag_inval_word(&core_asm_stage[i]);
         out[i].core = i;
         out[i].psci_ret = core_psci_ret[i];
         out[i].stage = core_stage[i] ? core_stage[i] : core_asm_stage[i];
@@ -91,6 +107,7 @@ static void core_wait_online(u32 id) {
     if (id >= NUM_CORES)
         return;
     for (u32 ms = 0; ms < 750U; ms++) {
+        core_diag_inval_word(&core_stage[id]);
         if (core_stage[id] >= 6U)
             return;
         watchdog_hw_pet();
