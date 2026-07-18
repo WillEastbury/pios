@@ -7381,6 +7381,15 @@ static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *
     if (offset > HOTPATCH_SLOT_BYTES || len > HOTPATCH_SLOT_BYTES - offset)
         return false;
 
+    /* Measures how long this call blocks core0's single reactor loop --
+     * since CORE_DISK == CORE_NET == 0 (include/core.h), net_poll()/TCP/UART
+     * cannot run for the whole duration of this synchronous multi-block SD
+     * flush. Emitted unconditionally (not threshold-gated) under
+     * DTRACE_CAT_OTA since a full commit is a rare, high-value event to
+     * always capture when tracing is on. */
+    u64 dt_sd_start;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(dt_sd_start));
+
     u32 base_lba = walfs_partition_lba() + (slot_offset / SD_BLOCK_SIZE);
     u32 pos = offset;
     u32 written = 0;
@@ -7392,14 +7401,24 @@ static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *
             n = len - written;
         u32 lba = base_lba + (pos / SD_BLOCK_SIZE);
         if (sector_off == 0 && n == SD_BLOCK_SIZE) {
-            if (!sd_write_block(lba, data + written))
+            if (!sd_write_block(lba, data + written)) {
+                u64 dt_sd_end;
+                __asm__ volatile("mrs %0, cntpct_el0" : "=r"(dt_sd_end));
+                DTRACE(DTRACE_CAT_OTA, DT_OTA_SD_BLOCK_DUR, written,
+                       dt_sd_end - dt_sd_start, slot_offset, 0);
                 return false;
+            }
         } else {
             if (!sd_read_block(lba, block))
                 simd_zero(block, sizeof(block));
             simd_memcpy(block + sector_off, data + written, n);
-            if (!sd_write_block(lba, block))
+            if (!sd_write_block(lba, block)) {
+                u64 dt_sd_end;
+                __asm__ volatile("mrs %0, cntpct_el0" : "=r"(dt_sd_end));
+                DTRACE(DTRACE_CAT_OTA, DT_OTA_SD_BLOCK_DUR, written,
+                       dt_sd_end - dt_sd_start, slot_offset, 0);
                 return false;
+            }
         }
         pos += n;
         written += n;
@@ -7410,6 +7429,12 @@ static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *
             since_pet = 0;
             watchdog_hw_pet();
         }
+    }
+    {
+        u64 dt_sd_end;
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(dt_sd_end));
+        DTRACE(DTRACE_CAT_OTA, DT_OTA_SD_BLOCK_DUR, written,
+               dt_sd_end - dt_sd_start, slot_offset, 0);
     }
     if (out_written) *out_written = written;
     return true;

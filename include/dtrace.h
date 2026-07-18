@@ -76,6 +76,13 @@
 #define DT_OTA_REACTOR_GAP  8   /* gap since last drain pass; a0=gap_ticks a1=received a2=total */
 #define DT_OTA_RX_RECOVER   9   /* recovery fired inside the tight drain loop;
                                    a0=received a1=total a2=drain_spins a3=rx_recover_count */
+#define DT_OTA_SD_BLOCK_DUR 10  /* whole-loop core0-blocking duration of the synchronous
+                                   multi-block SD flush done by http_write_kernel_slot_range()
+                                   (OTA commit / uartflash commit both funnel through it).
+                                   Since CORE_DISK == CORE_NET == 0, this entire duration is
+                                   time net_poll()/TCP/UART do NOT run -- a direct measurement
+                                   of network-reactor starvation caused by disk I/O sharing
+                                   core 0. a0=bytes_written a1=dur_ticks a2=slot_offset a3=0 */
 /* REACTOR (core 0 service loop) */
 #define DT_RX_PHASE_NET     1   /* a0=dur_ticks */
 #define DT_RX_PHASE_TCP     2   /* a0=dur_ticks */

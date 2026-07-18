@@ -174,6 +174,7 @@ static const char *ev_name(u8 log2, u16 ev)
         case DT_OTA_DRAIN_SPIN: return "drain"; case DT_OTA_WATCHDOG: return "watchdog";
         case DT_OTA_COMMIT: return "commit"; case DT_OTA_RESET: return "reset";
         case DT_OTA_WADV: return "wadv"; case DT_OTA_REACTOR_GAP: return "gap";
+        case DT_OTA_SD_BLOCK_DUR: return "sdblock";
         } break;
     case DTRACE_CAT_REACTOR:
         switch (ev) {
