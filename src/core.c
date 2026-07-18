@@ -103,6 +103,7 @@ static i64 psci_cpu_on(u64 target_mpidr, u64 entry, u64 context) {
 }
 
 void core_start_secondary(u32 id, void (*entry)(void)) {
+    (void)entry;
     /* MPIDR affinity layout is platform-specific: Pi 5 (Cortex-A76) carries the
      * core index in Aff1 (id << 8); QEMU virt carries it in Aff0 (id). */
     i64 ret = psci_cpu_on((u64)id << PIOS_PSCI_AFF_SHIFT, (u64)(usize)secondary_entry, (u64)id);
