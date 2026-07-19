@@ -15,7 +15,7 @@
 
 /* IRQ trace via raw SD blocks.
  * We can't rely on DRAM-resident trace (Pi 5 watchdog reset clears RAM) or
- * on framebuffer markers (HDMI capture is unreliable mid-wedge). Instead
+ * on framebuffer markers (a core0/scanout stall can stop visible updates). Instead
  * each waypoint in irq_dispatch writes a 512-byte sector to a known LBA
  * range in the gap between MBR and FAT (LBA 16..23 - well below the
  * partition table @ LBA 2048). After a wedge the SD is pulled and we
@@ -56,24 +56,51 @@ static volatile struct exception_crash_record crash_record_last;
  * inside irq_dispatch(). */
 static struct debug_freeze_slot g_debug_freeze[DEBUG_FREEZE_MAX_CORES] ALIGNED(64);
 
+static void debug_freeze_capture_and_wait(u32 core, const struct irq_frame *frame,
+                                          u32 last_intid)
+{
+    if (core >= DEBUG_FREEZE_MAX_CORES || !frame ||
+        !g_debug_freeze[core].requested)
+        return;
+
+    for (u32 i = 0; i < 31U; i++)
+        g_debug_freeze[core].x[i] = frame->x[i];
+    g_debug_freeze[core].elr = frame->elr;
+    g_debug_freeze[core].spsr = frame->spsr;
+    g_debug_freeze[core].freeze_tick = timer_monotonic_ms();
+    g_debug_freeze[core].last_intid = last_intid;
+    dmb_ishst();
+    g_debug_freeze[core].frozen = 1U;
+    dsb_ishst();
+
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    while (g_debug_freeze[core].requested)
+        wfe();
+    __asm__ volatile("msr daifclr, #2" ::: "memory");
+
+    g_debug_freeze[core].frozen = 0U;
+    dmb_ishst();
+}
+
+void debug_freeze_cooperative_dispatch(struct irq_frame *frame)
+{
+    debug_freeze_capture_and_wait(core_id() & 3U, frame, 0xFFFFFFFFU);
+}
+
 void debug_freeze_request(u32 core)
 {
     if (core >= DEBUG_FREEZE_MAX_CORES)
         return;
     g_debug_freeze[core].requested = 1U;
     dsb_ishst();
-    /* Non-hosting user cores (the common case: CORE_USERM/CORE_USER1, and
-     * CORE_USER0 whenever idle) deliberately disable their periodic timer
-     * PPI and event stream to save power (see proc_preempt_init()), waking
-     * ONLY on-demand via the GIC_SGI_WAKE doorbell. Piggybacking purely on
-     * "whatever interrupt fires next" would then never fire on an idle
-     * core. Reuse that already-armed doorbell to force one prompt IRQ so
-     * irq_dispatch()'s freeze-check actually gets a chance to run; the SGI
-     * itself is otherwise a routine, harmless wake (the scheduler just
-     * finds nothing new to run and goes back to WFE if we hadn't set the
-     * freeze flag first). */
-    gic_send_sgi((u8)(1U << core), GIC_SGI_WAKE);
-    sev(); /* also cover the hosting core's plain cooperative WFE idle path */
+    /* Non-hosting user cores publish FIFO-SGI readiness after their banked GIC
+     * interface and handler are live. Force one prompt IRQ there so
+     * irq_dispatch() reaches the freeze check; process-hosting cores keep the
+     * cooperative SEV/WFE path because their GIC interface remains disabled. */
+    if (fifo_irq_ready(core))
+        gic_send_sgi((u8)(1U << core), GIC_SGI_WAKE);
+    else
+        sev();
 }
 
 void debug_freeze_clear(u32 core)
@@ -97,6 +124,7 @@ bool debug_freeze_is_requested(u32 core)
 {
     if (core >= DEBUG_FREEZE_MAX_CORES)
         return false;
+    dmb_ishld();
     return g_debug_freeze[core].requested != 0U;
 }
 
@@ -472,23 +500,7 @@ void irq_dispatch(struct irq_frame *frame) {
      * typically) -- no new SGI/handler plumbing needed. DAIF-mask while
      * spinning so no nested IRQ reentrancy has to be reasoned about; a
      * frozen core genuinely does nothing else at all until resumed. */
-    if (c < DEBUG_FREEZE_MAX_CORES && g_debug_freeze[c].requested) {
-        for (u32 i = 0; i < 31U; i++)
-            g_debug_freeze[c].x[i] = frame->x[i];
-        g_debug_freeze[c].elr = frame->elr;
-        g_debug_freeze[c].spsr = frame->spsr;
-        g_debug_freeze[c].freeze_tick = timer_ticks();
-        g_debug_freeze[c].last_intid = intid;
-        dmb_ishst();
-        g_debug_freeze[c].frozen = 1U;
-        dsb_ishst();
-        __asm__ volatile("msr daifset, #2" ::: "memory"); /* mask IRQ while parked */
-        while (g_debug_freeze[c].requested)
-            wfe();
-        __asm__ volatile("msr daifclr, #2" ::: "memory");
-        g_debug_freeze[c].frozen = 0U;
-        dmb_ishst();
-    }
+    debug_freeze_capture_and_wait(c, frame, intid);
 }
 
 void irq_diag_snapshot(struct irq_diag_snapshot *out)

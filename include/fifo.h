@@ -10,7 +10,7 @@
 
 #define FIFO_CAPACITY   512
 #define FIFO_MSG_SIZE   64
-#define FIFO_SPAN_CAPACITY 512
+#define FIFO_SPAN_CAPACITY 256
 
 /* ---- Message types ---- */
 
@@ -99,3 +99,8 @@ u32   fifo_span_pop_batch_asm(u32 dst_core, u32 src_core, struct fifo_span_msg *
 u32   fifo_span_push_batch_ish(u32 src_core, u32 dst_core, const struct fifo_span_msg *msgs, u32 count);
 u32   fifo_span_pop_batch_ish(u32 dst_core, u32 src_core, struct fifo_span_msg *msgs, u32 max_count);
 u32   fifo_last_sequence(u32 core);
+/* Mark `core` ready to receive FIFO publication doorbells via GIC SGI.
+ * Called by the target core only after its SGI handler and banked enable are live. */
+void  fifo_irq_enable(u32 core);
+bool  fifo_irq_ready(u32 core);
+u32   fifo_irq_sent(u32 core);

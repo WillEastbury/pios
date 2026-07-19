@@ -101,7 +101,7 @@ struct fifo_span {         // SPSC ring, one per ordered (src,dst) core pair
     volatile u32 head ALIGNED(64);   // producer writes
     volatile u32 tail ALIGNED(64);   // consumer writes
     u8 _pad[128 - 2*64];             // no false sharing
-    struct fifo_span_msg msgs[512] ALIGNED(64);
+    struct fifo_span_msg msgs[256] ALIGNED(64);
 };
 ```
 
@@ -110,7 +110,7 @@ struct fifo_span {         // SPSC ring, one per ordered (src,dst) core pair
   the benchmark). `get_span_fifo(src,dst)` places these after the 16 generic
   `struct fifo` in `SHARED_FIFO_BASE`.
 - **Batch** push/pop (`fifo_span_push_batch` / `fifo_span_pop_batch`) amortise
-  the publish barrier + `SEV` across up to 16 descriptors. Receiver
+  the publish barrier + SGI/SEV doorbell across up to 16 descriptors. Receiver
   **batch-drain** is the single biggest cross-core win (see §5).
 
 ### Publish / consume ordering (SPSC)
@@ -215,7 +215,7 @@ batch-drain), not in micro-tuning the copy.
 
 Because the wakeup dominates, throughput comes from amortising it:
 
-- `fifo_*_batch` move up to 16 descriptors per `SEV`.
+- `fifo_*_batch` move up to 16 descriptors per publication doorbell.
 - **Receiver batch-drain**: the consumer drains everything available in one wake
   (`fifo_pop_batch` / `fifo_span_pop_batch`) instead of one-per-wake. This is
   applied to the real network/socket service paths (`src/net.c`, `src/socket.c`).

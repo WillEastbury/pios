@@ -12,7 +12,7 @@ PIOS targets the **Raspberry Pi 5** exclusively:
 
 ## Core Assignment
 
-PIOS uses a **static partitioning** model. Each core runs a single dedicated role. Core 0 is an infinite polling loop; cores 1-3 run preemptive user schedulers.
+PIOS uses a **static partitioning** model. Core 0 runs the IRQ-driven service reactor; cores 1-3 run cooperative user schedulers.
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -21,8 +21,8 @@ PIOS uses a **static partitioning** model. Each core runs a single dedicated rol
 │  Core 0  │  Core 1  │  Core 2  │   Core 3    │
 │KERNEL+NET│  USER M  │  USER 0  │   USER 1    │
 │ +DISK svc│          │          │              │
-│ net_poll │ preempt  │ preempt  │  preempt    │
-│ FIFO svc │ sched    │ sched    │  sched      │
+│ IRQ/react│ SGI/FIFO │ process  │  process    │
+│ services │ sched    │ sched    │  sched      │
 ├──────────┴──────────┴──────────┴──────────────┤
 │         Lock-free SPSC FIFO Layer             │
 ├──────────┬──────────┬─────────────────────────┤
@@ -36,21 +36,21 @@ PIOS uses a **static partitioning** model. Each core runs a single dedicated rol
 
 ### Core 0 — Kernel + Network + Disk
 - Owns the Cadence GEM/MACB Ethernet MAC (on RP1 southbridge) exclusively
-- Tight polling loop: `nic_recv()` → validate → dispatch → `nic_send()`
+- IRQ-driven reactor: `nic_recv()` → validate → dispatch → `nic_send()`, with maintenance backstops
 - Services UDP/TCP send requests from user cores via FIFO
 - Handles ICMP echo reply (rate-limited)
 - Handles disk I/O FIFO requests (`MSG_DISK_READ`/`MSG_DISK_WRITE`) — `CORE_DISK = CORE_NET = 0`
 - Runs serial console REPL on RP1 UART0
-- Never sleeps, never blocks
+- Parks between timer/IRQ/service events; does not block in IRQ context
 
 ### Core 1 — User (USERM)
 - 16MB private RAM, initialised environment
-- Runs a preemptive process scheduler (timer quanta @ 1kHz, default 5ms)
+- Runs a cooperative process scheduler and receives targeted FIFO SGI doorbells
 - Communicates with Core 0 Net/Disk through FIFO messages
 
 ### Cores 2-3 — User (USER0 / USER1)
 - 16MB private RAM each, initialised environment
-- Run preemptive process schedulers (same as Core 1)
+- Run cooperative process schedulers; timer/preemption metadata exists but IRQ preemption is disabled
 - Communicate with Core 0 Net/Disk through FIFO messages
 
 ## Memory Map

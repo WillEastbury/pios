@@ -54,7 +54,9 @@
                                     * a1=owned_after_gap (nonzero = hole/anomaly: a NOT-owned
                                     * descriptor followed by more owned ones -- points at a
                                     * false/stale overrun rather than real traffic volume),
-                                    * a2=rx_idx, a3=NUM_RX */
+                                    * a2=rx_idx, a3=first_owned_distance */
+#define DT_MAC_RXHOLERECOVER 8 /* ordered-ring hole: a0=stuck rx_idx
+                                * a1=owned_after_gap a2=first distance a3=count */
 /* FIFO */
 #define DT_FIFO_PUSH        1   /* a0=(src<<8|dst) a1=type a2=seq */
 #define DT_FIFO_POP         2   /* a0=(dst<<8|src) a1=type a2=seq */

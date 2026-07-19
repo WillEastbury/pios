@@ -143,16 +143,10 @@ NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 
 /* ==================================================================
  * Stop-the-world debug freeze: a lightweight remote-inspection tool.
  *
- * Rather than a new SGI + handler-registration plumb-through, this piggy-
- * backs on whatever interrupt already fires periodically on the TARGET
- * core (the timer, on every core, or the RP1 ETH MSI on core0) --
- * irq_dispatch() checks a per-core "freeze requested" flag right after
- * its own EOI (so the GIC's IAR/EOIR pairing is never disturbed) and, if
- * set, saves the interrupted register frame into a dedicated per-core
- * slot and spins there (wfe, DAIF-masked) until told to resume, instead
- * of returning to whatever the core was doing. This never touches
- * vectors.S, the handler table, or any existing handler's calling
- * convention.
+ * IRQ-capable cores capture immediately after EOI in irq_dispatch(). Cores
+ * whose GIC interface must remain disabled use a scheduler safe point backed
+ * by debug_freeze_cooperative_point(), which snapshots the live register set
+ * before parking. Both paths spin WFE with IRQs masked until resumed.
  *
  * One writer per field: only the requesting (console) core ever writes
  * `requested`; only the target core itself ever writes `frozen`/the
@@ -182,4 +176,5 @@ bool debug_freeze_is_requested(u32 core);
 /* Snapshot the saved frame for a frozen core. Returns false if that core
  * isn't currently frozen (nothing meaningful to read yet). */
 bool debug_freeze_snapshot(u32 core, struct debug_freeze_slot *out);
-
+/* Assembly register-capture wrapper; safe to call from a scheduler loop. */
+void debug_freeze_cooperative_point(void);

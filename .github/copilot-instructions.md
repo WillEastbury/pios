@@ -121,12 +121,12 @@ Use these as scan/review rules for FIFO, wake-ring, scheduler, descriptor, IPC, 
 
 | Core | Role | Hot loop | Source |
 |------|------|----------|--------|
-| 0 | Network | `net_poll()` — process one Ethernet frame + check FIFO | `kernel.c:core0_main()` |
-| 1 | Disk I/O | Wait for FIFO message → SD read/write → reply | `kernel.c:core1_main()` |
-| 2 | User | Available for application code | `kernel.c:core2_main()` |
-| 3 | User | Available for application code | `kernel.c:core3_main()` |
+| 0 | Kernel / network / disk | IRQ-driven `net_poll()` + services + console | `kernel.c:core0_main()` |
+| 1 | User management | Scheduler + SGI FIFO doorbell | `kernel.c:core1_main()` |
+| 2 | User | Cooperative application scheduler | `kernel.c:core2_main()` |
+| 3 | User | Cooperative application scheduler | `kernel.c:core3_main()` |
 
-Cores communicate **only** through lock-free SPSC FIFOs (`fifo.h`). No shared mutable state, no locks, no atomics. The FIFO message types (`MSG_DISK_READ`, `MSG_NET_UDP_SEND`, etc.) are the OS's internal API.
+Cores communicate through lock-free SPSC FIFOs (`fifo.h`) and explicit scheduler wake records. Each successful FIFO publication/batch uses a targeted SGI on IRQ-ready cores and SEV fallback on process-hosting cores whose GIC interface remains disabled.
 
 ### Memory Map
 

@@ -217,9 +217,6 @@ struct macb_desc {
 } PACKED;
 #endif
 
-static struct macb_desc rx_ring[NUM_RX] ALIGNED(64);
-static struct macb_desc tx_ring[NUM_TX] ALIGNED(64);
-
 /* RX/TX frame buffers live in the dedicated DMA_NET arena (a fixed, mapped,
  * Non-Cacheable 2MB region) rather than in .bss. This is the "dedicated per-core
  * DMA arena" follow-up the MMU layer anticipates (see mmu.c mmu_enable_caching):
@@ -230,16 +227,34 @@ static struct macb_desc tx_ring[NUM_TX] ALIGNED(64);
  * in .bss (also NC, already coherent). Layout within DMA_NET:
  *     [0 .. NUM_RX*BUF_SIZE)            RX buffers
  *     [NUM_RX*BUF_SIZE .. +NUM_TX*BUF_SIZE) TX buffers
- * Total = (512+64)*2048 = 1.125MB, well within DMA_NET_SIZE (2MB). */
+ *     [aligned buffer end .. +RX descriptors) RX descriptor ring
+ *     [aligned RX ring end .. +TX descriptors) TX descriptor ring
+ *
+ * The descriptor rings used to live in .bss under the assumption that .bss was
+ * always Normal-NC. Live hardware disproved the safety of that assumption:
+ * rx_idx could stop on an OWN=0 descriptor while hundreds of later descriptors
+ * were OWN=1, the exact signature produced when a CPU cache-line writeback of
+ * one compact 16-byte descriptor overwrites a DMA update to its sibling. Keep
+ * descriptors in the explicitly Normal-NC DMA arena with their buffers so no
+ * cacheable alias or startup mapping can recreate that ownership hole. */
 #define MACB_RX_POOL_OFF   0U
 #define MACB_TX_POOL_OFF   ((u64)NUM_RX * BUF_SIZE)
 #define MACB_DMA_POOL_BYTES (((u64)NUM_RX + (u64)NUM_TX) * BUF_SIZE)
-_Static_assert(MACB_DMA_POOL_BYTES <= DMA_NET_SIZE,
-               "MACB RX+TX buffer pool exceeds the DMA_NET arena");
+#define MACB_RX_DESC_OFF   ((MACB_DMA_POOL_BYTES + 63ULL) & ~63ULL)
+#define MACB_RX_RING_BYTES ((u64)NUM_RX * sizeof(struct macb_desc))
+#define MACB_TX_DESC_OFF   ((MACB_RX_DESC_OFF + MACB_RX_RING_BYTES + 63ULL) & ~63ULL)
+#define MACB_TX_RING_BYTES ((u64)NUM_TX * sizeof(struct macb_desc))
+#define MACB_DMA_TOTAL_BYTES (MACB_TX_DESC_OFF + MACB_TX_RING_BYTES)
+_Static_assert(MACB_DMA_TOTAL_BYTES <= DMA_NET_SIZE,
+               "MACB buffers and descriptor rings exceed the DMA_NET arena");
 static u8 (*const rx_bufs)[BUF_SIZE] =
     (u8 (*)[BUF_SIZE])(usize)(DMA_NET_BASE + MACB_RX_POOL_OFF);
 static u8 (*const tx_bufs)[BUF_SIZE] =
     (u8 (*)[BUF_SIZE])(usize)(DMA_NET_BASE + MACB_TX_POOL_OFF);
+static struct macb_desc *const rx_ring =
+    (struct macb_desc *)(usize)(DMA_NET_BASE + MACB_RX_DESC_OFF);
+static struct macb_desc *const tx_ring =
+    (struct macb_desc *)(usize)(DMA_NET_BASE + MACB_TX_DESC_OFF);
 static u32 rx_idx;
 static u32 tx_idx;
 static u32 tx_tail;
@@ -652,9 +667,9 @@ bool macb_init(void) {
     __asm__ volatile("dsb sy" ::: "memory");
     /* Use clean+invalidate so cachelines are evicted; subsequent reads
      * (including MAC's status updates via DMA) will be served from RAM. */
-    dcache_clean_invalidate_range((u64)(usize)rx_ring, sizeof(rx_ring));
+    dcache_clean_invalidate_range((u64)(usize)rx_ring, MACB_RX_RING_BYTES);
     dcache_clean_range((u64)(usize)rx_bufs, (u64)NUM_RX * BUF_SIZE);
-    dcache_clean_invalidate_range((u64)(usize)tx_ring, sizeof(tx_ring));
+    dcache_clean_invalidate_range((u64)(usize)tx_ring, MACB_TX_RING_BYTES);
     __asm__ volatile("dsb sy" ::: "memory");
 
     uart_puts("[mac] RX desc[0]=");
@@ -845,7 +860,7 @@ static void macb_dump_tx_state(const char *tag)
     uart_puts(" TBQP=");
     uart_hex(mr(TBQP));
     uart_puts("\n");
-    dcache_clean_invalidate_range((u64)(usize)tx_ring, sizeof(tx_ring));
+    dcache_clean_invalidate_range((u64)(usize)tx_ring, MACB_TX_RING_BYTES);
     uart_puts("[mac] desc.ctrl:");
     for (u32 i = 0; i < NUM_TX; i++) {
         uart_putc(' ');
@@ -895,7 +910,7 @@ static void macb_tx_recover_silent(void)
     tx_tail = 0;
     tx_inflight = 0;
     __asm__ volatile("dsb sy" ::: "memory");
-    dcache_clean_invalidate_range((u64)(usize)tx_ring, sizeof(tx_ring));
+    dcache_clean_invalidate_range((u64)(usize)tx_ring, MACB_TX_RING_BYTES);
     __asm__ volatile("dsb sy" ::: "memory");
 
     mw(TBQP, (u32)(usize)&tx_ring[0]);
@@ -1018,6 +1033,44 @@ bool macb_send(const u8 *frame, u32 len) {
 /* ── Receive ── */
 static u32 rx_recv_count;
 static u32 rx_recover_count;
+static u32 rx_hole_recover_count;
+
+static void macb_rx_ownership_snapshot(u32 *total_owned,
+                                       u32 *contig_owned,
+                                       u32 *owned_after_gap,
+                                       u32 *first_owned_distance)
+{
+    dcache_invalidate_range((u64)(usize)rx_ring, MACB_RX_RING_BYTES);
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    u32 contig = 0;
+    u32 after = 0;
+    u32 first = NUM_RX;
+    u32 total = 0;
+    bool saw_gap = false;
+    for (u32 distance = 0; distance < NUM_RX; distance++) {
+        u32 idx = (rx_idx + distance) % NUM_RX;
+        bool owned = (rx_ring[idx].addr & RX_ADDR_OWN) != 0;
+        if (owned)
+            total++;
+        if (!saw_gap) {
+            if (owned) {
+                contig++;
+            } else {
+                saw_gap = true;
+            }
+        } else if (owned) {
+            if (first == NUM_RX)
+                first = distance;
+            after++;
+        }
+    }
+
+    if (total_owned) *total_owned = total;
+    if (contig_owned) *contig_owned = contig;
+    if (owned_after_gap) *owned_after_gap = after;
+    if (first_owned_distance) *first_owned_distance = first;
+}
 
 bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
     /* Invalidate RX descriptor to see MAC's DMA writes (non-coherent PCIe).
@@ -1128,7 +1181,7 @@ static void macb_rx_ring_rebuild(void) {
     }
     rx_idx = 0;
     __asm__ volatile("dsb sy" ::: "memory");
-    dcache_clean_invalidate_range((u64)(usize)rx_ring, sizeof(rx_ring));
+    dcache_clean_invalidate_range((u64)(usize)rx_ring, MACB_RX_RING_BYTES);
     __asm__ volatile("dsb sy" ::: "memory");
 
     /* Point the RX queue back at the ring base. */
@@ -1147,6 +1200,40 @@ static void macb_rx_ring_rebuild(void) {
     (void)mr(NCR);
 }
 
+bool macb_rx_hole_recover(void) {
+    u32 contig = 0;
+    u32 after = 0;
+    u32 first = NUM_RX;
+    u32 stuck_idx = rx_idx;
+    macb_rx_ownership_snapshot(NULL, &contig, &after, &first);
+
+    /* A current descriptor not owned by software followed by several later
+     * OWN descriptors is impossible for an ordered GEM RX ring: hardware must
+     * publish descriptor N before N+1. Requiring four later OWN descriptors
+     * avoids reacting to a transient observation while DMA is completing one
+     * descriptor, yet catches the live failure (hundreds queued beyond a hole)
+     * well before BNA/OVR or the 90s liveness watchdog can fire. */
+    if (contig != 0U || after < 4U)
+        return false;
+
+    /* RX DMA remains active during the bounded diagnostic scan. Revalidate the
+     * current descriptor after the scan so normal DMA progress (current became
+     * OWN while later descriptors were being inspected) is not mistaken for a
+     * stable hole. A real sibling-writeback hole remains OWN=0 here. */
+    dcache_invalidate_range((u64)(usize)&rx_ring[stuck_idx],
+                            sizeof(struct macb_desc));
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (rx_ring[stuck_idx].addr & RX_ADDR_OWN)
+        return false;
+
+    rx_hole_recover_count++;
+    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXHOLERECOVER,
+           stuck_idx, after, first, rx_hole_recover_count);
+    pioscap_notify_event("rx-descriptor-hole");
+    macb_rx_ring_rebuild();
+    return true;
+}
+
 bool macb_rx_recover(void) {
     u32 rsr = mr(RSR);
     if (!(rsr & (RSR_BNA | RSR_OVR)))
@@ -1163,21 +1250,12 @@ bool macb_rx_recover(void) {
      * confusion) rather than real traffic volume. Walk forward from rx_idx
      * counting the contiguous owned run, then keep scanning to see if MORE
      * owned descriptors exist beyond a gap. */
-    dcache_invalidate_range((u64)(usize)rx_ring, sizeof(rx_ring));
-    __asm__ volatile("dsb sy" ::: "memory");
     u32 contig_owned = 0;
-    bool saw_gap = false;
     u32 owned_after_gap = 0;
-    for (u32 i = 0; i < NUM_RX; i++) {
-        u32 idx = (rx_idx + i) % NUM_RX;
-        bool owned = (rx_ring[idx].addr & RX_ADDR_OWN) != 0;
-        if (!saw_gap) {
-            if (owned) contig_owned++;
-            else saw_gap = true;
-        } else if (owned) {
-            owned_after_gap++;
-        }
-    }
+    u32 first_owned_distance = NUM_RX;
+    u32 recover_idx = rx_idx;
+    macb_rx_ownership_snapshot(NULL, &contig_owned, &owned_after_gap,
+                               &first_owned_distance);
 
     macb_rx_ring_rebuild();
     rx_recover_count++;
@@ -1185,13 +1263,14 @@ bool macb_rx_recover(void) {
      * needing a live poll to race the event: which overrun bit(s) latched,
      * the lifetime recovery count, and where RX/TX were in the ring at the
      * moment of detection. */
-    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXRECOVER, rx_recover_count, rsr, rx_idx, tx_idx);
+    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXRECOVER, rx_recover_count, rsr, recover_idx, tx_idx);
     /* a0=contig_owned (owned run starting at rx_idx; NUM_RX means genuinely
      * fully saturated), a1=owned_after_gap (nonzero means a hole pattern: a
      * NOT-owned descriptor followed by MORE owned ones -- a real anomaly,
      * since normal fill-up should never skip a descriptor), a2=rx_idx,
      * a3=NUM_RX (for scale). */
-    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXRECOVER_PATTERN, contig_owned, owned_after_gap, rx_idx, NUM_RX);
+    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXRECOVER_PATTERN,
+           contig_owned, owned_after_gap, recover_idx, first_owned_distance);
     pioscap_notify_event("rx-overrun-recover");
     return true;
 }
@@ -1329,15 +1408,15 @@ void macb_diag(struct macb_diag *out)
     out->tx_idx = tx_idx;
     out->rx_recv = rx_recv_count;
     out->tx_send = tx_send_count;
-    /* Count RX descriptors the MAC has filled (OWN set) but the CPU hasn't
-     * drained. Invalidate the ring first so we see the MAC's DMA writes. */
-    dcache_invalidate_range((u64)(usize)rx_ring, sizeof(rx_ring));
-    __asm__ volatile("dsb sy" ::: "memory");
     u32 owned = 0;
-    for (u32 i = 0; i < NUM_RX; i++)
-        if (rx_ring[i].addr & RX_ADDR_OWN)
-            owned++;
+    u32 contig = 0;
+    u32 after_gap = 0;
+    u32 first_after = NUM_RX;
+    macb_rx_ownership_snapshot(&owned, &contig, &after_gap, &first_after);
     out->rx_owned = owned;
+    out->rx_contig_owned = contig;
+    out->rx_owned_after_gap = after_gap;
+    out->rx_first_owned_distance = first_after;
     out->nsr  = mr(NSR);
     out->rsr  = mr(RSR);
     out->tsr  = mr(TSR);
@@ -1351,6 +1430,7 @@ void macb_diag(struct macb_diag *out)
     out->tx_drop = tx_drop_count;
     out->tx_recover = tx_recover_count;
     out->rx_live_recover = rx_live_recover_count;
+    out->rx_hole_recover = rx_hole_recover_count;
     out->rx_wedge = rx_wedge_count;
     out->rx_idle = rx_idle_count;
     /* GEM_TXPAUSECNT/RXPAUSECNT are lifetime hardware counters that clear on
@@ -1436,8 +1516,8 @@ void macb_dump_full_state(const char *tag) {
     uart_puts(" RBQP=");
     uart_hex(mr(RBQP));
     uart_puts("\n");
-    dcache_clean_invalidate_range((u64)(usize)tx_ring, sizeof(tx_ring));
-    dcache_invalidate_range((u64)(usize)rx_ring, sizeof(rx_ring));
+    dcache_clean_invalidate_range((u64)(usize)tx_ring, MACB_TX_RING_BYTES);
+    dcache_invalidate_range((u64)(usize)rx_ring, MACB_RX_RING_BYTES);
     uart_puts("[mac] TX:");
     for (u32 i = 0; i < NUM_TX; i++) {
         uart_putc(' ');

@@ -4,9 +4,9 @@ physical serial port (the Raspberry Pi Debug Probe's UART bridge), reusing
 the same FULL-mode protocol validated end-to-end against QEMU's TCP-backed
 UART in tools/uartflash_qemu_test.py.
 
-Bypasses the network entirely -- useful when a bulk network OTA transfer is
-unreliable (the still-unresolved NIC RX wedge under load), since the console
-UART path is a completely independent code path from the network stack.
+Bypasses the network entirely. This remains usable when the MAC RX consumer is
+blocked behind a descriptor-ownership hole because UART does not traverse the
+network stack.
 """
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def send_binary_with_ack(conn: SerialConn, data: bytes, ack_prefix: str, max_ret
             if chunk:
                 raw += chunk
                 text = strip_ansi(raw.decode("ascii", "replace"))
-                if "\n" in text or ack_prefix in text or "TIMEOUT" in text:
+                if ack_prefix in text or "TIMEOUT" in text:
                     break
         text = strip_ansi(raw.decode("ascii", "replace")).strip()
         if ack_prefix in text:

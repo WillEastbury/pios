@@ -42,6 +42,9 @@ struct macb_diag {
     u32 rx_idx;
     u32 tx_idx;
     u32 rx_owned;   /* RX descriptors with OWN set (MAC-filled backlog) */
+    u32 rx_contig_owned;       /* contiguous OWN run starting at rx_idx */
+    u32 rx_owned_after_gap;    /* OWN descriptors after first non-OWN hole */
+    u32 rx_first_owned_distance; /* distance from rx_idx to first OWN after gap */
     u32 rx_recv;    /* lifetime frames received */
     u32 tx_send;    /* lifetime frames sent */
     u32 nsr;
@@ -57,6 +60,7 @@ struct macb_diag {
     u32 tx_drop;        /* lifetime TX frames dropped (ring full) */
     u32 tx_recover;     /* lifetime TX ring recoveries performed */
     u32 rx_live_recover;/* lifetime RX-liveness (silence) recoveries performed */
+    u32 rx_hole_recover;/* lifetime ordered-ring hole recoveries performed */
     u32 rx_wedge;       /* lifetime real wedges: silence + unmet demand */
     u32 rx_idle;        /* lifetime extended RX-silence periods (informational, not faults) */
     u32 tx_pause;       /* lifetime 802.3x PAUSE frames we generated (visibility for PAE) */
@@ -68,6 +72,9 @@ void macb_diag(struct macb_diag *out);
  * ring so the polling driver recovers instead of staying wedged. Cheap to call
  * every poll; returns true only when it actually performed a recovery. */
 bool macb_rx_recover(void);
+/* Detect an impossible ordered-ring hole (current OWN=0, later OWN=1) and
+ * rebuild the RX ring. Returns true only when a recovery was performed. */
+bool macb_rx_hole_recover(void);
 
 /* RX-liveness watchdog. Some RX wedges halt the RX DMA WITHOUT latching
  * RSR.BNA/OVR, so macb_rx_recover()'s status check never fires and the polling

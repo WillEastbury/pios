@@ -130,8 +130,8 @@ void core_start_secondary(u32 id, void (*entry)(void)) {
  * starts (0x80/0x81 once it idles). Serialising bring-up removes the concurrent
  * boot race where multiple secondaries hammer shared resources — DMA channel,
  * per-core MMU table build, the shared procs[] table — at the same time. That
- * race is timing-sensitive (kernel .text is non-cacheable, so instruction-fetch
- * latency, and thus boot timing, shifts with code layout), which is why any
+ * race changes with instruction-fetch latency (kernel .text is non-cacheable),
+ * so code-layout changes alter which secondary reaches shared setup first. Any
  * unrelated code change could strand core 2 inside its httpd launch. The wait is
  * bounded and pets the hardware watchdog so a dead candidate can never brick
  * boot — core 0 proceeds after the timeout and A/B rollback still applies. */

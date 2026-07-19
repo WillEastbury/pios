@@ -3,7 +3,7 @@
 PIOS exposes the same operator command set through several surfaces:
 
 - **UART serial console** on the Pi 5 GPIO header, `115200 8N1`, no flow control.
-- **HDMI mirror console**, which echoes UART input and command output to the framebuffer.
+- **HDMI F3 terminal panel**, confined to the lower half of the framebuffer.
 - **TCP debug console** on port `2323` after `unlock pios`.
 - **Web Admin Console** on `http://192.168.0.201/`.
 - **HTTP operator endpoints** on ports `8080`, `8081`, and `8082`.
@@ -24,7 +24,9 @@ Type Help for assistance!
 ready>
 ```
 
-Input typed on UART is echoed to both UART and HDMI. Command output is also mirrored to both surfaces.
+UART always echoes to the serial terminal. When F3 console mode is active, input and command output
+are also rendered inside the lower HDMI terminal panel; the upper dashboard area is not cleared or
+used for terminal scrolling.
 
 ### VT/ANSI terminal contract
 
@@ -152,6 +154,21 @@ firewall list
 ```
 
 Port `2323` is allowed through the default inbound firewall. The unlock step is intentionally required because commands run on the live kernel.
+
+The parser accepts bare CR, bare LF, and CRLF as one terminator, supports backspace editing, rejects
+overlong lines while discarding the remainder of that line, and returns to the `pios>` prompt.
+
+Built-in debugger commands are available on UART, TCP-2323, and the HTTP terminal:
+
+```text
+break [core]       freeze one secondary core, or all secondaries when omitted
+freeze status      show requested/frozen state for cores 0-3
+regs <core>        dump x0-x30, ELR, saved PSTATE, timestamp, and interrupt source
+resume [core]      resume one frozen core, or all secondaries when omitted
+```
+
+Core 0 is never frozen by an unqualified `break`, preserving the control session. IRQ-capable cores
+capture at interrupt exit; process-hosting cores capture at a scheduler safe point.
 
 ## Web Admin Console
 

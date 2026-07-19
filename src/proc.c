@@ -2453,6 +2453,8 @@ void proc_schedule(void)
     }
 
     for (;;) {
+        if (debug_freeze_is_requested(core_id()))
+            debug_freeze_cooperative_point();
         watchdog_touch(core_id());
         workq_drain(8);
         if (cohdiag_consumer_arm)
@@ -2691,12 +2693,14 @@ u32 proc_count(void)
 
 /* ----------------------------------------------------------------------------
  * GIC SGI inter-core wake doorbell.
- * The event-stream WFE poll (EVNTI) is a crutch for unreliable cross-core SEV.
- * The real model is an interrupt doorbell: a producer (e.g. core 0) posts work
+ * Global SEV is not a targeted delivery contract and unrelated events can wake
+ * every core. The primary model is an interrupt doorbell: a producer posts work
  * to a user core's wake ring, then fires SGI GIC_SGI_WAKE at that core, waking
  * it from WFI without periodic polling. The handler does no work beyond a
  * delivery counter -- returning from the IRQ unblocks WFI/WFE and the scheduler
- * loop re-drains the ring and re-checks the runnable set.
+ * loop re-drains the ring and re-checks the runnable set. The handler sets the
+ * local event latch so an SGI taken just before the scheduler's WFE cannot turn
+ * into a check-then-sleep lost wake.
  *
  * The per-core delivery counter is isolated to its own 64-byte cache line (this
  * bring-up does not retain remotely-written shared lines coherently) and the
@@ -2713,6 +2717,7 @@ static void proc_sgi_wake_handler(void)
     u32 c = core_id() & 3U;
     sgi_wake_stat[c].recv++;
     diag_clean_word(&sgi_wake_stat[c]);
+    __asm__ volatile("sevl" ::: "memory");
 }
 
 /* Enable SGI doorbell receipt on the calling core. SGI enable/priority live in
@@ -2723,13 +2728,15 @@ static void proc_sgi_wake_setup(void)
     irq_register(GIC_SGI_WAKE, proc_sgi_wake_handler);
     gic_set_priority(GIC_SGI_WAKE, 0x40);   /* match timer PPI; below PMR 0xF0 */
     gic_enable_irq(GIC_SGI_WAKE);
+    fifo_irq_enable(core_id());
 }
 
 static void proc_signal_user_core(u32 target_core)
 {
-    sev();
-    if (target_core == CORE_USERM || target_core == CORE_USER1)
+    if (fifo_irq_ready(target_core))
         gic_send_sgi((u8)(1U << target_core), GIC_SGI_WAKE);
+    else
+        sev();
 }
 
 void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
@@ -2749,8 +2756,10 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
      *   - hosts_process core: PROVEN cooperative idle (no GIC interface), woken by
      *     SEV (proc_post_remote_wake) for real work, with the architected timer
      *     event stream as a slow missed-SEV safety net (see EVNTI below).
-     *   - non-hosting cores: SGI-doorbell/WFI idle -- GIC interface up so the SGI
-     *     doorbell can deliver an on-demand wake when a process is assigned. The
+     *   - non-hosting cores: SGI-doorbell/WFE idle -- GIC interface up so the SGI
+     *     doorbell can deliver an on-demand wake when work is published. The SGI
+     *     handler sets the local event latch, closing the interrupt-before-WFE
+     *     race without relying on a periodic poll. The
      *     periodic CNTP timer PPI and architected event stream are DISABLED here:
      *     with no process to run and preemption off, any periodic wake just makes
      *     an unused core burn cycles doing a no-op scheduler scan.
@@ -2827,12 +2836,10 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
     if (!hosts_process)
         proc_sgi_wake_setup();
 
-    uart_puts("[proc] preempt core=");
-    uart_hex(core_id());
-    uart_puts(hosts_process ? " mode=coop+evtstream" : " mode=sgi-doorbell");
-    uart_puts(" quantum_ticks=");
-    uart_hex(q);
-    uart_putc('\n');
+    /* Do not write per-core startup banners directly to the single UART stream:
+     * cores 1-3 initialise concurrently and byte-interleave. `proc sched`,
+     * `core status`, and `sgi stat` expose the same state without corrupting
+     * the interactive console. */
 }
 
 /* Preemption-accounting half of the unified per-core timer tick hook. Marks a
@@ -3647,6 +3654,8 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         out->copy512_ticks = 0;
         out->memcpy2048_ticks = 0;
         out->span2048_ticks = 0;
+        out->fifo_irq_delta = 0;
+        out->_fifo_irq_pad = 0;
         out->cross_fifo_ticks = 0;
         out->cross_batch_ticks = 0;
         out->cross_ring_batch_ticks = 0;
@@ -3762,6 +3771,7 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
     t1 = proc_sched_counter_ticks();
     out->span2048_ticks = t1 >= t0 ? t1 - t0 : 0;
 
+    u32 fifo_irq_before = fifo_irq_sent(CORE_USERM);
     if (core_id() == CORE_NET) {
         struct fifo_msg m;
         struct fifo_msg r;
@@ -4062,6 +4072,10 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
     out->iterations = iterations;
     out->desc_size = sizeof(struct proc_ipc_span_desc);
     out->fifo_handle = h;
+    out->fifo_irq_delta = fifo_irq_sent(CORE_USERM) - fifo_irq_before;
+    out->_fifo_irq_pad = 0;
+    if (fifo_irq_ready(CORE_USERM) && out->fifo_irq_delta == 0)
+        errors++;
     out->errors = errors;
     return errors == 0;
 }

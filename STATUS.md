@@ -1,6 +1,6 @@
 # PIOS — Status & Roadmap
 
-**Last updated:** 2026-04-14
+**Last updated:** 2026-07-19
 
 PIOS is a bare-metal operating system for the Raspberry Pi 5 (BCM2712 / Cortex-A76).
 No Linux, no libc, no POSIX. Every line runs directly on hardware.
@@ -14,7 +14,7 @@ No Linux, no libc, no POSIX. Every line runs directly on hardware.
 | MMU | ✅ Working | Identity-mapped, VA=PA. Device memory for MMIO. |
 | GIC-400 | ✅ Working | IRQ routing, priorities, per-CPU targeting |
 | ARM Generic Timer | ✅ Working | Tick-based scheduling, delays |
-| Multi-core (4× A76) | ✅ Working | Core 0=net/disk, Core 1=disk I/O, Cores 2-3=user |
+| Multi-core (4× A76) | ✅ Working | Core 0=services, Core 1=USERM/SGI FIFO, Cores 2-3=user workers |
 | Watchdog | ✅ Working | Arm/disarm, reboot on trip |
 | Exception handling | ✅ Working | IRQ, FIQ, SError, sync handlers |
 
@@ -60,7 +60,7 @@ No Linux, no libc, no POSIX. Every line runs directly on hardware.
 ### Process Model
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Process scheduler | ✅ Working | Per-core, priority-based (lazy→realtime) |
+| Process scheduler | ✅ Working | Per-core cooperative dispatch; priority classes active, IRQ preemption scaffold disabled |
 | PIX binary loader | ✅ Working | Custom executable format with relocations |
 | IPC queues | ✅ Working | Inter-process message passing |
 | IPC streams | ✅ Working | Byte-stream IPC |
@@ -80,7 +80,8 @@ No Linux, no libc, no POSIX. Every line runs directly on hardware.
 ### Console Shell
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Interactive console | ✅ Working | UART serial + HDMI |
+| Interactive console | ✅ Working | UART, unlocked TCP-2323, and lower-half HDMI F3 terminal |
+| Built-in debugger | ✅ Working | All-secondary freeze/status/register dump/resume; core 0 remains live |
 | File operations | ✅ Working | ls, cat, cp, mv, rm, mkdir, find, hexdump |
 | Text editor | ✅ Working | Ctrl+S/Q, copy/paste, insert mode |
 | Network config | ✅ Working | netcfg set/apply/dhcp, stream tcp/udp |
@@ -166,9 +167,9 @@ No Linux, no libc, no POSIX. Every line runs directly on hardware.
 ### Developer Experience
 | Feature | Difficulty | Impact |
 |---------|-----------|--------|
-| **GDB stub / remote debug** | Medium | No debugger, only UART printf |
-| **CI build pipeline** | Easy | No automated builds or tests |
-| **Unit test framework** | Medium | No tests at all — "it compiles" is the test |
+| **GDB protocol stub** | Medium | No GDB wire protocol; built-in UART/TCP/HTTP freeze+register debugger is available |
+| **CI build pipeline** | Easy | Local QEMU/host regression scripts exist; no hosted CI workflow |
+| **Unit test framework** | Medium | Host parser/codec tests plus QEMU smoke/UART/TCP debugger suites exist |
 | **Cross-platform build** | Easy | Requires specific aarch64 toolchain on Windows/WSL |
 
 ---

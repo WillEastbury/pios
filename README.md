@@ -41,15 +41,15 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 | **Stage0 + Raw Slot Layout** | FAT `kernel8.img` is a stable stage0 loader; partition 2 reserves the first 10 MiB for second-stage and system areas before WALFS. See [DISKLAYOUT.md](DISKLAYOUT.md). |
 | **HDMI Boot Console** | 1024×768 framebuffer with 8×8 bitmap font, `fb_printf()`. |
 | **UART Serial I/O** | RP1 PL011 UART0 at 115200 baud. Line editing with backspace. |
-| **Operator Consoles** | UART+HDMI mirrored console, TCP debug console, Web Admin terminal, logs, OTA, reboot, and firewall operations. See [CONSOLE.md](CONSOLE.md). |
-| **Inter-Core FIFO** | 16 lock-free SPSC ring buffers (4×4 grid). 64-byte messages. |
+| **Operator Consoles** | UART console, unlocked TCP debugger, Web Admin terminal, and a lower-half HDMI F3 terminal panel. See [CONSOLE.md](CONSOLE.md). |
+| **Inter-Core FIFO** | 16 lock-free SPSC channels; 512×64-byte messages or 256 span descriptors, with targeted SGI publication doorbells where safe. |
 | **Unified Pipes** | `/ipc`, `/net`, `/fs`, `/hw` domains mapped through capability-gated pipe adapters. |
 | **NEON/SIMD** | Hardware-accelerated memcpy (64B/iter), IP checksum, CRC32C. |
 | **DMA Engine** | BCM2712 scatter-gather DMA. 6 channels. Frees CPU from bulk copies. |
 | **QPU Tensor Compute** | VideoCore VII dispatch framework with bound-kernel gating; NEON remains default fallback. |
 | **MMU** | Identity-mapped page tables. Cacheable RAM, device memory for MMIO. |
 | **GIC-400 Interrupts** | Full interrupt controller with timer IRQ support. |
-| **Preemptive User Scheduling** | Cores 1-3 run timer-driven quanta (default 5ms @ 1kHz) with safe deferred preemption. |
+| **User Scheduling** | Cores 1-3 run priority-based cooperative schedulers; timer/preemption metadata exists but IRQ preemption remains disabled. |
 | **EL2→EL1 Boot** | Proper exception level transition with NEON/timer access enabled. |
 | **PCIe + RP1 Southbridge** | PCIe root complex init; RP1 GPIO, clock, UART, and USB xHCI. |
 | **USB xHCI + HID Keyboard** | USB host via xHCI on RP1; HID keyboard and mass storage class drivers. |
@@ -238,10 +238,10 @@ Address             Size    Purpose
 
 | Core | Role | Loop | Private RAM |
 |------|------|------|-------------|
-| 0 | **Kernel + Network + Disk** | `net_poll()` + FIFO requests + serial console | 16MB @ 0x00200000 |
-| 1 | **User (USERM)** | Preemptive process scheduler | 16MB @ 0x01200000 |
-| 2 | **User (USER0)** | Preemptive process scheduler | 16MB @ 0x02200000 |
-| 3 | **User (USER1)** | Preemptive process scheduler | 16MB @ 0x03200000 |
+| 0 | **Kernel + Network + Disk** | `net_poll()` + FIFO requests + serial console | 16MB @ 0x00800000 |
+| 1 | **User (USERM)** | Cooperative process scheduler + SGI FIFO doorbell | 16MB @ 0x01800000 |
+| 2 | **User (USER0)** | Cooperative process scheduler | 16MB @ 0x02800000 |
+| 3 | **User (USER1)** | Cooperative process scheduler | 16MB @ 0x03800000 |
 
 ### Inter-Core Communication
 
@@ -467,7 +467,7 @@ pios/
 - [x] TCP stack + BSD-like socket API
 - [x] DNS resolution
 - [x] WALFS append-only filesystem
-- [x] Preemptive user-space process scheduler (all user cores)
+- [x] Cooperative user-space process schedulers (all user cores; IRQ preemption scaffold retained)
 - [x] Capsule isolation + EL2 stage-2 groundwork
 - [ ] Hardened DHCP
 

@@ -46,7 +46,8 @@ In the tables below the **Surfaces** column marks availability:
 | Command | Surfaces | Description |
 |---|---|---|
 | `status` | H U | System/build/network summary (build label, uptime, RX/TX, drops). |
-| `core status` / `sched` / `sched status` / `proc sched` | H U | Scheduler/core busy, WFI residency, soft-event/boost counters. |
+| `core status` / `sched` / `sched status` / `proc sched` | H U | PSCI/core stage plus scheduler busy, park/wake, soft-event, and boost counters. |
+| `sgi stat` / `sgi test <core> [count]` | H U | SGI receive counts plus FIFO IRQ readiness/sent counters; bounded delivery probe. |
 | `ps` / `processes` | H U | Process snapshot: PID/PPID, state, core, arena/span telemetry, graph. |
 | `users` | H U | Principal/user snapshot (no password hashes). |
 | `kill <pid>` | H U | Terminate a process by PID. |
@@ -121,7 +122,7 @@ In the tables below the **Surfaces** column marks availability:
 | `ksvc status` | H U | Kernel service registry: core ownership, priority, call/error/duration. |
 | `ksvc selftest` | H U | Mailbox round-trip + pause/resume/fault/restart transitions. |
 | `ksvc pause\|resume\|fault\|restart <id>` | H U | Service lifecycle controls. |
-| `ipc bench [iterations]` | H U | IPC micro-benchmarks: SVC decode, span FIFO, split span, copied FIFO, cross-core, span rings, all-core fanout. |
+| `ipc bench [iterations]` | H U | IPC micro-benchmarks including cross-core FIFO IRQ delivery (`fifo_irq_delta`). |
 | `abi status` / `abi selftest` | H U | Kernel/user ABI transition stage, SVC trap, entry contract, KPI shims. |
 | `svc <args>` | U | Direct SVC/service shim invocation (debug). |
 | `capsule …` / `obs …` | U | Capsule/observer subsystems (detail via HDMI). |
@@ -139,6 +140,8 @@ In the tables below the **Surfaces** column marks availability:
 | `dumpmem <addr> [bytes]` | H U | Dump a memory range. |
 | `dma status` / `dma selftest` | H U | DMA channel registers, selftest, CB address mode. |
 | `irq status` / `irq probe` / `irq selftest` | H U | IRQ counters, read-only GIC probes, delivery selftest. |
+| `macbdiag` / `rxdiag` | H U | MAC RX ownership topology (`contig`, `after_gap`, `first_after`), hole/BNA/liveness recoveries, NIC/net/IRQ pipeline counters. |
+| `break [core]` / `freeze status` / `regs <core>` / `resume [core]` | H U | Freeze/inspect/resume secondary cores; core 0 remains live as the control plane. |
 | `irq cntpns confirm` / `irq cntpns step <n>` | H | Opt-in watchdog-protected CNTPNS/PPI30 delivery test / stepped probe. |
 | `irq trace [reset]` / `irq sdtrace [wipe]` | H | IRQ dispatch / SD trace rings. |
 | `rp1 irq` / `rp1 pci` | H | RP1 southbridge IRQ/PCIe diagnostics. |

@@ -158,6 +158,9 @@ static const char *ev_name(u8 log2, u16 ev)
         case DT_MAC_RX: return "rx"; case DT_MAC_TX: return "tx";
         case DT_MAC_TXRECLAIM: return "txreclaim"; case DT_MAC_RXRECOVER: return "rxrecover";
         case DT_MAC_TXRECOVER: return "txrecover";
+        case DT_MAC_RXLIVERECOVER: return "rxliverecover";
+        case DT_MAC_RXRECOVER_PATTERN: return "rxrecover-pattern";
+        case DT_MAC_RXHOLERECOVER: return "rxhole-recover";
         } break;
     case DTRACE_CAT_FIFO:
         switch (ev) { case DT_FIFO_PUSH: return "push"; case DT_FIFO_POP: return "pop"; } break;

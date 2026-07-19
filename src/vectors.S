@@ -13,6 +13,7 @@
 .extern irq_vector_minimal_count
 .extern irq_vector_minimal_last_iar
 .extern core_asm_stage
+.weak debug_freeze_cooperative_dispatch
 
 .section .bss
 .balign 4
@@ -117,6 +118,14 @@ el2_to_el1:
     mov     w2, #1
     str     w2, [x1]
 .Lret:
+    /* Both entry paths return to C at EL1. QEMU PSCI starts secondaries
+     * directly at EL1, so enabling FP/SIMD only after the EL2 eret left that
+     * path unable to execute compiler-generated NEON (core_env_init traps on
+     * its first `movi`). Establish the same CPACR_EL1 contract here for both. */
+    mrs     x0, cpacr_el1
+    orr     x0, x0, #(3 << 20)
+    msr     cpacr_el1, x0
+    isb
     mrs     x3, mpidr_el1
     ubfx    x3, x3, #8, #8
     ldr     x4, =core_asm_stage
@@ -178,7 +187,11 @@ el2_sync_handler:
     bl      el2_hvc_trap          /* x0=fid, x1..x4 args, x0 return */
     b       .Lel2_sync_out
 .Lel2_sync_bad:
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    ldr     x12, =0x09000000
+#else
     ldr     x12, =0x107C201000
+#endif
 1:  ldr     w13, [x12, #0x18]
     tbnz    w13, #5, 1b
     mov     w13, #'2'
@@ -287,6 +300,21 @@ vector_table:
     add     sp, sp, #(34 * 8)
 .endm
 
+.global debug_freeze_cooperative_point
+debug_freeze_cooperative_point:
+    SAVE_CONTEXT
+    ldr     x1, [sp, #(15 * 16)]       /* saved x30 = caller return PC */
+    str     x1, [sp, #(15 * 16 + 8)]   /* frame.elr */
+    mrs     x1, daif
+    str     x1, [sp, #(16 * 16)]       /* diagnostic PSTATE subset */
+    mov     x0, sp
+    ldr     x1, =debug_freeze_cooperative_dispatch
+    cbz     x1, 1f                     /* stage0/provisioner do not link it */
+    blr     x1
+1:
+    RESTORE_CONTEXT
+    ret
+
 irq_handler:
     stp     x16, x17, [sp, #-16]!
     ldr     x16, =irq_vector_minimal_mode
@@ -325,7 +353,11 @@ irq_handler:
     eret
 
 sync_handler:
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    ldr     x12, =0x09000000
+#else
     ldr     x12, =0x107C201000
+#endif
 1:  ldr     w13, [x12, #0x18]
     tbnz    w13, #5, 1b
     mov     w13, #'1'

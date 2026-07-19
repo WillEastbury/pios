@@ -20,8 +20,8 @@ Stage0 bootstrap  (kernel8.img — small, stable, never OTA'd)
 Real kernel  (real_kernel.img — the OTA'able stage-2)  src/start.S → kernel_main
    │  EL2→EL1, BSS, early FB, MMU on, subsystem init, start cores 1-3
    ▼
-core0_main()  network + disk + console service loop  (never returns)
-cores 1-3     per-core preemptive process schedulers
+core0_main()  IRQ-driven network + disk + console reactor  (never returns)
+cores 1-3     per-core cooperative process schedulers
 ```
 
 ---
@@ -242,8 +242,8 @@ regime (`kernel.c:13294-13300`).
   (`src/start.S:332-343`).
 - `daifclr #2`, then `bl coreN_main` (`src/start.S:344-349`).
 
-Each secondary's C entry (`core1_main`/`core2_main`/`core3_main`,
-`src/kernel.c:12803,12822,12843`) runs a **per-core preemptive scheduler**:
+Each secondary's C entry (`core1_main`/`core2_main`/`core3_main`) runs a
+**per-core cooperative scheduler**:
 
 ```c
 core_env_init(CORE_USERx);
@@ -253,11 +253,9 @@ proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
 proc_schedule();   /* never returns */
 ```
 
-Core 2 (USER0) additionally launches the embedded userland HTTP server
-(`user/httpd`, port 81) from `user_httpd_payload.S` before entering the
-scheduler (`src/kernel.c:12833-12837`). Progress is published via
-`core_mark_online()` stage markers, surfaced by the `cores`/`proc sched`
-console commands.
+Core 2 and core 3 additionally launch embedded userland HTTP workers before
+entering the scheduler. Progress is published via `core_mark_online()` stage
+markers, surfaced by `core status` and `proc sched`.
 
 > The `core1_main`/`core2_main`/`core3_main` in `src/bootstrap.c` and
 > `src/provision.c` are minimal `for(;;) wfi();` stubs for the stage0/provisioner

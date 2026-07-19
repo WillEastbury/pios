@@ -122,24 +122,29 @@ def entry(platform: int, name: str, payload_off: int, payload_size: int,
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build one PGS2 package containing Pi5 and QEMU stage2 payloads.")
-    ap.add_argument("--pi", required=True, type=pathlib.Path)
-    ap.add_argument("--qemu", required=True, type=pathlib.Path)
+    ap = argparse.ArgumentParser(description="Build a PGS2 package containing Pi5 and optional QEMU payloads.")
+    ap.add_argument("--pi", type=pathlib.Path)
+    ap.add_argument("--qemu", type=pathlib.Path)
     ap.add_argument("--out", required=True, type=pathlib.Path)
     ap.add_argument("--compress-qemu", action="store_true")
     args = ap.parse_args()
 
-    pi = args.pi.read_bytes()
-    qemu = args.qemu.read_bytes()
-    if not pi:
+    if not args.pi and not args.qemu:
+        raise SystemExit("at least one of --pi or --qemu is required")
+
+    pi = args.pi.read_bytes() if args.pi else None
+    qemu = args.qemu.read_bytes() if args.qemu else None
+    if args.pi and not pi:
         raise SystemExit("Pi payload is empty")
-    if not qemu:
+    if args.qemu and not qemu:
         raise SystemExit("QEMU payload is empty")
 
     qemu_payload = qemu
     qemu_flags = 0
     qemu_codec = PAYLOAD_CODEC_NONE
     if args.compress_qemu:
+        if qemu is None:
+            raise SystemExit("--compress-qemu requires --qemu")
         qemu_payload = simple_picocompress(qemu)
         qemu_flags = PAYLOAD_FLAG_COMPRESSED
         qemu_codec = PAYLOAD_CODEC_PICOCOMPRESS
@@ -148,10 +153,15 @@ def main() -> int:
 
     header_bytes = 32
     entry_bytes = 112
-    entry_count = 2
-    pi_off = align_up(header_bytes + entry_count * entry_bytes)
-    qemu_off = align_up(pi_off + len(pi))
-    total = align_up(qemu_off + len(qemu_payload))
+    entry_count = (1 if pi is not None else 0) + (1 if qemu_payload is not None else 0)
+    cursor = align_up(header_bytes + entry_count * entry_bytes)
+    pi_off = cursor if pi is not None else 0
+    if pi is not None:
+        cursor = align_up(pi_off + len(pi))
+    qemu_off = cursor if qemu_payload is not None else 0
+    if qemu_payload is not None:
+        cursor = align_up(qemu_off + len(qemu_payload))
+    total = cursor
     if total > MAX_PACKAGE:
         raise SystemExit(f"stage2 package too large: {total} > {MAX_PACKAGE}")
 
@@ -159,36 +169,46 @@ def main() -> int:
     header = struct.pack("<IHHHHIQQ", MAGIC, VERSION, header_bytes, entry_count,
                          entry_bytes, FLAG_PACKAGED, 0, total)
     write_at(out, 0, header)
-    write_at(out, header_bytes, entry(
-        PLATFORM_PI5,
-        "pi5-bcm2712",
-        pi_off,
-        len(pi),
-        PI_LOAD,
-        len(pi),
-        FEAT_AARCH64 | FEAT_PI_FIRMWARE,
-        FEAT_GENERIC_TIMER | FEAT_GICV2 | FEAT_PL011 | FEAT_RP1 |
-        FEAT_PCIE | FEAT_SD | FEAT_GENET | FEAT_MAILBOX_FB,
-    ))
-    write_at(out, header_bytes + entry_bytes, entry(
-        PLATFORM_QEMU,
-        "qemu-virt",
-        qemu_off,
-        len(qemu_payload),
-        QEMU_LOAD,
-        QEMU_MEMORY,
-        FEAT_AARCH64 | FEAT_GENERIC_TIMER | FEAT_GICV2 | FEAT_PL011 |
-        FEAT_RAM_WALFS | FEAT_UEFI,
-        0,
-        qemu_flags,
-        qemu_codec,
-        len(qemu),
-    ))
-    write_at(out, pi_off, pi)
-    write_at(out, qemu_off, qemu_payload)
+    entry_index = 0
+    if pi is not None:
+        write_at(out, header_bytes + entry_index * entry_bytes, entry(
+            PLATFORM_PI5,
+            "pi5-bcm2712",
+            pi_off,
+            len(pi),
+            PI_LOAD,
+            len(pi),
+            FEAT_AARCH64 | FEAT_PI_FIRMWARE,
+            FEAT_GENERIC_TIMER | FEAT_GICV2 | FEAT_PL011 | FEAT_RP1 |
+            FEAT_PCIE | FEAT_SD | FEAT_GENET | FEAT_MAILBOX_FB,
+        ))
+        write_at(out, pi_off, pi)
+        entry_index += 1
+    if qemu_payload is not None:
+        write_at(out, header_bytes + entry_index * entry_bytes, entry(
+            PLATFORM_QEMU,
+            "qemu-virt",
+            qemu_off,
+            len(qemu_payload),
+            QEMU_LOAD,
+            QEMU_MEMORY,
+            FEAT_AARCH64 | FEAT_GENERIC_TIMER | FEAT_GICV2 | FEAT_PL011 |
+            FEAT_RAM_WALFS | FEAT_UEFI,
+            0,
+            qemu_flags,
+            qemu_codec,
+            len(qemu),
+        ))
+        write_at(out, qemu_off, qemu_payload)
     args.out.write_bytes(out)
-    qemu_note = f"{len(qemu_payload)}:{len(qemu)}" if args.compress_qemu else str(len(qemu))
-    print(f"stage2 package: {args.out} total={len(out)} pi={len(pi)}@{pi_off} qemu={qemu_note}@{qemu_off}")
+    if pi is not None and qemu_payload is not None:
+        qemu_note = f"{len(qemu_payload)}:{len(qemu)}" if args.compress_qemu else str(len(qemu))
+        print(f"stage2 package: {args.out} total={len(out)} pi={len(pi)}@{pi_off} qemu={qemu_note}@{qemu_off}")
+    elif qemu_payload is not None:
+        qemu_note = f"{len(qemu_payload)}:{len(qemu)}" if args.compress_qemu else str(len(qemu))
+        print(f"stage2 package: {args.out} total={len(out)} pi=none qemu={qemu_note}@{qemu_off}")
+    else:
+        print(f"stage2 package: {args.out} total={len(out)} pi={len(pi)}@{pi_off} qemu=none")
     return 0
 
 

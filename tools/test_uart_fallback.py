@@ -155,24 +155,35 @@ def main():
             failures.append("self-safety")
         send("resume", wait=1.0)
 
-        print("\n=== debug freeze: actual freeze completion (KNOWN OPEN ISSUE) ===")
-        print("Not treated as a hard failure here -- per_core IRQ counters show")
-        print("ZERO interrupts ever delivered to cores 1-3 under this QEMU config,")
-        print("a separate, deeper question from the NIC wedge investigation.")
-        r = send("break 1")
+        print("\n=== debug freeze: all secondary cores ===")
+        send("break")
         frozen = False
-        for _ in range(10):
-            r = send("freeze status", wait=0.8)
-            if "core1: requested=1 frozen=1" in r:
-                frozen = True
+        for _ in range(15):
+            r = send("freeze status", wait=0.5)
+            frozen = all(f"core{c}: requested=1 frozen=1" in r for c in (1, 2, 3))
+            if frozen:
                 break
-        print(f"[{'PASS' if frozen else 'INFO (open issue)'}] core1 froze: {frozen}")
-        send("resume 1")
+        print(f"[{'PASS' if frozen else 'FAIL'}] cores 1-3 frozen -> {r.strip()!r}")
+        if not frozen:
+            failures.append("freeze-all")
+
+        regs = send("regs 2")
+        regs_ok = "core2 frozen at tick=" in regs and "x0=" in regs and "elr=" in regs
+        print(f"[{'PASS' if regs_ok else 'FAIL'}] cooperative register snapshot -> {regs.strip()!r}")
+        if not regs_ok:
+            failures.append("freeze-regs")
+
+        send("resume")
+        r = send("freeze status", wait=0.5)
+        resumed = all(f"core{c}: requested=0 frozen=0" in r for c in (1, 2, 3))
+        print(f"[{'PASS' if resumed else 'FAIL'}] cores 1-3 resumed -> {r.strip()!r}")
+        if not resumed:
+            failures.append("resume-all")
 
         if failures:
             print(f"\nFAILED: {failures}")
             return 1
-        print("\nALL CHECKS PASSED (freeze-completion tracked separately, see above)")
+        print("\nALL CHECKS PASSED")
         return 0
     finally:
         proc.terminate()

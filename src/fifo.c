@@ -9,6 +9,13 @@
 #include "core_env.h"
 #include "fb.h"
 #include "dtrace.h"
+#include "gic.h"
+
+#define FIFO_GRID_ENTRIES       16U
+#define FIFO_MSG_POOL_BYTES     (FIFO_GRID_ENTRIES * sizeof(struct fifo))
+#define FIFO_SPAN_POOL_OFFSET   FIFO_MSG_POOL_BYTES
+#define FIFO_SPAN_POOL_BYTES    (FIFO_GRID_ENTRIES * sizeof(struct fifo_span))
+#define FIFO_IRQ_TARGET_OFFSET  (FIFO_SPAN_POOL_OFFSET + FIFO_SPAN_POOL_BYTES)
 
 struct fifo_core_seq {
     volatile u32 seq;
@@ -17,6 +24,28 @@ struct fifo_core_seq {
 static struct fifo_core_seq fifo_seq[4];
 _Static_assert(sizeof(struct fifo_core_seq) == 64,
                "FIFO sequence records must be one cache line");
+
+struct fifo_irq_target {
+    volatile u32 ready;
+    u32 _pad[15];
+} ALIGNED(64);
+
+struct fifo_irq_counter {
+    volatile u32 sent;
+    u32 _pad[15];
+} ALIGNED(64);
+
+#define FIFO_IRQ_TARGET_BYTES   (4U * sizeof(struct fifo_irq_target))
+#define FIFO_IRQ_COUNTER_OFFSET (FIFO_IRQ_TARGET_OFFSET + FIFO_IRQ_TARGET_BYTES)
+#define FIFO_IRQ_COUNTER_BYTES  (FIFO_GRID_ENTRIES * sizeof(struct fifo_irq_counter))
+#define FIFO_SHARED_BYTES       (FIFO_IRQ_COUNTER_OFFSET + FIFO_IRQ_COUNTER_BYTES)
+
+_Static_assert(sizeof(struct fifo_irq_target) == 64,
+               "FIFO IRQ target records must be one cache line");
+_Static_assert(sizeof(struct fifo_irq_counter) == 64,
+               "FIFO IRQ counters must be one cache line");
+_Static_assert(FIFO_SHARED_BYTES <= SHARED_FIFO_SIZE,
+               "FIFO rings and IRQ metadata exceed SHARED_FIFO_SIZE");
 
 static inline void fifo_note_activity(u32 count)
 {
@@ -43,8 +72,54 @@ static inline struct fifo *get_fifo(u32 src, u32 dst) {
 
 static inline struct fifo_span *get_span_fifo(u32 src, u32 dst) {
     return (struct fifo_span *)(SHARED_FIFO_BASE +
-                                (16U * sizeof(struct fifo)) +
+                                FIFO_SPAN_POOL_OFFSET +
                                 ((usize)src * 4 + dst) * sizeof(struct fifo_span));
+}
+
+static inline struct fifo_irq_target *get_irq_target(u32 core) {
+    return (struct fifo_irq_target *)(SHARED_FIFO_BASE +
+                                      FIFO_IRQ_TARGET_OFFSET +
+                                      (usize)core * sizeof(struct fifo_irq_target));
+}
+
+static inline struct fifo_irq_counter *get_irq_counter(u32 src, u32 dst) {
+    return (struct fifo_irq_counter *)(SHARED_FIFO_BASE +
+                                       FIFO_IRQ_COUNTER_OFFSET +
+                                       ((usize)src * 4 + dst) * sizeof(struct fifo_irq_counter));
+}
+
+void fifo_irq_enable(u32 core) {
+    if (core >= 4U)
+        return;
+    get_irq_target(core)->ready = 1U;
+    dsb_ishst();
+}
+
+bool fifo_irq_ready(u32 core) {
+    if (core >= 4U)
+        return false;
+    dmb_ishld();
+    return get_irq_target(core)->ready != 0U;
+}
+
+u32 fifo_irq_sent(u32 core) {
+    if (core >= 4U)
+        return 0;
+    u32 total = 0;
+    dmb_ishld();
+    for (u32 src = 0; src < 4U; src++)
+        total += get_irq_counter(src, core)->sent;
+    return total;
+}
+
+static inline void fifo_notify(u32 src, u32 dst) {
+    if (fifo_irq_ready(dst)) {
+        get_irq_counter(src, dst)->sent++;
+        dmb_ishst();
+        gic_send_sgi((u8)(1U << dst), GIC_SGI_WAKE);
+    } else {
+        sev();
+    }
 }
 
 void fifo_init_all(void) {
@@ -70,7 +145,7 @@ bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {
     dsb();              /* head visible before event signal */
     fifo_note_activity(1);
     DTRACE(DTRACE_CAT_FIFO, DT_FIFO_PUSH, (src << 8) | dst, msg->type, next, msg->tag);
-    sev();              /* wake sleeping cores */
+    fifo_notify(src, dst);
     return true;
 }
 
@@ -94,7 +169,7 @@ u32 fifo_push_batch(u32 src, u32 dst, const struct fifo_msg *msgs, u32 count) {
         f->head = head;
         dsb();
         fifo_note_activity(pushed);
-        sev();
+        fifo_notify(src, dst);
     }
     return pushed;
 }
@@ -178,9 +253,9 @@ u32 fifo_span_push_batch(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32
     if (pushed) {
         dmb_ishst();        /* data stores before head (inner-shareable scope) */
         f->head = head;
-        dsb_ishst();        /* head visible before SEV */
+        dsb_ishst();        /* head visible before doorbell */
         fifo_note_activity(pushed);
-        sev();
+        fifo_notify(src, dst);
     }
     return pushed;
 }
@@ -243,9 +318,9 @@ u32 fifo_span_push_batch_acqrel(u32 src, u32 dst, const struct fifo_span_msg *ms
     }
     if (pushed) {
         atomic_store32(&f->head, head);              /* release: data before head */
-        __asm__ volatile("dsb ishst" ::: "memory");  /* head visible before SEV */
+        __asm__ volatile("dsb ishst" ::: "memory");  /* head visible before doorbell */
         fifo_note_activity(pushed);
-        sev();
+        fifo_notify(src, dst);
     }
     return pushed;
 }
@@ -290,7 +365,7 @@ u32 fifo_span_push_batch_asm(u32 src, u32 dst, const struct fifo_span_msg *msgs,
         atomic_store32(&f->head, head);
         __asm__ volatile("dsb ishst" ::: "memory");
         fifo_note_activity(pushed);
-        sev();
+        fifo_notify(src, dst);
     }
     return pushed;
 }
@@ -316,7 +391,7 @@ u32 fifo_span_pop_batch_asm(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 ma
 
 /* Inner-shareable DMB scope — same structure as the DMB-SY baseline but with
  * the minimal correct barrier scope for inner-shareable cores:
- *   producer DMB ISHST (data before head) + DSB ISHST (head before SEV)
+ *   producer DMB ISHST (data before head) + DSB ISHST (head before doorbell)
  *   consumer DMB ISHLD (head before data reads) + DMB ISH (reads before tail) */
 u32 fifo_span_push_batch_ish(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32 count) {
     if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
@@ -338,7 +413,7 @@ u32 fifo_span_push_batch_ish(u32 src, u32 dst, const struct fifo_span_msg *msgs,
         f->head = head;
         dsb_ishst();
         fifo_note_activity(pushed);
-        sev();
+        fifo_notify(src, dst);
     }
     return pushed;
 }

@@ -95,12 +95,10 @@ PROMPT = "ready>"
 
 
 def send_cmd(conn: UartConn, cmd: str, read_timeout: float = 6.0) -> str:
-    """Send a text command and return its reply, robust against the
-    console's no-newline 'ready> ' prompt (color-wrapped) which can arrive
-    with unpredictable timing relative to our reads -- sometimes merging
-    with the echo of the NEXT command, sometimes appearing twice in a row
-    (a late-arriving prompt from a previous command plus this command's own).
-    Rather than parsing line-by-line (fragile against exactly that timing),
+    """Send a text command and return its reply across arbitrary TCP chunking.
+    The console's no-newline, color-wrapped prompt may share a recv() chunk
+    with the next command echo, and a delayed prior prompt may precede the
+    current prompt. Rather than parsing line-by-line,
     accumulate raw bytes in conn.buf until the decoded text ends with the
     prompt marker, then strip every prompt occurrence and the echoed
     command text (found by exact substring, not a blind replace) in one

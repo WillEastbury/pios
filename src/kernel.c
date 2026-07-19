@@ -517,6 +517,8 @@ static bool debug_tcp_unlocked;
 static char debug_tcp_line[DEBUG_TCP_LINE_MAX];
 static u32 debug_tcp_len;
 static u32 debug_tcp_iac_skip;
+static i32 debug_tcp_last_term_char = -1;
+static bool debug_tcp_discard_line;
 #define CORE0_ETH_IRQ_STALL_THRESHOLD       4U     /* consecutive non-clearing quenches before poll fallback */
 #define CORE0_ETH_IRQ_FALLBACK_COOLDOWN_MS  5000ULL /* how long to stay poll-only before retrying IRQ mode */
 static volatile u64 core0_eth_irq_count;
@@ -591,6 +593,8 @@ static void debug_tcp_close(void)
     debug_tcp_unlocked = false;
     debug_tcp_len = 0;
     debug_tcp_iac_skip = 0;
+    debug_tcp_last_term_char = -1;
+    debug_tcp_discard_line = false;
 }
 
 static void debug_tcp_handle_line(void)
@@ -624,12 +628,23 @@ static void debug_tcp_feed(u8 c)
         debug_tcp_iac_skip = 2; /* ignore simple TELNET IAC command triplets */
         return;
     }
-    if (c == '\r')
+    if (debug_tcp_discard_line) {
+        if (c == '\r' || c == '\n') {
+            debug_tcp_discard_line = false;
+            debug_tcp_last_term_char = c;
+        }
         return;
-    if (c == '\n') {
+    }
+    if (c == '\r' || c == '\n') {
+        if (debug_tcp_last_term_char >= 0 && debug_tcp_last_term_char != c) {
+            debug_tcp_last_term_char = -1;
+            return;
+        }
+        debug_tcp_last_term_char = c;
         debug_tcp_handle_line();
         return;
     }
+    debug_tcp_last_term_char = -1;
     if (c == 8 || c == 127) {
         if (debug_tcp_len > 0) {
             debug_tcp_len--;
@@ -641,9 +656,12 @@ static void debug_tcp_feed(u8 c)
     if (c < 0x20 || c > 0x7E)
         return;
     if (debug_tcp_len + 1 >= sizeof(debug_tcp_line)) {
-        static const char msg[] = "\r\nERR: line too long\r\ndebug> ";
-        (void)tcp_write(debug_client_conn, msg, sizeof(msg) - 1);
+        static const char locked_msg[] = "\r\nERR: line too long\r\ndebug> ";
+        static const char unlocked_msg[] = "\r\nERR: line too long\r\npios> ";
+        const char *msg = debug_tcp_unlocked ? unlocked_msg : locked_msg;
+        (void)tcp_write(debug_client_conn, msg, pios_strlen(msg));
         debug_tcp_len = 0;
+        debug_tcp_discard_line = true;
         return;
     }
     debug_tcp_line[debug_tcp_len++] = (char)c;
@@ -658,6 +676,8 @@ static void debug_tcp_poll(void)
             debug_tcp_unlocked = false;
             debug_tcp_len = 0;
             debug_tcp_iac_skip = 0;
+            debug_tcp_last_term_char = -1;
+            debug_tcp_discard_line = false;
             static const char banner[] =
                 "\r\nPIOS TCP debug console\r\n"
                 "WARNING: commands run on the live kernel.\r\n"
@@ -694,6 +714,8 @@ static void net_services_listen(void)
     debug_tcp_unlocked = false;
     debug_tcp_len = 0;
     debug_tcp_iac_skip = 0;
+    debug_tcp_last_term_char = -1;
+    debug_tcp_discard_line = false;
 
     echo_listen_conn = -1;
     http_listen_conn = tcp_listen(HTTP_TCP_PORT);
@@ -1551,6 +1573,7 @@ struct perf_counter_snapshot {
     u32 nic_rx_peak_mbps_x1000;
     u32 nic_tx_peak_mbps_x1000;
     u32 nic_rx_wedge;
+    u32 nic_rx_hole_recover;
     u32 nic_rx_idle;
     u32 nic_link_mbps;
     bool nic_link_full_duplex;
@@ -1810,10 +1833,12 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
         struct macb_diag md;
         macb_diag(&md);
         p->nic_rx_wedge = md.rx_wedge;
+        p->nic_rx_hole_recover = md.rx_hole_recover;
         p->nic_rx_idle = md.rx_idle;
     }
 #else
     p->nic_rx_wedge = 0;
+    p->nic_rx_hole_recover = 0;
     p->nic_rx_idle = 0;
 #endif
     p->nic_link_mbps = nic_link_mbps();
@@ -1980,6 +2005,7 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "nic_rx_peak_mbps_x1000", perf.nic_rx_peak_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "nic_tx_peak_mbps_x1000", perf.nic_tx_peak_mbps_x1000, true);
     http_append_json_metric(out, &len, max, "nic_rx_wedge", perf.nic_rx_wedge, true);
+    http_append_json_metric(out, &len, max, "nic_rx_hole_recover", perf.nic_rx_hole_recover, true);
     http_append_json_metric(out, &len, max, "nic_rx_idle", perf.nic_rx_idle, true);
     http_append_json_metric(out, &len, max, "nic_link_mbps", perf.nic_link_mbps, true);
     http_append_json_metric(out, &len, max, "nic_link_full_duplex", perf.nic_link_full_duplex ? 1U : 0U, true);
@@ -3067,6 +3093,12 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, md.rx_owned);
         http_append(out, &len, max, "/");
         http_append_u64(out, &len, max, md.ring_size);
+        http_append(out, &len, max, " contig=");
+        http_append_u64(out, &len, max, md.rx_contig_owned);
+        http_append(out, &len, max, " after_gap=");
+        http_append_u64(out, &len, max, md.rx_owned_after_gap);
+        http_append(out, &len, max, " first_after=");
+        http_append_u64(out, &len, max, md.rx_first_owned_distance);
         http_append(out, &len, max, " rx_idx=");
         http_append_u64(out, &len, max, md.rx_idx);
         http_append(out, &len, max, " tx_idx=");
@@ -3095,6 +3127,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, md.tx_recover);
         http_append(out, &len, max, " rx_live_recover=");
         http_append_u64(out, &len, max, md.rx_live_recover);
+        http_append(out, &len, max, " rx_hole_recover=");
+        http_append_u64(out, &len, max, md.rx_hole_recover);
         http_append(out, &len, max, " rx_wedge=");
         http_append_u64(out, &len, max, md.rx_wedge);
         http_append(out, &len, max, " rx_idle=");
@@ -3677,6 +3711,16 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, "sgi recv[0..3]=");
             for (u32 c = 0; c < 4U; c++) {
                 http_append_u64(out, &len, max, proc_sgi_wake_count(c));
+                http_append(out, &len, max, c < 3U ? "," : "\n");
+            }
+            http_append(out, &len, max, "fifo irq ready[0..3]=");
+            for (u32 c = 0; c < 4U; c++) {
+                http_append_u64(out, &len, max, fifo_irq_ready(c) ? 1U : 0U);
+                http_append(out, &len, max, c < 3U ? "," : "\n");
+            }
+            http_append(out, &len, max, "fifo irq sent[0..3]=");
+            for (u32 c = 0; c < 4U; c++) {
+                http_append_u64(out, &len, max, fifo_irq_sent(c));
                 http_append(out, &len, max, c < 3U ? "," : "\n");
             }
         } else {
@@ -4797,6 +4841,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, b.memcpy2048_ticks);
         http_append(out, &len, max, " span2048_ticks=");
         http_append_u64(out, &len, max, b.span2048_ticks);
+        http_append(out, &len, max, " fifo_irq_delta=");
+        http_append_u64(out, &len, max, b.fifo_irq_delta);
         http_append(out, &len, max, " cross_fifo_ticks=");
         http_append_u64(out, &len, max, b.cross_fifo_ticks);
         http_append(out, &len, max, " cross_batch_ticks=");
@@ -6215,6 +6261,12 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, md.rx_recover);
         http_append(out, &len, max, " live_recover=");
         http_append_u64(out, &len, max, md.rx_live_recover);
+        http_append(out, &len, max, " hole_recover=");
+        http_append_u64(out, &len, max, md.rx_hole_recover);
+        http_append(out, &len, max, " contig=");
+        http_append_u64(out, &len, max, md.rx_contig_owned);
+        http_append(out, &len, max, " after_gap=");
+        http_append_u64(out, &len, max, md.rx_owned_after_gap);
 #else
         http_append(out, &len, max, "MAC  unavailable (non-GEM platform)");
 #endif
@@ -9132,6 +9184,8 @@ static void admin_service_poll(struct admin_http_service *svc)
                 if (readable == 0) {
                     bool recovered = macb_rx_recover();
                     if (!recovered)
+                        recovered = macb_rx_hole_recover();
+                    if (!recovered)
                         recovered = macb_rx_liveness_recover(timer_monotonic_ms());
                     if (recovered) {
                         struct macb_diag md_post;
@@ -10651,6 +10705,30 @@ static bool ui_parse_mac6(const char *s, u8 out[6])
         }
     }
     return *s == 0;
+}
+
+static void ui_console_hdmi_reset(void)
+{
+    u32 rows = fb_rows();
+    u32 cols = fb_cols();
+    if (rows == 0 || cols == 0)
+        return;
+
+    u32 panel_top = rows / 2U;
+    if (panel_top + 3U >= rows)
+        panel_top = 0;
+
+    fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
+    for (u32 row = panel_top; row < rows; row++)
+        fb_clear_row(row);
+
+    fb_set_cursor(0, panel_top);
+    fb_puts(" PIOS TERMINAL | UART + TCP/2323 + HDMI");
+    fb_set_cursor(0, panel_top + 1U);
+    fb_hline(cols);
+
+    fb_set_reserved_rows(panel_top + 2U);
+    fb_set_cursor(0, panel_top + 2U);
 }
 
 static void ui_console_write(const char *s)
@@ -14730,8 +14808,7 @@ static void ui_cmd_edit(const char *path)
         timer_delay_ms(1);
     }
 
-    fb_clear(UI_SHELL_BG_COLOR);
-    fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
+    ui_console_hdmi_reset();
     ui_console_write("PIOS F3 Console (serial + HDMI)\n");
     ui_console_write("Type 'help' for commands.\n");
     ui_console_prompt();
@@ -17042,16 +17119,30 @@ static void ui_console_exec(char *line)
         uart_vt_clear();
         uart_vt_home();
         if (ui_mode == UI_MODE_CONSOLE) {
-            fb_clear(UI_SHELL_BG_COLOR);
-            fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
+            ui_console_hdmi_reset();
             ui_console_write("PIOS F3 Console (serial + HDMI)\n");
         }
     } else if (ui_streq(argv[0], "time")) {
-        u64 t = timer_ticks();
-        fb_printf("ticks=%X\n", t);
-        uart_puts("ticks=");
-        uart_hex(t);
-        uart_puts("\n");
+        if (argc < 2 || ui_streq(argv[1], "time")) {
+            ui_console_write("ERR: usage time <command>\n");
+        } else {
+            char nested[UI_CONSOLE_LINE_MAX];
+            u32 pos = 0;
+            for (u32 i = 1; i < argc; i++) {
+                const char *s = argv[i];
+                while (*s && pos + 1U < sizeof(nested))
+                    nested[pos++] = *s++;
+                if (i + 1U < argc && pos + 1U < sizeof(nested))
+                    nested[pos++] = ' ';
+            }
+            nested[pos] = 0;
+            u64 start = read_cntvct();
+            ui_console_exec(nested);
+            u64 end = read_cntvct();
+            ui_console_write("elapsed_ticks=");
+            ui_console_u64_dec(end >= start ? end - start : 0);
+            ui_console_write("\n");
+        }
     } else if (ui_streq(argv[0], "addr")) {
         ui_cmd_addr(argc, argv);
     } else if (ui_streq(argv[0], "netstat")) {
@@ -17738,8 +17829,7 @@ static void ui_handle_keys(void)
         } else if (key == USB_KBD_KEY_F3) {
             ui_mode = UI_MODE_CONSOLE;
             ui_console_len = 0;
-            fb_clear(UI_SHELL_BG_COLOR);
-            fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
+            ui_console_hdmi_reset();
             ui_console_write("PIOS F3 Console (serial + HDMI)\n");
             ui_console_write("Type 'help' for commands.\n");
             ui_console_prompt();
@@ -17792,8 +17882,7 @@ static void ui_handle_keys(void)
         } else if (c == 'c' || c == 'C') {
             ui_mode = UI_MODE_CONSOLE;
             ui_console_len = 0;
-            fb_clear(UI_SHELL_BG_COLOR);
-            fb_set_color(UI_SHELL_TEXT_COLOR, UI_SHELL_BG_COLOR);
+            ui_console_hdmi_reset();
             ui_console_write("PIOS F3 Console (serial + HDMI)\n");
             ui_console_write("Type 'help' for commands.\n");
             ui_console_prompt();
@@ -18739,7 +18828,7 @@ static void hdmi_dashboard_render(void)
         bool tx_hno = (md.tsr & (1U << 8)) != 0;   /* TX HRESP not OK */
         bool rx_en  = (md.ncr & (1U << 2)) != 0;   /* RX enabled */
         bool tx_en  = (md.ncr & (1U << 3)) != 0;   /* TX enabled */
-        bool link   = perf.nic_link_mbps != 0U;    /* real link state (PHY/MDIO), NSR bit0 is unreliable here */
+        bool link   = perf.nic_link_mbps != 0U;    /* negotiated PHY/MDIO state; GEM NSR bit0 is not the link source */
         bool axi_err = (md.eth_cfg_stat & 0x30U) != 0U; /* ARLEN/AWLEN illegal = real AXI bus fault */
         bool ring_full = md.ring_size && md.rx_owned >= (md.ring_size - (md.ring_size / 8U));
         bool wedged = bna || rx_ovr || rx_hno || tx_bex || tx_und || tx_hno ||
@@ -18820,9 +18909,9 @@ static void hdmi_dashboard_render(void)
         fb_set_color(md.rx_live_recover ? C_YEL : C_WHT, 0x00000000);
         fb_printf("%u", md.rx_live_recover);
         fb_set_color(C_GRY, 0x00000000);
-        fb_puts(" rx_idle=");
-        fb_set_color(C_WHT, 0x00000000);
-        fb_printf("%u", md.rx_idle);
+        fb_puts(" hole=");
+        fb_set_color(md.rx_hole_recover ? C_YEL : C_WHT, 0x00000000);
+        fb_printf("%u", md.rx_hole_recover);
         fb_set_cursor(dc, dr++);
         fb_set_color(C_GRY, 0x00000000);
         fb_puts("RBQP=0x");
@@ -19230,7 +19319,7 @@ static void core0_io_tick_hook(u32 core, u64 tick)
      * anymore -- ONLY on real RP1/GEM hardware, where core0_eth_irq_arm_host()
      * actually arms that IRQ path at boot (see PIOS_HAS_RP1 && PIOS_HAS_GENET
      * gating there). The previous unconditional 128Hz force existed only
-     * because RX IRQ delivery was believed unreliable under load; that belief
+     * because RX IRQ delivery was previously suspected under load; that hypothesis
      * was based on an unverified "check-then-arm" race theory that RP1SPEC.md
      * 6.2 actually contradicts (IACK-while-still-asserted is documented to
      * generate a fresh MSI), and the REAL bug was a software lost-wakeup race
@@ -19478,7 +19567,7 @@ static bool ksvc_timer_poll(void *ctx)
      * unconditional CORE0_IO_MAINT tick, preserves self-healing for a real
      * MAC/DMA fault regardless of whether IRQ-driven wake is currently
      * working at all. */
-    if (!macb_rx_recover())
+    if (!macb_rx_recover() && !macb_rx_hole_recover())
         macb_rx_liveness_recover(timer_monotonic_ms());
 #endif
     return true;
@@ -19614,6 +19703,8 @@ NORETURN void core0_main(void) {
              * without this the NIC stays wedged (rx_idx frozen) even after the
              * load stops. Recover, then drain the freshly-restarted ring. */
             if (macb_rx_recover())
+                got += net_poll();
+            else if (macb_rx_hole_recover())
                 got += net_poll();
             /* Also self-heal a non-BNA/OVR RX halt (which the status check above
              * cannot see): if the RX-liveness watchdog (activity-gated) fires,

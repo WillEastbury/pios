@@ -226,9 +226,9 @@ UNUSED static bool bp_read_buf(u32 addr, u8 *buf, u32 len)
 
 static bool bp_write_buf(u32 addr, const u8 *buf, u32 len)
 {
-    /* Use single 4-byte CMD53 transactions — same pattern as bp_write32,
-     * proven reliable. Larger chunks (e.g. 64-byte) intermittently hang
-     * the SDIO controller after several hundred transactions. */
+    /* Use single 4-byte CMD53 transactions, matching bp_write32. In the
+     * recorded stress run, 64-byte CMD53 writes stopped controller progress
+     * after several hundred transactions; 4-byte writes completed the run. */
     if (addr & 3) {
         uart_puts("[bpwb] unaligned addr=");
         uart_hex(addr);

@@ -183,15 +183,17 @@ while (!fifo_pop(CORE_USER0, CORE_DISK, &reply))
 ## Buffer Ownership Rules
 
 1. The `buffer` pointer in a request message points to memory **owned by the sender**
-2. Core 1 (disk) copies data into/from the buffer, then sends a reply
+2. Core 0 owns the disk service, copies data into/from the buffer, then sends a reply
 3. The sender must not modify the buffer until it receives the reply
 4. For large transfers, use memory in the shared DMA region (`DMA_DISK_BASE`)
 
 ## Performance
 
-- Message push/pop: ~20ns (cache-line write + barrier + SEV)
-- FIFO depth 512: can absorb bursts without backpressure
-- `sev`/`wfe` wakes sleeping cores within ~100ns
+- Message rings hold 511 usable 64-byte messages; span rings hold 255 usable descriptors.
+- Each successful publication/batch sends a targeted SGI to IRQ-ready cores and uses SEV fallback for
+  process-hosting cores whose GIC interface remains disabled.
+- Use `ipc bench [iterations]` for current platform measurements; it reports FIFO IRQ delivery as
+  `fifo_irq_delta` rather than relying on fixed nanosecond estimates.
 
 ## Userland IPC Primitives (Issue #26, initial milestone)
 

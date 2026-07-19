@@ -156,13 +156,13 @@ mode COM3 BAUD=115200 PARITY=n DATA=8 STOP=1
 3. You should see:
 
 ```
-[uart] RP1 UART online
-
-PIOS Console ready. Type 'help'.
-> 
+PIOS Serial Console is online
+Type Help for assistance!
+ready>
 ```
 
-The full boot progress is shown on the HDMI screen (colour-coded phases). Once the serial console prompt appears, PIOS is fully operational.
+The HDMI workbench remains visible above a dedicated lower-half F3 terminal panel. Once the serial
+console prompt appears, PIOS is fully operational.
 
 ## Troubleshooting
 

@@ -13,6 +13,8 @@ Assertions:
   - `stackdiag` shows a healthy TCP/IP data plane
   - `dtrace` enable + dump works
   - `schedquanta` reports the expected quantum
+  - all secondary cores reach their scheduler loops
+  - the core-1 SGI doorbell and FIFO-triggered IRQ path deliver
   - `cdump` snapshot + diff works
   - an OTA stream upload completes with {"ok":true}
   - a 20-request HTTP burst is 20/20
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -141,6 +144,38 @@ class Smoke:
         except Exception as e:
             self.check("schedquanta quantum=5ms", False, str(e))
 
+        # multicore startup + SGI/FIFO doorbell
+        try:
+            out = term("core status")
+            stages = {}
+            for line in out.splitlines():
+                m = re.fullmatch(r"([0-3])\s+(-?\d+)\s+(\d+)", line.strip())
+                if m:
+                    stages[int(m.group(1))] = (int(m.group(2)), int(m.group(3)))
+            ok = all(c in stages and stages[c][0] == 0 and stages[c][1] >= 6
+                     for c in (1, 2, 3))
+            self.check("secondary cores online", ok, out.replace("\n", " | ")[:160])
+        except Exception as e:
+            self.check("secondary cores online", False, str(e))
+
+        try:
+            out = term("sgi test 1 8")
+            m = re.search(r"delta=(\d+)", out)
+            self.check("core-1 SGI doorbell delivers",
+                       m is not None and int(m.group(1)) > 0, out.strip())
+        except Exception as e:
+            self.check("core-1 SGI doorbell delivers", False, str(e))
+
+        try:
+            out = term("ipc bench 256", timeout=30)
+            m = re.search(r"fifo_irq_delta=(\d+)", out)
+            self.check("FIFO IRQ delivery",
+                       "ipc bench OK" in out and "errors=0" in out and
+                       m is not None and int(m.group(1)) > 0,
+                       out.strip()[:180])
+        except Exception as e:
+            self.check("FIFO IRQ delivery", False, str(e))
+
         # cdump snapshot + diff
         try:
             term("cdump snap a")
@@ -217,9 +252,11 @@ class Smoke:
         return 0 if ok else 1
 
 
-def wait_boot(timeout: float = 60.0) -> bool:
+def wait_boot(proc: subprocess.Popen | None = None, timeout: float = 60.0) -> bool:
     start = time.time()
     while time.time() - start < timeout:
+        if proc is not None and proc.poll() is not None:
+            return False
         try:
             if get("/api/status", timeout=3)[0] == 200:
                 return True
@@ -261,7 +298,7 @@ def main() -> int:
     proc = subprocess.Popen(qargs)
     rc = 3
     try:
-        if not wait_boot():
+        if not wait_boot(proc):
             print(f"{RED}[smoke] board never reached /api/status (boot hang){RST}")
             return 3
         print("[smoke] board up — running assertions:\n")
@@ -285,4 +322,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

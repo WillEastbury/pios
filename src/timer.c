@@ -80,13 +80,19 @@ void timer_init(u32 hz) {
     /* Enable non-secure physical timer, unmask */
     __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1UL));
 
-    uart_puts("[timer] core=");
-    uart_hex(cid);
-    uart_puts(" hz=");
-    uart_hex(hz);
-    uart_puts(" interval=");
-    uart_hex(interval);
-    uart_puts(")\n");
+    /* UART is a single hardware stream owned by core 0. Secondary cores start
+     * concurrently, so printing their timer banners here interleaves bytes and
+     * corrupts the operator console. Their timer state is available via IRQ and
+     * scheduler diagnostics instead. */
+    if (cid == CORE_NET) {
+        uart_puts("[timer] core=");
+        uart_hex(cid);
+        uart_puts(" hz=");
+        uart_hex(hz);
+        uart_puts(" interval=");
+        uart_hex(interval);
+        uart_puts(")\n");
+    }
 }
 
 u64 timer_ticks(void) {
