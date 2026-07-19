@@ -124,7 +124,8 @@ void gic_set_group1(u32 intid) {
     if (intid >= 1020) return;
     u32 reg = intid / 32;
     u32 bit = intid % 32;
-    mmio_write(gicd_reg(0x080 + reg * 4), 1U << bit);
+    u32 val = mmio_read(gicd_reg(0x080 + reg * 4));
+    mmio_write(gicd_reg(0x080 + reg * 4), val | (1U << bit));
 }
 
 void gic_set_edge_triggered(u32 intid) {

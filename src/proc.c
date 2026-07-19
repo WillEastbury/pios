@@ -2726,6 +2726,9 @@ static void proc_sgi_wake_handler(void)
 static void proc_sgi_wake_setup(void)
 {
     irq_register(GIC_SGI_WAKE, proc_sgi_wake_handler);
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+    gic_set_group1(GIC_SGI_WAKE);
+#endif
     gic_set_priority(GIC_SGI_WAKE, 0x40);   /* match timer PPI; below PMR 0xF0 */
     gic_enable_irq(GIC_SGI_WAKE);
     fifo_irq_enable(core_id());

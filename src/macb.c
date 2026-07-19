@@ -1034,6 +1034,8 @@ bool macb_send(const u8 *frame, u32 len) {
 static u32 rx_recv_count;
 static u32 rx_recover_count;
 static u32 rx_hole_recover_count;
+static u32 rx_hole_candidate_idx = NUM_RX;
+static u64 rx_hole_candidate_since_ms;
 
 static void macb_rx_ownership_snapshot(u32 *total_owned,
                                        u32 *contig_owned,
@@ -1213,8 +1215,11 @@ bool macb_rx_hole_recover(void) {
      * avoids reacting to a transient observation while DMA is completing one
      * descriptor, yet catches the live failure (hundreds queued beyond a hole)
      * well before BNA/OVR or the 90s liveness watchdog can fire. */
-    if (contig != 0U || after < 4U)
+    if (contig != 0U || after < 4U) {
+        rx_hole_candidate_idx = NUM_RX;
+        rx_hole_candidate_since_ms = 0;
         return false;
+    }
 
     /* RX DMA remains active during the bounded diagnostic scan. Revalidate the
      * current descriptor after the scan so normal DMA progress (current became
@@ -1223,7 +1228,19 @@ bool macb_rx_hole_recover(void) {
     dcache_invalidate_range((u64)(usize)&rx_ring[stuck_idx],
                             sizeof(struct macb_desc));
     __asm__ volatile("dsb sy" ::: "memory");
-    if (rx_ring[stuck_idx].addr & RX_ADDR_OWN)
+    if (rx_ring[stuck_idx].addr & RX_ADDR_OWN) {
+        rx_hole_candidate_idx = NUM_RX;
+        rx_hole_candidate_since_ms = 0;
+        return false;
+    }
+
+    u64 now_ms = timer_monotonic_ms();
+    if (rx_hole_candidate_idx != stuck_idx) {
+        rx_hole_candidate_idx = stuck_idx;
+        rx_hole_candidate_since_ms = now_ms;
+        return false;
+    }
+    if (now_ms - rx_hole_candidate_since_ms < 20ULL)
         return false;
 
     rx_hole_recover_count++;
@@ -1231,6 +1248,8 @@ bool macb_rx_hole_recover(void) {
            stuck_idx, after, first, rx_hole_recover_count);
     pioscap_notify_event("rx-descriptor-hole");
     macb_rx_ring_rebuild();
+    rx_hole_candidate_idx = NUM_RX;
+    rx_hole_candidate_since_ms = 0;
     return true;
 }
 

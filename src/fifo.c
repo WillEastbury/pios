@@ -117,9 +117,10 @@ static inline void fifo_notify(u32 src, u32 dst) {
         get_irq_counter(src, dst)->sent++;
         dmb_ishst();
         gic_send_sgi((u8)(1U << dst), GIC_SGI_WAKE);
-    } else {
-        sev();
     }
+    /* SEV remains the sticky correctness backstop if the platform's SGI
+     * security/group routing is not yet delivering to that secondary. */
+    sev();
 }
 
 void fifo_init_all(void) {
