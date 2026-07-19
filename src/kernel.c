@@ -73,6 +73,8 @@
 #include "el2.h"
 #include "crypto.h"
 #include "watchdog.h"
+#include "stackprot.h"
+#include "stack_canary.h"
 #include "fat32.h"
 #include "pios_addr.h"
 #include "picoscript.h"
@@ -3218,6 +3220,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             { "proc_svc",    proc_svc_selftest },
             { "proc_entry",  proc_entry_contract_selftest },
             { "tensor_neon", tensor_selftest },
+            { "el2_stage2",  el2_stage2_selftest },
         };
         u32 nt = (u32)(sizeof(bat) / sizeof(bat[0]));
         u32 passed = 0;
@@ -15493,6 +15496,19 @@ static void ui_cmd_capsule(u32 argc, char **argv)
         }
         (void)el2_hvc_call(EL2_HVC_STAGE2_FAULTS, 0, 0, 0, 0, &faults);
         fb_printf("capsule=%u st=0x%x faults=0x%x\n", id, st, faults);
+        {
+            u32 fc = 0, active = 0, last_cap = 0;
+            u64 esr = 0, elr = 0, far_ipa = 0, sp = 0;
+            bool faulted_el0 = false;
+            u32 core = core_id();
+            if (el2_stage2_fault_detail(core, &fc, &esr, &elr, &far_ipa, &sp,
+                                        &faulted_el0, &active, &last_cap)) {
+                fb_printf("core=%u active=%u last_fault_cap=%u count=%u\n",
+                          core, active, last_cap, fc);
+                fb_printf("esr=0x%x elr=0x%x far_ipa=0x%x sp_%s=0x%x\n",
+                          esr, elr, far_ipa, faulted_el0 ? "el0" : "el1", sp);
+            }
+        }
         return;
     }
     if (ui_streq(argv[1], "check")) {
@@ -19550,7 +19566,25 @@ NORETURN void core0_main(void) {
     u64 dt_phase_thresh;
     { u64 f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); dt_phase_thresh = f / 20000U; }
 
+    u64 stack_canary_last_check = 0;
     for (;;) {
+        /* Placed at the very top of the loop, before the idle branch's
+         * `continue`, so this runs every iteration regardless of whether
+         * core0 is idle or servicing IO -- self-rate-limited the same way
+         * watchdog_poll() throttles itself, since this is NOT wired through
+         * watchdog_poll() (see stack_canary.h/.c comment history: that
+         * function turned out to have zero callers anywhere in the tree,
+         * and resurrecting it would also reactivate its own dormant, never-
+         * fed g_wdog liveness-trip path -- watchdog_touch() likewise has no
+         * callers, so every core's last_touch would sit at its init value
+         * forever, and watchdog_poll() would spuriously trip ~5s after
+         * every boot. Call stack_canary_check() directly instead.) */
+        u64 now_ticks = timer_ticks();
+        if (now_ticks - stack_canary_last_check >= 100ULL) {
+            stack_canary_last_check = now_ticks;
+            stack_canary_check();
+        }
+
         u32 flags = core0_io_take_flags();
         if (flags == 0) {
             watchdog_hw_pet();
@@ -20263,6 +20297,10 @@ static bool provision_write_payload_to_slot(void)
 #endif
 
 void kernel_main(void) {
+    /* Seed the stack-protector canary as early as possible, before any
+     * deeper subsystem init runs (see stackprot.h). */
+    stackprot_init();
+
     bool usb_ok = false;
     bool fb_ok = PIOS_HAS_BOOTINFO_FB ? false : true;  /* Pi FB is early; QEMU GOP is deferred. */
     bool sd_ok = false;
@@ -20361,6 +20399,23 @@ void kernel_main(void) {
         exception_init();
         bp_ok("[exc] vectors installed");
 
+        /* g_boot_el/g_el2_active (el2.c) were never populated before this:
+         * el2_init() had no caller anywhere in the tree, so despite
+         * el2_boot_el_state being correctly recorded by boot assembly
+         * (vectors.S) when the core genuinely starts at real EL2,
+         * el2_hvc_call() always took the software-only fallback path
+         * (a plain C function call, never a real `hvc` trap), and
+         * el2_stage2_program_hw()'s read_current_el()!=2 check always
+         * failed silently -- meaning VTTBR_EL2/HCR_EL2 were NEVER actually
+         * programmed, on any platform, regardless of capsule bookkeeping
+         * reporting success. Found via rubber-duck review. This activates
+         * that dormant hardware path for the first time; see AGENTS.md
+         * continuation note before trusting stage-2 as a real boundary on
+         * physical Pi5 hardware -- it has only been exercised on QEMU here. */
+        el2_init();
+        bp_log(el2_active() ? "[el2] real EL2 active, stage-2 HW path live"
+                             : "[el2] not at EL2 (boot_el != 2); stage-2 stays software-only");
+
         bp_log("[gic] gic_init...");
         gic_init();
         bp_ok("[gic] distributor + CPU iface ready");
@@ -20372,6 +20427,8 @@ void kernel_main(void) {
         bp_log("[wdog] watchdog_init(5s)...");
         watchdog_init(5000, false);
         bp_ok("[wdog] armed");
+
+        stack_canary_init();
 
         bp_log("[irq] unmasking IRQs...");
         __asm__ volatile("msr daifclr, #2");

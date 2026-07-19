@@ -218,6 +218,12 @@ struct appf_service_record {
 #define PROC_RUNNING  2
 #define PROC_BLOCKED  3
 #define PROC_DEAD     4
+/* Transient: reserved by find_empty_slot() under its lock, before the
+ * caller either finishes initializing the process (-> PROC_READY) or
+ * fails and releases it back to PROC_EMPTY (proc_mark_empty()). Appended
+ * rather than inserted, so PROC_READY/RUNNING/BLOCKED/DEAD keep their
+ * existing numeric values. */
+#define PROC_CLAIMED  5
 
 /* Priority classes (low preempt interval = more frequent scheduling) */
 #define PROC_PRIO_LAZY      0

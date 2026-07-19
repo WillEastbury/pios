@@ -1147,10 +1147,22 @@ static bool capsule_manifest_load(struct process *p, const char *path)
         copy_trim(key, sizeof(key), line, pios_strlen(line));
         copy_trim(val, sizeof(val), eq + 1, pios_strlen(eq + 1));
         if (str_eq(key, "capsule")) {
-            if (!(str_eq(val, "on") || str_eq(val, "true") || str_eq(val, "1") ||
-                  str_eq(val, "off") || str_eq(val, "false") || str_eq(val, "0")))
+            /* Stage-2 hardware isolation is mandatory for path-loaded
+             * processes and defaults on (capsule_manifest_defaults()). A
+             * manifest living at <path>.cap is authored by whoever placed
+             * <path> itself -- an ordinary, untrusted binary -- so honoring
+             * a self-declared "capsule=off" would let any process opt itself
+             * out of isolation with no privilege check. Accept the
+             * redundant on/true/1 confirmation; treat an attempt to disable
+             * isolation as a malformed manifest and fail closed instead of
+             * silently granting the escape. */
+            if (str_eq(val, "on") || str_eq(val, "true") || str_eq(val, "1")) {
+                p->capsule_enabled = true;
+            } else if (str_eq(val, "off") || str_eq(val, "false") || str_eq(val, "0")) {
                 return false;
-            p->capsule_enabled = str_eq(val, "on") || str_eq(val, "true") || str_eq(val, "1");
+            } else {
+                return false;
+            }
         } else if (str_eq(key, "spawn")) {
             if (!(str_eq(val, "allow") || str_eq(val, "true") || str_eq(val, "1") ||
                   str_eq(val, "deny") || str_eq(val, "false") || str_eq(val, "0")))
@@ -1666,14 +1678,102 @@ static u8 *slot_base(u32 slot)
     return core_ram_base() + PROC_SLOT_OFFSET + (u64)slot * PROC_SLOT_SIZE;
 }
 
+/* Guards the scan-and-claim in find_empty_slot(): cores 2/3 (per the fixed
+ * core-assignment table) can both call proc_load_and_exec/proc_exec_from_mem
+ * concurrently, and procs[] is a single array shared across cores (not
+ * per-core) -- an unlocked scan let two cores both see the same index as
+ * PROC_EMPTY and both proceed to use it. This is the one shared mutable
+ * global in this file that genuinely needs a lock rather than message
+ * passing, and needs a strict single-claimant guarantee that a FIFO
+ * round-trip can't cheaply give here.
+ *
+ * NOTE (corrected after rubber-duck review): find_empty_slot() IS reachable
+ * from proc_schedule()'s per-core for(;;) loop, via
+ * proc_handle_launch_request() -> proc_exec_with_policy() -- it is not
+ * purely a cold, out-of-band process-creation path as an earlier version of
+ * this comment claimed. What keeps this safe is that the lock is only
+ * actually taken when (a) the unlocked "maybe_free" peek below finds a free
+ * slot AND (b) a genuine new-process launch request is pending (i.e.
+ * proc_handle_launch_request's own seq/done_seq gate already passed) --
+ * both rare, bounded events, not a per-tick occurrence. The critical
+ * section itself is a fixed MAX_PROCS_PER_CORE-element scan plus one write,
+ * with no I/O or nested locking, so the spin is short and bounded even
+ * though it executes inside the scheduler loop's call tree. */
+static volatile u8 g_slot_alloc_lock;
+
 static i32 find_empty_slot(void)
 {
+    /* Per-core xorshift64* PRNG, lazily seeded once from the ARM generic
+     * timer counter. Not cryptographic -- just enough entropy that which
+     * of the MAX_PROCS_PER_CORE empty slots (and therefore which fixed
+     * load address, slot_base()) a new process lands in isn't perfectly
+     * predictable process-to-process the way always picking the lowest
+     * empty index was. A full ASLR redesign (randomizing the kernel image
+     * load address or the fixed per-core memory map itself) would be a
+     * much larger, riskier change given how much of core_env.h/mmu.c
+     * depends on those addresses being fixed -- this is the well-scoped,
+     * low-risk piece of it. */
+    static u64 prng_state[4];
+    u32 c = core_id() & 3U;
+
+    /* First check (unlocked, optimistic): skip the lock entirely on the
+     * common "definitely full" case without contending on it. */
+    bool maybe_free = false;
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
-        if (procs[i].state == PROC_EMPTY)
-            return (i32)i;
+        if (procs[i].state == PROC_EMPTY) { maybe_free = true; break; }
     }
-    return -1;
+    if (!maybe_free)
+        return -1;
+
+    /* Acquire: simple test-and-set spinlock. Reached from proc_schedule()'s
+     * call tree (see the note on g_slot_alloc_lock's declaration above), but
+     * only actually taken on the rare/bounded "free slot exists and a launch
+     * is pending" path, with a fixed MAX_PROCS_PER_CORE-element critical
+     * section and no I/O -- not the kind of unbounded/blocking lock the
+     * "no locks in scheduler" invariant is meant to rule out. */
+    while (__atomic_test_and_set(&g_slot_alloc_lock, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("yield");
+    }
+
+    /* Second check (locked, authoritative): re-scan under the lock -- the
+     * unlocked peek above could be stale by now -- and claim the chosen
+     * slot (PROC_EMPTY -> PROC_CLAIMED) before releasing, so no other core
+     * can observe it as still-empty. */
+    u32 empty[MAX_PROCS_PER_CORE];
+    u32 n = 0;
+    for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++)
+        if (procs[i].state == PROC_EMPTY)
+            empty[n++] = i;
+
+    if (n == 0) {
+        __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+        return -1; /* raced away between the two checks */
+    }
+
+    u32 pick;
+    if (n == 1) {
+        pick = 0;
+    } else {
+        if (prng_state[c] == 0) {
+            u64 t = read_cntvct();
+            prng_state[c] = t ^ ((u64)c << 32) ^ 0x9E3779B97F4A7C15ULL;
+            if (prng_state[c] == 0)
+                prng_state[c] = 0xA5A5A5A5A5A5A5A5ULL;
+        }
+        u64 x = prng_state[c];
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        prng_state[c] = x;
+        pick = (u32)(x % n);
+    }
+
+    i32 chosen = (i32)empty[pick];
+    procs[chosen].state = PROC_CLAIMED;
+    __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+    return chosen;
 }
+
 
 /* Trampoline: x19=&kernel_api_tab, x20=entry. First schedule lands here via LR. */
 static NORETURN void proc_trampoline(void)
@@ -1871,17 +1971,20 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
         uart_puts("[proc] file not found: ");
         uart_puts(path);
         uart_putc('\n');
+        proc_mark_empty((u32)slot);
         return -1;
     }
 
     struct walfs_inode info;
     if (!walfs_stat(inode, &info)) {
         uart_puts("[proc] stat failed\n");
+        proc_mark_empty((u32)slot);
         return -1;
     }
 
     if (info.size == 0 || info.size > PROC_SLOT_SIZE - 64) {
         uart_puts("[proc] invalid binary size\n");
+        proc_mark_empty((u32)slot);
         return -1;
     }
 
@@ -1890,6 +1993,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     u32 loaded = walfs_read(inode, 0, base, (u32)info.size);
     if (loaded != (u32)info.size) {
         uart_puts("[proc] load incomplete\n");
+        proc_mark_empty((u32)slot);
         return -1;
     }
     u32 exec_hash = hw_crc32c(base, loaded);
@@ -1898,7 +2002,14 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     proc_bump_generation((u32)slot);
     p->pid = next_pid++;
     p->parent_pid = 0;
-    p->state = PROC_READY;
+    /* p->state stays PROC_CLAIMED (set by find_empty_slot()) through the rest
+     * of setup -- a rubber-duck review caught that publishing PROC_READY
+     * this early let a same-core interrupt handler or another core's
+     * diagnostics/IPC code observe a "ready" process before its arena,
+     * capsule binding, entry contract, register context, or (critically)
+     * its MMU page tables were actually built. PROC_READY is now the last
+     * field written, right before proc_publish_control(), once the process
+     * is genuinely safe to schedule or address. */
     proc_wake_pending[slot].v = 0;
     p->principal_id = principal_current();
     p->affinity_core = affinity_core;
@@ -1986,6 +2097,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     uart_puts(path);
     uart_putc('\n');
 
+    p->state = PROC_READY;
     proc_publish_control((u32)slot);
     return (i32)p->pid;
 }
@@ -2011,17 +2123,47 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     if (!blob || blob_len == 0 || blob_len > PROC_SLOT_SIZE - 64U)
         return -1;
 
-    i32 slot = find_empty_slot();
-    if (slot < 0) {
-        uart_puts("[proc] mem-exec: no free slot\n");
+    /* The blob is linked at the fixed slot base PROC_EMBED_BASE; unlike
+     * proc_load_and_exec()'s WALFS loader, this can't use the randomized
+     * find_empty_slot() (a rubber-duck review caught this: with 6 slots,
+     * a random pick lands on the one whose slot_base() equals
+     * PROC_EMBED_BASE only ~1/6 of the time, and even worse, would
+     * previously have SPUN THROUGH randomly-claimed-then-released slots
+     * rather than deterministically finding the one that must be used).
+     * Compute the required slot directly from PROC_EMBED_BASE instead,
+     * matching the pattern proc_exec_from_mem_el0() already uses for its
+     * caller-supplied physical_base. This function currently has no
+     * callers (dead code), but a latent trap like this shouldn't ship. */
+    u64 expected_lo = (u64)(usize)core_ram_base() + PROC_SLOT_OFFSET;
+    if (PROC_EMBED_BASE < expected_lo || (PROC_EMBED_BASE - expected_lo) % PROC_SLOT_SIZE != 0)
+        return -1;
+    u32 required_slot = (u32)((PROC_EMBED_BASE - expected_lo) / PROC_SLOT_SIZE);
+    if (required_slot >= MAX_PROCS_PER_CORE)
+        return -1;
+
+    /* Claim under the same lock find_empty_slot() uses: this is a fixed,
+     * specific slot rather than a random pick from the free pool, but it's
+     * still a slot find_empty_slot() could independently pick for an
+     * unrelated process on another core -- close that TOCTOU window too. */
+    while (__atomic_test_and_set(&g_slot_alloc_lock, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("yield");
+    }
+    bool busy = (procs[required_slot].state != PROC_EMPTY);
+    if (!busy)
+        procs[required_slot].state = PROC_CLAIMED;
+    __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+    if (busy) {
+        uart_puts("[proc] mem-exec: required slot busy\n");
         return -1;
     }
+    i32 slot = (i32)required_slot;
 
     u8 *base = slot_base((u32)slot);
     /* The blob is linked at a fixed slot base; refuse if this slot doesn't
      * match (would mean absolute relocations land at the wrong address). */
     if ((u64)(usize)base != PROC_EMBED_BASE) {
         uart_puts("[proc] mem-exec: slot base mismatch\n");
+        proc_mark_empty((u32)slot);
         return -1;
     }
     dma_zero(5, base, PROC_SLOT_SIZE);
@@ -2033,7 +2175,9 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     proc_bump_generation((u32)slot);
     p->pid = next_pid++;
     p->parent_pid = 0;
-    p->state = PROC_READY;
+    /* p->state stays PROC_CLAIMED through setup; see the identical note in
+     * proc_exec_with_policy() above -- PROC_READY is now published only
+     * right before proc_publish_control(), once setup fully succeeds. */
     proc_wake_pending[slot].v = 0;
     p->principal_id = PRINCIPAL_ROOT;   /* trusted: embedded in kernel image */
     p->affinity_core = affinity_core;
@@ -2110,6 +2254,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     uart_puts(name ? name : "?");
     uart_putc('\n');
 
+    p->state = PROC_READY;
     proc_publish_control((u32)slot);
     return (i32)p->pid;
 }
@@ -2172,7 +2317,9 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     proc_bump_generation((u32)slot);
     p->pid = next_pid++;
     p->parent_pid = 0;
-    p->state = PROC_READY;
+    /* p->state stays PROC_EMPTY->(implicitly claimed by the busy-check above)
+     * through setup; see the identical note in proc_exec_with_policy() --
+     * PROC_READY is now published only right before proc_publish_control(). */
     proc_wake_pending[slot].v = 0;
     p->principal_id = PRINCIPAL_ROOT;
     p->affinity_core = affinity_core;
@@ -2242,6 +2389,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     el0_launch_status = 1;
     el0_launch_pid = p->pid;
 
+    p->state = PROC_READY;
     proc_publish_control((u32)slot);
     return (i32)p->pid;
 }
@@ -2327,6 +2475,16 @@ void proc_schedule(void)
                 if (procs[i].pid != 0) {
                     u64 out = 0;
                     (void)el2_hvc_call(EL2_HVC_PORT_UNBIND_ALL, procs[i].pid, 0, 0, 0, &out);
+                }
+                /* Release the capsule descriptor/stage-2 plan (if any) before
+                 * freeing the slot, so a future process reusing this exact
+                 * physical slot doesn't spuriously fail el2_stage2_plan_set()'s
+                 * cross-capsule PA overlap check against this now-dead
+                 * process's stale, otherwise-never-released entry (rubber-duck
+                 * review finding #3). */
+                if (procs[i].capsule_id != PROC_CAPSULE_ID_NONE) {
+                    el2_capsule_release(procs[i].capsule_id);
+                    procs[i].capsule_id = PROC_CAPSULE_ID_NONE;
                 }
                 proc_mark_empty(i);
             }

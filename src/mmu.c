@@ -87,10 +87,16 @@ u64 shared_tcr;
     (2UL  << 32)      \
 )
 
-/* Helper: create a 1GB L1 block entry for normal cacheable RAM */
+/* Helper: create a 1GB L1 block entry for normal cacheable RAM.
+ * PXN|UXN: the kernel never executes instructions through this coarse
+ * block-level mapping (kernel .text lives only in the fine-grained block-0
+ * code window built by kimg_page_attrs()); everywhere else covered by this
+ * helper is process-slot storage, scratch RAM, or framebuffer memory that
+ * the kernel only ever reads/writes, never fetches instructions from under
+ * its own TTBR. Real W^X: never both writable and executable. */
 static inline u64 ram_block_1g(u64 addr) {
     return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
 }
 
 /* Helper: create a 1GB L1 block entry for device MMIO */
@@ -100,18 +106,22 @@ static inline u64 dev_block_1g(u64 addr) {
            PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
 }
 
-/* Helper: create a 2MB L2 block entry for normal cacheable RAM */
+/* Helper: create a 2MB L2 block entry for normal cacheable RAM (see
+ * ram_block_1g comment: PXN|UXN because the kernel never executes through
+ * this coarse mapping). */
 static inline u64 ram_block_2m(u64 addr) {
     return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
 }
 
 /* Helper: create a 2MB L2 block entry for Normal Non-Cacheable RAM.
  * Bit pattern (addr | 0x705) is identical to the NC block start.S installs
- * at l1_table[0], so NC regions keep their exact current attributes. */
+ * at l1_table[0], so NC regions keep their exact current attributes (the
+ * added PXN|UXN bits sit above bit 52 and don't disturb that low-bit
+ * invariant). */
 static inline u64 ram_block_2m_nc(u64 addr) {
     return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
 }
 
 /* Helper: create a 2MB L2 block entry for device MMIO */
@@ -119,6 +129,29 @@ static inline u64 dev_block_2m(u64 addr) {
     return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
            PTE_ATTR(MT_DEVICE_nGnRnE) |
            PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+}
+
+/* Kernel image page attributes (4KB granule), real W^X enforcement for
+ * block 0 (0x0-0x1FFFFF): a 3-way split matching the R E / RW ELF PHDRS
+ * split already applied to the link scripts.
+ *   [code_lo, rodata_hi)  .text.boot+.text+.stage2_manifest+.rodata
+ *                          -> read-only, executable (no PXN/UXN)
+ *   [rodata_hi, bss_lo)   .data (writable initialised globals)
+ *                          -> read-write, execute-never (PXN|UXN)
+ *   everything else       low RAM below the image + .bss head in block 0
+ *                          -> read-write, execute-never (PXN|UXN)
+ * No page is ever both writable and executable. Cacheability is unchanged
+ * from before (WB only inside [code_lo, bss_lo), NC elsewhere) so this is
+ * a pure permission tightening, not a behavior change to caching. */
+static inline u64 kimg_page_attrs(u64 page, u64 code_lo, u64 rodata_hi, u64 bss_lo)
+{
+    u64 memattr = (page >= code_lo && page < bss_lo)
+                      ? PTE_ATTR(MT_NORMAL) : PTE_ATTR(MT_NORMAL_NC);
+    if (page >= code_lo && page < rodata_hi)
+        return page | PTE_VALID | PTE_PAGE | PTE_AF | PTE_SH_INNER |
+               memattr | PTE_AP_RO_EL1;
+    return page | PTE_VALID | PTE_PAGE | PTE_AF | PTE_SH_INNER |
+           memattr | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
 }
 
 static void map_user_device_windows(u64 *l1)
@@ -159,7 +192,18 @@ static inline u64 user_ram_nc_attrs(void)
 
 static void map_user_kernel_low(u64 *l2)
 {
-    for (u32 b = 0; b < (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE); b++) {
+    /* CORE0_RAM_BASE/L2_BLOCK_SIZE is 4 on real Pi5 hardware (CORE0_RAM_BASE=
+     * 0x800000) but 528 on QEMU_VIRT (CORE0_RAM_BASE=0x42000000) -- both
+     * l2_table_low[] and the per-slot l2 table passed in are fixed 512-entry
+     * arrays, so the unclamped loop read/wrote 16 entries past both arrays
+     * on QEMU_VIRT (confirmed: GCC -O2 flags "iteration 512 invokes undefined
+     * behavior"). Clamp to the actual table size; entries above 512 are the
+     * per-core private RAM window and beyond, which mmu_user_slot_pages()
+     * maps separately anyway. */
+    u32 count = (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE);
+    if (count > 512U)
+        count = 512U;
+    for (u32 b = 0; b < count; b++) {
         u64 pa = (u64)b * L2_BLOCK_SIZE;
         /* Mirror the live kernel low-RAM attributes EXACTLY by copying
          * l2_table_low. After cache enable, l2_table_low[0] points at the
@@ -174,22 +218,33 @@ static void map_user_kernel_low(u64 *l2)
     }
 }
 
+/* PTE_NG (not global) on all three of these: they map per-process, per-slot
+ * private code/data pages (user_l3_proc[uc][slot], reachable only via this
+ * process's own TTBR0). Without NG these entries are TLB-global, so a stale
+ * translation could in principle outlive a slot's reuse by ASID alone --
+ * a rubber-duck review caught that the EL1-side variants here lacked PTE_NG
+ * while the EL0-side ones (user_page_el0_*_attrs below) already had it.
+ * Correctness never depended on this: mmu_switch_to_user/_kernel always do a
+ * full, all-ASID TLB invalidate on every switch regardless of tagging (see
+ * the ASID comment on mmu_switch_to_user), so no stale entry has ever
+ * actually survived a switch. This closes the gap so the ASID tagging is
+ * also real defense-in-depth here, not just on the EL0 mappings. */
 static inline u64 user_page_rwx_attrs(void)
 {
     return PTE_VALID | PTE_PAGE | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_NG;
 }
 
 static inline u64 user_page_rx_attrs(void)
 {
     return PTE_VALID | PTE_PAGE | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RO_EL1 | PTE_UXN;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RO_EL1 | PTE_UXN | PTE_NG;
 }
 
 static inline u64 user_page_rw_xn_attrs(void)
 {
     return PTE_VALID | PTE_PAGE | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN | PTE_NG;
 }
 
 static inline u64 user_page_el0_rx_attrs(void)
@@ -320,18 +375,17 @@ void mmu_init(void) {
      * shared FIFO/DMA/IPC NC, framebuffer back buffer WB. */
     volatile u64 *l2 = l2_table_low;
     extern char __text_start[];
+    extern char __rodata_end[];
     extern char __bss_start[];
-    const u64 code_lo = (u64)(usize)__text_start & ~(L3_PAGE_SIZE - 1);
-    const u64 code_hi = (u64)(usize)__bss_start  & ~(L3_PAGE_SIZE - 1);
+    const u64 code_lo    = (u64)(usize)__text_start  & ~(L3_PAGE_SIZE - 1);
+    const u64 rodata_hi  = (u64)(usize)__rodata_end & ~(L3_PAGE_SIZE - 1);
+    const u64 code_hi    = (u64)(usize)__bss_start   & ~(L3_PAGE_SIZE - 1);
     for (u32 i = 0; i < 512; i++) {
         u64 addr = (u64)i * L2_BLOCK_SIZE;
         if (i == 0) {
             for (u32 p = 0; p < 512; p++) {
                 u64 page = (u64)p * L3_PAGE_SIZE;
-                u64 attr = (page >= code_lo && page < code_hi)
-                               ? PTE_ATTR(MT_NORMAL) : PTE_ATTR(MT_NORMAL_NC);
-                l3_block0[p] = page | PTE_VALID | PTE_PAGE | PTE_AF |
-                               PTE_SH_INNER | attr | PTE_AP_RW_EL1;
+                l3_block0[p] = kimg_page_attrs(page, code_lo, rodata_hi, code_hi);
             }
             l2[i] = (u64)(usize)l3_block0 | PTE_VALID | PTE_TABLE;
             continue;
@@ -449,17 +503,41 @@ void mmu_enable_caching(void) {
      * .bss (MACB rings/bufs, etc.) coherent with its DMA master: with the caches
      * now actually allocating (WB-from-boot fix), mapping that .bss WB caused the
      * NIC to wedge under load. The dedicated per-core DMA arena (follow-up) will
-     * let us reclaim .bss WB while keeping DMA memory NC. */
+     * let us reclaim .bss WB while keeping DMA memory NC.
+     *
+     * Real W^X on top of that same cacheability split (kimg_page_attrs, see its
+     * comment above): [__text_start, __rodata_end) is read-only + executable;
+     * [__rodata_end, __bss_start) (.data) and everything else in block 0 is
+     * read-write + execute-never. rodata_hi rounds DOWN like code_hi/code_lo --
+     * a page straddling the rodata/data boundary must come out writable, not
+     * read-only, or the first write to an early .data global page-sharing with
+     * the .rodata tail would fault.
+     *
+     * IMPORTANT (corrected after rubber-duck review): this whole mechanism only
+     * covers block 0, physical [0x0, 0x1FFFFF] via l2_table_low/l3_block0 -- it
+     * assumes __text_start falls inside that first 2MB, which is true for real
+     * Pi5 hardware (link.ld links at 0x80000) but NOT for QEMU (link_qemu_full.ld
+     * links at 0x40080000, inside L1[1]'s separate 1GB block, untouched by this
+     * function). So even when force-enabled on QEMU for a one-off test
+     * (PIOS_ENABLE_CACHE_REMAP=1), this loop still runs and correctly enforces
+     * RO+X/RW+XN over the *unused* low-2MB region, but it does NOT touch the
+     * QEMU kernel's own .text/.rodata/.data at 0x40080000+, which stays whatever
+     * start.S's coarse 1GB block left it as (WB, RWX, no PXN/UXN). A QEMU-forced
+     * run of this path therefore does not prove W^X actually protects the
+     * running kernel's own code -- only a real Pi5 hardware boot (where
+     * PIOS_ENABLE_CACHE_REMAP defaults to 1 and __text_start genuinely sits in
+     * block 0) exercises that. Verify via readelf -l on real_kernel.elf (PT_LOAD
+     * R E vs RW segments) and, ideally, an on-device page-table dump rather than
+     * a QEMU run. */
     extern char __text_start[];
+    extern char __rodata_end[];
     extern char __bss_start[];
-    const u64 code_lo = (u64)(usize)__text_start & ~(L3_PAGE_SIZE - 1);
-    const u64 code_hi = (u64)(usize)__bss_start  & ~(L3_PAGE_SIZE - 1);
+    const u64 code_lo   = (u64)(usize)__text_start  & ~(L3_PAGE_SIZE - 1);
+    const u64 rodata_hi = (u64)(usize)__rodata_end  & ~(L3_PAGE_SIZE - 1);
+    const u64 code_hi   = (u64)(usize)__bss_start   & ~(L3_PAGE_SIZE - 1);
     for (u32 i = 0; i < 512; i++) {
         u64 addr = (u64)i * L3_PAGE_SIZE;
-        u64 attr = (addr >= code_lo && addr < code_hi)
-                       ? PTE_ATTR(MT_NORMAL) : PTE_ATTR(MT_NORMAL_NC);
-        l3_block0[i] = addr | PTE_VALID | PTE_PAGE | PTE_AF |
-                       PTE_SH_INNER | attr | PTE_AP_RW_EL1;
+        l3_block0[i] = kimg_page_attrs(addr, code_lo, rodata_hi, code_hi);
     }
 
     for (u32 i = 0; i < 512; i++) {
@@ -694,7 +772,26 @@ bool mmu_switch_to_user(u32 core, u32 slot)
     if (!user_table_valid[uc][slot].v)
         return false;
 
-    u64 ttbr = (u64)(usize)user_l1[uc][slot];
+    /* Tag this process's table with a distinct 8-bit ASID (TCR_EL1.AS=0,
+     * the default here -- see TCR_VALUE -- selects 8-bit ASID in
+     * TTBR0_EL1[55:48]). ASID 0 is reserved for the shared kernel table
+     * (mmu_switch_to_kernel). Real physical addresses on this hardware
+     * never reach bit 48+, so OR-ing the ASID into that field cannot
+     * collide with the table's physical base.
+     *
+     * This is additive defense-in-depth, not a change to the isolation
+     * boundary itself: mmu_invalidate_tlb() below still does a full
+     * (all-ASID) invalidate on every switch, exactly as before, so
+     * correctness never depended on ASID tagging. But an untagged switch
+     * left every process's translations sharing ASID 0 -- if a future
+     * change ever dropped or narrowed that flush (e.g. for a legitimate
+     * perf optimization), stale cross-process TLB entries would have had
+     * no ASID to distinguish them. Tagging now means that failure mode
+     * would show up as one process's table walking into a completely
+     * different physical mapping (an immediate, loud fault or wrong-data
+     * bug), not a silent, exploitable stale-permission read/write. */
+    u64 asid = (u64)(1U + uc * MAX_PROCS_PER_CORE + slot);
+    u64 ttbr = (asid << 48) | (u64)(usize)user_l1[uc][slot];
     __asm__ volatile("msr ttbr0_el1, %0" :: "r"(ttbr));
     mmu_invalidate_tlb();
     return true;
@@ -702,6 +799,7 @@ bool mmu_switch_to_user(u32 core, u32 slot)
 
 void mmu_switch_to_kernel(void)
 {
+    /* ASID 0, reserved for the shared kernel table (see mmu_switch_to_user). */
     __asm__ volatile("msr ttbr0_el1, %0" :: "r"(shared_ttbr0));
     mmu_invalidate_tlb();
 }

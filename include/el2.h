@@ -1,7 +1,18 @@
 #pragma once
 #include "types.h"
 
-#define EL2_CAPSULE_MAX 8U
+/* Total concurrent process capacity is MAX_PROCS_PER_CORE(6) * 4 cores = 24
+ * (proc.h), so with mandatory-by-default stage-2 isolation (proc.c
+ * capsule_manifest_load), the old EL2_CAPSULE_MAX=8 was a hard ceiling
+ * BELOW the process capacity: the 9th concurrently-running process would
+ * always fail el2_capsule_bind_slot and fail process creation closed, even
+ * though a process slot was free. Raised to 32 (headroom above 24) -- the
+ * dominant per-capsule cost is g_stage2_root[]+g_stage2_l2[] at 8KB each
+ * (el2.c), so 32*8KB=256KB total, trivial next to actual RAM. Packed
+ * diagnostic fields (active_capsule/last_fault_capsule in the
+ * EL2_HVC_STAGE2_FAULTS return value, el2.c) mask to 8 bits (max 255), so
+ * this must stay under 255 as long as that packed format is unchanged. */
+#define EL2_CAPSULE_MAX 32U
 
 /* Hypercall IDs reserved for PIKEE capsule host services. */
 #define EL2_HVC_GET_EL            0x1000U
@@ -59,6 +70,7 @@ bool el2_stage2_status(u32 id, struct el2_stage2_plan *out);
 i32  el2_stage2_activate(u32 id);
 i32  el2_capsule_bind_slot(u32 owner_principal, u32 manifest_hash, u64 el0_slot_base,
                            u64 el0_slot_size, u32 *id_out);
+void el2_capsule_release(u32 id);
 
 /* Minimal software dispatcher used while full HVC trap path is being wired. */
 i32 el2_hvc_dispatch(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0);
@@ -67,3 +79,18 @@ i32 el2_hvc_call(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4, u64 *ret0);
 /* EL2 trap entry helper called from vectors.S. */
 u64 el2_hvc_trap(u32 fid, u64 x1, u64 x2, u64 x3, u64 x4);
 u64 el2_sync_fault_trap(u64 esr, u64 elr);
+
+/* Direct (non-HVC) accessor for the fuller per-core stage-2 fault context
+ * (core, syndrome, PC, SP, faulting IPA, capsule) captured by
+ * el2_sync_fault_trap. far_ipa is the full IPA (HPFAR_EL2+FAR_EL2
+ * combined, not raw HPFAR_EL2); sp is SP_EL0 or SP_EL1 depending on
+ * faulted_el0 (which EL the faulting context was running at). Returns
+ * false if core >= 4. */
+bool el2_stage2_fault_detail(u32 core, u32 *fault_count, u64 *esr, u64 *elr,
+                              u64 *far_ipa, u64 *sp, bool *faulted_el0,
+                              u32 *active_capsule, u32 *last_fault_capsule);
+
+/* QEMU-safe pure-logic selftest: per-core activation state, fail-closed IPA
+ * bounds, and cross-capsule PA overlap rejection. See kernel.c selftest
+ * battery. */
+bool el2_stage2_selftest(void);

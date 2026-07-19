@@ -1,21 +1,28 @@
 ENTRY(_start)
 
+PHDRS
+{
+    text PT_LOAD FLAGS(5); /* R|X */
+    data PT_LOAD FLAGS(6); /* R|W */
+}
+
 SECTIONS
 {
     . = 0x40080000;
     __image_start = .;
 
     __text_start = .;
-    .text.boot : { *(.text.boot) }
-    .text      : { *(.text*) }
+    .text.boot : { *(.text.boot) } :text
+    .text      : { *(.text*) } :text
     __text_end = .;
     .stage2_manifest : {
         __stage2_manifest_start = .;
         KEEP(*(.stage2_manifest))
         __stage2_manifest_end = .;
-    }
-    .rodata    : { *(.rodata*) }
-    .data      : { *(.data*) }
+    } :text
+    .rodata    : { *(.rodata*) } :text
+    __rodata_end = .;
+    .data      : { *(.data*) } :data
 
     . = ALIGN(16);
     .bss . (NOLOAD) : {
@@ -23,7 +30,7 @@ SECTIONS
         *(.bss*)
         *(COMMON)
         __bss_end = .;
-    }
+    } :data
 
     . = ALIGN(4096);
     . += 0x40000;
