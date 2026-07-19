@@ -51,7 +51,17 @@ could not advance past the missing ownership publication.
 - [x] QEMU smoke **11/11**.
 - [x] UART console/debugger, TCP-2323 debugger, and UART full/patch flash tests pass under QEMU.
 - [x] Pi5 payload builds; changed files compile without new warnings.
-- [ ] Hardware RX fix is not yet booted. A first bootstrap attempt stopped before `bootstrap_main`;
+- [x] Live Pi5 recovery image `v20260719.162441` ran for nearly three hours with
+      `rx_recv=32951`, `rx_owned=0`, `RSR=0`, `rx_wedge=0`, and
+      `rx_hole_recover=10`. Twelve consecutive ~244 KiB downloads kept ARP/ping
+      reachable; the final two timed out with `tx_recover` incrementing, while
+      RX continued advancing. Ingress darkness is therefore contained; the
+      remaining bulk tail is TX/TCP-side.
+- [x] Live diagnostics exposed a separate SGI problem in that recovery build:
+      `sgi recv[1..3]=0` and the synthetic FIFO reply ring filled. Commit
+      `04ac3ea` adds Pi5 banked Group1 setup and always retains SEV as the
+      correctness backstop; QEMU remains 11/11.
+- [ ] The persistent FAT stage0 path is not yet booted. A first bootstrap attempt stopped before `bootstrap_main`;
       stage0 now uses the dedicated `bootstrap_start.S`/`link_bootstrap.ld` path. The replacement
       FAT pair is `kernel8.img` + `PIOSSTG2.PKG`: stage0 reads the package, verifies it, caches it in
       raw slot A header-last, activates A, and boots it.
