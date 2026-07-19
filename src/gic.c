@@ -68,6 +68,11 @@ void gic_init(void) {
     for (u32 i = 0; i < num_irqs / 32; i++)
         mmio_write(gicd_reg(0x280 + i * 4), 0xFFFFFFFF);
 
+    /* Clear active state too. A watchdog warm reset can preserve GIC
+     * distributor state; an SGI left active can never be delivered again. */
+    for (u32 i = 0; i < num_irqs / 32; i++)
+        mmio_write(gicd_reg(0x380 + i * 4), 0xFFFFFFFF);
+
     /* Set all priorities to a default (0xA0) */
     for (u32 i = 0; i < num_irqs / 4; i++)
         mmio_write(gicd_reg(0x400 + i * 4), 0xA0A0A0A0);
@@ -188,6 +193,9 @@ void gic_send_sgi(u8 target_mask, u32 sgi_id) {
  * bits (ATF leaves GICC_CTLR ~0x60 on Pi 5; the validated enable is old|1). */
 void gic_cpu_init(void) {
     u32 old_c_ctlr = mmio_read(gicc_reg(0x000));
+    /* SGI/PPI pending and active registers are banked per CPU interface. */
+    mmio_write(gicd_reg(0x280), 0xFFFFFFFFU);
+    mmio_write(gicd_reg(0x380), 0xFFFFFFFFU);
     mmio_write(gicc_reg(0x004), 0xF0);          /* PMR: accept normal priorities */
     mmio_write(gicc_reg(0x000), old_c_ctlr | 1U);
     __asm__ volatile("dsb sy; isb" ::: "memory");

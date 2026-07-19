@@ -10,6 +10,7 @@
 #include "fb.h"
 #include "dtrace.h"
 #include "gic.h"
+#include "mmu.h"
 
 #define FIFO_GRID_ENTRIES       16U
 #define FIFO_MSG_POOL_BYTES     (FIFO_GRID_ENTRIES * sizeof(struct fifo))
@@ -46,6 +47,14 @@ _Static_assert(sizeof(struct fifo_irq_counter) == 64,
                "FIFO IRQ counters must be one cache line");
 _Static_assert(FIFO_SHARED_BYTES <= SHARED_FIFO_SIZE,
                "FIFO rings and IRQ metadata exceed SHARED_FIFO_SIZE");
+
+static inline void fifo_clean(const volatile void *p, u64 len) {
+    dcache_clean_range((u64)(usize)p, len);
+}
+
+static inline void fifo_invalidate(const volatile void *p, u64 len) {
+    dcache_invalidate_range((u64)(usize)p, len);
+}
 
 static inline void fifo_note_activity(u32 count)
 {
@@ -134,6 +143,7 @@ bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {
     if (src >= 4 || dst >= 4) return false;
     struct fifo *f = get_fifo(src, dst);
     u32 head = f->head;
+    fifo_invalidate(&f->tail, sizeof(f->tail));
     u32 next = (head + 1) & (FIFO_CAPACITY - 1); /* power-of-2 mask */
 
     if (unlikely(next == f->tail))
@@ -141,8 +151,10 @@ bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {
 
     /* Copy message with NEON (64 bytes = one cache line) */
     simd_memcpy(&f->msgs[head], msg, sizeof(struct fifo_msg));
+    fifo_clean(&f->msgs[head], sizeof(struct fifo_msg));
     dmb();              /* msg visible before head update */
     f->head = next;
+    fifo_clean(&f->head, sizeof(f->head));
     dsb();              /* head visible before event signal */
     fifo_note_activity(1);
     DTRACE(DTRACE_CAT_FIFO, DT_FIFO_PUSH, (src << 8) | dst, msg->type, next, msg->tag);
@@ -154,6 +166,7 @@ u32 fifo_push_batch(u32 src, u32 dst, const struct fifo_msg *msgs, u32 count) {
     if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
     struct fifo *f = get_fifo(src, dst);
     u32 head = f->head;
+    fifo_invalidate(&f->tail, sizeof(f->tail));
     u32 tail = f->tail;
     u32 pushed = 0;
 
@@ -162,12 +175,14 @@ u32 fifo_push_batch(u32 src, u32 dst, const struct fifo_msg *msgs, u32 count) {
         if (unlikely(next == tail))
             break;
         simd_memcpy(&f->msgs[head], &msgs[pushed], sizeof(struct fifo_msg));
+        fifo_clean(&f->msgs[head], sizeof(struct fifo_msg));
         head = next;
         pushed++;
     }
     if (pushed) {
         dmb();
         f->head = head;
+        fifo_clean(&f->head, sizeof(f->head));
         dsb();
         fifo_note_activity(pushed);
         fifo_notify(src, dst);
@@ -180,13 +195,16 @@ bool fifo_pop(u32 dst, u32 src, struct fifo_msg *msg) {
     struct fifo *f = get_fifo(src, dst);
     u32 tail = f->tail;
 
+    fifo_invalidate(&f->head, sizeof(f->head));
     if (unlikely(tail == f->head))
         return false;   /* empty */
 
     dmb();              /* ensure we read current head before msg */
+    fifo_invalidate(&f->msgs[tail], sizeof(struct fifo_msg));
     simd_memcpy(msg, &f->msgs[tail], sizeof(struct fifo_msg));
     dmb();              /* msg consumed before tail advance */
     f->tail = (tail + 1) & (FIFO_CAPACITY - 1);
+    fifo_clean(&f->tail, sizeof(f->tail));
     fifo_note_activity(1);
     DTRACE(DTRACE_CAT_FIFO, DT_FIFO_POP, (dst << 8) | src, msg->type, f->tail, msg->tag);
     return true;
@@ -196,11 +214,13 @@ u32 fifo_pop_batch(u32 dst, u32 src, struct fifo_msg *msgs, u32 max_count) {
     if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
     struct fifo *f = get_fifo(src, dst);
     u32 tail = f->tail;
+    fifo_invalidate(&f->head, sizeof(f->head));
     u32 head = f->head;
     u32 popped = 0;
 
     dmb();
     while (popped < max_count && tail != head) {
+        fifo_invalidate(&f->msgs[tail], sizeof(struct fifo_msg));
         simd_memcpy(&msgs[popped], &f->msgs[tail], sizeof(struct fifo_msg));
         tail = (tail + 1) & (FIFO_CAPACITY - 1);
         popped++;
@@ -208,6 +228,7 @@ u32 fifo_pop_batch(u32 dst, u32 src, struct fifo_msg *msgs, u32 max_count) {
     if (popped) {
         dmb();
         f->tail = tail;
+        fifo_clean(&f->tail, sizeof(f->tail));
         fifo_note_activity(popped);
     }
     return popped;
@@ -217,20 +238,26 @@ bool fifo_peek(u32 dst, u32 src, struct fifo_msg *msg) {
     if (src >= 4 || dst >= 4 || !msg) return false;
     struct fifo *f = get_fifo(src, dst);
     u32 tail = f->tail;
+    fifo_invalidate(&f->head, sizeof(f->head));
     if (unlikely(tail == f->head))
         return false;
     dmb();
+    fifo_invalidate(&f->msgs[tail], sizeof(struct fifo_msg));
     simd_memcpy(msg, &f->msgs[tail], sizeof(struct fifo_msg));
     return true;
 }
 
 bool fifo_empty(u32 dst, u32 src) {
     struct fifo *f = get_fifo(src, dst);
+    fifo_invalidate(&f->head, sizeof(f->head));
+    fifo_invalidate(&f->tail, sizeof(f->tail));
     return (f->tail == f->head);
 }
 
 u32 fifo_count(u32 dst, u32 src) {
     struct fifo *f = get_fifo(src, dst);
+    fifo_invalidate(&f->head, sizeof(f->head));
+    fifo_invalidate(&f->tail, sizeof(f->tail));
     u32 h = f->head;
     u32 t = f->tail;
     return (h - t) & (FIFO_CAPACITY - 1);
@@ -240,6 +267,7 @@ u32 fifo_span_push_batch(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32
     if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 head = f->head;
+    fifo_invalidate(&f->tail, sizeof(f->tail));
     u32 tail = f->tail;
     u32 pushed = 0;
 
@@ -248,12 +276,14 @@ u32 fifo_span_push_batch(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32
         if (unlikely(next == tail))
             break;
         f->msgs[head] = msgs[pushed];
+        fifo_clean(&f->msgs[head], sizeof(struct fifo_span_msg));
         head = next;
         pushed++;
     }
     if (pushed) {
         dmb_ishst();        /* data stores before head (inner-shareable scope) */
         f->head = head;
+        fifo_clean(&f->head, sizeof(f->head));
         dsb_ishst();        /* head visible before doorbell */
         fifo_note_activity(pushed);
         fifo_notify(src, dst);
@@ -265,11 +295,13 @@ u32 fifo_span_pop_batch(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_co
     if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 tail = f->tail;
+    fifo_invalidate(&f->head, sizeof(f->head));
     u32 head = f->head;
     u32 popped = 0;
 
     dmb_ishld();            /* head read before data reads (inner-shareable) */
     while (popped < max_count && tail != head) {
+        fifo_invalidate(&f->msgs[tail], sizeof(struct fifo_span_msg));
         msgs[popped] = f->msgs[tail];
         tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
         popped++;
@@ -277,6 +309,7 @@ u32 fifo_span_pop_batch(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_co
     if (popped) {
         dmb_ish();          /* data reads before tail store */
         f->tail = tail;
+        fifo_clean(&f->tail, sizeof(f->tail));
         fifo_note_activity(popped);
     }
     return popped;
@@ -306,6 +339,7 @@ u32 fifo_span_push_batch_acqrel(u32 src, u32 dst, const struct fifo_span_msg *ms
     if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 head = f->head;
+    fifo_invalidate(&f->tail, sizeof(f->tail));
     u32 tail = atomic_load32(&f->tail);
     u32 pushed = 0;
 
@@ -314,11 +348,13 @@ u32 fifo_span_push_batch_acqrel(u32 src, u32 dst, const struct fifo_span_msg *ms
         if (unlikely(next == tail))
             break;
         f->msgs[head] = msgs[pushed];
+        fifo_clean(&f->msgs[head], sizeof(struct fifo_span_msg));
         head = next;
         pushed++;
     }
     if (pushed) {
         atomic_store32(&f->head, head);              /* release: data before head */
+        fifo_clean(&f->head, sizeof(f->head));
         __asm__ volatile("dsb ishst" ::: "memory");  /* head visible before doorbell */
         fifo_note_activity(pushed);
         fifo_notify(src, dst);
@@ -330,16 +366,19 @@ u32 fifo_span_pop_batch_acqrel(u32 dst, u32 src, struct fifo_span_msg *msgs, u32
     if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 tail = f->tail;
+    fifo_invalidate(&f->head, sizeof(f->head));
     u32 head = atomic_load32(&f->head);              /* acquire: see published data */
     u32 popped = 0;
 
     while (popped < max_count && tail != head) {
+        fifo_invalidate(&f->msgs[tail], sizeof(struct fifo_span_msg));
         msgs[popped] = f->msgs[tail];
         tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
         popped++;
     }
     if (popped) {
         atomic_store32(&f->tail, tail);              /* release: reads before tail */
+        fifo_clean(&f->tail, sizeof(f->tail));
         fifo_note_activity(popped);
     }
     return popped;
@@ -351,6 +390,7 @@ u32 fifo_span_push_batch_asm(u32 src, u32 dst, const struct fifo_span_msg *msgs,
     if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 head = f->head;
+    fifo_invalidate(&f->tail, sizeof(f->tail));
     u32 tail = atomic_load32(&f->tail);
     u32 pushed = 0;
 
@@ -359,11 +399,13 @@ u32 fifo_span_push_batch_asm(u32 src, u32 dst, const struct fifo_span_msg *msgs,
         if (unlikely(next == tail))
             break;
         span_copy32_asm(&f->msgs[head], &msgs[pushed]);
+        fifo_clean(&f->msgs[head], sizeof(struct fifo_span_msg));
         head = next;
         pushed++;
     }
     if (pushed) {
         atomic_store32(&f->head, head);
+        fifo_clean(&f->head, sizeof(f->head));
         __asm__ volatile("dsb ishst" ::: "memory");
         fifo_note_activity(pushed);
         fifo_notify(src, dst);
@@ -375,16 +417,19 @@ u32 fifo_span_pop_batch_asm(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 ma
     if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 tail = f->tail;
+    fifo_invalidate(&f->head, sizeof(f->head));
     u32 head = atomic_load32(&f->head);
     u32 popped = 0;
 
     while (popped < max_count && tail != head) {
+        fifo_invalidate(&f->msgs[tail], sizeof(struct fifo_span_msg));
         span_copy32_asm(&msgs[popped], &f->msgs[tail]);
         tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
         popped++;
     }
     if (popped) {
         atomic_store32(&f->tail, tail);
+        fifo_clean(&f->tail, sizeof(f->tail));
         fifo_note_activity(popped);
     }
     return popped;
@@ -398,6 +443,7 @@ u32 fifo_span_push_batch_ish(u32 src, u32 dst, const struct fifo_span_msg *msgs,
     if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 head = f->head;
+    fifo_invalidate(&f->tail, sizeof(f->tail));
     u32 tail = f->tail;
     u32 pushed = 0;
 
@@ -406,12 +452,14 @@ u32 fifo_span_push_batch_ish(u32 src, u32 dst, const struct fifo_span_msg *msgs,
         if (unlikely(next == tail))
             break;
         f->msgs[head] = msgs[pushed];
+        fifo_clean(&f->msgs[head], sizeof(struct fifo_span_msg));
         head = next;
         pushed++;
     }
     if (pushed) {
         dmb_ishst();
         f->head = head;
+        fifo_clean(&f->head, sizeof(f->head));
         dsb_ishst();
         fifo_note_activity(pushed);
         fifo_notify(src, dst);
@@ -423,11 +471,13 @@ u32 fifo_span_pop_batch_ish(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 ma
     if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 tail = f->tail;
+    fifo_invalidate(&f->head, sizeof(f->head));
     u32 head = f->head;
     u32 popped = 0;
 
     dmb_ishld();
     while (popped < max_count && tail != head) {
+        fifo_invalidate(&f->msgs[tail], sizeof(struct fifo_span_msg));
         msgs[popped] = f->msgs[tail];
         tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
         popped++;
@@ -435,6 +485,7 @@ u32 fifo_span_pop_batch_ish(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 ma
     if (popped) {
         dmb_ish();
         f->tail = tail;
+        fifo_clean(&f->tail, sizeof(f->tail));
         fifo_note_activity(popped);
     }
     return popped;
