@@ -38,7 +38,7 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 | **Hardened Network Stack** | IP/TCP/UDP/ICMP/ARP/DNS with strict ingress validation and no fragmentation. |
 | **Cadence GEM/MACB NIC** | Cadence GEM Ethernet MAC on RP1 southbridge via PCIe 2.0 x4. |
 | **Raw Block Storage** | SDHCI driver for SD/eMMC (EMMC2). WALFS WAL-based append-only filesystem. |
-| **Stage0 + Raw Slot Layout** | FAT `kernel8.img` is a stable stage0 loader; partition 2 reserves the first 10 MiB for second-stage and system areas before WALFS. See [DISKLAYOUT.md](DISKLAYOUT.md). |
+| **Stage0 + FAT Recovery Update** | FAT `kernel8.img` is a stable 20–30 KiB loader. A checksummed `PIOSSTG2.PKG` can refresh verified raw slot A before boot; partition 2 reserves the first 10 MiB before WALFS. |
 | **HDMI Boot Console** | 1024×768 framebuffer with 8×8 bitmap font, `fb_printf()`. |
 | **UART Serial I/O** | RP1 PL011 UART0 at 115200 baud. Line editing with backspace. |
 | **Operator Consoles** | UART console, unlocked TCP debugger, Web Admin terminal, and a lower-half HDMI F3 terminal panel. See [CONSOLE.md](CONSOLE.md). |
@@ -88,7 +88,7 @@ make clean && make
 make CROSS=aarch64-linux-gnu-
 ```
 
-Output: `kernel8.img` (~240KB)
+Outputs: `kernel8.img` (minimal stage0) and `PIOSSTG2.PKG` (stage2 package)
 
 ### Verify
 
@@ -122,6 +122,7 @@ cp firmware/boot/bcm2712-rpi-5-b.dtb /mnt/sdcard/
 
 # Copy PIOS
 cp kernel8.img  /mnt/sdcard/
+cp PIOSSTG2.PKG /mnt/sdcard/
 cp config.txt   /mnt/sdcard/
 ```
 

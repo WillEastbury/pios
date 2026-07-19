@@ -1,12 +1,14 @@
 # PIOS Disk Layout
 
-PIOS uses the FAT boot partition only for the stable stage0 loader. The mutable operating system image and persistent storage live in partition 2.
+PIOS keeps the stable stage0 loader and an optional recovery/update package on FAT. The verified
+boot cache and persistent storage live in partition 2.
 
 ## Partition overview
 
 ```text
 Partition 1: FAT boot partition
   kernel8.img                 stable stage0 loader
+  PIOSSTG2.PKG                checksummed read-only stage2 update source
   config.txt / firmware       Pi firmware boot files
 
 Partition 2: PIOS system + storage partition
@@ -24,20 +26,16 @@ All offsets below are relative to the start of partition 2.
                      signature, magic, layout version, active kernel length,
                      build/version, flags, optional CRC.
 
-0x000200..0x1FFFFF   Second-stage kernel image zone
+0x000200..0x37FFFF   Second-stage package cache (slot A)
                      Kernel image payload loaded by stage0.
                      Contains the second-stage loader plus core kernel code:
                      HDMI/VideoCore, RP1, NIC, DMA, IO, SD card, UART,
                      hardware init, scheduler, memory manager, etc.
 
-0x200000..0x2C7FFF   TCP/IP stack area, 800 KiB
-                     MAC, ARP, DHCP, DNS, ICMP, UDP, TCP, streams clients.
+0x380000..0x3801FF   Boot-control sector (`PBC0`)
 
-0x2C8000..0x2FFFFF   Firewall rules + static IP config area, 200 KiB
-
-0x300000..0x3FFFFF   Admin Console HTTP server service area
-
-0x400000..0x4FFFFF   Kernel debugger / dump / inspector area
+0x400000              Legacy raw slot-B base. Do not install a full package here:
+                      the current 3.5 MiB slot geometry overlaps the live regions below.
 
 0x500000..0x5FFFFF   User records
 
@@ -50,13 +48,20 @@ All offsets below are relative to the start of partition 2.
 0xA00000..end        WALFS structure and storage of packs/cards
 ```
 
+The older TCP/IP/firewall/admin/debug offsets encoded in the reserved header are metadata for
+planned split services, not independently writable extents while the expanded stage2 cache occupies
+`0x000200..0x37FFFF`. FAT stage0 therefore writes only raw slot A. Existing OTA slot-B support must
+not be used for packages that extend into user-record or hot-log ranges until the layout is migrated.
+
 ## Boot and update flow
 
 1. Pi firmware loads `kernel8.img` from the FAT partition.
-2. `kernel8.img` is the stable stage0 loader.
-3. Stage0 reads block 0 in partition 2 and validates the `PIOS` header.
-4. Stage0 reads the second-stage payload from `0x000200..0x1FFFFF`.
-5. Stage0 copies the second-stage image to RAM and jumps to it.
+2. Stage0 validates partition 2 and looks for root 8.3 file `PIOSSTG2.PKG`.
+3. A changed, checksummed FAT package is written and byte-verified in raw slot A; its valid header
+   is committed last, then boot control activates A.
+4. If the FAT package is unchanged, stage0 preserves existing boot-control decisions (including OTA).
+5. Stage0 loads the selected valid raw package, selects the Pi5 manifest entry, copies it to RAM,
+   and jumps to it.
 6. OTA hot-flash writes a new second-stage payload while the running kernel remains hot in RAM.
 7. OTA commits by writing the valid header last.
 8. Reboot uses PSCI `SYSTEM_RESET`; stage0 then loads the new second-stage image.
@@ -83,7 +88,7 @@ The layout is codified in `include/walfs.h`:
 ```c
 PIOS_RESERVED_BYTES         0x00A00000
 PIOS_STAGE2_OFFSET          0x00000200
-PIOS_STAGE2_END_OFFSET      0x001FFFFF
+PIOS_STAGE2_END_OFFSET      0x0037FFFF
 PIOS_TCPIP_STACK_OFFSET     0x00200000
 PIOS_TCPIP_STACK_BYTES      0x000C8000
 PIOS_FIREWALL_CFG_OFFSET    0x002C8000

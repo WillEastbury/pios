@@ -28,7 +28,7 @@ PI_LOAD = 0x00080000
 QEMU_LOAD = 0x40080000
 QEMU_MEMORY = 0x02000000
 ALIGN = 512
-MAX_PACKAGE = 0x1FFE00
+MAX_PACKAGE = 0x37FE00
 PAYLOAD_FLAG_COMPRESSED = 1
 PAYLOAD_CODEC_NONE = 0
 PAYLOAD_CODEC_PICOCOMPRESS = 1
@@ -43,6 +43,14 @@ def write_at(buf: bytearray, off: int, data: bytes) -> None:
     if len(buf) < end:
         buf.extend(b"\0" * (end - len(buf)))
     buf[off:end] = data
+
+
+def package_id_for(buf: bytes) -> int:
+    value = 0xCBF29CE484222325
+    for index, byte in enumerate(buf):
+        value ^= 0 if 16 <= index < 24 else byte
+        value = (value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return value or 1
 
 
 def simple_picocompress(data: bytes) -> bytes:
@@ -200,15 +208,17 @@ def main() -> int:
             len(qemu),
         ))
         write_at(out, qemu_off, qemu_payload)
+    package_id = package_id_for(out)
+    write_at(out, 16, struct.pack("<Q", package_id))
     args.out.write_bytes(out)
     if pi is not None and qemu_payload is not None:
         qemu_note = f"{len(qemu_payload)}:{len(qemu)}" if args.compress_qemu else str(len(qemu))
-        print(f"stage2 package: {args.out} total={len(out)} pi={len(pi)}@{pi_off} qemu={qemu_note}@{qemu_off}")
+        print(f"stage2 package: {args.out} total={len(out)} id={package_id:016x} pi={len(pi)}@{pi_off} qemu={qemu_note}@{qemu_off}")
     elif qemu_payload is not None:
         qemu_note = f"{len(qemu_payload)}:{len(qemu)}" if args.compress_qemu else str(len(qemu))
-        print(f"stage2 package: {args.out} total={len(out)} pi=none qemu={qemu_note}@{qemu_off}")
+        print(f"stage2 package: {args.out} total={len(out)} id={package_id:016x} pi=none qemu={qemu_note}@{qemu_off}")
     else:
-        print(f"stage2 package: {args.out} total={len(out)} pi={len(pi)}@{pi_off} qemu=none")
+        print(f"stage2 package: {args.out} total={len(out)} id={package_id:016x} pi={len(pi)}@{pi_off} qemu=none")
     return 0
 
 

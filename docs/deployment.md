@@ -20,7 +20,7 @@
 git clone https://github.com/WillEastbury/pios.git
 cd pios
 make CROSS=aarch64-none-elf-
-# Output: kernel8.img (~240KB)
+# Outputs: kernel8.img + PIOSSTG2.PKG
 ```
 
 ## Prepare SD Card
@@ -44,6 +44,7 @@ cp firmware/boot/bcm2712-rpi-5-b.dtb /mnt/sdcard/
 ### Step 3: Copy PIOS
 ```bash
 cp kernel8.img  /mnt/sdcard/
+cp PIOSSTG2.PKG /mnt/sdcard/
 cp config.txt   /mnt/sdcard/
 ```
 
@@ -53,7 +54,8 @@ cp config.txt   /mnt/sdcard/
 ├── start4.elf              GPU firmware (loads our kernel)
 ├── fixup4.dat              Memory fixup
 ├── bcm2712-rpi-5-b.dtb     Device tree
-├── kernel8.img             PIOS kernel (~240KB)
+├── kernel8.img             Minimal stable stage0 loader
+├── PIOSSTG2.PKG            Checksummed Pi5/QEMU stage2 package
 └── config.txt              Boot config
 ```
 

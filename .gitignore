@@ -12,6 +12,7 @@ qemu_*.pid
 *.elf
 *.img
 *.bin
+*.PKG
 *.map
 
 # IDE / Editor

@@ -14,8 +14,8 @@ Pi 5 firmware (GPU ROM + start4.elf)
    │  loads FAT:/kernel8.img → 0x80000, enters at EL1, MMU off
    ▼
 Stage0 bootstrap  (kernel8.img — small, stable, never OTA'd)
-   │  arms HW watchdog, reads MBR + boot-control sector, picks A/B slot,
-   │  validates slot header, copies stage-2 to staging RAM, jumps
+   │  arms HW watchdog, optionally imports FAT:/PIOSSTG2.PKG into raw slot A,
+   │  reads boot control, validates the selected slot, stages and jumps
    ▼
 Real kernel  (real_kernel.img — the OTA'able stage-2)  src/start.S → kernel_main
    │  EL2→EL1, BSS, early FB, MMU on, subsystem init, start cores 1-3
@@ -48,6 +48,12 @@ partition 2 as the stage-2 "real kernel" (see [disk_layout.md](disk_layout.md)).
 `bootstrap_start.S` clears BSS and calls `bootstrap_main()`
 (`src/bootstrap_start.S:6-22`). Stage0 is intentionally minimal: it brings up
 just enough (SD + serial + framebuffer) to choose and load a stage-2 image.
+
+Before slot selection, stage0 mounts FAT32 read-only, searches the root directory for the exact
+8.3 name `PIOSSTG2.PKG`, validates its bounded manifest and whole-package FNV-1a ID, and compares
+it against raw slot A. A changed package is written with an invalid header, read back byte-for-byte,
+then committed by writing the valid header last. Invalid partition geometry disables all updater
+and boot-control writes.
 
 ### 2.1 Arm the hardware watchdog first
 

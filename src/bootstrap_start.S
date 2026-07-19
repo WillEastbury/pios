@@ -43,9 +43,16 @@ bootstrap_trampoline:
     mov     x6, x2
 1:
     cbz     x6, 2f
+    cmp     x6, #8
+    b.lo    3f
     ldr     x7, [x5], #8
     str     x7, [x4], #8
     sub     x6, x6, #8
+    b       1b
+3:
+    ldrb    w7, [x5], #1
+    strb    w7, [x4], #1
+    sub     x6, x6, #1
     b       1b
 2:
     dsb     sy

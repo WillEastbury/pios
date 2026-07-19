@@ -51,15 +51,15 @@ could not advance past the missing ownership publication.
 - [x] QEMU smoke **11/11**.
 - [x] UART console/debugger, TCP-2323 debugger, and UART full/patch flash tests pass under QEMU.
 - [x] Pi5 payload builds; changed files compile without new warnings.
-- [ ] Hardware RX fix is not yet booted. The board currently runs a jump-only provisioner embedded
-      with `v20260718.172808`; it ignores pending raw A/B slots on reset. UART flash successfully
-      staged slot A, but selecting it requires replacing FAT `kernel8.img` with the real bootstrap
-      (or a provisioner embedding the new payload).
+- [ ] Hardware RX fix is not yet booted. A first bootstrap attempt stopped before `bootstrap_main`;
+      stage0 now uses the dedicated `bootstrap_start.S`/`link_bootstrap.ld` path. The replacement
+      FAT pair is `kernel8.img` + `PIOSSTG2.PKG`: stage0 reads the package, verifies it, caches it in
+      raw slot A header-last, activates A, and boots it.
 
 ### Next steps
-1. Run `build_bootstrap.bat` (preferred persistent A/B setup) or `build_provisioner.bat`.
-2. Write the resulting `kernel8.img` to the **PIOS BOOT** FAT32 volume after inserting the SD card
-   reader. Never write to the NVMe system disk.
+1. Run `build_bootstrap.bat`.
+2. Copy both `kernel8.img` and `PIOSSTG2.PKG` to the **PIOS BOOT** FAT32 volume. Never write to the
+   NVMe system disk.
 3. Boot and confirm `macbdiag` shows the descriptor ring base inside `DMA_NET`, all cores reach
    scheduler stage, and `sgi stat` reports FIFO IRQ readiness/delivery.
 4. Run simultaneous bulk upload/download while polling `macbdiag`, `rxdiag`, and

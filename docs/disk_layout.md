@@ -18,8 +18,8 @@ Related: [boot.md](boot.md) (how stage0 consumes these structures).
 ```
 SD card
 ├── MBR (LBA 0)                      0x55AA signature; p2 start @ mbr[0x1CE+8]
-├── Partition 1  — FAT32 boot        kernel8.img (stage0), config.txt, start4.elf,
-│                                    fixup4.dat, *.dtb  (firmware-readable only)
+├── Partition 1  — FAT32 boot        kernel8.img (stage0), PIOSSTG2.PKG,
+│                                    config.txt, start4.elf, fixup4.dat, *.dtb
 └── Partition 2  — PIOS system       raw kernel slots + control + records + WALFS
     ├── 0x000000 .. 0x9FFFFF  (10 MiB)  reserved system area  (§2)
     └── 0xA00000 .. end                 WALFS packs/cards/storage  (§5)
@@ -35,21 +35,22 @@ Partition 2 is discovered at runtime from the MBR; all offsets below are
 - `PIOS_RESERVED_BYTES = 10 MiB`, `WALFS_BOOT_SLOT_LBAS = 10 MiB/512 = 20480`
   sectors (`include/walfs.h:40-42,100-103`).
 
-> The fallback partition-2 start LBA is `2048` when the MBR is unreadable
-> (`src/bootstrap.c:20`).
+> The legacy read-only fallback slot starts at LBA `2048` when the MBR is
+> unreadable. FAT update and boot-control writes are disabled unless partition 2
+> passes full bounds validation.
 
 ---
 
 ## 2. Reserved system area (first 10 MiB of partition 2)
 
-The reserved area carries the **A/B raw kernel slots** and the boot-control
-sector, followed by persistent system records. The *active* layout is:
+The reserved area carries the verified raw slot-A cache and boot control,
+followed by persistent system records:
 
 | Offset | Size | Region | Constant |
 |---|---|---|---|
-| `0x000000` | 2 MiB | **Boot slot A** (raw stage-2 kernel) | `PIOS_BOOT_SLOT_A_OFFSET` |
-| `0x200000` | 512 B | **Boot-control sector** (`PBC0`) | `PIOS_BOOTCTRL_OFFSET` |
-| `0x300000` | 2 MiB | **Boot slot B** (raw stage-2 kernel) | `PIOS_BOOT_SLOT_B_OFFSET` |
+| `0x000000` | 3.5 MiB | **Boot slot A** (verified stage-2 package cache) | `PIOS_BOOT_SLOT_A_OFFSET` |
+| `0x380000` | 512 B | **Boot-control sector** (`PBC0`) | `PIOS_BOOTCTRL_OFFSET` |
+| `0x400000` | legacy | Legacy slot-B base; full packages are unsafe here | `PIOS_BOOT_SLOT_B_OFFSET` |
 | `0x500000` | 1 MiB | User records (keystore sealed root, §6) | `PIOS_USER_RECORDS_OFFSET` |
 | `0x600000` | 2 MiB | Circular hot-log buffer | `PIOS_HOT_LOGS_OFFSET` |
 | `0x800000` | 1 MiB | Kernel-state crashdump zone | `PIOS_CRASHDUMP_OFFSET` |
@@ -58,17 +59,15 @@ sector, followed by persistent system records. The *active* layout is:
 
 (`include/walfs.h:64-98`)
 
-- Each slot is capped at `PIOS_BOOT_SLOT_BYTES = 0x200000` (2 MiB)
+- Slot A is capped at `PIOS_BOOT_SLOT_BYTES = 0x380000` (3.5 MiB)
   (`include/walfs.h:67`). Within a slot, the 512-byte header is at offset 0 and
   the stage-2 payload starts at `PIOS_STAGE2_OFFSET = 0x200`
   (`include/walfs.h:64-65`).
 
-> **Legacy note.** The on-disk PIOS header (§2.1) still advertises an *original*
-> sub-zone plan — TCP/IP `0x200000`, firewall `0x2C8000`, admin `0x300000`,
-> debug `0x400000` — preserved by `pios_fill_reserved_header()`
-> (`src/kernel.c:3754-3774`). The active A/B model **overlays** the
-> `0x200000–0x4FFFFF` range with the control sector + slot B; the header fields
-> for those zones are vestigial. User-records (`0x500000`) onward are unchanged.
+> **Layout hazard.** The legacy slot-B base at `0x400000` plus a 3.5 MiB slot
+> overlaps user records (`0x500000`) and hot logs (`0x600000`). The FAT updater
+> therefore writes only slot A. The older TCP/IP/firewall/admin/debug header
+> offsets are vestigial while the expanded stage2 package occupies their range.
 
 ### 2.1 Slot header (`PIOS`)
 
@@ -293,8 +292,8 @@ hashing (`src/principal.c:67-76`).
 
 | Name | Value | Source |
 |---|---|---|
-| Slot A / control / Slot B offsets | `0x000000` / `0x200000` / `0x300000` | `walfs.h:68-70` |
-| Boot slot cap | `0x200000` (2 MiB) | `walfs.h:67` |
+| Slot A / control / legacy Slot B offsets | `0x000000` / `0x380000` / `0x400000` | `walfs.h:68-70` |
+| Boot slot cap | `0x380000` (3.5 MiB) | `walfs.h:67` |
 | Stage-2 payload offset (in slot) | `0x200` | `walfs.h:64` |
 | Reserved-area header magic | `0x50494F53` `'PIOS'` | `walfs.h:44` |
 | Boot-control magic | `0x50424330` `'PBC0'` | `walfs.h:71` |
