@@ -249,10 +249,10 @@ static u8 (*const rx_bufs)[BUF_SIZE] =
     (u8 (*)[BUF_SIZE])(usize)(DMA_NET_BASE + MACB_RX_POOL_OFF);
 static u8 (*const tx_bufs)[BUF_SIZE] =
     (u8 (*)[BUF_SIZE])(usize)(DMA_NET_BASE + MACB_TX_POOL_OFF);
-static struct macb_desc *const rx_ring =
-    (struct macb_desc *)(usize)(DMA_NET_BASE + MACB_RX_DESC_OFF);
-static struct macb_desc *const tx_ring =
-    (struct macb_desc *)(usize)(DMA_NET_BASE + MACB_TX_DESC_OFF);
+static volatile struct macb_desc *const rx_ring =
+    (volatile struct macb_desc *)(usize)(DMA_NET_BASE + MACB_RX_DESC_OFF);
+static volatile struct macb_desc *const tx_ring =
+    (volatile struct macb_desc *)(usize)(DMA_NET_BASE + MACB_TX_DESC_OFF);
 static u32 rx_idx;
 static u32 tx_idx;
 static u32 tx_tail;
@@ -636,7 +636,7 @@ bool macb_init(void) {
         volatile struct macb_desc *d = &rx_ring[i];
 #if !USE_8BYTE_DESC
         d->addr_hi = MACB_DMA_HI;
-        d->rsvd = 0xCAFE0000;  /* canary w3 */
+        d->rsvd = 0;
 #endif
         d->ctrl = 0xDEAD0000;  /* canary w1 */
         __asm__ volatile("dsb sy" ::: "memory");
