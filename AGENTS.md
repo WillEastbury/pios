@@ -67,6 +67,16 @@ could not advance past the missing ownership publication.
       `ipc bench 64` returned `OK errors=0`; eight consecutive 243,799-byte
       `/picoscript` downloads completed in 1.25-1.58s each; ping remained live;
       `rx_wedge=0`, `rx_owned=0`, `RSR=0`, and no TX recovery occurred.
+- [x] Follow-up trace resolved the high `rx_hole_recover` counter: every event
+      showed only 4-9 OWN descriptors immediately after the gap (distance 1-2),
+      matching a 64-byte DC maintenance operation clobbering sibling DMA-owned
+      descriptors. Since the complete MACB arena is Normal-NC, all RX/TX arena
+      `dc ivac/cvac/civac` calls were removed; DMA acquire/release barriers remain.
+      The same audit normalized FIFO producer-tail acquire and consumer-tail
+      release ordering across every message/span variant.
+- [x] Final Pi5 payload `v20260720.185820` passed QEMU smoke 11/11 and was OTA
+      committed to safe raw slot A (`pending=A`, one try). FAT still contains the
+      jump-only provisioner, so selecting pending A requires the corrected stage0.
 - [ ] The persistent FAT stage0 path is not yet booted. A first bootstrap attempt stopped before `bootstrap_main`;
       stage0 now uses the dedicated `bootstrap_start.S`/`link_bootstrap.ld` path. The replacement
       FAT pair is `kernel8.img` + `PIOSSTG2.PKG`: stage0 reads the package, verifies it, caches it in

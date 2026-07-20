@@ -220,11 +220,9 @@ struct macb_desc {
 /* RX/TX frame buffers live in the dedicated DMA_NET arena (a fixed, mapped,
  * Non-Cacheable 2MB region) rather than in .bss. This is the "dedicated per-core
  * DMA arena" follow-up the MMU layer anticipates (see mmu.c mmu_enable_caching):
- * it keeps the buffer pool DMA-coherent with the MAC (NC, no cache maintenance
- * needed) AND lets the network-first RX ring grow to 512 entries (1MB) without
- * bloating the sub-8MB kernel image. The driver's existing dcache clean/invalidate
- * calls become harmless no-ops on this NC memory. The small descriptor rings stay
- * in .bss (also NC, already coherent). Layout within DMA_NET:
+ * it keeps the buffer pool and descriptor rings DMA-coherent with the MAC (NC,
+ * no cache maintenance) AND lets the network-first RX ring grow without bloating
+ * the sub-8MB kernel image. Layout within DMA_NET:
  *     [0 .. NUM_RX*BUF_SIZE)            RX buffers
  *     [NUM_RX*BUF_SIZE .. +NUM_TX*BUF_SIZE) TX buffers
  *     [aligned buffer end .. +RX descriptors) RX descriptor ring
@@ -665,11 +663,8 @@ bool macb_init(void) {
     tx_inflight = 0;
 
     __asm__ volatile("dsb sy" ::: "memory");
-    /* Use clean+invalidate so cachelines are evicted; subsequent reads
-     * (including MAC's status updates via DMA) will be served from RAM. */
-    dcache_clean_invalidate_range((u64)(usize)rx_ring, MACB_RX_RING_BYTES);
-    dcache_clean_range((u64)(usize)rx_bufs, (u64)NUM_RX * BUF_SIZE);
-    dcache_clean_invalidate_range((u64)(usize)tx_ring, MACB_TX_RING_BYTES);
+    /* DMA_NET is Normal-NC. DC maintenance here can cover four compact
+     * descriptors and write stale sibling ownership over a PCIe DMA update. */
     __asm__ volatile("dsb sy" ::: "memory");
 
     uart_puts("[mac] RX desc[0]=");
@@ -860,7 +855,7 @@ static void macb_dump_tx_state(const char *tag)
     uart_puts(" TBQP=");
     uart_hex(mr(TBQP));
     uart_puts("\n");
-    dcache_clean_invalidate_range((u64)(usize)tx_ring, MACB_TX_RING_BYTES);
+    __asm__ volatile("dsb sy" ::: "memory");
     uart_puts("[mac] desc.ctrl:");
     for (u32 i = 0; i < NUM_TX; i++) {
         uart_putc(' ');
@@ -876,8 +871,7 @@ static void macb_dump_tx_state(const char *tag)
 static void macb_tx_reclaim(void)
 {
     while (tx_inflight) {
-        dcache_clean_invalidate_range((u64)(usize)&tx_ring[tx_tail],
-                                      sizeof(struct macb_desc));
+        __asm__ volatile("dsb sy" ::: "memory");
         if (!(tx_ring[tx_tail].ctrl & TX_STAT_USED))
             break;
         tx_tail = (tx_tail + 1U) % NUM_TX;
@@ -910,7 +904,6 @@ static void macb_tx_recover_silent(void)
     tx_tail = 0;
     tx_inflight = 0;
     __asm__ volatile("dsb sy" ::: "memory");
-    dcache_clean_invalidate_range((u64)(usize)tx_ring, MACB_TX_RING_BYTES);
     __asm__ volatile("dsb sy" ::: "memory");
 
     mw(TBQP, (u32)(usize)&tx_ring[0]);
@@ -940,11 +933,11 @@ bool macb_send(const u8 *frame, u32 len) {
     }
 
     u32 desc_idx = tx_idx;
-    dcache_clean_invalidate_range((u64)(usize)&tx_ring[desc_idx], sizeof(struct macb_desc));
+    __asm__ volatile("dsb sy" ::: "memory");
     if (!(tx_ring[desc_idx].ctrl & TX_STAT_USED)) {
         macb_tx_recover_silent();
         desc_idx = tx_idx;
-        dcache_clean_invalidate_range((u64)(usize)&tx_ring[desc_idx], sizeof(struct macb_desc));
+        __asm__ volatile("dsb sy" ::: "memory");
     }
     if (tx_inflight >= NUM_TX || !(tx_ring[desc_idx].ctrl & TX_STAT_USED)) {
         tx_drop_count++;
@@ -961,9 +954,6 @@ bool macb_send(const u8 *frame, u32 len) {
     u8 *dst = tx_bufs[desc_idx];
     simd_memcpy(dst, frame, len);
 
-    /* Flush TX buffer to RAM for non-coherent PCIe DMA */
-    dcache_clean_range((u64)(usize)dst, len);
-
     /* Setup descriptor (Circle: set addr during send, then barrier, then ctrl) */
 #if !USE_8BYTE_DESC
     tx_ring[desc_idx].addr_hi = MACB_DMA_HI;
@@ -977,19 +967,7 @@ bool macb_send(const u8 *frame, u32 len) {
     if (desc_idx == NUM_TX - 1) ctrl |= TX_STAT_WRAP;
     tx_ring[desc_idx].ctrl = ctrl;
 
-    /* CRITICAL: clean+invalidate the descriptor (NOT just clean).
-     *
-     * 16-byte descriptors share 64-byte cache lines: 4 descriptors per line.
-     * If we only "clean" (dc cvac), the line stays in cache. When the MAC
-     * later writes USED=1 to a sibling descriptor in the same cache line
-     * via non-coherent DMA, our cached copy becomes stale. The next time we
-     * touch any descriptor in that line and clean again, we overwrite the
-     * MAC's USED-bit updates with stale data — descriptors then look
-     * forever-busy and TX stops.
-     *
-     * Clean+invalidate (dc civac) evicts the line so the next access loads
-     * the MAC's fresh updates from RAM. */
-    dcache_clean_invalidate_range((u64)(usize)&tx_ring[desc_idx], sizeof(struct macb_desc));
+    /* Descriptor and payload are Normal-NC; publish stores before TSTART. */
     __asm__ volatile("dsb sy" ::: "memory");
 
     /* PCIe write-barrier: read back a benign MAC register before kicking
@@ -1042,7 +1020,6 @@ static void macb_rx_ownership_snapshot(u32 *total_owned,
                                        u32 *owned_after_gap,
                                        u32 *first_owned_distance)
 {
-    dcache_invalidate_range((u64)(usize)rx_ring, MACB_RX_RING_BYTES);
     __asm__ volatile("dsb sy" ::: "memory");
 
     u32 contig = 0;
@@ -1075,15 +1052,9 @@ static void macb_rx_ownership_snapshot(u32 *total_owned,
 }
 
 bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
-    /* Invalidate RX descriptor to see MAC's DMA writes (non-coherent PCIe).
-     * dcache_invalidate_range() already ends with its own dsb(); a second
-     * unconditional barrier here fired on every single poll -- even the vast
-     * majority that find no new frame ready -- for no extra ordering benefit.
-     * Removed as part of reducing per-poll/per-frame reclaim overhead (see
-     * the buffer-invalidate fix below): a slow reclaim path is what lets
-     * rx_owned climb toward NUM_RX under sustained load until RSR.BNA
-     * latches and the MAC halts entirely. */
-    dcache_invalidate_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
+    /* DMA_NET is Normal-NC: order PCIe writes, but never issue cache-line
+     * maintenance against compact descriptor lines. */
+    __asm__ volatile("dsb sy" ::: "memory");
 
     /* Read descriptor */
     u32 addr_val = rx_ring[rx_idx].addr;
@@ -1092,6 +1063,8 @@ bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
     if (!(addr_val & RX_ADDR_OWN))
         return false;
 
+    /* Acquire DMA publication: OWN must be observed before status/payload. */
+    __asm__ volatile("dmb oshld" ::: "memory");
     u32 status = rx_ring[rx_idx].ctrl;
     u32 flen = status & RX_STAT_LEN_MASK;
     if (checksum_trusted) {
@@ -1102,40 +1075,22 @@ bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
 
     if (flen == 0 || flen > BUF_SIZE) {
         /* Reclaim descriptor */
+        __asm__ volatile("dmb osh" ::: "memory");
         rx_ring[rx_idx].addr &= ~RX_ADDR_OWN;
-        /* 16-byte RX descriptors share 64-byte cache lines. Match the TX-side
-         * contract: evict the line after returning ownership so later CPU
-         * touches cannot clean a stale sibling descriptor over DMA updates. */
-        dcache_clean_invalidate_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
+        __asm__ volatile("dsb sy" ::: "memory");
         rx_idx = (rx_idx + 1) % NUM_RX;
         return false;
     }
-
-    /* Invalidate only the bytes the MAC actually wrote (flen), not the full
-     * BUF_SIZE (2048) buffer. Under sustained high-rate bursts, unconditionally
-     * invalidating all 32 cache lines of BUF_SIZE regardless of actual frame
-     * size (e.g. a 60-byte ARP frame only needs 1 line) measurably slows down
-     * per-frame reclaim -- and since RX descriptor reclaim is the only thing
-     * that hands ring space back to the MAC, a slow reclaim path is exactly
-     * what lets rx_owned climb toward NUM_RX under load until RSR.BNA latches
-     * and the MAC halts (observed live: rx_owned climbing past 450/512 before
-     * a stall). We only ever read `flen` bytes via simd_memcpy below, so
-     * invalidating exactly that (rounded up to the enclosing cache lines by
-     * dcache_invalidate_range itself) is correct and sufficient. */
-    dcache_invalidate_range((u64)(usize)rx_bufs[rx_idx], flen);
 
     /* Copy frame out (NEON for throughput) */
     u8 *src = rx_bufs[rx_idx];
     simd_memcpy(frame, src, flen);
     *len = flen;
 
-    /* Reclaim: clear ownership bit and flush back to RAM */
+    /* Release ownership only after the frame copy has completed. */
+    __asm__ volatile("dmb osh" ::: "memory");
     rx_ring[rx_idx].addr &= ~RX_ADDR_OWN;
-    /* See invalid-frame reclaim above: never leave a descriptor line cached
-     * after publishing ownership back to the MAC. dcache_clean_invalidate_range
-     * already ends with its own dsb(); a second unconditional barrier here was
-     * pure per-frame overhead with no additional ordering guarantee. */
-    dcache_clean_invalidate_range((u64)(usize)&rx_ring[rx_idx], sizeof(struct macb_desc));
+    __asm__ volatile("dsb sy" ::: "memory");
 
     rx_idx = (rx_idx + 1) % NUM_RX;
     rx_recv_count++;
@@ -1183,7 +1138,6 @@ static void macb_rx_ring_rebuild(void) {
     }
     rx_idx = 0;
     __asm__ volatile("dsb sy" ::: "memory");
-    dcache_clean_invalidate_range((u64)(usize)rx_ring, MACB_RX_RING_BYTES);
     __asm__ volatile("dsb sy" ::: "memory");
 
     /* Point the RX queue back at the ring base. */
@@ -1225,8 +1179,6 @@ bool macb_rx_hole_recover(void) {
      * current descriptor after the scan so normal DMA progress (current became
      * OWN while later descriptors were being inspected) is not mistaken for a
      * stable hole. A real sibling-writeback hole remains OWN=0 here. */
-    dcache_invalidate_range((u64)(usize)&rx_ring[stuck_idx],
-                            sizeof(struct macb_desc));
     __asm__ volatile("dsb sy" ::: "memory");
     if (rx_ring[stuck_idx].addr & RX_ADDR_OWN) {
         rx_hole_candidate_idx = NUM_RX;
@@ -1535,8 +1487,7 @@ void macb_dump_full_state(const char *tag) {
     uart_puts(" RBQP=");
     uart_hex(mr(RBQP));
     uart_puts("\n");
-    dcache_clean_invalidate_range((u64)(usize)tx_ring, MACB_TX_RING_BYTES);
-    dcache_invalidate_range((u64)(usize)rx_ring, MACB_RX_RING_BYTES);
+    __asm__ volatile("dsb sy" ::: "memory");
     uart_puts("[mac] TX:");
     for (u32 i = 0; i < NUM_TX; i++) {
         uart_putc(' ');
