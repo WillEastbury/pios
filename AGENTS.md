@@ -61,6 +61,12 @@ could not advance past the missing ownership publication.
       `sgi recv[1..3]=0` and the synthetic FIFO reply ring filled. Commit
       `04ac3ea` adds Pi5 banked Group1 setup and always retains SEV as the
       correctness backstop; QEMU remains 11/11.
+- [x] Final hardware image `v20260719.210339` clears warm-reset GIC active state
+      and performs explicit FIFO cache-line clean/invalidate. Live Pi5 results:
+      `sgi test` delivered 16/16 to each of cores 1, 2, and 3;
+      `ipc bench 64` returned `OK errors=0`; eight consecutive 243,799-byte
+      `/picoscript` downloads completed in 1.25-1.58s each; ping remained live;
+      `rx_wedge=0`, `rx_owned=0`, `RSR=0`, and no TX recovery occurred.
 - [ ] The persistent FAT stage0 path is not yet booted. A first bootstrap attempt stopped before `bootstrap_main`;
       stage0 now uses the dedicated `bootstrap_start.S`/`link_bootstrap.ld` path. The replacement
       FAT pair is `kernel8.img` + `PIOSSTG2.PKG`: stage0 reads the package, verifies it, caches it in
