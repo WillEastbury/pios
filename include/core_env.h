@@ -47,6 +47,11 @@
 #define FB_BACK_BASE        PIOS_FB_BACK_BASE
 #define FB_BACK_SIZE        PIOS_FB_BACK_SIZE
 
+/* Core 0's first 4 KiB is reserved for the core_env owner record plus small
+ * cross-core control objects that require WB Inner-Shareable memory (notably
+ * exclusive-access spinlocks). The bump allocator starts after this page. */
+#define CORE0_CONTROL_RESERVE  0x1000UL
+
 static const u64 core_ram_bases[4] = {
     CORE0_RAM_BASE, CORE1_RAM_BASE, CORE2_RAM_BASE, CORE3_RAM_BASE
 };
@@ -83,8 +88,12 @@ static inline void core_env_init(u32 id) {
     e->id             = id;
     e->ram_base       = (u8 *)(usize)core_ram_bases[id & 3];
     e->ram_end        = e->ram_base + CORE_PRIV_SIZE;
-    /* heap starts after the env struct, 64-byte aligned */
-    e->heap_ptr       = (u8 *)(((usize)e + sizeof(*e) + 63) & ~63UL);
+    /* Core 0 reserves its first page for shared WB control records. Other
+     * cores retain the compact env-followed-by-heap layout. */
+    usize heap_start = ((usize)e + sizeof(*e) + 63) & ~63UL;
+    if ((id & 3U) == 0U)
+        heap_start = CORE0_RAM_BASE + CORE0_CONTROL_RESERVE;
+    e->heap_ptr       = (u8 *)heap_start;
     e->msg_sent       = 0;
     e->msg_recv       = 0;
     e->poll_count     = 0;

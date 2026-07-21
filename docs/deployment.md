@@ -55,7 +55,7 @@ cp config.txt   /mnt/sdcard/
 ├── fixup4.dat              Memory fixup
 ├── bcm2712-rpi-5-b.dtb     Device tree
 ├── kernel8.img             Minimal stable stage0 loader
-├── PIOSSTG2.PKG            Checksummed Pi5/QEMU stage2 package
+├── PIOSSTG2.PKG            Checksummed Pi5 stage2 package
 └── config.txt              Boot config
 ```
 

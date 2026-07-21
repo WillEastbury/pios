@@ -90,13 +90,22 @@ echo Building full QEMU feature-parity payload...
 call .\build_qemu_full.bat
 if errorlevel 1 exit /b 1
 
-echo Packaging shared Pi5+QEMU stage2 as real_kernel.img...
-python tools\build_stage2_package.py --pi build_pi5_stage2\PIOS_PI5_STAGE2.BIN --qemu build_qemu_full\PIOS_QEMU_FULL.BIN --compress-qemu --out real_kernel.img
+echo Packaging Pi5 stage2 as real_kernel.img...
+REM real_kernel.img / PIOSSTG2.PKG is written WHOLE into raw slot A by stage0
+REM (write_slot_package) and by the HTTP/UART OTA tools, so the entire package
+REM must fit PIOS_STAGE2_ZONE_BYTES (0x37FE00). The Pi5 payload alone is ~3.2 MB
+REM (the embedded PicoScript IDE_HTML blob is ~1.9 MB), so a combined Pi5+QEMU
+REM package no longer fits the slot. The Pi5 FAT slot never needs the QEMU image
+REM (qemu_smoke boots build_qemu_full\PIOS_QEMU_FULL.BIN directly and the QEMU
+REM UEFI path builds its own QEMU-only package), so package Pi5-only here.
+python tools\build_stage2_package.py --pi build_pi5_stage2\PIOS_PI5_STAGE2.BIN --out real_kernel.img
 if errorlevel 1 exit /b 1
 copy /Y real_kernel.img PIOSSTG2.PKG >nul
 
 echo Compiling bootstrap...
 "%CC%" %ASFLAGS% -c src\bootstrap_start.S -o build_boot\bootstrap_start.o
+if errorlevel 1 exit /b 1
+"%CC%" %ASFLAGS% -c src\bootstrap_trampoline.S -o build_boot\bootstrap_trampoline.o
 if errorlevel 1 exit /b 1
 "%CC%" %BOOT_CFLAGS% -c src\bootstrap.c -o build_boot\bootstrap.o
 if errorlevel 1 exit /b 1
@@ -106,7 +115,7 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 
 echo Linking bootstrap kernel8.img...
-"%LD%" -T link_bootstrap.ld -nostdlib -o bootstrap.elf build_boot\bootstrap_start.o build_boot\bootstrap.o build_boot\sd.o build_boot\fb.o
+"%LD%" -T link_bootstrap.ld -nostdlib -o bootstrap.elf build_boot\bootstrap_start.o build_boot\bootstrap_trampoline.o build_boot\bootstrap.o build_boot\sd.o build_boot\fb.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary bootstrap.elf kernel8.img
 if errorlevel 1 exit /b 1
@@ -114,6 +123,6 @@ if errorlevel 1 exit /b 1
 for %%f in (kernel8.img) do echo bootstrap kernel8.img size: %%~zf bytes
 for %%f in (build_pi5_stage2\PIOS_PI5_STAGE2.BIN) do echo Pi5 payload size: %%~zf bytes
 for %%f in (build_qemu_full\PIOS_QEMU_FULL.BIN) do echo QEMU full payload size: %%~zf bytes
-for %%f in (real_kernel.img) do echo shared stage2 real_kernel.img size: %%~zf bytes
+for %%f in (real_kernel.img) do echo Pi5 stage2 real_kernel.img size: %%~zf bytes
 for %%f in (PIOSSTG2.PKG) do echo FAT updater PIOSSTG2.PKG size: %%~zf bytes
 echo BOOTSTRAP BUILD COMPLETE

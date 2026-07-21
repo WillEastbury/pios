@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+#include "core_env.h"
 
 /* Small syscall-path spinlock for short, bounded cross-core registry updates.
  * Scheduler code must not take these locks. Each lock owns a complete line so
@@ -11,6 +12,21 @@ struct kspinlock {
 
 _Static_assert(sizeof(struct kspinlock) == 64,
                "kspinlock must own exactly one cache line");
+
+#define KSPIN_SHARED_BASE  (CORE0_RAM_BASE + 0x100UL)
+#define KSPIN_SHARED_SLOTS 16U
+
+static inline struct kspinlock *kspin_shared(u32 slot)
+{
+    return (struct kspinlock *)(usize)(KSPIN_SHARED_BASE +
+                                      (u64)(slot % KSPIN_SHARED_SLOTS) * 64ULL);
+}
+
+static inline void kspin_init(struct kspinlock *lock)
+{
+    lock->held = 0;
+    __asm__ volatile("dmb sy" ::: "memory");
+}
 
 static inline void kspin_lock(struct kspinlock *lock)
 {

@@ -45,9 +45,17 @@ partition 2 as the stage-2 "real kernel" (see [disk_layout.md](disk_layout.md)).
 
 ## 2. Stage0 bootstrap (`src/bootstrap.c`, `src/bootstrap_start.S`)
 
-`bootstrap_start.S` clears BSS and calls `bootstrap_main()`
-(`src/bootstrap_start.S:6-22`). Stage0 is intentionally minimal: it brings up
-just enough (SD + serial + framebuffer) to choose and load a stage-2 image.
+`bootstrap_start.S` performs the EL2->EL1 handoff, clears BSS, then **enables
+the MMU** with the low 1 GiB mapped Normal-NC (reusing the proven `start.S`
+MAIR/TCR/SCTLR magic) before calling `bootstrap_main()`. The MMU is required:
+the EMMC PIO card-identification handshake (CMD55 + ACMD41) and the VideoCore
+mailbox only complete under the MMU-on / Normal-NC configuration the one-shot
+provisioner also forces (`build_provisioner.bat` sets
+`PIOS_CACHE_WB_FROM_BOOT=0`). With the MMU off, RAM is Device-nGnRnE and
+uncached and ACMD41 never finishes. Payload handoff then goes through the shared
+`bootstrap_trampoline.S`, which disables the MMU/caches again before branching to
+the stage-2 entry. Stage0 is otherwise intentionally minimal: it brings up just
+enough (SD + serial + framebuffer) to choose and load a stage-2 image.
 
 Before slot selection, stage0 mounts FAT32 read-only, searches the root directory for the exact
 8.3 name `PIOSSTG2.PKG`, validates its bounded manifest and whole-package FNV-1a ID, and compares

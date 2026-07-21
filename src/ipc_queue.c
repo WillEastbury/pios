@@ -16,7 +16,7 @@ struct ipc_queue_obj {
 
 static struct ipc_queue_obj g_queues[IPC_QUEUE_MAX_OBJECTS];
 static bool g_persist_runtime;
-static struct kspinlock g_queue_lock;
+static struct kspinlock *const g_queue_lock = (struct kspinlock *)(usize)(KSPIN_SHARED_BASE + 0U * 64U);
 static const char *const g_queue_walfs_path = "/var/ipc/queues";
 _Static_assert((sizeof(struct ipc_queue_obj) & 63U) == 0U,
                "IPC queue objects must have cache-line stride");
@@ -97,18 +97,19 @@ static u32 queue_pop_index(const struct ipc_queue_obj *q)
 
 void ipc_queue_init(void)
 {
-    kspin_lock(&g_queue_lock);
+    kspin_init(g_queue_lock);
+    kspin_lock(g_queue_lock);
     for (u32 i = 0; i < IPC_QUEUE_MAX_OBJECTS; i++)
         queue_poison(&g_queues[i]);
     g_persist_runtime = false;
-    kspin_unlock(&g_queue_lock);
+    kspin_unlock(g_queue_lock);
 }
 
 void ipc_queue_set_persistence(bool enabled)
 {
-    kspin_lock(&g_queue_lock);
+    kspin_lock(g_queue_lock);
     g_persist_runtime = enabled;
-    kspin_unlock(&g_queue_lock);
+    kspin_unlock(g_queue_lock);
 }
 
 static i32 ipc_queue_create_unlocked(const char *name, u32 depth, u32 flags, u32 frame_max)
@@ -232,65 +233,65 @@ static i32 ipc_queue_flush_unlocked(i32 handle)
 
 i32 ipc_queue_create(const char *name, u32 depth, u32 flags, u32 frame_max)
 {
-    kspin_lock(&g_queue_lock);
+    kspin_lock(g_queue_lock);
     i32 rc = ipc_queue_create_unlocked(name, depth, flags, frame_max);
-    kspin_unlock(&g_queue_lock);
+    kspin_unlock(g_queue_lock);
     return rc;
 }
 
 i32 ipc_queue_open(const char *name)
 {
-    kspin_lock(&g_queue_lock);
+    kspin_lock(g_queue_lock);
     i32 rc = ipc_queue_open_unlocked(name);
-    kspin_unlock(&g_queue_lock);
+    kspin_unlock(g_queue_lock);
     return rc;
 }
 
 i32 ipc_queue_push(i32 handle, const void *data, u32 len)
 {
-    kspin_lock(&g_queue_lock);
+    kspin_lock(g_queue_lock);
     i32 rc = ipc_queue_push_unlocked(handle, data, len);
-    kspin_unlock(&g_queue_lock);
+    kspin_unlock(g_queue_lock);
     return rc;
 }
 
 i32 ipc_queue_pop(i32 handle, void *out, u32 out_max, u32 *len_out)
 {
-    kspin_lock(&g_queue_lock);
+    kspin_lock(g_queue_lock);
     i32 rc = ipc_queue_pop_unlocked(handle, out, out_max, len_out);
-    kspin_unlock(&g_queue_lock);
+    kspin_unlock(g_queue_lock);
     return rc;
 }
 
 i32 ipc_queue_peek(i32 handle, void *out, u32 out_max, u32 *len_out)
 {
-    kspin_lock(&g_queue_lock);
+    kspin_lock(g_queue_lock);
     i32 rc = ipc_queue_peek_unlocked(handle, out, out_max, len_out);
-    kspin_unlock(&g_queue_lock);
+    kspin_unlock(g_queue_lock);
     return rc;
 }
 
 i32 ipc_queue_len(i32 handle)
 {
-    kspin_lock(&g_queue_lock);
+    kspin_lock(g_queue_lock);
     i32 rc = ipc_queue_len_unlocked(handle);
-    kspin_unlock(&g_queue_lock);
+    kspin_unlock(g_queue_lock);
     return rc;
 }
 
 i32 ipc_queue_close(i32 handle)
 {
-    kspin_lock(&g_queue_lock);
+    kspin_lock(g_queue_lock);
     i32 rc = ipc_queue_close_unlocked(handle);
-    kspin_unlock(&g_queue_lock);
+    kspin_unlock(g_queue_lock);
     return rc;
 }
 
 i32 ipc_queue_flush(i32 handle)
 {
-    kspin_lock(&g_queue_lock);
+    kspin_lock(g_queue_lock);
     i32 rc = ipc_queue_flush_unlocked(handle);
-    kspin_unlock(&g_queue_lock);
+    kspin_unlock(g_queue_lock);
     return rc;
 }
 
