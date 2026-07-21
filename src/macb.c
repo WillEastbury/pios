@@ -10,6 +10,7 @@
  */
 
 #include "macb.h"
+#include "macb_rx_engine.h"
 #include "mmio.h"
 #include "uart.h"
 #include "mailbox.h"
@@ -140,6 +141,8 @@ static inline void ecw(u32 off, u32 val) { mmio_write(ETH_CFG_BASE + off, val); 
 #define DMACFG_RXBS_SHIFT   16
 #define DMACFG_FBLDO_SHIFT  0
 #define DMACFG_TXCOEN       (1 << 11)
+#define DMACFG_RXEXT        (1U << 28)
+#define DMACFG_TXEXT        (1U << 29)
 #define DMACFG_ADDR64       (1 << 30)
 
 /* ── Buffer descriptor format ── */
@@ -241,6 +244,7 @@ struct macb_desc {
 #define MACB_RX_DESC_OFF   ((MACB_DMA_POOL_BYTES + 63ULL) & ~63ULL)
 #define MACB_RX_RING_BYTES ((u64)NUM_RX * sizeof(struct macb_desc))
 #define MACB_TX_DESC_OFF   ((MACB_RX_DESC_OFF + MACB_RX_RING_BYTES + 63ULL) & ~63ULL)
+#define MACB_RX_TRAILING_BYTES (MACB_TX_DESC_OFF - (MACB_RX_DESC_OFF + MACB_RX_RING_BYTES))
 #define MACB_TX_RING_BYTES ((u64)NUM_TX * sizeof(struct macb_desc))
 #define MACB_DMA_TOTAL_BYTES (MACB_TX_DESC_OFF + MACB_TX_RING_BYTES)
 _Static_assert(MACB_DMA_TOTAL_BYTES <= DMA_NET_SIZE,
@@ -253,7 +257,6 @@ static volatile struct macb_desc *const rx_ring =
     (volatile struct macb_desc *)(usize)(DMA_NET_BASE + MACB_RX_DESC_OFF);
 static volatile struct macb_desc *const tx_ring =
     (volatile struct macb_desc *)(usize)(DMA_NET_BASE + MACB_TX_DESC_OFF);
-static u32 rx_idx;
 static u32 tx_idx;
 static u32 tx_tail;
 static u32 tx_inflight;
@@ -564,6 +567,9 @@ bool macb_init(void) {
         dmacfg |= (3 << 8);    /* RXBMS = 3 (max) */
         dmacfg &= ~(1 << 7);   /* no endian swap pkt */
         dmacfg &= ~(1 << 6);   /* no endian swap desc */
+        /* We use the 64-bit, non-PTP four-word descriptor format. Firmware
+         * state must not silently select six-word timestamp descriptors. */
+        dmacfg &= ~(DMACFG_RXEXT | DMACFG_TXEXT);
 #if USE_8BYTE_DESC
         dmacfg &= ~DMACFG_ADDR64;  /* 8-byte descriptors */
 #else
@@ -631,20 +637,11 @@ bool macb_init(void) {
     u32 tsr_init = mr(TSR);
     if (tsr_init) mw(TSR, tsr_init);  /* Clear TX status */
 
-    /* ── Setup RX descriptors ── */
-    for (u32 i = 0; i < NUM_RX; i++) {
-        volatile struct macb_desc *d = &rx_ring[i];
-#if !USE_8BYTE_DESC
-        d->addr_hi = MACB_DMA_HI;
-        d->rsvd = 0;
-#endif
-        d->ctrl = 0xDEAD0000;  /* canary w1 */
-        __asm__ volatile("dsb sy" ::: "memory");
-        u32 a = (u32)(usize)&rx_bufs[i][0];
-        if (i == NUM_RX - 1) a |= RX_ADDR_WRAP;
-        d->addr = a;
-    }
-    rx_idx = 0;
+    /* ── Setup RX descriptors ──
+     * The RX ring is owned by the RX engine (src/macb_rx_engine.c). It
+     * publishes the whole ring, programs RBQP/RBQPH, clears RSR and enables
+     * NCR.RE at macb_rx_engine_init() time, once PHY/NCFGR are final. Nothing
+     * to do here. */
 
     /* ── Setup TX descriptors ── */
     for (u32 i = 0; i < NUM_TX; i++) {
@@ -663,24 +660,12 @@ bool macb_init(void) {
     tx_inflight = 0;
 
     __asm__ volatile("dsb sy" ::: "memory");
-    /* DMA_NET is Normal-NC. DC maintenance here can cover four compact
-     * descriptors and write stale sibling ownership over a PCIe DMA update. */
-    __asm__ volatile("dsb sy" ::: "memory");
 
-    uart_puts("[mac] RX desc[0]=");
-    uart_hex(rx_ring[0].addr);
-    uart_puts(" exp=");
-    uart_hex((u32)(usize)&rx_bufs[0][0]);
-    uart_puts("\n");
-
-    /* ── Ring base pointers ── */
-    mw(RBQP, (u32)(usize)&rx_ring[0]);
+    /* ── TX ring base pointer (the RX engine programs RBQP/RBQPH itself) ── */
     mw(TBQP, (u32)(usize)&tx_ring[0]);
 #if !USE_8BYTE_DESC
-    mw(RBQPH, MACB_DMA_HI);
     mw(TBQPH, MACB_DMA_HI);
 #else
-    mw(RBQPH, 0);
     mw(TBQPH, 0);
 #endif
 
@@ -719,9 +704,9 @@ bool macb_init(void) {
     /* USRIO: RGMII mode only (Circle: GEM_BIT(RGMII)) */
     mw(USRIO, USRIO_RGMII);
 
-    /* Enable TX + RX only (NO MPE — Circle enables MPE per MDIO op) */
-    mw(NCR, NCR_RE | NCR_TE);
-
+    /* Do PHY selection, link wait and the final NCFGR with RX and TX still
+     * disabled. MDIO toggles NCR.MPE itself per op, so it works without RE/TE.
+     * RX is enabled later by macb_rx_engine_init(); TX is enabled after it. */
     if (!phy_select())
         return false;
 
@@ -825,6 +810,32 @@ bool macb_init(void) {
                   gig ? "1000" : (spd100 ? "100" : "10"),
                   fd ? "FD" : "HD", ncfgr);
     }
+
+    /* ── Bring up RX via the engine ──
+     * PHY/NCFGR are final and RX/TX are still disabled. The engine publishes
+     * the whole ring with reception off, programs RBQP/RBQPH, clears RSR, and
+     * only then enables NCR.RE. */
+    {
+        struct macb_rx_config rxcfg = {
+            .ring = (volatile void *)rx_ring,
+            .buffers = &rx_bufs[0][0],
+            .ring_count = NUM_RX,
+            .buffer_size = BUF_SIZE,
+            .dma_high = MACB_DMA_HI,
+            .trailing_bytes = (u32)MACB_RX_TRAILING_BYTES,
+            .checksum_enabled = rx_csum_enabled,
+        };
+        if (!macb_rx_engine_init(&rxcfg)) {
+            uart_puts("[mac] RX engine init failed\n");
+            return false;
+        }
+    }
+
+    /* Reception is now enabled by the engine; enable transmission while
+     * preserving the NCR bits the engine set (RE). */
+    mw(NCR, mr(NCR) | NCR_TE);
+    __asm__ volatile("dsb sy" ::: "memory");
+    (void)mr(NCR);
 
     return true;
 }
@@ -1008,386 +1019,110 @@ bool macb_send(const u8 *frame, u32 len) {
     return true;
 }
 
-/* ── Receive ── */
-static u32 rx_recv_count;
-static u32 rx_recover_count;
-static u32 rx_hole_recover_count;
-static u32 rx_hole_candidate_idx = NUM_RX;
-static u64 rx_hole_candidate_since_ms;
+/* ── Receive ──
+ * The RX ring, software cursor, OWN-bit publication/acquire ordering, ordered-
+ * hole capture and every recovery path are owned by the RX engine
+ * (src/macb_rx_engine.c). The wrappers below adapt the engine to the stable
+ * public macb.h API without duplicating any ring state here. */
 
-static void macb_rx_ownership_snapshot(u32 *total_owned,
-                                       u32 *contig_owned,
-                                       u32 *owned_after_gap,
-                                       u32 *first_owned_distance)
+/* The public hole snapshot (macb.h) and the engine hole image capture the same
+ * number of post-hole OWN descriptors; the converter below relies on it. */
+_Static_assert(MACB_RX_CAPTURE_OWNED == MACB_HOLE_FOLLOW_COUNT,
+               "engine/public hole follow-count mismatch");
+
+bool macb_rx_hole_snapshot(struct macb_hole_snapshot *out)
 {
-    __asm__ volatile("dsb sy" ::: "memory");
+    if (!out)
+        return false;
 
-    u32 contig = 0;
-    u32 after = 0;
-    u32 first = NUM_RX;
-    u32 total = 0;
-    bool saw_gap = false;
-    for (u32 distance = 0; distance < NUM_RX; distance++) {
-        u32 idx = (rx_idx + distance) % NUM_RX;
-        bool owned = (rx_ring[idx].addr & RX_ADDR_OWN) != 0;
-        if (owned)
-            total++;
-        if (!saw_gap) {
-            if (owned) {
-                contig++;
-            } else {
-                saw_gap = true;
-            }
-        } else if (owned) {
-            if (first == NUM_RX)
-                first = distance;
-            after++;
-        }
+    struct macb_rx_hole_image img;
+    if (!macb_rx_engine_last_hole(&img) || !img.valid)
+        return false;
+
+    out->valid = img.valid ? 1U : 0U;
+    out->sequence = img.sequence;
+    out->stuck_idx = img.stuck_idx;
+    out->rbqp = img.rbqp;
+    out->rbqph = img.rbqph;
+    out->rsr = img.rsr;
+    out->ncr = img.ncr;
+    out->expected_addr = img.expected_addr;
+    out->rbqp_stopped = img.rbqp_stopped;
+    out->dmacfg = img.dmacfg;
+    out->dcfg10 = img.dcfg10;
+    out->rxbdctrl = img.rxbdctrl;
+    out->prefetch_descs = img.prefetch_descs;
+    out->trailing_bytes = img.trailing_bytes;
+    out->cache_line = img.cache_line;
+    out->cache_probe_flags = img.cache_probe_flags;
+
+    out->stuck.idx = img.stuck.index;
+    out->stuck.addr = img.stuck.addr;
+    out->stuck.ctrl = img.stuck.ctrl;
+    out->stuck.addr_hi = img.stuck.addr_hi;
+    out->stuck.word3 = img.stuck.word3;
+    out->stopped.idx = img.stopped.index;
+    out->stopped.addr = img.stopped.addr;
+    out->stopped.ctrl = img.stopped.ctrl;
+    out->stopped.addr_hi = img.stopped.addr_hi;
+    out->stopped.word3 = img.stopped.word3;
+    out->after_ivac.idx = img.after_ivac.index;
+    out->after_ivac.addr = img.after_ivac.addr;
+    out->after_ivac.ctrl = img.after_ivac.ctrl;
+    out->after_ivac.addr_hi = img.after_ivac.addr_hi;
+    out->after_ivac.word3 = img.after_ivac.word3;
+
+    out->follow_count = img.later_owned_count;
+    for (u32 i = 0; i < MACB_HOLE_FOLLOW_COUNT; i++) {
+        out->follow[i].idx = img.later_owned[i].index;
+        out->follow[i].addr = img.later_owned[i].addr;
+        out->follow[i].ctrl = img.later_owned[i].ctrl;
+        out->follow[i].addr_hi = img.later_owned[i].addr_hi;
+        out->follow[i].word3 = img.later_owned[i].word3;
     }
-
-    if (total_owned) *total_owned = total;
-    if (contig_owned) *contig_owned = contig;
-    if (owned_after_gap) *owned_after_gap = after;
-    if (first_owned_distance) *first_owned_distance = first;
+    return true;
 }
 
 bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
-    /* DMA_NET is Normal-NC: order PCIe writes, but never issue cache-line
-     * maintenance against compact descriptor lines. */
-    __asm__ volatile("dsb sy" ::: "memory");
-
-    /* Read descriptor */
-    u32 addr_val = rx_ring[rx_idx].addr;
-
-    /* Check if current RX descriptor has been filled by MAC */
-    if (!(addr_val & RX_ADDR_OWN))
-        return false;
-
-    /* Acquire DMA publication: OWN must be observed before status/payload. */
-    __asm__ volatile("dmb oshld" ::: "memory");
-    u32 status = rx_ring[rx_idx].ctrl;
-    u32 flen = status & RX_STAT_LEN_MASK;
-    if (checksum_trusted) {
-        u32 csum = (status & RX_STAT_CSUM_MASK) >> RX_STAT_CSUM_SHIFT;
-        *checksum_trusted = rx_csum_enabled &&
-                            ((csum & RX_STAT_CSUM_CHECKED_MASK) != 0U);
-    }
-
-    if (flen == 0 || flen > BUF_SIZE) {
-        /* Reclaim descriptor */
-        __asm__ volatile("dmb osh" ::: "memory");
-        rx_ring[rx_idx].addr &= ~RX_ADDR_OWN;
-        __asm__ volatile("dsb sy" ::: "memory");
-        rx_idx = (rx_idx + 1) % NUM_RX;
-        return false;
-    }
-
-    /* Copy frame out (NEON for throughput) */
-    u8 *src = rx_bufs[rx_idx];
-    simd_memcpy(frame, src, flen);
-    *len = flen;
-
-    /* Release ownership only after the frame copy has completed. */
-    __asm__ volatile("dmb osh" ::: "memory");
-    rx_ring[rx_idx].addr &= ~RX_ADDR_OWN;
-    __asm__ volatile("dsb sy" ::: "memory");
-
-    rx_idx = (rx_idx + 1) % NUM_RX;
-    rx_recv_count++;
-    return true;
-}
-
-/* RX-overrun recovery. GEM has no self-healing path once the RX ring overruns:
- * when every descriptor is owned by software (CPU couldn't drain fast enough)
- * the MAC latches RSR.BNA (Buffer Not Available) and, if the RX FIFO then
- * overflows, RSR.OVR — and RX DMA effectively stops delivering. Clearing RSR
- * alone does NOT restart a halted RX engine, so the polling driver would stay
- * wedged (rx_idx frozen, frames never consumed) even after the load stops.
- *
- * This performs the canonical GEM recovery: stop RX, hand the whole ring back
- * to the MAC (clear OWN, preserve buffer addr + WRAP), reset the CPU cursor and
- * the queue pointer to the ring base, W1C-clear the latched RX status, then
- * re-enable RX. In-flight buffered frames are discarded (TCP will retransmit) —
- * recovering the NIC is worth far more than salvaging a handful of packets.
- *
- * Cheap to call every poll: it reads RSR and returns immediately unless a real
- * BNA/OVR stall is latched. Returns true if it performed a recovery. */
-/* Stop RX, hand the whole ring back to the MAC (clear OWN, preserve buffer
- * addr + WRAP), reset the CPU cursor + queue pointer to the ring base, W1C-clear
- * the latched RX status, and re-enable RX. This is the canonical GEM RX restart;
- * toggling NCR.RE restarts a halted RX DMA regardless of what halted it. Shared
- * by the BNA/OVR recovery and the RX-liveness watchdog. */
-static void macb_rx_ring_rebuild(void) {
-    /* Stop RX while we rebuild the ring. */
-    u32 ncr = mr(NCR);
-    mw(NCR, ncr & ~NCR_RE);
-    __asm__ volatile("dsb sy" ::: "memory");
-
-    /* Hand every descriptor back to the MAC (OWN cleared), preserving the
-     * buffer address and the WRAP flag on the final descriptor. */
-    for (u32 i = 0; i < NUM_RX; i++) {
-        volatile struct macb_desc *d = &rx_ring[i];
-#if !USE_8BYTE_DESC
-        d->addr_hi = MACB_DMA_HI;
-        d->rsvd = 0;
-#endif
-        d->ctrl = 0;
-        u32 a = (u32)(usize)&rx_bufs[i][0];
-        if (i == NUM_RX - 1) a |= RX_ADDR_WRAP;
-        d->addr = a;   /* OWN bit clear => MAC owns it again */
-    }
-    rx_idx = 0;
-    __asm__ volatile("dsb sy" ::: "memory");
-    __asm__ volatile("dsb sy" ::: "memory");
-
-    /* Point the RX queue back at the ring base. */
-    mw(RBQP, (u32)(usize)&rx_ring[0]);
-#if !USE_8BYTE_DESC
-    mw(RBQPH, MACB_DMA_HI);
-#endif
-
-    /* W1C-clear the latched RX status (BNA/OVR/etc). */
-    mw(RSR, mr(RSR));
-    __asm__ volatile("dsb sy" ::: "memory");
-
-    /* Re-enable RX and force the writes out to the device. */
-    mw(NCR, mr(NCR) | NCR_RE);
-    __asm__ volatile("dsb sy" ::: "memory");
-    (void)mr(NCR);
+    return macb_rx_engine_recv(frame, BUF_SIZE, len, checksum_trusted);
 }
 
 bool macb_rx_hole_recover(void) {
-    u32 contig = 0;
-    u32 after = 0;
-    u32 first = NUM_RX;
-    u32 stuck_idx = rx_idx;
-    macb_rx_ownership_snapshot(NULL, &contig, &after, &first);
-
-    /* A current descriptor not owned by software followed by several later
-     * OWN descriptors is impossible for an ordered GEM RX ring: hardware must
-     * publish descriptor N before N+1. Requiring four later OWN descriptors
-     * avoids reacting to a transient observation while DMA is completing one
-     * descriptor, yet catches the live failure (hundreds queued beyond a hole)
-     * well before BNA/OVR or the 90s liveness watchdog can fire. */
-    if (contig != 0U || after < 4U) {
-        rx_hole_candidate_idx = NUM_RX;
-        rx_hole_candidate_since_ms = 0;
-        return false;
-    }
-
-    /* RX DMA remains active during the bounded diagnostic scan. Revalidate the
-     * current descriptor after the scan so normal DMA progress (current became
-     * OWN while later descriptors were being inspected) is not mistaken for a
-     * stable hole. A real sibling-writeback hole remains OWN=0 here. */
-    __asm__ volatile("dsb sy" ::: "memory");
-    if (rx_ring[stuck_idx].addr & RX_ADDR_OWN) {
-        rx_hole_candidate_idx = NUM_RX;
-        rx_hole_candidate_since_ms = 0;
-        return false;
-    }
-
-    u64 now_ms = timer_monotonic_ms();
-    if (rx_hole_candidate_idx != stuck_idx) {
-        rx_hole_candidate_idx = stuck_idx;
-        rx_hole_candidate_since_ms = now_ms;
-        return false;
-    }
-    if (now_ms - rx_hole_candidate_since_ms < 20ULL)
-        return false;
-
-    rx_hole_recover_count++;
-    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXHOLERECOVER,
-           stuck_idx, after, first, rx_hole_recover_count);
-    pioscap_notify_event("rx-descriptor-hole");
-    macb_rx_ring_rebuild();
-    rx_hole_candidate_idx = NUM_RX;
-    rx_hole_candidate_since_ms = 0;
-    return true;
+    return macb_rx_engine_recover_ordering_hole();
 }
 
 bool macb_rx_recover(void) {
-    u32 rsr = mr(RSR);
-    if (!(rsr & (RSR_BNA | RSR_OVR)))
-        return false;
-
-    /* Snapshot the OWN-bit pattern BEFORE macb_rx_ring_rebuild() wipes it, to
-     * distinguish a genuine sequential fill (every descriptor from rx_idx
-     * forward is owned, consistent with real traffic volume exhausting the
-     * ring) from a "hole" pattern (some descriptors in that span are NOT
-     * owned, i.e. already reclaimed, while later ones ARE owned) -- a hole
-     * would mean the ring reported "full" (BNA) while genuinely having spare
-     * capacity, pointing at a false/stale overrun signal (e.g. a stuck
-     * descriptor never getting reclaimed, or a hardware/cache-coherency
-     * confusion) rather than real traffic volume. Walk forward from rx_idx
-     * counting the contiguous owned run, then keep scanning to see if MORE
-     * owned descriptors exist beyond a gap. */
-    u32 contig_owned = 0;
-    u32 owned_after_gap = 0;
-    u32 first_owned_distance = NUM_RX;
-    u32 recover_idx = rx_idx;
-    macb_rx_ownership_snapshot(NULL, &contig_owned, &owned_after_gap,
-                               &first_owned_distance);
-
-    macb_rx_ring_rebuild();
-    rx_recover_count++;
-    /* Dump enough context to reconstruct what the recovery saw without
-     * needing a live poll to race the event: which overrun bit(s) latched,
-     * the lifetime recovery count, and where RX/TX were in the ring at the
-     * moment of detection. */
-    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXRECOVER, rx_recover_count, rsr, recover_idx, tx_idx);
-    /* a0=contig_owned (owned run starting at rx_idx; NUM_RX means genuinely
-     * fully saturated), a1=owned_after_gap (nonzero means a hole pattern: a
-     * NOT-owned descriptor followed by MORE owned ones -- a real anomaly,
-     * since normal fill-up should never skip a descriptor), a2=rx_idx,
-     * a3=NUM_RX (for scale). */
-    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXRECOVER_PATTERN,
-           contig_owned, owned_after_gap, recover_idx, first_owned_distance);
-    pioscap_notify_event("rx-overrun-recover");
-    return true;
+    return macb_rx_engine_recover_status();
 }
 
-/* RX-liveness watchdog — see macb.h. Distinguishes ordinary RX-silence
- * ("idle") from a genuine RX DMA halt that does NOT latch RSR.BNA/OVR (which
- * macb_rx_recover cannot see). This LAN is reasonably noisy -- there is
- * usually SOME traffic, just not necessarily traffic PIOS cares about -- so
- * an extended RX-silence window by itself is common and not a fault. Only
- * escalate to a real "wedge" (ring rebuild + rx_wedge counter) when there is
- * also corroborating evidence of unmet demand: our own stack has actively
- * transmitted (tx_progress) during the silence window (e.g. mid-connection
- * retries/ACKs/replies expecting a peer response) and RX still produced
- * nothing back. Plain silence with no such demand is just idle -- tracked
- * separately via rx_idle for dashboards/diagnostics, never rebuilt for.
- *
- * TIMEOUT TUNING (2026-07-16 field observation): the original 4000ms base
- * timeout produced repeated false-positive "wedge" recoveries -- macb_diag
- * showed rx_recover=0 (BNA/OVR never latched) and RSR=0 (no hardware overrun
- * ever observed) alongside a steadily climbing wedge counter, i.e. the ring
- * was never actually stuck. Raising the base to 15000ms alone did not change
- * the observed false-trip cadence (~1 per 60-70s before AND after), showing
- * the natural inbound gap on this LAN is itself ~60-70s -- so the demand-
- * gated design above is the real fix; the larger 90s base timeout plus
- * IDLE_DISARM_MS kept below it (so a link with neither RX nor TX activity
- * disarms itself instead of always losing the race to the wedge check) is a
- * belt-and-braces second layer. */
-#define MACB_RX_LIVENESS_IDLE_REPORT_MS  15000ULL
-#define MACB_RX_LIVENESS_TIMEOUT_MS      90000ULL
-#define MACB_RX_LIVENESS_IDLE_DISARM_MS  30000ULL
-#define MACB_RX_LIVENESS_BACKOFF_MAX_MS 180000ULL
-static u32 rx_live_last_count;
-static u32 rx_live_last_tx_count;
-static u64 rx_live_last_rx_ms;
-static u64 rx_live_last_activity_ms;
-static u32 rx_live_recover_count;
-static u32 rx_wedge_count;         /* real wedges: silence + unmet demand */
-static u32 rx_idle_count;          /* informational: extended RX-silence periods (not faults) */
-static u32 rx_live_streak;
-static bool rx_live_armed;
-static bool rx_tx_since_last_rx;   /* our stack transmitted during the current silence window */
-static bool rx_idle_reported;      /* idle already counted for the current silence window */
-
+/* RX-liveness watchdog — see macb.h. The engine owns the demand-gated
+ * 90s silence detection, backoff and rebuild; pass the live TX progress
+ * counter so it can tell an idle link from a genuine wedge. */
 bool macb_rx_liveness_recover(u64 now_ms) {
-    if (rx_live_last_activity_ms == 0) {
-        rx_live_last_count = rx_recv_count;
-        rx_live_last_tx_count = tx_send_count;
-        rx_live_last_rx_ms = now_ms;
-        rx_live_last_activity_ms = now_ms;
-        rx_live_streak = 0;
-        rx_live_armed = false;
-        rx_tx_since_last_rx = false;
-        rx_idle_reported = false;
-        return false;
-    }
-
-    bool rx_progress = (rx_recv_count != rx_live_last_count);
-    bool tx_progress = (tx_send_count != rx_live_last_tx_count);
-
-    if (tx_progress) {
-        rx_live_last_tx_count = tx_send_count;
-        rx_live_last_activity_ms = now_ms;
-        rx_tx_since_last_rx = true;
-    }
-
-    /* Any RX progress proves the lane is live: (re)arm, clear backoff, and
-     * start a fresh silence window (clear the demand/idle-reported flags). */
-    if (rx_progress) {
-        rx_live_last_count = rx_recv_count;
-        rx_live_last_rx_ms = now_ms;
-        rx_live_last_activity_ms = now_ms;
-        rx_live_streak = 0;
-        rx_live_armed = true;
-        rx_tx_since_last_rx = false;
-        rx_idle_reported = false;
-        return false;
-    }
-
-    /* Fully quiet link (neither RX nor TX activity): stop probing to avoid
-     * idle false positives. */
-    if (now_ms - rx_live_last_activity_ms >= MACB_RX_LIVENESS_IDLE_DISARM_MS) {
-        rx_live_armed = false;
-        rx_live_streak = 0;
-        rx_live_last_rx_ms = now_ms;
-        return false;
-    }
-
-    if (!rx_live_armed)
-        return false;
-
-    u64 idle_ms = now_ms - rx_live_last_rx_ms;
-
-    /* Informational only: note an extended RX-silence window once per
-     * window. This is expected/common on a noisy-but-not-for-us LAN and is
-     * NOT by itself evidence of a fault. */
-    if (idle_ms >= MACB_RX_LIVENESS_IDLE_REPORT_MS && !rx_idle_reported) {
-        rx_idle_count++;
-        rx_idle_reported = true;
-    }
-
-    u64 timeout = MACB_RX_LIVENESS_TIMEOUT_MS;
-    u32 shift = rx_live_streak;
-    if (shift > 4U)
-        shift = 4U; /* 90s * 16 = 1440s; cap below to 180s. */
-    timeout <<= shift;
-    if (timeout > MACB_RX_LIVENESS_BACKOFF_MAX_MS)
-        timeout = MACB_RX_LIVENESS_BACKOFF_MAX_MS;
-
-    if (idle_ms < timeout)
-        return false;
-
-    if (!rx_tx_since_last_rx) {
-        /* Extended silence with no corroborating demand: just an idle link,
-         * not a fault. Keep waiting instead of rebuilding a ring that was
-         * never actually stuck. */
-        return false;
-    }
-
-    /* No RX for the active watchdog window: assume RX DMA is wedged. */
-    rx_wedge_count++;
-    macb_rx_ring_rebuild();
-    rx_live_recover_count++;
-    DTRACE(DTRACE_CAT_MAC, DT_MAC_RXLIVERECOVER, rx_wedge_count, idle_ms, rx_live_streak, tx_send_count);
-    pioscap_notify_event("rx-liveness-wedge");
-    rx_live_streak++;
-    rx_live_last_rx_ms = now_ms;
-    return true;
+    return macb_rx_engine_recover_liveness(now_ms, tx_send_count);
 }
 
 void macb_diag(struct macb_diag *out)
 {
     if (!out)
         return;
-    out->rx_idx = rx_idx;
+
+    struct macb_rx_diag rd;
+    macb_rx_engine_diag(&rd);
+    out->rx_idx = rd.rx_idx;
+    out->rx_recv = rd.rx_recv;
+    out->rx_owned = rd.rx_owned;
+    out->rx_contig_owned = rd.rx_contig_owned;
+    out->rx_owned_after_gap = rd.rx_owned_after_gap;
+    out->rx_first_owned_distance = rd.rx_first_owned_distance;
+    out->rx_recover = rd.rx_recover;
+    out->rx_live_recover = rd.rx_live_recover;
+    out->rx_hole_recover = rd.rx_hole_recover;
+    out->rx_wedge = rd.rx_wedge;
+    out->rx_idle = rd.rx_idle;
+
     out->tx_idx = tx_idx;
-    out->rx_recv = rx_recv_count;
     out->tx_send = tx_send_count;
-    u32 owned = 0;
-    u32 contig = 0;
-    u32 after_gap = 0;
-    u32 first_after = NUM_RX;
-    macb_rx_ownership_snapshot(&owned, &contig, &after_gap, &first_after);
-    out->rx_owned = owned;
-    out->rx_contig_owned = contig;
-    out->rx_owned_after_gap = after_gap;
-    out->rx_first_owned_distance = first_after;
     out->nsr  = mr(NSR);
     out->rsr  = mr(RSR);
     out->tsr  = mr(TSR);
@@ -1396,14 +1131,9 @@ void macb_diag(struct macb_diag *out)
     out->tbqp = mr(TBQP);
     out->imr  = mr(IMR);
     out->eth_cfg_stat = ecr(ETH_CFG_STAT);
-    out->rx_recover = rx_recover_count;
     out->ring_size = NUM_RX;
     out->tx_drop = tx_drop_count;
     out->tx_recover = tx_recover_count;
-    out->rx_live_recover = rx_live_recover_count;
-    out->rx_hole_recover = rx_hole_recover_count;
-    out->rx_wedge = rx_wedge_count;
-    out->rx_idle = rx_idle_count;
     /* GEM_TXPAUSECNT/RXPAUSECNT are lifetime hardware counters that clear on
      * read, so accumulate into static software totals here (macb_diag is
      * currently the only reader) rather than reporting a raw read that would
@@ -1432,7 +1162,10 @@ void macb_irq_snapshot(struct macb_irq_snapshot *out, bool read_clear_isr)
 
 void macb_irq_enable_rx(void)
 {
-    mw(RSR, 0xFFFFFFFFU);
+    /* The RX engine exclusively owns BNA/OVR/HRESP clearing + persistence.
+     * Only W1C the frame-received bit here; leave fault bits latched for
+     * macb_rx_engine_recover_status(). */
+    mw(RSR, RSR_REC);
     (void)mr(ISR);
     mw(IER, INT_RCOMP);
 }
@@ -1441,15 +1174,16 @@ u32 macb_irq_ack_rx(void)
 {
     u32 rsr = mr(RSR);
     u32 isr = mr(ISR);
-    if (rsr)
-        mw(RSR, rsr);
+    /* W1C only RSR_REC — never BNA/OVR/HRESP (engine-owned). */
+    if (rsr & RSR_REC)
+        mw(RSR, RSR_REC);
     if (isr)
         mw(ISR, isr);
     dsb();
     rsr = mr(RSR);
     u32 isr2 = mr(ISR);
-    if (rsr)
-        mw(RSR, rsr);
+    if (rsr & RSR_REC)
+        mw(RSR, RSR_REC);
     if (isr2)
         mw(ISR, isr2);
     dsb();
@@ -1458,18 +1192,20 @@ u32 macb_irq_ack_rx(void)
 
 /* Snapshot of full MAC state for stall diagnosis (host-side polling). */
 void macb_dump_full_state(const char *tag) {
+    struct macb_rx_diag rd;
+    macb_rx_engine_diag(&rd);
     uart_puts("[mac] ");
     uart_puts(tag);
     uart_puts(" tx_idx=");
     uart_hex(tx_idx);
     uart_puts(" rx_idx=");
-    uart_hex(rx_idx);
+    uart_hex(rd.rx_idx);
     uart_puts(" tx_sent=");
     uart_hex(tx_send_count);
     uart_puts(" tx_drop=");
     uart_hex(tx_drop_count);
     uart_puts(" rx_recv=");
-    uart_hex(rx_recv_count);
+    uart_hex(rd.rx_recv);
     uart_puts("\n[mac] NCR=");
     uart_hex(mr(NCR));
     uart_puts(" NCFGR=");
@@ -1534,9 +1270,11 @@ bool macb_kick_stall(void) {
     uart_hex(ncr_pre);
     uart_puts("\n");
 
-    /* Write-1-to-clear status bits (GEM TSR/RSR/ISR are W1C). */
+    /* Write-1-to-clear status bits (GEM TSR/RSR/ISR are W1C). The RX engine
+     * exclusively owns BNA/OVR/HRESP fault clearing + persistence, so only
+     * W1C the frame-received bit here and leave fault recovery to the engine. */
     if (tsr_pre) mw(TSR, tsr_pre);
-    if (rsr_pre) mw(RSR, rsr_pre);
+    if (rsr_pre & RSR_REC) mw(RSR, RSR_REC);
 
     /* Halt TX, brief pause, then restart. */
     mw(NCR, ncr_pre | NCR_THALT);
@@ -1569,6 +1307,9 @@ void macb_set_rx_checksum_offload(bool enable)
 {
     rx_csum_enabled = enable;
     macb_apply_rx_checksum_offload();
+    /* Keep the engine's recv() checksum-trust reporting consistent with the
+     * runtime NCFGR.RXCOEN state it can no longer see directly. */
+    macb_rx_engine_set_checksum_enabled(enable);
 }
 
 void macb_set_tso(bool enable)

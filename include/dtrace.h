@@ -57,6 +57,12 @@
                                     * a2=rx_idx, a3=first_owned_distance */
 #define DT_MAC_RXHOLERECOVER 8 /* ordered-ring hole: a0=stuck rx_idx
                                 * a1=owned_after_gap a2=first distance a3=count */
+#define DT_MAC_RXMALFORMED   9 /* malformed RX descriptor released (bad SOF/EOF
+                                * or length): a0=idx a1=ctrl a2=len */
+#define DT_MAC_RXHRESP      10 /* HRESP/bus-error RX rebuild (fail-closed):
+                                * a0=rsr a1=rx_idx a2=rx_recover */
+#define DT_MAC_REDISABLEFAIL 11 /* NCR.RE would not clear before a ring rebuild;
+                                 * rebuild refused (fail closed): a0=ncr */
 /* FIFO */
 #define DT_FIFO_PUSH        1   /* a0=(src<<8|dst) a1=type a2=seq */
 #define DT_FIFO_POP         2   /* a0=(dst<<8|src) a1=type a2=seq */

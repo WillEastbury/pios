@@ -161,6 +161,9 @@ static const char *ev_name(u8 log2, u16 ev)
         case DT_MAC_RXLIVERECOVER: return "rxliverecover";
         case DT_MAC_RXRECOVER_PATTERN: return "rxrecover-pattern";
         case DT_MAC_RXHOLERECOVER: return "rxhole-recover";
+        case DT_MAC_RXMALFORMED: return "rxmalformed";
+        case DT_MAC_RXHRESP: return "rxhresp-recover";
+        case DT_MAC_REDISABLEFAIL: return "re-disable-fail";
         } break;
     case DTRACE_CAT_FIFO:
         switch (ev) { case DT_FIFO_PUSH: return "push"; case DT_FIFO_POP: return "pop"; } break;

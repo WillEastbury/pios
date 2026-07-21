@@ -31,13 +31,10 @@ core_asm_stage:
 #define PIOS_CACHE_BRINGUP_FIX 1
 #endif
 
-/* GATE (reversible): map the low 1GB (kernel RAM) Write-Back cacheable from the
- * boot translation table instead of Non-Cacheable, so the kernel never runs a
- * Non-Cacheable phase that is later swapped to WB (Circle maps RAM WB single-
- * stage; PIOS's NC-then-swap may be poisoning the A76 cache so it won't
- * allocate). Side effect: the scanout framebuffer at 0x3F400000 becomes WB
- * (HDMI may show stale frames) — acceptable for a network-accessed test. Set to
- * 0 and rebuild to revert. */
+/* Gate retained for provisioner/recovery builds. Main kernels use the mixed
+ * boot L2 split below so code/core RAM are WB while FIFO/DMA/IPC are NC from
+ * first enable. Provisioners pass 0 because their early SD path requires the
+ * original fully-NC low-1GB mapping and disables cache bring-up maintenance. */
 #ifndef PIOS_CACHE_WB_FROM_BOOT
 #define PIOS_CACHE_WB_FROM_BOOT 1
 #endif
@@ -166,19 +163,58 @@ _start:
     subs    x1, x1, #1
     b.ne    .Lzero_l1
 
-    /* L1[0]: first 1GB. */
+    /* L1[0]: first 1GB via a boot-only 2MB-granular table. DMA_NET must be
+     * Normal-NC from the first MMU enable: mapping the whole low 1GB WB and
+     * tightening it later left descriptor lines observable through stale WB
+     * cache state even though the final PTE was NC. Keep the eventual runtime
+     * cache split from the start:
+     *   block 0       kernel image window                         WB
+     *   blocks 1-3    BSS/page tables/stacks                      NC
+     *   blocks 4-35   per-core private RAM                        WB
+     *   blocks 36-39  FIFO/DMA_NET/DMA_DISK/IPC                   NC
+     *   blocks 40-47  HDMI back buffer                            WB
+     *   remainder     high RAM/scanout                            NC
+     * mmu_enable_caching() later builds its finer W^X table in a separate
+     * l2_table_low, so the live boot table is never edited in place. */
     ldr     x0, =l1_table
 #if PIOS_CACHE_WB_FROM_BOOT
-    /* Map block 0 (which holds the kernel code window) Write-Back from the very
-     * first cache enable. This is the proven breakthrough fix: it eliminates the
-     * Non-Cacheable boot window that otherwise poisons the A76 cache so it never
-     * allocates. The runtime mmu_enable_caching() then splits block 0 (code WB,
-     * rest NC) and maps blocks 1-3 NC so all DMA driver .bss stays coherent.
-     * Reverts to the original NC block-0 when the gate is 0. */
-    mov     x2, #0x709                 /* ATTR(2) = WB cacheable          */
+    ldr     x7, =l2_table_boot
+    mov     x5, #0
+    mov     x2, #0x705                 /* ATTR(1) = Normal-NC             */
+.Lboot_l2_nc:
+    lsl     x3, x5, #21
+    orr     x4, x3, x2
+    str     x4, [x7, x5, lsl #3]
+    add     x5, x5, #1
+    cmp     x5, #512
+    b.lt    .Lboot_l2_nc
+
+    mov     x2, #0x709                 /* ATTR(2) = Normal-WB             */
+    str     x2, [x7, #0]               /* block 0                         */
+    mov     x5, #4
+.Lboot_l2_core_wb:
+    lsl     x3, x5, #21
+    orr     x4, x3, x2
+    str     x4, [x7, x5, lsl #3]
+    add     x5, x5, #1
+    cmp     x5, #36
+    b.lt    .Lboot_l2_core_wb
+    mov     x5, #40
+.Lboot_l2_fb_wb:
+    lsl     x3, x5, #21
+    orr     x4, x3, x2
+    str     x4, [x7, x5, lsl #3]
+    add     x5, x5, #1
+    cmp     x5, #48
+    b.lt    .Lboot_l2_fb_wb
+
+    ldr     x2, =l2_table_boot
+    orr     x2, x2, #3                 /* valid table descriptor          */
     str     x2, [x0, #0]
 #else
-    mov     x2, #0x705                 /* original: NC 1GB block          */
+    /* Minimal provisioner/recovery path: preserve the proven all-NC low 1GB
+     * while early SD access runs without the full cache bring-up sequence. */
+    mov     x2, #0x705
     str     x2, [x0, #0]
 #endif
 

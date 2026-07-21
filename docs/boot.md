@@ -163,7 +163,7 @@ enabled (`src/start.S:136-206`):
 
 | L1 index | VA range | Descriptor | Notes |
 |---|---|---|---|
-| 0 | `0x0`–`0x3FFF_FFFF` | `0x705` block | Low 1 GB, **Normal Non-Cacheable** at boot |
+| 0 | `0x0`–`0x3FFF_FFFF` | table → 2 MB L2 blocks | Kernel/core RAM/back buffer WB; BSS/FIFO/DMA/IPC/high RAM NC |
 | 1-3 | `0x4000_0000`–`0xFFFF_FFFF` | `…|0x709` block | Normal Write-Back cacheable RAM |
 | 64-67 | `0x1_0000_0000`–`0x1_FFFF_FFFF` | device block | BCM2712 peripherals (`0x401 | 0x0060<<48`) |
 | 124-127 | `0x1F_0000_0000`–`0x1F_FFFF_FFFF` | device block | RP1 BAR window |
@@ -177,9 +177,10 @@ enabled (`src/start.S:136-206`):
   `SA` (`src/start.S:208-216`).
 - `sp = __stack_top_core0`, `bl kernel_main` (`src/start.S:218-223`).
 
-> The low 1 GB (including the kernel `.text`) is **Non-Cacheable at boot**.
-> RAM regions are selectively promoted to cacheable after handoff by
-> `mmu_enable_caching()` (§4, see [mmu.md](mmu.md)).
+> DMA_NET, DMA_DISK, FIFO, and IPC are Normal-NC from the first MMU enable.
+> They are never temporarily mapped WB. Minimal provisioner/recovery builds
+> retain the fully-NC low-1-GB mapping required by their early SD path.
+> `mmu_enable_caching()` later installs the finer W^X block-0 split.
 
 ---
 

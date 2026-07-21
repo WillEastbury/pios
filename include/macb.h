@@ -68,6 +68,44 @@ struct macb_diag {
 } PACKED;
 void macb_diag(struct macb_diag *out);
 
+#define MACB_HOLE_FOLLOW_COUNT 8U
+
+struct macb_desc_snapshot {
+    u32 idx;
+    u32 addr;
+    u32 ctrl;
+    u32 addr_hi;
+    u32 word3;
+} PACKED;
+
+struct macb_hole_snapshot {
+    u32 valid;
+    u32 sequence;
+    u32 stuck_idx;
+    u32 rbqp;
+    u32 rbqph;
+    u32 rsr;
+    u32 ncr;
+    u32 expected_addr;
+    u32 rbqp_stopped;
+    u32 dmacfg;
+    u32 dcfg10;
+    u32 rxbdctrl;
+    u32 prefetch_descs;
+    u32 trailing_bytes;
+    u32 cache_line;
+    u32 cache_probe_flags;
+    struct macb_desc_snapshot stuck;
+    struct macb_desc_snapshot stopped;
+    struct macb_desc_snapshot after_ivac;
+    u32 follow_count;
+    struct macb_desc_snapshot follow[MACB_HOLE_FOLLOW_COUNT];
+} PACKED;
+
+/* Return the last stable ordered-hole descriptor image captured before ring
+ * recovery. The snapshot persists across recovery so UART can inspect it. */
+bool macb_rx_hole_snapshot(struct macb_hole_snapshot *out);
+
 /* Detect a latched RX overrun/BNA stall and, if present, reset+restart the RX
  * ring so the polling driver recovers instead of staying wedged. Cheap to call
  * every poll; returns true only when it actually performed a recovery. */

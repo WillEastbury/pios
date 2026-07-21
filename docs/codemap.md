@@ -66,10 +66,9 @@ pios/
 ## Memory Management
 
 ### `src/mmu.c` — MMU / Page Tables
-- **Role:** Identity-mapped VA=PA, L1 block entries for 1GB regions
-- **Regions:** Normal WB Cacheable for RAM, Device-nGnRnE for MMIO
+- **Role:** Identity-mapped VA=PA with low-RAM L2/L3 attribute splits
+- **Regions:** WB private/code RAM; NC FIFO/DMA/IPC/control RAM; Device-nGnRnE MMIO
 - **API:** `mmu_init()`, `dcache_clean_range()`, `dcache_invalidate_range()`
-- **Known issue:** L1[0] maps first 1GB as uncached (#64)
 
 ### `include/core_env.h` — Memory Map & Per-Core Allocation
 - **Role:** Defines physical memory layout, per-core RAM bases, bump allocator
@@ -123,7 +122,7 @@ pios/
 
 ### `src/macb.c` — Cadence MACB/GEM Ethernet Driver
 - **Role:** Gigabit Ethernet via RP1 southbridge, DMA descriptor rings
-- **Features:** PHY auto-negotiation, 16-byte DMA descriptors, TX/RX with cache coherency
+- **Features:** PHY auto-negotiation, 16-byte DMA descriptors, standalone RX ownership/recovery engine
 - **API:** `macb_init()`, `macb_send()`, `macb_recv()`, `macb_get_mac()`, `macb_link_up()`
 - **Interactions:** Called via `nic.c`, uses `pcie.c`/`rp1.c` for BAR access
 

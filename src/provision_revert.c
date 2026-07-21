@@ -28,6 +28,7 @@ extern const u8 provision_revert_payload_start[];
 extern const u8 provision_revert_payload_end[];
 
 u64 l1_table[512] ALIGNED(4096);
+u64 l2_table_boot[512] ALIGNED(4096);
 u64 shared_ttbr0;
 u64 shared_mair;
 u64 shared_tcr;

@@ -3075,6 +3075,88 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, "lease pool slots=");
         http_append_u64(out, &len, max, st.slots_total);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "rxholedump")) {
+#if !PIOS_HAS_GENET
+        http_append(out, &len, max,
+            "rxholedump unavailable: macb/GEM not active on this platform\n");
+#else
+        struct macb_hole_snapshot hs;
+        if (!macb_rx_hole_snapshot(&hs)) {
+            http_append(out, &len, max, "rxholedump none\n");
+        } else {
+            http_append(out, &len, max, "rxholedump seq=");
+            http_append_u64(out, &len, max, hs.sequence);
+            http_append(out, &len, max, " stuck=");
+            http_append_u64(out, &len, max, hs.stuck_idx);
+            http_append(out, &len, max, " RBQP=");
+            http_append_hex32(out, &len, max, hs.rbqp);
+            http_append(out, &len, max, " RBQPH=");
+            http_append_hex32(out, &len, max, hs.rbqph);
+            http_append(out, &len, max, " RSR=");
+            http_append_hex32(out, &len, max, hs.rsr);
+            http_append(out, &len, max, " NCR=");
+            http_append_hex32(out, &len, max, hs.ncr);
+            http_append(out, &len, max, " RBQP_STOP=");
+            http_append_hex32(out, &len, max, hs.rbqp_stopped);
+            http_append(out, &len, max, "\nmode DMACFG=");
+            http_append_hex32(out, &len, max, hs.dmacfg);
+            http_append(out, &len, max, " DCFG10=");
+            http_append_hex32(out, &len, max, hs.dcfg10);
+            http_append(out, &len, max, " RXBDCTRL=");
+            http_append_hex32(out, &len, max, hs.rxbdctrl);
+            http_append(out, &len, max, " prefetch_desc=");
+            http_append_u64(out, &len, max, hs.prefetch_descs);
+            http_append(out, &len, max, " trailing=");
+            http_append_u64(out, &len, max, hs.trailing_bytes);
+            http_append(out, &len, max, "\ncache line=");
+            http_append_hex32(out, &len, max, hs.cache_line);
+            http_append(out, &len, max, " flags=");
+            http_append_hex32(out, &len, max, hs.cache_probe_flags);
+            http_append(out, &len, max, "\nstuck idx=");
+            http_append_u64(out, &len, max, hs.stuck.idx);
+            http_append(out, &len, max, " expected=");
+            http_append_hex32(out, &len, max, hs.expected_addr);
+            http_append(out, &len, max, " words=");
+            http_append_hex32(out, &len, max, hs.stuck.addr);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, hs.stuck.ctrl);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, hs.stuck.addr_hi);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, hs.stuck.word3);
+            http_append(out, &len, max, "\nstopped words=");
+            http_append_hex32(out, &len, max, hs.stopped.addr);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, hs.stopped.ctrl);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, hs.stopped.addr_hi);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, hs.stopped.word3);
+            http_append(out, &len, max, "\nafter_ivac words=");
+            http_append_hex32(out, &len, max, hs.after_ivac.addr);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, hs.after_ivac.ctrl);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, hs.after_ivac.addr_hi);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, hs.after_ivac.word3);
+            http_append(out, &len, max, "\n");
+            for (u32 i = 0; i < hs.follow_count; i++) {
+                const struct macb_desc_snapshot *d = &hs.follow[i];
+                http_append(out, &len, max, "owned idx=");
+                http_append_u64(out, &len, max, d->idx);
+                http_append(out, &len, max, " words=");
+                http_append_hex32(out, &len, max, d->addr);
+                http_append(out, &len, max, "/");
+                http_append_hex32(out, &len, max, d->ctrl);
+                http_append(out, &len, max, "/");
+                http_append_hex32(out, &len, max, d->addr_hi);
+                http_append(out, &len, max, "/");
+                http_append_hex32(out, &len, max, d->word3);
+                http_append(out, &len, max, "\n");
+            }
+        }
+#endif
     } else if (http_streq(cmd, "macbdiag")) {
         /* P1 live wedge diagnosis: poll this while ramping load. If rx_owned
          * climbs to 32 the RX ring is full (overrun); if rx_recv/tx_send stop

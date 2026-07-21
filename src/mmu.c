@@ -29,6 +29,7 @@
 
 /* Page tables — 4KB aligned (l1_table used by start.S for early MMU) */
 u64 l1_table[512] ALIGNED(4096);
+u64 l2_table_boot[512] ALIGNED(4096);  /* start.S low-1GB split; never edited live */
 static u64 l1_table_cached[512] ALIGNED(4096); /* BBM-safe target: fresh root for cache enable */
 static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
 static u64 l3_block0[512] ALIGNED(4096);     /* block 0 (0-2MB) split to 4KB pages */

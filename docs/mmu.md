@@ -47,7 +47,8 @@ Do not approximate attributes. If a mapping layer cannot encode the correct attr
 
 ### L2 Table (first 1GB, 512 × 2MB blocks)
 
-The first 1GB is split by physical region. The live kernel table uses:
+The first 1GB is split by physical region from the first MMU enable. The
+boot-only L2 table and the live runtime table agree on DMA/FIFO/IPC attributes:
 
 - block 0 (`0x00000000-0x001FFFFF`) as an L3 table: kernel code/data pages are WB, low/BSS/page-table metadata remains NC.
 - blocks 1-3 (`0x00200000-0x007FFFFF`) as Normal NC for kernel `.bss`, stacks, scheduler/process metadata, page tables, and boot-critical control data.
