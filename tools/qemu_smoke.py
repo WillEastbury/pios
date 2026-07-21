@@ -108,6 +108,36 @@ class Smoke:
         except Exception as e:
             self.check("status 200 + version", False, str(e))
 
+        # hosted PicoScript WebIDE portal + PIOS bridge
+        try:
+            code, body = get("/picoscript", timeout=30)
+            self.check("picoscript WebIDE portal served",
+                       code == 200 and "PicoScript" in body and "PiosIdeBridge" in body,
+                       f"{len(body)} bytes")
+        except Exception as e:
+            self.check("picoscript WebIDE portal served", False, str(e))
+
+        # /picoscript/config JSON (endpoint prefixes + current hook table version)
+        try:
+            code, body = get("/picoscript/config")
+            self.check("picoscript config JSON",
+                       code == 200 and '"capsule_prefix":"/api/capsule"' in body
+                       and "0x968CCEF1" in body,
+                       body.strip()[:80])
+        except Exception as e:
+            self.check("picoscript config JSON", False, str(e))
+
+        # PicoWAL workspace page (opened from the portal's PicoWAL tab)
+        try:
+            code, body = get("/picoscript/picowal.html")
+            self.check("picoscript PicoWAL workspace served",
+                       code == 200 and "PicoWAL Workspace" in body
+                       and "/api/walfs" in body,
+                       f"{len(body)} bytes")
+        except Exception as e:
+            self.check("picoscript PicoWAL workspace served", False, str(e))
+
+
         # selftest battery
         try:
             out = term("selftest", timeout=20)

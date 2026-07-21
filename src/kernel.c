@@ -83,7 +83,8 @@
 #include "picovm.h"
 #include "pixe_request.h"
 #include "pixe_host.h"
-#include "picoscript_playground_asset.h"
+#include "ide_assets.h"
+#include "pico_hooks.h"
 #include "keystore.h"
 #include "tls.h"
 #include "brotli.h"
@@ -548,7 +549,7 @@ static void admin_services_listen(void);
 static void admin_services_poll(void);
 static void http_log_event(const char *event, u32 a, u32 b);
 static u32 http_build_no_content_response(char *out, u32 max);
-static u32 http_build_picoscript_response(char *out, u32 max);
+static u32 http_build_picoscript_response(char *out, u32 max, const u8 *req, u32 req_len);
 static u32 http_build_static_file_response(char *out, u32 max, const u8 *req, u32 req_len);
 static u32 http_build_pcap_response(char *out, u32 max, const u8 *req, u32 req_len);
 static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, u32 req_len);
@@ -1251,7 +1252,12 @@ static u32 http_route_id(const u8 *req, u32 len)
         return HTTP_ROUTE_STATIC;
     if (http_request_path_is(req, len, "/picoscript") ||
         http_request_path_is(req, len, "/picoscript/") ||
-        http_request_path_is(req, len, "/picoscript/playground.html"))
+        http_request_path_is(req, len, "/picoscript/index.html") ||
+        http_request_path_is(req, len, "/picoscript/playground.html") ||
+        http_request_path_is(req, len, "/picoscript/picowal.html") ||
+        http_request_path_is(req, len, "/picoscript/config") ||
+        http_request_path_is(req, len, "/picoscript/pico_hooks.js") ||
+        http_request_path_is(req, len, "/picoscript/baremetal-binary.js"))
         return HTTP_ROUTE_PICOSCRIPT;
     if (http_request_path_is(req, len, "/favicon.ico") ||
         http_request_path_is(req, len, "/picoscript/favicon.ico"))
@@ -8325,7 +8331,7 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
         return len;
     }
     if (route == HTTP_ROUTE_PICOSCRIPT) {
-        len = http_build_picoscript_response(out, max);
+        len = http_build_picoscript_response(out, max, req, req_len);
         http_diag.build_len = len;
         http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
         return len;
@@ -8587,15 +8593,45 @@ static u32 http_build_no_content_response(char *out, u32 max)
     return len;
 }
 
-static u32 http_build_picoscript_response(char *out, u32 max)
+static u32 http_build_picoscript_config_response(char *out, u32 max)
 {
     u32 len = 0;
-    http_static_body = picoscript_playground_html;
-    http_static_len = picoscript_playground_html_len;
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+    http_append(out, &len, max,
+        "{\"ok\":true,"
+        "\"ide_prefix\":\"/picoscript/\","
+        "\"capsule_prefix\":\"/api/capsule\","
+        "\"walfs_prefix\":\"/api/walfs\","
+        "\"terminal_prefix\":\"/api/terminal\","
+        "\"picosts_enabled\":false,"
+        "\"build\":\"");
+    http_append(out, &len, max, PIOS_BUILD_STAMP);
+    http_append(out, &len, max, "\",\"version\":\"");
+    http_append(out, &len, max, PIOS_VERSION);
+    http_append(out, &len, max, "\",\"hook_table_version\":\"0x");
+    http_append_hex32(out, &len, max, (u32)PV_HOOK_TABLE_VERSION);
+    http_append(out, &len, max, "\"}\n");
+    return len;
+}
+
+static u32 http_build_picoscript_asset_response(char *out, u32 max,
+                                                const u8 *body, u32 body_len,
+                                                const char *content_type)
+{
+    u32 len = 0;
+    http_static_body = body;
+    http_static_len = body_len;
     http_static_off = 0;
     http_append(out, &len, max,
         "HTTP/1.0 200 OK\r\n"
-        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Type: ");
+    http_append(out, &len, max, content_type);
+    http_append(out, &len, max,
+        "\r\n"
         "Cache-Control: no-store\r\n"
         "Content-Length: ");
     http_append_u64(out, &len, max, http_static_len);
@@ -8603,6 +8639,24 @@ static u32 http_build_picoscript_response(char *out, u32 max)
         "\r\n"
         "Connection: close\r\n\r\n");
     return len;
+}
+
+static u32 http_build_picoscript_response(char *out, u32 max, const u8 *req, u32 req_len)
+{
+    if (http_request_path_is(req, req_len, "/picoscript/config"))
+        return http_build_picoscript_config_response(out, max);
+    if (http_request_path_is(req, req_len, "/picoscript/picowal.html"))
+        return http_build_picoscript_asset_response(out, max,
+            IDE_PICOWAL_HTML, IDE_PICOWAL_HTML_LEN, "text/html; charset=utf-8");
+    if (http_request_path_is(req, req_len, "/picoscript/pico_hooks.js"))
+        return http_build_picoscript_asset_response(out, max,
+            IDE_PICO_HOOKS_JS, IDE_PICO_HOOKS_JS_LEN, "application/javascript; charset=utf-8");
+    if (http_request_path_is(req, req_len, "/picoscript/baremetal-binary.js"))
+        return http_build_picoscript_asset_response(out, max,
+            IDE_BAREMETAL_BINARY_JS, IDE_BAREMETAL_BINARY_JS_LEN, "application/javascript; charset=utf-8");
+    /* Portal (root/index.html/playground.html and any other /picoscript request). */
+    return http_build_picoscript_asset_response(out, max,
+        IDE_HTML, IDE_HTML_LEN, "text/html; charset=utf-8");
 }
 
 static bool http_static_path_from_req(const u8 *req, u32 req_len, char *out, u32 out_max)

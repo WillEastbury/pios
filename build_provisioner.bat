@@ -41,6 +41,19 @@ if errorlevel 1 exit /b 1
 "%OC%" -O binary real_kernel.elf real_kernel.img
 if errorlevel 1 exit /b 1
 
+REM Hard stage2 payload-size guard: real_kernel.img is the embedded stage2
+REM payload (NOT the provisioner FAT wrapper kernel8.img below) and must fit
+REM the raw boot slot zone (PIOS_STAGE2_ZONE_BYTES in include/walfs.h =
+REM 0x37FE00). Fail the build if the real payload overflows the zone.
+set PIOS_STAGE2_ZONE_BYTES=3669504
+for %%f in (real_kernel.img) do set RKIMG_SIZE=%%~zf
+if %RKIMG_SIZE% GTR %PIOS_STAGE2_ZONE_BYTES% (
+    echo ERROR: real_kernel.img %RKIMG_SIZE% bytes exceeds PIOS_STAGE2_ZONE_BYTES %PIOS_STAGE2_ZONE_BYTES%
+    del real_kernel.img
+    exit /b 1
+)
+echo real_kernel.img %RKIMG_SIZE% bytes within PIOS_STAGE2_ZONE_BYTES %PIOS_STAGE2_ZONE_BYTES%
+
 echo Compiling one-off provisioner...
 REM The provisioner is a MINIMAL binary that does raw SD writes via sd.c before
 REM jumping to the embedded kernel. It must boot Non-Cacheable (low 1GB NC) so

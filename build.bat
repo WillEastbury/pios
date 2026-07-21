@@ -61,4 +61,16 @@ if errorlevel 1 (
 )
 
 for %%f in (kernel8.img) do echo kernel8.img size: %%~zf bytes
+
+REM Hard stage2 payload-size guard: kernel8.img is the direct-boot stage2
+REM payload and must fit the raw boot slot zone (PIOS_STAGE2_ZONE_BYTES in
+REM include/walfs.h = 0x37FE00). Fail the build if it overflows the zone.
+set PIOS_STAGE2_ZONE_BYTES=3669504
+for %%f in (kernel8.img) do set KIMG_SIZE=%%~zf
+if %KIMG_SIZE% GTR %PIOS_STAGE2_ZONE_BYTES% (
+    echo ERROR: kernel8.img %KIMG_SIZE% bytes exceeds PIOS_STAGE2_ZONE_BYTES %PIOS_STAGE2_ZONE_BYTES%
+    del kernel8.img
+    exit /b 1
+)
+echo kernel8.img %KIMG_SIZE% bytes within PIOS_STAGE2_ZONE_BYTES %PIOS_STAGE2_ZONE_BYTES%
 echo BUILD COMPLETE

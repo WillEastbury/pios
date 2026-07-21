@@ -18,8 +18,12 @@
 #define PV_NUM_REGS   16
 #define PV_MAX_CARDS  2048      /* open-addressed; must be a power of two */
 #define PV_MAX_CALL   256
-#define PV_MAX_OUT    8192
+#ifndef PV_MAX_OUT
+#define PV_MAX_OUT    8192      /* response/output buffer; override for large bodies */
+#endif
+#ifndef PV_MAX_SPANS
 #define PV_MAX_SPANS  1024      /* span table: handle = 1-based index, 0 = null */
+#endif
 #define PV_MAX_WRITERS 16       /* Utf8Writer / Json / Xml handles */
 #define PV_MAX_READERS 16       /* Utf8Reader handles */
 #ifndef PV_MAX_MAPS
@@ -32,6 +36,37 @@
 #define PV_MAP_POOL   8192      /* byte pool for map key/value spans */
 #endif
 #define PV_JSON_DEPTH  32       /* nested object/array depth per writer */
+#ifndef PV_MAX_DESCRIPTORS
+#define PV_MAX_DESCRIPTORS 64   /* Descriptor.* table: handle = 1-based index, 0 = null */
+#endif
+#ifndef PV_MAX_LEASES
+#define PV_MAX_LEASES 64        /* Lease.* table: handle = 1-based index, 0 = null */
+#endif
+#ifndef PV_MAX_FIFOS
+#define PV_MAX_FIFOS  16        /* Fifo.* channel table: handle = 1-based index, 0 = null */
+#endif
+#ifndef PV_FIFO_DEPTH
+#define PV_FIFO_DEPTH 16        /* max buffered messages per Fifo channel */
+#endif
+#ifndef PV_MAX_LOGS
+#define PV_MAX_LOGS   128       /* Log.* table: handle = 1-based sequence id, 0 = null */
+#endif
+#ifndef PV_MAX_ERR_HANDLERS
+#define PV_MAX_ERR_HANDLERS 32  /* Error.* handler stack depth (nested try/except) */
+#endif
+#ifndef PV_MAX_HTML_NODES
+#define PV_MAX_HTML_NODES 64    /* Html.* DOM node table: handle = 1-based index, 0 = null */
+#endif
+#ifndef PV_HTML_MAX_ATTRS
+#define PV_HTML_MAX_ATTRS 8     /* max attributes per Html.* node */
+#endif
+#ifndef PV_HTML_MAX_CHILDREN
+#define PV_HTML_MAX_CHILDREN 16 /* max children per Html.* node */
+#endif
+#ifndef PV_HTML_MAX_DEPTH
+#define PV_HTML_MAX_DEPTH 32    /* Serialize/QuerySelector/ParseTree tree-walk bound --
+                                 * matches picoscript_vm.py's HTML_MAX_DEPTH exactly */
+#endif
 
 /* ---- 16 core opcodes (bits [31:28]) ---------------------------------- */
 enum {
@@ -81,15 +116,26 @@ enum {
     PV_CAP_ENV     = 1 << 8,   /* Environment.*, Locale.* */
     PV_CAP_CRYPTO  = 1 << 9,   /* Crypto.Encrypt/Decrypt (AES) */
     PV_CAP_GPIO    = 1 << 10,  /* Gpio.* (device pins; OS/emulator-backed) */
-    PV_CAP_CAPSULE = 1 << 11   /* Pack/Card/Fifo (capsule store + intra-capsule IPC) */
+    PV_CAP_CAPSULE = 1 << 11,  /* Pack/Card/Fifo (capsule store + intra-capsule IPC) */
+    PV_CAP_DEVICE  = 1 << 12,  /* Device.* (enumerate/open a streaming device) */
+    PV_CAP_DMA     = 1 << 13,  /* Stream.* (DMA-ring buffers) */
+    PV_CAP_EVENT   = 1 << 14,  /* Event.* (reactive event queue; UI/async dispatch) */
+    PV_CAP_UI      = 1 << 15   /* Ui.* (retained scene tree / remote windowing) */
 };
-#define PV_CAP_ALL  0xFFFu     /* default grant: every binding (host restricts to gate) */
+#define PV_CAP_ALL  0xFFFFu    /* default grant: every binding (host restricts to gate) */
 
 typedef struct pv_ctx pv_ctx;
 
 /* Host-hook callback for OP_NOOP host hooks (Random/Queue/Storage/etc.).
  * `hook` is the low byte of imm16; operands are register indices + imm16. */
 typedef void (*pv_host_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16);
+
+/* App-installable storage backend for Storage and Search card-pack hooks.
+ * Return non-zero if the hook was handled (else the runtime treats it as a
+ * no-op returning 0). A native binary sets pv_storage_hook to compile in its
+ * own pack/card store without modifying the runtime. */
+typedef int (*pv_storage_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
+extern pv_storage_fn pv_storage_hook;
 
 struct pv_ctx {
     int32_t   regs[PV_NUM_REGS];
@@ -107,6 +153,27 @@ struct pv_ctx {
     int       http_status;     /* -1 until Net.Status */
     int       http_type;       /* content-type marker value, 0 until Net.Type */
 
+    /* Custom response headers (Resp.Header/Net.Header), raw "Name: Value\r\n"
+     * bytes, appended in call order. The default pool-mode HTTP framing
+     * (pv_send_http_response in picovm_pool.c) always emits Content-Type/
+     * Content-Length/Connection itself; this buffer carries anything beyond
+     * that (e.g. CORS, custom Content-Type overrides). Was a documented
+     * no-op until host/picowal's app_router.eng needed real CORS headers to
+     * let the WebIDE (a different origin) call this server. */
+#ifndef PV_MAX_OUT_HEADERS
+#define PV_MAX_OUT_HEADERS 1024
+#endif
+    char      out_headers[PV_MAX_OUT_HEADERS];
+    int       out_headers_len;
+
+    /* HTTP request context — populated by the pool worker (pv_http_parse_request)
+     * before each handler runs, so PicoScript Req.* hooks resolve natively.
+     * Pointers reference the worker's recv buffer (valid for the handler's life). */
+    const char *req_method;  int req_method_len;
+    const char *req_path;    int req_path_len;
+    const char *req_headers; int req_headers_len;   /* raw "name: value\r\n" block */
+    const char *req_body;    int req_body_len;
+
     int64_t   retval;
     uint64_t  rng_state;
 
@@ -118,10 +185,48 @@ struct pv_ctx {
     int       fault_pc;        /* bytecode PC where fault was recorded; 0 until fault */
     int       fault_detail;    /* fault-specific detail: opcode, jump target, hook id, or 0 */
     int       cur_pc;          /* current bytecode PC, retained so host faults can report it */
+
+    /* Error.*: real try/except -- see docs/EXCEPTION_ENGINE.md. A handler
+     * *stack* (not a single slot), mirroring picoscript_vm.py's
+     * _error_handler_stack / vm/picovm.js's _errState.handlerStack exactly,
+     * so nested try/except is correct. pending_jump/pending_jump_set let a
+     * host hook (Error.Raise/Resume) or a caught fault (pv_set_fault)
+     * redirect the interpreter's *local* `pc` variable in pv_vm_run's main
+     * loop -- unlike Python/JS where the host can mutate `vm.pc` directly,
+     * the C loop's pc is a local, so this is the channel back to it. */
+    int32_t   err_stack[PV_MAX_ERR_HANDLERS];
+    int       err_sp;
+    /* Parallel to err_stack: call_sp recorded at the moment each handler was
+     * pushed (Error.SetHandler). A Raise (or a genuine fault caught via
+     * pv_set_fault) truncates call_stack back to err_call_depth[err_sp-1]
+     * before redirecting pc -- otherwise a raise inside a called subroutine
+     * leaves that subroutine's return address on call_stack, and a later
+     * RETURN pops it and resumes skipped try-body code. Mirrors the
+     * identical fix in picoscript_vm.py's _error_handler_call_depth and
+     * vm/picovm.js's _errState.callDepth. */
+    int       err_call_depth[PV_MAX_ERR_HANDLERS];
+    int32_t   err_code;
+    int32_t   err_detail;
+    int32_t   err_resume_pc;
+    int32_t   pending_jump;
+    uint8_t   pending_jump_set;
+    /* Native-C-transpile (lower_to_c) try/except only: emitted C has no
+     * bytecode PC to redirect (it's real goto/labels within one C function),
+     * so a Raise with no in-function handler sets this flag and returns
+     * immediately instead; every emitted subroutine call site checks it
+     * right after the call and either gotos its own in-function handler (if
+     * any) or propagates by returning too -- unwinding the native C call
+     * stack one frame at a time until a handler is found or the top-level
+     * caller sees it uncaught. err_code/err_detail above double as the
+     * raised value here (same Error.Code()/Detail() read-back semantics as
+     * the bytecode VMs). See docs/EXCEPTION_ENGINE.md. */
+    int32_t   raise_active;
+
     uint32_t  caps;            /* granted binding capabilities (PV_CAP_*); default PV_CAP_ALL */
     int       no_alloc;        /* when set, arena allocation in a hook faults (INV-5 hot path) */
     int       host_status;     /* INV-18: typed status of the last fallible hook (0 = OK) */
     uint32_t  const_floor;     /* INV-9: lowest literal const-pool address; [floor,0x8000) is RO */
+    uint8_t   const_used[4096];/* bitset for initialized literal const bytes below 0x8000 */
 
     /* simple in-VM queues for the default host (Queue.*) */
     int32_t   queues[8][64];
@@ -187,6 +292,69 @@ struct pv_ctx {
     uint8_t   bso1_key[64];                 /* BSO1 HMAC-SHA256 signing key (Binary.SetKey) */
     int       bso1_key_len;
 
+    int       active_pack;                  /* Pack.Use: a lightweight "active pack" selector */
+    uint32_t  thread_yield_count;           /* Thread.YieldCounted: deterministic yield counter */
+
+    /* Descriptor.*: a pure buffer descriptor (ptr/len/flags), no host state --
+     * a real, deterministic primitive, distinct from Span.* (the arena-
+     * string-library view type). 1-based handle; 0 = null. */
+    uint32_t  desc_ptr[PV_MAX_DESCRIPTORS];
+    int32_t   desc_len[PV_MAX_DESCRIPTORS];
+    uint32_t  desc_flags[PV_MAX_DESCRIPTORS];
+    uint8_t   desc_used[PV_MAX_DESCRIPTORS];
+    int       desc_count;
+
+    /* Lease.*: a generic capability/ownership token over a span + type hint.
+     * Pure in-VM bookkeeping, distinct from the stream-frame lease concept
+     * used internally by Stream.Next (a different, unrelated mechanism). */
+    int32_t   lease_span[PV_MAX_LEASES];
+    int32_t   lease_type[PV_MAX_LEASES];
+    uint8_t   lease_valid[PV_MAX_LEASES];
+    uint8_t   lease_used[PV_MAX_LEASES];
+    int       lease_count;
+
+    /* Fifo.*: independent named byte-channel FIFOs (Open returns a fresh
+     * channel handle). Distinct from Queue.* (fixed 8-channel int FIFO). */
+    int32_t   fifo_msg[PV_MAX_FIFOS][PV_FIFO_DEPTH];   /* span handles, FIFO order */
+    int       fifo_head[PV_MAX_FIFOS];
+    int       fifo_tail[PV_MAX_FIFOS];
+    int       fifo_depth[PV_MAX_FIFOS];
+    uint8_t   fifo_used[PV_MAX_FIFOS];
+    int       fifo_count;
+
+    /* Html.*: a real, pure, deterministic DOM node table (no host state
+     * needed -- see docs/NAMESPACE_STATUS.md's "HTML DOM + HTTP parsing"
+     * section). 1-based handle; 0 = null. A node is a *text* node iff its
+     * attrs contain reserved key "#text" (attr_key stores its span, and the
+     * matching attr_val is the text content span) -- CreateNode+SetAttribute
+     * alone can build one, and ParseTree's internal builder uses the exact
+     * same convention. An empty tag (0) with no "#text" attr is a
+     * transparent fragment/wrapper (ParseTree's synthetic multi-root
+     * wrapper, also usable directly by scripts). Bounded (fixed-size),
+     * consistent with this embedded runtime's other handle tables. */
+    int32_t   html_tag[PV_MAX_HTML_NODES];                          /* span handle */
+    int32_t   html_attr_key[PV_MAX_HTML_NODES][PV_HTML_MAX_ATTRS];   /* span handles */
+    int32_t   html_attr_val[PV_MAX_HTML_NODES][PV_HTML_MAX_ATTRS];   /* span handles */
+    uint8_t   html_attr_count[PV_MAX_HTML_NODES];
+    int32_t   html_child[PV_MAX_HTML_NODES][PV_HTML_MAX_CHILDREN];   /* node handles */
+    uint8_t   html_child_count[PV_MAX_HTML_NODES];
+    uint8_t   html_used[PV_MAX_HTML_NODES];
+    int       html_count;
+
+    /* Log.*: deterministic, script-visible tracing/audit log (see
+     * docs/LOGGING.md) -- an append-only table of {level, span}, keyed by a
+     * monotonic sequence id returned by Log.Write. Not timestamped
+     * (wall-clock time is host-injected/non-deterministic by this VM's own
+     * established convention). Fixed-size (PV_MAX_LOGS), consistent with
+     * this embedded runtime's other handle tables (Map/Descriptor/Lease/
+     * Fifo above) -- a bounded, deterministic difference from Python/JS's
+     * unbounded dict-backed version, not a behavioral divergence at any
+     * realistic scale. */
+    int32_t   log_level[PV_MAX_LOGS];
+    int32_t   log_span[PV_MAX_LOGS];
+    uint8_t   log_used[PV_MAX_LOGS];
+    int       log_count;
+
     pv_host_fn host;
 };
 
@@ -196,9 +364,26 @@ static inline int32_t pv_mem_get(pv_ctx *ctx, uint32_t addr)
 {
     return ctx->mem_size ? (int32_t)ctx->mem[addr % (uint32_t)ctx->mem_size] : 0;
 }
+static inline int pv_const_used(pv_ctx *ctx, uint32_t addr)
+{
+    return addr < 0x8000u ? (ctx->const_used[addr >> 3] & (uint8_t)(1u << (addr & 7))) != 0 : 0;
+}
+static inline void pv_const_mark(pv_ctx *ctx, uint32_t addr)
+{
+    if (addr < 0x8000u) ctx->const_used[addr >> 3] |= (uint8_t)(1u << (addr & 7));
+}
 static inline void pv_mem_set(pv_ctx *ctx, uint32_t addr, int32_t val)
 {
-    if (ctx->mem_size) ctx->mem[addr % (uint32_t)ctx->mem_size] = (uint8_t)(val & 0xFF);
+    if (!ctx->mem_size) return;
+    addr %= (uint32_t)ctx->mem_size;
+    if (addr >= ctx->const_floor && addr < 0x8000u) {
+        ctx->fault = PV_FAULT_CONST_WRITE;
+        ctx->fault_pc = ctx->cur_pc;
+        ctx->fault_detail = (int)addr;
+        ctx->halted = 1;
+        return;
+    }
+    ctx->mem[addr] = (uint8_t)(val & 0xFF);
 }
 static inline void pv_io_write(pv_ctx *ctx, int32_t b)
 {
@@ -240,6 +425,10 @@ int64_t pv_host(pv_ctx *ctx, const char *ns, const char *method, int64_t a, int6
  * Template/Span/Io) as first-class native calls without the bytecode VM. */
 int64_t pv_host2(pv_ctx *ctx, int hook, int64_t a, int64_t b);
 int64_t pv_dsp(pv_ctx *ctx, int subop, int64_t a, int64_t b);
+
+/* Value-kind introspection for `key` in the currently active map (see
+ * picovm.c for the full note): 0=int/bool, 1=string/span, 2=null, -1=absent. */
+int pv_map_value_kind(pv_ctx *ctx, int key_span_handle);
 
 /* Dot8: signed int8 span dot product, HW-accelerated where available
  * (AArch64 NEON SDOT / Cortex-M33 SMLAD / portable scalar). pv_dot8_setlen
