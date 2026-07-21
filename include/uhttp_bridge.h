@@ -133,7 +133,7 @@ static inline struct uhttp_bridge *uhttp_bridge_at(u32 idx)
 #ifdef PIOS_USER_EL0
     return (struct uhttp_bridge *)(usize)(UHTTP_BRIDGE_ALIAS_BASE + (idx * UHTTP_BRIDGE_STRIDE));
 #else
-    return (struct uhttp_bridge *)(usize)(0x04D00000UL + (idx * UHTTP_BRIDGE_STRIDE));
+    return (struct uhttp_bridge *)(usize)(PIOS_IPC_SHM_BASE + (idx * UHTTP_BRIDGE_STRIDE));
 #endif
 }
 
@@ -147,3 +147,4 @@ void uhttp_bridge_state(i32 *listen_conn, u32 *state, u32 *req_seq, u32 *resp_se
                         u32 *reqs, u32 *magic, u32 *httpd_pid);
 void uhttp_bridge_state_idx(u32 idx, i32 *listen_conn, u32 *state, u32 *req_seq, u32 *resp_seq,
                             u32 *reqs, u32 *magic, u32 *httpd_pid);
+u32 uhttp_bridge_target_core(u32 idx);

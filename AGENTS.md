@@ -63,6 +63,10 @@ could not advance past the missing ownership publication.
   dirty bytes, moved the auxiliary GEM descriptor into DMA_NET NC, gave lease
   records 64-byte stride, matched stage-2 table-walk cacheability to each platform,
   and serialized named queue/topic/pipe registries across user cores.
+- QEMU user TTBRs now use distinct low/physical/high L2 tables, eliminating the
+  old cross-L1 aliases and allowing both embedded EL0 HTTP workers to launch.
+  Process snapshots show `httpd-vm-el0` on core 2 and `httpd-vm1-el0` on core 3;
+  the workbench also falls back to each bridge's configured target core.
 
 ### Validation and deployment state
 - [x] QEMU smoke **11/11**.

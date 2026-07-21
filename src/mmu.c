@@ -35,11 +35,37 @@ static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
 static u64 l3_block0[512] ALIGNED(4096);     /* block 0 (0-2MB) split to 4KB pages */
 
 /* Per-process user tables for user cores. Process slots are 1MiB-misaligned,
- * so each 2MiB slot can straddle two L2 entries and needs two L3 tables. */
+ * so each 2MiB slot can straddle two L2 entries and needs two L3 tables.
+ *
+ * A user table can touch up to three distinct 1 GiB L1 regions, and each region
+ * gets its OWN L2 table so a mapping installed for one region can never alias
+ * into another. (The previous single user_l2_low was shared by L1[0], the
+ * process VA and the IPC alias at once, which manufactured high-VA aliases and
+ * — because QEMU's slots/FIFO/IPC sit above 1 GiB — indexed the 512-entry table
+ * out of bounds so QEMU user tables never built.)
+ *   user_l2_low  -> L1[0]                          low identity 0-1 GiB
+ *   user_l2_phys -> L1[CORE0_RAM_BASE / 1 GiB]     kernel/core/FIFO/IPC RAM
+ *                                                  (== L1[0] on Pi, L1[1] QEMU)
+ *   user_l2_high -> L1[0x2001000000 / 1 GiB] (128) EL0 linked image + IPC alias
+ * On Pi the phys region IS L1[0], so user_l2_low backs it and user_l2_phys stays
+ * unused (see user_l2_install / user_l2_lookup), preserving the exact Pi L1[0]
+ * table used today. */
 static u64 user_l1[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
 static u64 user_l2_low[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
+static u64 user_l2_phys[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
+static u64 user_l2_high[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
 static u64 user_l3_proc[3][MAX_PROCS_PER_CORE][2][512] ALIGNED(4096);
 static u64 user_l3_ipc[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
+
+/* 1 GiB L1 region indices backed by a process's own fine-grained L2 tables.
+ * All are compile-time constants folded from the platform memory map. */
+#define USER_L1_LOW_INDEX   0u
+#define USER_L1_PHYS_INDEX  ((u32)(CORE0_RAM_BASE / L1_BLOCK_SIZE))
+#define USER_HIGH_LINK_BASE 0x2001000000ULL
+#define USER_HIGH_IPC_ALIAS 0x2003000000ULL
+#define USER_L1_HIGH_INDEX  ((u32)(USER_HIGH_LINK_BASE / L1_BLOCK_SIZE))
+_Static_assert((USER_HIGH_IPC_ALIAS / L1_BLOCK_SIZE) == (USER_HIGH_LINK_BASE / L1_BLOCK_SIZE),
+               "EL0 linked base and IPC alias must share one high L1 region");
 struct mmu_valid_slot {
     volatile u32 v;
     u32 _pad[15];
@@ -115,6 +141,21 @@ static inline u64 ram_block_2m(u64 addr) {
            PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
 }
 
+/* Helper: 2MB WB L2 block that stays EL1-EXECUTABLE (PXN clear). The QEMU
+ * kernel image/scheduler window must remain fetchable at EL1 while a user
+ * TTBR0 is active, so the scheduler can execute its dispatch tail, ctx_switch()
+ * and proc_el0_trampoline() (all in kernel .text at 0x40080000) after
+ * mmu_switch_to_user(). This mirrors the kernel's own coarse L1[1] block
+ * (start.S installs 0x709 = WB, AP_RW_EL1, PXN=0; mmu_enable_caching() copies
+ * L1 entries 1..511 verbatim into l1_table_cached, so the live kernel view of
+ * this PA range is WB + EL1-executable). AP_RW_EL1 + UXN keep EL0 out entirely
+ * (no access, no execute); cacheability is WB so the same PA carries identical
+ * memory attributes under both the kernel and user TTBRs. */
+static inline u64 ram_block_2m_exec(u64 addr) {
+    return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
+           PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL1 | PTE_UXN;
+}
+
 /* Helper: create a 2MB L2 block entry for Normal Non-Cacheable RAM.
  * Bit pattern (addr | 0x705) is identical to the NC block start.S installs
  * at l1_table[0], so NC regions keep their exact current attributes (the
@@ -173,10 +214,52 @@ static inline u32 user_core_index(u32 core) {
     return core - 1;
 }
 
-static inline void map_user_low_2m(u64 *l2, u32 idx, u64 pa, u64 attrs)
+/* Return the per-slot L2 table that backs 1 GiB L1 region `l1idx`, or NULL if
+ * that region is not one a user table fine-grains (device windows / unused RAM).
+ * Install form: also writes the L1 table descriptor pointing at the L2 table.
+ * On Pi USER_L1_PHYS_INDEX == USER_L1_LOW_INDEX, so the low branch catches it
+ * and the phys region resolves to user_l2_low, exactly as before. */
+static u64 *user_l2_install(u32 uc, u32 slot, u64 *l1, u32 l1idx)
 {
-    if (idx < 512)
-        l2[idx] = (pa & ~(L2_BLOCK_SIZE - 1)) | attrs;
+    u64 *l2;
+    if (l1idx == USER_L1_LOW_INDEX)
+        l2 = user_l2_low[uc][slot];
+    else if (l1idx == USER_L1_PHYS_INDEX)
+        l2 = user_l2_phys[uc][slot];
+    else if (l1idx == USER_L1_HIGH_INDEX)
+        l2 = user_l2_high[uc][slot];
+    else
+        return 0;
+    if (l1idx < 512)
+        l1[l1idx] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
+    return l2;
+}
+
+/* Lookup form (no L1 write): pick the L2 table a queried VA's L1 region uses. */
+static u64 *user_l2_lookup(u32 uc, u32 slot, u32 l1idx)
+{
+    if (l1idx == USER_L1_LOW_INDEX)
+        return user_l2_low[uc][slot];
+    if (l1idx == USER_L1_PHYS_INDEX)
+        return user_l2_phys[uc][slot];
+    if (l1idx == USER_L1_HIGH_INDEX)
+        return user_l2_high[uc][slot];
+    return 0;
+}
+
+/* Map a 2 MiB identity block (VA == PA) for `pa` into whichever per-slot L2
+ * table backs pa's 1 GiB L1 region, installing the L1 descriptor. Fails closed
+ * if pa's region is not user-fine-grained. Indexing is relative to the region
+ * base, so it is correct whether the block sits below or above 1 GiB. */
+static bool map_user_identity_2m(u32 uc, u32 slot, u64 *l1, u64 pa, u64 attrs)
+{
+    u32 l1idx = (u32)(pa / L1_BLOCK_SIZE);
+    u64 *l2 = user_l2_install(uc, slot, l1, l1idx);
+    if (!l2)
+        return false;
+    u32 idx = (u32)((pa % L1_BLOCK_SIZE) / L2_BLOCK_SIZE);
+    l2[idx] = (pa & ~(L2_BLOCK_SIZE - 1)) | attrs;
+    return true;
 }
 
 static inline u64 user_ram_attrs(void)
@@ -216,6 +299,35 @@ static void map_user_kernel_low(u64 *l2)
          * through one cacheability that the kernel TTBR later reads through the
          * other (the WB/NC alias that previously broke the multicore wake ring). */
         l2[b] = l2_table_low[b] ? l2_table_low[b] : ram_block_2m_nc(pa);
+    }
+}
+
+/* QEMU: the kernel image, BSS, per-core scheduler stacks and every global
+ * scheduler object live in [region_base, CORE0_RAM_BASE) inside L1[1], not L1[0]
+ * (the QEMU kernel links at 0x40080000). Map that whole window privileged WB
+ * and EL1-EXECUTABLE (EL1 RW+X, EL0 no access, UXN) so the scheduler can fetch
+ * and run its dispatch tail + ctx_switch + proc_el0_trampoline on its own kernel
+ * stack while TTBR0 points at this user table -- the same WB, EL1-executable
+ * attributes as the kernel's coarse L1[1] block (start.S 0x709, PXN clear), just
+ * at 2 MiB granularity. Using a PXN block here instead faults the very first
+ * instruction fetch after mmu_switch_to_user(), so the process is never entered
+ * (el0_enter_count stays 0) and the core spins in an EL1 instruction-abort loop.
+ * On Pi the phys region IS L1[0] and is already covered verbatim by
+ * map_user_kernel_low(), so USER_L1_PHYS_INDEX == USER_L1_LOW_INDEX and this is
+ * a no-op there (Pi L1[0] table unchanged). */
+static void map_user_kernel_phys(u32 uc, u32 slot, u64 *l1)
+{
+    u32 l1idx = USER_L1_PHYS_INDEX;
+    if (l1idx == USER_L1_LOW_INDEX)
+        return;
+    u64 region_base = (u64)l1idx * L1_BLOCK_SIZE;
+    u64 *l2 = user_l2_install(uc, slot, l1, l1idx);
+    if (!l2)
+        return;
+    for (u64 pa = region_base; pa < CORE0_RAM_BASE; pa += L2_BLOCK_SIZE) {
+        u32 idx = (u32)((pa - region_base) / L2_BLOCK_SIZE);
+        if (idx < 512)
+            l2[idx] = ram_block_2m_exec(pa);
     }
 }
 
@@ -260,39 +372,24 @@ static inline u64 user_page_el0_rw_xn_attrs(void)
            PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN | PTE_NG;
 }
 
-static inline u64 user_page_el1_nc_xn_attrs(void)
-{
-    return PTE_VALID | PTE_PAGE | PTE_AF |
-           PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN | PTE_NG;
-}
-
 static inline u64 user_page_el0_nc_xn_attrs(void)
 {
     return PTE_VALID | PTE_PAGE | PTE_AF |
            PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN | PTE_NG;
 }
 
-static void map_user_ipc_el0_pages(u32 uc, u32 slot, u64 *l2)
+/* Map the shared IPC_SHM window EL0-readable at `alias` (a high VA) into the
+ * high region's OWN L2 table (user_l2_high), never the low/phys L2 -- so the
+ * IPC alias can never leak into the identity map. Fails closed if the alias is
+ * not inside the single supported high L1 region (USER_L1_HIGH_INDEX). */
+static bool map_user_ipc_el0_alias(u32 uc, u32 slot, u64 *l1, u64 alias)
 {
-    u32 idx = (u32)(IPC_SHM_BASE / L2_BLOCK_SIZE);
-    u64 block_base = (u64)idx * L2_BLOCK_SIZE;
-    simd_zero(user_l3_ipc[uc][slot], sizeof(user_l3_ipc[uc][slot]));
-    l2[idx] = (u64)(usize)user_l3_ipc[uc][slot] | PTE_VALID | PTE_TABLE;
-    for (u32 i = 0; i < 512; i++) {
-        u64 pa = block_base + (u64)i * L3_PAGE_SIZE;
-        u64 attrs = (pa >= IPC_SHM_BASE && pa < IPC_SHM_BASE + IPC_SHM_SIZE)
-                        ? user_page_el0_nc_xn_attrs()
-                        : user_page_el1_nc_xn_attrs();
-        user_l3_ipc[uc][slot][i] = pa | attrs;
-    }
-}
-
-static void map_user_ipc_el0_alias(u32 uc, u32 slot, u64 *l1, u64 *l2, u64 alias)
-{
-    u64 l1idx = alias / L1_BLOCK_SIZE;
-    if (l1idx >= 512)
-        return;
-    l1[l1idx] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
+    u32 l1idx = (u32)(alias / L1_BLOCK_SIZE);
+    if (l1idx != USER_L1_HIGH_INDEX)
+        return false;
+    u64 *l2 = user_l2_install(uc, slot, l1, l1idx);
+    if (!l2)
+        return false;
     u32 idx = (u32)((alias % L1_BLOCK_SIZE) / L2_BLOCK_SIZE);
     simd_zero(user_l3_ipc[uc][slot], sizeof(user_l3_ipc[uc][slot]));
     l2[idx] = (u64)(usize)user_l3_ipc[uc][slot] | PTE_VALID | PTE_TABLE;
@@ -304,10 +401,12 @@ static void map_user_ipc_el0_alias(u32 uc, u32 slot, u64 *l1, u64 *l2, u64 alias
         u64 pa = IPC_SHM_BASE + (u64)i * L3_PAGE_SIZE;
         user_l3_ipc[uc][slot][i] = pa | user_page_el0_nc_xn_attrs();
     }
+    return true;
 }
 
-static bool mmu_user_slot_pages(u32 core, u32 slot, u64 slot_base, u64 slot_size,
-                                u32 code_bytes, bool split, bool el0_access)
+static bool mmu_user_slot_pages(u32 core, u32 slot, u64 *l1, u64 slot_base,
+                                u64 slot_size, u32 code_bytes, bool split,
+                                bool el0_access)
 {
     if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE || slot_size != PROC_SLOT_SIZE)
         return false;
@@ -315,12 +414,27 @@ static bool mmu_user_slot_pages(u32 core, u32 slot, u64 slot_base, u64 slot_size
         return false;
 
     u32 uc = user_core_index(core);
-    u64 *l2 = user_l2_low[uc][slot];
-    u64 first_l2 = slot_base / L2_BLOCK_SIZE;
     u64 end = slot_base + slot_size;
+    if (end < slot_base)
+        return false;
+
+    /* The slot must sit entirely inside ONE 1 GiB L1 region so it maps through a
+     * single per-slot L2 table; index that L2 RELATIVE to the region base, never
+     * by absolute PA (QEMU slots at 0x44xxxxxx would otherwise index a 512-entry
+     * L2 out of bounds). */
+    u32 l1idx = (u32)(slot_base / L1_BLOCK_SIZE);
+    if ((u32)((end - 1) / L1_BLOCK_SIZE) != l1idx)
+        return false;
+    u64 *l2 = user_l2_install(uc, slot, l1, l1idx);
+    if (!l2)
+        return false;
+    u64 region_base = (u64)l1idx * L1_BLOCK_SIZE;
+
+    u64 first_l2 = (slot_base - region_base) / L2_BLOCK_SIZE;
+    u64 last_l2 = (end - 1 - region_base) / L2_BLOCK_SIZE;
     u64 code_end = slot_base + code_bytes;
     u64 data_start = split ? ((code_end + L3_PAGE_SIZE - 1) & ~(L3_PAGE_SIZE - 1)) : slot_base;
-    if (end < slot_base || first_l2 >= 512 || (end - 1) / L2_BLOCK_SIZE >= 512)
+    if (first_l2 >= 512 || last_l2 >= 512)
         return false;
     if (split && (code_bytes == 0 || code_end > end || data_start >= end))
         return false;
@@ -330,7 +444,7 @@ static bool mmu_user_slot_pages(u32 core, u32 slot, u64 slot_base, u64 slot_size
 
     u32 l3_count = 0;
     for (u64 a = slot_base; a < end; a += L3_PAGE_SIZE) {
-        u64 l2idx = a / L2_BLOCK_SIZE;
+        u64 l2idx = (a - region_base) / L2_BLOCK_SIZE;
         u32 table = (u32)(l2idx - first_l2);
         if (table >= 2)
             return false;
@@ -356,9 +470,28 @@ static void mmu_user_table_publish(u32 uc, u32 slot)
 {
     dcache_clean_invalidate_range((u64)(usize)user_l1[uc][slot], sizeof(user_l1[uc][slot]));
     dcache_clean_invalidate_range((u64)(usize)user_l2_low[uc][slot], sizeof(user_l2_low[uc][slot]));
+    dcache_clean_invalidate_range((u64)(usize)user_l2_phys[uc][slot], sizeof(user_l2_phys[uc][slot]));
+    dcache_clean_invalidate_range((u64)(usize)user_l2_high[uc][slot], sizeof(user_l2_high[uc][slot]));
     dcache_clean_invalidate_range((u64)(usize)user_l3_proc[uc][slot], sizeof(user_l3_proc[uc][slot]));
     dcache_clean_invalidate_range((u64)(usize)user_l3_ipc[uc][slot], sizeof(user_l3_ipc[uc][slot]));
     dsb();
+}
+
+/* Fresh per-slot table skeleton shared by every builder: zero the L1 and all
+ * three per-slot L2 tables, then install the always-present kernel-side regions
+ * -- the low identity map (L1[0], kernel low RAM copied verbatim from
+ * l2_table_low) and, on QEMU only, the kernel image/stack/globals window in
+ * L1[1]. Per-builder code then adds the process slot, FIFO, IPC window and (for
+ * the EL0-at builder) the high linked image window. */
+static void mmu_user_table_reset(u32 uc, u32 slot, u64 *l1)
+{
+    simd_zero(l1, 512 * sizeof(u64));
+    simd_zero(user_l2_low[uc][slot], 512 * sizeof(u64));
+    simd_zero(user_l2_phys[uc][slot], 512 * sizeof(u64));
+    simd_zero(user_l2_high[uc][slot], 512 * sizeof(u64));
+    l1[USER_L1_LOW_INDEX] = (u64)(usize)user_l2_low[uc][slot] | PTE_VALID | PTE_TABLE;
+    map_user_kernel_low(user_l2_low[uc][slot]);
+    map_user_kernel_phys(uc, slot, l1);
 }
 
 void mmu_init(void) {
@@ -623,26 +756,22 @@ bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)
 
     u32 uc = user_core_index(core);
     u64 *l1 = user_l1[uc][slot];
-    u64 *l2 = user_l2_low[uc][slot];
-    simd_zero(l1, 512 * sizeof(u64));
-    simd_zero(l2, 512 * sizeof(u64));
 
-    l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
-
-    /* Map ALL kernel RAM [0, CORE0_RAM_BASE) privileged (AP_RW_EL1, EL0 no
-     * access). The scheduler keeps executing kernel code with TTBR0 pointing at
+    /* Fresh skeleton: L1[0] low identity (kernel low RAM copied verbatim from
+     * l2_table_low, privileged/EL0-inaccessible) + the QEMU kernel image window
+     * in L1[1]. The scheduler keeps executing kernel code with TTBR0 pointing at
      * this user table between mmu_switch_to_user() and ctx_switch(), so it must
-     * be able to reach its own stack, procs[], scheduler_ctx and preempt state
-     * (all live well above the old 2MB window, up to ~5.6MB). These blocks are
-     * EL0-inaccessible, so the user process gains nothing: isolation preserved. */
-    map_user_kernel_low(l2);
+     * reach its own stack, procs[], scheduler_ctx and preempt state through these
+     * privileged mappings; isolation is preserved because they are EL0-no-access. */
+    mmu_user_table_reset(uc, slot, l1);
 
-    /* Map this process slot and shared FIFO window (kernel ABI FIFO path). */
-    if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, 0, false, false))
+    /* Map this process slot (identity VA == PA) and shared FIFO window. */
+    if (!mmu_user_slot_pages(core, slot, l1, slot_base, slot_size, 0, false, false))
         return false;
-    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE),
-                    SHARED_FIFO_BASE, user_ram_nc_attrs());
-    map_user_ipc_el0_alias(uc, slot, l1, l2, 0x2003000000ULL);
+    if (!map_user_identity_2m(uc, slot, l1, SHARED_FIFO_BASE, user_ram_nc_attrs()))
+        return false;
+    if (!map_user_ipc_el0_alias(uc, slot, l1, USER_HIGH_IPC_ALIAS))
+        return false;
 
     /* Keep peripheral MMIO mapped for current direct-call kernel API ABI. */
     map_user_device_windows(l1);
@@ -661,20 +790,15 @@ bool mmu_user_table_build_split(u32 core, u32 slot, u64 slot_base, u64 slot_size
 
     u32 uc = user_core_index(core);
     u64 *l1 = user_l1[uc][slot];
-    u64 *l2 = user_l2_low[uc][slot];
-    simd_zero(l1, 512 * sizeof(u64));
-    simd_zero(l2, 512 * sizeof(u64));
 
-    l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
-
-    /* Map ALL kernel RAM [0, CORE0_RAM_BASE) privileged (see mmu_user_table_build).
-     * Required so the scheduler can run its dispatch tail + ctx_switch on its own
-     * (high) kernel stack while TTBR0 points at this user table. EL0-inaccessible. */
-    map_user_kernel_low(l2);
-    if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, code_bytes, true, false))
+    /* Kernel-side regions privileged (see mmu_user_table_build): required so the
+     * scheduler can run its dispatch tail + ctx_switch on its own kernel stack
+     * while TTBR0 points at this user table. EL0-inaccessible. */
+    mmu_user_table_reset(uc, slot, l1);
+    if (!mmu_user_slot_pages(core, slot, l1, slot_base, slot_size, code_bytes, true, false))
         return false;
-    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE),
-                    SHARED_FIFO_BASE, user_ram_nc_attrs());
+    if (!map_user_identity_2m(uc, slot, l1, SHARED_FIFO_BASE, user_ram_nc_attrs()))
+        return false;
 
     map_user_device_windows(l1);
 
@@ -692,18 +816,14 @@ bool mmu_user_table_build_split_el0(u32 core, u32 slot, u64 slot_base, u64 slot_
 
     u32 uc = user_core_index(core);
     u64 *l1 = user_l1[uc][slot];
-    u64 *l2 = user_l2_low[uc][slot];
-    simd_zero(l1, 512 * sizeof(u64));
-    simd_zero(l2, 512 * sizeof(u64));
 
-    l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
-
-    map_user_kernel_low(l2);
-    if (!mmu_user_slot_pages(core, slot, slot_base, slot_size, code_bytes, true, true))
+    mmu_user_table_reset(uc, slot, l1);
+    if (!mmu_user_slot_pages(core, slot, l1, slot_base, slot_size, code_bytes, true, true))
         return false;
-    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE),
-                    SHARED_FIFO_BASE, user_ram_nc_attrs());
-    map_user_ipc_el0_alias(uc, slot, l1, l2, 0x2003000000ULL);
+    if (!map_user_identity_2m(uc, slot, l1, SHARED_FIFO_BASE, user_ram_nc_attrs()))
+        return false;
+    if (!map_user_ipc_el0_alias(uc, slot, l1, USER_HIGH_IPC_ALIAS))
+        return false;
 
     map_user_device_windows(l1);
 
@@ -725,27 +845,33 @@ bool mmu_user_table_build_split_el0_at(u32 core, u32 slot, u64 va_base, u64 pa_b
 
     u32 uc = user_core_index(core);
     u64 *l1 = user_l1[uc][slot];
-    u64 *l2 = user_l2_low[uc][slot];
-    simd_zero(l1, 512 * sizeof(u64));
-    simd_zero(l2, 512 * sizeof(u64));
 
-    l1[0] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
-    map_user_kernel_low(l2);
+    mmu_user_table_reset(uc, slot, l1);
 
-    u64 l1idx = va_base / L1_BLOCK_SIZE;
-    if (l1idx >= 512)
+    /* Map the linked EL0 image window (va_base -> pa_base) into the high L1
+     * region's OWN L2 table (user_l2_high), never the low/phys L2 -- so the slot
+     * is reachable ONLY at its linked VA and is never aliased into the identity
+     * regions. Fail closed if va_base is outside the supported high L1 region. */
+    u32 l1idx = (u32)(va_base / L1_BLOCK_SIZE);
+    if (l1idx != USER_L1_HIGH_INDEX)
         return false;
-    l1[l1idx] = (u64)(usize)l2 | PTE_VALID | PTE_TABLE;
+    u64 end = va_base + slot_size;
+    if (end < va_base || (u32)((end - 1) / L1_BLOCK_SIZE) != l1idx)
+        return false;
+    u64 *l2 = user_l2_install(uc, slot, l1, l1idx);
+    if (!l2)
+        return false;
+    u64 region_base = (u64)l1idx * L1_BLOCK_SIZE;
 
     simd_zero(user_l3_proc[uc][slot][0], 512 * sizeof(u64));
     simd_zero(user_l3_proc[uc][slot][1], 512 * sizeof(u64));
     u64 code_end = va_base + code_bytes;
     u64 data_start = (code_end + L3_PAGE_SIZE - 1) & ~(u64)(L3_PAGE_SIZE - 1);
-    u64 first_l2 = (va_base % L1_BLOCK_SIZE) / L2_BLOCK_SIZE;
+    u64 first_l2 = (va_base - region_base) / L2_BLOCK_SIZE;
     for (u64 off = 0; off < slot_size; off += L3_PAGE_SIZE) {
         u64 va = va_base + off;
         u64 pa = pa_base + off;
-        u64 idx = (va % L1_BLOCK_SIZE) / L2_BLOCK_SIZE;
+        u64 idx = (va - region_base) / L2_BLOCK_SIZE;
         u32 table = (u32)(idx - first_l2);
         if (table >= 2)
             return false;
@@ -756,9 +882,10 @@ bool mmu_user_table_build_split_el0_at(u32 core, u32 slot, u64 va_base, u64 pa_b
             (pa & ~(L3_PAGE_SIZE - 1)) | attrs;
     }
 
-    map_user_low_2m(l2, (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE),
-                    SHARED_FIFO_BASE, user_ram_nc_attrs());
-    map_user_ipc_el0_alias(uc, slot, l1, l2, 0x2003000000ULL);
+    if (!map_user_identity_2m(uc, slot, l1, SHARED_FIFO_BASE, user_ram_nc_attrs()))
+        return false;
+    if (!map_user_ipc_el0_alias(uc, slot, l1, USER_HIGH_IPC_ALIAS))
+        return false;
     map_user_device_windows(l1);
     mmu_user_table_publish(uc, slot);
     user_table_valid[uc][slot].v = true;
@@ -813,11 +940,19 @@ bool mmu_user_ipc_shm_window(u32 core, u32 slot, bool enable)
     if (!user_table_valid[uc][slot].v)
         return false;
 
-    u64 *l2 = user_l2_low[uc][slot];
-    u32 idx = (u32)(IPC_SHM_BASE / L2_BLOCK_SIZE);
+    /* IPC_SHM_BASE is identity-mapped (VA == PA) as a coarse 2 MiB NC block in
+     * whichever L2 table backs its 1 GiB L1 region (L1[0] on Pi, L1[1] on QEMU),
+     * not always user_l2_low. */
+    u32 l1idx = (u32)(IPC_SHM_BASE / L1_BLOCK_SIZE);
+    u32 idx = (u32)((IPC_SHM_BASE % L1_BLOCK_SIZE) / L2_BLOCK_SIZE);
     if (enable) {
-        map_user_low_2m(l2, idx, IPC_SHM_BASE, user_ram_nc_attrs());
-    } else if (idx < 512) {
+        if (!map_user_identity_2m(uc, slot, user_l1[uc][slot], IPC_SHM_BASE,
+                                  user_ram_nc_attrs()))
+            return false;
+    } else {
+        u64 *l2 = user_l2_lookup(uc, slot, l1idx);
+        if (!l2)
+            return false;
         l2[idx] = 0;
     }
 
@@ -840,22 +975,30 @@ bool mmu_user_pte_snapshot(u32 core, u32 slot, u64 va, u64 *l1e, u64 *l2e, u64 *
     if (l1idx >= 512)
         return false;
     if (l1e) *l1e = user_l1[uc][slot][l1idx];
+
+    /* Walk through the L2 table this VA's L1 region actually references, not
+     * always user_l2_low. Regions with no per-slot L2 (device windows) stop
+     * here with l2e/l3e = 0. */
+    u64 *l2 = user_l2_lookup(uc, slot, l1idx);
+    if (!l2)
+        return true;
     u32 l2idx = (u32)((va % L1_BLOCK_SIZE) / L2_BLOCK_SIZE);
-    u64 e2 = user_l2_low[uc][slot][l2idx];
+    u64 e2 = l2[l2idx];
     if (l2e) *l2e = e2;
-    if ((e2 & (PTE_VALID | PTE_TABLE)) == (PTE_VALID | PTE_TABLE)) {
-        u64 slot_base = (u64)core_ram_bases[core] + PROC_SLOT_OFFSET + (u64)slot * PROC_SLOT_SIZE;
-        u64 first_l2 = slot_base / L2_BLOCK_SIZE;
-        if (l2idx == (u32)((0x2003000000ULL % L1_BLOCK_SIZE) / L2_BLOCK_SIZE)) {
-            u32 pidx = (u32)((va / L3_PAGE_SIZE) & 511U);
-            if (l3e) *l3e = user_l3_ipc[uc][slot][pidx];
-            return true;
-        }
-        if (l2idx < first_l2 || l2idx - first_l2 >= 2)
-            return true;
-        u32 table = (u32)(l2idx - first_l2);
-        u32 pidx = (u32)((va / L3_PAGE_SIZE) & 511U);
-        if (l3e) *l3e = user_l3_proc[uc][slot][table][pidx];
+    if ((e2 & (PTE_VALID | PTE_TABLE)) != (PTE_VALID | PTE_TABLE))
+        return true;
+
+    /* Resolve which L3 table the L2 entry points at by matching its table base,
+     * so slot pages, the linked EL0 image and the IPC alias are all reported
+     * correctly regardless of which region/index they landed in. */
+    u64 l3base = e2 & 0x0000FFFFFFFFF000ULL;
+    u32 pidx = (u32)((va / L3_PAGE_SIZE) & 511U);
+    if (l3base == (u64)(usize)user_l3_ipc[uc][slot]) {
+        if (l3e) *l3e = user_l3_ipc[uc][slot][pidx];
+    } else if (l3base == (u64)(usize)user_l3_proc[uc][slot][0]) {
+        if (l3e) *l3e = user_l3_proc[uc][slot][0][pidx];
+    } else if (l3base == (u64)(usize)user_l3_proc[uc][slot][1]) {
+        if (l3e) *l3e = user_l3_proc[uc][slot][1][pidx];
     }
     return true;
 }

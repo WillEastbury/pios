@@ -195,6 +195,13 @@ void uhttp_bridge_state_idx(u32 idx, i32 *p_listen, u32 *p_state, u32 *p_req_seq
     if (p_pid)      *p_pid      = b->httpd_pid;
 }
 
+u32 uhttp_bridge_target_core(u32 idx)
+{
+    if (idx >= UHTTP_BRIDGE_COUNT)
+        return CORE_NET;
+    return urt[idx].target_core;
+}
+
 static bool req_headers_complete(const u8 *p, u32 n)
 {
     for (u32 i = 3; i < n; i++) {

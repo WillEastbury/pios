@@ -81,15 +81,9 @@ static struct proc_preempt_core preempt_state[3];
 #define preempt_quantum_ticks(uc) (preempt_state[(uc)].quantum_ticks)
 _Static_assert(sizeof(struct proc_preempt_core) == 64,
                "preempt core state must be one cache line");
-/* Per-user-core scheduler diagnostics. Each core's counters occupy a PRIVATE,
- * 64-byte-aligned cache line so a writer core's `dc cvac` (clean-to-PoC, needed
- * because inter-core snoop coherency is inactive on this A76) only ever writes
- * back ITS OWN line. The previous packed u64[3] arrays interleaved all three
- * user cores within shared cache lines, so the busiest idler (core 2 / httpd,
- * ~4.3M idles/s) clobbered cores 1 & 3's counters every time it cleaned a line
- * it shared with them — surfacing as bogus c1=99.9% / c3=0.0% on the dashboard.
- * One clean of any field publishes the whole line; core 0 invalidates the line
- * before reading and never writes it, so the reader-side dc ivac is safe. */
+/* Per-user-core scheduler diagnostics. Each core's counters occupy a private
+ * 64-byte line. Pi maps kernel .bss NC from first enable; QEMU keeps its kernel
+ * block WB, so publication helpers mirror the platform mapping. */
 struct sched_diag_percore {
     u64 start_ticks;
     u64 idle_ticks;
@@ -105,16 +99,15 @@ static u64 svc_call_count;
 static u64 svc_bad_count;
 static struct proc_security_stats proc_sec_stats;
 
-/* Writer-side coherency for the per-user-core scheduler diagnostics above
- * (the sched_diag[] per-core counters). Each core writes ONLY its own
- * cache-line-isolated slot; clean it to PoC after each update so core 0's
- * proc_sched_snapshot reader observes it even though inter-core snoop coherency
- * is not active on this A76 (mirrors the PROC_RWAKE dc cvac / dc ivac pattern).
- * dc cvac operates at cache-line granularity, so one clean of &sched_diag[uc]
- * publishes every field in that core's line at once. */
+/* Writer-side release ordering for the per-user-core NC diagnostics above. */
 static inline void diag_clean_word(volatile void *p) {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
     __asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
     __asm__ volatile("dsb ish" ::: "memory");
+#else
+    (void)p;
+    __asm__ volatile("dmb sy" ::: "memory");
+#endif
 }
 
 /* ----------------------------------------------------------------------------
@@ -270,14 +263,24 @@ static bool proc_prio_valid(u32 p)
 
 static inline void proc_publish_control(u32 slot)
 {
-    if (slot < MAX_PROCS_PER_CORE)
+    if (slot < MAX_PROCS_PER_CORE) {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
         dcache_clean_range((u64)(usize)&procs[slot], 64U);
+#else
+        __asm__ volatile("dmb sy" ::: "memory");
+#endif
+    }
 }
 
 static inline void proc_diag_refresh_slot(u32 slot)
 {
-    if (slot < MAX_PROCS_PER_CORE && core_id() == CORE_NET)
+    if (slot < MAX_PROCS_PER_CORE && core_id() == CORE_NET) {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
         dcache_invalidate_range((u64)(usize)&procs[slot], 64U);
+#else
+        __asm__ volatile("dmb sy" ::: "memory");
+#endif
+    }
 }
 
 static void proc_bump_generation(u32 slot)
@@ -3233,20 +3236,29 @@ static void proc_sched_stage(u32 s) {
     __asm__ volatile("dsb ish" ::: "memory");
 }
 
-/* Reader-side coherency: these diagnostic fields are written ONLY by user cores
- * (never by core 0). Invalidate core 0's possibly-stale cached copy to PoC before
- * reading so a single write by a now-sleeping core is observed even if snoop
- * coherency is not active. Safe because core 0 holds no dirty data here. */
+/* Shared-FIFO diagnostics retain explicit invalidate: the wake-ring contract
+ * uses cache maintenance on every platform and its writers still clean to PoC. */
 static inline void diag_inval_word(volatile void *p) {
     __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory");
     __asm__ volatile("dsb ish" ::: "memory");
+}
+
+/* Reader-side acquire for kernel-BSS diagnostics, matching diag_clean_word. */
+static inline void diag_inval_bss(volatile void *p) {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+#else
+    (void)p;
+    __asm__ volatile("dmb sy" ::: "memory");
+#endif
 }
 
 u32 proc_sgi_wake_count(u32 core)
 {
     if (core >= 4U)
         return 0;
-    diag_inval_word(&sgi_wake_stat[core]);
+    diag_inval_bss(&sgi_wake_stat[core]);
     return sgi_wake_stat[core].recv;
 }
 
@@ -4090,7 +4102,7 @@ u32 proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries)
     u32 n = max_entries < 3U ? max_entries : 3U;
     u64 now = proc_sched_counter_ticks();
     for (u32 i = 0; i < n; i++) {
-        diag_inval_word(&sched_diag[i]); /* one inval refreshes the whole line */
+        diag_inval_bss(&sched_diag[i]);
         u64 start = sched_diag[i].start_ticks;
         u64 total = (start != 0 && now >= start) ? (now - start) : 0;
         u64 idle = sched_diag[i].idle_ticks;

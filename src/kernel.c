@@ -18154,7 +18154,8 @@ static bool dash_capsule_same_group(const struct proc_capsule_ui_entry *a,
            dash_streq(a->group, b->group);
 }
 
-static bool dash_bridge_for_port(u16 port, u32 *bridge_out, u32 *pid_out)
+static bool dash_bridge_for_port(u16 port, u32 *bridge_out, u32 *pid_out,
+                                 u32 *core_out)
 {
     u32 idx = 0xFFFFFFFFU;
     if (port == UHTTP_PORT)
@@ -18171,6 +18172,7 @@ static bool dash_bridge_for_port(u16 port, u32 *bridge_out, u32 *pid_out)
     (void)listen; (void)state; (void)req; (void)resp; (void)total; (void)magic;
     if (bridge_out) *bridge_out = idx;
     if (pid_out) *pid_out = pid;
+    if (core_out) *core_out = uhttp_bridge_target_core(idx);
     return true;
 }
 
@@ -18230,7 +18232,8 @@ static struct dash_listener_info dash_listener_info_for(
     info.image = info.owner;
     info.principal_id = PRINCIPAL_ROOT;
     info.principal = "root";
-    info.has_bridge = dash_bridge_for_port(tcp->local_port, &info.bridge, &info.pid);
+    info.has_bridge = dash_bridge_for_port(tcp->local_port, &info.bridge, &info.pid,
+                                           &info.core);
     if (info.pid) {
         const struct proc_ui_entry *p = dash_proc_for_pid(proc, proc_n, info.pid);
         if (p) {
@@ -18415,7 +18418,7 @@ static void dash_draw_listener_row(u32 row, u32 c_pid, u32 c_core, u32 c_user,
     else
         fb_puts("kern");
     fb_set_cursor(c_core, row);
-    fb_printf("%u", info->has_proc ? info->core : 0U);
+    fb_printf("%u", (info->has_proc || info->has_bridge) ? info->core : 0U);
     fb_set_cursor(c_user, row);
     dash_put_trunc(info->principal ? info->principal : "?", 10U);
     fb_set_cursor(c_cpu, row);
@@ -20008,6 +20011,27 @@ extern const u8 user_el0_probe_start[];
 extern const u8 user_el0_probe_end[];
 extern const u8 user_el0_pico_start[];
 extern const u8 user_el0_pico_end[];
+
+/* Physical slot bases for the kernel-embedded EL0 HTTP workers, derived from
+ * the platform core RAM map so the identical launch path works on Pi5 and
+ * QEMU. proc_exec_from_mem_el0() recomputes the slot from
+ * (physical_base - core_ram_base - PROC_SLOT_OFFSET) / PROC_SLOT_SIZE and
+ * refuses a mismatch, so each value must equal slot_base(slot) for its core.
+ * core 2 uses slot 0; core 3 deliberately uses slot 1. The linked base is the
+ * high EL0 image VA (mmu.c USER_HIGH_LINK_BASE). */
+#define HTTPD_VM_EL0_LINK_BASE   0x2001000000ULL
+#define HTTPD_VM_EL0_CORE2_SLOT  0U
+#define HTTPD_VM_EL0_CORE3_SLOT  1U
+#define HTTPD_VM_EL0_CORE2_PHYS  \
+    (CORE2_RAM_BASE + PROC_SLOT_OFFSET + (u64)HTTPD_VM_EL0_CORE2_SLOT * PROC_SLOT_SIZE)
+#define HTTPD_VM_EL0_CORE3_PHYS  \
+    (CORE3_RAM_BASE + PROC_SLOT_OFFSET + (u64)HTTPD_VM_EL0_CORE3_SLOT * PROC_SLOT_SIZE)
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+_Static_assert(HTTPD_VM_EL0_CORE2_PHYS == 0x02900000ULL,
+               "core2 EL0 slot base must stay 0x02900000 on Pi5");
+_Static_assert(HTTPD_VM_EL0_CORE3_PHYS == 0x03B00000ULL,
+               "core3 EL0 slot base must stay 0x03B00000 on Pi5");
+#endif
 NORETURN void core2_main(void) {
     core_mark_online(CORE_USER0, 1);
     core_env_init(CORE_USER0);
@@ -20024,7 +20048,7 @@ NORETURN void core2_main(void) {
     /* Launch the PicoScript VM-backed HTTP benchmark worker on port 82. */
     proc_exec_from_mem_el0("user/httpd-vm-el0", user_httpd_vm_start,
                            (u32)(usize)(user_httpd_vm_end - user_httpd_vm_start),
-                           0x2001000000ULL, 0x02900000ULL, PROC_PRIO_NORMAL, core_id());
+                           HTTPD_VM_EL0_LINK_BASE, HTTPD_VM_EL0_CORE2_PHYS, PROC_PRIO_NORMAL, core_id());
     proc_schedule(); /* never returns */
     for (;;) wfe();
 }
@@ -20046,7 +20070,7 @@ NORETURN void core3_main(void) {
     /* Launch a second PicoScript VM-backed HTTP worker on bridge 1 / port 83. */
     proc_exec_from_mem_el0("user/httpd-vm1-el0", user_httpd_native_start,
                            (u32)(usize)(user_httpd_native_end - user_httpd_native_start),
-                           0x2001000000ULL, 0x03B00000ULL, PROC_PRIO_NORMAL, core_id());
+                           HTTPD_VM_EL0_LINK_BASE, HTTPD_VM_EL0_CORE3_PHYS, PROC_PRIO_NORMAL, core_id());
     {
         u64 sctlr;
         __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
