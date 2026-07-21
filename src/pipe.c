@@ -1,6 +1,7 @@
 #include "pipe.h"
 #include "ipc_queue.h"
 #include "ipc_stream.h"
+#include "kspin.h"
 
 #define PIPE_IPC_PREFIX "/ipc/"
 #define PIPE_NET_PREFIX "/net/"
@@ -23,6 +24,7 @@ struct pipe_obj {
 } ALIGNED(64);
 
 static struct pipe_obj g_pipes[PIPE_MAX_OBJECTS];
+static struct kspinlock g_pipe_lock;
 _Static_assert((sizeof(struct pipe_obj) & 63U) == 0U,
                "pipe descriptors must have cache-line stride");
 
@@ -202,11 +204,13 @@ static i32 backend_open_ipc(const char *name, u32 type, i32 *stream_sub_out)
 
 void pipe_init(void)
 {
+    kspin_lock(&g_pipe_lock);
     for (u32 i = 0; i < PIPE_MAX_OBJECTS; i++)
         pipe_poison(&g_pipes[i]);
+    kspin_unlock(&g_pipe_lock);
 }
 
-i32 pipe_create(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
+static i32 pipe_create_unlocked(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
 {
     u32 domain = 0;
     const char *name = NULL;
@@ -243,7 +247,7 @@ i32 pipe_create(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
     return slot;
 }
 
-i32 pipe_open(const char *path, u32 type)
+static i32 pipe_open_unlocked(const char *path, u32 type)
 {
     u32 domain = 0;
     const char *name = NULL;
@@ -288,7 +292,7 @@ i32 pipe_open(const char *path, u32 type)
     return slot;
 }
 
-i32 pipe_close(i32 pipe_id)
+static i32 pipe_close_unlocked(i32 pipe_id)
 {
     struct pipe_obj *p = pipe_from_id(pipe_id);
     if (!p) return IPC_ERR_INVAL;
@@ -299,7 +303,7 @@ i32 pipe_close(i32 pipe_id)
     return IPC_OK;
 }
 
-i32 pipe_read(i32 pipe_id, void *buf, u32 len)
+static i32 pipe_read_unlocked(i32 pipe_id, void *buf, u32 len)
 {
     struct pipe_obj *p = pipe_from_id(pipe_id);
     if (!p || !buf || len == 0) return IPC_ERR_INVAL;
@@ -310,7 +314,7 @@ i32 pipe_read(i32 pipe_id, void *buf, u32 len)
     return (i32)out_len;
 }
 
-i32 pipe_write(i32 pipe_id, const void *buf, u32 len)
+static i32 pipe_write_unlocked(i32 pipe_id, const void *buf, u32 len)
 {
     struct pipe_obj *p = pipe_from_id(pipe_id);
     if (!p || !buf || len == 0) return IPC_ERR_INVAL;
@@ -320,7 +324,7 @@ i32 pipe_write(i32 pipe_id, const void *buf, u32 len)
     return (i32)len;
 }
 
-i32 pipe_send(i32 pipe_id, const void *msg, u32 len)
+static i32 pipe_send_unlocked(i32 pipe_id, const void *msg, u32 len)
 {
     struct pipe_obj *p = pipe_from_id(pipe_id);
     if (!p || !msg || len == 0) return IPC_ERR_INVAL;
@@ -330,7 +334,7 @@ i32 pipe_send(i32 pipe_id, const void *msg, u32 len)
     return (i32)len;
 }
 
-i32 pipe_recv(i32 pipe_id, void *msg, u32 len)
+static i32 pipe_recv_unlocked(i32 pipe_id, void *msg, u32 len)
 {
     struct pipe_obj *p = pipe_from_id(pipe_id);
     if (!p || !msg || len == 0) return IPC_ERR_INVAL;
@@ -341,7 +345,7 @@ i32 pipe_recv(i32 pipe_id, void *msg, u32 len)
     return (i32)out_len;
 }
 
-i32 pipe_stat(i32 pipe_id, struct pipe_stat *out)
+static i32 pipe_stat_unlocked(i32 pipe_id, struct pipe_stat *out)
 {
     struct pipe_obj *p = pipe_from_id(pipe_id);
     if (!p || !out) return IPC_ERR_INVAL;
@@ -357,4 +361,68 @@ i32 pipe_stat(i32 pipe_id, struct pipe_stat *out)
     out->open_count = p->open_count;
     copy_bytes(out->path, p->path, PIPE_PATH_MAX + 1);
     return IPC_OK;
+}
+
+i32 pipe_create(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
+{
+    kspin_lock(&g_pipe_lock);
+    i32 rc = pipe_create_unlocked(path, type, depth, flags, frame_max);
+    kspin_unlock(&g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_open(const char *path, u32 type)
+{
+    kspin_lock(&g_pipe_lock);
+    i32 rc = pipe_open_unlocked(path, type);
+    kspin_unlock(&g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_close(i32 pipe_id)
+{
+    kspin_lock(&g_pipe_lock);
+    i32 rc = pipe_close_unlocked(pipe_id);
+    kspin_unlock(&g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_read(i32 pipe_id, void *buf, u32 len)
+{
+    kspin_lock(&g_pipe_lock);
+    i32 rc = pipe_read_unlocked(pipe_id, buf, len);
+    kspin_unlock(&g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_write(i32 pipe_id, const void *buf, u32 len)
+{
+    kspin_lock(&g_pipe_lock);
+    i32 rc = pipe_write_unlocked(pipe_id, buf, len);
+    kspin_unlock(&g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_send(i32 pipe_id, const void *msg, u32 len)
+{
+    kspin_lock(&g_pipe_lock);
+    i32 rc = pipe_send_unlocked(pipe_id, msg, len);
+    kspin_unlock(&g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_recv(i32 pipe_id, void *msg, u32 len)
+{
+    kspin_lock(&g_pipe_lock);
+    i32 rc = pipe_recv_unlocked(pipe_id, msg, len);
+    kspin_unlock(&g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_stat(i32 pipe_id, struct pipe_stat *out)
+{
+    kspin_lock(&g_pipe_lock);
+    i32 rc = pipe_stat_unlocked(pipe_id, out);
+    kspin_unlock(&g_pipe_lock);
+    return rc;
 }

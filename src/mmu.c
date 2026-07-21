@@ -872,13 +872,40 @@ void dcache_clean_range(u64 start, u64 size) {
 }
 
 void dcache_invalidate_range(u64 start, u64 size) {
-    u64 line = 64;
-    u64 addr = start & ~(line - 1);
+    const u64 line = 64;
+    if (size == 0)
+        return;
     u64 end = start + size;
-    while (addr < end) {
+    if (end < start)
+        return;
+
+    u64 first = start & ~(line - 1);
+    u64 last = (end - 1) & ~(line - 1);
+    if (first == last) {
+        if (start == first && end == first + line) {
+            __asm__ volatile("dc ivac, %0" :: "r"(first) : "memory");
+        } else {
+            /* Preserve dirty bytes belonging to adjacent objects that share
+             * this partial line. Plain ivac would silently discard them. */
+            __asm__ volatile("dc civac, %0" :: "r"(first) : "memory");
+        }
+        dsb();
+        return;
+    }
+
+    u64 addr = first;
+    if (start != first) {
+        __asm__ volatile("dc civac, %0" :: "r"(addr) : "memory");
+        addr += line;
+    }
+
+    u64 interior_end = (end & (line - 1)) ? last : end;
+    while (addr < interior_end) {
         __asm__ volatile("dc ivac, %0" :: "r"(addr) : "memory");
         addr += line;
     }
+    if (end & (line - 1))
+        __asm__ volatile("dc civac, %0" :: "r"(last) : "memory");
     dsb();
 }
 

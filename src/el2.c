@@ -3,6 +3,7 @@
 #include "proc.h"
 #include "core_env.h"
 #include "uart.h"
+#include "mmu.h"
 
 __asm__(".global __el2_integrity_start\n__el2_integrity_start:");
 
@@ -89,6 +90,9 @@ static void el2_port_owner_poison(struct el2_port_owner *o)
 }
 static struct el2_capsule_desc g_capsules[EL2_CAPSULE_MAX];
 static struct el2_stage2_plan g_stage2[EL2_CAPSULE_MAX];
+/* These tables live in .bss. Real Pi maps kernel .bss NC, while QEMU's coarse
+ * kernel RAM block is WB. VTCR and publication below mirror that platform
+ * attribute exactly so the table walker never aliases the CPU mapping. */
 static u64 g_stage2_root[EL2_CAPSULE_MAX][512] ALIGNED(4096);
 static u64 g_stage2_l2[EL2_CAPSULE_MAX][512] ALIGNED(4096);
 
@@ -173,7 +177,13 @@ static void el2_stage2_build_table(u32 id)
                   S2_PTE_VALID | S2_PTE_BLOCK | S2_PTE_AF |
                   S2_MEMATTR_NORMAL | S2_SH_INNER | S2_S2AP_RW;
     }
-
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    dcache_clean_invalidate_range((u64)(usize)g_stage2_root[id],
+                                  sizeof(g_stage2_root[id]));
+    dcache_clean_invalidate_range((u64)(usize)g_stage2_l2[id],
+                                  sizeof(g_stage2_l2[id]));
+#endif
+    dsb();
 }
 
 static bool el2_stage2_pa_range_is_normal_wb(u64 pa_base, u64 size)
@@ -197,8 +207,13 @@ static bool el2_stage2_program_hw(u32 id)
 
     u64 vtcr = (16UL << 0) |   /* T0SZ=16 => 48-bit IPA */
                (0UL  << 6)  |  /* SL0 level 1 */
-               (0UL  << 8)  |  /* IRGN0 WB WA */
-               (0UL  << 10) |  /* ORGN0 WB WA */
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+               (1UL  << 8)  |  /* IRGN0 WB WA */
+               (1UL  << 10) |  /* ORGN0 WB WA */
+#else
+               (0UL  << 8)  |  /* IRGN0 Non-cacheable */
+               (0UL  << 10) |  /* ORGN0 Non-cacheable */
+#endif
                (3UL  << 12) |  /* SH0 inner */
                (2UL  << 16) |  /* TG0 4KB */
                (2UL  << 32);   /* PS 40-bit PA */

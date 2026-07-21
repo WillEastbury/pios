@@ -61,6 +61,8 @@ These are hard scan/review rules for FIFO, wake-ring, scheduler, descriptor, IPC
 - RULE: No locks in scheduler.
 - RULE: No syscalls from scheduler context.
 - RULE: Counters are diagnostics, not synchronization.
+- Named queue/topic/pipe registries are shared across user cores and serialize
+  bounded syscall-path mutations with cache-line-isolated `kspinlock` records.
 
 ### Length, parsing, and bounds
 

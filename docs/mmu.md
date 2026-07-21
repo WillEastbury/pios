@@ -118,6 +118,9 @@ dcache_clean_invalidate_range(start, size);  // Clean then invalidate
 ```
 
 Uses `dc cvac`, `dc ivac`, `dc civac` instructions with 64-byte cache line stride (Cortex-A76).
+Range invalidation uses `dc civac` only for partially covered boundary lines so
+dirty bytes belonging to adjacent objects are preserved; fully covered lines
+use `dc ivac` so stale CPU data cannot be written back over a DMA result.
 
 ## DMA Coherency
 

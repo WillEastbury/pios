@@ -59,6 +59,10 @@ could not advance past the missing ownership publication.
   was reduced to 256 entries so rings plus IRQ metadata fit inside the mapped 1 MiB region.
 - UART and TCP-2323 console parsing, all-core freeze/register inspection, and the lower-half HDMI
   terminal panel have QEMU regression coverage.
+- A follow-up coherency audit made partial-line DMA invalidation preserve adjacent
+  dirty bytes, moved the auxiliary GEM descriptor into DMA_NET NC, gave lease
+  records 64-byte stride, matched stage-2 table-walk cacheability to each platform,
+  and serialized named queue/topic/pipe registries across user cores.
 
 ### Validation and deployment state
 - [x] QEMU smoke **11/11**.

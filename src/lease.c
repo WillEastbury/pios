@@ -18,6 +18,10 @@
 
 static struct lease_arena      g_arenas[LEASE_ARENA_MAX];
 static struct lease_descriptor g_pool[LEASE_POOL_MAX];
+_Static_assert(sizeof(struct lease_arena) == 64,
+               "lease arenas must have cache-line stride");
+_Static_assert(sizeof(struct lease_descriptor) == 64,
+               "lease descriptors must have cache-line stride");
 static u64  g_next_lease_id;
 static u32  g_next_arena_id;
 static bool g_inited;

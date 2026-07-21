@@ -1,4 +1,5 @@
 #include "ipc_stream.h"
+#include "kspin.h"
 
 struct topic_sub {
     bool used;
@@ -25,6 +26,7 @@ struct ipc_topic_obj {
 
 static struct ipc_topic_obj g_topics[IPC_TOPIC_MAX];
 static bool g_persist_runtime;
+static struct kspinlock g_topic_lock;
 static const char *const g_topic_walfs_path = "/var/ipc/topics";
 _Static_assert(sizeof(struct topic_sub) == 64,
                "IPC topic subscriptions must be one cache line");
@@ -128,17 +130,21 @@ static u32 topic_tail(const struct ipc_topic_obj *t)
 
 void ipc_stream_init(void)
 {
+    kspin_lock(&g_topic_lock);
     for (u32 i = 0; i < IPC_TOPIC_MAX; i++)
         topic_poison(&g_topics[i]);
     g_persist_runtime = false;
+    kspin_unlock(&g_topic_lock);
 }
 
 void ipc_stream_set_persistence(bool enabled)
 {
+    kspin_lock(&g_topic_lock);
     g_persist_runtime = enabled;
+    kspin_unlock(&g_topic_lock);
 }
 
-i32 ipc_topic_create(const char *name, u32 replay_window, u32 flags, u32 event_max)
+static i32 ipc_topic_create_unlocked(const char *name, u32 replay_window, u32 flags, u32 event_max)
 {
     if (!ascii_name_ok(name)) return IPC_ERR_INVAL;
     if (replay_window == 0 || replay_window > IPC_TOPIC_WINDOW_MAX) return IPC_ERR_INVAL;
@@ -162,13 +168,13 @@ i32 ipc_topic_create(const char *name, u32 replay_window, u32 flags, u32 event_m
     return IPC_ERR_NOSPC;
 }
 
-i32 ipc_topic_open(const char *name)
+static i32 ipc_topic_open_unlocked(const char *name)
 {
     if (!ascii_name_ok(name)) return IPC_ERR_INVAL;
     return topic_find(name);
 }
 
-i32 ipc_topic_publish(i32 topic_handle, const void *data, u32 len)
+static i32 ipc_topic_publish_unlocked(i32 topic_handle, const void *data, u32 len)
 {
     struct ipc_topic_obj *t = topic_from_handle(topic_handle);
     if (!t || !data) return IPC_ERR_INVAL;
@@ -191,7 +197,7 @@ i32 ipc_topic_publish(i32 topic_handle, const void *data, u32 len)
     return IPC_OK;
 }
 
-i32 ipc_topic_subscribe(i32 topic_handle)
+static i32 ipc_topic_subscribe_unlocked(i32 topic_handle)
 {
     struct ipc_topic_obj *t = topic_from_handle(topic_handle);
     if (!t) return IPC_ERR_INVAL;
@@ -208,7 +214,7 @@ i32 ipc_topic_subscribe(i32 topic_handle)
     return IPC_ERR_NOSPC;
 }
 
-i32 ipc_topic_read(i32 sub_handle, void *out, u32 out_max, u32 *len_out)
+static i32 ipc_topic_read_unlocked(i32 sub_handle, void *out, u32 out_max, u32 *len_out)
 {
     u32 topic_idx, sub_idx;
     if (!sub_decode(sub_handle, &topic_idx, &sub_idx)) return IPC_ERR_INVAL;
@@ -234,7 +240,7 @@ i32 ipc_topic_read(i32 sub_handle, void *out, u32 out_max, u32 *len_out)
     return IPC_OK;
 }
 
-i32 ipc_topic_flush(i32 topic_handle)
+static i32 ipc_topic_flush_unlocked(i32 topic_handle)
 {
     struct ipc_topic_obj *t = topic_from_handle(topic_handle);
     if (!t) return IPC_ERR_INVAL;
@@ -253,9 +259,65 @@ i32 ipc_topic_flush(i32 topic_handle)
 #endif
 }
 
-i32 ipc_topic_len(i32 topic_handle)
+static i32 ipc_topic_len_unlocked(i32 topic_handle)
 {
     struct ipc_topic_obj *t = topic_from_handle(topic_handle);
     if (!t) return IPC_ERR_INVAL;
     return (i32)t->count;
+}
+
+i32 ipc_topic_create(const char *name, u32 replay_window, u32 flags, u32 event_max)
+{
+    kspin_lock(&g_topic_lock);
+    i32 rc = ipc_topic_create_unlocked(name, replay_window, flags, event_max);
+    kspin_unlock(&g_topic_lock);
+    return rc;
+}
+
+i32 ipc_topic_open(const char *name)
+{
+    kspin_lock(&g_topic_lock);
+    i32 rc = ipc_topic_open_unlocked(name);
+    kspin_unlock(&g_topic_lock);
+    return rc;
+}
+
+i32 ipc_topic_publish(i32 topic_handle, const void *data, u32 len)
+{
+    kspin_lock(&g_topic_lock);
+    i32 rc = ipc_topic_publish_unlocked(topic_handle, data, len);
+    kspin_unlock(&g_topic_lock);
+    return rc;
+}
+
+i32 ipc_topic_subscribe(i32 topic_handle)
+{
+    kspin_lock(&g_topic_lock);
+    i32 rc = ipc_topic_subscribe_unlocked(topic_handle);
+    kspin_unlock(&g_topic_lock);
+    return rc;
+}
+
+i32 ipc_topic_read(i32 sub_handle, void *out, u32 out_max, u32 *len_out)
+{
+    kspin_lock(&g_topic_lock);
+    i32 rc = ipc_topic_read_unlocked(sub_handle, out, out_max, len_out);
+    kspin_unlock(&g_topic_lock);
+    return rc;
+}
+
+i32 ipc_topic_flush(i32 topic_handle)
+{
+    kspin_lock(&g_topic_lock);
+    i32 rc = ipc_topic_flush_unlocked(topic_handle);
+    kspin_unlock(&g_topic_lock);
+    return rc;
+}
+
+i32 ipc_topic_len(i32 topic_handle)
+{
+    kspin_lock(&g_topic_lock);
+    i32 rc = ipc_topic_len_unlocked(topic_handle);
+    kspin_unlock(&g_topic_lock);
+    return rc;
 }

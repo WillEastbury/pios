@@ -231,13 +231,11 @@ struct macb_desc {
  *     [aligned buffer end .. +RX descriptors) RX descriptor ring
  *     [aligned RX ring end .. +TX descriptors) TX descriptor ring
  *
- * The descriptor rings used to live in .bss under the assumption that .bss was
- * always Normal-NC. Live hardware disproved the safety of that assumption:
- * rx_idx could stop on an OWN=0 descriptor while hundreds of later descriptors
- * were OWN=1, the exact signature produced when a CPU cache-line writeback of
- * one compact 16-byte descriptor overwrites a DMA update to its sibling. Keep
- * descriptors in the explicitly Normal-NC DMA arena with their buffers so no
- * cacheable alias or startup mapping can recreate that ownership hole. */
+ * The descriptor rings used to live in .bss. Live hardware later proved that
+ * DMA_NET itself also had to be NC from the first MMU enable: a stopped RX
+ * descriptor remained OWN=0 until dc ivac exposed GEM's OWN=1 publication.
+ * Keep every MAC descriptor in the dedicated arena and preserve its continuous
+ * NC mapping across boot/runtime tables. */
 #define MACB_RX_POOL_OFF   0U
 #define MACB_TX_POOL_OFF   ((u64)NUM_RX * BUF_SIZE)
 #define MACB_DMA_POOL_BYTES (((u64)NUM_RX + (u64)NUM_TX) * BUF_SIZE)
@@ -246,7 +244,9 @@ struct macb_desc {
 #define MACB_TX_DESC_OFF   ((MACB_RX_DESC_OFF + MACB_RX_RING_BYTES + 63ULL) & ~63ULL)
 #define MACB_RX_TRAILING_BYTES (MACB_TX_DESC_OFF - (MACB_RX_DESC_OFF + MACB_RX_RING_BYTES))
 #define MACB_TX_RING_BYTES ((u64)NUM_TX * sizeof(struct macb_desc))
-#define MACB_DMA_TOTAL_BYTES (MACB_TX_DESC_OFF + MACB_TX_RING_BYTES)
+#define MACB_DUMMY_DESC_OFF ((MACB_TX_DESC_OFF + MACB_TX_RING_BYTES + 63ULL) & ~63ULL)
+#define MACB_DUMMY_DESC_BYTES 64ULL
+#define MACB_DMA_TOTAL_BYTES (MACB_DUMMY_DESC_OFF + MACB_DUMMY_DESC_BYTES)
 _Static_assert(MACB_DMA_TOTAL_BYTES <= DMA_NET_SIZE,
                "MACB buffers and descriptor rings exceed the DMA_NET arena");
 static u8 (*const rx_bufs)[BUF_SIZE] =
@@ -257,6 +257,8 @@ static volatile struct macb_desc *const rx_ring =
     (volatile struct macb_desc *)(usize)(DMA_NET_BASE + MACB_RX_DESC_OFF);
 static volatile struct macb_desc *const tx_ring =
     (volatile struct macb_desc *)(usize)(DMA_NET_BASE + MACB_TX_DESC_OFF);
+static volatile struct macb_desc *const dummy_desc =
+    (volatile struct macb_desc *)(usize)(DMA_NET_BASE + MACB_DUMMY_DESC_OFF);
 static u32 tx_idx;
 static u32 tx_tail;
 static u32 tx_inflight;
@@ -673,19 +675,17 @@ bool macb_init(void) {
 
     /* ── Multi-queue init (Circle: gmac_init_multi_queues) ── */
     {
-        static struct macb_desc dummy_desc ALIGNED(64);
-        dummy_desc.ctrl = TX_STAT_USED;
-        dummy_desc.addr = 0;
+        dummy_desc->ctrl = TX_STAT_USED;
+        dummy_desc->addr = 0;
 #if !USE_8BYTE_DESC
-        dummy_desc.addr_hi = MACB_DMA_HI;
-        dummy_desc.rsvd = 0;
+        dummy_desc->addr_hi = MACB_DMA_HI;
+        dummy_desc->rsvd = 0;
 #endif
         __asm__ volatile("dsb sy" ::: "memory");
-        dcache_clean_range((u64)(usize)&dummy_desc, sizeof(dummy_desc));
 
         u32 dcfg6 = mr(0x0294);
         u32 queue_mask = (dcfg6 & 0xFF) | 0x01;
-        u32 dummy_lo = (u32)(usize)&dummy_desc;
+        u32 dummy_lo = (u32)(usize)dummy_desc;
         for (u32 q = 1; q < 8; q++) {
             if (queue_mask & (1 << q)) {
                 mw(0x0440 + ((q-1) << 2), dummy_lo);

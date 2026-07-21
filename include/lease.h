@@ -117,7 +117,8 @@ struct lease_arena {
     u64 cursor;          /* bump-allocation cursor (offset within arena) */
     u32 generation;      /* bumped on arena reset */
     u32 in_use;          /* registry slot occupied */
-};
+    u32 _pad[4];
+} ALIGNED(64);
 
 /* Reusable descriptor slot. PACKED so it can travel over a fifo_span. */
 struct lease_descriptor {
@@ -131,8 +132,8 @@ struct lease_descriptor {
     u32 owner_capsule;
     u32 flags;           /* LEASE_F_* */
     u32 state;           /* LEASE_STATE_* */
-    u32 _pad;
-} PACKED;
+    u32 _pad[2];
+} PACKED ALIGNED(64);
 
 struct lease_stats {
     u32 arenas;
