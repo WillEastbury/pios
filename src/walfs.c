@@ -956,13 +956,26 @@ u32 walfs_read(u64 inode_id, u64 offset, void *buf, u32 len)
 {
     if (!mounted) return 0;
     if (len == 0) return 0;
-    if (data_index_overflow || data_index_count == 0)
-        return walfs_read_linear(inode_id, offset, buf, len);
 
+    /* Zero the full caller buffer first so no stale bytes can leak, then clamp
+     * the read to the inode's current logical size. A shrinking walfs_replace
+     * leaves older DATA records for the truncated tail in the log; without this
+     * clamp those bytes would resurface past the new EOF. */
     u8 *dst = (u8 *)buf;
     simd_zero(dst, len);
+
+    struct walfs_inode ino;
+    if (!walfs_stat(inode_id, &ino)) return 0;
+    if (offset >= ino.size) return 0;
+    u64 avail = ino.size - offset;
+    u32 rlen = ((u64)len > avail) ? (u32)avail : len;
+    if (rlen == 0) return 0;
+
+    if (data_index_overflow || data_index_count == 0)
+        return walfs_read_linear(inode_id, offset, buf, rlen);
+
     u32 high = 0;
-    u64 rs = offset, re = offset + len;
+    u64 rs = offset, re = offset + rlen;
 
     for (u32 i = 0; i < data_index_count; i++) {
         const struct wal_data_index_entry *e = &data_index[i];

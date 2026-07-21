@@ -37,6 +37,10 @@ TESTS_MANIFEST = {
     # also does WALFS I/O -- this half is pure logic, no MMIO/asm/WALFS
     # deps). Also has a standalone libFuzzer harness: fuzz_capsule_manifest.c
     "test_capsule_manifest.c": ["src/capsule_manifest_parse.c"],
+    # PicoSTS token/KDF/codec core: base64url, PBKDF2-HMAC-SHA256, HS256 JWT
+    # sign/verify, claim reader. Pure logic (no MMIO/WALFS/asm); the test
+    # supplies an independent SHA-256/HMAC oracle. See src/sts_token.c.
+    "test_sts_token.c": ["src/sts_token.c"],
 }
 
 

@@ -36,6 +36,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 QEMU = r"C:\Program Files\qemu\qemu-system-aarch64.exe"
@@ -56,6 +57,16 @@ def term(cmd: str, timeout: float = 8.0) -> str:
 def get(path: str, timeout: float = 8.0):
     with urllib.request.urlopen(f"{HTTP}{path}", timeout=timeout) as r:
         return r.status, r.read().decode("utf-8", "replace")
+
+
+def get_any(path: str, timeout: float = 8.0):
+    # Like get(), but returns (code, body) for 4xx/5xx instead of raising, so
+    # fail-closed responses (403 tls_required, admin_required) can be asserted.
+    try:
+        with urllib.request.urlopen(f"{HTTP}{path}", timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
 
 
 def ota_stream(image: bytes, timeout: float = 60.0) -> str:
@@ -234,6 +245,101 @@ class Smoke:
             except Exception:
                 pass
         self.check("HTTP burst 20/20", ok == 20, f"{ok}/20")
+
+        # ── PicoSTS hosted auth/z vertical slice ──────────────────────────
+        # Deterministic coverage via the admin console (real sts_login/validate
+        # code paths) + HTTP surface (public health/jwks, TLS-only enforcement).
+        # Test provisioning is QEMU-platform-gated; production never ships these.
+        try:
+            # 1. Public health over plain HTTP; secret absent before provisioning
+            code, body = get("/api/sts/health")
+            self.check("sts health public (no secret yet)",
+                       code == 200 and '"has_secret":false' in body and '"service":"sts"' in body,
+                       body.strip()[:80])
+
+            # 2. JWKS public + exposes no key material (HS256 symmetric)
+            code, body = get("/api/sts/jwks")
+            self.check("sts jwks public, empty keys",
+                       code == 200 and '"keys":[]' in body, body.strip()[:60])
+
+            # 3. TLS-only enforcement: login refused on plaintext :80
+            code, body = get_any("/api/sts/login?user=x&pass=y&aud=wave-sts")
+            self.check("sts login TLS-only (403 on :80)",
+                       code == 403 and "tls_required" in body, f"code={code}")
+
+            # 4. Seed known users (QEMU-only), then confirm no-secret failure:
+            #    a valid user+password must still fail closed without a secret.
+            term("sts testusers")
+            out = term("sts login admin1 pw-admin-123 wave-sts demo")
+            self.check("sts no-secret fails closed",
+                       "no_signing_secret" in out, out.strip()[:80])
+
+            # 5. Provision the deterministic test secret, then login succeeds
+            term("sts testsecret")
+            out = term("sts login admin1 pw-admin-123 wave-sts demo")
+            self.check("sts login ok (admin)",
+                       "login ok" in out and "sts.admin" in out, out.strip()[:80])
+
+            # 6. Validate the issued token
+            out = term("sts validate wave-sts")
+            self.check("sts validate ok",
+                       "valid tenant=demo" in out, out.strip()[:80])
+
+            # 7. Tamper must fail closed
+            out = term("sts tamper wave-sts")
+            self.check("sts tamper rejected",
+                       "invalid(ok)" in out, out.strip()[:80])
+
+            # 8. Wrong password fails closed
+            out = term("sts login admin1 wrongpass wave-sts demo")
+            self.check("sts wrong password rejected",
+                       "auth_failed" in out, out.strip()[:80])
+
+            # 9. Scope denial: user1 may not request sts.admin
+            out = term("sts login user1 pw-user-123 wave-sts demo sts.admin")
+            self.check("sts scope denied",
+                       "FAIL err=" in out and ("scope_denied" in out or "forbidden" in out),
+                       out.strip()[:80])
+
+            # 10. Admin authz boundary: user1 token lacks sts.admin scope
+            term("sts login user1 pw-user-123 wave-sts demo")
+            out = term("sts authz sts.admin wave-sts")
+            self.check("sts admin authz denied (user1)",
+                       out.strip().startswith("sts authz deny"), out.strip()[:80])
+
+            # 11. Admin authz boundary: admin1 token carries sts.admin scope
+            term("sts login admin1 pw-admin-123 wave-sts demo")
+            out = term("sts authz sts.admin wave-sts")
+            self.check("sts admin authz allowed (admin1)",
+                       out.strip().startswith("sts authz allow"), out.strip()[:80])
+
+            # 12. HTTP sensitive admin route refused on plaintext :80 (TLS-only)
+            code, body = get_any("/api/sts/users")
+            self.check("sts users TLS-only on :80 (403)",
+                       code == 403 and "tls_required" in body, f"code={code}")
+
+            # 13. Bearer-admin gate on /api/sts/users (drives the REAL handler via
+            #     a synthesized TLS request in the console). admin1 has sts.admin.
+            term("sts login admin1 pw-admin-123 wave-sts demo")
+            out = term("sts users")
+            self.check("sts users admin bearer allowed",
+                       '"ok":true' in out and '"total":' in out and '"users":[' in out,
+                       out.strip()[:100])
+
+            # 14. Pagination: bounded limit + offset + next continuation cursor
+            out = term("sts users 0 1")
+            self.check("sts users pagination (limit=1, next cursor)",
+                       '"limit":1' in out and '"offset":0' in out and '"next":1' in out,
+                       out.strip()[:120])
+
+            # 15. Bearer-admin denial: user1 token lacks sts.admin scope => 403
+            term("sts login user1 pw-user-123 wave-sts demo")
+            out = term("sts users")
+            self.check("sts users non-admin bearer denied",
+                       "403 Forbidden" in out and "scope_denied" in out,
+                       out.strip()[:100])
+        except Exception as e:
+            self.check("sts vertical slice", False, str(e))
 
         # DNS resolve: async lookup via SLIRP gateway (soft check — UDP rx may
         # be limited on QEMU; failure is logged but does not block the gate)

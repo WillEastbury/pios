@@ -111,6 +111,14 @@ In the tables below the **Surfaces** column marks availability:
 | `acme status` / `acme prepare <domain>` / `acme csrhex` | H U | ACME account/order state, CSR DER hex export. |
 | `acme challenge <token> <keyauth>` / `acme clear` / `acme selftest` | H U | Manage HTTP-01 challenge state (served at `/.well-known/acme-challenge/<token>`). |
 | `keystore status` / `keystore derive <label>` | H U | Sealed root-of-trust status / non-secret label fingerprint. |
+| `sts status` | H U | PicoSTS token service status: secret present, user count, UTC set, live RNG/entropy status string. |
+| `sts login <user> <pass> <aud> <tenant> [scope+scope]` | H U | Exercise `sts_login` (real code path). Stores the issued token in a diagnostics slot; prints granted scope + token length only (never the token bytes). |
+| `sts validate <aud>` | H U | Validate the last stored token for an audience; prints tenant + scopes or the fail-closed error. |
+| `sts tamper <aud>` | H U | Flip a signature byte of the stored token and validate — must be rejected (verifies tamper fail-closed). |
+| `sts authz <scope> <aud>` | H U | Authorization-boundary probe: allow only if the stored token validates and carries `<scope>`. |
+| `sts users [offset] [limit]` | H U | Drive the real `/api/sts/users` handler via a synthesized TLS request bearing the last stored token: exercises the `sts.admin` bearer gate (401/403 fail-closed) and bounded pagination (`total`/`offset`/`limit`/`next`). Prints the raw JSON response. |
+| `sts gensecret` | H U | Provision an HS256 secret from the CSPRNG seam. **Fails closed** with the RNG status when no trusted entropy source is present. |
+| `sts testusers` / `sts testsecret` | H U | **QEMU-only** deterministic test provisioning (fixed users + secret). Compiled out on production/hardware builds so known credentials never ship. |
 | `brotli selftest` | H U | Verify in-tree Brotli encoder + PicoWeb micro-Brotli decoder. |
 
 ---

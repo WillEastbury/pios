@@ -96,6 +96,9 @@
 #include "mmio.h"
 #include "capsule_store.h"
 #include "platform.h"
+#include "random.h"
+#include "sts.h"
+#include "sts_token.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -270,7 +273,7 @@ static tcp_conn_t http_listen_conn = -1;
 static tcp_conn_t https_tls_listen_conn = -1;
 static tcp_conn_t https_tls_tcp_conn = -1;
 static tls_conn_t https_tls_conn = -1;
-static u8 https_tls_req_buf[512];
+static u8 https_tls_req_buf[3072];   /* >= STS_TOKEN_MAX + request header overhead */
 static u32 https_tls_req_len;
 static bool https_tls_accepted;
 static bool https_tls_response_sent;
@@ -2409,6 +2412,236 @@ static void http_bench_row(char *out, u32 *len, u32 max, const char *label,
     http_append(out, len, max, "\n");
 }
 
+/* ---- PicoSTS console command (shared helpers + deterministic test harness) ----
+ *
+ * The `sts` console command exercises the real sts_login/sts_validate/upsert
+ * code paths deterministically so QEMU tests can cover login/validate/tamper/
+ * scope-denial without needing a TLS client. Test provisioning (fixed secret +
+ * known users) is compiled ONLY on the QEMU platform, so production/hardware
+ * builds never ship known credentials. No token bytes are ever printed. */
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+#define STS_TEST_PROVISION 1
+#else
+#define STS_TEST_PROVISION 0
+#endif
+
+static char g_sts_test_token[STS_TOKEN_MAX];
+static u32  g_sts_test_token_len;
+
+static const char *sts_err_name(i32 rc)
+{
+    switch (rc) {
+    case STS_OK:            return "ok";
+    case STS_ERR_INPUT:     return "invalid_input";
+    case STS_ERR_AUDIENCE:  return "audience_denied";
+    case STS_ERR_AUTH:      return "auth_failed";
+    case STS_ERR_FORBIDDEN: return "forbidden";
+    case STS_ERR_SCOPE:     return "scope_denied";
+    case STS_ERR_NOSECRET:  return "no_signing_secret";
+    case STS_ERR_NOTIME:    return "clock_unset";
+    case STS_ERR_EXPIRED:   return "token_expired";
+    case STS_ERR_FULL:      return "store_full";
+    default:                return "internal_error";
+    }
+}
+
+static u32 sts_next_arg(const char *s, u32 i, char *out, u32 cap)
+{
+    while (s[i] == ' ') i++;
+    u32 o = 0;
+    while (s[i] && s[i] != ' ') { if (o + 1U < cap) out[o++] = s[i]; i++; }
+    out[o] = 0;
+    return i;
+}
+
+/* Forward decl: the console `sts users` harness drives the real HTTP users
+ * handler (bearer admin gate + pagination) through a synthesized TLS request. */
+static u32 http_build_sts_response(char *out, u32 max, const u8 *req, u32 req_len, bool via_tls);
+
+static void http_exec_sts_command(char *out, u32 *len_ptr, u32 max, const char *args)
+{
+    u32 len = *len_ptr;
+    char sub[16];
+    u32 i = sts_next_arg(args, 0, sub, sizeof(sub));
+
+    if (sub[0] == 0 || http_streq(sub, "status")) {
+        struct sts_user_public snap[STS_MAX_USERS];
+        u32 n = sts_list(snap, STS_MAX_USERS);
+        http_append(out, &len, max, "sts status secret=");
+        http_append(out, &len, max, sts_has_secret() ? "yes" : "no");
+        http_append(out, &len, max, " users=");
+        http_append_u64(out, &len, max, n);
+        http_append(out, &len, max, " utc=");
+        http_append(out, &len, max, timer_utc_ms() ? "set" : "unset");
+        http_append(out, &len, max, " rng=");
+        http_append(out, &len, max, crypto_random_status());
+        http_append(out, &len, max, "\n");
+    }
+#if STS_TEST_PROVISION
+    else if (http_streq(sub, "testusers")) {
+        u8 salt_a[STS_SALT_LEN], salt_u[STS_SALT_LEN];
+        for (u32 k = 0; k < STS_SALT_LEN; k++) { salt_a[k] = (u8)(0xA0U + k); salt_u[k] = (u8)(0x50U + k); }
+        i32 r1 = sts_upsert_user("admin1", "pw-admin-123", salt_a,
+                                 (u16)(1U << 0), (u16)((1U<<0)|(1U<<1)|(1U<<2)), STS_FLAG_ADMIN);
+        i32 r2 = sts_upsert_user("user1", "pw-user-123", salt_u,
+                                 (u16)(1U << 0), (u16)(1U << 1), 0);
+        http_append(out, &len, max, "sts testusers admin1=");
+        http_append(out, &len, max, sts_err_name(r1));
+        http_append(out, &len, max, " user1=");
+        http_append(out, &len, max, sts_err_name(r2));
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(sub, "testsecret")) {
+        u8 secret[32];
+        for (u32 k = 0; k < 32; k++) secret[k] = (u8)(0x40U + k);
+        bool ok = sts_provision_secret(secret, sizeof(secret));
+        if (timer_utc_ms() == 0U) (void)timer_set_utc_ms(1700000000000ULL);
+        http_append(out, &len, max, ok ? "sts testsecret ok\n" : "sts testsecret FAIL\n");
+    }
+#endif
+    else if (http_streq(sub, "gensecret")) {
+        u8 secret[32];
+        if (!crypto_random_bytes(secret, sizeof(secret))) {
+            http_append(out, &len, max, "sts gensecret FAIL rng=");
+            http_append(out, &len, max, crypto_random_status());
+            http_append(out, &len, max, "\n");
+        } else {
+            bool ok = sts_provision_secret(secret, sizeof(secret));
+            for (u32 k = 0; k < sizeof(secret); k++) secret[k] = 0;
+            http_append(out, &len, max, ok ? "sts gensecret ok\n" : "sts gensecret FAIL provision\n");
+        }
+    } else if (http_streq(sub, "login")) {
+        char user[64], pass[128], aud[64], tenant[64], scope_s[160];
+        i = sts_next_arg(args, i, user, sizeof(user));
+        i = sts_next_arg(args, i, pass, sizeof(pass));
+        i = sts_next_arg(args, i, aud, sizeof(aud));
+        i = sts_next_arg(args, i, tenant, sizeof(tenant));
+        i = sts_next_arg(args, i, scope_s, sizeof(scope_s));
+        if (tenant[0] == 0) { tenant[0] = 'd'; tenant[1] = 'e'; tenant[2] = 'm'; tenant[3] = 'o'; tenant[4] = 0; }
+        u16 req_scope = 0;
+        bool scope_ok = true;
+        if (scope_s[0]) {
+            u32 j = 0;
+            while (scope_s[j]) {
+                while (scope_s[j] == '+' || scope_s[j] == ',') j++;
+                u32 st = j;
+                while (scope_s[j] && scope_s[j] != '+' && scope_s[j] != ',') j++;
+                if (j > st) {
+                    i32 si = sts_scope_index(&scope_s[st], j - st);
+                    if (si < 0) { scope_ok = false; break; }
+                    req_scope |= (u16)(1U << (u32)si);
+                }
+            }
+        }
+        char scope_out[256];
+        g_sts_test_token_len = 0;
+        i32 rc = scope_ok
+            ? sts_login(user, pass, aud, tenant, req_scope, 0,
+                        g_sts_test_token, sizeof(g_sts_test_token), &g_sts_test_token_len,
+                        scope_out, sizeof(scope_out))
+            : STS_ERR_SCOPE;
+        for (u32 k = 0; k < sizeof(pass); k++) pass[k] = 0;
+        if (rc == STS_OK) {
+            http_append(out, &len, max, "sts login ok scope=");
+            http_append(out, &len, max, scope_out);
+            http_append(out, &len, max, " tokenlen=");
+            http_append_u64(out, &len, max, g_sts_test_token_len);
+            http_append(out, &len, max, "\n");
+        } else {
+            http_append(out, &len, max, "sts login FAIL err=");
+            http_append(out, &len, max, sts_err_name(rc));
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(sub, "validate") || http_streq(sub, "tamper") || http_streq(sub, "authz")) {
+        bool is_authz = http_streq(sub, "authz");
+        char need_scope[32];
+        need_scope[0] = 0;
+        if (is_authz) i = sts_next_arg(args, i, need_scope, sizeof(need_scope));
+        char aud[64];
+        i = sts_next_arg(args, i, aud, sizeof(aud));
+        if (g_sts_test_token_len == 0) {
+            http_append(out, &len, max, "sts ");
+            http_append(out, &len, max, sub);
+            http_append(out, &len, max, " FAIL no_token\n");
+        } else {
+            char token[STS_TOKEN_MAX];
+            u32 tl = g_sts_test_token_len;
+            for (u32 k = 0; k < tl; k++) token[k] = g_sts_test_token[k];
+            token[tl] = 0;
+            if (http_streq(sub, "tamper")) {
+                /* flip a byte in the signature (last) segment => must fail closed */
+                token[tl - 1] = (token[tl - 1] == 'A') ? 'B' : 'A';
+            }
+            char tenant[64];
+            u16 scope_mask = 0;
+            i32 rc = sts_validate(token, tl, aud, tenant, sizeof(tenant), &scope_mask);
+            if (http_streq(sub, "tamper")) {
+                http_append(out, &len, max, (rc == STS_OK) ? "sts tamper VALID(BAD)\n" : "sts tamper invalid(ok)\n");
+            } else if (is_authz) {
+                i32 si = sts_scope_index(need_scope, pios_strlen(need_scope));
+                bool allow = (rc == STS_OK) && (si >= 0) && (scope_mask & (u16)(1U << (u32)si));
+                http_append(out, &len, max, allow ? "sts authz allow scope=" : "sts authz deny scope=");
+                http_append(out, &len, max, need_scope);
+                if (rc != STS_OK) { http_append(out, &len, max, " err="); http_append(out, &len, max, sts_err_name(rc)); }
+                http_append(out, &len, max, "\n");
+            } else {
+                if (rc == STS_OK) {
+                    char scope_str[256];
+                    (void)sts_scope_mask_to_string(scope_mask, scope_str, sizeof(scope_str));
+                    http_append(out, &len, max, "sts validate valid tenant=");
+                    http_append(out, &len, max, tenant);
+                    http_append(out, &len, max, " scope=");
+                    http_append(out, &len, max, scope_str);
+                    http_append(out, &len, max, "\n");
+                } else {
+                    http_append(out, &len, max, "sts validate invalid err=");
+                    http_append(out, &len, max, sts_err_name(rc));
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        }
+    } else if (http_streq(sub, "users")) {
+        /* Deterministic coverage for the /api/sts/users bearer-admin gate and
+         * pagination: synthesize a TLS GET carrying the last-issued test token
+         * as the Authorization bearer, then drive the REAL HTTP handler. */
+        char off_s[12], lim_s[12];
+        i = sts_next_arg(args, i, off_s, sizeof(off_s));
+        i = sts_next_arg(args, i, lim_s, sizeof(lim_s));
+        if (g_sts_test_token_len == 0) {
+            http_append(out, &len, max, "sts users FAIL no_token\n");
+        } else {
+            static char req[STS_TOKEN_MAX + 160];
+            static char resp[1280];
+            u32 rq = 0;
+            http_append(req, &rq, sizeof(req), "GET /api/sts/users");
+            if (off_s[0] || lim_s[0]) {
+                http_append(req, &rq, sizeof(req), "?offset=");
+                http_append(req, &rq, sizeof(req), off_s[0] ? off_s : "0");
+                http_append(req, &rq, sizeof(req), "&limit=");
+                http_append(req, &rq, sizeof(req), lim_s[0] ? lim_s : "0");
+            }
+            http_append(req, &rq, sizeof(req), " HTTP/1.0\r\nAuthorization: Bearer ");
+            http_append_bytes(req, &rq, sizeof(req), (const u8 *)g_sts_test_token, g_sts_test_token_len);
+            http_append(req, &rq, sizeof(req), "\r\n\r\n");
+            u32 rl = http_build_sts_response(resp, sizeof(resp), (const u8 *)req, rq, true);
+            http_append(out, &len, max, "sts users bytes=");
+            http_append_u64(out, &len, max, rl);
+            http_append(out, &len, max, "\n");
+            http_append_bytes(out, &len, max, (const u8 *)resp, rl);
+            http_append(out, &len, max, "\n");
+        }
+    } else {
+        http_append(out, &len, max,
+            "usage: sts status | sts login <user> <pass> <aud> <tenant> [scope+scope] | "
+            "sts validate <aud> | sts tamper <aud> | sts authz <scope> <aud> | "
+            "sts users [offset] [limit] | sts gensecret"
+#if STS_TEST_PROVISION
+            " | sts testusers | sts testsecret"
+#endif
+            "\n");
+    }
+    *len_ptr = len;
+}
+
 /* The single, shared implementation of every "terminal" command (~150+
  * commands: status/netstat/macbdiag/rp1 irq/stackdiag/processes/... -- the
  * full diagnostic surface). Both the HTTP /api/terminal handler and the
@@ -3343,6 +3576,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             { "proc_entry",  proc_entry_contract_selftest },
             { "tensor_neon", tensor_selftest },
             { "el2_stage2",  el2_stage2_selftest },
+            { "sts",         sts_selftest },
         };
         u32 nt = (u32)(sizeof(bat) / sizeof(bat[0]));
         u32 passed = 0;
@@ -5740,6 +5974,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_walfs_list_text(out, &len, max, cmd + 6);
     } else if (http_starts_with(cmd, "fsinspect ")) {
         http_append_walfs_list_text(out, &len, max, cmd + 10);
+    } else if (http_streq(cmd, "sts") || http_starts_with(cmd, "sts ")) {
+        http_exec_sts_command(out, &len, max, http_streq(cmd, "sts") ? "" : cmd + 4);
     } else if (http_streq(cmd, "walfs") || http_streq(cmd, "walfs status") ||
                http_streq(cmd, "fs status")) {
         struct walfs_status_snapshot ws;
@@ -8318,6 +8554,362 @@ static u32 http_build_spa_response(char *out, u32 max)
     return len;
 }
 
+/* ---- PicoSTS hosted auth/z endpoints (vendored contract, WALFS-backed) ----
+ *
+ * health + jwks are public (HTTP or HTTPS); login/validate/whoami/users are
+ * TLS-only and fail closed on plaintext. Credentials/tenants arrive as
+ * query/form parameters for this first slice (documented limitation) and are
+ * NEVER logged: no request-body echo, no secret in any http_log_event, and the
+ * password buffer is scrubbed before returning. HS256 is symmetric so /jwks
+ * intentionally exposes no key material. */
+static void http_sts_json_header(char *out, u32 *len, u32 max, const char *status)
+{
+    http_append(out, len, max, "HTTP/1.0 ");
+    http_append(out, len, max, status);
+    http_append(out, len, max,
+        "\r\nContent-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n");
+}
+
+/* Extract a bearer token from the Authorization header (NUL-terminated).
+ * Returns the token length or 0 (absent/oversized => fail closed). */
+/* True only for an HTTP POST request line (method is case-sensitive). */
+static bool http_method_is_post(const u8 *req, u32 len)
+{
+    return len >= 5U && req[0] == 'P' && req[1] == 'O' && req[2] == 'S' &&
+           req[3] == 'T' && (req[4] == ' ' || req[4] == '\t');
+}
+
+/* Extract a single request header value by case-insensitive name. name_lc must
+ * be lowercase and include the trailing ':'. Trims surrounding whitespace and
+ * fails closed (returns 0) on overflow. The caller must never log the result
+ * for secret headers such as X-PIOS-Password. */
+static u32 http_header_value_ci(const u8 *req, u32 len, const char *name_lc,
+                                char *out, u32 cap)
+{
+    if (!out || cap == 0U) return 0;
+    out[0] = 0;
+    u32 nlen = 0;
+    while (name_lc[nlen]) nlen++;
+    if (nlen == 0U) return 0;
+    for (u32 i = 0; i + nlen <= len; i++) {
+        if (i != 0 && req[i - 1] != '\n') continue;
+        if (!http_match_ci(&req[i], name_lc)) continue;
+        i += nlen;
+        while (i < len && (req[i] == ' ' || req[i] == '\t')) i++;
+        u32 o = 0;
+        while (i < len && req[i] != '\r' && req[i] != '\n') {
+            if (o + 1U >= cap) return 0;   /* fail closed on overflow */
+            out[o++] = (char)req[i++];
+        }
+        while (o > 0U && (out[o - 1] == ' ' || out[o - 1] == '\t')) o--;
+        out[o] = 0;
+        return o;
+    }
+    return 0;
+}
+
+static u32 http_bearer_token(const u8 *req, u32 len, char *out, u32 cap)
+{
+    static const char auth_hdr[] = "authorization:";
+    static const char bearer[] = "bearer ";
+    if (!out || cap == 0U) return 0;
+    out[0] = 0;
+    for (u32 i = 0; i + sizeof(auth_hdr) - 1 < len; i++) {
+        if (i != 0 && req[i - 1] != '\n') continue;
+        if (!http_match_ci(&req[i], auth_hdr)) continue;
+        i += (u32)sizeof(auth_hdr) - 1;
+        while (i < len && (req[i] == ' ' || req[i] == '\t')) i++;
+        if (i + sizeof(bearer) - 1 >= len || !http_match_ci(&req[i], bearer)) return 0;
+        i += (u32)sizeof(bearer) - 1;
+        u32 o = 0;
+        while (i < len && req[i] != '\r' && req[i] != '\n' && req[i] != ' ' && req[i] != '\t') {
+            if (o + 1U >= cap) return 0;   /* fail closed on overflow */
+            out[o++] = (char)req[i++];
+        }
+        out[o] = 0;
+        return o;
+    }
+    return 0;
+}
+
+/* Space/plus-separated scope string -> policy bitmask (unknown scope => fail). */
+static bool http_sts_parse_scopes(const char *s, u16 *mask_out)
+{
+    u16 mask = 0;
+    u32 i = 0;
+    while (s[i]) {
+        while (s[i] == ' ' || s[i] == '+') i++;
+        u32 start = i;
+        while (s[i] && s[i] != ' ' && s[i] != '+') i++;
+        if (i > start) {
+            i32 si = sts_scope_index(&s[start], i - start);
+            if (si < 0) return false;
+            mask |= (u16)(1U << (u32)si);
+        }
+    }
+    *mask_out = mask;
+    return true;
+}
+
+/* One TLS record is the hard transport limit for a :443 response (mirrors
+ * tls.c TLS_MAX_RECORD). The users listing is paginated to stay under it. */
+#define STS_TLS_RECORD_MAX  1024U
+/* Page cap for /api/sts/users so a full page + envelope + headers always fits
+ * one TLS record; a per-record size guard additionally enforces the bound. */
+#define STS_USERS_PAGE_MAX  4U
+
+static u32 http_build_sts_response(char *out, u32 max, const u8 *req, u32 req_len, bool via_tls)
+{
+    u32 len = 0;
+
+    /* ---- public: health ---- */
+    if (http_request_path_is(req, req_len, "/api/sts/health")) {
+        u64 utc = timer_utc_ms();
+        http_sts_json_header(out, &len, max, "200 OK");
+        http_append(out, &len, max, "{\"service\":\"sts\",\"has_secret\":");
+        http_append(out, &len, max, sts_has_secret() ? "true" : "false");
+        http_append(out, &len, max, ",\"utc_set\":");
+        http_append(out, &len, max, utc ? "true" : "false");
+        http_append(out, &len, max, ",\"rng_available\":");
+        http_append(out, &len, max, crypto_random_available() ? "true" : "false");
+        http_append(out, &len, max, ",\"rng\":");
+        http_append_json_string(out, &len, max, crypto_random_status());
+        http_append(out, &len, max, ",\"tls\":");
+        http_append(out, &len, max, via_tls ? "true" : "false");
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+
+    /* ---- public: JWKS (HS256 symmetric => no public keys, ever) ---- */
+    if (http_request_path_is(req, req_len, "/api/sts/jwks")) {
+        http_sts_json_header(out, &len, max, "200 OK");
+        http_append(out, &len, max, "{\"keys\":[],\"alg\":\"HS256\",\"note\":\"symmetric; no public key material\"}\n");
+        return len;
+    }
+
+    /* ---- everything below is sensitive: TLS-only, fail closed ---- */
+    if (!via_tls) {
+        http_sts_json_header(out, &len, max, "403 Forbidden");
+        http_append(out, &len, max, "{\"ok\":false,\"error\":\"tls_required\"}\n");
+        return len;
+    }
+
+    /* ---- login: password -> scoped token (mirrors POST /sts/login) ---- */
+    if (http_request_path_is(req, req_len, "/api/sts/login")) {
+        if (!http_method_is_post(req, req_len)) {
+            http_sts_json_header(out, &len, max, "405 Method Not Allowed");
+            http_append(out, &len, max, "{\"ok\":false,\"error\":\"method_not_allowed\"}\n");
+            return len;
+        }
+        char user[64], pass[128], aud[64], tenant[64], scope_s[160], ttl_s[16];
+        char token[STS_TOKEN_MAX];
+        char scope_out[256];
+        u32 tlen = 0;
+        u16 req_scope = 0;
+        u32 ttl = 0;
+        /* Non-secret identifiers stay bounded query params; the password is
+         * carried only in the X-PIOS-Password header (TLS-only path) and is
+         * never taken from the URL and never logged. */
+        u32 plen = http_header_value_ci(req, req_len, "x-pios-password:", pass, sizeof(pass));
+        if (plen == 0U ||
+            !http_query_value(req, req_len, "/api/sts/login", "user", user, sizeof(user)) ||
+            !http_query_value(req, req_len, "/api/sts/login", "aud", aud, sizeof(aud))) {
+            for (u32 k = 0; k < sizeof(pass); k++) pass[k] = 0;
+            http_sts_json_header(out, &len, max, "400 Bad Request");
+            http_append(out, &len, max, "{\"ok\":false,\"error\":\"missing_params\"}\n");
+            return len;
+        }
+        if (!http_query_value(req, req_len, "/api/sts/login", "tenant", tenant, sizeof(tenant)) || tenant[0] == 0) {
+            tenant[0] = 'd'; tenant[1] = 'e'; tenant[2] = 'f'; tenant[3] = 'a';
+            tenant[4] = 'u'; tenant[5] = 'l'; tenant[6] = 't'; tenant[7] = 0;
+        }
+        if (http_query_value(req, req_len, "/api/sts/login", "scope", scope_s, sizeof(scope_s)) && scope_s[0]) {
+            if (!http_sts_parse_scopes(scope_s, &req_scope)) {
+                for (u32 k = 0; k < sizeof(pass); k++) pass[k] = 0;
+                http_sts_json_header(out, &len, max, "403 Forbidden");
+                http_append(out, &len, max, "{\"ok\":false,\"error\":\"scope_denied\"}\n");
+                return len;
+            }
+        }
+        if (http_query_value(req, req_len, "/api/sts/login", "ttl", ttl_s, sizeof(ttl_s)))
+            (void)http_parse_u32(ttl_s, &ttl);
+
+        i32 rc = sts_login(user, pass, aud, tenant, req_scope, ttl,
+                           token, sizeof(token), &tlen, scope_out, sizeof(scope_out));
+        for (u32 k = 0; k < sizeof(pass); k++) pass[k] = 0;   /* scrub secret */
+
+        if (rc == STS_OK) {
+            http_sts_json_header(out, &len, max, "200 OK");
+            http_append(out, &len, max, "{\"ok\":true,\"token\":\"");
+            http_append(out, &len, max, token);
+            http_append(out, &len, max, "\",\"scope\":");
+            http_append_json_string(out, &len, max, scope_out);
+            http_append(out, &len, max, "}\n");
+        } else {
+            http_sts_json_header(out, &len, max, (rc == STS_ERR_AUTH) ? "401 Unauthorized" : "403 Forbidden");
+            http_append(out, &len, max, "{\"ok\":false,\"error\":\"");
+            http_append(out, &len, max, sts_err_name(rc));
+            http_append(out, &len, max, "\"}\n");
+        }
+        return len;
+    }
+
+    /* ---- validate: token + audience -> claims (mirrors POST /sts/validate) ---- */
+    if (http_request_path_is(req, req_len, "/api/sts/validate")) {
+        if (!http_method_is_post(req, req_len)) {
+            http_sts_json_header(out, &len, max, "405 Method Not Allowed");
+            http_append(out, &len, max, "{\"ok\":false,\"error\":\"method_not_allowed\"}\n");
+            return len;
+        }
+        char token[STS_TOKEN_MAX], aud[64], tenant[64];
+        u16 scope_mask = 0;
+        /* Token is only accepted via Authorization: Bearer, never in the URL. */
+        u32 tlen = http_bearer_token(req, req_len, token, sizeof(token));
+        if (tlen == 0 ||
+            !http_query_value(req, req_len, "/api/sts/validate", "aud", aud, sizeof(aud))) {
+            http_sts_json_header(out, &len, max, "400 Bad Request");
+            http_append(out, &len, max, "{\"ok\":false,\"error\":\"missing_params\"}\n");
+            return len;
+        }
+        i32 rc = sts_validate(token, tlen, aud, tenant, sizeof(tenant), &scope_mask);
+        if (rc == STS_OK) {
+            char scope_str[256];
+            (void)sts_scope_mask_to_string(scope_mask, scope_str, sizeof(scope_str));
+            http_sts_json_header(out, &len, max, "200 OK");
+            http_append(out, &len, max, "{\"active\":true,\"tenant\":");
+            http_append_json_string(out, &len, max, tenant);
+            http_append(out, &len, max, ",\"scope\":");
+            http_append_json_string(out, &len, max, scope_str);
+            http_append(out, &len, max, "}\n");
+        } else {
+            http_sts_json_header(out, &len, max, "200 OK");
+            http_append(out, &len, max, "{\"active\":false,\"error\":\"");
+            http_append(out, &len, max, sts_err_name(rc));
+            http_append(out, &len, max, "\"}\n");
+        }
+        return len;
+    }
+
+    /* ---- whoami: token-gated authorization boundary (requires sts.validate) --- */
+    if (http_request_path_is(req, req_len, "/api/sts/whoami")) {
+        char token[STS_TOKEN_MAX], tenant[64];
+        u16 scope_mask = 0;
+        u32 tlen = http_bearer_token(req, req_len, token, sizeof(token));
+        if (tlen == 0) {
+            http_sts_json_header(out, &len, max, "401 Unauthorized");
+            http_append(out, &len, max, "{\"ok\":false,\"error\":\"missing_bearer\"}\n");
+            return len;
+        }
+        i32 rc = sts_validate(token, tlen, "wave-sts", tenant, sizeof(tenant), &scope_mask);
+        u16 need = (u16)(1U << 1);   /* sts.validate */
+        if (rc != STS_OK || !(scope_mask & need)) {
+            http_sts_json_header(out, &len, max, "403 Forbidden");
+            http_append(out, &len, max, "{\"ok\":false,\"error\":\"");
+            http_append(out, &len, max, (rc != STS_OK) ? sts_err_name(rc) : "scope_denied");
+            http_append(out, &len, max, "\"}\n");
+            return len;
+        }
+        char scope_str[256];
+        (void)sts_scope_mask_to_string(scope_mask, scope_str, sizeof(scope_str));
+        http_sts_json_header(out, &len, max, "200 OK");
+        http_append(out, &len, max, "{\"ok\":true,\"tenant\":");
+        http_append_json_string(out, &len, max, tenant);
+        http_append(out, &len, max, ",\"scope\":");
+        http_append_json_string(out, &len, max, scope_str);
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+
+    /* ---- admin: list users ---- */
+    if (http_request_path_is(req, req_len, "/api/sts/users")) {
+        /* HTTP_AUTH_ENABLED is 0, so http_admin_authorized() cannot gate this
+         * route. Require a real STS bearer token for audience "wave-sts" that
+         * carries the sts.admin scope. Missing bearer => 401; invalid/expired
+         * token => 401; valid token without sts.admin => 403. Fail closed. */
+        char token[STS_TOKEN_MAX], tenant[64];
+        u16 scope_mask = 0;
+        u32 tlen = http_bearer_token(req, req_len, token, sizeof(token));
+        if (tlen == 0) {
+            http_sts_json_header(out, &len, max, "401 Unauthorized");
+            http_append(out, &len, max, "{\"ok\":false,\"error\":\"missing_bearer\"}\n");
+            return len;
+        }
+        i32 arc = sts_validate(token, tlen, "wave-sts", tenant, sizeof(tenant), &scope_mask);
+        if (arc != STS_OK) {
+            http_sts_json_header(out, &len, max, "401 Unauthorized");
+            http_append(out, &len, max, "{\"ok\":false,\"error\":\"");
+            http_append(out, &len, max, sts_err_name(arc));
+            http_append(out, &len, max, "\"}\n");
+            return len;
+        }
+        i32 admin_idx = sts_scope_index("sts.admin", 9);
+        if (admin_idx < 0 || !(scope_mask & (u16)(1U << (u32)admin_idx))) {
+            http_sts_json_header(out, &len, max, "403 Forbidden");
+            http_append(out, &len, max, "{\"ok\":false,\"error\":\"scope_denied\"}\n");
+            return len;
+        }
+
+        /* Bounded pagination. limit is clamped to STS_USERS_PAGE_MAX; a
+         * per-record size guard then guarantees the complete response (headers
+         * + JSON) never exceeds one STS_TLS_RECORD_MAX TLS record. */
+        u32 offset = 0, limit = STS_USERS_PAGE_MAX;
+        char num[16];
+        if (http_query_value(req, req_len, "/api/sts/users", "offset", num, sizeof(num)))
+            (void)http_parse_u32(num, &offset);
+        if (http_query_value(req, req_len, "/api/sts/users", "limit", num, sizeof(num))) {
+            u32 l = 0;
+            if (http_parse_u32(num, &l) && l != 0U && l < limit) limit = l;
+        }
+
+        static struct sts_user_public snap[STS_MAX_USERS];
+        u32 total = sts_list(snap, STS_MAX_USERS);
+        u32 start = (offset < total) ? offset : total;
+
+        http_sts_json_header(out, &len, max, "200 OK");
+        http_append(out, &len, max, "{\"ok\":true,\"total\":");
+        http_append_u64(out, &len, max, total);
+        http_append(out, &len, max, ",\"offset\":");
+        http_append_u64(out, &len, max, start);
+        http_append(out, &len, max, ",\"users\":[");
+
+        u32 emitted = 0;
+        u32 idx = start;
+        for (; idx < total && emitted < limit; idx++) {
+            char rec[320];
+            u32 rl = 0;
+            char scope_str[160];
+            (void)sts_scope_mask_to_string(snap[idx].scope_mask, scope_str, sizeof(scope_str));
+            if (emitted) http_append(rec, &rl, sizeof(rec), ",");
+            http_append(rec, &rl, sizeof(rec), "{\"username\":");
+            http_append_json_string(rec, &rl, sizeof(rec), snap[idx].username);
+            http_append(rec, &rl, sizeof(rec), ",\"admin\":");
+            http_append(rec, &rl, sizeof(rec), (snap[idx].flags & STS_FLAG_ADMIN) ? "true" : "false");
+            http_append(rec, &rl, sizeof(rec), ",\"disabled\":");
+            http_append(rec, &rl, sizeof(rec), (snap[idx].flags & STS_FLAG_DISABLED) ? "true" : "false");
+            http_append(rec, &rl, sizeof(rec), ",\"scope\":");
+            http_append_json_string(rec, &rl, sizeof(rec), scope_str);
+            http_append(rec, &rl, sizeof(rec), "}");
+            /* Reserve room for the closing  ],"limit":N,"next":NNN}\n. */
+            if (len + rl + 32U > STS_TLS_RECORD_MAX) break;
+            http_append_bytes(out, &len, max, (const u8 *)rec, rl);
+            emitted++;
+        }
+        http_append(out, &len, max, "],\"limit\":");
+        http_append_u64(out, &len, max, limit);
+        http_append(out, &len, max, ",\"next\":");
+        if (idx < total) http_append_u64(out, &len, max, idx);
+        else http_append(out, &len, max, "null");
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+
+    http_sts_json_header(out, &len, max, "404 Not Found");
+    http_append(out, &len, max, "{\"ok\":false,\"error\":\"unknown_sts_route\"}\n");
+    return len;
+}
+
 static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     u32 len = 0;
@@ -8346,6 +8938,21 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
         len = http_build_no_content_response(out, max);
         http_diag.build_len = len;
         http_trace(HTTP_EVT_BUILD_EXIT, route, len, 204);
+        return len;
+    }
+    /* PicoSTS endpoints. This dispatcher only ever runs on the plaintext :80
+     * server, so via_tls is always false here: health/jwks answer, and the
+     * sensitive login/validate/whoami/users routes fail closed with 403
+     * tls_required. The HTTPS :443 path routes these with via_tls=true. */
+    if (http_request_path_is(req, req_len, "/api/sts/health") ||
+        http_request_path_is(req, req_len, "/api/sts/jwks") ||
+        http_request_path_is(req, req_len, "/api/sts/login") ||
+        http_request_path_is(req, req_len, "/api/sts/validate") ||
+        http_request_path_is(req, req_len, "/api/sts/whoami") ||
+        http_request_path_is(req, req_len, "/api/sts/users")) {
+        len = http_build_sts_response(out, max, req, req_len, false);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
         return len;
     }
     if (HTTP_AUTH_ENABLED && !http_admin_authorized(req, req_len)) {
@@ -9622,23 +10229,94 @@ static void echo_tcp_poll(void) {
                     https_tls_tcp_conn = -1;
                 }
             } else if (!https_tls_response_sent) {
-                if (tcp_readable(https_tls_tcp_conn) > 0 && https_tls_req_len == 0) {
-                    i32 rn = tls_read(https_tls_conn, https_tls_req_buf, sizeof(https_tls_req_buf));
-                    if (rn > 0) https_tls_req_len = (u32)rn;
+                /* Accumulate the (possibly multi-segment, POST-bodied) request
+                 * across polls until it is structurally complete. A single
+                 * gated read cannot hold a POST login carrying an
+                 * X-PIOS-Password header plus body, so append each readable
+                 * chunk and only dispatch once http_request_complete() is true.
+                 * Fail closed if the buffer fills before the request completes. */
+                if (tcp_readable(https_tls_tcp_conn) > 0 &&
+                    https_tls_req_len < sizeof(https_tls_req_buf)) {
+                    i32 rn = tls_read(https_tls_conn,
+                                      https_tls_req_buf + https_tls_req_len,
+                                      sizeof(https_tls_req_buf) - https_tls_req_len);
+                    if (rn > 0) {
+                        https_tls_req_len += (u32)rn;
+                        https_tls_last_activity_ms = timer_monotonic_ms();
+                    }
                 }
-                static const char resp[] =
-                    "HTTP/1.0 200 OK\r\n"
-                    "Content-Type: text/plain\r\n"
-                    "Content-Length: 20\r\n"
-                    "Connection: close\r\n\r\n"
-                    "PIOS kernel TLS 443\n";
-                if (tls_write(https_tls_conn, resp, sizeof(resp) - 1) > 0) {
-                    https_tls_response_sent = true;
-                    https_tls_last_activity_ms = timer_monotonic_ms();
-                    http_log_event("tls443-response", HTTPS_TLS_TCP_PORT, sizeof(resp) - 1);
-                    tls_close(https_tls_conn);
-                    https_tls_tcp_conn = -1;
-                    https_tls_conn = -1;
+
+                bool buf_full = https_tls_req_len >= sizeof(https_tls_req_buf);
+                bool complete = https_tls_req_len > 0 &&
+                    http_request_complete(https_tls_req_buf, https_tls_req_len);
+
+                if (!complete && !buf_full) {
+                    /* Still waiting for the rest of the request. Drop the
+                     * connection if the peer goes quiet for too long. */
+                    if ((timer_monotonic_ms() - https_tls_last_activity_ms) > 5000ULL) {
+                        tls_close(https_tls_conn);
+                        https_tls_tcp_conn = -1;
+                        https_tls_conn = -1;
+                    }
+                } else {
+                    /* Route PicoSTS endpoints over TLS (via_tls=true) so the
+                     * TLS-only login/validate/whoami/users routes are reachable
+                     * only here, never on plaintext :80. Non-STS paths keep the
+                     * minimal health banner. */
+                    static char https_resp[8192];
+                    char sts_tail[64];
+                    i32 wn = -1;
+                    if (buf_full && !complete) {
+                        /* Oversized / incomplete request -> fail closed. */
+                        static const char toobig[] =
+                            "HTTP/1.0 431 Request Header Fields Too Large\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"ok\":false,\"error\":\"request_too_large\"}\n";
+                        wn = tls_write(https_tls_conn, toobig, sizeof(toobig) - 1);
+                    } else if (http_request_path_prefix_token(https_tls_req_buf,
+                                   https_tls_req_len, "/api/sts", sts_tail, sizeof(sts_tail))) {
+                        u32 rlen = http_build_sts_response(https_resp, sizeof(https_resp),
+                                                           https_tls_req_buf, https_tls_req_len, true);
+                        /* tls_write cannot safely split a record: a response
+                         * larger than one TLS record would be rejected by
+                         * tls_write anyway, so fail closed with a small 500
+                         * rather than emitting a truncated/oversized frame. */
+                        if (rlen == 0U || rlen > STS_TLS_RECORD_MAX) {
+                            static const char too_big[] =
+                                "HTTP/1.0 500 Internal Server Error\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"ok\":false,\"error\":\"response_too_large\"}\n";
+                            wn = tls_write(https_tls_conn, too_big, sizeof(too_big) - 1);
+                        } else {
+                            wn = tls_write(https_tls_conn, https_resp, rlen);
+                        }
+                    } else {
+                        static const char resp[] =
+                            "HTTP/1.0 200 OK\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "Content-Length: 20\r\n"
+                            "Connection: close\r\n\r\n"
+                            "PIOS kernel TLS 443\n";
+                        wn = tls_write(https_tls_conn, resp, sizeof(resp) - 1);
+                    }
+                    if (wn > 0) {
+                        https_tls_response_sent = true;
+                        https_tls_last_activity_ms = timer_monotonic_ms();
+                        http_log_event("tls443-response", HTTPS_TLS_TCP_PORT, (u32)wn);
+                        tls_close(https_tls_conn);
+                        https_tls_tcp_conn = -1;
+                        https_tls_conn = -1;
+                    } else {
+                        /* tls_write cannot partially queue a record, so a
+                         * non-positive result is terminal: reset the sole
+                         * connection immediately instead of retrying forever. */
+                        http_log_event("tls443-write-fail", HTTPS_TLS_TCP_PORT, (u32)wn);
+                        tls_close(https_tls_conn);
+                        https_tls_tcp_conn = -1;
+                        https_tls_conn = -1;
+                    }
                 }
             } else if ((timer_monotonic_ms() - https_tls_last_activity_ms) > 1000ULL) {
                 tls_close(https_tls_conn);
@@ -20776,6 +21454,12 @@ void kernel_main(void) {
         bp_log("[cache] bcache_init...");
         bcache_init();
         watchdog_hw_pet();
+        bp_log("[rng] crypto_random_init...");
+        crypto_random_init();
+        if (crypto_random_available())
+            bp_ok("[rng] trusted entropy source online");
+        else
+            bp_warn("[rng] no trusted entropy source (secrets require explicit provisioning)");
         bp_log("[walfs] walfs_init...");
         walfs_ok = walfs_init();
         watchdog_hw_pet();
@@ -20820,14 +21504,21 @@ void kernel_main(void) {
              * because the stored hash no longer matches. */
             uart_puts("[bt] skip EL2 integ arm (dev)\n");
             bp_warn("[walfs] integrity check skipped (dev)");
+            /* STS user store is WALFS-backed; mount it now that WALFS +
+             * principal identity are online. Fails closed internally (no
+             * secret / unset clock gate at issue time). */
+            bp_log("[sts] sts_init...");
+            if (sts_init())
+                bp_ok("[sts] token service mounted");
+            else
+                bp_warn("[sts] token service mount FAILED");
         } else {
             bp_err("[walfs] WALFS init FAILED");
         }
         if (walfs_ok) bp_ok("[fs] SD + WALFS online");
         else bp_warn("[fs] SD ok, WALFS failed");
         bp_log("[key] keystore_init...");
-        if (keystore_init()) {
-            bp_ok("[key] sealed root ready");
+        if (keystore_init()) {            bp_ok("[key] sealed root ready");
             bp_log("[x509] x509_init...");
             x509_init();
             if (x509_generate_dev_cert("PIOS kernel dev") && x509_bind_tls())

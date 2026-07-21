@@ -432,3 +432,129 @@ For exact signatures, use the corresponding header as source of truth.
 - If an operation is in `struct kernel_api`, it is userland-callable.
 - Raw driver entrypoints (`genet_*`, `sd_*`, `v3d_*`, etc.) are kernel C APIs unless explicitly bridged by a PIKEE/IPC surface.
 - `tensor_bind_kernel_blob` is now bridged to userland for controlled real-kernel bring-up (admin capability required).
+
+## 4) PicoSTS hosted authentication / authorization
+
+PIOS hosts a native re-implementation of the PicoSTS ("wave-sts") security token
+service. It is a fail-closed HS256 JWT issuer/validator with a WALFS-backed user
+store. It is wire-compatible with the Python reference
+(`retail_v2.auth.TokenIssuer`); the pure token/KDF/codec core lives in
+`src/sts_token.c` (host-tested, `tests/test_sts_token.c`) and the service in
+`src/sts.c` (`include/sts.h`).
+
+### Storage (WALFS, not embedded PicoWAL)
+
+Records persist as fixed-layout files under a deck-mapped directory, mirroring
+the `principal.c` precedent:
+
+| Path | Contents |
+|------|----------|
+| `/var/sts/users.rec` | Packed `struct sts_user[]` (username, 16-byte salt, PBKDF2-SHA256 pwhash, audience mask, scope mask, flags). |
+| `/var/sts/secret.key` | HS256 signing secret (>= 32 bytes). Absent until explicitly provisioned. |
+
+Passwords are hashed with PBKDF2-HMAC-SHA256, 120000 iterations (matches the
+PicoSTS `UserStore._hash_password`). No plaintext password or token is ever
+persisted or logged.
+
+### Randomness / provisioning status (fail-closed)
+
+There is **no wired hardware CSPRNG** on the current target. `include/random.h`
+(`src/random.c`) is the single, auditable entropy seam: it probes Armv8.5
+`FEAT_RNG` (`RNDR`) via `ID_AA64ISAR0_EL1` and uses it only when present. On the
+Pi 5 (Cortex-A76, Armv8.2) and the QEMU `cortex-a53` model the feature is
+absent, so `crypto_random_available()` is **false** and `crypto_random_bytes()`
+fails closed (zeroes the buffer, returns false) — it never substitutes
+timer/PMU entropy. Consequently the STS signing secret and per-user salts must
+be **provisioned out-of-band**; the service refuses to issue tokens with no
+secret. `/api/sts/health` reports the live RNG status string.
+
+### TLS requirement
+
+- `GET /api/sts/health` and `GET /api/sts/jwks` are **public** (HTTP or HTTPS).
+- `/api/sts/login`, `/api/sts/validate`, `/api/sts/whoami`, `/api/sts/users` are
+  **TLS-only**. The plaintext `:80` router answers these with
+  `403 {"error":"tls_required"}`. They function on the kernel TLS server (`:443`),
+  which routes `/api/sts/*` with the request-context TLS flag set.
+
+> **Scope of protection.** The PIOS `:443` endpoint is currently a *custom,
+> non-browser* kernel TLS record wrapper, not a browser-compatible X.509 HTTPS
+> server. STS therefore protects **only its own `/api/sts/*` TLS endpoints** —
+> it does not yet secure the browser IDE or the existing admin surface. The
+> global legacy `HTTP_AUTH_ENABLED` path is intentionally left unchanged, and
+> `/picoscript/config` reports `picosts_enabled:false`. Migrating the IDE and
+> admin routes onto STS bearer tokens awaits browser-compatible TLS plus bearer
+> wiring and is out of scope for this slice.
+
+### HTTP endpoints
+
+Non-secret identifiers (`user`, `aud`, `tenant`, `scope`, `ttl`) are accepted as
+bounded URL query parameters for this first slice (a documented limitation; a JSON
+body parser is intentionally not used). **Secrets are never placed in the URL:**
+the login password is carried only in the `X-PIOS-Password` request header, and
+tokens only in `Authorization: Bearer`. Mutating routes require `POST`. Secret
+headers/tokens are never logged.
+
+| Method/Path | TLS | Auth | Parameters | Result |
+|-------------|-----|------|-----------|--------|
+| `GET /api/sts/health` | no | none | — | `{"service":"sts","has_secret":bool,"utc_set":bool,"rng_available":bool,"rng":str,"tls":bool}` |
+| `GET /api/sts/jwks` | no | none | — | `{"keys":[],"alg":"HS256",...}` — HS256 is symmetric so no key material is exposed. |
+| `POST /api/sts/login` | yes | `X-PIOS-Password` header | query `user,aud[,tenant,scope,ttl]` + header `X-PIOS-Password` | `200 {"ok":true,"token":"…","scope":"…"}` or `400/401/403/405 {"ok":false,"error":…}` |
+| `POST /api/sts/validate` | yes | bearer token | header `Authorization: Bearer ...` + query `aud` | `200 {"active":bool,"tenant":…,"scope":…}` |
+| `GET /api/sts/whoami` | yes | bearer token | header `Authorization: Bearer ...` | Authorization boundary: `200 {"ok":true,…}` only when the token validates and carries `sts.validate`; else `403`. |
+| `GET /api/sts/users` | yes | bearer token w/ `sts.admin` | header `Authorization: Bearer` + query `[offset,limit]` | `200 {"ok":true,"total":N,"offset":N,"users":[…],"limit":N,"next":N|null}` (no secrets), else `401/403` |
+
+Non-`POST` requests to `login`/`validate` return `405 method_not_allowed` (after
+the TLS gate). A request larger than the `:443` request buffer fails closed with
+`431 request_too_large`. A built response larger than one TLS record
+(`STS_TLS_RECORD_MAX` = 1024, mirroring `tls.c`) fails closed with
+`500 response_too_large`; the `:443` dispatcher never splits a TLS record and
+resets the connection immediately if `tls_write` fails.
+
+`/api/sts/whoami` is a real authorization boundary: access is granted only after
+`sts_validate()` verifies the bearer token and confirms the required scope.
+`/api/sts/users` is **not** gated by `http_admin_authorized` (legacy HTTP auth is
+compiled out, `HTTP_AUTH_ENABLED=0`). It requires a valid STS bearer token for
+audience `wave-sts` that carries the `sts.admin` scope: missing bearer → `401
+missing_bearer`, invalid/expired token → `401 <error>`, valid token without
+`sts.admin` → `403 scope_denied`. The listing is paginated with bounded `offset`
+and `limit` (clamped to `STS_USERS_PAGE_MAX` = 4); a per-record size guard keeps
+the whole response inside one TLS record, and `next` returns the continuation
+offset (or `null` when the listing is exhausted).
+
+### Fail-closed matrix
+
+Every path returns a negative status / non-2xx on: unset UTC clock
+(`clock_unset`), missing signing secret (`no_signing_secret`), unknown/disabled
+user or wrong password (`auth_failed`), audience not permitted for the user
+(`audience_denied`/`forbidden`), scope not permitted by policy or not granted to
+the user (`scope_denied`/`forbidden`), and malformed/tampered/expired tokens
+(`auth_failed`/`token_expired`). Audiences and scopes are constrained to a fixed
+allowlist (`STS_AUD` / `STS_SCOPE` / `STS_POLICY` in `src/sts.c`, mirroring
+wave-sts `_scope_policy()`).
+
+### Startup and self-test
+
+`sts_init()` runs during boot after WALFS + principal init (fail-closed if WALFS
+is unavailable). `crypto_random_init()` runs earlier and logs whether a trusted
+entropy source is present. `sts_selftest` is part of the kernel `selftest`
+battery (PBKDF2 KAT + in-memory HS256 round-trip + tamper rejection + a WALFS
+replace-shrink-read regression check).
+
+### Console command (diagnostics / test harness)
+
+See `docs/commands.md` for the `sts` console command. The deterministic
+`sts testusers` / `sts testsecret` provisioning is compiled **only** on the QEMU
+platform (`PIOS_PLATFORM_QEMU_VIRT`); production/hardware builds never ship known
+credentials or a known secret.
+
+### Limitations (this slice)
+
+- No JSON request-body parser: bounded query parameters for non-secret fields;
+  the password uses the `X-PIOS-Password` header and tokens use `Authorization:
+  Bearer`.
+- No CSPRNG on current hardware: secrets/salts require explicit provisioning.
+- OIDC/SSO federation (`wave_sts/oidc.py`, RS256/ES256, external IdP) is out of
+  scope.
+- The `:443` kernel TLS server is a minimal single-connection, non-browser TLS
+  wrapper; it is the TLS transport for `/api/sts/*` but is not a full concurrent
+  HTTPS pool and does not yet secure the IDE/admin surfaces.
