@@ -267,7 +267,17 @@ static const u8 font8x8_box[][8] = {
  * kernel (canary/canary_main.c).  Bypasses mailbox.c to eliminate any
  * differences in cache flushing, message construction, or timing.
  */
+#ifdef PIOS_RUNTIME_MMIO_BOOTSTRAP
+#include "board_detect.h"
+/* Same rationale as sd.c's runtime EMMC base: the bootstrap image links
+ * this same fb.c for both Pi5 and BCM2837-family boards, and the mailbox
+ * lives at a different physical address on each. board_detect_init() has
+ * already resolved g_board_bases.mbox_base by the time kernel_fb_early()
+ * (which calls this) runs. */
+#define FB_MBOX_BASE       (g_board_bases.mbox_base)
+#else
 #define FB_MBOX_BASE       0x107C013880UL
+#endif
 #define FB_MBOX0_READ      (FB_MBOX_BASE + 0x00)
 #define FB_MBOX0_STATUS    (FB_MBOX_BASE + 0x18)
 #define FB_MBOX1_WRITE     (FB_MBOX_BASE + 0x20)

@@ -54,6 +54,33 @@ _start:
     str     xzr, [x1], #8
     b       .Lbss
 .Lbss_done:
+    /* ── Runtime board detection (before ANY MMU/peripheral setup) ──
+     * MIDR_EL1 is a CPU identification system register, not an MMIO
+     * peripheral, so it's always safe to read here regardless of which
+     * board this is -- unlike any peripheral address, which we don't yet
+     * know how to map correctly until AFTER this decision. The L1 page
+     * table itself must differ by board: Pi5's peripherals live at a high
+     * 36-bit address entirely outside the low 4 GiB, while the BCM2837
+     * family's (Pi3/Pi Zero 2W) peripherals live INSIDE the low 1-2 GiB
+     * that would otherwise be a simple Normal-NC RAM block, so giving them
+     * Device memory type requires a genuinely different table layout, not
+     * just different addresses. board_detect_init() (src/board_detect.c)
+     * also populates g_board_bases/g_board_family for later C-side use
+     * (bootstrap.c/sd.c/fb.c's runtime peripheral base resolution). */
+    bl      board_detect_init
+    ldr     x0, =g_board_family
+    ldr     w0, [x0]
+    cmp     w0, #1                      /* BOARD_FAMILY_PI5     */
+    b.eq    .Lb_pi5_table
+    cmp     w0, #2                      /* BOARD_FAMILY_BCM2837 */
+    b.eq    .Lb_bcm2837_table
+    /* BOARD_FAMILY_UNKNOWN (0) or anything else: neither peripheral map is
+     * known to be safe. Fail closed rather than guess -- an unrecognized
+     * core here means genuinely unanticipated hardware, and silently
+     * assuming either board's addresses risks an external abort or worse
+     * on whatever this actually is. */
+    b       .Lhalt
+
     /* ── EL1 MMU bring-up (required before touching SD/EMMC) ──
      * sd.c's EMMC PIO bring-up and the VideoCore mailbox are only proven
      * correct with the MMU enabled and the low 1 GiB mapped Normal-NC — the
@@ -70,6 +97,7 @@ _start:
      *   L1[64..67]   0x10_00000000  Device     UART, mailbox, EMMC2, PM watchdog
      *   L1[124..127] 0x1F_00000000  Device     RP1 (unused by stage0)
      */
+.Lb_pi5_table:
     ldr     x0, =l1_table
     mov     x1, #512
 .Lb_zero_l1:
@@ -114,6 +142,72 @@ _start:
     cmp     x5, #128
     b.lt    .Lb_rp1
 
+    b       .Lb_mmu_enable
+
+    /* ── BCM2837-family (Pi3 B/B+/A+, Pi Zero 2 W): peripherals fall inside
+     * the low 4 GiB, so L1[0] and L1[1] cannot be simple 1 GiB blocks with
+     * a single memory type each the way Pi5's can:
+     *   L1[0] -> l2_table_bcm2837_boot (2 MiB granularity):
+     *     L2[0..503]   0x00000000-0x3EFFFFFF (1008 MiB) Normal-NC   RAM
+     *     L2[504..511] 0x3F000000-0x3FFFFFFF (16 MiB)   Device      low periph
+     *       (UART0/mailbox/EMMC/PM watchdog -- see board_detect.c)
+     *   L1[1] 0x40000000-0x7FFFFFFF: single 1 GiB Device block. QA7
+     *     (ARM-local peripherals: per-core timer IRQ enables, IPI
+     *     mailboxes -- see src/irqc_legacy.c) lives at its very start
+     *     (0x40000000); stage0 never touches anything else in this range,
+     *     so there is no need to split it further.
+     *   L1[2]/L1[3]: left unmapped (fault on any access). Stage0's own RAM
+     *     usage (BOOT_STAGING_ADDR/BOOT_TRAMP_ADDR) is entirely within
+     *     L1[0]; this loader has no reason to touch, and no confident
+     *     knowledge of, anything past 2 GiB on this SoC. */
+.Lb_bcm2837_table:
+    ldr     x0, =l1_table
+    mov     x1, #512
+.Lb_zero_l1_bcm:
+    str     xzr, [x0], #8
+    subs    x1, x1, #1
+    b.ne    .Lb_zero_l1_bcm
+
+    ldr     x7, =l2_table_bcm2837_boot
+    mov     x1, #512
+.Lb_zero_l2_bcm:
+    str     xzr, [x7], #8
+    subs    x1, x1, #1
+    b.ne    .Lb_zero_l2_bcm
+
+    ldr     x0, =l1_table
+    ldr     x7, =l2_table_bcm2837_boot
+    mov     x5, #0
+    mov     x2, #0x705                 /* ATTR(1) = Normal-NC             */
+.Lb_bcm_l2_ram:
+    lsl     x3, x5, #21
+    orr     x4, x3, x2
+    str     x4, [x7, x5, lsl #3]
+    add     x5, x5, #1
+    cmp     x5, #504
+    b.lt    .Lb_bcm_l2_ram
+
+    mov     x2, #0x401                 /* Device-nGnRnE, ATTR(0)          */
+    movk    x2, #0x0060, lsl #48
+.Lb_bcm_l2_periph:
+    lsl     x3, x5, #21
+    orr     x4, x3, x2
+    str     x4, [x7, x5, lsl #3]
+    add     x5, x5, #1
+    cmp     x5, #512
+    b.lt    .Lb_bcm_l2_periph
+
+    ldr     x2, =l2_table_bcm2837_boot
+    orr     x2, x2, #3                 /* valid table descriptor          */
+    str     x2, [x0, #0]               /* L1[0] -> l2_table_bcm2837_boot  */
+
+    mov     x2, #0x401                 /* Device-nGnRnE, ATTR(0)          */
+    movk    x2, #0x0060, lsl #48
+    mov     x3, #0x40000000
+    orr     x4, x3, x2
+    str     x4, [x0, #8]               /* L1[1]: QA7 + rest, Device       */
+
+.Lb_mmu_enable:
     dsb     sy
 
     ldr     x1, =0xBBFF4400            /* MAIR_EL1 (matches start.S)      */

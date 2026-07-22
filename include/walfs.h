@@ -65,6 +65,20 @@
 #define PIOS_STAGE2_END_OFFSET          0x37FFFFU  /* 3.5MB slot (was 2MB) */
 #define PIOS_STAGE2_ZONE_BYTES          (PIOS_STAGE2_END_OFFSET - PIOS_STAGE2_OFFSET + 1U)
 #define PIOS_BOOT_SLOT_BYTES            (PIOS_STAGE2_END_OFFSET + 1U)
+/* Max size of the FAT-resident PIOSSTG2.PKG file itself, as loaded whole
+ * into stage0's staging buffer (BOOT_STAGING_ADDR) before the matching
+ * platform's payload is selected and extracted. Deliberately larger than
+ * PIOS_STAGE2_ZONE_BYTES (the raw-slot payload size, unchanged): the FAT
+ * package lives on the separate FAT32 boot partition, not the raw/WALFS
+ * partition these PIOS_*_OFFSET constants describe, so it has no reason to
+ * be capped at one platform's raw-slot size. Since stage0.c's
+ * stage0_apply_fat_update() now extracts only the SELECTED platform's
+ * payload (select_stage2_image()) before writing to the raw slot -- never
+ * the whole file -- one PIOSSTG2.PKG can carry a Pi5 AND a BCM2837-family
+ * (Pi3/Pi Zero 2W) payload simultaneously (see include/board_detect.h,
+ * tools/build_stage2_package.py --bcm2837), letting a single universal
+ * stage0 kernel8.img boot correctly on whichever board reads the card. */
+#define PIOS_FAT_PACKAGE_MAX_BYTES      (16U * 1024U * 1024U)
 #define PIOS_BOOT_SLOT_A_OFFSET         0x000000U
 #define PIOS_BOOTCTRL_OFFSET            0x380000U  /* moved: was 0x200000 */
 #define PIOS_BOOT_SLOT_B_OFFSET         0x400000U  /* moved: was 0x300000 */

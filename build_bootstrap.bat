@@ -4,7 +4,7 @@ set CC=%TC%\aarch64-none-elf-gcc.exe
 set LD=%TC%\aarch64-none-elf-ld.exe
 set OC=%TC%\aarch64-none-elf-objcopy.exe
 set FULL_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2 -fstack-protector-strong
-set BOOT_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -DPIOS_FB_NO_DOUBLE_BUFFER
+set BOOT_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -DPIOS_FB_NO_DOUBLE_BUFFER -DPIOS_RUNTIME_MMIO_BOOTSTRAP=1
 set USER_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -fno-builtin
 set QEMU_STAGE2_CFLAGS=-Wall -Wextra -Wno-unused-function -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8-a -mgeneral-regs-only -Iinclude -O2 -fno-builtin -DPIOS_PLATFORM=PIOS_PLATFORM_QEMU_VIRT
 set ASFLAGS=-march=armv8.2-a+simd+crc+crypto
@@ -109,13 +109,15 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%CC%" %BOOT_CFLAGS% -c src\bootstrap.c -o build_boot\bootstrap.o
 if errorlevel 1 exit /b 1
+"%CC%" %BOOT_CFLAGS% -c src\board_detect.c -o build_boot\board_detect.o
+if errorlevel 1 exit /b 1
 "%CC%" %BOOT_CFLAGS% -c src\sd.c -o build_boot\sd.o
 if errorlevel 1 exit /b 1
 "%CC%" %BOOT_CFLAGS% -c src\fb.c -o build_boot\fb.o
 if errorlevel 1 exit /b 1
 
 echo Linking bootstrap kernel8.img...
-"%LD%" -T link_bootstrap.ld -nostdlib -o bootstrap.elf build_boot\bootstrap_start.o build_boot\bootstrap_trampoline.o build_boot\bootstrap.o build_boot\sd.o build_boot\fb.o
+"%LD%" -T link_bootstrap.ld -nostdlib -o bootstrap.elf build_boot\bootstrap_start.o build_boot\bootstrap_trampoline.o build_boot\bootstrap.o build_boot\board_detect.o build_boot\sd.o build_boot\fb.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary bootstrap.elf kernel8.img
 if errorlevel 1 exit /b 1

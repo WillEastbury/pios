@@ -13,6 +13,13 @@
 #define PIOS_STAGE2_PLATFORM_UEFI       3U
 #define PIOS_STAGE2_PLATFORM_HYPERV_ARM 4U
 #define PIOS_STAGE2_PLATFORM_HYPERV_AMD64 5U
+/* Pi3 B/B+/A+ and Pi Zero 2 W (BCM2837(B0)/BCM2710A1) share one payload
+ * entry: both boot the SAME compiled kernel image (see
+ * include/platform.h PIOS_PLATFORM_PI3/_PIZERO2W, which resolve to
+ * identical peripheral base addresses), so there is no need for two
+ * separate manifest entries. Runtime-detected via MIDR_EL1 in stage0
+ * (see include/board_detect.h), not hardcoded like the other platform IDs. */
+#define PIOS_STAGE2_PLATFORM_BCM2837_FAMILY 6U
 
 #define PIOS_STAGE2_FEAT_AARCH64        (1ULL << 0)
 #define PIOS_STAGE2_FEAT_X86_64         (1ULL << 16)

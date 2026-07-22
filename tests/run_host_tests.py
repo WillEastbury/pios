@@ -47,6 +47,10 @@ TESTS_MANIFEST = {
     # path, non-recursive nested-copy composition, and the grant callback
     # snapshot/relock/rollback linearization. See tests/test_lease.c.
     "test_lease.c": ["src/lease.c"],
+    # MIDR_EL1 board-family decode for the multi-platform stage0 bootstrap
+    # (Cortex-A76 -> Pi5, Cortex-A53 -> BCM2837-family). Pure bit-decode
+    # logic, no asm/MMIO. See src/board_detect.c, include/board_detect.h.
+    "test_board_detect.c": ["src/board_detect.c"],
 }
 
 

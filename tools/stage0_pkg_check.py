@@ -10,19 +10,26 @@ it is committed to raw slot A:
                                whole-package FNV-1a id (bytes 16..23 excluded)
   * select_stage2_image()   -> locate the platform entry, validate payload
                                offset/size/entry bounds and load_addr
-  * write_slot_package()    -> the WHOLE package is written into the stage2 zone,
-                               so the entire file must fit PIOS_STAGE2_ZONE_BYTES
+  * write_slot_package()    -> only the SELECTED platform's payload subset is
+                               extracted and written into the raw slot (see
+                               stage0_apply_fat_update()), so the raw slot
+                               stays capped at PIOS_STAGE2_ZONE_BYTES (one
+                               platform's payload) while the FAT-resident
+                               package file itself is capped at the larger
+                               PIOS_FAT_PACKAGE_MAX_BYTES -- it can carry
+                               multiple platforms' payloads (e.g. Pi5 AND
+                               BCM2837-family/Pi3/Pi Zero 2W) simultaneously,
+                               since stage0 now genuinely detects which board
+                               it's running on via MIDR_EL1 (board_detect.c)
+                               before extracting only that one payload.
 
-Because stage0 stores the complete package in the slot and only extracts the
-matching platform payload at boot, the file as a whole (not just the payload)
-must fit the zone.  This harness is Pi5-focused by default but can validate any
-platform id.
+This harness is Pi5-focused by default but can validate any platform id.
 
 Exit code is 0 only when every check passes, so it can gate a hardware deploy
 next to tools/qemu_smoke.py.
 
 Usage:
-  python tools/stage0_pkg_check.py [PACKAGE] [--platform pi5|qemu|uefi|<id>]
+  python tools/stage0_pkg_check.py [PACKAGE] [--platform pi5|qemu|uefi|bcm2837|<id>]
 """
 
 from __future__ import annotations
@@ -40,9 +47,10 @@ HEADER_BYTES = 32
 ENTRY_BASE_BYTES = 64                # sizeof(struct pios_stage2_manifest_entry)
 PACKAGED_ENTRY_BYTES = 96            # PIOS_STAGE2_PACKAGED_ENTRY_BYTES (V1 min)
 
-PLATFORM = {"pi5": 1, "qemu": 2, "uefi": 3, "hyperv-arm": 4, "hyperv-amd64": 5}
+PLATFORM = {"pi5": 1, "qemu": 2, "uefi": 3, "hyperv-arm": 4, "hyperv-amd64": 5, "bcm2837": 6, "pi3": 6, "pizero2w": 6}
 PI_LOAD = 0x00080000                 # BOOT_DST_ADDR / PI_LOAD
-STAGE2_ZONE_BYTES = 0x37FE00         # PIOS_STAGE2_ZONE_BYTES (3,669,504)
+STAGE2_ZONE_BYTES = 0x37FE00         # PIOS_STAGE2_ZONE_BYTES (3,669,504) -- per-platform raw-slot payload cap
+FAT_PACKAGE_MAX_BYTES = 16 * 1024 * 1024  # PIOS_FAT_PACKAGE_MAX_BYTES -- whole multi-platform FAT file cap
 
 FNV_BASIS = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
@@ -116,9 +124,11 @@ def validate(path: pathlib.Path, want_platform: int, rep: Report) -> None:
     rep.check("entry table within image", table_bytes <= image_len,
               f"table={table_bytes} image={image_len}")
 
-    # ---- whole package fits the raw stage2 zone (write_slot_package) ------
-    rep.check("whole package fits stage2 zone", image_len <= STAGE2_ZONE_BYTES,
-              f"{image_len} <= {STAGE2_ZONE_BYTES} (headroom {STAGE2_ZONE_BYTES - image_len})")
+    # ---- whole FAT-resident package fits the staging/FAT-read cap ---------
+    # (Not the raw-slot zone: only the per-platform payload extracted below
+    # needs to fit that -- see the "payload fits stage2 zone" check.)
+    rep.check("whole package fits FAT package cap", image_len <= FAT_PACKAGE_MAX_BYTES,
+              f"{image_len} <= {FAT_PACKAGE_MAX_BYTES} (headroom {FAT_PACKAGE_MAX_BYTES - image_len})")
 
     # ---- select the requested platform payload (select_stage2_image) ------
     found = False
@@ -147,7 +157,7 @@ def validate(path: pathlib.Path, want_platform: int, rep: Report) -> None:
                   f"{entry_offset} < {payload_size}")
         rep.check("payload fits stage2 zone", payload_size <= STAGE2_ZONE_BYTES,
                   f"{payload_size} <= {STAGE2_ZONE_BYTES}")
-        want_load = PI_LOAD if want_platform == PLATFORM["pi5"] else load_addr
+        want_load = PI_LOAD if want_platform in (PLATFORM["pi5"], PLATFORM["bcm2837"]) else load_addr
         rep.check("load_addr == 0x00080000 (Pi5 BOOT_DST_ADDR)",
                   load_addr == want_load,
                   f"0x{load_addr:X}")

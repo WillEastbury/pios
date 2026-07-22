@@ -2,22 +2,27 @@
 
 This document traces PIOS from power-on to a fully multi-core system, with
 file/line citations to the authoritative source. It covers the two-stage A/B
-boot chain, the `start.S` low-level bring-up, the `kernel_main()` init order,
-secondary-core start, and the health-gated A/B success/rollback model.
+boot chain, multi-platform board detection (§2.0), the `start.S` low-level
+bring-up, the `kernel_main()` init order, secondary-core start, and the
+health-gated A/B success/rollback model.
 
-Related: [disk_layout.md](disk_layout.md) (on-disk slot/control structures),
-[mmu.md](mmu.md) (page tables), [architecture.md](architecture.md) (core
-assignment & memory map), [deployment.md](deployment.md) (SD prep / OTA).
+Related: [disk_layout.md](disk_layout.md) (on-disk slot/control structures,
+including the FAT-package size model), [mmu.md](mmu.md) (page tables),
+[architecture.md](architecture.md) (core assignment & memory map),
+[deployment.md](deployment.md) (SD prep / OTA), `include/board_detect.h`
+(runtime CPU/board detection).
 
 ```
-Pi 5 firmware (GPU ROM + start4.elf)
+Pi 5 / Pi 3 / Pi Zero 2 W firmware
    │  loads FAT:/kernel8.img → 0x80000, enters at EL1, MMU off
    ▼
-Stage0 bootstrap  (kernel8.img — small, stable, never OTA'd)
-   │  arms HW watchdog, optionally imports FAT:/PIOSSTG2.PKG into raw slot A,
-   │  reads boot control, validates the selected slot, stages and jumps
+Stage0 bootstrap  (kernel8.img — small, stable, never OTA'd, multi-platform)
+   │  detects board via MIDR_EL1 (§2.0), arms HW watchdog, optionally imports
+   │  FAT:/PIOSSTG2.PKG's matching-platform payload into raw slot A, reads
+   │  boot control, validates the selected slot, stages and jumps
    ▼
-Real kernel  (real_kernel.img — the OTA'able stage-2)  src/start.S → kernel_main
+Real kernel  (real_kernel.img / kernel8_pi3.img / kernel8_pizero2w.img —
+              the OTA'able, single-platform stage-2)  src/start.S → kernel_main
    │  EL2→EL1, BSS, early FB, MMU on, subsystem init, start cores 1-3
    ▼
 core0_main()  IRQ-driven network + disk + console reactor  (never returns)
@@ -38,14 +43,68 @@ stage0 image to physical `0x80000`.
   handoff comment, `src/start.S:25-29`).
 
 `kernel8.img` is built to be small and **stable**: it is the only image written
-to the FAT partition and is not replaced by OTA. The mutable OS lives in
-partition 2 as the stage-2 "real kernel" (see [disk_layout.md](disk_layout.md)).
+to the FAT partition and is not replaced by OTA. Since board_detect.c was
+added, it is also **multi-platform**: the same compiled image boots correctly
+on Pi5 (BCM2712) or the BCM2837 family (Pi3 B/B+/A+, Pi Zero 2 W) -- see §2.0.
+The mutable OS lives in partition 2 as the stage-2 "real kernel" (see
+[disk_layout.md](disk_layout.md)).
 
 ---
 
 ## 2. Stage0 bootstrap (`src/bootstrap.c`, `src/bootstrap_start.S`)
 
-`bootstrap_start.S` performs the EL2->EL1 handoff, clears BSS, then **enables
+### 2.0 Multi-platform board detection
+
+Before building any page table, `bootstrap_start.S` calls `board_detect_init()`
+(`src/board_detect.c`), which reads `MIDR_EL1` -- a CPU-identification system
+register, not an MMIO peripheral, so it is safe to read before any
+board-specific address is known -- and decodes its PartNum field (bits
+`[15:4]`) to a board family:
+
+| PartNum | Core | Family |
+|---|---|---|
+| `0xD0B` | Cortex-A76 | `BOARD_FAMILY_PI5` |
+| `0xD03` | Cortex-A53 | `BOARD_FAMILY_BCM2837` (Pi3 B/B+/A+, Pi Zero 2 W) |
+| anything else | — | `BOARD_FAMILY_UNKNOWN` → halt (fail closed; see below) |
+
+This decision **must** happen before the L1 page table is built, not after,
+because the two board families cannot share one table:
+
+- **Pi5**: peripherals live at a high 36-bit address (`0x10_0000_0000`+),
+  entirely outside the low 4 GiB, so a simple 1 GiB Normal-NC block covers
+  L1[0] with no peripheral overlap (unchanged from before board detection
+  existed).
+- **BCM2837-family**: the "low peripheral" window (`0x3F00_0000`-`0x3FFF_FFFF`
+  -- UART0/mailbox/EMMC/PM watchdog) and the ARM-local "QA7" block
+  (`0x4000_0000`+ -- per-core timer IRQ enables, IPI mailboxes; see
+  `src/irqc_legacy.c`) both fall **inside** the low 4 GiB that would
+  otherwise be simple Normal-NC RAM blocks. Giving them Device memory type
+  therefore requires a genuinely different table: L1[0] becomes a table
+  descriptor into a boot-only 2 MiB-granular L2 table
+  (`l2_table_bcm2837_boot`) with RAM (blocks 0-503, Normal-NC) and the low
+  peripheral window (blocks 504-511, Device-nGnRnE) as separate entries;
+  L1[1] is a single 1 GiB Device block (QA7 lives at its very start; nothing
+  else in that range is touched by stage0).
+
+An unrecognized `MIDR_EL1` halts rather than guessing either table -- silently
+assuming either board's addressing on genuinely unanticipated hardware risks
+an external abort or worse.
+
+`board_detect_init()` also populates `g_board_bases`/`g_board_family`
+(`include/board_detect.h`), which `bootstrap.c` (PM watchdog, UART0),
+`sd.c` (EMMC base, guarded by `PIOS_RUNTIME_MMIO_BOOTSTRAP`), and `fb.c`
+(VideoCore mailbox base, same guard) read at runtime instead of their normal
+compile-time `PIOS_*_BASE` macros -- so the identical `bootstrap.o`/`sd.o`/
+`fb.o` work correctly regardless of which of these boards they end up
+running on. `stage0_platform_id()` uses the same detection to select the
+matching entry out of `PIOSSTG2.PKG` (see
+[disk_layout.md §1.1](disk_layout.md#11-multi-platform-stage0-and-the-two-tier-size-model)).
+The main kernel (`real_kernel.img`/`kernel8_pi3.img`/`kernel8_pizero2w.img`)
+is unaffected by any of this -- it stays compile-time single-platform
+(`PIOS_PLATFORM=...`), built separately per board by `build.bat`/
+`build_pi3.bat`/`build_pizero2w.bat`.
+
+`bootstrap_start.S` then performs the EL2->EL1 handoff, clears BSS, then **enables
 the MMU** with the low 1 GiB mapped Normal-NC (reusing the proven `start.S`
 MAIR/TCR/SCTLR magic) before calling `bootstrap_main()`. The MMU is required:
 the EMMC PIO card-identification handshake (CMD55 + ACMD41) and the VideoCore

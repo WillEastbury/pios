@@ -18,8 +18,12 @@ Related: [boot.md](boot.md) (how stage0 consumes these structures).
 ```
 SD card
 ├── MBR (LBA 0)                      0x55AA signature; p2 start @ mbr[0x1CE+8]
-├── Partition 1  — FAT32 boot        kernel8.img (stage0), PIOSSTG2.PKG,
-│                                    config.txt, start4.elf, fixup4.dat, *.dtb
+├── Partition 1  — FAT32 boot        kernel8.img (stage0, board-detecting/
+│                                    multi-platform -- see §1.1), PIOSSTG2.PKG
+│                                    (may carry a Pi5 AND a BCM2837-family
+│                                    payload simultaneously), config.txt,
+│                                    start4.elf/fixup4.dat (Pi5), start.elf/
+│                                    fixup.dat (Pi3/Pi Zero 2W), *.dtb
 └── Partition 2  — PIOS system       raw kernel slots + control + records + WALFS
     ├── 0x000000 .. 0x9FFFFF  (10 MiB)  reserved system area  (§2)
     └── 0xA00000 .. end                 WALFS packs/cards/storage  (§5)
@@ -38,6 +42,41 @@ Partition 2 is discovered at runtime from the MBR; all offsets below are
 > The legacy read-only fallback slot starts at LBA `2048` when the MBR is
 > unreadable. FAT update and boot-control writes are disabled unless partition 2
 > passes full bounds validation.
+
+### 1.1 Multi-platform stage0 and the two-tier size model
+
+`kernel8.img` (stage0) now genuinely detects which board it is running on --
+reading `MIDR_EL1` (a CPU-identification system register, not an MMIO
+peripheral, so safe before any board-specific address is known) to
+distinguish Cortex-A76 (Pi5) from Cortex-A53 (BCM2837-family: Pi3 B/B+/A+,
+Pi Zero 2 W) -- see `include/board_detect.h`, `src/board_detect.c`. The SAME
+`kernel8.img` therefore boots correctly on any of these boards from one FAT
+partition.
+
+This means `PIOSSTG2.PKG` (the FAT-resident package) and the raw-slot payload
+it eventually produces are now governed by **two distinct size caps**, not
+one:
+
+| Cap | Value | Applies to | Constant |
+|---|---|---|---|
+| Per-platform raw-slot payload | `0x37FE00` (3.5 MiB) | the ONE payload stage0 extracts and writes into raw slot A | `PIOS_STAGE2_ZONE_BYTES` |
+| Whole FAT package file | `16 MiB` | the FAT-resident `PIOSSTG2.PKG`, which may bundle multiple platforms' payloads | `PIOS_FAT_PACKAGE_MAX_BYTES` |
+
+Stage0's `stage0_apply_fat_update()` loads the **whole** FAT file into the
+staging buffer (`BOOT_STAGING_ADDR`, capped at `PIOS_FAT_PACKAGE_MAX_BYTES`),
+then `select_stage2_image()` finds the entry matching the runtime-detected
+platform id and extracts **only that payload subset** (capped at
+`PIOS_STAGE2_ZONE_BYTES`) into raw slot A -- never the whole file. This is
+what makes it safe for `PIOSSTG2.PKG` to be bigger than any single raw slot:
+`tools/build_stage2_package.py --pi <pi5.bin> --bcm2837 <bcm2837.img> --out
+PIOSSTG2.PKG` builds exactly such a combined package, and
+`tools/stage0_pkg_check.py --platform pi5|bcm2837` validates either entry
+independently.
+
+Platform ids (`include/stage2_manifest.h`): `PIOS_STAGE2_PLATFORM_PI5=1`,
+`PIOS_STAGE2_PLATFORM_QEMU_VIRT=2`, `PIOS_STAGE2_PLATFORM_BCM2837_FAMILY=6`
+(Pi3 and Pi Zero 2 W share one entry -- both boot the identical compiled
+image; see `include/platform.h` `PIOS_PLATFORM_PI3`/`PIOS_PLATFORM_PIZERO2W`).
 
 ---
 
@@ -302,3 +341,6 @@ hashing (`src/principal.c:67-76`).
 | WALFS record magic | `0x5245434F` `'RECO'` | `walfs.h:109` |
 | Keystore magic / offset | `0x5254534B` `'KSTR'` / `0x500000` | `keystore.c:11`, `walfs.h:93` |
 | OTA TCP port | `8082` | `kernel.c:132` |
+| Per-platform raw-slot payload cap | `0x37FE00` (3.5 MiB) | `walfs.h: PIOS_STAGE2_ZONE_BYTES` |
+| Whole FAT package cap (may bundle multiple platforms) | `16 MiB` | `walfs.h: PIOS_FAT_PACKAGE_MAX_BYTES` |
+| BCM2837-family platform id (Pi3/Pi Zero 2W, shared) | `6` | `stage2_manifest.h: PIOS_STAGE2_PLATFORM_BCM2837_FAMILY` |

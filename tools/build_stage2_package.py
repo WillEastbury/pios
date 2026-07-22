@@ -10,6 +10,7 @@ FLAG_PACKAGED = 1
 
 PLATFORM_PI5 = 1
 PLATFORM_QEMU = 2
+PLATFORM_BCM2837_FAMILY = 6
 
 FEAT_AARCH64 = 1 << 0
 FEAT_GENERIC_TIMER = 1 << 1
@@ -28,7 +29,17 @@ PI_LOAD = 0x00080000
 QEMU_LOAD = 0x40080000
 QEMU_MEMORY = 0x02000000
 ALIGN = 512
-MAX_PACKAGE = 0x37FE00
+# Whole-package cap: the FAT-resident PIOSSTG2.PKG lives on the separate
+# FAT32 boot partition, not the raw/WALFS partition, so it is NOT limited to
+# one platform's raw-slot payload size (0x37FE00 / PIOS_STAGE2_ZONE_BYTES).
+# stage0 (src/bootstrap.c stage0_apply_fat_update()) extracts only the
+# SELECTED platform's payload before writing to the raw slot, so one package
+# can safely carry multiple platforms' payloads (e.g. --pi and --bcm2837
+# together). Matches include/walfs.h PIOS_FAT_PACKAGE_MAX_BYTES.
+MAX_PACKAGE = 16 * 1024 * 1024
+# Per-platform payload cap: matches include/walfs.h PIOS_STAGE2_ZONE_BYTES,
+# enforced by stage0's select_stage2_image() on each individual entry.
+MAX_PAYLOAD = 0x37FE00
 PAYLOAD_FLAG_COMPRESSED = 1
 PAYLOAD_CODEC_NONE = 0
 PAYLOAD_CODEC_PICOCOMPRESS = 1
@@ -130,22 +141,33 @@ def entry(platform: int, name: str, payload_off: int, payload_size: int,
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build a PGS2 package containing Pi5 and optional QEMU payloads.")
+    ap = argparse.ArgumentParser(description="Build a PGS2 package containing Pi5, BCM2837-family, and/or optional QEMU payloads.")
     ap.add_argument("--pi", type=pathlib.Path)
+    ap.add_argument("--bcm2837", type=pathlib.Path,
+                     help="Pi3 B/B+/A+ / Pi Zero 2W payload (BCM2837(B0)/BCM2710A1, runtime-selected via MIDR_EL1 in stage0)")
     ap.add_argument("--qemu", type=pathlib.Path)
     ap.add_argument("--out", required=True, type=pathlib.Path)
     ap.add_argument("--compress-qemu", action="store_true")
     args = ap.parse_args()
 
-    if not args.pi and not args.qemu:
-        raise SystemExit("at least one of --pi or --qemu is required")
+    if not args.pi and not args.bcm2837 and not args.qemu:
+        raise SystemExit("at least one of --pi, --bcm2837, or --qemu is required")
 
     pi = args.pi.read_bytes() if args.pi else None
+    bcm2837 = args.bcm2837.read_bytes() if args.bcm2837 else None
     qemu = args.qemu.read_bytes() if args.qemu else None
     if args.pi and not pi:
         raise SystemExit("Pi payload is empty")
+    if args.bcm2837 and not bcm2837:
+        raise SystemExit("BCM2837-family payload is empty")
     if args.qemu and not qemu:
         raise SystemExit("QEMU payload is empty")
+    # QEMU boots its own PIOS_QEMU_FULL.BIN directly (not via this raw-slot
+    # path), so it isn't bounded by MAX_PAYLOAD the way pi/bcm2837 are.
+    if pi is not None and len(pi) > MAX_PAYLOAD:
+        raise SystemExit(f"Pi payload too large for raw slot: {len(pi)} > {MAX_PAYLOAD}")
+    if bcm2837 is not None and len(bcm2837) > MAX_PAYLOAD:
+        raise SystemExit(f"BCM2837-family payload too large for raw slot: {len(bcm2837)} > {MAX_PAYLOAD}")
 
     qemu_payload = qemu
     qemu_flags = 0
@@ -161,11 +183,15 @@ def main() -> int:
 
     header_bytes = 32
     entry_bytes = 112
-    entry_count = (1 if pi is not None else 0) + (1 if qemu_payload is not None else 0)
+    entry_count = ((1 if pi is not None else 0) + (1 if bcm2837 is not None else 0) +
+                   (1 if qemu_payload is not None else 0))
     cursor = align_up(header_bytes + entry_count * entry_bytes)
     pi_off = cursor if pi is not None else 0
     if pi is not None:
         cursor = align_up(pi_off + len(pi))
+    bcm2837_off = cursor if bcm2837 is not None else 0
+    if bcm2837 is not None:
+        cursor = align_up(bcm2837_off + len(bcm2837))
     qemu_off = cursor if qemu_payload is not None else 0
     if qemu_payload is not None:
         cursor = align_up(qemu_off + len(qemu_payload))
@@ -192,6 +218,19 @@ def main() -> int:
         ))
         write_at(out, pi_off, pi)
         entry_index += 1
+    if bcm2837 is not None:
+        write_at(out, header_bytes + entry_index * entry_bytes, entry(
+            PLATFORM_BCM2837_FAMILY,
+            "bcm2837-family",
+            bcm2837_off,
+            len(bcm2837),
+            PI_LOAD,
+            len(bcm2837),
+            FEAT_AARCH64 | FEAT_PI_FIRMWARE,
+            FEAT_GENERIC_TIMER | FEAT_PL011 | FEAT_SD | FEAT_MAILBOX_FB,
+        ))
+        write_at(out, bcm2837_off, bcm2837)
+        entry_index += 1
     if qemu_payload is not None:
         write_at(out, header_bytes + entry_index * entry_bytes, entry(
             PLATFORM_QEMU,
@@ -211,14 +250,15 @@ def main() -> int:
     package_id = package_id_for(out)
     write_at(out, 16, struct.pack("<Q", package_id))
     args.out.write_bytes(out)
-    if pi is not None and qemu_payload is not None:
+    pi_note = f"{len(pi)}@{pi_off}" if pi is not None else "none"
+    bcm2837_note = f"{len(bcm2837)}@{bcm2837_off}" if bcm2837 is not None else "none"
+    if qemu_payload is not None:
         qemu_note = f"{len(qemu_payload)}:{len(qemu)}" if args.compress_qemu else str(len(qemu))
-        print(f"stage2 package: {args.out} total={len(out)} id={package_id:016x} pi={len(pi)}@{pi_off} qemu={qemu_note}@{qemu_off}")
-    elif qemu_payload is not None:
-        qemu_note = f"{len(qemu_payload)}:{len(qemu)}" if args.compress_qemu else str(len(qemu))
-        print(f"stage2 package: {args.out} total={len(out)} id={package_id:016x} pi=none qemu={qemu_note}@{qemu_off}")
+        qemu_note = f"{qemu_note}@{qemu_off}"
     else:
-        print(f"stage2 package: {args.out} total={len(out)} id={package_id:016x} pi={len(pi)}@{pi_off} qemu=none")
+        qemu_note = "none"
+    print(f"stage2 package: {args.out} total={len(out)} id={package_id:016x} "
+          f"pi={pi_note} bcm2837={bcm2837_note} qemu={qemu_note}")
     return 0
 
 

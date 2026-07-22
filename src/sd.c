@@ -471,8 +471,20 @@ u32 sd_qemu_virtio_blk_diag(void)
 
 /* ── helpers ──────────────────────────────────────────────────────── */
 
+#ifdef PIOS_RUNTIME_MMIO_BOOTSTRAP
+#include "board_detect.h"
+/* The bootstrap image links this same sd.c for both Pi5 and BCM2837-family
+ * boards; EMMC2_BASE (a compile-time PIOS_EMMC2_BASE constant, always Pi5's
+ * address) is wrong for the latter. board_detect_init() (called before
+ * sd_init()) has already resolved g_board_bases.emmc_base correctly for
+ * whichever board this is -- use it instead. The main kernel (not built
+ * with PIOS_RUNTIME_MMIO_BOOTSTRAP) keeps the simple compile-time constant. */
+static inline void sd_write(u32 off, u32 val) { mmio_write(g_board_bases.emmc_base + off, val); }
+static inline u32  sd_read(u32 off)           { return mmio_read(g_board_bases.emmc_base + off); }
+#else
 static inline void sd_write(u32 off, u32 val) { mmio_write(EMMC2_BASE + off, val); }
 static inline u32  sd_read(u32 off)           { return mmio_read(EMMC2_BASE + off); }
+#endif
 
 static u32 sd_mbps_x1000(u32 blocks, u64 elapsed_us)
 {

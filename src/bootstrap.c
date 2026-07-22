@@ -12,6 +12,7 @@
 #include "fb.h"
 #include "walfs.h"
 #include "stage2_manifest.h"
+#include "board_detect.h"
 
 #define BOOT_DST_ADDR       0x00080000ULL
 #define BOOT_STAGING_ADDR   0x08000000ULL
@@ -19,7 +20,12 @@
 #define BOOT_FALLBACK_LBA   2048U
 #define BOOT_SLOT_MAGIC     PIOS_RESERVED_HEADER_MAGIC
 #define BOOT_WDOG_SECONDS   15U
-#define PM_BASE             (PERIPH_BASE + 0x00100000UL)
+/* PM_BASE/UART0_BASE used to be compile-time PERIPH_BASE-derived macros,
+ * which only ever matched Pi5. Now resolved once at runtime from
+ * g_board_bases (see board_detect_init(), called first thing in
+ * bootstrap_main()) so the SAME bootstrap image works on Pi5 or the
+ * BCM2837 family (Pi3/Pi Zero 2W). */
+#define PM_BASE             (g_board_bases.pm_base)
 #define PM_RSTC             (PM_BASE + 0x1CU)
 #define PM_WDOG             (PM_BASE + 0x24U)
 #define PM_PASSWORD         0x5A000000U
@@ -39,6 +45,12 @@ extern u8 bootstrap_trampoline[];
 extern u8 bootstrap_trampoline_end[];
 
 u64 l1_table[512] ALIGNED(4096);
+/* BCM2837-family boot-only L2 split for L1[0] (see bootstrap_start.S): the
+ * first 1GiB is RAM (Normal-NC) except its last 16MiB, which is the
+ * "low peripheral" MMIO window (0x3F000000-0x3FFFFFFF on Pi3/Pi Zero 2W)
+ * and must be Device-nGnRnE. Unused/never referenced on Pi5 (whose boot
+ * path keeps the original simple 1GiB block descriptors). */
+u64 l2_table_bcm2837_boot[512] ALIGNED(4096);
 u64 shared_ttbr0;
 u64 shared_mair;
 u64 shared_tcr;
@@ -129,6 +141,13 @@ static void write_reserved_header(u8 *out, u32 payload_len)
 
 static u32 stage0_platform_id(void)
 {
+    /* g_board_family is populated by board_detect_init(), called from
+     * bootstrap_start.S before this point (and again, idempotently, at the
+     * top of bootstrap_main()). Falls back to PI5 (the proven, currently
+     * shipping path) if detection is somehow inconclusive, rather than an
+     * undefined/zero platform id that would match no manifest entry. */
+    if (g_board_family == BOARD_FAMILY_BCM2837)
+        return PIOS_STAGE2_PLATFORM_BCM2837_FAMILY;
     return PIOS_STAGE2_PLATFORM_PI5;
 }
 
@@ -225,8 +244,8 @@ static void stage0_watchdog_arm(u32 seconds)
 
 void uart_putc(char c)
 {
-    while (mmio_read(UART0_BASE + 0x18) & (1U << 5)) ;
-    mmio_write(UART0_BASE + 0x00, (u32)c);
+    while (mmio_read(g_board_bases.uart0_base + 0x18) & (1U << 5)) ;
+    mmio_write(g_board_bases.uart0_base + 0x00, (u32)c);
 }
 
 void uart_puts(const char *s)
@@ -462,7 +481,7 @@ static bool fat32_find_stage2(const struct fat32_ro *fs, u32 *first_cluster,
                             read_le16(entry + 26);
                 u32 size = read_le32(entry + 28);
                 if (!fat32_cluster_valid(fs, first) || size == 0 ||
-                    size > PIOS_STAGE2_ZONE_BYTES)
+                    size > PIOS_FAT_PACKAGE_MAX_BYTES)
                     return false;
                 *first_cluster = first;
                 *file_size = size;
@@ -485,7 +504,7 @@ static bool fat32_load_file(const struct fat32_ro *fs, u32 first_cluster,
                             u32 file_size, u8 *dst)
 {
     if (!fs || !dst || !fat32_cluster_valid(fs, first_cluster) ||
-        file_size == 0 || file_size > PIOS_STAGE2_ZONE_BYTES)
+        file_size == 0 || file_size > PIOS_FAT_PACKAGE_MAX_BYTES)
         return false;
 
     u32 remaining = file_size;
@@ -666,9 +685,22 @@ static bool stage0_apply_fat_update(u32 root_lba)
         return false;
     }
 
+    /* Write only the SELECTED platform's payload subset into the raw slot,
+     * not the whole (potentially multi-platform) FAT package -- the raw
+     * slot is sized for one platform's payload (PIOS_STAGE2_ZONE_BYTES,
+     * ~3.5 MiB) and stays that size regardless of how many platforms the
+     * FAT-resident PIOSSTG2.PKG carries. This is what makes it possible for
+     * ONE PIOSSTG2.PKG to hold both a Pi5 and a BCM2837-family payload
+     * (bigger than any single raw slot could hold) while this stage0
+     * loader -- now genuinely multi-platform itself, see board_detect.c --
+     * still only ever writes the one payload matching the board it's
+     * actually running on. */
+    const u8 *payload = staging + selection.payload_offset;
+    u32 payload_len = selection.payload_bytes;
+
     u32 target_lba = root_lba +
                      (slot_offset(PIOS_BOOTCTRL_SLOT_A) / SD_BLOCK_SIZE);
-    if (slot_package_matches(target_lba, staging, file_size, true)) {
+    if (slot_package_matches(target_lba, payload, payload_len, true)) {
         uart_puts("[boot] FAT package already cached in slot A\n");
         return true;
     }
@@ -677,7 +709,7 @@ static bool stage0_apply_fat_update(u32 root_lba)
     uart_puts("[boot] installing FAT package id=");
     uart_hex(update_id);
     uart_puts("\n");
-    if (!write_slot_package(target_lba, staging, file_size) ||
+    if (!write_slot_package(target_lba, payload, payload_len) ||
         !bootctrl_activate_slot_a(root_lba)) {
         fb_puts("[stage0] FAT install failed\n");
         uart_puts("[boot] FAT install failed\n");
@@ -791,6 +823,12 @@ void serror_exception(u64 esr, u64 elr, u64 far, u64 spsr)
 
 NORETURN void bootstrap_main(void)
 {
+    /* Already called once from bootstrap_start.S (before the L1 page table
+     * was built, since the table itself must differ by board -- see the
+     * dual-path L1 construction there) but calling it again here is cheap,
+     * deterministic, and idempotent; do so defensively so board detection
+     * is never silently skipped if the asm path is ever refactored. */
+    board_detect_init();
     kernel_fb_early();
     uart_puts("[boot] PIOS bootstrap\n");
     stage0_watchdog_arm(BOOT_WDOG_SECONDS);
