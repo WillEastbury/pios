@@ -706,19 +706,31 @@ static bool slot_header_bootable(u32 slot_lba)
 
 /* A staged OTA update has precedence over the FAT bootstrap package. The FAT
  * file is an installation/recovery source, not an authority that should
- * overwrite a newer valid raw slot on every reboot. Validate both the pending
- * boot-control state and the target header before suppressing FAT recovery. */
-static bool bootctrl_has_bootable_pending(u32 root_lba)
+ * overwrite a valid raw slot on every reboot. Validate pending first, then the
+ * known-good active slot, before suppressing FAT recovery. */
+static bool bootctrl_has_bootable_raw_slot(u32 root_lba)
 {
     u32 ctl_lba = root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE);
     if (!sd_read_block(ctl_lba, bootctl) || !bootctrl_valid(bootctl))
-        return false;
+        return slot_header_bootable(root_lba +
+                                    (slot_offset(PIOS_BOOTCTRL_SLOT_A) /
+                                     SD_BLOCK_SIZE));
     u32 pending = read_le32(bootctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF);
     u32 tries = read_le32(bootctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF);
-    if (pending > PIOS_BOOTCTRL_SLOT_B || tries == 0)
-        return false;
-    u32 pending_lba = root_lba + (slot_offset(pending) / SD_BLOCK_SIZE);
-    return slot_header_bootable(pending_lba);
+    if (pending <= PIOS_BOOTCTRL_SLOT_B && tries > 0) {
+        u32 pending_lba = root_lba + (slot_offset(pending) / SD_BLOCK_SIZE);
+        if (slot_header_bootable(pending_lba))
+            return true;
+    }
+
+    u32 active = read_le32(bootctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF);
+    u32 good = read_le32(bootctl + PIOS_BOOTCTRL_GOOD_MASK_OFF);
+    if (active <= PIOS_BOOTCTRL_SLOT_B && (good & (1U << active))) {
+        u32 active_lba = root_lba + (slot_offset(active) / SD_BLOCK_SIZE);
+        if (slot_header_bootable(active_lba))
+            return true;
+    }
+    return false;
 }
 
 static u32 select_kernel_slot_lba(u32 root_lba)
@@ -795,8 +807,8 @@ NORETURN void bootstrap_main(void)
     bool partition_valid = discover_kernel_partition(&root_lba);
     if (!partition_valid)
         root_lba = BOOT_FALLBACK_LBA;
-    else if (bootctrl_has_bootable_pending(root_lba))
-        uart_puts("[boot] valid pending slot; FAT import skipped\n");
+    else if (bootctrl_has_bootable_raw_slot(root_lba))
+        uart_puts("[boot] valid raw slot; FAT import skipped\n");
     else
         (void)stage0_apply_fat_update(root_lba);
     u32 slot_lba = partition_valid ? select_kernel_slot_lba(root_lba)
