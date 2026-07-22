@@ -11567,24 +11567,19 @@ static void ui_console_prompt(void)
     uart_vt_reset();
 }
 
-static void ui_print_ip(u32 ip)
-{
-    u32 a = (ip >> 24) & 0xFF;
-    u32 b = (ip >> 16) & 0xFF;
-    u32 c = (ip >> 8) & 0xFF;
-    u32 d = ip & 0xFF;
-    fb_printf("%u.%u.%u.%u", a, b, c, d);
-    uart_puts("[");
-    uart_hex(a); uart_putc('.');
-    uart_hex(b); uart_putc('.');
-    uart_hex(c); uart_putc('.');
-    uart_hex(d); uart_puts("]");
-}
-
 static void ui_console_ip(u32 ip)
 {
-    fb_printf("%u.%u.%u.%u", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF,
-              (ip >> 8) & 0xFF, ip & 0xFF);
+    /* Route via ui_console_write() (UART + HDMI + TCP) instead of the old
+     * fb_printf()-only implementation, which left this address invisible
+     * over the TCP/2323 debug console and physical UART alike -- same
+     * class of bug fixed for "dtrace dump"/"hexsec"/"capsule". */
+    ui_console_u32_dec((ip >> 24) & 0xFF);
+    ui_console_write(".");
+    ui_console_u32_dec((ip >> 16) & 0xFF);
+    ui_console_write(".");
+    ui_console_u32_dec((ip >> 8) & 0xFF);
+    ui_console_write(".");
+    ui_console_u32_dec(ip & 0xFF);
 }
 
 static void ui_console_route_table(void)
@@ -11593,14 +11588,18 @@ static void ui_console_route_table(void)
     u32 n = net_route_snapshot(routes, NET_ROUTE_MAX);
     ui_console_write("ROUTE DST MASK GW FLAGS PFX\n");
     for (u32 i = 0; i < n; i++) {
-        fb_printf("%u ", i);
+        ui_console_u32_dec(i);
+        ui_console_write(" ");
         ui_console_ip(routes[i].dst);
         ui_console_write(" ");
         ui_console_ip(routes[i].mask);
         ui_console_write(" ");
         ui_console_ip(routes[i].gateway);
         ui_console_write(" ");
-        fb_printf("%u %u\n", routes[i].flags, routes[i].prefix_len);
+        ui_console_u32_dec(routes[i].flags);
+        ui_console_write(" ");
+        ui_console_u32_dec(routes[i].prefix_len);
+        ui_console_write("\n");
     }
 }
 
@@ -11674,8 +11673,14 @@ static void ui_console_arp_table(void)
         ui_console_write(" ");
         ui_console_mac(e[i].mac);
         ui_console_write(" ");
-        fb_printf("%u %u %u %u\n", e[i].state, e[i].retries,
-                  e[i].consistency, (u32)e[i].age_ms);
+        ui_console_u32_dec(e[i].state);
+        ui_console_write(" ");
+        ui_console_u32_dec(e[i].retries);
+        ui_console_write(" ");
+        ui_console_u32_dec(e[i].consistency);
+        ui_console_write(" ");
+        ui_console_u32_dec((u32)e[i].age_ms);
+        ui_console_write("\n");
     }
 }
 
@@ -13901,15 +13906,15 @@ static void ui_print_dns_status(void)
     struct dns_async_status ds;
     dns_async_status(&ds);
     ui_console_write("dns state=");
-    fb_printf("%u", ds.state);
+    ui_console_u32_dec(ds.state);
     ui_console_write(" server=");
     ui_console_ip(ds.server_ip);
     ui_console_write(" result=");
     ui_console_ip(ds.result_ip);
     ui_console_write(" attempts=");
-    fb_printf("%u", ds.attempts);
+    ui_console_u32_dec(ds.attempts);
     ui_console_write(" error=");
-    fb_printf("%u", ds.last_error);
+    ui_console_u32_dec(ds.last_error);
     ui_console_write(" rx=");
     ui_console_u32_dec(ds.rx_total);
     ui_console_write(" server_rx=");
@@ -14390,40 +14395,42 @@ static void ui_cmd_netcfg(u32 argc, char **argv)
     const net_stats_t *st = net_get_stats();
     u8 mac[6];
     nic_get_mac(mac);
-    fb_printf("link=%s mode=%s\n", nic_link_up() ? "up" : "down", ui_cfg_dhcp ? "dhcp" : "static");
-    fb_printf("ip=");
-    ui_print_ip(net_get_our_ip());
-    fb_puts(" mask=");
-    ui_print_ip(ui_cfg_mask);
-    fb_puts(" gw=");
-    ui_print_ip(ui_cfg_gw);
-    fb_puts(" dns=");
-    ui_print_ip(ui_cfg_dns);
-    fb_puts("\n");
-    fb_printf("mac=%x:%x:%x:%x:%x:%x\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    fb_printf("tx=%X rx=%X udp_tx=%X udp_rx=%X drops=%X\n",
-              st->tx_packets, st->rx_packets, st->udp_sent, st->udp_recv,
-              st->drop_runt + st->drop_bad_cksum + st->drop_fragment + st->drop_ip_options +
-              st->drop_bad_src + st->drop_not_for_us + st->drop_bad_proto +
-              st->drop_icmp_ratelimit + st->drop_no_neighbor + st->drop_udp_malformed + st->drop_oversized);
-
-    uart_puts("net link=");
-    uart_puts(nic_link_up() ? "up" : "down");
-    uart_puts(" mode=");
-    uart_puts(ui_cfg_dhcp ? "dhcp" : "static");
-    uart_puts(" ip=");
-    uart_hex(net_get_our_ip());
-    uart_puts(" mask=");
-    uart_hex(ui_cfg_mask);
-    uart_puts(" gw=");
-    uart_hex(ui_cfg_gw);
-    uart_puts(" dns=");
-    uart_hex(ui_cfg_dns);
-    uart_puts(" tx=");
-    uart_hex((u32)st->tx_packets);
-    uart_puts(" rx=");
-    uart_hex((u32)st->rx_packets);
-    uart_puts("\n");
+    /* Render via ui_console_write() (UART + HDMI + TCP) instead of the old
+     * split fb_printf()/uart_puts() pair -- the fb_printf() side never
+     * reached UART/TCP at all, and the separate uart_puts() side was a
+     * reduced-field duplicate that never reached HDMI/TCP; same class of
+     * bug fixed for "dtrace dump"/"hexsec"/"capsule"/"watchdog". */
+    ui_console_write("net link=");
+    ui_console_write(nic_link_up() ? "up" : "down");
+    ui_console_write(" mode=");
+    ui_console_write(ui_cfg_dhcp ? "dhcp" : "static");
+    ui_console_write(" ip=");
+    ui_console_ip(net_get_our_ip());
+    ui_console_write(" mask=");
+    ui_console_ip(ui_cfg_mask);
+    ui_console_write(" gw=");
+    ui_console_ip(ui_cfg_gw);
+    ui_console_write(" dns=");
+    ui_console_ip(ui_cfg_dns);
+    ui_console_write("\nmac=");
+    for (u32 i = 0; i < 6; i++) {
+        if (i) ui_console_write(":");
+        ui_console_hex_fixed(mac[i], 2);
+    }
+    ui_console_write("\ntx=");
+    ui_console_hex_fixed(st->tx_packets, 8);
+    ui_console_write(" rx=");
+    ui_console_hex_fixed(st->rx_packets, 8);
+    ui_console_write(" udp_tx=");
+    ui_console_hex_fixed(st->udp_sent, 8);
+    ui_console_write(" udp_rx=");
+    ui_console_hex_fixed(st->udp_recv, 8);
+    ui_console_write(" drops=");
+    ui_console_hex_fixed(st->drop_runt + st->drop_bad_cksum + st->drop_fragment + st->drop_ip_options +
+                          st->drop_bad_src + st->drop_not_for_us + st->drop_bad_proto +
+                          st->drop_icmp_ratelimit + st->drop_no_neighbor + st->drop_udp_malformed + st->drop_oversized,
+                          8);
+    ui_console_write("\n");
     ui_console_route_table();
     ui_console_arp_table();
 }
@@ -14610,9 +14617,16 @@ static void ui_cmd_db(u32 argc, char **argv)
         }
         u32 ids[64];
         u32 n = picowal_db_list((u16)card, ids, 64);
-        fb_printf("db card=%u count=%u\n", card, n);
-        for (u32 i = 0; i < n; i++)
-            fb_printf("  rec=%u\n", ids[i]);
+        ui_console_write("db card=");
+        ui_console_u32_dec(card);
+        ui_console_write(" count=");
+        ui_console_u32_dec(n);
+        ui_console_write("\n");
+        for (u32 i = 0; i < n; i++) {
+            ui_console_write("  rec=");
+            ui_console_u32_dec(ids[i]);
+            ui_console_write("\n");
+        }
         return;
     }
 
@@ -14634,7 +14648,13 @@ static void ui_cmd_db(u32 argc, char **argv)
             ui_console_write("ERR: key pack failed\n");
             return;
         }
-        fb_printf("key=0x%x card=%u record=%u\n", key, card, rec);
+        ui_console_write("key=0x");
+        ui_console_hex_fixed(key, 8);
+        ui_console_write(" card=");
+        ui_console_u32_dec(card);
+        ui_console_write(" record=");
+        ui_console_u32_dec(rec);
+        ui_console_write("\n");
         return;
     }
 
@@ -14663,8 +14683,13 @@ static void ui_cmd_db(u32 argc, char **argv)
             return;
         }
         i32 n = picowal_db_put((u16)card, rec, data, p);
-        if (n < 0) ui_console_write("ERR: put failed\n");
-        else fb_printf("OK: wrote %u bytes\n", (u32)n);
+        if (n < 0) {
+            ui_console_write("ERR: put failed\n");
+        } else {
+            ui_console_write("OK: wrote ");
+            ui_console_u32_dec((u32)n);
+            ui_console_write(" bytes\n");
+        }
         return;
     }
 
@@ -14690,27 +14715,39 @@ static void ui_cmd_db(u32 argc, char **argv)
             return;
         }
         i32 n = picowal_db_put((u16)card, rec, data, (u32)got);
-        if (n < 0) ui_console_write("ERR: putf failed\n");
-        else fb_printf("OK: wrote %u bytes\n", (u32)n);
+        if (n < 0) {
+            ui_console_write("ERR: putf failed\n");
+        } else {
+            ui_console_write("OK: wrote ");
+            ui_console_u32_dec((u32)n);
+            ui_console_write(" bytes\n");
+        }
         return;
     }
 
     if (ui_streq(argv[1], "get")) {
         static u8 data[PICOWAL_DATA_MAX];
+        static char printable[PICOWAL_DATA_MAX + 1];
         i32 n = picowal_db_get((u16)card, rec, data, PICOWAL_DATA_MAX);
         if (n < 0) {
             ui_console_write("ERR: get failed\n");
             return;
         }
-        fb_printf("db card=%u rec=%u len=%u\n", card, rec, (u32)n);
+        ui_console_write("db card=");
+        ui_console_u32_dec(card);
+        ui_console_write(" rec=");
+        ui_console_u32_dec(rec);
+        ui_console_write(" len=");
+        ui_console_u32_dec((u32)n);
+        ui_console_write("\n");
         for (i32 i = 0; i < n; i++) {
             char c = (char)data[i];
             if (c < 0x20 || c > 0x7E) c = '.';
-            uart_putc(c);
-            fb_putc(c);
+            printable[i] = c;
         }
-        uart_puts("\n");
-        fb_putc('\n');
+        printable[n] = 0;
+        ui_console_write(printable);
+        ui_console_write("\n");
         return;
     }
 
@@ -14742,7 +14779,9 @@ static void ui_cmd_db(u32 argc, char **argv)
             ui_console_write("ERR: target write failed\n");
             return;
         }
-        fb_printf("OK: wrote file bytes=%u\n", (u32)n);
+        ui_console_write("OK: wrote file bytes=");
+        ui_console_u32_dec((u32)n);
+        ui_console_write("\n");
         return;
     }
 
