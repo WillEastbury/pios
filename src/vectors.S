@@ -353,15 +353,10 @@ irq_handler:
     eret
 
 sync_handler:
-#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
-    ldr     x12, =0x09000000
-#else
-    ldr     x12, =0x107C201000
-#endif
-1:  ldr     w13, [x12, #0x18]
-    tbnz    w13, #5, 1b
-    mov     w13, #'1'
-    str     w13, [x12, #0x00]
+    /* Never poll a diagnostic UART before saving the exception context. The
+     * old Pi path used BCM address 0x107C201000 even after the console moved to
+     * RP1 PL011 at 0x1F00030000; every EL0 SVC then spun forever waiting on a
+     * nonexistent UART's TX-full bit. C exception handling owns diagnostics. */
     SAVE_CONTEXT
     mov     x0, sp
     mrs     x1, esr_el1

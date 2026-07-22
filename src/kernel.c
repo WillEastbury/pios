@@ -2568,8 +2568,15 @@ static void http_exec_sts_command(char *out, u32 *len_ptr, u32 max, const char *
             for (u32 k = 0; k < tl; k++) token[k] = g_sts_test_token[k];
             token[tl] = 0;
             if (http_streq(sub, "tamper")) {
-                /* flip a byte in the signature (last) segment => must fail closed */
-                token[tl - 1] = (token[tl - 1] == 'A') ? 'B' : 'A';
+                /* Flip the first signature character. Mutating the final
+                 * base64url character can change only unused padding bits and
+                 * decode to the same signature bytes. */
+                u32 sig = 0;
+                for (u32 k = 0; k < tl; k++)
+                    if (token[k] == '.')
+                        sig = k + 1U;
+                if (sig < tl)
+                    token[sig] = (token[sig] == 'A') ? 'B' : 'A';
             }
             char tenant[64];
             u16 scope_mask = 0;
