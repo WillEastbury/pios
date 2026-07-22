@@ -276,15 +276,17 @@ static inline u64 user_ram_nc_attrs(void)
 
 static void map_user_kernel_low(u64 *l2)
 {
-    /* CORE0_RAM_BASE/L2_BLOCK_SIZE is 4 on real Pi5 hardware (CORE0_RAM_BASE=
-     * 0x800000) but 528 on QEMU_VIRT (CORE0_RAM_BASE=0x42000000) -- both
-     * l2_table_low[] and the per-slot l2 table passed in are fixed 512-entry
-     * arrays, so the unclamped loop read/wrote 16 entries past both arrays
-     * on QEMU_VIRT (confirmed: GCC -O2 flags "iteration 512 invokes undefined
-     * behavior"). Clamp to the actual table size; entries above 512 are the
-     * per-core private RAM window and beyond, which mmu_user_slot_pages()
-     * maps separately anyway. */
-    u32 count = (u32)(CORE0_RAM_BASE / L2_BLOCK_SIZE);
+    /* Mirror every privileged kernel/private-RAM block before SHARED_FIFO.
+     * On Pi this includes the linker-reserved secondary scheduler stacks at
+     * ~9.8-10.7 MiB. Mapping only [0, CORE0_RAM_BASE) (the old bound, 8 MiB)
+     * made the first stack access after mmu_switch_to_user fault at scheduler
+     * stage 50, before ctx_switch/EL0 entry. Copy l2_table_low verbatim so each
+     * PA keeps its exact NC/WB and PXN/UXN attributes; EL0 still has no access.
+     *
+     * On QEMU these physical ranges are in L1[1], so the 512-entry L1[0] table
+     * remains clamped here and map_user_kernel_phys() handles the actual kernel
+     * window separately. */
+    u32 count = (u32)(SHARED_FIFO_BASE / L2_BLOCK_SIZE);
     if (count > 512U)
         count = 512U;
     for (u32 b = 0; b < count; b++) {
