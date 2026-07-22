@@ -16404,11 +16404,21 @@ static void ui_cmd_capsule(u32 argc, char **argv)
         struct proc_capsule_ui_entry e[UI_SNAPSHOT_MAX];
         u32 n = proc_capsule_snapshot(e, UI_SNAPSHOT_MAX);
         for (u32 i = 0; i < n; i++) {
-            fb_printf("pid=0x%x core=%u cap=%u hash=0x%x grp=%s vfs=%s\n",
-                      e[i].pid, e[i].affinity_core, e[i].capsule_id, e[i].capsule_hash,
-                      e[i].group[0] ? e[i].group : "-", e[i].vfs_root[0] ? e[i].vfs_root : "-");
+            ui_console_write("pid=");
+            ui_console_hex_fixed(e[i].pid, 8);
+            ui_console_write(" core=");
+            ui_console_u32_dec(e[i].affinity_core);
+            ui_console_write(" cap=");
+            ui_console_u32_dec(e[i].capsule_id);
+            ui_console_write(" hash=");
+            ui_console_hex_fixed(e[i].capsule_hash, 8);
+            ui_console_write(" grp=");
+            ui_console_write(e[i].group[0] ? e[i].group : "-");
+            ui_console_write(" vfs=");
+            ui_console_write(e[i].vfs_root[0] ? e[i].vfs_root : "-");
+            ui_console_write("\n");
         }
-        uart_puts("capsule ls done\n");
+        ui_console_write("capsule ls done\n");
         return;
     }
     if (ui_streq(argv[1], "status")) {
@@ -16423,7 +16433,13 @@ static void ui_cmd_capsule(u32 argc, char **argv)
             return;
         }
         (void)el2_hvc_call(EL2_HVC_STAGE2_FAULTS, 0, 0, 0, 0, &faults);
-        fb_printf("capsule=%u st=0x%x faults=0x%x\n", id, st, faults);
+        ui_console_write("capsule=");
+        ui_console_u32_dec(id);
+        ui_console_write(" st=");
+        ui_console_hex_fixed(st, 16);
+        ui_console_write(" faults=");
+        ui_console_hex_fixed(faults, 16);
+        ui_console_write("\n");
         {
             u32 fc = 0, active = 0, last_cap = 0;
             u64 esr = 0, elr = 0, far_ipa = 0, sp = 0;
@@ -16431,10 +16447,23 @@ static void ui_cmd_capsule(u32 argc, char **argv)
             u32 core = core_id();
             if (el2_stage2_fault_detail(core, &fc, &esr, &elr, &far_ipa, &sp,
                                         &faulted_el0, &active, &last_cap)) {
-                fb_printf("core=%u active=%u last_fault_cap=%u count=%u\n",
-                          core, active, last_cap, fc);
-                fb_printf("esr=0x%x elr=0x%x far_ipa=0x%x sp_%s=0x%x\n",
-                          esr, elr, far_ipa, faulted_el0 ? "el0" : "el1", sp);
+                ui_console_write("core=");
+                ui_console_u32_dec(core);
+                ui_console_write(" active=");
+                ui_console_u32_dec(active);
+                ui_console_write(" last_fault_cap=");
+                ui_console_u32_dec(last_cap);
+                ui_console_write(" count=");
+                ui_console_u32_dec(fc);
+                ui_console_write("\nesr=");
+                ui_console_hex_fixed(esr, 16);
+                ui_console_write(" elr=");
+                ui_console_hex_fixed(elr, 16);
+                ui_console_write(" far_ipa=");
+                ui_console_hex_fixed(far_ipa, 16);
+                ui_console_write(faulted_el0 ? " sp_el0=" : " sp_el1=");
+                ui_console_hex_fixed(sp, 16);
+                ui_console_write("\n");
             }
         }
         return;
@@ -16885,13 +16914,8 @@ static void ui_cmd_watchdog(u32 argc, char **argv)
     if (ui_streq(argv[1], "status")) {
         struct watchdog_status st;
         watchdog_status(&st);
-        fb_printf("watchdog armed=%u mode=%s timeout=%u trips=%u last_core=%u\n",
-                  st.armed ? 1U : 0U, st.reboot_on_trip ? "reboot" : "halt",
-                  st.timeout_ticks, st.trip_count, st.last_trip_core);
         u32 rem = watchdog_hw_remaining_ticks();
         u32 rstc = watchdog_hw_rstc();
-        fb_printf("hw remaining_ticks=0x%x (~%ums) rstc=0x%x\n",
-                  rem, (u32)(((u64)rem * 1000ULL) >> 16), rstc);
         ui_console_write("watchdog armed=");
         ui_console_u32_dec(st.armed ? 1U : 0U);
         ui_console_write(" mode=");
@@ -16915,7 +16939,6 @@ static void ui_cmd_watchdog(u32 argc, char **argv)
         }
         watchdog_hw_arm_seconds(s);
         u32 rem = watchdog_hw_remaining_ticks();
-        fb_printf("OK: hw watchdog armed s=%u remaining=0x%x\n", s, rem);
         ui_console_write("OK: hw watchdog armed s=");
         ui_console_u32_dec(s);
         ui_console_write(" remaining=");
@@ -16926,7 +16949,6 @@ static void ui_cmd_watchdog(u32 argc, char **argv)
     if (ui_streq(argv[1], "hw-pet")) {
         watchdog_hw_pet();
         u32 rem = watchdog_hw_remaining_ticks();
-        fb_printf("OK: hw watchdog petted remaining=0x%x\n", rem);
         ui_console_write("OK: hw watchdog petted remaining=");
         ui_console_hex_fixed(rem, 8);
         ui_console_write("\n");
