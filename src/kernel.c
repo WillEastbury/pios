@@ -17494,9 +17494,17 @@ static void ui_cmd_svc(u32 argc, char **argv)
         for (u32 i = 0; i < UI_SVC_MAX; i++) {
             struct ui_service_unit *s = &ui_services[i];
             if (!s->used) continue;
-            fb_printf("svc %-12s state=%u pid=%x dep=%s path=%s\n",
-                      s->name, s->state, (u32)(s->pid > 0 ? s->pid : 0),
-                      s->depends[0] ? s->depends : "-", s->path);
+            ui_console_write("svc ");
+            ui_console_write(s->name);
+            ui_console_write(" state=");
+            ui_console_u32_dec(s->state);
+            ui_console_write(" pid=");
+            ui_console_hex_fixed((u32)(s->pid > 0 ? s->pid : 0), 8);
+            ui_console_write(" dep=");
+            ui_console_write(s->depends[0] ? s->depends : "-");
+            ui_console_write(" path=");
+            ui_console_write(s->path);
+            ui_console_write("\n");
         }
         return;
     }
