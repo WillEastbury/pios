@@ -127,7 +127,7 @@ static inline struct fifo_irq_counter *get_irq_counter(u32 src, u32 dst) {
 }
 
 void fifo_irq_enable(u32 core) {
-    if (core >= 4U)
+    if (core >= 4U || core_id() != core)
         return;
     fifo_store_release(&get_irq_target(core)->ready, 1U);
 }
@@ -166,7 +166,7 @@ void fifo_init_all(void) {
 }
 
 bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {
-    if (src >= 4 || dst >= 4) return false;
+    if (src >= 4 || dst >= 4 || core_id() != src) return false;
     struct fifo *f = get_fifo(src, dst);
     u32 head = f->head;
     u32 tail = fifo_load_acquire(&f->tail);
@@ -186,7 +186,7 @@ bool fifo_push(u32 src, u32 dst, const struct fifo_msg *msg) {
 }
 
 u32 fifo_push_batch(u32 src, u32 dst, const struct fifo_msg *msgs, u32 count) {
-    if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
+    if (src >= 4 || dst >= 4 || core_id() != src || !msgs || count == 0) return 0;
     struct fifo *f = get_fifo(src, dst);
     u32 head = f->head;
     u32 tail = fifo_load_acquire(&f->tail);
@@ -210,7 +210,7 @@ u32 fifo_push_batch(u32 src, u32 dst, const struct fifo_msg *msgs, u32 count) {
 }
 
 bool fifo_pop(u32 dst, u32 src, struct fifo_msg *msg) {
-    if (src >= 4 || dst >= 4) return false;
+    if (src >= 4 || dst >= 4 || core_id() != dst) return false;
     struct fifo *f = get_fifo(src, dst);
     u32 tail = f->tail;
 
@@ -227,7 +227,7 @@ bool fifo_pop(u32 dst, u32 src, struct fifo_msg *msg) {
 }
 
 u32 fifo_pop_batch(u32 dst, u32 src, struct fifo_msg *msgs, u32 max_count) {
-    if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
+    if (src >= 4 || dst >= 4 || core_id() != dst || !msgs || max_count == 0) return 0;
     struct fifo *f = get_fifo(src, dst);
     u32 tail = f->tail;
     u32 head = fifo_load_acquire(&f->head);
@@ -247,7 +247,7 @@ u32 fifo_pop_batch(u32 dst, u32 src, struct fifo_msg *msgs, u32 max_count) {
 }
 
 bool fifo_peek(u32 dst, u32 src, struct fifo_msg *msg) {
-    if (src >= 4 || dst >= 4 || !msg) return false;
+    if (src >= 4 || dst >= 4 || core_id() != dst || !msg) return false;
     struct fifo *f = get_fifo(src, dst);
     u32 tail = f->tail;
     u32 head = fifo_load_acquire(&f->head);
@@ -273,7 +273,7 @@ u32 fifo_count(u32 dst, u32 src) {
 }
 
 u32 fifo_span_push_batch(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32 count) {
-    if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
+    if (src >= 4 || dst >= 4 || core_id() != src || !msgs || count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 head = f->head;
     u32 tail = fifo_load_acquire(&f->tail);
@@ -297,7 +297,7 @@ u32 fifo_span_push_batch(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32
 }
 
 u32 fifo_span_pop_batch(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_count) {
-    if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
+    if (src >= 4 || dst >= 4 || core_id() != dst || !msgs || max_count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 tail = f->tail;
     u32 head = fifo_load_acquire(&f->head);
@@ -320,24 +320,26 @@ u32 fifo_span_pop_batch(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_co
 /*  A/B span-ring variants: acquire/release + hand-asm descriptor copy */
 /* ------------------------------------------------------------------ */
 
-/* Hand-rolled 32-byte (one fifo_span_msg) copy via a single NEON ldp/stp
- * q-register pair — 2 instructions, no loop, no memcpy call. */
-static inline void span_copy32_asm(struct fifo_span_msg *d, const struct fifo_span_msg *s) {
+/* Hand-rolled 64-byte (one fifo_span_msg) copy via two NEON ldp/stp q-register
+ * pairs — 4 instructions, no loop, no memcpy call. */
+static inline void span_copy64_asm(struct fifo_span_msg *d, const struct fifo_span_msg *s) {
     __asm__ volatile(
         "ldp q0, q1, [%1]\n\t"
+        "ldp q2, q3, [%1, #32]\n\t"
         "stp q0, q1, [%0]\n\t"
+        "stp q2, q3, [%0, #32]\n\t"
         :
         : "r"(d), "r"(s)
-        : "v0", "v1", "memory"
+        : "v0", "v1", "v2", "v3", "memory"
     );
 }
 
-/* Idiomatic C: acquire/release ordering, compiler-generated 32B struct copy.
+/* Idiomatic C: acquire/release ordering, compiler-generated 64B struct copy.
  * Correct SPSC ordering on the 4 inner-shareable A76 cores without DMB-SY:
  *   producer publishes head with STLR (release) after the data stores;
  *   producer reads tail with LDAR (acquire) to see consumer-freed slots. */
 u32 fifo_span_push_batch_acqrel(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32 count) {
-    if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
+    if (src >= 4 || dst >= 4 || core_id() != src || !msgs || count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 head = f->head;
     u32 tail = fifo_atomic_load_acquire(&f->tail);
@@ -361,7 +363,7 @@ u32 fifo_span_push_batch_acqrel(u32 src, u32 dst, const struct fifo_span_msg *ms
 }
 
 u32 fifo_span_pop_batch_acqrel(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_count) {
-    if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
+    if (src >= 4 || dst >= 4 || core_id() != dst || !msgs || max_count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 tail = f->tail;
     u32 head = fifo_atomic_load_acquire(&f->head);
@@ -383,7 +385,7 @@ u32 fifo_span_pop_batch_acqrel(u32 dst, u32 src, struct fifo_span_msg *msgs, u32
 /* Hand-tuned: identical ordering to _acqrel, but the descriptor copy is the
  * explicit ldp/stp q NEON pair instead of compiler struct assignment. */
 u32 fifo_span_push_batch_asm(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32 count) {
-    if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
+    if (src >= 4 || dst >= 4 || core_id() != src || !msgs || count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 head = f->head;
     u32 tail = fifo_atomic_load_acquire(&f->tail);
@@ -393,7 +395,7 @@ u32 fifo_span_push_batch_asm(u32 src, u32 dst, const struct fifo_span_msg *msgs,
         u32 next = (head + 1) & (FIFO_SPAN_CAPACITY - 1);
         if (unlikely(next == tail))
             break;
-        span_copy32_asm(&f->msgs[head], &msgs[pushed]);
+        span_copy64_asm(&f->msgs[head], &msgs[pushed]);
         fifo_clean(&f->msgs[head], sizeof(struct fifo_span_msg));
         head = next;
         pushed++;
@@ -407,7 +409,7 @@ u32 fifo_span_push_batch_asm(u32 src, u32 dst, const struct fifo_span_msg *msgs,
 }
 
 u32 fifo_span_pop_batch_asm(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_count) {
-    if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
+    if (src >= 4 || dst >= 4 || core_id() != dst || !msgs || max_count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 tail = f->tail;
     u32 head = fifo_atomic_load_acquire(&f->head);
@@ -415,7 +417,7 @@ u32 fifo_span_pop_batch_asm(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 ma
 
     while (popped < max_count && tail != head) {
         fifo_invalidate(&f->msgs[tail], sizeof(struct fifo_span_msg));
-        span_copy32_asm(&msgs[popped], &f->msgs[tail]);
+        span_copy64_asm(&msgs[popped], &f->msgs[tail]);
         tail = (tail + 1) & (FIFO_SPAN_CAPACITY - 1);
         popped++;
     }
@@ -431,7 +433,7 @@ u32 fifo_span_pop_batch_asm(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 ma
  *   producer DMB ISHST (data before head) + DSB ISHST (head before doorbell)
  *   consumer DMB ISHLD (head before data reads) + DMB ISH (reads before tail) */
 u32 fifo_span_push_batch_ish(u32 src, u32 dst, const struct fifo_span_msg *msgs, u32 count) {
-    if (src >= 4 || dst >= 4 || !msgs || count == 0) return 0;
+    if (src >= 4 || dst >= 4 || core_id() != src || !msgs || count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 head = f->head;
     u32 tail = fifo_load_acquire(&f->tail);
@@ -455,7 +457,7 @@ u32 fifo_span_push_batch_ish(u32 src, u32 dst, const struct fifo_span_msg *msgs,
 }
 
 u32 fifo_span_pop_batch_ish(u32 dst, u32 src, struct fifo_span_msg *msgs, u32 max_count) {
-    if (src >= 4 || dst >= 4 || !msgs || max_count == 0) return 0;
+    if (src >= 4 || dst >= 4 || core_id() != dst || !msgs || max_count == 0) return 0;
     struct fifo_span *f = get_span_fifo(src, dst);
     u32 tail = f->tail;
     u32 head = fifo_load_acquire(&f->head);

@@ -4012,9 +4012,9 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
         /* ── A/B: span-ring descriptor copy + memory-ordering strategy ──
          * Same-core round-trip on the unused (CORE_NET,CORE_NET) self-ring
          * isolates raw copy + barrier cost from scheduler/wakeup noise:
-         *   base   = DMB-SY + compiler 32B struct copy   (current production)
+         *   base   = DMB-SY + compiler 64B struct copy   (current production)
          *   acqrel = LDAR/STLR + DSB ISHST, compiler copy
-         *   asm    = same ordering, hand ldp/stp q (NEON) 32B copy
+         *   asm    = same ordering, hand ldp/stp q (NEON) 64B copy
          * Each iteration pushes then pops one chunk; per-desc = ticks/iters. */
         {
             struct fifo_span_msg rb[16];

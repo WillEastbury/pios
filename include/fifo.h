@@ -67,7 +67,11 @@ struct fifo_span_msg {
     u32 flags;
     u32 aux;
     u32 _pad;
-} ALIGNED(32);
+    u64 _reserved[4];
+} ALIGNED(64);
+
+_Static_assert(sizeof(struct fifo_span_msg) == 64,
+               "FIFO span descriptors must be one cache line");
 
 struct fifo_span {
     volatile u32 head ALIGNED(64);
@@ -89,9 +93,9 @@ u32   fifo_span_pop_batch(u32 dst_core, u32 src_core, struct fifo_span_msg *msgs
 
 /* A/B variants of the span ring (same ABI). Used by the IPC benchmark to
  * compare memory-ordering + descriptor-copy strategies head to head:
- *   (baseline above) DMB-SY full barriers + compiler 32B struct copy
+ *   (baseline above) DMB-SY full barriers + compiler 64B struct copy
  *   _acqrel          LDAR/STLR acquire-release + DSB ISHST, compiler copy
- *   _asm             same ordering, hand-rolled ldp/stp q (NEON) 32B copy */
+ *   _asm             same ordering, hand-rolled ldp/stp q (NEON) 64B copy */
 u32   fifo_span_push_batch_acqrel(u32 src_core, u32 dst_core, const struct fifo_span_msg *msgs, u32 count);
 u32   fifo_span_pop_batch_acqrel(u32 dst_core, u32 src_core, struct fifo_span_msg *msgs, u32 max_count);
 u32   fifo_span_push_batch_asm(u32 src_core, u32 dst_core, const struct fifo_span_msg *msgs, u32 count);
