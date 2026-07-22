@@ -13645,8 +13645,96 @@ static void ui_print_tensor_status(void)
     ui_console_write("\n");
 }
 
+struct ui_walfs_deck_ctx {
+    u32 count;
+    char names[16][32];
+};
+
+static struct ui_walfs_deck_ctx g_ui_walfs_decks;
+
+static void ui_walfs_deck_cb(const struct walfs_dirent *entry)
+{
+    if (!entry || g_ui_walfs_decks.count >= 16)
+        return;
+    struct walfs_inode ino;
+    if (!walfs_stat(entry->child_id, &ino) || !(ino.flags & WALFS_DIR))
+        return;
+    u32 i = g_ui_walfs_decks.count++;
+    u32 n = 0;
+    while (entry->name[n] && n < sizeof(g_ui_walfs_decks.names[0]) - 1U) {
+        g_ui_walfs_decks.names[i][n] = (char)entry->name[n];
+        n++;
+    }
+    g_ui_walfs_decks.names[i][n] = 0;
+}
+
+/* Bounded WALFS/PicoWAL summary for "tensor walfs" -- a single view combining
+ * mount/health/capacity (walfs_status), active PicoWAL-style decks (a single
+ * top-level readdir of /var/picowal, capped at 16 entries), and per-deck
+ * record counts (one bounded picowal_db_list() call per deck found, also
+ * capped at 16 cards). This is a read-only snapshot: no writes, no
+ * scheduling side effects, and both readdir/list calls are already
+ * depth/count-bounded primitives used elsewhere in the console. */
+static void ui_print_tensor_walfs_dashboard(void)
+{
+    struct walfs_status_snapshot ws;
+    walfs_status(&ws);
+    ui_console_write("WALFS mounted=");
+    ui_console_write(ws.mounted ? "yes" : "no");
+    ui_console_write(" root=");
+    ui_console_write(ws.root_ok ? "ok" : "bad");
+    ui_console_write(" super=");
+    ui_console_write(ws.super_ok ? "ok" : "bad");
+    ui_console_write(" region_blocks=");
+    ui_console_u64_dec(ws.region_blocks);
+    ui_console_write("\nindex records=");
+    ui_console_u64_dec(ws.super_records);
+    ui_console_write(" head=");
+    ui_console_u64_dec(ws.super_head);
+    ui_console_write(" tree_root=");
+    ui_console_u64_dec(ws.super_tree_root);
+    ui_console_write(" (WAL super-block; tree_root doubles as the active B-tree index page)\n");
+
+    g_ui_walfs_decks.count = 0;
+    u64 pw = walfs_find("/var/picowal");
+    if (!pw) {
+        ui_console_write("decks: none (/var/picowal not present)\n");
+        return;
+    }
+    walfs_readdir(pw, ui_walfs_deck_cb);
+    ui_console_write("decks=");
+    ui_console_u32_dec(g_ui_walfs_decks.count);
+    ui_console_write("\n");
+    for (u32 i = 0; i < g_ui_walfs_decks.count; i++) {
+        const char *name = g_ui_walfs_decks.names[i];
+        u32 card = 0;
+        bool parsed = name[0] == 'c';
+        for (u32 k = 1; parsed && name[k]; k++) {
+            if (name[k] < '0' || name[k] > '9') { parsed = false; break; }
+            card = card * 10U + (u32)(name[k] - '0');
+        }
+        ui_console_write("  deck ");
+        ui_console_write(name);
+        if (parsed && card <= PICOWAL_CARD_MAX) {
+            u32 ids[64];
+            u32 n = picowal_db_list((u16)card, ids, 64);
+            ui_console_write(" card=");
+            ui_console_u32_dec(card);
+            ui_console_write(" records=");
+            ui_console_u32_dec(n);
+            ui_console_write(n >= 64 ? "+ (capped)\n" : "\n");
+        } else {
+            ui_console_write(" (non-card directory)\n");
+        }
+    }
+}
+
 static void ui_cmd_tensor(u32 argc, char **argv)
 {
+    if (argc >= 2 && ui_streq(argv[1], "walfs")) {
+        ui_print_tensor_walfs_dashboard();
+        return;
+    }
     if (argc >= 2 && ui_streq(argv[1], "selftest")) {
         ui_console_write(tensor_selftest() ? "Tensor selftest OK\n" : "Tensor selftest FAILED\n");
         ui_print_tensor_status();
@@ -13898,7 +13986,7 @@ static void ui_cmd_tensor(u32 argc, char **argv)
         ui_print_tensor_status();
         return;
     }
-    ui_console_write("ERR: usage qpu status | qpu reset soft | qpu reset pm confirm | qpu selftest | qpu tiny | tensor status | tensor selftest | tensor tiny\n");
+    ui_console_write("ERR: usage qpu status | qpu reset soft | qpu reset pm confirm | qpu selftest | qpu tiny | tensor status | tensor selftest | tensor tiny | tensor walfs\n");
 }
 
 static void ui_print_dns_status(void)
