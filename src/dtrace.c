@@ -3,7 +3,6 @@
  */
 
 #include "dtrace.h"
-#include "uart.h"
 #include "simd.h"
 
 #define DTRACE_RING_CAP   512U          /* records per core (power of two) */
@@ -254,7 +253,7 @@ u32 dtrace_dump(char *out, u32 max, u32 max_records)
         /* 4-way merge: pick the oldest unconsumed record across all rings. */
         i32 best = -1;
         u64 best_ts = ~0ULL;
-        struct dtrace_rec br;
+        struct dtrace_rec br = {0};
         for (u32 c = 0; c < NUM_CORES; c++) {
             struct dtrace_rec r;
             if (cursor_peek(c, &cu[c], &r) && r.ts < best_ts) {
@@ -269,40 +268,6 @@ u32 dtrace_dump(char *out, u32 max, u32 max_records)
         format_rec(out, &len, max, &br, oldest);
     }
     return len;
-}
-
-void dtrace_dump_uart(u32 max_records)
-{
-    struct dt_cursor cu[NUM_CORES];
-    u64 oldest = ~0ULL;
-    for (u32 c = 0; c < NUM_CORES; c++) {
-        u64 h = g_dtrace_rings[c].head;
-        u64 count = h < DTRACE_RING_CAP ? h : DTRACE_RING_CAP;
-        cu[c].idx = h - count;
-        cu[c].end = h;
-        if (count) {
-            struct dtrace_rec r;
-            if (cursor_peek(c, &cu[c], &r) && r.ts < oldest) oldest = r.ts;
-        }
-    }
-    if (oldest == ~0ULL) oldest = 0;
-    if (max_records == 0 || max_records > NUM_CORES * DTRACE_RING_CAP)
-        max_records = NUM_CORES * DTRACE_RING_CAP;
-
-    for (u32 emitted = 0; emitted < max_records; emitted++) {
-        i32 best = -1; u64 best_ts = ~0ULL; struct dtrace_rec br;
-        for (u32 c = 0; c < NUM_CORES; c++) {
-            struct dtrace_rec r;
-            if (cursor_peek(c, &cu[c], &r) && r.ts < best_ts) { best_ts = r.ts; best = (i32)c; br = r; }
-        }
-        if (best < 0) break;
-        cu[best].idx++;
-        char line[128];
-        u32 l = 0;
-        format_rec(line, &l, sizeof(line) - 1U, &br, oldest);
-        line[l] = 0;
-        uart_puts(line);
-    }
 }
 
 u32 dtrace_status(char *out, u32 max)

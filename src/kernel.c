@@ -14431,15 +14431,22 @@ static void ui_cmd_netcfg(u32 argc, char **argv)
 static void ui_cmd_disk(u32 argc, char **argv)
 {
     if (argc < 2 || ui_streq(argv[1], "info")) {
+        /* Render via ui_console_write() (UART + HDMI + TCP) instead of the
+         * old direct fb_printf()/uart_puts() pair, which was invisible over
+         * the TCP debug console -- same class of bug fixed for "dtrace dump"
+         * and "hexsec". */
         const sd_card_t *card = sd_get_card_info();
-        fb_printf("disk type=%u rca=0x%x cap_bytes=%X\n", card->type, card->rca, card->capacity);
-        uart_puts("disk type=");
-        uart_hex(card->type);
-        uart_puts(" rca=");
-        uart_hex(card->rca);
-        uart_puts(" cap=");
-        uart_hex(card->capacity);
-        uart_puts("\n");
+        char line[128];
+        u32 len = 0;
+        http_append(line, &len, sizeof(line), "disk type=");
+        http_append_u64(line, &len, sizeof(line), card->type);
+        http_append(line, &len, sizeof(line), " rca=0x");
+        http_append_hex32(line, &len, sizeof(line), card->rca);
+        http_append(line, &len, sizeof(line), " cap_bytes=0x");
+        http_append_hex32(line, &len, sizeof(line), (u32)card->capacity);
+        http_append(line, &len, sizeof(line), "\n");
+        line[len] = 0;
+        ui_console_write(line);
         return;
     }
     if (ui_streq(argv[1], "sync")) {
@@ -14455,9 +14462,27 @@ static void ui_cmd_disk(u32 argc, char **argv)
     if (ui_streq(argv[1], "verify")) {
         struct walfs_health h;
         bool ok = walfs_verify(&h);
-        fb_printf("walfs verify: ok=%u super=%u head=%u rec=%u crc_err=%u hdr_err=%u open_tx=%u scan_end=%X\n",
-                  ok ? 1U : 0U, h.super_ok ? 1U : 0U, h.wal_head_ok ? 1U : 0U,
-                  h.valid_records, h.crc_errors, h.header_errors, h.open_tx ? 1U : 0U, h.scan_end);
+        char line[192];
+        u32 len = 0;
+        http_append(line, &len, sizeof(line), "walfs verify: ok=");
+        http_append_u64(line, &len, sizeof(line), ok ? 1U : 0U);
+        http_append(line, &len, sizeof(line), " super=");
+        http_append_u64(line, &len, sizeof(line), h.super_ok ? 1U : 0U);
+        http_append(line, &len, sizeof(line), " head=");
+        http_append_u64(line, &len, sizeof(line), h.wal_head_ok ? 1U : 0U);
+        http_append(line, &len, sizeof(line), " rec=");
+        http_append_u64(line, &len, sizeof(line), h.valid_records);
+        http_append(line, &len, sizeof(line), " crc_err=");
+        http_append_u64(line, &len, sizeof(line), h.crc_errors);
+        http_append(line, &len, sizeof(line), " hdr_err=");
+        http_append_u64(line, &len, sizeof(line), h.header_errors);
+        http_append(line, &len, sizeof(line), " open_tx=");
+        http_append_u64(line, &len, sizeof(line), h.open_tx ? 1U : 0U);
+        http_append(line, &len, sizeof(line), " scan_end=0x");
+        http_append_hex32(line, &len, sizeof(line), h.scan_end);
+        http_append(line, &len, sizeof(line), "\n");
+        line[len] = 0;
+        ui_console_write(line);
         ui_console_write(ok ? "OK: walfs verify clean\n" : "ERR: walfs verify failed\n");
         return;
     }
@@ -14731,34 +14756,39 @@ static void ui_dump_sector(u32 lba)
         ui_console_write("ERR: sd_read_block failed\n");
         return;
     }
+    /* Render into a line buffer and fan out via ui_console_write() (UART +
+     * HDMI console + TCP/2323) instead of writing straight to uart_puts()/
+     * fb_printf(): the old direct-to-UART/HDMI calls made "hexsec" invisible
+     * to anyone using the TCP debug console, the same class of bug fixed for
+     * "dtrace dump". */
     static const char hex[] = "0123456789ABCDEF";
-    fb_printf("LBA 0x%x\n", lba);
-    uart_puts("LBA ");
-    uart_hex(lba);
-    uart_puts("\n");
+    char line[96];
+    u32 len = 0;
+    http_append(line, &len, sizeof(line), "LBA 0x");
+    http_append_hex32(line, &len, sizeof(line), lba);
+    http_append(line, &len, sizeof(line), "\n");
+    line[len] = 0;
+    ui_console_write(line);
     for (u32 off = 0; off < SD_BLOCK_SIZE; off += 16) {
-        fb_printf("%x: ", off);
-        uart_hex(off);
-        uart_puts(": ");
+        len = 0;
+        http_append_hex32(line, &len, sizeof(line), off);
+        http_append(line, &len, sizeof(line), ": ");
         for (u32 i = 0; i < 16; i++) {
             u8 b = sector[off + i];
-            fb_putc(hex[(b >> 4) & 0xF]);
-            fb_putc(hex[b & 0xF]);
-            fb_putc(' ');
-            uart_putc(hex[(b >> 4) & 0xF]);
-            uart_putc(hex[b & 0xF]);
-            uart_putc(' ');
+            line[len++] = hex[(b >> 4) & 0xF];
+            line[len++] = hex[b & 0xF];
+            line[len++] = ' ';
         }
-        fb_puts(" |");
-        uart_puts(" |");
+        line[len++] = '|';
         for (u32 i = 0; i < 16; i++) {
             char c = (char)sector[off + i];
             if (c < 0x20 || c > 0x7E) c = '.';
-            fb_putc(c);
-            uart_putc(c);
+            line[len++] = c;
         }
-        fb_puts("|\n");
-        uart_puts("|\n");
+        line[len++] = '|';
+        line[len++] = '\n';
+        line[len] = 0;
+        ui_console_write(line);
     }
 }
 
@@ -18451,9 +18481,17 @@ static void ui_console_exec(char *line)
             }
             dtrace_set_mask(m);
         } else if (argc >= 2 && ui_streq(argv[1], "dump")) {
+            /* Render into a shared buffer and fan out via ui_console_write()
+             * (UART + HDMI console + TCP/2323) instead of writing straight to
+             * the physical UART: the old dtrace_dump_uart() path made "dtrace
+             * dump" invisible to anyone using the TCP debug console or the
+             * HDMI terminal, which defeats the point of a unified console. */
+            static char dump_buf[8192];
             u32 n = 256;
             if (argc >= 3) (void)ui_parse_u32(argv[2], &n);
-            dtrace_dump_uart(n);
+            u32 dl = dtrace_dump(dump_buf, sizeof(dump_buf) - 1U, n);
+            dump_buf[dl] = 0;
+            ui_console_write(dump_buf);
         }
         {
             char sb[160];

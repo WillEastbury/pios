@@ -41,6 +41,12 @@ TESTS_MANIFEST = {
     # sign/verify, claim reader. Pure logic (no MMIO/WALFS/asm); the test
     # supplies an independent SHA-256/HMAC oracle. See src/sts_token.c.
     "test_sts_token.c": ["src/sts_token.c"],
+    # Lease registry cross-core locking: compiled from src/lease.c with host
+    # shims for mmu.h (cache ops -> no-ops) and kspin.h (single-address-space
+    # spinlock). Pins the serialization contract: lock release on every error
+    # path, non-recursive nested-copy composition, and the grant callback
+    # snapshot/relock/rollback linearization. See tests/test_lease.c.
+    "test_lease.c": ["src/lease.c"],
 }
 
 

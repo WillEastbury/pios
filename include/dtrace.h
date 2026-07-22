@@ -137,8 +137,6 @@ void dtrace_emit(u32 cat, u16 ev, u64 a0, u64 a1, u64 a2, u64 a3);
 /* Format up to max_records most-recent records (timestamp-merged across cores)
  * into out[0..max). Returns bytes written. */
 u32  dtrace_dump(char *out, u32 max, u32 max_records);
-/* Dump straight to UART (for the serial console). */
-void dtrace_dump_uart(u32 max_records);
 /* One-line status (enabled, mask, per-core counts). */
 u32  dtrace_status(char *out, u32 max);
 

@@ -175,12 +175,32 @@ struct lease_mmu_ops {
 };
 void lease_set_mmu_ops(const struct lease_mmu_ops *ops);
 
+/*
+ * Initialize the lease fabric. Call once before the secondary cores start.
+ * CROSS-CORE: all lease APIs serialize registry access through a shared syscall-
+ * path spinlock (kspin control-page slot 3); they are control/syscall-path only
+ * and must never be called from scheduler or IRQ hot paths. MMU map/unmap
+ * callbacks run with the lock dropped (see lease_grant/lease_revoke).
+ * lease_init() is idempotent in production and never resets a live registry.
+ */
 void lease_init(void);
 
 /* Arena registry. Returns arena_id or LEASE_ARENA_NONE on failure. */
 u32  lease_arena_register(u32 kind, u32 cache_policy, u32 owner_capsule,
                           u64 base, u64 size);
+/*
+ * Returns a pointer to the internal arena record. Only the identity fields
+ * (arena_id/kind/cache_policy/owner_capsule/base/size) are safe to read through
+ * it: they are immutable after register and the record is never freed. The
+ * `cursor` and `generation` fields are mutated concurrently by other cores and
+ * must NOT be trusted through this pointer -- use lease_arena_snapshot() for a
+ * consistent, race-free copy of the whole record.
+ */
 const struct lease_arena *lease_arena_get(u32 arena_id);
+/* Race-free cache-line snapshot of an arena record (captured under the registry
+ * lock). Returns true if the arena exists. Prefer this over lease_arena_get()
+ * whenever the mutable cursor/generation fields matter. */
+bool lease_arena_snapshot(u32 arena_id, struct lease_arena *out);
 void lease_arena_reset(u32 arena_id);   /* bump cursor=0, generation++ */
 
 /*
@@ -224,7 +244,14 @@ i32  lease_copy_into(const struct lease_descriptor *src, u32 dst_arena,
 /* Kernel gatekeeper validation: bounds + slot + generation + (optional) owner. */
 i32  lease_validate(const struct lease_descriptor *d, u32 expect_owner /* or LEASE_ARENA_NONE */);
 
-/* Resolve a live lease to a kernel-side pointer (NULL if invalid). */
+/* Resolve a live lease to a kernel-side pointer (NULL if invalid).
+ * CONTRACT: the returned PA is stable while the arena exists and the descriptor
+ * offset is immutable while the lease is live, so the pointer never dangles. The
+ * BYTES it addresses are governed by the lease lifecycle -- the caller must hold
+ * a live lease in the correct state (WRITING to produce, READING to consume) and
+ * MUST NOT use the pointer after releasing/transferring the lease, since the span
+ * may then be recycled by another core. Validation is point-in-time under the
+ * registry lock and does not pin the descriptor after return. */
 void *lease_ptr(const struct lease_descriptor *d);
 
 void lease_get_stats(struct lease_stats *out);
