@@ -6,6 +6,8 @@
 #define PIOS_PLATFORM_UEFI       3
 #define PIOS_PLATFORM_HYPERV_ARM 4
 #define PIOS_PLATFORM_HYPERV_AMD64 5
+#define PIOS_PLATFORM_PI3        6
+#define PIOS_PLATFORM_PIZERO2W   7
 
 #ifndef PIOS_PLATFORM
 #define PIOS_PLATFORM PIOS_PLATFORM_PI5
@@ -24,6 +26,8 @@
 #define PIOS_GIC_BASE               0x08000000UL
 #define PIOS_GICD_BASE              0x08000000UL
 #define PIOS_GICC_BASE              0x08010000UL
+#define PIOS_QA7_BASE               0UL
+#define PIOS_HAS_GIC                1
 #define PIOS_HAS_RP1                0
 #define PIOS_HAS_PCIE               0
 #define PIOS_HAS_GENET              0
@@ -54,6 +58,8 @@
 #define PIOS_GIC_BASE               0UL
 #define PIOS_GICD_BASE              0UL
 #define PIOS_GICC_BASE              0UL
+#define PIOS_QA7_BASE               0UL
+#define PIOS_HAS_GIC                1
 #define PIOS_HAS_RP1                0
 #define PIOS_HAS_PCIE               0
 #define PIOS_HAS_GENET              0
@@ -81,6 +87,8 @@
 #define PIOS_GIC_BASE               0UL
 #define PIOS_GICD_BASE              0UL
 #define PIOS_GICC_BASE              0UL
+#define PIOS_QA7_BASE               0UL
+#define PIOS_HAS_GIC                0
 #define PIOS_HAS_RP1                0
 #define PIOS_HAS_PCIE               0
 #define PIOS_HAS_GENET              0
@@ -95,6 +103,50 @@
 #define PIOS_ENABLE_NATIVE_VIDEOCORE 0
 #define PIOS_HAS_HYPERV             1
 #define PIOS_HAS_VMBUS              1
+#elif PIOS_PLATFORM == PIOS_PLATFORM_PI3 || PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+/* BCM2837/BCM2837B0 (Pi3 B/B+) and BCM2710A1 (Pi Zero 2 W) share the same
+ * die/peripheral generation and "low peripheral" memory map -- quad
+ * Cortex-A53 (ARMv8-A), legacy VideoCore IV, no RP1 southbridge, and
+ * critically NO GIC-400: interrupts are the legacy Broadcom local
+ * interrupt controller + ARM-local "QA7" peripherals block (per-core
+ * timer IRQ enables, IPI mailboxes, pending-status), a physically
+ * separate fixed block from the main peripheral bus. See src/irqc_legacy.c.
+ * Secondary cores also do NOT support the PSCI HVC mechanism Pi5/QEMU use
+ * -- stock firmware expects a spin-table wakeup (per-core mailbox in low
+ * memory), which is not yet implemented; PIOS_HAS_PSCI_SECONDARIES=0 here
+ * documents that gap rather than silently assuming PSCI works. */
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3
+#define PIOS_PLATFORM_NAME          "pi3-bcm2837"
+#else
+#define PIOS_PLATFORM_NAME          "pizero2w-bcm2710a1"
+#endif
+#define PIOS_PLATFORM_CORE_COUNT    4U
+#define PIOS_PERIPH_BASE            0x3F000000UL
+#define PIOS_UART0_BASE             (PIOS_PERIPH_BASE + 0x201000UL)
+#define PIOS_MBOX_BASE              (PIOS_PERIPH_BASE + 0x00B880UL)
+#define PIOS_EMMC2_BASE             (PIOS_PERIPH_BASE + 0x300000UL)
+#define PIOS_GENET_BASE             0UL
+#define PIOS_PCIE_RC_BASE           0UL
+#define PIOS_RP1_BAR_BASE           0UL
+#define PIOS_GIC_BASE               0UL
+#define PIOS_GICD_BASE              0UL
+#define PIOS_GICC_BASE              0UL
+#define PIOS_QA7_BASE               0x40000000UL
+#define PIOS_HAS_GIC                0
+#define PIOS_HAS_RP1                0
+#define PIOS_HAS_PCIE               0
+#define PIOS_HAS_GENET              0
+#define PIOS_HAS_SD                 1
+#define PIOS_HAS_MAILBOX_FB         1
+#define PIOS_HAS_BOOTINFO_FB        0
+#define PIOS_HAS_DMA                0
+#define PIOS_HAS_PSCI_SECONDARIES   0
+#define PIOS_PSCI_USE_HVC           0
+#define PIOS_PSCI_AFF_SHIFT         8
+#define PIOS_HAS_VIRTIO_NET         0
+#define PIOS_ENABLE_NATIVE_VIDEOCORE 0
+#define PIOS_HAS_HYPERV             0
+#define PIOS_HAS_VMBUS              0
 #else
 #define PIOS_PLATFORM_NAME          "pi5-bcm2712"
 #define PIOS_PLATFORM_CORE_COUNT    4U
@@ -108,6 +160,8 @@
 #define PIOS_GIC_BASE               0x107FFF8000UL
 #define PIOS_GICD_BASE              0x107FFF9000UL
 #define PIOS_GICC_BASE              0x107FFFA000UL
+#define PIOS_QA7_BASE               0UL
+#define PIOS_HAS_GIC                1
 #define PIOS_HAS_RP1                1
 #define PIOS_HAS_PCIE               1
 #define PIOS_HAS_GENET              1

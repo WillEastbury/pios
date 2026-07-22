@@ -34,6 +34,12 @@
 /* RP1 southbridge register window (mapped via PCIe outbound ATU) */
 #define RP1_BAR_BASE        PIOS_RP1_BAR_BASE
 
+/* ARM-local "QA7" peripherals (BCM2836/2837/2710A1 only -- Pi3/Pi Zero 2W).
+ * Per-core timer IRQ enables, IPI mailboxes, and interrupt-pending status;
+ * a fixed block physically separate from PERIPH_BASE. Zero on platforms
+ * that have a real GIC-400 instead (PIOS_HAS_GIC=1). See src/irqc_legacy.c. */
+#define QA7_BASE            PIOS_QA7_BASE
+
 static inline void mmio_write(u64 addr, u32 val) {
     *(volatile u32 *)addr = val;
 }

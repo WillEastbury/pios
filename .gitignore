@@ -5,6 +5,8 @@ build_uefi/
 build_qemu_stage2/
 build_qemu_full/
 build_hyperv_amd64*/
+build_pi3/
+build_pizero2w/
 hyperv_amd64_esp/
 build_uefi_live*/
 qemu_*.pid
@@ -14,6 +16,7 @@ qemu_*.pid
 *.bin
 *.PKG
 *.map
+*.rsp
 
 # IDE / Editor
 .vscode/

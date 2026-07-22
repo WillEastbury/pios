@@ -1,8 +1,17 @@
 /*
  * gic.c - ARM GIC-400 interrupt controller driver
+ *
+ * Only compiled when the platform actually has a GIC-400 (PIOS_HAS_GIC=1 --
+ * Pi5/QEMU/Hyper-V-ARM). BCM2837-family boards (Pi3, Pi Zero 2 W) have no
+ * GIC at all; see src/irqc_legacy.c for that platform's implementation of
+ * this exact same public API (gic_init/gic_send_sgi/gic_acknowledge/...),
+ * backed by the legacy Broadcom local interrupt controller + QA7 ARM-local
+ * peripherals block instead. Callers (exception.c, timer.c, proc.c, fifo.c,
+ * kernel.c) never need to know which one is linked in.
  */
-
 #include "gic.h"
+#if PIOS_HAS_GIC
+
 #include "mmio.h"
 #include "uart.h"
 #include "fb.h"
@@ -200,3 +209,5 @@ void gic_cpu_init(void) {
     mmio_write(gicc_reg(0x000), old_c_ctlr | 1U);
     __asm__ volatile("dsb sy; isb" ::: "memory");
 }
+
+#endif /* PIOS_HAS_GIC */
