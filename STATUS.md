@@ -229,4 +229,6 @@ make                           # Linux/WSL
 # See .github/copilot-instructions.md for manual build steps
 ```
 
-Kernel size: ~265KB. Runs from a single `kernel8.img` on the FAT32 boot partition.
+Image size: a 27 KiB `kernel8.img` stage0 loader on the FAT32 boot partition plus a ~3.45 MiB
+stage2 payload (`PIOSSTG2.PKG` / raw slot). See [docs/size.md](docs/size.md) for the current
+measured breakdown.
