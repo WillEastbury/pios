@@ -49,9 +49,16 @@
 #include "coredump.h"
 #include "virtio_net.h"
 #include "uhttp_bridge.h"
+#include "capsvc.h"
 #include "pix.h"
 #include "pcie.h"
 #include "rp1.h"
+#include "rp1_adc.h"
+#include "rp1_dma.h"
+#include "rp1_fw.h"
+#include "sdio.h"
+#include "cyw43.h"
+#include "wifi_nic.h"
 #include "rp1_gpio.h"
 #include "rp1_clk.h"
 #include "rp1_uart.h"
@@ -87,6 +94,9 @@
 #include "pico_hooks.h"
 #include "keystore.h"
 #include "tls.h"
+#include "tls13_record.h"
+#include "tls_router_match.h"
+#include "media_hw.h"
 #include "brotli.h"
 #include "picocompress.h"
 #include "picoweb.h"
@@ -154,6 +164,14 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define ADMIN_STATUS_TCP_PORT  8080
 #define ADMIN_REBOOT_TCP_PORT  8081
 #define ADMIN_UPDATE_TCP_PORT  8082
+/* Proof-of-concept capsule-backed service (docs/net_capsule_fifo.md phase 1):
+ * a PicoScript-hosted capsule on core 3 slot 0 serves this port entirely
+ * outside the kernel. This one line is the whole integration surface --
+ * capsvc.c has zero knowledge of what "admin" means. */
+#define CAPSVC_ADMIN_PORT      8090
+#define WIFI_STATIC_IP         0xC0A800CAU  /* 192.168.0.202 */
+#define WIFI_STATIC_MASK       0xFFFF0000U  /* /16 */
+#define WIFI_STATIC_GW         0xC0A80001U  /* 192.168.0.1 */
 #define DEBUG_TCP_PORT 2323
 #define DEBUG_TCP_LINE_MAX 256
 #define HTTP_AUTH_ENABLED 0
@@ -277,6 +295,9 @@ static u8 https_tls_req_buf[3072];   /* >= STS_TOKEN_MAX + request header overhe
 static u32 https_tls_req_len;
 static bool https_tls_accepted;
 static bool https_tls_response_sent;
+static bool https_tls_route_pending;
+static u64 https_tls_route_token;
+static u8 https_tls_route_response[CAPSVC_SLOT_DATA_MAX];
 static u64 https_tls_last_activity_ms;
 static bool http_reboot_pending;
 static i32 ksvc_net_id = -1;
@@ -389,6 +410,7 @@ struct admin_http_service {
      * streamed straight into the RAM staging buffer. */
     bool stream_mode;
     bool stream_reboot;
+    u32  stream_kind;       /* 0=kernel OTA, CYW_BLOB_* for WiFi staging */
     u32  stream_total;
     u32  stream_received;
     u64  stream_wadv_ms;     /* last window re-advertise while waiting for tail */
@@ -714,6 +736,10 @@ static void net_services_listen(void)
     https_tls_req_len = 0;
     https_tls_accepted = false;
     https_tls_response_sent = false;
+    https_tls_route_pending = false;
+    https_tls_route_token = 0;
+    https_tls_route_pending = false;
+    https_tls_route_token = 0;
     debug_client_conn = -1;
     debug_tcp_unlocked = false;
     debug_tcp_len = 0;
@@ -727,6 +753,10 @@ static void net_services_listen(void)
     debug_listen_conn = tcp_listen(DEBUG_TCP_PORT);
     admin_services_listen();
     uhttp_bridge_init();   /* userland HTTP on :81 (kernel-terminated TCP) */
+    i32 capsvc_admin = capsvc_register(CAPSVC_ADMIN_PORT, CORE_USER1);
+    if (capsvc_admin >= 0)
+        (void)capsvc_bind_host((u32)capsvc_admin, "admin.pios");
+    capsvc_init();         /* generic capsule-service dispatcher (docs/net_capsule_fifo.md) */
     http_log_event("net-listen", HTTP_TCP_PORT, ADMIN_STATUS_TCP_PORT);
 }
 
@@ -738,6 +768,22 @@ static void http_log_event(const char *event, u32 a, u32 b)
     http_log_ring[slot].event = event;
     http_log_ring[slot].a = a;
     http_log_ring[slot].b = b;
+}
+
+static void wifi_upload_progress(void)
+{
+    static u32 cadence;
+    net_poll();
+#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+    if ((++cadence & 31U) == 0U) {
+        bool recovered = macb_rx_recover();
+        if (!recovered)
+            recovered = macb_rx_hole_recover();
+        if (!recovered)
+            (void)macb_rx_liveness_recover(timer_monotonic_ms());
+    }
+#endif
+    watchdog_hw_pet();
 }
 
 static void http_trace(u32 event, u32 route, u32 a, u32 b)
@@ -2162,6 +2208,20 @@ static const char *tcp_owner_label(u16 port)
     if (port == ADMIN_REBOOT_TCP_PORT) return "admin/reboot";
     if (port == ADMIN_UPDATE_TCP_PORT) return "admin/update";
     if (port == DEBUG_TCP_PORT) return "kernel/debug";
+    if (port == UHTTP_PORT) return "uhttp/bridge0";
+#if UHTTP_BRIDGE_COUNT > 1
+    if (port == UHTTP_NATIVE_PORT) return "uhttp/bridge1";
+#endif
+    /* Generic capsvc-registered service (never a hardcoded name -- capsvc.c
+     * stays service-agnostic; this only reports "a capsule owns this port"). */
+    {
+        u32 n = capsvc_service_count();
+        for (u32 i = 0; i < n; i++) {
+            u16 svc_port = 0;
+            if (capsvc_service_info(i, &svc_port, 0, 0, 0, 0, 0) && svc_port == port)
+                return "capsule";
+        }
+    }
     return "-";
 }
 
@@ -2235,6 +2295,8 @@ static bool pios_bootctrl_clear_pending(void);
 static bool pios_bootctrl_reset_a(void);
 static bool pios_bootctrl_test_invalid_b(void);
 static bool http_write_kernel_slot_header(u32 slot_offset, u32 payload_len, bool valid);
+static bool ui_parse_ip4(const char *s, u32 *out);
+static bool ui_parse_u32(const char *s, u32 *out);
 static bool irq_cntpns_test(u64 *before_out, u64 *after_out, u32 *last_intid_out,
                             u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *unhandled_out);
 static u32 irq_cntpns_step(u32 depth, u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *pmr_out,
@@ -2267,6 +2329,56 @@ static bool http_parse_db_ref(u32 argc, char **argv, u32 start, u32 *card_out, u
     *rec_out = rec;
     *next_arg = start + 2;
     return true;
+}
+
+/* picowal_db_get() refuses a 0-length output buffer outright (can't distinguish
+ * "empty record" from "no such record" that way), so existence is checked with
+ * a real (if tiny) probe read instead -- used by the WALFS card "add"/"update"
+ * verbs to enforce create-only / update-only semantics. */
+static bool db_record_exists(u16 card, u32 rec)
+{
+    u8 probe[1];
+    return picowal_db_get(card, rec, probe, sizeof(probe)) >= 0;
+}
+
+/* Core of the "db editor" line-replace verb: reconstructs `cur` (cur_len
+ * bytes, newline-delimited "lines") with 1-based `target_line` replaced by
+ * `text` (or appended, padding blank lines, if target_line is past the
+ * current end) into `out` (out_max capacity). Returns the new length, or -1
+ * on overflow. Stateless by design -- no server-side edit session, matching
+ * every other terminal command in this file. */
+static i32 db_editor_splice_line(const u8 *cur, i32 cur_len, u32 target_line,
+                                 const char *text, u32 text_len,
+                                 u8 *out, u32 out_max)
+{
+    if (target_line == 0 || !out)
+        return -1;
+    u32 out_len = 0;
+    u32 line_no = 1;
+    i32 i = 0;
+    while (line_no < target_line) {
+        i32 line_start = i;
+        while (i < cur_len && cur[i] != '\n') i++;
+        u32 line_len = (u32)(i - line_start);
+        if (out_len + line_len + 1 > out_max)
+            return -1;
+        for (u32 k = 0; k < line_len; k++) out[out_len++] = cur[line_start + k];
+        out[out_len++] = '\n';
+        if (i < cur_len) i++;  /* consume the source '\n'; otherwise this is a synthesized pad line */
+        line_no++;
+    }
+    if (out_len + text_len + 1 > out_max)
+        return -1;
+    for (u32 k = 0; k < text_len; k++) out[out_len++] = (u8)text[k];
+    out[out_len++] = '\n';
+    if (i < cur_len) {
+        while (i < cur_len && cur[i] != '\n') i++;
+        if (i < cur_len) i++;
+    }
+    if (out_len + (u32)(cur_len - i) > out_max)
+        return -1;
+    for (; i < cur_len; i++) out[out_len++] = cur[i];
+    return (i32)out_len;
 }
 
 /* ---- PicoScript bytecode VM (picovm) -------------------------------------
@@ -2382,6 +2494,22 @@ static void http_append_tensor_tail(char *out, u32 *len, u32 max)
     http_append_hex32(out, len, max, dbg.current_cfg5);
     http_append(out, len, max, "/");
     http_append_hex32(out, len, max, dbg.current_cfg6);
+    http_append(out, len, max, " cache=");
+    http_append_hex32(out, len, max, dbg.l2t_before_invalidate);
+    http_append(out, len, max, "/");
+    http_append_hex32(out, len, max, dbg.l2t_after_invalidate);
+    http_append(out, len, max, "/");
+    http_append_hex32(out, len, max, dbg.l2t_after_tmuwcf);
+    http_append(out, len, max, "/");
+    http_append_hex32(out, len, max, dbg.l2t_after_clean);
+    http_append(out, len, max, " wait=");
+    http_append_u64(out, len, max, dbg.l2t_invalidate_wait_us);
+    http_append(out, len, max, "/");
+    http_append_u64(out, len, max, dbg.tmuwcf_wait_us);
+    http_append(out, len, max, "/");
+    http_append_u64(out, len, max, dbg.l2t_clean_wait_us);
+    http_append(out, len, max, " clean=");
+    http_append_u64(out, len, max, dbg.cache_clean_ok);
     http_append(out, len, max, "\n");
 }
 
@@ -2649,6 +2777,24 @@ static void http_exec_sts_command(char *out, u32 *len_ptr, u32 max, const char *
     *len_ptr = len;
 }
 
+/* Send an ICMP echo request, retrying while polling the network stack for
+ * up to arp_wait_ms if the first attempt fails purely because the
+ * destination/next-hop MAC hasn't been ARP-resolved yet (a fresh boot or a
+ * long-idle neighbor entry can require the initial ARP round trip before
+ * net_icmp_echo_send()'s net_resolve_mac() call succeeds). */
+static bool net_icmp_echo_send_retry(u32 dst_ip, u16 ident, u16 seq, u8 ttl, u32 arp_wait_ms)
+{
+    u64 deadline = timer_monotonic_ms() + arp_wait_ms;
+    for (;;) {
+        if (net_icmp_echo_send(dst_ip, ident, seq, ttl))
+            return true;
+        if (timer_monotonic_ms() >= deadline)
+            return false;
+        net_poll();
+        timer_delay_us(2000);
+    }
+}
+
 /* The single, shared implementation of every "terminal" command (~150+
  * commands: status/netstat/macbdiag/rp1 irq/stackdiag/processes/... -- the
  * full diagnostic surface). Both the HTTP /api/terminal handler and the
@@ -2664,9 +2810,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max,
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
-            "Examples: status | ps | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
+            "Examples: status | ps | services | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
             "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | picocompress selftest | picoweb selftest\n"
-            "Command help: help status | help netstat | help firewall | help reboot | help peek | help walfs | help cachestats\n"
+            "Client tools: arp | route | ping <ip-or-cached-host> [count] | traceroute <ip-or-cached-host> [max_hops] | dnslookup <hostname>\n"
+            "Command help: help status | help netstat | help firewall | help reboot | help peek | help walfs | help db | help cachestats\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
     } else if (http_starts_with(cmd, "help ")) {
         const char *topic = cmd + 5;
@@ -2674,14 +2821,26 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, "status\n  Show system/build/network summary.\n");
         } else if (http_streq(topic, "ps") || http_streq(topic, "processes")) {
             http_append(out, &len, max, "processes\n  Show process snapshot with PPID, arena/span telemetry, and process graph roots/children.\n");
+        } else if (http_streq(topic, "services")) {
+            http_append(out, &len, max, "services\n  Show every listening port, host-header (reserved for future virtual-hosting), and the owning pid/capsule/core -- uhttp bridges, capsvc-registered capsule services, and in-kernel-only ports.\n");
         } else if (http_streq(topic, "netstat")) {
             http_append(out, &len, max, "netstat\n  Show live TCP listeners/sessions, owners, buffers, retries, and firewall drops.\n");
         } else if (http_streq(topic, "rxdiag")) {
             http_append(out, &len, max, "rxdiag\n  Correlate MAC DMA drain, NIC filtering, NET dispatch, poll cadence, and Ethernet IRQ handoff.\n");
         } else if (http_streq(topic, "netcfg")) {
-            http_append(out, &len, max, "netcfg | netcfg routes | netcfg neighbors | netcfg trace\n  Show network summary, route table, ARP/neighbor table, and last outbound route/MAC/UDP decision.\n");
+            http_append(out, &len, max, "netcfg | netcfg routes | netcfg neighbors | netcfg trace\n  Show network summary, route table, ARP/neighbor table, and last outbound route/MAC/UDP decision. See also: arp, route.\n");
+        } else if (http_streq(topic, "arp")) {
+            http_append(out, &len, max, "arp\n  Dump the ARP/neighbor table (same data as netcfg neighbors).\n");
+        } else if (http_streq(topic, "route")) {
+            http_append(out, &len, max, "route\n  Dump the routing table (same data as netcfg routes).\n");
+        } else if (http_streq(topic, "ping")) {
+            http_append(out, &len, max, "ping <ip-or-cached-host> [count]\n  Send ICMP echo requests (default count=4, max 20); reports per-probe RTT/TTL and min/avg/max summary.\n");
+        } else if (http_streq(topic, "traceroute")) {
+            http_append(out, &len, max, "traceroute <ip-or-cached-host> [max_hops]\n  ICMP TTL-probe traceroute (default max_hops=16, max 30); reports each hop's IP and RTT.\n");
+        } else if (http_streq(topic, "dnslookup")) {
+            http_append(out, &len, max, "dnslookup <hostname>\n  Blocking DNS A-record lookup (checks cache first, then queries live). See also: dns resolve (async).\n");
         } else if (http_streq(topic, "dns")) {
-            http_append(out, &len, max, "dns resolve <hostname> | dns status | dns flush\n  Start/poll an async A-record resolver job without blocking HTTP service loops.\n");
+            http_append(out, &len, max, "dns resolve <hostname> | dns status | dns flush\n  Start/poll an async A-record resolver job without blocking HTTP service loops. See also: dnslookup (blocking).\n");
         } else if (http_streq(topic, "http") || http_streq(topic, "https")) {
             http_append(out, &len, max, "http get <ip-or-cached-host> [path] [port] [timeout_ms]\nhttps get <ip-or-cached-host> [path] [port] [timeout_ms]\n  Console-mode HTTP client; hostnames use the DNS cache populated by dns resolve/status.\n");
         } else if (http_streq(topic, "firewall")) {
@@ -2704,6 +2863,16 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, "bootctrl status | bootctrl clear-pending | bootctrl reset-a confirm | bootctrl test-invalid-b confirm\n  Show/repair/test stage0 A/B boot-control state without host raw-disk access.\n");
         } else if (http_streq(topic, "dma")) {
             http_append(out, &len, max, "dma status | dma selftest\n  Show DMA channel registers, selftest result, selected CB address mode, and retry selftest.\n");
+        } else if (http_streq(topic, "adc")) {
+            http_append(out, &len, max, "adc init | adc status | adc temp | adc read <0..4> | adc mv <0..4>\n  Explicitly initialize and sample the RP1 ADC with bounded polling; channel 4 is the internal temperature sensor.\n");
+        } else if (http_streq(topic, "rp1dma")) {
+            http_append(out, &len, max, "rp1dma status | rp1dma probe | rp1dma selftest\n  Guarded RP1 AXI-DMAC visibility/reset probe and byte-exact memory-copy selftest.\n");
+        } else if (http_streq(topic, "rp1fw")) {
+            http_append(out, &len, max, "rp1fw status | rp1fw version\n  Guarded RP1 M3 firmware-mailbox version round trip.\n");
+        } else if (http_streq(topic, "mediahw")) {
+            http_append(out, &len, max, "mediahw status | mediahw hevc | mediahw pisp-be\n  Watchdog-guarded read-only identity probes for dedicated BCM2712 media engines.\n");
+        } else if (http_streq(topic, "wifi")) {
+            http_append(out, &len, max, "wifi status | wifi probe | wifi init | wifi scan | wifi join <ssid> <pass> | wifi disconnect\n  Explicit watchdog-guarded CYW43455/BCM2712-SDIO2 bring-up; never runs at boot.\n");
         } else if (http_streq(topic, "addr")) {
             http_append(out, &len, max, "addr <kind:pack/card[/tail]>\n  Parse and canonicalize PIOS resource addresses. Kinds: wal,tcp,udp,stream,dev,file.\n");
         } else if (http_streq(topic, "keystore")) {
@@ -2730,6 +2899,16 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, "qpu status | tensor selftest\n  Show V3D/QPU tensor dispatch diagnostics and verify safe NEON fallback kernels.\n");
         } else if (http_streq(topic, "walfs") || http_streq(topic, "disk")) {
             http_append(out, &len, max, "walfs verify | walfs compact | walfs status | walfs format confirm\n  Verify WAL metadata/record-chain integrity, compact the WAL (non-destructive), or status.\n");
+        } else if (http_streq(topic, "db")) {
+            http_append(out, &len, max,
+                "db key|get|put|save|add|update|del|copy|rename|editor|list <addr>\n"
+                "  <addr> is either \"<card> <record>\" or \"wal:<pack>/<card>\".\n"
+                "  put <addr> <text...>          text-only write (space-joined argv)\n"
+                "  save|add|update <addr> <hex>  binary-safe write; add=create-only, update=must-exist\n"
+                "  copy|rename <src> <dst>       duplicate or move a record's content between addresses\n"
+                "  editor <addr>                 dump with 1-based line numbers\n"
+                "  editor <addr> <line> <text...> replace/append that line (stateless, no edit session)\n"
+                "  list <card>                   list every record id present in a card\n");
         } else if (http_streq(topic, "crypto")) {
             http_append(out, &len, max, "crypto selftest\n  Run AES-GCM + nibble-table GHASH crypto selftest.\n");
         } else if (http_streq(topic, "cachestats")) {
@@ -2903,6 +3082,144 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
     } else if (http_streq(cmd, "dns flush")) {
         dns_cache_flush();
         http_append(out, &len, max, "DNS cache flushed\n");
+    } else if (http_streq(cmd, "arp")) {
+        http_append_arp_table(out, &len, max);
+    } else if (http_streq(cmd, "route")) {
+        http_append_route_table(out, &len, max);
+    } else if (http_starts_with(cmd, "dnslookup ")) {
+        const char *host = cmd + 10;
+        u32 ip = 0;
+        if (dns_resolve(host, &ip)) {
+            http_append(out, &len, max, "dnslookup ");
+            http_append(out, &len, max, host);
+            http_append(out, &len, max, " -> ");
+            http_append_ip4(out, &len, max, ip);
+            http_append(out, &len, max, "\n");
+        } else {
+            http_append(out, &len, max, "ERR: dnslookup failed (no server configured or no reply)\n");
+        }
+    } else if (http_starts_with(cmd, "ping ")) {
+        char line[160];
+        char *argv[4];
+        u32 p = 0;
+        while (cmd[p] && p + 1 < sizeof(line)) { line[p] = cmd[p]; p++; }
+        line[p] = 0;
+        u32 argc = http_split_args(line, argv, 4);
+        u32 dst_ip = 0;
+        u32 count = 4;
+        if (argc < 2 || (!ui_parse_ip4(argv[1], &dst_ip) && !dns_cache_lookup(argv[1], &dst_ip))) {
+            http_append(out, &len, max, "ERR: usage ping <ip-or-cached-host> [count]\n");
+        } else if (argc >= 3 && (!ui_parse_u32(argv[2], &count) || count == 0 || count > 20)) {
+            http_append(out, &len, max, "ERR: count must be 1-20\n");
+        } else {
+            http_append(out, &len, max, "PING ");
+            http_append_ip4(out, &len, max, dst_ip);
+            http_append(out, &len, max, "\n");
+            static u16 ping_ident_ctr;
+            u16 ident = (u16)(0xB000u + (ping_ident_ctr++ & 0x0FFFu));
+            u32 sent = 0, recv = 0;
+            u32 rtt_min = 0xFFFFFFFFu, rtt_max = 0, rtt_sum = 0;
+            for (u32 i = 0; i < count; i++) {
+                u16 seq = (u16)(i + 1);
+                sent++;
+                if (!net_icmp_echo_send_retry(dst_ip, ident, seq, 64, 1500)) {
+                    http_append(out, &len, max, "  send failed\n");
+                    continue;
+                }
+                struct net_ping_result r;
+                bool got = false;
+                u64 deadline = timer_monotonic_ms() + 1000;
+                while (timer_monotonic_ms() < deadline) {
+                    net_poll();
+                    if (net_icmp_echo_poll_result(&r)) { got = true; break; }
+                    timer_delay_us(200);
+                }
+                if (got && r.got_reply) {
+                    recv++;
+                    if (r.rtt_ms < rtt_min) rtt_min = r.rtt_ms;
+                    if (r.rtt_ms > rtt_max) rtt_max = r.rtt_ms;
+                    rtt_sum += r.rtt_ms;
+                    http_append(out, &len, max, "  reply from ");
+                    http_append_ip4(out, &len, max, r.from_ip);
+                    http_append(out, &len, max, " seq=");
+                    http_append_u64(out, &len, max, seq);
+                    http_append(out, &len, max, " ttl=");
+                    http_append_u64(out, &len, max, r.reply_ttl);
+                    http_append(out, &len, max, " time=");
+                    http_append_u64(out, &len, max, r.rtt_ms);
+                    http_append(out, &len, max, "ms\n");
+                } else {
+                    http_append(out, &len, max, "  seq=");
+                    http_append_u64(out, &len, max, seq);
+                    http_append(out, &len, max, " timeout\n");
+                }
+            }
+            http_append(out, &len, max, "--- stats: ");
+            http_append_u64(out, &len, max, sent);
+            http_append(out, &len, max, " sent, ");
+            http_append_u64(out, &len, max, recv);
+            http_append(out, &len, max, " received");
+            if (recv) {
+                http_append(out, &len, max, ", rtt min/avg/max=");
+                http_append_u64(out, &len, max, rtt_min);
+                http_append(out, &len, max, "/");
+                http_append_u64(out, &len, max, rtt_sum / recv);
+                http_append(out, &len, max, "/");
+                http_append_u64(out, &len, max, rtt_max);
+                http_append(out, &len, max, "ms");
+            }
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "traceroute ")) {
+        char line[160];
+        char *argv[4];
+        u32 p = 0;
+        while (cmd[p] && p + 1 < sizeof(line)) { line[p] = cmd[p]; p++; }
+        line[p] = 0;
+        u32 argc = http_split_args(line, argv, 4);
+        u32 dst_ip = 0;
+        u32 max_hops = 16;
+        if (argc < 2 || (!ui_parse_ip4(argv[1], &dst_ip) && !dns_cache_lookup(argv[1], &dst_ip))) {
+            http_append(out, &len, max, "ERR: usage traceroute <ip-or-cached-host> [max_hops]\n");
+        } else if (argc >= 3 && (!ui_parse_u32(argv[2], &max_hops) || max_hops == 0 || max_hops > 30)) {
+            http_append(out, &len, max, "ERR: max_hops must be 1-30\n");
+        } else {
+            http_append(out, &len, max, "TRACEROUTE ");
+            http_append_ip4(out, &len, max, dst_ip);
+            http_append(out, &len, max, "\n");
+            static u16 trace_ident_ctr;
+            u16 ident = (u16)(0xC000u + (trace_ident_ctr++ & 0x0FFFu));
+            for (u32 ttl = 1; ttl <= max_hops; ttl++) {
+                u16 seq = (u16)ttl;
+                http_append_u64(out, &len, max, ttl);
+                http_append(out, &len, max, "  ");
+                if (!net_icmp_echo_send_retry(dst_ip, ident, seq, (u8)ttl, 1500)) {
+                    http_append(out, &len, max, "send failed\n");
+                    break;
+                }
+                struct net_ping_result r;
+                bool got = false;
+                u64 deadline = timer_monotonic_ms() + 1000;
+                while (timer_monotonic_ms() < deadline) {
+                    net_poll();
+                    if (net_icmp_echo_poll_result(&r)) { got = true; break; }
+                    timer_delay_us(200);
+                }
+                if (!got) {
+                    http_append(out, &len, max, "*\n");
+                    continue;
+                }
+                http_append_ip4(out, &len, max, r.from_ip);
+                http_append(out, &len, max, "  ");
+                http_append_u64(out, &len, max, r.rtt_ms);
+                http_append(out, &len, max, "ms");
+                if (r.got_reply) {
+                    http_append(out, &len, max, "  (reached)\n");
+                    break;
+                }
+                http_append(out, &len, max, "\n");
+            }
+        }
     } else if (http_starts_with(cmd, "http get ") || http_starts_with(cmd, "https get ")) {
         bool use_tls = http_starts_with(cmd, "https ");
         char line[160];
@@ -2930,6 +3247,584 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         } else {
             http_append_sanitized_bytes(out, &len, max, body, body_len);
         }
+    } else if (http_streq(cmd, "adc") || http_starts_with(cmd, "adc ")) {
+        char *argv[4];
+        u32 argc = http_split_args(cmd, argv, 4);
+        if (argc < 2 || http_streq(argv[1], "status") ||
+            http_streq(argv[1], "diag")) {
+            struct rp1_adc_diag d;
+            rp1_adc_diag_snapshot(&d);
+            http_append(out, &len, max, "adc initialized=");
+            http_append(out, &len, max, d.initialized ? "yes" : "no");
+            http_append(out, &len, max, " error=");
+            http_append_u64(out, &len, max, d.last_error);
+            http_append(out, &len, max, " reads=");
+            http_append_u64(out, &len, max, d.reads);
+            http_append(out, &len, max, " failures=");
+            http_append_u64(out, &len, max, d.failures);
+            http_append(out, &len, max, " timeouts=");
+            http_append_u64(out, &len, max, d.timeouts);
+            http_append(out, &len, max, " conversion_errors=");
+            http_append_u64(out, &len, max, d.conversion_errors);
+            http_append(out, &len, max, "\nregs cs=");
+            http_append_hex32(out, &len, max, d.cs);
+            http_append(out, &len, max, " fcs=");
+            http_append_hex32(out, &len, max, d.fcs);
+            http_append(out, &len, max, " div=");
+            http_append_hex32(out, &len, max, d.div);
+            http_append(out, &len, max, " ints=");
+            http_append_hex32(out, &len, max, d.ints);
+            http_append(out, &len, max, "\nlast channel=");
+            http_append_u64(out, &len, max, d.last_channel);
+            http_append(out, &len, max, " raw=");
+            http_append_u64(out, &len, max, d.last_raw);
+            http_append(out, &len, max, " mv=");
+            http_append_u64(out, &len, max, d.last_mv);
+            http_append(out, &len, max, " temp_mc=");
+            if (d.last_temp_mc < 0) {
+                http_append(out, &len, max, "-");
+                http_append_u64(out, &len, max, (u64)(-(i64)d.last_temp_mc));
+            } else {
+                http_append_u64(out, &len, max, (u64)d.last_temp_mc);
+            }
+            http_append(out, &len, max, "\n");
+        } else if (http_streq(argv[1], "init")) {
+            http_append(out, &len, max,
+                        rp1_adc_init() ? "ADC init OK\n" : "ADC init FAILED\n");
+        } else if (http_streq(argv[1], "temp")) {
+            i32 millidegrees;
+            if (!rp1_adc_read_temperature(&millidegrees)) {
+                http_append(out, &len, max, "ERR: ADC temperature read failed\n");
+            } else {
+                http_append(out, &len, max, "temperature_mc=");
+                if (millidegrees < 0) {
+                    http_append(out, &len, max, "-");
+                    http_append_u64(out, &len, max, (u64)(-(i64)millidegrees));
+                } else {
+                    http_append_u64(out, &len, max, (u64)millidegrees);
+                }
+                http_append(out, &len, max, "\n");
+            }
+        } else if (http_streq(argv[1], "read") ||
+                   http_streq(argv[1], "mv")) {
+            u32 channel;
+            u32 value;
+            if (argc < 3 || !http_parse_u32(argv[2], &channel) ||
+                channel >= RP1_ADC_CHANNEL_COUNT) {
+                http_append(out, &len, max, "ERR: ADC channel must be 0..4\n");
+            } else {
+                bool ok = http_streq(argv[1], "mv")
+                    ? rp1_adc_read_mv(channel, &value)
+                    : rp1_adc_read_raw(channel, &value);
+                if (!ok) {
+                    http_append(out, &len, max, "ERR: ADC read failed\n");
+                } else {
+                    http_append(out, &len, max,
+                                http_streq(argv[1], "mv") ? "mv=" : "raw=");
+                    http_append_u64(out, &len, max, value);
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        } else {
+            http_append(out, &len, max,
+                        "ERR: usage adc init|status|diag|temp|read <0..4>|mv <0..4>\n");
+        }
+    } else if (http_streq(cmd, "wifi") ||
+               http_streq(cmd, "wifi status")) {
+        struct sdio_diag d;
+        struct cyw43_diag cd;
+        sdio_diag_snapshot(&d);
+        cyw43_diag_snapshot(&cd);
+        http_append(out, &len, max, "wifi active=");
+        http_append_u64(out, &len, max, nic_is_wifi());
+        http_append(out, &len, max, " link=");
+        http_append_u64(out, &len, max, cyw43_link_state());
+        http_append(out, &len, max, " sdio_attempted=");
+        http_append_u64(out, &len, max, d.attempted);
+        http_append(out, &len, max, " initialized=");
+        http_append_u64(out, &len, max, d.initialized);
+        http_append(out, &len, max, " stage=");
+        http_append_u64(out, &len, max, d.last_stage);
+        http_append(out, &len, max, "\ncap=");
+        http_append_hex32(out, &len, max, d.cap0);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, d.cap1);
+        http_append(out, &len, max, " present=");
+        http_append_hex32(out, &len, max, d.present_before);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, d.present_after_cfg);
+        http_append(out, &len, max, " cfg=");
+        http_append_hex32(out, &len, max, d.cfg_ctrl);
+        http_append(out, &len, max, " pinsel=");
+        http_append_hex32(out, &len, max, d.pin_sel);
+        http_append(out, &len, max, "\nwl_data=");
+        http_append_hex32(out, &len, max, d.wl_data);
+        http_append(out, &len, max, " wl_iodir=");
+        http_append_hex32(out, &len, max, d.wl_iodir);
+        http_append(out, &len, max, " cmd5 tries=");
+        http_append_u64(out, &len, max, d.cmd5_attempts);
+        http_append(out, &len, max, " intr=");
+        http_append_hex32(out, &len, max, d.cmd5_interrupt);
+        http_append(out, &len, max, " resp=");
+        http_append_hex32(out, &len, max, d.cmd5_response);
+        http_append(out, &len, max, "\ncyw stage=");
+        http_append_u64(out, &len, max, cd.stage);
+        http_append(out, &len, max, " error=");
+        http_append_u64(out, &len, max, cd.last_error);
+        http_append(out, &len, max, " ram=");
+        http_append_hex32(out, &len, max, cd.ram_base);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, cd.ram_size);
+        http_append(out, &len, max, " fw=");
+        http_append_u64(out, &len, max, cd.firmware_uploaded);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, cd.firmware_verified);
+        http_append(out, &len, max, " cr4=");
+        http_append_hex32(out, &len, max, cd.cr4_resetctrl);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, cd.cr4_ioctrl);
+        http_append(out, &len, max, " clk=");
+        http_append_hex32(out, &len, max, cd.clkcsr);
+        http_append(out, &len, max, " ht=");
+        http_append_u64(out, &len, max, cd.ht_available);
+        http_append(out, &len, max, " f2=");
+        http_append_u64(out, &len, max, cd.func2_ready);
+        http_append(out, &len, max, " clm=");
+        http_append_u64(out, &len, max, cd.clm_loaded);
+        http_append(out, &len, max, " f1_batch=");
+        http_append_u64(out, &len, max, cd.f1_batch_blocks);
+        http_append(out, &len, max, " fw_ms=");
+        http_append_u64(out, &len, max, cd.firmware_upload_ms);
+        http_append(out, &len, max, "\nbcdc calls=");
+        http_append_u64(out, &len, max, cd.bcdc_calls);
+        http_append(out, &len, max, " send_fail=");
+        http_append_u64(out, &len, max, cd.bcdc_send_failures);
+        http_append(out, &len, max, " timeout=");
+        http_append_u64(out, &len, max, cd.bcdc_timeouts);
+        http_append(out, &len, max, " pending=");
+        http_append_u64(out, &len, max, cd.bcdc_pending_bytes);
+        http_append(out, &len, max, " cccr=");
+        http_append_hex32(out, &len, max, cd.bcdc_cccr_pending);
+        http_append(out, &len, max, " rframe=");
+        http_append_u64(out, &len, max, cd.bcdc_rframe_count);
+        http_append(out, &len, max, "\nframe ch=");
+        http_append_u64(out, &len, max, cd.bcdc_last_channel);
+        http_append(out, &len, max, " len=");
+        http_append_u64(out, &len, max, cd.bcdc_last_frame_len);
+        http_append(out, &len, max, " id=");
+        http_append_u64(out, &len, max, cd.bcdc_request_id);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, cd.bcdc_response_id);
+        http_append(out, &len, max, " status=");
+        http_append_hex32(out, &len, max, cd.bcdc_status);
+        http_append(out, &len, max, "\nsdiod int=");
+        http_append_hex32(out, &len, max, cd.sdiod_intstatus);
+        http_append(out, &len, max, " mask=");
+        http_append_hex32(out, &len, max, cd.sdiod_intmask);
+        http_append(out, &len, max, " mailbox=");
+        http_append_hex32(out, &len, max, cd.sdiod_mailbox);
+        u32 d11_reset = 0U;
+        u32 d11_io = 0U;
+        http_append(out, &len, max, "\nd11=");
+        if (cyw43_d11_state(&d11_reset, &d11_io)) {
+            http_append_hex32(out, &len, max, d11_reset);
+            http_append(out, &len, max, "/");
+            http_append_hex32(out, &len, max, d11_io);
+        } else {
+            http_append(out, &len, max, "unavailable");
+        }
+        http_append(out, &len, max, "\nevent type=");
+        http_append_u64(out, &len, max, cd.last_event_type);
+        http_append(out, &len, max, " status=");
+        http_append_u64(out, &len, max, cd.last_event_status);
+        http_append(out, &len, max, " reason=");
+        http_append_u64(out, &len, max, cd.last_event_reason);
+        http_append(out, &len, max, " flags=");
+        http_append_hex32(out, &len, max, cd.last_event_flags);
+        http_append(out, &len, max, " len=");
+        http_append_u64(out, &len, max, cd.last_event_len);
+        http_append(out, &len, max, " events=");
+        http_append_u64(out, &len, max, cd.event_count);
+        http_append(out, &len, max, " scan_count=");
+        http_append_u64(out, &len, max, cd.scan_result_count);
+        http_append(out, &len, max, "\nevent raw=");
+        for (u32 i = 0U; i < 9U; i++)
+            http_append_hex32(out, &len, max, cd.event_words[i]);
+        http_append(out, &len, max, "\neapol frames=");
+        http_append_u64(out, &len, max, cd.eapol_frames);
+        http_append(out, &len, max, " len=");
+        http_append_u64(out, &len, max, cd.eapol_len);
+        http_append(out, &len, max, " keyinfo=");
+        http_append_hex32(out, &len, max, cd.eapol_key_info);
+        http_append(out, &len, max, " replay=");
+        http_append_hex32(out, &len, max, cd.eapol_replay_hi);
+        http_append(out, &len, max, ":");
+        http_append_hex32(out, &len, max, cd.eapol_replay_lo);
+        http_append(out, &len, max, "\neapol raw=");
+        for (u32 i = 0U; i < 11U; i++)
+            http_append_hex32(out, &len, max, cd.eapol_words[i]);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "wifi probe")) {
+        watchdog_hw_arm_seconds(15U);
+        bool ok = sdio_init();
+        watchdog_hw_disable();
+        http_append(out, &len, max,
+                    ok ? "WiFi SDIO probe OK\n" :
+                         "WiFi SDIO probe FAILED; reboot recommended\n");
+    } else if (http_streq(cmd, "wifi prepare")) {
+        watchdog_hw_arm_seconds(15U);
+        bool ok = cyw43_preload_blobs() && cyw43_init();
+        watchdog_hw_disable();
+        http_append(out, &len, max,
+                    ok ? "WiFi prepare OK\n" : "WiFi prepare FAILED\n");
+    } else if (http_streq(cmd, "wifi load")) {
+        cyw43_set_progress_hook(wifi_upload_progress);
+        watchdog_hw_arm_seconds(15U);
+        bool ok = cyw43_load_firmware();
+        watchdog_hw_disable();
+        http_append(out, &len, max,
+                    ok ? "WiFi firmware load OK\n" :
+                         "WiFi firmware load FAILED\n");
+    } else if (http_streq(cmd, "wifi chip")) {
+        watchdog_hw_arm_seconds(15U);
+        bool ok = cyw43_init();
+        watchdog_hw_disable();
+        http_append(out, &len, max,
+                    ok ? "WiFi chip probe OK ram=" :
+                         "WiFi chip probe FAILED ram=");
+        http_append_u64(out, &len, max, cyw43_ram_size());
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "wifi init")) {
+        cyw43_set_progress_hook(wifi_upload_progress);
+        watchdog_hw_arm_seconds(15U);
+        bool ok = nic_init_wifi();
+        watchdog_hw_disable();
+        http_append(out, &len, max,
+                    ok ? "WiFi init OK\n" : "WiFi init FAILED\n");
+    } else if (http_streq(cmd, "wifi scan")) {
+        bool ok = cyw43_scan_start();
+        if (!ok) {
+            http_append(out, &len, max, "WiFi scan start FAILED\n");
+        } else {
+            http_append(out, &len, max,
+                        "WiFi scan started; use wifi results\n");
+        }
+    } else if (http_streq(cmd, "wifi results")) {
+        struct cyw_scan_result results[CYW_MAX_SCAN_RESULTS];
+        u32 count = CYW_MAX_SCAN_RESULTS;
+        if (cyw43_scan_in_progress()) {
+            http_append(out, &len, max, "WiFi scan in progress\n");
+        } else {
+            bool ok = cyw43_scan_get_results(results, &count);
+            if (!ok) {
+                http_append(out, &len, max, "WiFi results unavailable\n");
+            } else {
+                http_append(out, &len, max, "WiFi scan count=");
+                http_append_u64(out, &len, max, count);
+                http_append(out, &len, max, "\n");
+                for (u32 i = 0; i < count; i++) {
+                    for (u32 j = 0; j < results[i].ssid_len; j++) {
+                        char ch[2] = {
+                            (char)(results[i].ssid[j] >= 32U &&
+                                   results[i].ssid[j] < 127U ?
+                                   results[i].ssid[j] : '?'),
+                            0
+                        };
+                        http_append(out, &len, max, ch);
+                    }
+                    http_append(out, &len, max, " bssid=");
+                    for (u32 j = 0U; j < CYW_MAC_LEN; j++) {
+                        static const char digits[] = "0123456789abcdef";
+                        char hex[3] = {
+                            digits[results[i].bssid[j] >> 4],
+                            digits[results[i].bssid[j] & 0x0FU],
+                            '\0'
+                        };
+                        if (j != 0U)
+                            http_append(out, &len, max, ":");
+                        http_append(out, &len, max, hex);
+                    }
+                    http_append(out, &len, max, " ch=");
+                    http_append_u64(out, &len, max, results[i].channel);
+                    http_append(out, &len, max, " rssi=");
+                    if (results[i].rssi < 0) {
+                        http_append(out, &len, max, "-");
+                        http_append_u64(out, &len, max,
+                                        (u64)(-(i64)results[i].rssi));
+                    } else {
+                        http_append_u64(out, &len, max,
+                                        (u64)results[i].rssi);
+                    }
+                    http_append(out, &len, max, " sec=");
+                    http_append_hex32(out, &len, max, results[i].security);
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        }
+    } else if (http_streq(cmd, "wifi radio")) {
+        u32 radio = 0U;
+        u32 channel = 0U;
+        if (!cyw43_radio_query(&radio, &channel)) {
+            http_append(out, &len, max, "WiFi radio query FAILED\n");
+        } else {
+            http_append(out, &len, max, "WiFi radio=");
+            http_append_hex32(out, &len, max, radio);
+            http_append(out, &len, max, " channel=");
+            http_append_u64(out, &len, max, channel);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "wifi joindiag")) {
+        struct cyw_join_diag jd;
+        struct cyw43_diag cd;
+        cyw43_diag_snapshot(&cd);
+        if (!cyw43_join_diag_query(&jd)) {
+            http_append(out, &len, max, "WiFi join diagnostics unavailable\n");
+        } else {
+            http_append(out, &len, max, "valid=");
+            http_append_hex32(out, &len, max, jd.valid);
+            http_append(out, &len, max, " radio=");
+            http_append_hex32(out, &len, max, jd.radio);
+            http_append(out, &len, max, " channel=");
+            http_append_u64(out, &len, max, jd.channel);
+            http_append(out, &len, max, " wsec=");
+            http_append_hex32(out, &len, max, jd.wsec);
+            http_append(out, &len, max, " wpa_auth=");
+            http_append_hex32(out, &len, max, jd.wpa_auth);
+            http_append(out, &len, max, " mfp=");
+            http_append_u64(out, &len, max, jd.mfp);
+            http_append(out, &len, max, " sup_wpa=");
+            http_append_u64(out, &len, max, jd.sup_wpa);
+            http_append(out, &len, max, " bcmerror=");
+            if (jd.bcmerror < 0) {
+                http_append(out, &len, max, "-");
+                http_append_u64(out, &len, max,
+                                (u64)(-(i64)jd.bcmerror));
+            } else {
+                http_append_u64(out, &len, max, (u64)jd.bcmerror);
+            }
+            http_append(out, &len, max, "\nbssid=");
+            for (u32 i = 0U; i < CYW_MAC_LEN; i++) {
+                static const char digits[] = "0123456789abcdef";
+                char hex[3] = {
+                    digits[jd.bssid[i] >> 4],
+                    digits[jd.bssid[i] & 0x0FU],
+                    '\0'
+                };
+                if (i != 0U)
+                    http_append(out, &len, max, ":");
+                http_append(out, &len, max, hex);
+            }
+            http_append(out, &len, max, " event=");
+            http_append_u64(out, &len, max, cd.last_event_type);
+            http_append(out, &len, max, " status=");
+            http_append_u64(out, &len, max, cd.last_event_status);
+            http_append(out, &len, max, " reason=");
+            http_append_u64(out, &len, max, cd.last_event_reason);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "wifi fwlog")) {
+        static char fwlog[2025];
+        u32 fwlog_len = 0U;
+        if (!cyw43_fwlog(fwlog, sizeof(fwlog), &fwlog_len)) {
+            http_append(out, &len, max, "WiFi firmware log unavailable\n");
+        } else {
+            http_append(out, &len, max, "WiFi firmware log:\n");
+            u32 available = len + 1U < max ? max - len - 1U : 0U;
+            if (fwlog_len > available)
+                fwlog_len = available;
+            memcpy(out + len, fwlog, fwlog_len);
+            len += fwlog_len;
+            out[len] = '\0';
+        }
+    } else if (http_starts_with(cmd, "wifi join3 ")) {
+        char *argv[5];
+        u32 argc = http_split_args(cmd, argv, 5);
+        if (argc < 4 || !cyw43_blobs_ready()) {
+            http_append(out, &len, max,
+                        "ERR: usage wifi join3 <ssid> <pass>\n");
+        } else {
+            u32 ssid_len = pios_strlen(argv[2]);
+            u32 pass_len = pios_strlen(argv[3]);
+            bool ok = ssid_len <= CYW_SSID_MAX &&
+                      pass_len <= 128U &&
+                      cyw43_join_sae(argv[2], ssid_len,
+                                     argv[3], pass_len);
+            http_append(out, &len, max,
+                        ok ? "WiFi join OK\n" : "WiFi join FAILED\n");
+        }
+    } else if (http_starts_with(cmd, "wifi joinpmk ")) {
+        char *argv[5];
+        u32 argc = http_split_args(cmd, argv, 5);
+        u8 pmk[32];
+        bool parsed = argc >= 4 && pios_strlen(argv[3]) == 64U;
+        for (u32 i = 0U; parsed && i < sizeof(pmk); i++)
+            parsed = pixe_parse_hex_byte_pair(argv[3] + i * 2U, &pmk[i]);
+        if (!parsed || !cyw43_blobs_ready()) {
+            http_append(out, &len, max,
+                        "ERR: usage wifi joinpmk <ssid> <64-hex-pmk>\n");
+        } else {
+            u32 ssid_len = pios_strlen(argv[2]);
+            bool ok = ssid_len <= CYW_SSID_MAX &&
+                      cyw43_join_pmk(argv[2], ssid_len, pmk);
+            memset(pmk, 0, sizeof(pmk));
+            http_append(out, &len, max,
+                        ok ? "WiFi join OK\n" : "WiFi join FAILED\n");
+            if (!ok) {
+                static char fwlog[2025];
+                u32 fwlog_len = 0U;
+                if (cyw43_fwlog(fwlog, sizeof(fwlog), &fwlog_len)) {
+                    http_append(out, &len, max, "Firmware log:\n");
+                    u32 available = len + 1U < max ? max - len - 1U : 0U;
+                    if (fwlog_len > available)
+                        fwlog_len = available;
+                    memcpy(out + len, fwlog, fwlog_len);
+                    len += fwlog_len;
+                    out[len] = '\0';
+                }
+            }
+        }
+    } else if (http_starts_with(cmd, "wifi join ")) {
+        char *argv[5];
+        u32 argc = http_split_args(cmd, argv, 5);
+        if (argc < 4 || !cyw43_blobs_ready()) {
+            http_append(out, &len, max,
+                        "ERR: usage wifi join <ssid> <pass>\n");
+        } else {
+            u32 ssid_len = pios_strlen(argv[2]);
+            u32 pass_len = pios_strlen(argv[3]);
+            bool ok = ssid_len <= CYW_SSID_MAX &&
+                      pass_len <= CYW_PASSPHRASE_MAX &&
+                      cyw43_join(argv[2], ssid_len, argv[3], pass_len,
+                                 WSEC_AES);
+            if (ok) {
+                u64 deadline = timer_monotonic_ms() + 20000ULL;
+                while (timer_monotonic_ms() < deadline &&
+                       cyw43_link_state() == CYW_LINK_JOINING) {
+                    cyw43_poll();
+                    timer_delay_ms(10U);
+                    watchdog_hw_pet();
+                }
+                ok = cyw43_is_connected();
+            }
+            http_append(out, &len, max,
+                        ok ? "WiFi join OK\n" : "WiFi join FAILED\n");
+        }
+    } else if (http_streq(cmd, "wifi activate")) {
+        if (!nic_activate_wifi_loaded()) {
+            http_append(out, &len, max, "WiFi activate FAILED\n");
+        } else {
+            net_init(WIFI_STATIC_IP, WIFI_STATIC_GW, WIFI_STATIC_MASK, NULL);
+            dns_init(WIFI_STATIC_GW);
+            net_services_listen();
+            http_append(out, &len, max,
+                        "WiFi active at 192.168.0.202/16\n");
+        }
+    } else if (http_streq(cmd, "wifi disconnect")) {
+        http_append(out, &len, max,
+                    cyw43_disconnect() ?
+                    "WiFi disconnected\n" :
+                    "WiFi disconnect FAILED\n");
+    } else if (http_streq(cmd, "mediahw") ||
+               http_streq(cmd, "mediahw status")) {
+        struct media_hw_diag d;
+        media_hw_diag_snapshot(&d);
+        const struct videocore_probe *vc = videocore_probe_get();
+        http_append(out, &len, max, "hevc probed=");
+        http_append_u64(out, &len, max, d.hevc_probed);
+        http_append(out, &len, max, " present=");
+        http_append_u64(out, &len, max, d.hevc_present);
+        http_append(out, &len, max, " version=");
+        http_append_hex32(out, &len, max, d.hevc_version);
+        http_append(out, &len, max, "\npisp_be probed=");
+        http_append_u64(out, &len, max, d.pisp_be_probed);
+        http_append(out, &len, max, " present=");
+        http_append_u64(out, &len, max, d.pisp_be_present);
+        http_append(out, &len, max, " version=");
+        http_append_hex32(out, &len, max, d.pisp_be_version);
+        http_append(out, &len, max, "\nhvs present=");
+        http_append_u64(out, &len, max, vc && vc->hvs_seen);
+        http_append(out, &len, max, " version=");
+        http_append_hex32(out, &len, max, vc ? vc->hvs_version : 0U);
+        http_append(out, &len, max, " failures=");
+        http_append_u64(out, &len, max, d.probe_failures);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "mediahw hevc")) {
+        http_append(out, &len, max,
+                    media_hw_probe_hevc() ? "HEVC probe OK\n" :
+                                            "HEVC probe FAILED\n");
+    } else if (http_streq(cmd, "mediahw pisp-be")) {
+        http_append(out, &len, max,
+                    media_hw_probe_pisp_be() ? "PiSP-BE probe OK\n" :
+                                               "PiSP-BE probe FAILED\n");
+    } else if (http_streq(cmd, "rp1fw") ||
+               http_streq(cmd, "rp1fw status")) {
+        struct rp1_fw_diag d;
+        rp1_fw_diag_snapshot(&d);
+        http_append(out, &len, max, "rp1fw ready=");
+        http_append_u64(out, &len, max, d.ready);
+        http_append(out, &len, max, " error=");
+        http_append_u64(out, &len, max, d.last_error);
+        http_append(out, &len, max, " requests=");
+        http_append_u64(out, &len, max, d.requests);
+        http_append(out, &len, max, " failures=");
+        http_append_u64(out, &len, max, d.failures);
+        http_append(out, &len, max, " bytes=");
+        http_append_u64(out, &len, max, d.response_bytes);
+        http_append(out, &len, max, " irq=");
+        http_append_hex32(out, &len, max, d.host_event_irq);
+        http_append(out, &len, max, "\nversion=");
+        for (u32 i = 0; i < 5U; i++)
+            http_append_hex32(out, &len, max, d.version[i]);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "rp1fw version")) {
+        u32 version[5];
+        if (!rp1_fw_get_version(version)) {
+            http_append(out, &len, max, "RP1 firmware version FAILED\n");
+        } else {
+            http_append(out, &len, max, "RP1 firmware version ");
+            for (u32 i = 0; i < 5U; i++)
+                http_append_hex32(out, &len, max, version[i]);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "rp1dma") ||
+               http_streq(cmd, "rp1dma status")) {
+        struct rp1_dma_diag d;
+        rp1_dma_diag_snapshot(&d);
+        http_append(out, &len, max, "rp1dma probed=");
+        http_append_u64(out, &len, max, d.probed);
+        http_append(out, &len, max, " ready=");
+        http_append_u64(out, &len, max, d.ready);
+        http_append(out, &len, max, " quarantined=");
+        http_append_u64(out, &len, max, d.quarantined);
+        http_append(out, &len, max, " error=");
+        http_append_u64(out, &len, max, d.last_error);
+        http_append(out, &len, max, " tests=");
+        http_append_u64(out, &len, max, d.selftest_runs);
+        http_append(out, &len, max, " failures=");
+        http_append_u64(out, &len, max, d.selftest_failures);
+        http_append(out, &len, max, "\nid=");
+        http_append_hex32(out, &len, max, d.dmac_id);
+        http_append(out, &len, max, " version=");
+        http_append_hex32(out, &len, max, d.comp_version);
+        http_append(out, &len, max, " cfg=");
+        http_append_hex32(out, &len, max, d.cfg);
+        http_append(out, &len, max, " chen=");
+        http_append_hex32(out, &len, max, d.chen);
+        http_append(out, &len, max, " int=");
+        http_append_hex32(out, &len, max, d.int_status);
+        http_append(out, &len, max, " ch_status=");
+        http_append_hex32(out, &len, max, d.chan_status);
+        http_append(out, &len, max, " ch_int=");
+        http_append_hex32(out, &len, max, d.chan_int_status);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "rp1dma probe")) {
+        http_append(out, &len, max,
+                    rp1_dma_probe() ? "RP1 DMA probe OK\n" :
+                                      "RP1 DMA probe FAILED\n");
+    } else if (http_streq(cmd, "rp1dma selftest")) {
+        http_append(out, &len, max,
+                    rp1_dma_selftest() ? "RP1 DMA selftest OK\n" :
+                                         "RP1 DMA selftest FAILED\n");
     } else if (http_streq(cmd, "dma") || http_streq(cmd, "dma status")) {
         struct dma_diag_snapshot d;
         dma_diag_snapshot(&d);
@@ -3080,6 +3975,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         const char *cn = "";
         if (cmd[8] == ' ') cn = cmd + 9;
         http_append(out, &len, max, x509_generate_csr(cn) ? "X509 CSR OK\n" : "X509 CSR FAILED\n");
+    } else if (http_starts_with(cmd, "x509 p256cert")) {
+        const char *cn = "";
+        if (cmd[13] == ' ') cn = cmd + 14;
+        http_append(out, &len, max, x509_generate_p256_cert(cn) ? "X509 P256 cert OK\n" : "X509 P256 cert FAILED\n");
     } else if (http_starts_with(cmd, "x509 p256")) {
         const char *cn = "";
         if (cmd[9] == ' ') cn = cmd + 10;
@@ -3320,6 +4219,14 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         lease_get_stats(&st);
         http_append(out, &len, max, "lease pool slots=");
         http_append_u64(out, &len, max, st.slots_total);
+        http_append(out, &len, max, " live=");
+        http_append_u64(out, &len, max, st.slots_live);
+        http_append(out, &len, max, " rejects mmu=");
+        http_append_u64(out, &len, max, st.mmu_rejects);
+        http_append(out, &len, max, " stale=");
+        http_append_u64(out, &len, max, st.stale_rejects);
+        http_append(out, &len, max, " state=");
+        http_append_u64(out, &len, max, st.state_rejects);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "rxholedump")) {
 #if !PIOS_HAS_GENET
@@ -3584,6 +4491,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             { "tensor_neon", tensor_selftest },
             { "el2_stage2",  el2_stage2_selftest },
             { "sts",         sts_selftest },
+            { "tls13_record",tls13_record_selftest },
         };
         u32 nt = (u32)(sizeof(bat) / sizeof(bat[0]));
         u32 passed = 0;
@@ -3739,6 +4647,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append_u64(out, &len, max, pid);
             http_append(out, &len, max, mg == UHTTP_BRIDGE_MAGIC ? " magic=ok\n" : " magic=BAD\n");
         }
+        capsvc_debug_status(out, &len, max);
 
         /* Inter-core FIFO occupancy: find the deepest active ring (constant
          * cross-core traffic for disk/net/socket/IPC). A ring pinned near
@@ -4624,6 +5533,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         u32 cmdstat = pcie_cfg_read(1, 0, 0, 0x04);
         u32 bar0 = pcie_cfg_read(1, 0, 0, 0x10);
         u32 bar1 = pcie_cfg_read(1, 0, 0, 0x14);
+        u32 bar2 = pcie_cfg_read(1, 0, 0, 0x18);
         u32 cap = pcie_cfg_read(1, 0, 0, 0x34) & 0xFFU;
         http_append(out, &len, max, "rp1 pci id=");
         http_append_hex32(out, &len, max, id);
@@ -4633,6 +5543,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, bar0);
         http_append(out, &len, max, " bar1=");
         http_append_hex32(out, &len, max, bar1);
+        http_append(out, &len, max, " bar2=");
+        http_append_hex32(out, &len, max, bar2);
         http_append(out, &len, max, " cap=");
         http_append_hex32(out, &len, max, cap);
         http_append(out, &len, max, "\nCAP OFF ID NEXT RAW0 RAW4 RAW8\n");
@@ -5740,6 +6652,95 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, "/");
         http_append_u64(out, &len, max, d ? d->global_reapply_count : 0U);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tensor picoscript") ||
+               http_streq(cmd, "tensor picoscript selftest") ||
+               http_streq(cmd, "qpu picoscript")) {
+        bool ok = tensor_picovm_selftest();
+        http_append(out, &len, max,
+                    ok ? "V3D QPU PicoScript enabled\n"
+                       : "V3D QPU PicoScript selftest FAILED; CPU fallback retained");
+        if (!ok) {
+            http_append(out, &len, max, " stage=");
+            http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "tensor picovm kernel") ||
+               http_streq(cmd, "qpu picovm kernel")) {
+        bool ok = tensor_picovm_kernel_selftest();
+        http_append(out, &len, max,
+                    ok ? "PicoVM QPU arithmetic-block prototype OK: (7 + -3) * 11 = 44"
+                       : "PicoVM QPU arithmetic-block prototype FAILED");
+        if (ok) {
+            u64 cpu_ns = 0;
+            u64 qpu_ns = 0;
+            if (tensor_picovm_kernel_bench(32U, &cpu_ns, &qpu_ns)) {
+                http_append(out, &len, max, " cpu_ns=");
+                http_append_u64(out, &len, max, cpu_ns);
+                http_append(out, &len, max, " qpu_ns=");
+                http_append_u64(out, &len, max, qpu_ns);
+            }
+        }
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "bitnet picoscript") ||
+               http_streq(cmd, "tensor bitnet")) {
+        i32 argmax = -1;
+        i32 checksum = 0;
+        u64 scalar_ns = 0;
+        u64 neon_ns = 0;
+        u64 qpu_kernel_ns = 0;
+        u64 qpu_total_ns = 0;
+        bool ok = tensor_picovm_bitnet_selftest(&argmax, &checksum,
+                                                &scalar_ns, &neon_ns,
+                                                &qpu_kernel_ns, &qpu_total_ns);
+        http_append(out, &len, max,
+                    ok ? "BitNet packed-tiny PicoScript QPU slice OK"
+                       : "BitNet packed-tiny PicoScript QPU slice FAILED");
+        http_append(out, &len, max, " argmax=");
+        http_append_u64(out, &len, max, (u32)argmax);
+        http_append(out, &len, max, " checksum=");
+        http_append_u64(out, &len, max, (u32)checksum);
+        http_append(out, &len, max, " scalar_ns=");
+        http_append_u64(out, &len, max, scalar_ns);
+        http_append(out, &len, max, " neon_ns=");
+        http_append_u64(out, &len, max, neon_ns);
+        http_append(out, &len, max, " qpu_kernel_ns=");
+        http_append_u64(out, &len, max, qpu_kernel_ns);
+        http_append(out, &len, max, " qpu_total_ns=");
+        http_append_u64(out, &len, max, qpu_total_ns);
+        if (!ok) {
+            http_append(out, &len, max, " stage=");
+            http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
+            http_append(out, &len, max, " out=");
+            http_append_hex32(out, &len, max, tensor_tiny_last_output_bits());
+            http_append(out, &len, max, " expect=");
+            http_append_hex32(out, &len, max, tensor_tiny_last_expected_bits());
+        }
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "bitnet batch") ||
+               http_streq(cmd, "tensor bitlinear batch")) {
+        u64 elapsed_ns = 0;
+        bool ok = tensor_picovm_bitlinear_selftest(&elapsed_ns);
+        http_append(out, &len, max,
+                    ok ? "BitLinear.MatMulBitmapBatch QPU OK"
+                       : "BitLinear.MatMulBitmapBatch QPU FAILED");
+        http_append(out, &len, max, " ns=");
+        http_append_u64(out, &len, max, elapsed_ns);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "media selftest") ||
+               http_streq(cmd, "tensor media")) {
+        bool ok = tensor_picovm_media_selftest();
+        http_append(out, &len, max,
+                    ok ? "Media superinstructions OK: QPU grayscale XOR + CPU H264; HEVC pending"
+                       : "Media superinstructions FAILED");
+        http_append(out, &len, max, " stage=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
+        http_append(out, &len, max, " out=");
+        http_append_hex32(out, &len, max, tensor_tiny_last_output_bits());
+        http_append(out, &len, max, " expect=");
+        http_append_hex32(out, &len, max, tensor_tiny_last_expected_bits());
+        http_append(out, &len, max, "\n");
+        if (!ok)
+            http_append_tensor_tail(out, &len, max);
     } else if (http_streq(cmd, "tensor tiny noop") || http_streq(cmd, "qpu tiny noop")) {
         bool ok = tensor_tiny_noop_proof();
         http_append(out, &len, max, ok ? "Tensor tiny noop proof OK" : "Tensor tiny noop proof FAILED");
@@ -5788,6 +6789,12 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, dbg.hub_int_sts);
         http_append(out, &len, max, " err=");
         http_append_hex32(out, &len, max, dbg.err_stat);
+        http_append(out, &len, max, " mmu=");
+        http_append_hex32(out, &len, max, dbg.mmu_ctl);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.mmu_vio_addr);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.mmu_vio_id);
         http_append(out, &len, max, " gmp=");
         http_append_hex32(out, &len, max, dbg.gmp_status);
         http_append(out, &len, max, "/");
@@ -5800,6 +6807,51 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, dbg.current_cfg5);
         http_append(out, &len, max, "/");
         http_append_hex32(out, &len, max, dbg.current_cfg6);
+        http_append(out, &len, max, " cache=");
+        http_append_hex32(out, &len, max, dbg.l2t_before_invalidate);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.l2t_after_invalidate);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.l2t_after_tmuwcf);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.l2t_after_clean);
+        http_append(out, &len, max, " wait=");
+        http_append_u64(out, &len, max, dbg.l2t_invalidate_wait_us);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, dbg.tmuwcf_wait_us);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, dbg.l2t_clean_wait_us);
+        http_append(out, &len, max, " clean=");
+        http_append_u64(out, &len, max, dbg.cache_clean_ok);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tensor tiny ssbo") ||
+               http_streq(cmd, "qpu tiny ssbo")) {
+        bool ok = tensor_tiny_store_ssbo_proof();
+        http_append(out, &len, max,
+                    ok ? "Tensor tiny SSBO store proof OK" :
+                         "Tensor tiny SSBO store proof FAILED");
+        http_append(out, &len, max, " out=");
+        http_append_hex32(out, &len, max, tensor_tiny_last_output_bits());
+        http_append(out, &len, max, " expect=");
+        http_append_hex32(out, &len, max, tensor_tiny_last_expected_bits());
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tensor batch1") ||
+               http_streq(cmd, "tensor batch2") ||
+               http_streq(cmd, "tensor batch16")) {
+        u32 rows = http_streq(cmd, "tensor batch1") ? 1U :
+                   (http_streq(cmd, "tensor batch2") ? 2U : 16U);
+        bool ok = tensor_matvec_batch_selftest(rows);
+        http_append(out, &len, max,
+                    ok ? "Tensor batched MatVec proof OK" :
+                         "Tensor batched MatVec proof FAILED");
+        http_append(out, &len, max, " rows=");
+        http_append_u64(out, &len, max, rows);
+        http_append(out, &len, max, " stage=");
+        http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
+        http_append(out, &len, max, " out=");
+        http_append_hex32(out, &len, max, tensor_tiny_last_output_bits());
+        http_append(out, &len, max, " expect=");
+        http_append_hex32(out, &len, max, tensor_tiny_last_expected_bits());
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "tensor tiny loadstore") || http_streq(cmd, "qpu tiny loadstore") ||
                http_streq(cmd, "tensor tiny load-store") || http_streq(cmd, "qpu tiny load-store")) {
@@ -5833,6 +6885,22 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, dbg.gmp_cfg);
         http_append(out, &len, max, "/");
         http_append_hex32(out, &len, max, dbg.gmp_vio_addr);
+        http_append(out, &len, max, " cache=");
+        http_append_hex32(out, &len, max, dbg.l2t_before_invalidate);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.l2t_after_invalidate);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.l2t_after_tmuwcf);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, dbg.l2t_after_clean);
+        http_append(out, &len, max, " wait=");
+        http_append_u64(out, &len, max, dbg.l2t_invalidate_wait_us);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, dbg.tmuwcf_wait_us);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, dbg.l2t_clean_wait_us);
+        http_append(out, &len, max, " clean=");
+        http_append_u64(out, &len, max, dbg.cache_clean_ok);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "tensor tiny memory") || http_streq(cmd, "qpu tiny memory") ||
                http_streq(cmd, "tensor tiny memory proof") || http_streq(cmd, "qpu tiny memory proof")) {
@@ -5894,6 +6962,35 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_bench_row(out, &len, max, "add  n=1024", TENSOR_BENCH_ADD, 1U, 1024U, 1U, 1024ULL, 1000U, 32U, with_v3d);
         http_bench_row(out, &len, max, "mul  n=1024", TENSOR_BENCH_MUL, 1U, 1024U, 1U, 1024ULL, 1000U, 32U, with_v3d);
         http_bench_row(out, &len, max, "relu n=1024", TENSOR_BENCH_RELU, 1U, 1024U, 1U, 1024ULL, 1000U, 32U, with_v3d);
+    } else if (http_streq(cmd, "tensor profile") ||
+               http_streq(cmd, "qpu profile")) {
+        struct tensor_accel_profile p;
+        bool ok = tensor_accel_profile_run(&p);
+        http_append(out, &len, max,
+                    "representative workload: 64 tiles x (64x64 matrix * 16 vectors) = 4,194,304 MACs\n");
+        http_append(out, &len, max, "packed_ternary scalar_ns=");
+        http_append_u64(out, &len, max, p.int8_scalar_ns);
+        http_append(out, &len, max, " neon_ns=");
+        http_append_u64(out, &len, max, p.int8_neon_ns);
+        http_append(out, &len, max, " qpu_ns=");
+        http_append_u64(out, &len, max, p.int8_qpu_ns);
+        http_append(out, &len, max, " selected=");
+        http_append(out, &len, max,
+                    p.int8_qpu_verified && p.int8_qpu_ns < p.int8_neon_ns
+                        ? "qpu" : "neon");
+        http_append(out, &len, max, "\nfp32 scalar_ns=");
+        http_append_u64(out, &len, max, p.fp32_scalar_ns);
+        http_append(out, &len, max, " neon_ns=");
+        http_append_u64(out, &len, max, p.fp32_neon_ns);
+        http_append(out, &len, max, " qpu_ns=");
+        http_append_u64(out, &len, max, p.fp32_qpu_ns);
+        http_append(out, &len, max, " selected=");
+        http_append(out, &len, max,
+                    p.fp32_qpu_verified && p.fp32_qpu_ns < p.fp32_neon_ns
+                        ? "qpu" : "neon");
+        http_append(out, &len, max,
+                    "\nfp16 selected=neon (QPU FP16 kernel pending)\nstatus=");
+        http_append(out, &len, max, ok ? "verified\n" : "FAILED\n");
     } else if (http_streq(cmd, "tensor matmul64") || http_streq(cmd, "qpu matmul64")) {
         bool ok = tensor_matmul64_selftest();
         http_append(out, &len, max, ok ? "Tensor matmul64 selftest OK" : "Tensor matmul64 selftest FAILED");
@@ -6065,7 +7162,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         char *argv[10];
         u32 argc = http_split_args(cmd, argv, 10);
         if (argc < 2) {
-            http_append(out, &len, max, "ERR: usage db key|get|put|del|list <addr>\n");
+            http_append(out, &len, max, "ERR: usage db key|get|put|save|add|update|del|copy|rename|editor|list <addr>\n");
         } else if (http_streq(argv[1], "list")) {
             if (argc < 3) {
                 http_append(out, &len, max, "ERR: usage db list <card|wal:pack/card>\n");
@@ -6148,6 +7245,131 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                         http_append(out, &len, max, "OK: wrote ");
                         http_append_u64(out, &len, max, (u32)n);
                         http_append(out, &len, max, " bytes\n");
+                    }
+                }
+            } else if (http_streq(argv[1], "save") || http_streq(argv[1], "add") ||
+                       http_streq(argv[1], "update")) {
+                /* Binary-safe (hex-encoded) write with create/update existence
+                 * semantics -- "save" is unconditional (matches "capsule
+                 * puthex"'s behaviour but for any WALFS card, not just cards
+                 * inside a capsule pack); "add" refuses an existing record;
+                 * "update" refuses a missing one. This is the generic binary
+                 * upload channel "db put" (text-only) never had. */
+                bool want_add = http_streq(argv[1], "add");
+                bool want_update = http_streq(argv[1], "update");
+                bool exists = db_record_exists((u16)card, rec);
+                if (argc <= argi) {
+                    http_append(out, &len, max, "ERR: usage db save|add|update <addr> <hexbytes>\n");
+                } else if (want_add && exists) {
+                    http_append(out, &len, max, "ERR: record already exists (use update or save)\n");
+                } else if (want_update && !exists) {
+                    http_append(out, &len, max, "ERR: record does not exist (use add or save)\n");
+                } else {
+                    const char *hex = argv[argi];
+                    u32 hex_len = pios_strlen(hex);
+                    static u8 data[PICOWAL_DATA_MAX];
+                    bool ok = (hex_len != 0 && (hex_len & 1U) == 0 &&
+                               hex_len / 2U <= PICOWAL_DATA_MAX);
+                    u32 count = hex_len / 2U;
+                    for (u32 i = 0; ok && i < count; i++)
+                        ok = pixe_parse_hex_byte_pair(hex + i * 2U, &data[i]);
+                    if (!ok) {
+                        http_append(out, &len, max, "ERR: bad hex payload\n");
+                    } else {
+                        i32 n = picowal_db_put((u16)card, rec, data, count);
+                        if (n < 0) {
+                            http_append(out, &len, max, "ERR: write failed\n");
+                        } else {
+                            http_append(out, &len, max, "OK: wrote ");
+                            http_append_u64(out, &len, max, (u32)n);
+                            http_append(out, &len, max, " bytes\n");
+                        }
+                    }
+                }
+            } else if (http_streq(argv[1], "copy") || http_streq(argv[1], "rename")) {
+                u32 dst_card = 0, dst_rec = 0, dst_argi = 0;
+                if (!http_parse_db_ref(argc, argv, argi, &dst_card, &dst_rec, &dst_argi)) {
+                    http_append(out, &len, max, "ERR: usage db copy|rename <src addr> <dst addr>\n");
+                } else {
+                    static u8 data[PICOWAL_DATA_MAX];
+                    i32 n = picowal_db_get((u16)card, rec, data, PICOWAL_DATA_MAX);
+                    if (n < 0) {
+                        http_append(out, &len, max, "ERR: source record not found\n");
+                    } else if (picowal_db_put((u16)dst_card, dst_rec, data, (u32)n) < 0) {
+                        http_append(out, &len, max, "ERR: write to destination failed\n");
+                    } else if (http_streq(argv[1], "rename") && !picowal_db_delete((u16)card, rec)) {
+                        http_append(out, &len, max, "ERR: copied but failed to delete source\n");
+                    } else {
+                        http_append(out, &len, max, http_streq(argv[1], "rename") ? "OK: moved " : "OK: copied ");
+                        http_append_u64(out, &len, max, (u32)n);
+                        http_append(out, &len, max, " bytes\n");
+                    }
+                }
+            } else if (http_streq(argv[1], "editor")) {
+                static u8 data[PICOWAL_DATA_MAX];
+                i32 n = picowal_db_get((u16)card, rec, data, PICOWAL_DATA_MAX);
+                if (n < 0) n = 0;
+                if (argc <= argi) {
+                    /* "db editor <addr>" -- dump with 1-based line numbers so an
+                     * operator can pick a line to replace via a follow-up
+                     * "db editor <addr> <line> <text...>" call. Stateless (no
+                     * server-side edit session) by design, matching every other
+                     * terminal command here. */
+                    http_append(out, &len, max, "db editor card=");
+                    http_append_u64(out, &len, max, card);
+                    http_append(out, &len, max, " rec=");
+                    http_append_u64(out, &len, max, rec);
+                    http_append(out, &len, max, " len=");
+                    http_append_u64(out, &len, max, (u32)n);
+                    http_append(out, &len, max, "\n");
+                    u32 line_no = 1, line_start = 0;
+                    for (i32 i = 0; i <= n; i++) {
+                        /* Skip the phantom empty final "line" produced when the
+                         * record already ends with '\n' (standard text-file
+                         * line-count semantics: content ending in a newline has
+                         * no extra trailing blank line). Always show at least
+                         * one line (1: <empty>) for a genuinely empty record. */
+                        if (i == n && line_start >= (u32)i && line_no > 1)
+                            break;
+                        if (i == n || data[i] == '\n') {
+                            http_append_u64(out, &len, max, line_no);
+                            http_append(out, &len, max, ": ");
+                            for (u32 j = line_start; j < (u32)i && len + 1 < max; j++) {
+                                u8 c = data[j];
+                                out[len++] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
+                                out[len] = 0;
+                            }
+                            http_append(out, &len, max, "\n");
+                            line_no++;
+                            line_start = (u32)i + 1;
+                        }
+                    }
+                } else {
+                    u32 target_line = 0;
+                    if (!http_parse_u32(argv[argi], &target_line) || target_line == 0) {
+                        http_append(out, &len, max, "ERR: usage db editor <addr> [<line> <text...>]\n");
+                    } else {
+                        char text[256];
+                        u32 tp = 0;
+                        for (u32 i = argi + 1; i < argc; i++) {
+                            const char *s = argv[i];
+                            while (*s && tp + 1 < sizeof(text)) text[tp++] = *s++;
+                            if (i + 1 < argc && tp + 1 < sizeof(text)) text[tp++] = ' ';
+                        }
+                        static u8 spliced[PICOWAL_DATA_MAX];
+                        i32 sn = db_editor_splice_line(data, n, target_line, text, tp,
+                                                       spliced, sizeof(spliced));
+                        if (sn < 0) {
+                            http_append(out, &len, max, "ERR: line splice failed (payload too large?)\n");
+                        } else if (picowal_db_put((u16)card, rec, spliced, (u32)sn) < 0) {
+                            http_append(out, &len, max, "ERR: write failed\n");
+                        } else {
+                            http_append(out, &len, max, "OK: line ");
+                            http_append_u64(out, &len, max, target_line);
+                            http_append(out, &len, max, " set, record now ");
+                            http_append_u64(out, &len, max, (u32)sn);
+                            http_append(out, &len, max, " bytes\n");
+                        }
                     }
                 }
             } else {
@@ -6437,6 +7659,86 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                 http_append(out, &len, max, snap[j].image_path);
                 http_append(out, &len, max, "\n");
             }
+        }
+    } else if (http_streq(cmd, "services")) {
+        /* Operator-facing "which capsule is hosting what" view: every listening
+         * TCP port, host-header (reserved for future virtual-hosting -- always
+         * "*" today), the owning pid/capsule/core, and a description PUBLISHED
+         * BY THE PROCESS ITSELF (compiled into that specific httpd.c/
+         * capsvc_host.c binary and written into its own attach-handshake
+         * struct at startup -- kernel.c never hardcodes it). Generalizes over
+         * uhttp bridges, capsvc-registered capsule services, and in-kernel-only
+         * admin/echo/http/tls/debug ports. */
+        struct proc_ui_entry pinfo[MAX_PROCS_PER_CORE + 1U];
+        u32 pinfo_n = proc_snapshot(pinfo, MAX_PROCS_PER_CORE + 1U);
+        http_append(out, &len, max, "PORT  HOST PID   CORE PROCESS               DESCRIPTION\n");
+        for (u32 bi = 0; bi < UHTTP_BRIDGE_COUNT; bi++) {
+            i32 lc = -1; u32 st = 0, rq = 0, rs = 0, reqs = 0, mg = 0, pid = 0;
+            uhttp_bridge_state_idx(bi, &lc, &st, &rq, &rs, &reqs, &mg, &pid);
+            (void)lc; (void)st; (void)rq; (void)rs; (void)reqs; (void)mg;
+            http_append_u64(out, &len, max, bi == 0 ? UHTTP_PORT : UHTTP_NATIVE_PORT);
+            http_append(out, &len, max, " *    ");
+            http_append_pid_field(out, &len, max, pid);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, uhttp_bridge_target_core(bi));
+            http_append(out, &len, max, " ");
+            const struct proc_ui_entry *p = 0;
+            for (u32 i = 0; i < pinfo_n; i++) {
+                if (pinfo[i].pid == pid) { p = &pinfo[i]; break; }
+            }
+            http_append(out, &len, max, p ? p->image_path : "-");
+            http_append(out, &len, max, " ");
+            struct uhttp_bridge *b = uhttp_bridge_at(bi);
+            uhttp_inval(b->description, UHTTP_LINE);
+            http_append(out, &len, max, b->description[0] ? b->description : "-");
+            http_append(out, &len, max, "\n");
+        }
+        u32 svc_n = capsvc_service_count();
+        for (u32 si = 0; si < svc_n; si++) {
+            u16 svc_port = 0; u32 core = 0, pid = 0; bool attached = false;
+            char desc[64];
+            if (!capsvc_service_info(si, &svc_port, &core, &pid, &attached, desc, sizeof(desc)))
+                continue;
+            http_append_u64(out, &len, max, svc_port);
+            http_append(out, &len, max, " *    ");
+            http_append_pid_field(out, &len, max, pid);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, core);
+            http_append(out, &len, max, " ");
+            const struct proc_ui_entry *p = 0;
+            for (u32 i = 0; i < pinfo_n; i++) {
+                if (pinfo[i].pid == pid) { p = &pinfo[i]; break; }
+            }
+            http_append(out, &len, max, p ? p->image_path : (attached ? "-" : "(not attached yet)"));
+            http_append(out, &len, max, " ");
+            http_append(out, &len, max, desc[0] ? desc : "-");
+            http_append(out, &len, max, "\n");
+            char host[CAPSVC_HOST_MAX];
+            if (capsvc_service_host(si, host, sizeof(host))) {
+                http_append_u64(out, &len, max, HTTPS_TLS_TCP_PORT);
+                http_append(out, &len, max, " ");
+                http_append(out, &len, max, host);
+                http_append(out, &len, max, " ");
+                http_append_pid_field(out, &len, max, pid);
+                http_append(out, &len, max, " ");
+                http_append_u64(out, &len, max, core);
+                http_append(out, &len, max, " ");
+                http_append(out, &len, max,
+                            p ? p->image_path :
+                            (attached ? "-" : "(not attached yet)"));
+                http_append(out, &len, max, " ");
+                http_append(out, &len, max, desc[0] ? desc : "-");
+                http_append(out, &len, max, "\n");
+            }
+        }
+        static const u16 kernel_ports[] = { ECHO_TCP_PORT, HTTP_TCP_PORT, HTTPS_TLS_TCP_PORT,
+                                            ADMIN_STATUS_TCP_PORT, ADMIN_REBOOT_TCP_PORT,
+                                            ADMIN_UPDATE_TCP_PORT, DEBUG_TCP_PORT };
+        for (u32 i = 0; i < sizeof(kernel_ports) / sizeof(kernel_ports[0]); i++) {
+            http_append_u64(out, &len, max, kernel_ports[i]);
+            http_append(out, &len, max, " *    -1    0 [kernel] ");
+            http_append(out, &len, max, tcp_owner_label(kernel_ports[i]));
+            http_append(out, &len, max, "\n");
         }
     } else if (http_starts_with(cmd, "process validate ")) {
         const char *path = cmd + 17;
@@ -7499,6 +8801,7 @@ static bool http_update_query_value(const u8 *req, u32 req_len, const char *key,
 {
     return http_query_value(req, req_len, "/api/admin/kernel-update", key, out, out_max) ||
            http_query_value(req, req_len, "/api/admin/kernel-stream", key, out, out_max) ||
+           http_query_value(req, req_len, "/api/admin/wifi-stream", key, out, out_max) ||
            http_query_value(req, req_len, "/", key, out, out_max);
 }
 
@@ -9870,6 +11173,7 @@ static void admin_service_poll(struct admin_http_service *svc)
             svc->resp_len = 0;
             svc->resp_off = 0;
             svc->stream_mode = false;
+            svc->stream_kind = 0U;
             svc->stream_received = 0;
             svc->stream_total = 0;
             svc->stream_reboot = false;
@@ -9989,34 +11293,59 @@ static void admin_service_poll(struct admin_http_service *svc)
             }
         }
         if (svc->stream_received >= svc->stream_total) {
-            bool fok = ota_stage_buf &&
-                http_write_kernel_payload_range(ota_update.target_slot_offset, 0,
-                                                ota_stage_buf, svc->stream_total, NULL) &&
-                http_write_kernel_slot_header(ota_update.target_slot_offset,
-                                              svc->stream_total, true);
+            bool wifi_stream = svc->stream_kind != 0U;
+            bool fok = wifi_stream
+                ? (ota_stage_buf &&
+                   cyw43_install_blob(svc->stream_kind, ota_stage_buf,
+                                      svc->stream_total))
+                : (ota_stage_buf &&
+                   http_write_kernel_payload_range(
+                       ota_update.target_slot_offset, 0, ota_stage_buf,
+                       svc->stream_total, NULL) &&
+                   http_write_kernel_slot_header(
+                       ota_update.target_slot_offset,
+                       svc->stream_total, true));
             svc->resp_len = 0;
             http_append(svc->resp, &svc->resp_len, sizeof(svc->resp),
                 "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
             if (fok) {
-                ota_update.active = false;
-                ota_update.commits++;
-                DTRACE(DTRACE_CAT_OTA, DT_OTA_COMMIT, svc->stream_total, ota_update.commits, 0, 0);
-                pios_bootctrl_mark_pending(ota_update.target_slot);
-                http_log_event("ota-stream-commit", svc->stream_total, ota_update.commits);
-                http_append(svc->resp, &svc->resp_len, sizeof(svc->resp),
-                    "{\"ok\":true,\"streamed\":true,\"reboot\":");
-                http_append(svc->resp, &svc->resp_len, sizeof(svc->resp),
-                    svc->stream_reboot ? "true}\n" : "false}\n");
-                if (svc->stream_reboot)
-                    http_reboot_pending = true;
+                if (wifi_stream) {
+                    http_log_event("wifi-blob-commit", svc->stream_kind,
+                                   svc->stream_total);
+                    http_append(svc->resp, &svc->resp_len,
+                                sizeof(svc->resp),
+                                "{\"ok\":true,\"wifi_blob\":true,\"ready\":");
+                    http_append(svc->resp, &svc->resp_len,
+                                sizeof(svc->resp),
+                                cyw43_blobs_ready() ? "true}\n" : "false}\n");
+                } else {
+                    ota_update.active = false;
+                    ota_update.commits++;
+                    DTRACE(DTRACE_CAT_OTA, DT_OTA_COMMIT,
+                           svc->stream_total, ota_update.commits, 0, 0);
+                    pios_bootctrl_mark_pending(ota_update.target_slot);
+                    http_log_event("ota-stream-commit", svc->stream_total,
+                                   ota_update.commits);
+                    http_append(svc->resp, &svc->resp_len,
+                                sizeof(svc->resp),
+                                "{\"ok\":true,\"streamed\":true,\"reboot\":");
+                    http_append(svc->resp, &svc->resp_len,
+                                sizeof(svc->resp),
+                                svc->stream_reboot ? "true}\n" : "false}\n");
+                    if (svc->stream_reboot)
+                        http_reboot_pending = true;
+                }
             } else {
-                ota_update.errors++;
-                ota_update.last_error = "stream flush failed";
+                if (!wifi_stream) {
+                    ota_update.errors++;
+                    ota_update.last_error = "stream flush failed";
+                }
                 http_append(svc->resp, &svc->resp_len, sizeof(svc->resp),
                     "{\"ok\":false,\"error\":\"stream flush failed\"}\n");
             }
             svc->resp_off = 0;
             svc->stream_mode = false;
+            svc->stream_kind = 0U;
         } else if (now - svc->last_activity_ms > 10000ULL) {
             /* stalled mid-stream: abort (slot left uncommitted = safe) */
             ota_update.active = false;
@@ -10041,9 +11370,17 @@ static void admin_service_poll(struct admin_http_service *svc)
          * body would never fit svc->req, so we must not wait for the full
          * request). http_header_body_offset() != 0 means headers are done. */
         u32 body_off = http_header_body_offset(svc->req, svc->req_len);
-        bool is_stream = body_off != 0 && svc == &admin_update_svc &&
-                         http_request_path_is(svc->req, svc->req_len, "/api/admin/kernel-stream") &&
-                         http_update_confirmed(svc->req, svc->req_len);
+        bool is_kernel_stream = body_off != 0 &&
+            svc == &admin_update_svc &&
+            http_request_path_is(svc->req, svc->req_len,
+                                 "/api/admin/kernel-stream") &&
+            http_update_confirmed(svc->req, svc->req_len);
+        bool is_wifi_stream = body_off != 0 &&
+            svc == &admin_update_svc &&
+            http_request_path_is(svc->req, svc->req_len,
+                                 "/api/admin/wifi-stream") &&
+            http_update_confirmed(svc->req, svc->req_len);
+        bool is_stream = is_kernel_stream || is_wifi_stream;
         if (is_stream) {
             u32 total = http_update_query_u32_default(svc->req, svc->req_len, "total", 0);
             char reboot[8];
@@ -10058,14 +11395,48 @@ static void admin_service_poll(struct admin_http_service *svc)
                     "{\"ok\":false,\"error\":\"stream unavailable or bad total\"}\n");
                 svc->resp_off = 0;
             } else {
-                ota_update.target_slot = pios_bootctrl_target_slot();
-                ota_update.target_slot_offset = pios_boot_slot_offset(ota_update.target_slot);
-                ota_update.total = total;
-                ota_update.received = 0;
-                ota_update.active = true;
-                ota_update.last_error = NULL;
-                http_write_kernel_slot_header(ota_update.target_slot_offset, total, false);
+                u32 stream_kind = 0U;
+                if (is_wifi_stream) {
+                    char kind[12];
+                    if (!http_update_query_value(svc->req, svc->req_len,
+                                                 "kind", kind,
+                                                 sizeof(kind))) {
+                        stream_kind = 0xFFFFFFFFU;
+                    } else if (http_streq(kind, "firmware")) {
+                        stream_kind = CYW_BLOB_FIRMWARE;
+                    } else if (http_streq(kind, "nvram")) {
+                        stream_kind = CYW_BLOB_NVRAM;
+                    } else if (http_streq(kind, "clm")) {
+                        stream_kind = CYW_BLOB_CLM;
+                    } else {
+                        stream_kind = 0xFFFFFFFFU;
+                    }
+                }
+                if (stream_kind == 0xFFFFFFFFU) {
+                    svc->resp_len = 0;
+                    http_append(svc->resp, &svc->resp_len,
+                                sizeof(svc->resp),
+                                "HTTP/1.0 200 OK\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Connection: close\r\n\r\n"
+                                "{\"ok\":false,\"error\":\"bad wifi kind\"}\n");
+                    svc->resp_off = 0;
+                    svc->last_activity_ms = now;
+                    return;
+                }
+                if (is_kernel_stream) {
+                    ota_update.target_slot = pios_bootctrl_target_slot();
+                    ota_update.target_slot_offset =
+                        pios_boot_slot_offset(ota_update.target_slot);
+                    ota_update.total = total;
+                    ota_update.received = 0;
+                    ota_update.active = true;
+                    ota_update.last_error = NULL;
+                    http_write_kernel_slot_header(
+                        ota_update.target_slot_offset, total, false);
+                }
                 svc->stream_mode = true;
+                svc->stream_kind = stream_kind;
                 svc->stream_total = total;
                 svc->stream_reboot = want_reboot;
                 svc->stream_received = 0;
@@ -10214,6 +11585,8 @@ static void echo_tcp_poll(void) {
     if (https_tls_tcp_conn >= 0) {
         u32 st = tcp_state(https_tls_tcp_conn);
         if (st == TCP_CLOSED || st == TCP_CLOSE_WAIT || st >= TCP_CLOSING) {
+            if (https_tls_route_pending)
+                capsvc_external_cancel(https_tls_route_token);
             if (https_tls_conn >= 0) tls_close(https_tls_conn);
             else tcp_close(https_tls_tcp_conn);
             https_tls_tcp_conn = -1;
@@ -10234,6 +11607,37 @@ static void echo_tcp_poll(void) {
                 } else if ((timer_monotonic_ms() - https_tls_last_activity_ms) > 5000ULL) {
                     tcp_close(https_tls_tcp_conn);
                     https_tls_tcp_conn = -1;
+                }
+            } else if (https_tls_route_pending) {
+                u32 response_len = 0;
+                i32 route_status = capsvc_external_poll(
+                    https_tls_route_token, https_tls_route_response,
+                    sizeof(https_tls_route_response), &response_len);
+                if (route_status > 0) {
+                    i32 wn = tls_write(https_tls_conn,
+                                       https_tls_route_response, response_len);
+                    http_log_event(wn > 0 ? "tls443-route-response" :
+                                            "tls443-route-write-fail",
+                                   HTTPS_TLS_TCP_PORT, (u32)wn);
+                    tls_close(https_tls_conn);
+                    https_tls_tcp_conn = -1;
+                    https_tls_conn = -1;
+                    https_tls_route_pending = false;
+                } else if (route_status < 0 ||
+                           timer_monotonic_ms() - https_tls_last_activity_ms >
+                               5000ULL) {
+                    if (route_status == 0)
+                        capsvc_external_cancel(https_tls_route_token);
+                    static const char unavailable[] =
+                        "HTTP/1.0 504 Gateway Timeout\r\n"
+                        "Content-Length: 0\r\n"
+                        "Connection: close\r\n\r\n";
+                    (void)tls_write(https_tls_conn, unavailable,
+                                    sizeof(unavailable) - 1U);
+                    tls_close(https_tls_conn);
+                    https_tls_tcp_conn = -1;
+                    https_tls_conn = -1;
+                    https_tls_route_pending = false;
                 }
             } else if (!https_tls_response_sent) {
                 /* Accumulate the (possibly multi-segment, POST-bodied) request
@@ -10273,6 +11677,7 @@ static void echo_tcp_poll(void) {
                     static char https_resp[8192];
                     char sts_tail[64];
                     i32 wn = -1;
+                    bool deferred = false;
                     if (buf_full && !complete) {
                         /* Oversized / incomplete request -> fail closed. */
                         static const char toobig[] =
@@ -10300,15 +11705,47 @@ static void echo_tcp_poll(void) {
                             wn = tls_write(https_tls_conn, https_resp, rlen);
                         }
                     } else {
-                        static const char resp[] =
-                            "HTTP/1.0 200 OK\r\n"
-                            "Content-Type: text/plain\r\n"
-                            "Content-Length: 20\r\n"
-                            "Connection: close\r\n\r\n"
-                            "PIOS kernel TLS 443\n";
-                        wn = tls_write(https_tls_conn, resp, sizeof(resp) - 1);
+                        char host[CAPSVC_HOST_MAX];
+                        i32 svc_idx = -1;
+                        if (tls_router_extract_host(https_tls_req_buf,
+                                                    https_tls_req_len,
+                                                    host, sizeof(host)))
+                            svc_idx = capsvc_find_host(host);
+                        if (svc_idx >= 0) {
+                            if (capsvc_external_begin(
+                                    (u32)svc_idx, https_tls_req_buf,
+                                    https_tls_req_len,
+                                    &https_tls_route_token) == 0) {
+                                https_tls_route_pending = true;
+                                https_tls_last_activity_ms =
+                                    timer_monotonic_ms();
+                                deferred = true;
+                                http_log_event("tls443-route",
+                                               HTTPS_TLS_TCP_PORT,
+                                               (u32)svc_idx);
+                            } else {
+                                static const char busy[] =
+                                    "HTTP/1.0 503 Service Unavailable\r\n"
+                                    "Content-Length: 0\r\n"
+                                    "Connection: close\r\n\r\n";
+                                wn = tls_write(https_tls_conn, busy,
+                                               sizeof(busy) - 1U);
+                            }
+                        } else {
+                            static const char resp[] =
+                                "HTTP/1.0 200 OK\r\n"
+                                "Content-Type: text/plain\r\n"
+                                "Content-Length: 20\r\n"
+                                "Connection: close\r\n\r\n"
+                                "PIOS kernel TLS 443\n";
+                            wn = tls_write(https_tls_conn, resp,
+                                           sizeof(resp) - 1);
+                        }
                     }
-                    if (wn > 0) {
+                    if (deferred) {
+                        /* The capsule owns the request slot until it publishes
+                         * a generation-matched reply. */
+                    } else if (wn > 0) {
                         https_tls_response_sent = true;
                         https_tls_last_activity_ms = timer_monotonic_ms();
                         http_log_event("tls443-response", HTTPS_TLS_TCP_PORT, (u32)wn);
@@ -10393,6 +11830,17 @@ static void echo_tcp_poll(void) {
         http_last_writable = tcp_writable(http_client_conn);
         if (st == TCP_CLOSED || st == TCP_CLOSE_WAIT || st >= TCP_CLOSING) {
             http_diag.closes++;
+            if (http_resp_len == 0 && http_req_len == 0) {
+                uart_puts("[http] early-close conn=");
+                uart_hex(http_client_conn >= 0 ? (u32)http_client_conn : 0xFFFFFFFFU);
+                uart_puts(" st=");
+                uart_hex(st);
+                uart_puts(" req_len=");
+                uart_hex(http_req_len);
+                uart_puts(" resp_len=");
+                uart_hex(http_resp_len);
+                uart_puts("\n");
+            }
             http_trace(HTTP_EVT_CLOSE, http_diag.route, http_resp_len, http_resp_off);
             http_reset_client(st != TCP_CLOSED);
         } else if (st == TCP_ESTABLISHED) {
@@ -10570,12 +12018,24 @@ static void echo_tcp_poll(void) {
                      * send a request line. Close those quietly; only partial
                      * requests are actionable request timeouts. */
                     http_diag.closes++;
+                    uart_puts("[http] quiet-close idle conn=");
+                    uart_hex(http_client_conn >= 0 ? (u32)http_client_conn : 0xFFFFFFFFU);
+                    uart_puts(" age_ms=");
+                    uart_hex((u32)(timer_monotonic_ms() - http_last_activity_ms));
+                    uart_puts("\n");
                     http_trace(HTTP_EVT_CLOSE, HTTP_ROUTE_UNKNOWN, 0,
                                http_client_conn >= 0 ? (u32)http_client_conn : 0xFFFFFFFFU);
                     http_reset_client(true);
                 } else {
                     http_diag.aborts++;
                     http_diag.error = HTTP_ERR_REQ_TIMEOUT;
+                    uart_puts("[http] req-timeout abort conn=");
+                    uart_hex(http_client_conn >= 0 ? (u32)http_client_conn : 0xFFFFFFFFU);
+                    uart_puts(" req_len=");
+                    uart_hex(http_req_len);
+                    uart_puts(" age_ms=");
+                    uart_hex((u32)(timer_monotonic_ms() - http_last_activity_ms));
+                    uart_puts("\n");
                     http_abort_client();
                 }
             }
@@ -10584,8 +12044,16 @@ static void echo_tcp_poll(void) {
             http_diag.error = HTTP_ERR_BAD_STATE;
             http_trace(HTTP_EVT_BAD_STATE, http_diag.route, st, http_last_activity_ms ? (u32)(timer_monotonic_ms() - http_last_activity_ms) : 0);
             if ((timer_monotonic_ms() - http_last_activity_ms) > 1000ULL ||
-                st == 0 || st >= 8)
+                st == 0 || st >= 8) {
+                uart_puts("[http] bad-state abort conn=");
+                uart_hex(http_client_conn >= 0 ? (u32)http_client_conn : 0xFFFFFFFFU);
+                uart_puts(" st=");
+                uart_hex(st);
+                uart_puts(" age_ms=");
+                uart_hex(http_last_activity_ms ? (u32)(timer_monotonic_ms() - http_last_activity_ms) : 0);
+                uart_puts("\n");
                 http_abort_client();
+            }
         }
         http_render_diag();
     }
@@ -10667,6 +12135,7 @@ static void ui_cmd_uartflash(u32 argc, char **argv);
 static void ui_cmd_watchdog(u32 argc, char **argv);
 static void ui_cmd_bootctrl(u32 argc, char **argv);
 static void ui_cmd_dma(u32 argc, char **argv);
+static void ui_cmd_adc(u32 argc, char **argv);
 static void ui_cmd_addr(u32 argc, char **argv);
 static void ui_cmd_keystore(u32 argc, char **argv);
 static void ui_cmd_tls(u32 argc, char **argv);
@@ -12092,6 +13561,16 @@ static void ui_console_u32_dec(u32 v)
     }
 }
 
+static void ui_console_i32_dec(i32 v)
+{
+    if (v < 0) {
+        ui_console_write("-");
+        ui_console_u32_dec((u32)(-(i64)v));
+    } else {
+        ui_console_u32_dec((u32)v);
+    }
+}
+
 static void ui_console_u64_dec(u64 v)
 {
     char buf[24];
@@ -12361,6 +13840,90 @@ static void ui_cmd_dma(u32 argc, char **argv)
     ui_console_write("ERR: usage dma status | dma selftest\n");
 }
 
+static void ui_print_adc_diag(void)
+{
+    struct rp1_adc_diag d;
+    rp1_adc_diag_snapshot(&d);
+    ui_console_write("adc initialized=");
+    ui_console_write(d.initialized ? "yes" : "no");
+    ui_console_write(" error=");
+    ui_console_u32_dec(d.last_error);
+    ui_console_write(" reads=");
+    ui_console_u32_dec(d.reads);
+    ui_console_write(" failures=");
+    ui_console_u32_dec(d.failures);
+    ui_console_write(" timeouts=");
+    ui_console_u32_dec(d.timeouts);
+    ui_console_write(" conversion_errors=");
+    ui_console_u32_dec(d.conversion_errors);
+    ui_console_write("\nregs cs=");
+    ui_console_hex_fixed(d.cs, 8);
+    ui_console_write(" fcs=");
+    ui_console_hex_fixed(d.fcs, 8);
+    ui_console_write(" div=");
+    ui_console_hex_fixed(d.div, 8);
+    ui_console_write(" ints=");
+    ui_console_hex_fixed(d.ints, 8);
+    ui_console_write("\nlast channel=");
+    ui_console_u32_dec(d.last_channel);
+    ui_console_write(" raw=");
+    ui_console_u32_dec(d.last_raw);
+    ui_console_write(" mv=");
+    ui_console_u32_dec(d.last_mv);
+    ui_console_write(" temp_mc=");
+    ui_console_i32_dec(d.last_temp_mc);
+    ui_console_write("\n");
+}
+
+static void ui_cmd_adc(u32 argc, char **argv)
+{
+    if (argc < 2 || ui_streq(argv[1], "status") ||
+        ui_streq(argv[1], "diag")) {
+        ui_print_adc_diag();
+        return;
+    }
+    if (ui_streq(argv[1], "init")) {
+        ui_console_write(rp1_adc_init() ? "ADC init OK\n" :
+                                          "ADC init FAILED\n");
+        ui_print_adc_diag();
+        return;
+    }
+    if (ui_streq(argv[1], "temp")) {
+        i32 millidegrees;
+        if (!rp1_adc_read_temperature(&millidegrees)) {
+            ui_console_write("ERR: ADC temperature read failed\n");
+            ui_print_adc_diag();
+            return;
+        }
+        ui_console_write("temperature_mc=");
+        ui_console_i32_dec(millidegrees);
+        ui_console_write("\n");
+        return;
+    }
+    if (ui_streq(argv[1], "read") || ui_streq(argv[1], "mv")) {
+        u32 channel;
+        u32 value;
+        if (argc < 3 || !ui_parse_u32(argv[2], &channel) ||
+            channel >= RP1_ADC_CHANNEL_COUNT) {
+            ui_console_write("ERR: ADC channel must be 0..4\n");
+            return;
+        }
+        bool ok = ui_streq(argv[1], "mv")
+            ? rp1_adc_read_mv(channel, &value)
+            : rp1_adc_read_raw(channel, &value);
+        if (!ok) {
+            ui_console_write("ERR: ADC read failed\n");
+            ui_print_adc_diag();
+            return;
+        }
+        ui_console_write(ui_streq(argv[1], "mv") ? "mv=" : "raw=");
+        ui_console_u32_dec(value);
+        ui_console_write("\n");
+        return;
+    }
+    ui_console_write("ERR: usage adc init|status|diag|temp|read <0..4>|mv <0..4>\n");
+}
+
 static void ui_cmd_keystore(u32 argc, char **argv)
 {
     if (argc >= 2 && ui_streq(argv[1], "derive")) {
@@ -12549,6 +14112,12 @@ static void ui_cmd_x509(u32 argc, char **argv)
     if (argc >= 2 && ui_streq(argv[1], "p256")) {
         const char *cn = argc >= 3 ? argv[2] : "";
         ui_console_write(x509_generate_p256_csr(cn) ? "X509 P256 CSR OK\n" : "X509 P256 CSR FAILED\n");
+        ui_print_x509_status();
+        return;
+    }
+    if (argc >= 2 && ui_streq(argv[1], "p256cert")) {
+        const char *cn = argc >= 3 ? argv[2] : "";
+        ui_console_write(x509_generate_p256_cert(cn) ? "X509 P256 cert OK\n" : "X509 P256 cert FAILED\n");
         ui_print_x509_status();
         return;
     }
@@ -13740,6 +15309,19 @@ static void ui_cmd_tensor(u32 argc, char **argv)
         ui_print_tensor_status();
         return;
     }
+    if (argc >= 2 && ui_streq(argv[1], "picoscript")) {
+        ui_console_write(tensor_picovm_selftest()
+                             ? "V3D QPU PicoScript enabled\n"
+                             : "V3D QPU PicoScript selftest FAILED; CPU fallback retained\n");
+        ui_print_tensor_status();
+        return;
+    }
+    if (argc >= 3 && ui_streq(argv[1], "picovm") && ui_streq(argv[2], "kernel")) {
+        ui_console_write(tensor_picovm_kernel_selftest()
+                             ? "PicoVM QPU arithmetic-block prototype OK\n"
+                             : "PicoVM QPU arithmetic-block prototype FAILED\n");
+        return;
+    }
     if (argc >= 3 && ui_streq(argv[1], "tiny") && ui_streq(argv[2], "noop")) {
         bool ok = tensor_tiny_noop_proof();
         ui_console_write(ok ? "Tensor tiny noop proof OK stage=" : "Tensor tiny noop proof FAILED stage=");
@@ -14683,6 +16265,9 @@ static void ui_cmd_db(u32 argc, char **argv)
         ui_console_write("db key <card> <record> | db key <wal:pack/card>\n");
         ui_console_write("db put <card> <record> <text...> | db put <wal:pack/card> <text...>\n");
         ui_console_write("db putf|getf <card> <record> <path> | db putf|getf <wal:pack/card> <path>\n");
+        ui_console_write("db save|add|update <addr> <hexbytes>  -- binary-safe write; add=create-only, update=must-exist\n");
+        ui_console_write("db copy|rename <src addr> <dst addr>\n");
+        ui_console_write("db editor <addr>  -- dump with line numbers | db editor <addr> <line> <text...>  -- replace/append that line\n");
         ui_console_write("db get|del <card> <record> | db get|del <wal:pack/card>\n");
         ui_console_write("db list <card|wal:pack/card>\n");
         ui_console_write("udp: port 7001 op={1:get,2:put,3:del,4:list} ver=1\n");
@@ -14870,6 +16455,129 @@ static void ui_cmd_db(u32 argc, char **argv)
         ui_console_write("OK: wrote file bytes=");
         ui_console_u32_dec((u32)n);
         ui_console_write("\n");
+        return;
+    }
+
+    if (ui_streq(argv[1], "save") || ui_streq(argv[1], "add") || ui_streq(argv[1], "update")) {
+        /* Binary-safe (hex-encoded) write with create/update existence
+         * semantics -- mirrors the HTTP-terminal "db save|add|update" verbs
+         * (http_exec_terminal_command) so the two front-ends stay in sync. */
+        bool want_add = ui_streq(argv[1], "add");
+        bool want_update = ui_streq(argv[1], "update");
+        bool exists = db_record_exists((u16)card, rec);
+        if (argc <= argi) {
+            ui_console_write("ERR: usage db save|add|update <addr> <hexbytes>\n");
+        } else if (want_add && exists) {
+            ui_console_write("ERR: record already exists (use update or save)\n");
+        } else if (want_update && !exists) {
+            ui_console_write("ERR: record does not exist (use add or save)\n");
+        } else {
+            const char *hex = argv[argi];
+            u32 hex_len = pios_strlen(hex);
+            static u8 data[PICOWAL_DATA_MAX];
+            bool ok = (hex_len != 0 && (hex_len & 1U) == 0 &&
+                       hex_len / 2U <= PICOWAL_DATA_MAX);
+            u32 count = hex_len / 2U;
+            for (u32 i = 0; ok && i < count; i++)
+                ok = pixe_parse_hex_byte_pair(hex + i * 2U, &data[i]);
+            if (!ok) {
+                ui_console_write("ERR: bad hex payload\n");
+            } else {
+                i32 n = picowal_db_put((u16)card, rec, data, count);
+                if (n < 0) {
+                    ui_console_write("ERR: write failed\n");
+                } else {
+                    ui_console_write("OK: wrote ");
+                    ui_console_u32_dec((u32)n);
+                    ui_console_write(" bytes\n");
+                }
+            }
+        }
+        return;
+    }
+
+    if (ui_streq(argv[1], "copy") || ui_streq(argv[1], "rename")) {
+        u32 dst_card = 0, dst_rec = 0, dst_argi = 0;
+        if (!ui_parse_db_ref(argc, argv, argi, &dst_card, &dst_rec, &dst_argi)) {
+            ui_console_write("ERR: usage db copy|rename <src addr> <dst addr>\n");
+        } else {
+            static u8 data[PICOWAL_DATA_MAX];
+            i32 n = picowal_db_get((u16)card, rec, data, PICOWAL_DATA_MAX);
+            if (n < 0) {
+                ui_console_write("ERR: source record not found\n");
+            } else if (picowal_db_put((u16)dst_card, dst_rec, data, (u32)n) < 0) {
+                ui_console_write("ERR: write to destination failed\n");
+            } else if (ui_streq(argv[1], "rename") && !picowal_db_delete((u16)card, rec)) {
+                ui_console_write("ERR: copied but failed to delete source\n");
+            } else {
+                ui_console_write(ui_streq(argv[1], "rename") ? "OK: moved " : "OK: copied ");
+                ui_console_u32_dec((u32)n);
+                ui_console_write(" bytes\n");
+            }
+        }
+        return;
+    }
+
+    if (ui_streq(argv[1], "editor")) {
+        static u8 data[PICOWAL_DATA_MAX];
+        i32 n = picowal_db_get((u16)card, rec, data, PICOWAL_DATA_MAX);
+        if (n < 0) n = 0;
+        if (argc <= argi) {
+            ui_console_write("db editor card=");
+            ui_console_u32_dec(card);
+            ui_console_write(" rec=");
+            ui_console_u32_dec(rec);
+            ui_console_write(" len=");
+            ui_console_u32_dec((u32)n);
+            ui_console_write("\n");
+            static char line_out[PICOWAL_DATA_MAX + 16];
+            u32 line_no = 1, line_start = 0;
+            for (i32 i = 0; i <= n; i++) {
+                if (i == n && line_start >= (u32)i && line_no > 1)
+                    break;
+                if (i == n || data[i] == '\n') {
+                    ui_console_u32_dec(line_no);
+                    ui_console_write(": ");
+                    u32 lo = 0;
+                    for (u32 j = line_start; j < (u32)i && lo + 1 < sizeof(line_out); j++) {
+                        u8 c = data[j];
+                        line_out[lo++] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
+                        line_out[lo] = 0;
+                    }
+                    ui_console_write(line_out);
+                    ui_console_write("\n");
+                    line_no++;
+                    line_start = (u32)i + 1;
+                }
+            }
+        } else {
+            u32 target_line = 0;
+            if (!ui_parse_u32(argv[argi], &target_line) || target_line == 0) {
+                ui_console_write("ERR: usage db editor <addr> [<line> <text...>]\n");
+            } else {
+                char text[256];
+                u32 tp = 0;
+                for (u32 i = argi + 1; i < argc; i++) {
+                    const char *s = argv[i];
+                    while (*s && tp + 1 < sizeof(text)) text[tp++] = *s++;
+                    if (i + 1 < argc && tp + 1 < sizeof(text)) text[tp++] = ' ';
+                }
+                static u8 spliced[PICOWAL_DATA_MAX];
+                i32 sn = db_editor_splice_line(data, n, target_line, text, tp,
+                                               spliced, sizeof(spliced));
+                if (sn < 0) {
+                    ui_console_write("ERR: line splice failed (payload too large?)\n");
+                } else if (picowal_db_put((u16)card, rec, spliced, (u32)sn) < 0) {
+                    ui_console_write("ERR: write failed\n");
+                } else {
+                    ui_console_write("OK: line ");
+                    ui_console_u32_dec(target_line);
+                    ui_console_write(" set, record now ");
+                    ui_console_u32_dec((u32)sn);
+                    ui_console_write(" bytes\n");
+                }
+            }
+        }
         return;
     }
 
@@ -17714,6 +19422,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("dns resolve <hostname>\n  Start async A-record lookup.\n");
         ui_console_write("dns status\n  Poll resolver job status.\n");
         ui_console_write("dns flush\n  Flush DNS cache.\n");
+        ui_console_write("See also: dnslookup <hostname>  (blocking one-shot lookup)\n");
     } else if (ui_streq(topic, "firewall")) {
         ui_console_write("firewall list\n  List rules.\n");
         ui_console_write("firewall reset\n  Restore inbound deny/outbound allow defaults plus service allows.\n");
@@ -17746,6 +19455,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("x509 generate [cn]\n  Generate a keystore-backed self-signed Ed25519 DER certificate.\n");
         ui_console_write("x509 csr [cn]\n  Generate a keystore-backed Ed25519 PKCS#10 CSR.\n");
         ui_console_write("x509 p256 [cn]\n  Generate a keystore-backed ECDSA P-256 PKCS#10 CSR for ACME.\n");
+        ui_console_write("x509 p256cert [cn]\n  Generate a self-signed ECDSA P-256/SHA-256 certificate (for the TLS 1.3 server).\n");
         ui_console_write("x509 bind\n  Mark the generated DER certificate as bound to kernel TLS.\n");
         ui_console_write("x509 import-self\n  Re-import the current DER certificate to exercise the import API.\n");
         ui_console_write("x509 selftest\n  Generate and bind a selftest DER certificate and CSR.\n");
@@ -17786,6 +19496,18 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "netcfg")) {
         ui_console_write("netcfg\n  Show current network config.\n");
         ui_console_write("netcfg set <ip|mask|gw|dns> <a.b.c.d>\nnetcfg apply\nnetcfg dhcp <on|off> [timeout_ms]\nnetcfg addnbr <ip> <mac>\nnetcfg routes|neighbors|trace\nnetcfg route add <dst> <mask> <gw> <connected|via>\n");
+        ui_console_write("See also: arp, route, ping, traceroute, dnslookup\n");
+    } else if (ui_streq(topic, "arp")) {
+        ui_console_write("arp\n  Dump the ARP/neighbor table (alias: arp table).\n");
+        ui_console_write("arp probe\n  Send ARP probes for configured neighbors.\narp status\n  Show ARP resolver counters.\n");
+    } else if (ui_streq(topic, "route")) {
+        ui_console_write("route\n  Dump the routing table (alias for netcfg routes).\n");
+    } else if (ui_streq(topic, "ping")) {
+        ui_console_write("ping <ip-or-cached-host> [count]\n  Send ICMP echo requests (default count=4, max 20) and report RTT/loss.\n");
+    } else if (ui_streq(topic, "traceroute")) {
+        ui_console_write("traceroute <ip-or-cached-host> [max_hops]\n  ICMP TTL-probe traceroute (default max_hops=16, max 30).\n");
+    } else if (ui_streq(topic, "dnslookup")) {
+        ui_console_write("dnslookup <hostname>\n  Blocking DNS A-record lookup (cache + live query).\n");
     } else if (ui_streq(topic, "stream")) {
         ui_console_write("stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
         ui_console_write("http get <ip-or-cached-host> [path] [port] [timeout_ms]\nhttps get <ip-or-cached-host> [path] [port] [timeout_ms]\n");
@@ -17830,6 +19552,10 @@ static void ui_cmd_crypto(u32 argc, char **argv)
 
 static void ui_cmd_arp(u32 argc, char **argv)
 {
+    if (argc < 2 || ui_streq(argv[1], "table")) {
+        ui_console_arp_table();
+        return;
+    }
     if (argc >= 2 && ui_streq(argv[1], "probe")) {
         arp_probe();
         const arp_stats_t *st = arp_get_stats();
@@ -17859,7 +19585,7 @@ static void ui_cmd_arp(u32 argc, char **argv)
         ui_console_write("\n");
         return;
     }
-    ui_console_write("usage: arp probe | arp status\n");
+    ui_console_write("usage: arp | arp table | arp probe | arp status\n");
 }
 
 static void ui_cmd_nic(u32 argc, char **argv)
@@ -18041,11 +19767,13 @@ static void ui_console_exec(char *line)
         } else if (ui_streq(argv[1], "net")) {
             ui_console_write("Network/firewall commands:\n");
             ui_console_write("  netstat netcfg [set|apply|dhcp|addnbr]\n");
+            ui_console_write("  arp | arp table | arp probe | arp status    route\n");
+            ui_console_write("  ping <ip-or-cached-host> [count]    traceroute <ip-or-cached-host> [max_hops]\n");
             ui_console_write("  firewall list|reset|clear|remove <idx>|default in <allow|deny> out <allow|deny>\n");
             ui_console_write("  firewall allow|deny <in|out|both> <tcp|udp|icmp|ip|arp> [port N] [src SPEC] [dst SPEC]\n");
             ui_console_write("  stream <tcp|udp> <ip> <port> from <file|text|tty> <arg?> to <console|file> [path] [timeout_ms]\n");
             ui_console_write("  http get <ip-or-cached-host> [path] [port] [timeout_ms] | https get <ip-or-cached-host> [path] [port] [timeout_ms]\n");
-            ui_console_write("  dns resolve <host> | dns status | dns flush\n");
+            ui_console_write("  dns resolve <host> | dns status | dns flush | dnslookup <host>\n");
             ui_console_write("  TCP debug console: port 2323, then 'unlock pios'\n");
         } else if (ui_streq(argv[1], "svc")) {
             ui_console_write("Service/script commands:\n");
@@ -18055,7 +19783,7 @@ static void ui_console_exec(char *line)
             ui_console_write("  if for foreach update status|stage <slot> [tries]|success\n");
         } else if (ui_streq(argv[1], "dev")) {
             ui_console_write("Device/debug commands:\n");
-            ui_console_write("  dma status|selftest  usb status|reinit|poll  wifi disabled\n");
+            ui_console_write("  mediahw status|hevc|pisp-be  rp1dma status|probe|selftest  rp1fw status|version\n");
             ui_console_write("  capsule ...  obs ...  hexsec <lba>\n");
             ui_console_write("  keystore status|derive <label>  edit|edit.pix <path>  clear echo\n");
             ui_console_write("  crypto selftest  arp probe  nic dump <on|off>|counters  cachestats\n");
@@ -18341,11 +20069,13 @@ static void ui_console_exec(char *line)
     } else if (ui_streq(argv[0], "svc")) {
         ui_cmd_svc(argc, argv);
     } else if (ui_streq(argv[0], "wifi")) {
-        ui_console_write("ERR: wifi support removed (parked in spike/wifi/, see GitHub issue)\n");
+        ui_console_exec_shared_fallback(argc, argv);
     } else if (ui_streq(argv[0], "usb")) {
         ui_cmd_usb(argc, argv);
     } else if (ui_streq(argv[0], "dma")) {
         ui_cmd_dma(argc, argv);
+    } else if (ui_streq(argv[0], "adc")) {
+        ui_cmd_adc(argc, argv);
     } else if (ui_streq(argv[0], "keystore")) {
         ui_cmd_keystore(argc, argv);
     } else if (ui_streq(argv[0], "tls")) {
@@ -19089,7 +20819,7 @@ static bool dash_capsule_same_group(const struct proc_capsule_ui_entry *a,
 }
 
 static bool dash_bridge_for_port(u16 port, u32 *bridge_out, u32 *pid_out,
-                                 u32 *core_out)
+                                 u32 *core_out, char *desc_out, u32 desc_max)
 {
     u32 idx = 0xFFFFFFFFU;
     if (port == UHTTP_PORT)
@@ -19107,22 +20837,59 @@ static bool dash_bridge_for_port(u16 port, u32 *bridge_out, u32 *pid_out,
     if (bridge_out) *bridge_out = idx;
     if (pid_out) *pid_out = pid;
     if (core_out) *core_out = uhttp_bridge_target_core(idx);
+    if (desc_out && desc_max) {
+        struct uhttp_bridge *b = uhttp_bridge_at(idx);
+        uhttp_inval(b->description, UHTTP_LINE);
+        u32 n = 0;
+        while (n + 1U < desc_max && n < UHTTP_LINE && b->description[n]) {
+            desc_out[n] = b->description[n];
+            n++;
+        }
+        desc_out[n] = 0;
+    }
     return true;
+}
+
+/* Generalizes dash_bridge_for_port() to any capsvc-registered service (admin
+ * console, and any future capsule-backed TCP server) via capsvc.c's generic
+ * enumeration API -- kernel.c is allowed to be service-aware, but this only
+ * ever reasons about port/pid/core, never a hardcoded service name. desc_out
+ * is the capsule's own self-published description (empty until it attaches). */
+static bool dash_capsvc_for_port(u16 port, u32 *svc_idx_out, u32 *pid_out,
+                                 u32 *core_out, char *desc_out, u32 desc_max)
+{
+    u32 n = capsvc_service_count();
+    for (u32 i = 0; i < n; i++) {
+        u16 svc_port = 0; u32 core = 0, pid = 0; bool attached = false;
+        if (!capsvc_service_info(i, &svc_port, &core, &pid, &attached, desc_out, desc_max))
+            continue;
+        if (svc_port != port)
+            continue;
+        if (svc_idx_out) *svc_idx_out = i;
+        if (pid_out) *pid_out = pid;
+        if (core_out) *core_out = core;
+        return true;
+    }
+    if (desc_out && desc_max) desc_out[0] = 0;
+    return false;
 }
 
 struct dash_listener_info {
     u16 port;
     u32 bridge;
+    u32 capsvc_idx;
     u32 pid;
     u32 core;
     u32 principal_id;
     u32 cpu_percent;
     u32 mem_kib;
     bool has_bridge;
+    bool has_capsvc;
     bool has_proc;
     const char *image;
     const char *owner;
     const char *principal;
+    char description[64];    /* process-published; empty until it attaches */
     const struct proc_capsule_ui_entry *capsule;
 };
 
@@ -19167,7 +20934,11 @@ static struct dash_listener_info dash_listener_info_for(
     info.principal_id = PRINCIPAL_ROOT;
     info.principal = "root";
     info.has_bridge = dash_bridge_for_port(tcp->local_port, &info.bridge, &info.pid,
-                                           &info.core);
+                                           &info.core, info.description, sizeof(info.description));
+    if (!info.has_bridge)
+        info.has_capsvc = dash_capsvc_for_port(tcp->local_port, &info.capsvc_idx,
+                                               &info.pid, &info.core,
+                                               info.description, sizeof(info.description));
     if (info.pid) {
         const struct proc_ui_entry *p = dash_proc_for_pid(proc, proc_n, info.pid);
         if (p) {
@@ -19352,7 +21123,7 @@ static void dash_draw_listener_row(u32 row, u32 c_pid, u32 c_core, u32 c_user,
     else
         fb_puts("kern");
     fb_set_cursor(c_core, row);
-    fb_printf("%u", (info->has_proc || info->has_bridge) ? info->core : 0U);
+    fb_printf("%u", (info->has_proc || info->has_bridge || info->has_capsvc) ? info->core : 0U);
     fb_set_cursor(c_user, row);
     dash_put_trunc(info->principal ? info->principal : "?", 10U);
     fb_set_cursor(c_cpu, row);
@@ -19373,16 +21144,32 @@ static void dash_draw_listener_row(u32 row, u32 c_pid, u32 c_core, u32 c_user,
         fb_printf("%u", info->bridge);
         fb_puts(" fifo -> tcp/");
         fb_printf("%u", info->port);
+    } else if (info->has_capsvc) {
+        fb_puts("capsvc svc");
+        fb_printf("%u", info->capsvc_idx);
+        fb_puts(" fifo -> tcp/");
+        fb_printf("%u", info->port);
     } else {
         dash_put_trunc(info->owner, fifo_width);
         fb_puts(" -> tcp/");
         fb_printf("%u", info->port);
+    }
+    /* Process-published description (compiled into that specific binary,
+     * written into its own attach-handshake struct at startup -- never
+     * hardcoded by the dashboard itself). Truncated defensively since this
+     * whole row already has no hard width guarantee past c_fifo. */
+    if (info->description[0]) {
+        fb_puts("  -- ");
+        dash_put_trunc(info->description, 28U);
     }
 }
 
 static void hdmi_dashboard_render(void)
 {
     static u64 last_ms;
+    static u64 last_wifi_ms;
+    static u64 last_wifi_rx;
+    static u64 last_wifi_tx;
     static bool layout_drawn;
     u64 now_ms = timer_monotonic_ms();
     /* Self-throttle floor (900ms) sits just under the 1Hz core0_io_tick_hook
@@ -19395,6 +21182,22 @@ static void hdmi_dashboard_render(void)
 
     struct perf_counter_snapshot perf;
     perf_counter_snapshot(&perf);
+    u64 wifi_rx = 0U;
+    u64 wifi_tx = 0U;
+    u32 wifi_rx_mbps_x1000 = 0U;
+    u32 wifi_tx_mbps_x1000 = 0U;
+    wifi_nic_counters(&wifi_rx, &wifi_tx);
+    if (last_wifi_ms != 0U && now_ms > last_wifi_ms &&
+        wifi_rx >= last_wifi_rx && wifi_tx >= last_wifi_tx) {
+        u64 elapsed_ms = now_ms - last_wifi_ms;
+        wifi_rx_mbps_x1000 =
+            (u32)(((wifi_rx - last_wifi_rx) * 8ULL) / elapsed_ms);
+        wifi_tx_mbps_x1000 =
+            (u32)(((wifi_tx - last_wifi_tx) * 8ULL) / elapsed_ms);
+    }
+    last_wifi_ms = now_ms;
+    last_wifi_rx = wifi_rx;
+    last_wifi_tx = wifi_tx;
 
     tcp_snapshot_entry_t tcp[TCP_MAX_CONNECTIONS];
     u32 tcp_n = tcp_snapshot(tcp, TCP_MAX_CONNECTIONS);
@@ -19407,7 +21210,7 @@ static void hdmi_dashboard_render(void)
     u32 screen_cols = fb_cols();
     u32 screen_rows = fb_rows();
     bool wide = screen_cols >= 180U;
-    u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 5U;
+    u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 6U;
     u32 hw_col = 0U;
     u32 hw_row = header_row + header_h + 1U;
     u32 hw_w = wide ? header_w : 78U;
@@ -19415,7 +21218,7 @@ static void hdmi_dashboard_render(void)
     u32 tns_col = 0U;
     u32 tns_row = hw_row + hw_h + 1U;
     u32 tns_w = wide ? header_w : 78U;
-    u32 tns_h = 5U;     /* border + 3 content rows: column header, NEON, V3D/QPU */
+    u32 tns_h = 9U;     /* border + header + six accelerator feature rows */
     u32 map_col = 0U;
     u32 map_row = tns_row + tns_h + 1U;
     u32 map_w = wide ? header_w : 78U;
@@ -19428,7 +21231,7 @@ static void hdmi_dashboard_render(void)
         log_top = screen_rows - log_h - 1U;
     u32 map_h = log_top > map_row + 3U ? log_top - map_row - 1U : (wide ? 16U : 13U);
 
-    /* Right-hand diagnostics column. On wide screens the HARDWARE / TENSOR /
+    /* Right-hand diagnostics column. On wide screens the HARDWARE / ACCEL /
      * MAP boxes leave a large unused gutter on the right. Carve a fixed-width
      * column there for live NIC/MAC, DMA, and FIFO/lease-arena diagnostics —
      * the one channel that stays readable when the network path wedges. */
@@ -19452,7 +21255,7 @@ static void hdmi_dashboard_render(void)
         fb_clear(0x00000000);
         dash_draw_window(header_col, header_row, header_w, header_h, "PIOS WORKBENCH", 0x0000FF80);
         dash_draw_window(hw_col, hw_row, hw_w, hw_h, "HARDWARE / CAPABILITIES", 0x0000CCFF);
-        dash_draw_window(tns_col, tns_row, tns_w, tns_h, "TENSOR / AI ACCELERATION", 0x00FF80FF);
+        dash_draw_window(tns_col, tns_row, tns_w, tns_h, "PARALLEL / VECTOR ACCELERATION", 0x00FF80FF);
         dash_draw_window(map_col, map_row, map_w, map_h, "NETWORK / PROCESS MAP", 0x00FFAA00);
         dash_draw_window(log_col, log_top, log_w, log_h, "WARNINGS / ERRORS", 0x00FF4040);
         if (diag_w) {
@@ -19467,9 +21270,6 @@ static void hdmi_dashboard_render(void)
     u32 h0 = header_col + 3U;
     u32 h1 = header_col + (header_w / 3U) + 2U;
     u32 h2 = header_col + ((header_w * 2U) / 3U) + 1U;
-    u32 ip = net_get_our_ip();
-    u32 mask = net_get_netmask();
-
     fb_set_cursor(h0, header_row + 1);
     fb_set_color(0x00FF80FF, 0x00000000);
     fb_puts("VERSION: ");
@@ -19485,11 +21285,11 @@ static void hdmi_dashboard_render(void)
     dash_put_uptime_breakdown(uptime_s);
     fb_set_cursor(h2, header_row + 1);
     fb_set_color(0x0000CCFF, 0x00000000);
-    fb_puts("IP: ");
+    fb_puts("WIRED IP: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
-    dash_ip(ip);
+    dash_ip(MY_IP);
     fb_puts("/");
-    fb_printf("%u", dash_prefix_len_from_mask(mask));
+    fb_printf("%u", dash_prefix_len_from_mask(MY_MASK));
 
     fb_set_cursor(h0, header_row + 2);
     fb_set_color(0x0000CCFF, 0x00000000);
@@ -19533,6 +21333,16 @@ static void hdmi_dashboard_render(void)
     fb_printf("%uMB", perf.ram_user_kib >> 10);
     fb_set_cursor(h2, header_row + 2);
     fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("WIRELESS IP: ");
+    fb_set_color(cyw43_is_connected() ? 0x0000FF80 : 0x00AAAAAA,
+                 0x00000000);
+    dash_ip(WIFI_STATIC_IP);
+    fb_puts("/");
+    fb_printf("%u", dash_prefix_len_from_mask(WIFI_STATIC_MASK));
+    fb_puts(cyw43_is_connected() ? " up" : " down");
+
+    fb_set_cursor(h2, header_row + 3);
+    fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts("BOARD: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
     fb_puts("rev=0x");
@@ -19574,7 +21384,7 @@ static void hdmi_dashboard_render(void)
     dash_put_bytes_mb(perf.walfs_used_bytes);
     fb_puts(" rec=");
     fb_printf("%u", perf.walfs_records);
-    fb_set_cursor(h2, header_row + 3);
+    fb_set_cursor(h2, header_row + 4);
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts("SD: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
@@ -19587,6 +21397,17 @@ static void hdmi_dashboard_render(void)
     fb_puts("/");
     dash_put_mbps(perf.sd_write_peak_mbps_x1000);
     fb_puts(" Mb/s");
+
+    fb_set_cursor(h0, header_row + 4);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    fb_puts("WIFI: ");
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    fb_puts("Rx=");
+    dash_put_mbps(wifi_rx_mbps_x1000);
+    fb_puts("/150 Tx=");
+    dash_put_mbps(wifi_tx_mbps_x1000);
+    fb_puts("/150 Mb/s ");
+    fb_puts(cyw43_is_connected() ? "up" : "down");
 
     dash_clear_body(hw_col, hw_row, hw_w, hw_h);
     u32 hw_r = hw_row + 1U;
@@ -19667,13 +21488,16 @@ static void hdmi_dashboard_render(void)
                     (PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB) ? "scanout+back" : "0",
                     (PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB) ? "workbench dashboard" : "serial console only");
 
-    /* TENSOR / AI ACCELERATION section: which compute backends accelerate the
-     * tensor primitives, their live state, and the terminal commands that drive
-     * them. NEON is always present (ARMv8.2 SIMD, fp32); V3D/QPU state is read
-     * live from tensor_status(). */
+    /* PARALLEL / VECTOR ACCELERATION: list only features that have passed their
+     * guarded runtime proof. CPU/NEON is always present; QPU feature state is
+     * read from each verified kernel rather than inferred from CSD availability. */
     dash_clear_body(tns_col, tns_row, tns_w, tns_h);
     struct tensor_status tns;
     tensor_status(&tns);
+    const struct v3d_kernel_desc *alu_desc =
+        v3d_kernel_desc_get(V3D_KERNEL_PICOVM_ALU);
+    const struct v3d_kernel_desc *matvec_desc =
+        v3d_kernel_desc_get(V3D_KERNEL_MATVEC16);
     {
         u32 tns_r = tns_row + 1U;
         const u32 t_back = tns_col + 3U;
@@ -19681,7 +21505,7 @@ static void hdmi_dashboard_render(void)
         const u32 t_detail = wide ? (tns_col + 26U) : (tns_col + 21U);
         const u32 t_detail_w = tns_w > (t_detail - tns_col) + 2U
                                    ? tns_w - (t_detail - tns_col) - 2U : 20U;
-        bool v3d_ready = tns.v3d_native_compute_enabled && tns.any_kernel_bound;
+        bool v3d_ready = tensor_picovm_accel_ready();
         fb_set_color(0x00AAAAAA, 0x00000000);
         fb_set_cursor(t_back, tns_r);
         fb_puts("BACKEND");
@@ -19697,7 +21521,17 @@ static void hdmi_dashboard_render(void)
         fb_set_cursor(t_state, tns_r);
         fb_puts("ready");
         fb_set_cursor(t_detail, tns_r);
-        dash_put_trunc("add mul scale dot relu softmax matmul matvec (fp32 SIMD)  cmd: tensor bench",
+        dash_put_trunc("FP32 add/mul/scale/dot/matmul/matvec/relu/softmax",
+                       t_detail_w);
+        tns_r++;
+        fb_set_color(0x0099FFCC, 0x00000000);
+        fb_set_cursor(t_back, tns_r);
+        fb_puts("CPU INT");
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_set_cursor(t_state, tns_r);
+        fb_puts("ready");
+        fb_set_cursor(t_detail, tns_r);
+        dash_put_trunc("I8 dot/matvec; I32 add/mul/scale/relu/norm/rope/softmax",
                        t_detail_w);
         tns_r++;
         fb_set_color(0x0000CCFF, 0x00000000);
@@ -19706,10 +21540,55 @@ static void hdmi_dashboard_render(void)
         fb_set_color(v3d_ready ? 0x0000FF80 : (tns.v3d_available ? 0x00FFAA00 : 0x00FF4040),
                      0x00000000);
         fb_set_cursor(t_state, tns_r);
-        fb_puts(v3d_ready ? "ready" : (tns.v3d_available ? "probe" : "off"));
+        fb_puts(v3d_ready ? "enabled" : (tns.v3d_dispatch_supported ? "probe" : "off"));
         fb_set_color(0x00FFFFFF, 0x00000000);
         fb_set_cursor(t_detail, tns_r);
-        dash_put_trunc("vector16/N add+mul, matvecN, matmul via QPU CSD  cmd: tensor vectorN | bench v3d",
+        dash_put_trunc(v3d_ready
+                           ? "PicoScript: DotI8 MatVecI8"
+                           : "QPU quarantined until PicoScript Tensor selftest  cmd: tensor picoscript",
+                       t_detail_w);
+        tns_r++;
+        fb_set_color(0x00CC99FF, 0x00000000);
+        fb_set_cursor(t_back, tns_r);
+        fb_puts("QPU VM");
+        fb_set_color((alu_desc && alu_desc->verified) ? 0x0000FF80 : 0x00FFAA00,
+                     0x00000000);
+        fb_set_cursor(t_state, tns_r);
+        fb_puts((alu_desc && alu_desc->verified) ? "enabled" : "probe");
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_set_cursor(t_detail, tns_r);
+        dash_put_trunc((alu_desc && alu_desc->verified)
+                           ? "Arithmetic block: ADD+MUL (24-bit bounded)"
+                           : "Arithmetic block pending  cmd: tensor picovm kernel",
+                       t_detail_w);
+        tns_r++;
+        fb_set_color(0x00FFCC66, 0x00000000);
+        fb_set_cursor(t_back, tns_r);
+        fb_puts("QPU BATCH");
+        fb_set_color((matvec_desc && matvec_desc->verified) ? 0x0000FF80 : 0x00FFAA00,
+                     0x00000000);
+        fb_set_cursor(t_state, tns_r);
+        fb_puts((matvec_desc && matvec_desc->verified) ? "enabled" : "probe");
+        fb_set_color(0x00FFFFFF, 0x00000000);
+        fb_set_cursor(t_detail, tns_r);
+        dash_put_trunc((matvec_desc && matvec_desc->verified)
+                           ? (tensor_prefer_qpu_fp32()
+                                  ? "FP32 + packed ternary batch QPU; dense INT8 NEON"
+                                  : "Batched matrix kernels verified; run tensor profile")
+                           : "Batched MatVec proof pending",
+                       t_detail_w);
+        tns_r++;
+        fb_set_color(0x0066FFCC, 0x00000000);
+        fb_set_cursor(t_back, tns_r);
+        fb_puts("MEDIA");
+        fb_set_color(tensor_picovm_media_accel_ready() ? 0x0000FF80 : 0x00FFFFFF,
+                     0x00000000);
+        fb_set_cursor(t_state, tns_r);
+        fb_puts(tensor_picovm_media_accel_ready() ? "enabled" : "CPU");
+        fb_set_cursor(t_detail, tns_r);
+        dash_put_trunc(tensor_picovm_media_accel_ready()
+                           ? "QPU Gray XOR codec; H264 CPU; HEVC/PiSP/HVS pending"
+                           : "Gray delta + H264 residual; HEVC/PiSP/HVS pending",
                        t_detail_w);
     }
 
@@ -20760,6 +22639,8 @@ NORETURN void core0_main(void) {
                 core0_eth_irq_deferred_quench = false;
                 core0_eth_irq_drain_and_quench(false);
             }
+            if (cyw43_runtime_ready())
+                cyw43_poll();
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
             /* Recovered from a poll-only livelock fallback: after a cooldown
              * (during which this same net_poll()/macb_rx_recover() pairing
@@ -20800,6 +22681,7 @@ NORETURN void core0_main(void) {
             u64 dt_http = sched_counter_ticks() - dt_http0;
             if (dt_http > dt_phase_thresh)
                 DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_HTTP, dt_http, 0, 0, 0);
+            capsvc_poll();   /* generic capsule-service dispatcher (docs/net_capsule_fifo.md) */
             ksvc_end(ksvc_tcp_id, svc_start, false);
             ksvc_run(ksvc_debug_id);
         }
@@ -20945,6 +22827,11 @@ extern const u8 user_el0_probe_start[];
 extern const u8 user_el0_probe_end[];
 extern const u8 user_el0_pico_start[];
 extern const u8 user_el0_pico_end[];
+/* Generic capsvc capsule host (src/user_capsvc_host_payload.S). One flat
+ * binary; CAPSVC_SVC_IDX is baked in per launch site via a separate compile,
+ * mirroring UHTTP_BRIDGE_INDEX for the httpd workers above. */
+extern const u8 user_capsvc_host0_start[];
+extern const u8 user_capsvc_host0_end[];
 
 /* Physical slot bases for the kernel-embedded EL0 HTTP workers, derived from
  * the platform core RAM map so the identical launch path works on Pi5 and
@@ -20966,6 +22853,14 @@ _Static_assert(HTTPD_VM_EL0_CORE2_PHYS == 0x02900000ULL,
 _Static_assert(HTTPD_VM_EL0_CORE3_PHYS == 0x03B00000ULL,
                "core3 EL0 slot base must stay 0x03B00000 on Pi5");
 #endif
+/* Generic capsvc host, capsule 0: procs[] is a SHARED array across all 4
+ * cores (rc-percore-sched, src/proc.c), so slot indices are GLOBAL, not
+ * per-core -- slot 0 is core2's httpd-vm-el0, slot 1 is core3's
+ * httpd-vm1-el0 (both already in use), so this must use a different slot
+ * number entirely, not "slot 0 relative to this core" again. Slot 2 is free. */
+#define CAPSVC_HOST0_SLOT 2U
+#define CAPSVC_HOST0_PHYS \
+    (CORE3_RAM_BASE + PROC_SLOT_OFFSET + (u64)CAPSVC_HOST0_SLOT * PROC_SLOT_SIZE)
 NORETURN void core2_main(void) {
     core_mark_online(CORE_USER0, 1);
     core_env_init(CORE_USER0);
@@ -21005,6 +22900,11 @@ NORETURN void core3_main(void) {
     proc_exec_from_mem_el0("user/httpd-vm1-el0", user_httpd_native_start,
                            (u32)(usize)(user_httpd_native_end - user_httpd_native_start),
                            HTTPD_VM_EL0_LINK_BASE, HTTPD_VM_EL0_CORE3_PHYS, PROC_PRIO_NORMAL, core_id());
+    /* Launch the generic capsvc capsule host serving CAPSVC_ADMIN_PORT
+     * (docs/net_capsule_fifo.md) -- slot 0 is free on this core. */
+    proc_exec_from_mem_el0("user/capsvc-host0-el0", user_capsvc_host0_start,
+                           (u32)(usize)(user_capsvc_host0_end - user_capsvc_host0_start),
+                           HTTPD_VM_EL0_LINK_BASE, CAPSVC_HOST0_PHYS, PROC_PRIO_NORMAL, core_id());
     {
         u64 sctlr;
         __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
@@ -21727,6 +23627,15 @@ void kernel_main(void) {
                 bp_ok("[x509] dev certificate descriptor ready");
             else
                 bp_warn("[x509] dev certificate descriptor unavailable");
+            /* Real TLS 1.3 server (src/tls.c's tls_accept()) needs an
+             * ECDSA-P256 leaf cert to match its ecdsa_secp256r1_sha256
+             * CertificateVerify -- generated last so it becomes the
+             * active cert in x509's single shared DER slot. */
+            bp_log("[x509] p256 cert for TLS 1.3 server...");
+            if (x509_generate_p256_cert("PIOS kernel dev"))
+                bp_ok("[x509] TLS 1.3 P-256 certificate ready");
+            else
+                bp_warn("[x509] TLS 1.3 P-256 certificate unavailable (real TLS falls back to failing closed)");
             bp_log("[acme] acme_init...");
             if (acme_init())
                 bp_ok("[acme] account state ready");

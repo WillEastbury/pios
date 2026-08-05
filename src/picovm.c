@@ -191,6 +191,11 @@ static uint8_t pv_arena_get(pv_ctx *ctx, uint32_t a)
  * NULL by default; a native deployment sets this to compile in its own
  * pack/card store. Return non-zero if the hook was handled. */
 pv_storage_fn pv_storage_hook = 0;
+pv_tensor_fn pv_tensor_hook = 0;
+pv_compute_fn pv_compute_hook = 0;
+pv_net_fn pv_net_hook = 0;
+pv_media_fn pv_media_hook = 0;
+pv_bitlinear_fn pv_bitlinear_hook = 0;
 static int pv_span_make(pv_ctx *ctx, uint32_t ptr, int32_t len)
 {
     if (len < 0) len = 0;
@@ -1350,6 +1355,9 @@ uint32_t pv_hook_cap(int hook)
     if ((hook >= 0x180 && hook <= 0x186) || (hook >= 0x1B3 && hook <= 0x1B5)) return PV_CAP_EVENT;   /* Event.* */
     if (hook >= 0x188 && hook <= 0x193) return PV_CAP_UI;      /* Ui.* */
     if ((hook >= 0x1D0 && hook <= 0x1DF) || (hook >= 0x200 && hook <= 0x20B)) return PV_CAP_STORAGE; /* Search.* over card packs */
+    if (hook >= 0x370 && hook <= 0x37B) return PV_CAP_DEVICE;  /* Tensor host/CatQ/Async */
+    if (hook >= 0x37C && hook <= 0x37D) return PV_CAP_STORAGE; /* Shard.* */
+    if ((hook >= 0x2E0 && hook <= 0x2E6) || (hook >= 0x37E && hook <= 0x380)) return PV_CAP_NET; /* Net.* */
     return 0;                                                /* pure: String/Number/Maths/Span/... */
 }
 
@@ -2298,6 +2306,368 @@ static int pv_parse_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
     return 0;
 }
 
+static int pv_tensor_span(pv_ctx *ctx, int handle, uint32_t *ptr, int32_t *len)
+{
+    if (!ctx || !ptr || !len || !ctx->mem ||
+        handle <= 0 || handle >= ctx->span_count)
+        return 0;
+    uint32_t p = ctx->span_ptr[handle];
+    int32_t n = ctx->span_len[handle];
+    if (n < 0 || p > (uint32_t)ctx->mem_size ||
+        (uint32_t)n > (uint32_t)ctx->mem_size - p)
+        return 0;
+    *ptr = p;
+    *len = n;
+    return 1;
+}
+
+static int32_t pv_tensor_i32be(const uint8_t *p)
+{
+    return (int32_t)(((uint32_t)p[0] << 24) |
+                     ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) |
+                     (uint32_t)p[3]);
+}
+
+static void pv_tensor_put_i32be(uint8_t *p, int32_t value)
+{
+    uint32_t v = (uint32_t)value;
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static uint32_t pv_tensor_isqrt64(uint64_t n)
+{
+    uint64_t bit = (uint64_t)1 << 62;
+    uint64_t res = 0;
+    while (bit > n) bit >>= 2;
+    while (bit) {
+        if (n >= res + bit) {
+            n -= res + bit;
+            res = (res >> 1) + bit;
+        } else {
+            res >>= 1;
+        }
+        bit >>= 2;
+    }
+    return res > 0xffffffffULL ? 0xffffffffU : (uint32_t)res;
+}
+
+static int pv_tensor_output_begin(pv_ctx *ctx, uint32_t count, uint32_t *base)
+{
+    uint64_t bytes = (uint64_t)count * 4U;
+    if (!ctx || !base || !ctx->mem || ctx->no_alloc ||
+        bytes > 0xffffffffULL || ctx->arena_top > (uint32_t)ctx->mem_size ||
+        (uint32_t)bytes > (uint32_t)ctx->mem_size - ctx->arena_top) {
+        if (ctx) { ctx->fault = PV_FAULT_ALLOC; ctx->halted = 1; }
+        return 0;
+    }
+    *base = ctx->arena_top;
+    return 1;
+}
+
+static int pv_tensor_default(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
+{
+    uint32_t xp = 0, yp = 0, base = 0;
+    int32_t xn = 0, yn = 0;
+    if (hook == PV_HOOK_TENSOR_SETSHAPE) {
+        ctx->tensor_rows = ctx->regs[rs1] < 0 ? 0 : ctx->regs[rs1];
+        ctx->tensor_cols = ctx->regs[rs2] < 0 ? 0 : ctx->regs[rs2];
+        ctx->regs[rd] = 1;
+        return 1;
+    }
+    if (hook == PV_HOOK_TENSOR_HASACCEL) {
+        ctx->regs[rd] = 0;
+        return 1;
+    }
+    if (!pv_tensor_span(ctx, ctx->regs[rs1], &xp, &xn)) {
+        ctx->regs[rd] = 0;
+        return 1;
+    }
+    if (hook == PV_HOOK_TENSOR_DOTI8) {
+        if (!pv_tensor_span(ctx, ctx->regs[rs2], &yp, &yn)) {
+            ctx->regs[rd] = 0; return 1;
+        }
+        int32_t n = ctx->tensor_cols > 0 ? ctx->tensor_cols : (xn < yn ? xn : yn);
+        if (n > xn) n = xn;
+        if (n > yn) n = yn;
+        int32_t acc = 0;
+        for (int32_t i = 0; i < n; i++)
+            acc = (int32_t)((uint32_t)acc +
+                            (uint32_t)((int8_t)ctx->mem[xp + (uint32_t)i] *
+                                      (int8_t)ctx->mem[yp + (uint32_t)i]));
+        ctx->regs[rd] = acc;
+        return 1;
+    }
+    if (hook == PV_HOOK_TENSOR_MATVECI8) {
+        if (!pv_tensor_span(ctx, ctx->regs[rs2], &yp, &yn)) {
+            ctx->regs[rd] = 0; return 1;
+        }
+        uint32_t rows = ctx->tensor_rows > 0 ? (uint32_t)ctx->tensor_rows : 0U;
+        uint32_t cols = ctx->tensor_cols > 0 ? (uint32_t)ctx->tensor_cols : (uint32_t)yn;
+        if (!pv_tensor_output_begin(ctx, rows, &base)) { ctx->regs[rd] = 0; return 1; }
+        for (uint32_t r = 0; r < rows; r++) {
+            int32_t acc = 0;
+            uint64_t row_base = (uint64_t)r * cols;
+            for (uint32_t c = 0; c < cols; c++) {
+                if (row_base + c >= (uint32_t)xn || c >= (uint32_t)yn) break;
+                acc = (int32_t)((uint32_t)acc +
+                      (uint32_t)((int8_t)ctx->mem[xp + (uint32_t)row_base + c] *
+                                 (int8_t)ctx->mem[yp + c]));
+            }
+            pv_tensor_put_i32be(ctx->mem + base + r * 4U, acc);
+        }
+        ctx->regs[rd] = pv_arena_finish(ctx, rows * 4U);
+        return 1;
+    }
+    uint32_t count = (uint32_t)xn / 4U;
+    if (hook == PV_HOOK_TENSOR_ARGMAXI32) {
+        int32_t best = 0;
+        int32_t best_value = count ? pv_tensor_i32be(ctx->mem + xp) : 0;
+        for (uint32_t i = 1; i < count; i++) {
+            int32_t value = pv_tensor_i32be(ctx->mem + xp + i * 4U);
+            if (value > best_value) { best_value = value; best = (int32_t)i; }
+        }
+        ctx->regs[rd] = best;
+        return 1;
+    }
+    if (hook == PV_HOOK_TENSOR_ADDI32 || hook == PV_HOOK_TENSOR_MULI32) {
+        if (!pv_tensor_span(ctx, ctx->regs[rs2], &yp, &yn)) {
+            ctx->regs[rd] = 0; return 1;
+        }
+        uint32_t other = (uint32_t)yn / 4U;
+        if (other < count) count = other;
+    }
+    if (!pv_tensor_output_begin(ctx, count, &base)) { ctx->regs[rd] = 0; return 1; }
+    if (hook == PV_HOOK_TENSOR_ADDI32 || hook == PV_HOOK_TENSOR_MULI32) {
+        for (uint32_t i = 0; i < count; i++) {
+            int32_t a = pv_tensor_i32be(ctx->mem + xp + i * 4U);
+            int32_t b = pv_tensor_i32be(ctx->mem + yp + i * 4U);
+            int32_t value = hook == PV_HOOK_TENSOR_ADDI32
+                ? (int32_t)((uint32_t)a + (uint32_t)b)
+                : (int32_t)(((int64_t)a * b) >> 8);
+            pv_tensor_put_i32be(ctx->mem + base + i * 4U, value);
+        }
+    } else if (hook == PV_HOOK_TENSOR_SCALEI32) {
+        int32_t scale = ctx->regs[rs2];
+        for (uint32_t i = 0; i < count; i++) {
+            int32_t a = pv_tensor_i32be(ctx->mem + xp + i * 4U);
+            pv_tensor_put_i32be(ctx->mem + base + i * 4U,
+                                (int32_t)((uint32_t)((int64_t)a * scale)));
+        }
+    } else if (hook == PV_HOOK_TENSOR_RELUI32) {
+        for (uint32_t i = 0; i < count; i++) {
+            int32_t value = pv_tensor_i32be(ctx->mem + xp + i * 4U);
+            pv_tensor_put_i32be(ctx->mem + base + i * 4U, value < 0 ? 0 : value);
+        }
+    } else if (hook == PV_HOOK_TENSOR_RMSNORMI32) {
+        if (!pv_tensor_span(ctx, ctx->regs[rs2], &yp, &yn)) {
+            ctx->regs[rd] = 0; return 1;
+        }
+        uint64_t sum = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            int64_t value = pv_tensor_i32be(ctx->mem + xp + i * 4U);
+            uint64_t square = (uint64_t)(value * value);
+            sum = UINT64_MAX - sum < square ? UINT64_MAX : sum + square;
+        }
+        uint32_t rms = pv_tensor_isqrt64(count ? sum / count : 1U);
+        if (rms == 0) rms = 1;
+        for (uint32_t i = 0; i < count; i++) {
+            int32_t value = pv_tensor_i32be(ctx->mem + xp + i * 4U);
+            int32_t gain = i * 4U + 4U <= (uint32_t)yn
+                ? pv_tensor_i32be(ctx->mem + yp + i * 4U) : 256;
+            pv_tensor_put_i32be(ctx->mem + base + i * 4U,
+                                (int32_t)(((int64_t)value * gain) / rms));
+        }
+    } else if (hook == PV_HOOK_TENSOR_ROPEI32) {
+        if (!pv_tensor_span(ctx, ctx->regs[rs2], &yp, &yn)) {
+            ctx->regs[rd] = 0; return 1;
+        }
+        count &= ~1U;
+        for (uint32_t i = 0; i < count; i += 2U) {
+            int32_t x = pv_tensor_i32be(ctx->mem + xp + i * 4U);
+            int32_t y = pv_tensor_i32be(ctx->mem + xp + (i + 1U) * 4U);
+            int32_t cosine = i * 4U + 4U <= (uint32_t)yn
+                ? pv_tensor_i32be(ctx->mem + yp + i * 4U) : 32768;
+            int32_t sine = (i + 1U) * 4U + 4U <= (uint32_t)yn
+                ? pv_tensor_i32be(ctx->mem + yp + (i + 1U) * 4U) : 0;
+            pv_tensor_put_i32be(ctx->mem + base + i * 4U,
+                                (int32_t)(((int64_t)x * cosine - (int64_t)y * sine) >> 15));
+            pv_tensor_put_i32be(ctx->mem + base + (i + 1U) * 4U,
+                                (int32_t)(((int64_t)x * sine + (int64_t)y * cosine) >> 15));
+        }
+    } else if (hook == PV_HOOK_TENSOR_SOFTMAXI32) {
+        int32_t maximum = count ? pv_tensor_i32be(ctx->mem + xp) : 0;
+        for (uint32_t i = 1; i < count; i++) {
+            int32_t value = pv_tensor_i32be(ctx->mem + xp + i * 4U);
+            if (value > maximum) maximum = value;
+        }
+        uint64_t sum = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            int32_t value = pv_tensor_i32be(ctx->mem + xp + i * 4U);
+            uint32_t bucket = (uint32_t)(maximum - value) >> 8;
+            if (bucket > 15U) bucket = 15U;
+            sum += 32768U >> bucket;
+        }
+        if (sum == 0) sum = 1;
+        for (uint32_t i = 0; i < count; i++) {
+            int32_t value = pv_tensor_i32be(ctx->mem + xp + i * 4U);
+            uint32_t bucket = (uint32_t)(maximum - value) >> 8;
+            if (bucket > 15U) bucket = 15U;
+            uint32_t weight = 32768U >> bucket;
+            pv_tensor_put_i32be(ctx->mem + base + i * 4U,
+                                (int32_t)((uint64_t)weight * 32767U / sum));
+        }
+    } else {
+        return 0;
+    }
+
+    ctx->regs[rd] = pv_arena_finish(ctx, count * 4U);
+    return 1;
+}
+
+    static int pv_media_default(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
+    {
+        if (hook == PV_HOOK_MEDIA_SETSHAPE) {
+            ctx->media_width = ctx->regs[rs1] < 0 ? 0 : ctx->regs[rs1];
+            ctx->media_height = ctx->regs[rs2] < 0 ? 0 : ctx->regs[rs2];
+            ctx->regs[rd] = ctx->media_width > 0 && ctx->media_height > 0;
+            return 1;
+        }
+        if (hook == PV_HOOK_MEDIA_HASACCEL) {
+            ctx->regs[rd] = 0;
+            return 1;
+        }
+        if (hook == PV_HOOK_MEDIA_HASHEVC) {
+            ctx->regs[rd] = 0;
+            return 1;
+        }
+        if (hook == PV_HOOK_MEDIA_HEVCCONFIGURE ||
+            hook == PV_HOOK_MEDIA_HEVCDECODE) {
+            ctx->regs[rd] = 0;
+            ctx->host_status = 2;
+            return 1;
+        }
+
+        uint32_t xp = 0, yp = 0, base = 0;
+        int32_t xn = 0, yn = 0;
+        if (!pv_tensor_span(ctx, ctx->regs[rs1], &xp, &xn))
+            return 0;
+        uint64_t pixels64 = (uint64_t)(uint32_t)ctx->media_width *
+                            (uint64_t)(uint32_t)ctx->media_height;
+        if (ctx->media_width <= 0 || ctx->media_height <= 0 ||
+            pixels64 > 0xffffffffULL || pixels64 > (uint32_t)xn)
+            return 0;
+        uint32_t pixels = (uint32_t)pixels64;
+        if ((hook == PV_HOOK_MEDIA_H264RESIDUAL ||
+             hook == PV_HOOK_MEDIA_H264RESTORE ||
+             hook == PV_HOOK_MEDIA_GRAYXORRESIDUAL ||
+             hook == PV_HOOK_MEDIA_GRAYXORRESTORE) &&
+            (!pv_tensor_span(ctx, ctx->regs[rs2], &yp, &yn) ||
+             pixels > (uint32_t)yn))
+            return 0;
+        if (!pv_tensor_output_begin(ctx, pixels, &base)) {
+            ctx->regs[rd] = 0;
+            return 1;
+        }
+
+        if (hook == PV_HOOK_MEDIA_GRAYDELTAENCODE) {
+            for (uint32_t row = 0; row < (uint32_t)ctx->media_height; row++) {
+                uint32_t off = row * (uint32_t)ctx->media_width;
+                uint8_t prev = 0;
+                for (uint32_t col = 0; col < (uint32_t)ctx->media_width; col++) {
+                    uint8_t cur = ctx->mem[xp + off + col];
+                    ctx->mem[base + off + col] = (uint8_t)(cur - prev);
+                    prev = cur;
+                }
+            }
+        } else if (hook == PV_HOOK_MEDIA_GRAYDELTADECODE) {
+            for (uint32_t row = 0; row < (uint32_t)ctx->media_height; row++) {
+                uint32_t off = row * (uint32_t)ctx->media_width;
+                uint8_t value = 0;
+                for (uint32_t col = 0; col < (uint32_t)ctx->media_width; col++) {
+                    value = (uint8_t)(value + ctx->mem[xp + off + col]);
+                    ctx->mem[base + off + col] = value;
+                }
+            }
+        } else if (hook == PV_HOOK_MEDIA_H264RESIDUAL ||
+                   hook == PV_HOOK_MEDIA_H264RESTORE ||
+                   hook == PV_HOOK_MEDIA_GRAYXORRESIDUAL ||
+                   hook == PV_HOOK_MEDIA_GRAYXORRESTORE) {
+            for (uint32_t i = 0; i < pixels; i++) {
+                uint8_t a = ctx->mem[xp + i];
+                uint8_t b = ctx->mem[yp + i];
+                if (hook == PV_HOOK_MEDIA_GRAYXORRESIDUAL ||
+                    hook == PV_HOOK_MEDIA_GRAYXORRESTORE)
+                    ctx->mem[base + i] = (uint8_t)(a ^ b);
+                else
+                    ctx->mem[base + i] = hook == PV_HOOK_MEDIA_H264RESIDUAL
+                        ? (uint8_t)(a - b) : (uint8_t)(a + b);
+            }
+        } else {
+            return 0;
+        }
+        ctx->regs[rd] = pv_arena_finish(ctx, pixels);
+        return 1;
+}
+
+static int pv_bitlinear_default(pv_ctx *ctx, int hook,
+                                int rd, int rs1, int rs2)
+{
+    if (hook == PV_HOOK_BITLINEAR_SETSHAPE) {
+        ctx->bitlinear_rows = ctx->regs[rs1] < 0 ? 0 : ctx->regs[rs1];
+        ctx->bitlinear_cols = ctx->regs[rs2] < 0 ? 0 : ctx->regs[rs2];
+        ctx->regs[rd] = ctx->bitlinear_rows > 0 && ctx->bitlinear_cols > 0;
+        return 1;
+    }
+    if (hook == PV_HOOK_BITLINEAR_HASFORMAT) {
+        ctx->regs[rd] = 1;
+        return 1;
+    }
+    if (hook != PV_HOOK_BITLINEAR_MATVECBITMAP &&
+        hook != PV_HOOK_BITLINEAR_MATMULBITMAPBATCH)
+        return 0;
+    uint32_t wp = 0, vp = 0, base = 0;
+    int32_t wn = 0, vn = 0;
+    if (!pv_tensor_span(ctx, ctx->regs[rs1], &wp, &wn) ||
+        !pv_tensor_span(ctx, ctx->regs[rs2], &vp, &vn))
+        return 0;
+    uint32_t rows = ctx->bitlinear_rows > 0 ? (uint32_t)ctx->bitlinear_rows : 0U;
+    uint32_t cols = ctx->bitlinear_cols > 0 ? (uint32_t)ctx->bitlinear_cols : 0U;
+    uint32_t stride = 2U * ((cols + 7U) / 8U);
+    uint32_t batch = hook == PV_HOOK_BITLINEAR_MATVECBITMAP ? 1U :
+                     (cols ? (uint32_t)vn / cols : 0U);
+    uint64_t weights = (uint64_t)rows * stride;
+    uint64_t output_count = (uint64_t)rows * batch;
+    if (rows == 0U || cols == 0U || batch == 0U ||
+        weights > (uint32_t)wn || (uint64_t)batch * cols > (uint32_t)vn ||
+        output_count > 0xffffffffULL ||
+        !pv_tensor_output_begin(ctx, (uint32_t)output_count, &base)) {
+        ctx->regs[rd] = 0;
+        return 1;
+    }
+    for (uint32_t b = 0; b < batch; b++) {
+        for (uint32_t row = 0; row < rows; row++) {
+            const uint8_t *packed = ctx->mem + wp + row * stride;
+            const uint8_t *zero = packed;
+            const uint8_t *minus = packed + stride / 2U;
+            int32_t acc = 0;
+            for (uint32_t col = 0; col < cols; col++) {
+                uint8_t bit = (uint8_t)(1U << (col & 7U));
+                if ((zero[col >> 3] & bit) == 0U) {
+                    int8_t value = (int8_t)ctx->mem[vp + b * cols + col];
+                    acc += (minus[col >> 3] & bit) ? -value : value;
+                }
+            }
+            pv_tensor_put_i32be(ctx->mem + base + (b * rows + row) * 4U, acc);
+        }
+    }
+    ctx->regs[rd] = pv_arena_finish(ctx, (uint32_t)output_count * 4U);
+    return 1;
+}
+
 void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
 {
     (void)imm16;
@@ -2319,6 +2689,35 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
     if (pv_storage_hook &&
         ((hook >= 0x60 && hook <= 0x6F) || (hook >= 0x1A0 && hook <= 0x1A4))) {
         if (pv_storage_hook(ctx, hook, rd, rs1, rs2)) return;
+    }
+    if (hook >= PV_HOOK_TENSOR_SETSHAPE && hook <= PV_HOOK_TENSOR_HASACCEL) {
+        if (pv_tensor_hook && pv_tensor_hook(ctx, hook, rd, rs1, rs2)) return;
+        if (pv_tensor_default(ctx, hook, rd, rs1, rs2)) return;
+    }
+    if (hook >= PV_HOOK_MEDIA_SETSHAPE && hook <= PV_HOOK_MEDIA_GRAYXORRESTORE) {
+        if (pv_media_hook && pv_media_hook(ctx, hook, rd, rs1, rs2)) return;
+        if (pv_media_default(ctx, hook, rd, rs1, rs2)) return;
+    }
+    if ((hook >= PV_HOOK_BITLINEAR_SETSHAPE &&
+         hook <= PV_HOOK_BITLINEAR_HASFORMAT) ||
+        hook == PV_HOOK_BITLINEAR_MATMULBITMAPBATCH) {
+        if (pv_bitlinear_hook &&
+            pv_bitlinear_hook(ctx, hook, rd, rs1, rs2)) return;
+        if (pv_bitlinear_default(ctx, hook, rd, rs1, rs2)) return;
+    }
+    if (hook >= PV_HOOK_TENSOR_MAP && hook <= PV_HOOK_SHARD_SAVE) {
+        if (pv_compute_hook && pv_compute_hook(ctx, hook, rd, rs1, rs2)) return;
+        ctx->regs[rd] = 0;
+        ctx->host_status = 1;
+        return;
+    }
+    if ((hook >= PV_HOOK_NET_LISTEN && hook <= PV_HOOK_NET_REGISTER) ||
+        (hook >= PV_HOOK_NET_CONNECT && hook <= PV_HOOK_NET_RECVSPAN)) {
+        if (pv_net_hook && pv_net_hook(ctx, hook, rd, rs1, rs2)) return;
+        ctx->regs[rd] = (hook == PV_HOOK_NET_READ || hook == PV_HOOK_NET_RECVSPAN)
+            ? pv_arena_finish(ctx, 0) : 0;
+        ctx->host_status = 1;
+        return;
     }
     /* Data.* host-bound read: no active server/data context in the reference
      * runtime, so return a defined empty/0 default (mirrors vm/picovm.js
@@ -2591,8 +2990,7 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
         (hook >= PV_HOOK_AUTH_GETUSERCREDENTIALS && hook <= PV_HOOK_AUTH_REVOKETOKEN) ||
         hook == PV_HOOK_CARD_READ || hook == PV_HOOK_CARD_WRITE || hook == PV_HOOK_CARD_ADDRESS ||
         (hook >= PV_HOOK_ENVIRONMENT_GETOSVERSION && hook <= PV_HOOK_ENVIRONMENT_GETELAPSEDTIME) ||
-        (hook >= PV_HOOK_CONTEXT_GETVERB && hook <= PV_HOOK_CONTEXT_GETTRACEID) ||
-        (hook >= PV_HOOK_NET_LISTEN && hook <= PV_HOOK_NET_REGISTER)) {
+        (hook >= PV_HOOK_CONTEXT_GETVERB && hook <= PV_HOOK_CONTEXT_GETTRACEID)) {
         int is_span =
             hook == PV_HOOK_X509_FETCHCERTIFICATE || hook == PV_HOOK_X509_GENERATECSR ||
             hook == PV_HOOK_X509_GENERATEKEYPAIR || hook == PV_HOOK_X509_GETCERTINFO ||
@@ -2606,8 +3004,7 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
             hook == PV_HOOK_CONTEXT_GETUSER || hook == PV_HOOK_CONTEXT_GETPERMISSIONS ||
             hook == PV_HOOK_CONTEXT_GETHEADERS || hook == PV_HOOK_CONTEXT_GETQUERYSTRING ||
             hook == PV_HOOK_CONTEXT_GETBODY || hook == PV_HOOK_CONTEXT_GETREQUESTID ||
-            hook == PV_HOOK_CONTEXT_GETCLIENTCERT || hook == PV_HOOK_CONTEXT_GETTRACEID ||
-            hook == PV_HOOK_NET_READ;
+            hook == PV_HOOK_CONTEXT_GETCLIENTCERT || hook == PV_HOOK_CONTEXT_GETTRACEID;
         ctx->regs[rd] = is_span ? pv_arena_finish(ctx, 0) : 0;
         ctx->host_status = 1; /* INV-18: NOT_FOUND -- no host binding installed */
         return;

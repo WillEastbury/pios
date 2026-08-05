@@ -35,13 +35,13 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%CC%" %USER_CFLAGS% -c src\picovm.c -o build_user\picovm.o
 if errorlevel 1 exit /b 1
-"%CC%" %USER_CFLAGS% -DPIOS_USER_EL0 -DUHTTP_BRIDGE_INDEX=0 -c user\httpd.c -o build_user\httpd_el0.o
+"%CC%" %USER_CFLAGS% -fno-gcse -DPIOS_USER_EL0 -DUHTTP_BRIDGE_INDEX=0 -c user\httpd.c -o build_user\httpd_el0.o
 if errorlevel 1 exit /b 1
 "%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_httpd.elf build_user\ustart.o build_user\httpd_el0.o build_user\picovm.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_httpd.elf user_httpd_vm.img
 if errorlevel 1 exit /b 1
-"%CC%" %USER_CFLAGS% -DPIOS_USER_EL0 -DUHTTP_BRIDGE_INDEX=1 -c user\httpd.c -o build_user\httpd_native.o
+"%CC%" %USER_CFLAGS% -fno-gcse -DPIOS_USER_EL0 -DUHTTP_BRIDGE_INDEX=1 -c user\httpd.c -o build_user\httpd_native.o
 if errorlevel 1 exit /b 1
 "%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_httpd_native.elf build_user\ustart.o build_user\httpd_native.o build_user\picovm.o
 if errorlevel 1 exit /b 1
@@ -63,11 +63,27 @@ if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_el0_pico.elf user_el0_pico.img
 if errorlevel 1 exit /b 1
 for %%f in (user_el0_pico.img) do echo user_el0_pico.img size: %%~zf bytes
+REM -fno-gcse: works around a confirmed GCC 13.3 (aarch64-none-elf) -fgcse
+REM miscompile for cap_process_slot's two-branch "program pointer" selection
+REM (capsvc_admin_default_program vs a loaded WALFS card) -- at -O2 with GCSE
+REM enabled, the compiled code silently used the wrong register for the
+REM `program` argument passed into pv_vm_run(), producing a near-NULL pointer
+REM that faulted inside pv_verify() with no diagnostic. Bisected across all
+REM 43 flags -O2 adds over -O1; -fno-gcse alone is sufficient and necessary
+REM (isolated via repeated QEMU boot+HTTP tests). See the comment in
+REM user/capsvc_host.c for the full story.
+"%CC%" %USER_CFLAGS% -fno-gcse -DPIOS_USER_EL0 -DCAPSVC_SVC_IDX=0 -c user\capsvc_host.c -o build_user\capsvc_host0.o
+if errorlevel 1 exit /b 1
+"%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_capsvc_host0.elf build_user\ustart.o build_user\capsvc_host0.o build_user\picovm.o
+if errorlevel 1 exit /b 1
+"%OC%" -O binary build_user\user_capsvc_host0.elf user_capsvc_host0.img
+if errorlevel 1 exit /b 1
+for %%f in (user_capsvc_host0.img) do echo user_capsvc_host0.img size: %%~zf bytes
 
 echo Building Pi5 stage2 payload...
 if not exist build mkdir build
 for %%f in (src\*.S) do (
-    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="bootstrap_trampoline.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="provision_revert_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" (
+    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="bootstrap_trampoline.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="provision_revert_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" if /I not "%%~nxf"=="qemu_boot_stage2_manifest.S" (
         echo Compiling %%~nf.S...
         "%CC%" %ASFLAGS% -c "%%f" -o "build\%%~nf.o"
         if errorlevel 1 exit /b 1

@@ -10,3 +10,9 @@
 /* simd_zero: used by parse_dhcp_options to clear the dhcp_parsed struct. */
 #include <string.h>
 static inline void simd_zero(void *p, unsigned long n) { memset(p, 0, n); }
+
+/* simd_memset/simd_memcpy: used by p256.c (point_inf) and other pure-logic
+ * modules under host test. Plain libc equivalents are sufficient here --
+ * the host build never needs the NEON-accelerated bare-metal versions. */
+static inline void simd_memset(void *p, unsigned char val, unsigned long n) { memset(p, val, n); }
+static inline void simd_memcpy(void *dst, const void *src, unsigned long n) { memcpy(dst, src, n); }

@@ -137,6 +137,29 @@ typedef void (*pv_host_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int 
 typedef int (*pv_storage_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
 extern pv_storage_fn pv_storage_hook;
 
+/* Optional native tensor accelerator. Return non-zero when handled; returning
+ * zero falls through to the deterministic pure-C Tensor.* implementation. */
+typedef int (*pv_tensor_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
+extern pv_tensor_fn pv_tensor_hook;
+
+/* Optional coarse compute provider for mapped tensors, CAT-Q transforms,
+ * asynchronous jobs, and model-shard I/O. The provider owns all opaque handles
+ * and may dispatch to CUDA, QPU, NEON, CPU, or another accelerator backend. */
+typedef int (*pv_compute_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
+extern pv_compute_fn pv_compute_hook;
+
+/* Optional raw socket provider for Net.Listen/Connect/Accept/Read/Write and
+ * span-oriented aliases. Servers and clients remain host-owned capabilities. */
+typedef int (*pv_net_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
+extern pv_net_fn pv_net_hook;
+
+/* Optional coarse media accelerator for grayscale/H.264-style block work. */
+typedef int (*pv_media_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
+extern pv_media_fn pv_media_hook;
+
+typedef int (*pv_bitlinear_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
+extern pv_bitlinear_fn pv_bitlinear_hook;
+
 struct pv_ctx {
     int32_t   regs[PV_NUM_REGS];
 
@@ -239,6 +262,12 @@ struct pv_ctx {
     long      mem_size;
 
     int       dot_len;        /* active span length for Dot8.Of */
+    int       tensor_rows;
+    int       tensor_cols;
+    int       media_width;
+    int       media_height;
+    int       bitlinear_rows;
+    int       bitlinear_cols;
 
     /* Span table + bump arena for the span/string namespaces (String/Number and,
      * built on these, Template/Http/...). A span handle is a 1-based index into

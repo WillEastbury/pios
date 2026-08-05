@@ -24,8 +24,9 @@ _Static_assert(UHTTP_BRIDGE_ADDR == IPC_SHM_BASE,
 /* Zones must land on separate 64-byte cache lines, buffers line-aligned, so the
  * clean/invalidate discipline never write-back-clobbers the opposite direction. */
 _Static_assert(__builtin_offsetof(struct uhttp_bridge, magic) == 0, "zoneB line");
-_Static_assert(__builtin_offsetof(struct uhttp_bridge, req_seq) == 64, "zoneA line");
-_Static_assert(__builtin_offsetof(struct uhttp_bridge, req) == 128, "req aligned");
+_Static_assert(__builtin_offsetof(struct uhttp_bridge, description) == 64, "zoneC (description) line");
+_Static_assert(__builtin_offsetof(struct uhttp_bridge, req_seq) == 128, "zoneA line");
+_Static_assert(__builtin_offsetof(struct uhttp_bridge, req) == 192, "req aligned");
 _Static_assert((UHTTP_REQ_MAX % 64U) == 0U, "req multiple of line");
 _Static_assert((__builtin_offsetof(struct uhttp_bridge, pico_prog_len) % 64U) == 0U, "pico metadata aligned");
 _Static_assert((__builtin_offsetof(struct uhttp_bridge, pico_prog) % 64U) == 0U, "pico prog aligned");

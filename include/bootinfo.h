@@ -3,7 +3,10 @@
 
 #define PIOS_BOOTINFO_MAGIC   0x5042494FU  /* 'PBIO' */
 #define PIOS_BOOTINFO_VERSION 1U
-#define PIOS_BOOTINFO_ADDR    0x41F00000UL
+/* QEMU RAM starts at 0x40000000 and the kernel is linked at 0x40080000.
+ * Keep bootinfo in its own loader-reserved page immediately below the kernel,
+ * outside the stage2 image/BSS/heap and all per-core private arenas. */
+#define PIOS_BOOTINFO_ADDR    0x40070000UL
 
 struct pios_bootinfo {
     u32 magic;

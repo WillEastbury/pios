@@ -51,6 +51,36 @@ TESTS_MANIFEST = {
     # (Cortex-A76 -> Pi5, Cortex-A53 -> BCM2837-family). Pure bit-decode
     # logic, no asm/MMIO. See src/board_detect.c, include/board_detect.h.
     "test_board_detect.c": ["src/board_detect.c"],
+    # P-256 general-point ECDH multiply (added for TLS 1.3 server-side
+    # ECDHE key exchange). Pure math, no MMIO/asm deps beyond simd_memset
+    # (stubbed). Vectors cross-checked against Python's `cryptography`
+    # library (independent P-256 implementation). See src/p256.c.
+    "test_p256_ecdh.c": ["src/p256.c"],
+    "test_bitnet_kernel.c": ["src/bitnet_kernel.c"],
+    "test_rp1_adc.c": ["src/rp1_adc_math.c"],
+    "test_tls_router_match.c": ["src/tls_router_match.c"],
+    # TLS 1.3 HKDF-Expand-Label / key schedule (RFC 8446 Section 7.1),
+    # validated against the official RFC 8448 byte-level trace. See
+    # src/tls13_keysched.c.
+    # TLS 1.3 HKDF-Expand-Label / key schedule (RFC 8446 Section 7.1),
+    # validated against the official RFC 8448 byte-level trace. See
+    # src/tls13_keysched.c. Links against src/sha256_hkdf.c (pure-logic
+    # SHA-256/HMAC/HKDF, extracted from crypto.c which has ARM-crypto-
+    # extension inline asm that can't host-compile).
+    "test_tls13_keysched.c": ["src/tls13_keysched.c", "src/sha256_hkdf.c"],
+    # TLS 1.3 ClientHello parser (RFC 8446 Section 4), validated against a
+    # real captured ClientHello from the RFC 8448 byte trace plus a hand-
+    # built secp256r1 key_share case and truncation/malformed negative
+    # tests. Pure logic, no MMIO/asm deps. See src/tls13_handshake.c.
+    "test_tls13_clienthello.c": ["src/tls13_handshake.c", "src/sha256_hkdf.c",
+                                 "src/p256.c", "src/ecdsa.c"],
+    # TLS 1.3 server-side handshake message builders (ServerHello,
+    # EncryptedExtensions, Certificate, CertificateVerify, Finished) and
+    # the transcript hash helper. Pure wire-format logic plus the P-256
+    # ECDSA sign path (also pure logic, no ARM asm). See
+    # src/tls13_handshake.c.
+    "test_tls13_handshake_builders.c": ["src/tls13_handshake.c", "src/sha256_hkdf.c",
+                                        "src/p256.c", "src/ecdsa.c"],
 }
 
 

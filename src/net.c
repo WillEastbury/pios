@@ -256,6 +256,8 @@ void net_firewall_install_defaults(void) {
     (void)nic_filter_add(&rule);
     rule.tcp_port_to = 2323;
     (void)nic_filter_add(&rule);
+    rule.tcp_port_to = 8090;        /* capsvc.c generic capsule-service dispatcher (see kernel.c CAPSVC_ADMIN_PORT) */
+    (void)nic_filter_add(&rule);
 
     /* Replies to outbound TCP clients target our ephemeral source ports.
      * The NIC firewall is stateless, so allow the client port range while
@@ -430,6 +432,15 @@ static bool icmp_rate_ok(void) {
     return true;
 }
 
+/* Pending outbound ping/traceroute probe (single-outstanding, core-0-only). */
+static struct {
+    bool waiting;
+    u16  ident;
+    u16  seq;
+    u64  sent_ms;
+    struct net_ping_result result;
+} g_ping;
+
 static void handle_icmp(const u8 *frame, u32 len,
                         struct ip_hdr *ip, u32 payload_off) {
     (void)len;
@@ -440,6 +451,27 @@ static void handle_icmp(const u8 *frame, u32 len,
     if (sizeof(struct eth_hdr) + ipt > sizeof(tx_frame)) return;
 
     struct icmp_hdr *icmp = (struct icmp_hdr *)(frame + payload_off);
+
+    /* Client-side matching for our own outstanding ping/traceroute probe. */
+    if (icmp->type == 0 && g_ping.waiting) {
+        if (ntohs(icmp->id) == g_ping.ident && ntohs(icmp->seq) == g_ping.seq) {
+            g_ping.result.got_reply = true;
+            g_ping.result.from_ip   = ntohl(ip->src_ip);
+            g_ping.result.reply_ttl = ip->ttl;
+            g_ping.result.rtt_ms    = (u32)(timer_monotonic_ms() - g_ping.sent_ms);
+        }
+        return;
+    }
+    if (icmp->type == 11 && g_ping.waiting) {
+        /* Time Exceeded (traceroute hop). Only one probe is ever outstanding
+         * on this path, so accept any Time Exceeded while waiting rather
+         * than parsing the embedded original datagram back out. */
+        g_ping.result.got_ttl_exceeded = true;
+        g_ping.result.from_ip          = ntohl(ip->src_ip);
+        g_ping.result.reply_ttl        = ip->ttl;
+        g_ping.result.rtt_ms           = (u32)(timer_monotonic_ms() - g_ping.sent_ms);
+        return;
+    }
 
     if (icmp->type != 8 || icmp->code != 0)
         return;
@@ -801,6 +833,72 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
     if (ok) egress_trace.udp_ok++;
     else egress_trace.udp_fail++;
     return ok;
+}
+
+/* ================================================================== */
+/*  ICMP echo client (ping / traceroute)                               */
+/* ================================================================== */
+
+bool net_icmp_echo_send(u32 dst_ip, u16 ident, u16 seq, u8 ttl) {
+    const u8 *dst_mac = net_resolve_mac(dst_ip);
+    if (!dst_mac) return false;
+
+    static const u8 payload[8] = { 'P','I','O','S','P','I','N','G' };
+    u16 icmp_len = (u16)(sizeof(struct icmp_hdr) + sizeof(payload));
+    u16 ip_total = (u16)(20 + icmp_len);
+    u32 frame_len = sizeof(struct eth_hdr) + ip_total;
+    if (frame_len > sizeof(tx_frame)) return false;
+
+    struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
+    simd_memcpy(eth->dst, dst_mac, 6);
+    simd_memcpy(eth->src, our_mac, 6);
+    eth->ethertype = htons(ETH_P_IP);
+
+    struct ip_hdr *ip = (struct ip_hdr *)(tx_frame + sizeof(struct eth_hdr));
+    ip->ver_ihl    = 0x45;
+    ip->tos        = 0;
+    ip->total_len  = htons(ip_total);
+    ip->id         = htons(ip_id_counter++);
+    ip->flags_frag = htons(0x4000);
+    ip->ttl        = ttl;
+    ip->protocol   = IP_PROTO_ICMP;
+    ip->checksum   = 0;
+    ip->src_ip     = htonl(our_ip);
+    ip->dst_ip     = htonl(dst_ip);
+    ip->checksum   = simd_checksum(ip, 20);
+
+    struct icmp_hdr *icmp = (struct icmp_hdr *)(tx_frame + sizeof(struct eth_hdr) + 20);
+    icmp->type     = 8;
+    icmp->code     = 0;
+    icmp->checksum = 0;
+    icmp->id       = htons(ident);
+    icmp->seq      = htons(seq);
+    simd_memcpy((u8 *)icmp + sizeof(struct icmp_hdr), payload, sizeof(payload));
+    icmp->checksum = simd_checksum(icmp, icmp_len);
+
+    if (frame_len < 60) frame_len = 60;
+
+    g_ping.waiting  = true;
+    g_ping.ident    = ident;
+    g_ping.seq      = seq;
+    g_ping.sent_ms  = timer_monotonic_ms();
+    g_ping.result.got_reply        = false;
+    g_ping.result.got_ttl_exceeded = false;
+    g_ping.result.from_ip          = 0;
+    g_ping.result.rtt_ms           = 0;
+    g_ping.result.reply_ttl        = 0;
+
+    bool ok = nic_send(tx_frame, frame_len);
+    if (ok) { stats.tx_packets++; stats.tx_bytes += frame_len; }
+    return ok;
+}
+
+bool net_icmp_echo_poll_result(struct net_ping_result *out) {
+    if (!g_ping.waiting) return false;
+    if (!g_ping.result.got_reply && !g_ping.result.got_ttl_exceeded) return false;
+    if (out) *out = g_ping.result;
+    g_ping.waiting = false;
+    return true;
 }
 
 /* ================================================================== */

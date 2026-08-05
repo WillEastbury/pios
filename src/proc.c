@@ -2857,6 +2857,25 @@ void proc_timer_tick(u32 core, u64 tick)
         return;
 
     u32 uc = core - CORE_USERM;
+
+    /* Timed-park deadline wake: scan this core's OWN slots only (affinity_core
+     * filter -- procs[] is shared across cores, filtered by ownership, per the
+     * rc-percore-sched comment above). Runs unconditionally, independent of
+     * preemption being armed/enabled: this wakes BLOCKED processes, it does not
+     * preempt a RUNNING one, so it must not be gated by the quantum-preempt
+     * early-return below. */
+    u64 now_ms = timer_monotonic_ms();
+    for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+        struct process *bp = &procs[i];
+        if (bp->affinity_core != core || bp->state != PROC_BLOCKED)
+            continue;
+        if (bp->wake_deadline_ms == 0U || now_ms < bp->wake_deadline_ms)
+            continue;
+        bp->wake_deadline_ms = 0U;
+        bp->state = PROC_READY;
+        DTRACE(DTRACE_CAT_SCHED, DT_SCHED_WAKE, bp->pid, i, bp->state, core);
+    }
+
     if (!preempt_enabled(uc) || !preempt_armed(uc) || preempt_pending(uc))
         return;
 
@@ -3351,6 +3370,15 @@ void proc_rwake_live(u32 core, u32 *live_state, u32 *live_pid, u32 *disp, u32 *w
  * READY. Mirrors proc_yield but parks the process as BLOCKED so the scheduler
  * runs others / idles in WFE until woken. */
 void proc_park(void) {
+    proc_park_timeout(0);
+}
+
+/* Timed variant of proc_park(): blocks until woken by proc_soft_event/remote
+ * wake, OR until `ms` elapses (0 = no timeout, identical to plain park).
+ * Timeout wake is delivered by proc_timer_tick() scanning this core's own
+ * BLOCKED slots each tick -- no cross-core involvement, so it does not
+ * disturb the "a core mutates only processes it owns" invariant. */
+void proc_park_timeout(u32 ms) {
     bool user = on_user_core();
     u32 uc = user ? user_core_slot() : 0;
     struct process *p = &procs[current_proc];
@@ -3376,12 +3404,14 @@ void proc_park(void) {
         return;
     }
     proc_account_runtime(p);
+    p->wake_deadline_ms = (ms != 0U) ? (timer_monotonic_ms() + (u64)ms) : 0U;
     p->state = PROC_BLOCKED;
     proc_park_note(2U); /* park_block++ */
     proc_note_desched(1U);
-    DTRACE(DTRACE_CAT_SCHED, DT_SCHED_PARK, p->pid, current_proc, core_id(), 0);
+    DTRACE(DTRACE_CAT_SCHED, DT_SCHED_PARK, p->pid, current_proc, core_id(), ms);
     ctx_switch(&p->ctx, &scheduler_ctx);
     proc_park_note(3U); /* park_resume++ */
+    p->wake_deadline_ms = 0U;
     proc_wake_pending[current_proc].v = 0;   /* consume the wake that dispatched us */
     if (user && preempt_enabled(uc) && p->state == PROC_RUNNING)
         preempt_armed(uc) = true;

@@ -25,7 +25,11 @@ static u64 g_last_poll;
 static void watchdog_psci_system_reset(void)
 {
     register u64 x0 __asm__("x0") = PSCI_SYSTEM_RESET;
+#if PIOS_PSCI_USE_HVC
+    __asm__ volatile("hvc #0" : "+r"(x0) :: "memory");
+#else
     __asm__ volatile("smc #0" : "+r"(x0) :: "memory");
+#endif
 }
 
 static NORETURN void watchdog_reboot_best_effort(void)
@@ -36,11 +40,18 @@ static NORETURN void watchdog_reboot_best_effort(void)
     dsb();
     isb();
 
+    /* QEMU virt has no Pi PM watchdog MMIO. If PSCI unexpectedly returns,
+     * fail closed in-place instead of taking a synchronous abort at address
+     * zero; a host monitor reset can still recover the VM. */
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    for (;;) wfe();
+#else
     /* Fallback for platforms without PSCI reset. On Pi 5 this legacy path can
      * be a partial warm reset, so PSCI above is the preferred reboot path. */
     mmio_write(PM_WDOG, PM_PASSWORD | 10U);
     mmio_write(PM_RSTC, PM_PASSWORD | PM_RSTC_FULL);
     for (;;) wfe();
+#endif
 }
 
 void watchdog_hw_arm_seconds(u32 seconds)

@@ -133,12 +133,39 @@ bool tensor_selftest(void);
 bool tensor_tiny_selftest(void);
 bool tensor_tiny_noop_proof(void);
 bool tensor_tiny_store_proof(void);
+bool tensor_tiny_store_ssbo_proof(void);
 bool tensor_tiny_load_store_proof(void);
 bool tensor_tiny_memory_proof(void);
 bool tensor_vector16_selftest(void);
 bool tensor_vectorn_selftest(u32 n);
 bool tensor_matvec128_selftest(void);
 bool tensor_matmul64_selftest(void);
+bool tensor_picovm_selftest(void);
+bool tensor_picovm_accel_ready(void);
+bool tensor_picovm_kernel_selftest(void);
+bool tensor_picovm_kernel_bench(u32 reps, u64 *cpu_ns, u64 *qpu_ns);
+bool tensor_picovm_bitnet_selftest(i32 *argmax_out, i32 *checksum_out,
+                                   u64 *scalar_ns_out, u64 *neon_ns_out,
+                                   u64 *qpu_kernel_ns_out, u64 *qpu_total_ns_out);
+bool tensor_matvec_batch_selftest(u32 rows);
+bool tensor_picovm_media_selftest(void);
+bool tensor_picovm_media_accel_ready(void);
+bool tensor_picovm_bitlinear_selftest(u64 *elapsed_ns);
+
+struct tensor_accel_profile {
+    u64 int8_scalar_ns;
+    u64 int8_neon_ns;
+    u64 int8_qpu_ns;
+    u64 fp32_scalar_ns;
+    u64 fp32_neon_ns;
+    u64 fp32_qpu_ns;
+    bool int8_qpu_verified;
+    bool fp32_qpu_verified;
+};
+bool tensor_accel_profile_run(struct tensor_accel_profile *out);
+bool tensor_prefer_qpu_int8(void);
+bool tensor_prefer_qpu_fp32(void);
+bool tensor_prefer_qpu_ternary(void);
 
 /* Benchmark harness: time one (op, shape, backend); returns per-iter ns. */
 #define TENSOR_BENCH_ADD    0U

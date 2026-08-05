@@ -26,6 +26,7 @@
 #define RP1_PADS_BANK1      0x0F4000
 #define RP1_PADS_BANK2      0x0F8000
 #define RP1_PCIE_APBS       0x108000
+#define RP1_SRAM_WINDOW     0x600000
 
 #define RP1_INT_ETH         6U
 

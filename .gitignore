@@ -55,6 +55,7 @@ core.*
 
 # WiFi credentials (add manually, never commit)
 wifi_config.h
+tools/wifi_config.local.json
 
 # WiFi firmware blobs (binary, not for source repo)
 /wifi/

@@ -115,7 +115,8 @@ u64 timer_monotonic_ms(void)
     __asm__ volatile("mrs %0, cntvct_el0" : "=r"(cnt));
     if (freq == 0)
         return 0;
-    return (cnt * 1000ULL) / freq;
+    return (cnt / freq) * 1000ULL +
+           ((cnt % freq) * 1000ULL) / freq;
 }
 
 u64 timer_utc_ms(void)

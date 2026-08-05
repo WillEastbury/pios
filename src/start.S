@@ -40,6 +40,14 @@ core_asm_stage:
 #endif
 
 _start:
+    /* Do not inherit interrupt state from the preceding loader/firmware.
+     * UEFI enters the QEMU stage2 at EL1 with IRQs enabled; once VBAR_EL1 is
+     * installed, pending firmware/device interrupts can then trap into the
+     * kernel before gic_init() has reset and claimed the controller, causing
+     * an IRQ storm between exception_init() and gic_init(). The normal boot
+     * path explicitly unmasks IRQs only after GIC/timer/watchdog setup. */
+    msr     daifset, #0xf
+
     mrs     x0, mpidr_el1
     and     x0, x0, #0x3
     cbnz    x0, .Lpark          /* only core 0 continues */

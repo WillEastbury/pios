@@ -49,6 +49,7 @@ int main(void) {
             "  source=1001\n"
             "  bytecode=1002\n"
             "  io=tcp/8080\n"
+            "  host=alpha.example\n"
             "  entry=main\n"
             "ipc_fifo=q1\n"
             "  from=worker\n"
@@ -67,6 +68,9 @@ int main(void) {
         CHECK(m.processes[0].source == 1001 && m.processes[0].bytecode == 1002,
               "process source/bytecode");
         CHECK(m.processes[0].has_tcp && m.processes[0].tcp_port == 8080, "tcp io parsed");
+        CHECK(m.processes[0].has_host &&
+              strcmp(m.processes[0].host, "alpha.example") == 0,
+              "host binding parsed");
         CHECK(strcmp(m.processes[0].entry, "main") == 0, "process entry");
         CHECK(m.fifo_count == 1, "one fifo");
         CHECK(m.fifos[0].depth == 16 && m.fifos[0].frame_max == 4096, "fifo depth/frame_max");
@@ -166,6 +170,14 @@ int main(void) {
               "CRLF line endings");
         CHECK(parse("capsule=on\rname=a\rprocess=w\r  entry=main\r", &m, err, sizeof(err)),
               "CR-only line endings");
+    }
+
+    /* --- 14. Host bindings are exact DNS-style names, not free-form spans. --- */
+    {
+        CHECK(!parse("capsule=on\nname=a\nprocess=w\n  host=bad host\n", &m, err, sizeof(err)),
+              "host with spaces rejected");
+        CHECK(!parse("capsule=on\nname=a\nprocess=w\n  host=bad:443\n", &m, err, sizeof(err)),
+              "host with port rejected");
     }
 
     printf("  %d passed, %d failed\n", g_pass, g_fail);

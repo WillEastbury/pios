@@ -473,3 +473,33 @@ int p256_derive_pubkey(const u8 scalar[32], u8 out_pub[65]) {
     return p256_scalar_mul_base(scalar, out_pub + 1);
 }
 
+/* ECDH: shared_xy = scalar * Q, where Q is an arbitrary (attacker/peer
+ * supplied) SEC1 uncompressed point -- NOT the fixed base point G. The
+ * general point scalar-mul (scalar_mul_window_u256) and on-curve check
+ * already existed internally (used by p256_pubkey_validate to confirm
+ * n*Q = infinity); this just exposes them together for TLS 1.3 ECDHE
+ * key exchange (secp256r1 key_share group). Returns 0 on success, -1 on
+ * malformed/off-curve input or an all-zero shared point (a peer sending
+ * a low-order point, which must never silently proceed). */
+int p256_scalar_mul_point(const u8 scalar[32], const u8 peer_pub[65], u8 out_xy[64]) {
+    if (!scalar || !peer_pub || !out_xy) return -1;
+    if (p256_pubkey_validate(peer_pub) != 0) return -1;
+
+    u256 x, y;
+    if (fe_from_be(&x, peer_pub + 1) != 0 || fe_from_be(&y, peer_pub + 33) != 0) return -1;
+
+    p256_point q;
+    point_from_affine(&q, &x, &y);
+
+    u256 k, ox, oy;
+    if (u256_from_be_checked(&k, scalar, &P256_N) != 0) return -1;
+    int rc = scalar_mul_window_u256(&q, &k, &ox, &oy);
+    secure_zero(&k, sizeof(k));
+    if (rc != 0) return -1;
+    if (u256_is_zero(&ox) && u256_is_zero(&oy)) return -1;
+
+    u256_to_be(&ox, out_xy);
+    u256_to_be(&oy, out_xy + 32);
+    return 0;
+}
+

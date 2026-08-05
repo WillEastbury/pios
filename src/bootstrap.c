@@ -13,10 +13,29 @@
 #include "walfs.h"
 #include "stage2_manifest.h"
 #include "board_detect.h"
+#include "platform.h"
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+/* QEMU's -M virt machine has NO RAM below 0x40000000 (that range is GIC/
+ * UART/virtio-mmio/reserved) -- unlike real Pi5/BCM2837 hardware, which has
+ * RAM starting at physical 0. Stage0 itself must therefore be linked/loaded
+ * at an address inside the actual RAM window (see link_bootstrap_qemu.ld,
+ * matching link_qemu_full.ld's existing 0x40080000 stage2 load address),
+ * and BOOT_DST_ADDR must match stage0's own link address exactly -- the
+ * self-overwriting trampoline jump (see bootstrap_trampoline.S) relies on
+ * the destination being wherever stage0's own code currently lives, so
+ * that by the time the copy overwrites it, execution has already moved to
+ * the relocated trampoline stub. Staging/trampoline addresses mirror the
+ * real-hardware pattern (positioned ~128 MiB past the RAM base) rebased
+ * onto QEMU's 0x40000000 RAM start instead of real hardware's 0. */
+#define BOOT_DST_ADDR       0x40080000ULL
+#define BOOT_STAGING_ADDR   0x48000000ULL
+#define BOOT_TRAMP_ADDR     0x47FFF000ULL
+#else
 #define BOOT_DST_ADDR       0x00080000ULL
 #define BOOT_STAGING_ADDR   0x08000000ULL
 #define BOOT_TRAMP_ADDR     0x07FFF000ULL
+#endif
 #define BOOT_FALLBACK_LBA   2048U
 #define BOOT_SLOT_MAGIC     PIOS_RESERVED_HEADER_MAGIC
 #define BOOT_WDOG_SECONDS   15U
@@ -141,6 +160,15 @@ static void write_reserved_header(u8 *out, u32 payload_len)
 
 static u32 stage0_platform_id(void)
 {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    /* A stage0 binary compiled for QEMU_VIRT only ever runs under QEMU
+     * (its own separately-built kernel8_qemu.img, distinct from the real-
+     * hardware kernel8.img) -- QEMU's `-cpu cortex-a53` reports the SAME
+     * MIDR_EL1 PartNum as real BCM2837 hardware, so runtime MIDR detection
+     * cannot (and must not) be used to distinguish them here. Report the
+     * platform id unconditionally instead of consulting g_board_family. */
+    return PIOS_STAGE2_PLATFORM_QEMU_VIRT;
+#else
     /* g_board_family is populated by board_detect_init(), called from
      * bootstrap_start.S before this point (and again, idempotently, at the
      * top of bootstrap_main()). Falls back to PI5 (the proven, currently
@@ -149,6 +177,7 @@ static u32 stage0_platform_id(void)
     if (g_board_family == BOARD_FAMILY_BCM2837)
         return PIOS_STAGE2_PLATFORM_BCM2837_FAMILY;
     return PIOS_STAGE2_PLATFORM_PI5;
+#endif
 }
 
 struct stage2_selection {
@@ -232,6 +261,17 @@ static u32 bootctrl_checksum(const u8 *p)
 
 static void stage0_watchdog_arm(u32 seconds)
 {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    /* No Broadcom PM/watchdog block exists under QEMU's -M virt memory map
+     * (PIOS_MBOX_BASE/PIOS_QA7_BASE are both 0 for this platform in
+     * platform.h) -- board_detect_init()'s MIDR-based family detection
+     * would otherwise misidentify QEMU's cortex-a53 as real BCM2837
+     * hardware and populate g_board_bases.pm_base with an address that
+     * doesn't exist here, faulting on first write. QEMU boots don't need
+     * (or have) a hardware watchdog; a hung boot is caught by the test
+     * harness's own timeout instead. */
+    (void)seconds;
+#else
     if (seconds == 0)
         seconds = 1;
     if (seconds > 15)
@@ -240,6 +280,7 @@ static void stage0_watchdog_arm(u32 seconds)
     mmio_write(PM_RSTC, PM_PASSWORD |
                          (mmio_read(PM_RSTC) & ~PM_RSTC_WRCFG_MASK) |
                          PM_RSTC_FULL);
+#endif
 }
 
 void uart_putc(char c)
@@ -953,6 +994,10 @@ have_header:
     isb();
 
     uart_puts("[boot] jumping real kernel\n");
+    uart_puts("[boot] sel.payload_offset="); uart_hex(sel.payload_offset);
+    uart_puts(" sel.payload_bytes="); uart_hex(sel.payload_bytes);
+    uart_puts(" sel.entry_offset="); uart_hex(sel.entry_offset);
+    uart_puts("\n");
     void (*tramp)(u64, u64, u64, u64) = (void (*)(u64, u64, u64, u64))(usize)BOOT_TRAMP_ADDR;
     tramp(BOOT_DST_ADDR, BOOT_STAGING_ADDR + sel.payload_offset, sel.payload_bytes,
           BOOT_DST_ADDR + sel.entry_offset);

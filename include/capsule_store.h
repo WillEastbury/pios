@@ -12,6 +12,7 @@
 #define CAPSULE_NAME_MAX 32U
 #define CAPSULE_IO_MAX 32U
 #define CAPSULE_ENTRY_MAX 16U
+#define CAPSULE_HOST_MAX 64U
 #define CAPSULE_FS_MAX 96U
 #define CAPSULE_PROCESS_MAX 8U
 #define CAPSULE_FIFO_MAX 8U
@@ -22,7 +23,9 @@ struct capsule_process {
     u32 bytecode;
     char io[CAPSULE_IO_MAX];
     char entry[CAPSULE_ENTRY_MAX];
+    char host[CAPSULE_HOST_MAX];
     bool has_tcp;
+    bool has_host;
     u16 tcp_port;
 };
 

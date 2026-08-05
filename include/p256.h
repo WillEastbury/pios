@@ -18,4 +18,10 @@ int p256_pubkey_validate(const u8 in[65]);
 /* Derive SEC1 uncompressed pubkey (0x04 || X || Y) from private scalar. */
 int p256_derive_pubkey(const u8 scalar[32], u8 out_pub[65]);
 
+/* ECDH shared secret: out_xy = scalar * Q (64 bytes: X || Y, big-endian),
+ * where Q (peer_pub, 65 bytes SEC1-uncompressed 0x04||X||Y) is an
+ * arbitrary, untrusted peer-supplied point -- validated on-curve before
+ * use. Returns 0 on success, -1 on malformed/off-curve/low-order input. */
+int p256_scalar_mul_point(const u8 scalar[32], const u8 peer_pub[65], u8 out_xy[64]);
+
 #endif

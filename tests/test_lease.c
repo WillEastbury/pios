@@ -196,8 +196,20 @@ int main(void)
     test_grant_callback_reentry_rollback();
 
     /* Finally, run the module's own end-to-end self-test (includes its
-     * lock-release + nested-copy section 8). */
+     * lock-release + nested-copy section 8). It intentionally drives stale,
+     * invalid-state and MMU-denial paths, but must not leave those diagnostic
+     * counters looking like real runtime failures. */
+    struct lease_stats before;
+    struct lease_stats after;
+    lease_get_stats(&before);
     CHECK(lease_selftest(), "in-module lease_selftest passes");
+    lease_get_stats(&after);
+    CHECK(after.mmu_rejects == before.mmu_rejects,
+          "selftest restores MMU reject counter");
+    CHECK(after.stale_rejects == before.stale_rejects,
+          "selftest restores stale reject counter");
+    CHECK(after.state_rejects == before.state_rejects,
+          "selftest restores state reject counter");
     CHECK(LOCK_FREE(), "lock free after selftest");
 
     if (failures == 0) { printf("  OK: all lease cross-core locking assertions passed\n"); return 0; }

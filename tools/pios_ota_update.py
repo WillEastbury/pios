@@ -34,6 +34,7 @@ def stream_upload(host: str, update_port: int, image: bytes, reboot: bool,
     print(f"[ota] streaming {total} bytes over a single self-paced connection...")
     with socket.create_connection((host, update_port), timeout=timeout) as sock:
         sock.settimeout(timeout)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # disable Nagle: test theory
         sock.sendall(header)
         sent = 0
         last_print = time.time()

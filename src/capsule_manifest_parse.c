@@ -98,7 +98,25 @@ static bool c_name_ok(const char *s)
                   (c >= '0' && c <= '9') || c == '_' || c == '-';
         if (!ok) return false;
     }
+
     return true;
+}
+
+static bool c_host_ok(const char *s)
+{
+    u32 n = 0;
+    if (!s || !*s)
+        return false;
+    while (*s) {
+        char ch = *s++;
+        bool alpha = (ch >= 'a' && ch <= 'z') ||
+                     (ch >= 'A' && ch <= 'Z');
+        bool digit = ch >= '0' && ch <= '9';
+        if (!alpha && !digit && ch != '-' && ch != '.')
+            return false;
+        n++;
+    }
+    return n < CAPSULE_HOST_MAX;
 }
 
 static void c_trim_copy(char *dst, u32 max, const char *src, u32 len)
@@ -226,6 +244,12 @@ bool capsule_manifest_parse(const char *text, u32 len, struct capsule_manifest *
                 }
             } else if (c_streq(key, "entry")) {
                 if (!c_name_ok(val) || !c_copy(p->entry, sizeof(p->entry), val)) { c_err(err, err_max, "bad entry"); return false; }
+            } else if (c_streq(key, "host")) {
+                if (!c_host_ok(val) || !c_copy(p->host, sizeof(p->host), val)) {
+                    c_err(err, err_max, "bad host");
+                    return false;
+                }
+                p->has_host = true;
             } else { c_err(err, err_max, "bad process key"); return false; }
         } else if (current == 2 && out->fifo_count > 0) {
             struct capsule_fifo *f = &out->fifos[out->fifo_count - 1U];

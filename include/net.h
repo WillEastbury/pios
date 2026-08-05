@@ -161,6 +161,25 @@ u32 net_poll(void);
 bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
                   const u8 *data, u16 len);
 
+/* ---- ICMP echo client (ping/traceroute) -------------------------------
+ * Single-outstanding-probe, core-0-only client API (mirrors net_send_udp).
+ * Caller sends one probe, then polls net_poll() + net_icmp_echo_poll_result()
+ * in a bounded loop (same pattern as ui_http_fetch()) until a reply/timeout. */
+struct net_ping_result {
+    bool got_reply;         /* true: genuine echo reply from dst_ip */
+    bool got_ttl_exceeded;  /* true: ICMP Time Exceeded from an intermediate hop */
+    u32  from_ip;           /* IP that actually replied */
+    u32  rtt_ms;
+    u8   reply_ttl;
+} PACKED;
+
+/* Send one ICMP echo request with the given identifier/sequence/TTL. */
+bool net_icmp_echo_send(u32 dst_ip, u16 ident, u16 seq, u8 ttl);
+
+/* Non-blocking: true + fills *out and clears the pending state once a
+ * matching reply (or Time Exceeded) has arrived since the last send. */
+bool net_icmp_echo_poll_result(struct net_ping_result *out);
+
 /* Process a UDP send request from another core via FIFO */
 void net_handle_fifo_request(void);
 

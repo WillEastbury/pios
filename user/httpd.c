@@ -10,7 +10,19 @@
  * count) is read through the kernel_api table at request time.
  *
  * Constraint: the image is mapped read-execute (W^X) — no writable globals; all
- * mutable state is on the stack or in the shared bridge.
+ * mutable state is on the stack, in the shared bridge, or (for build_body()'s
+ * PicoScript VM state -- see struct httpd_scratch below) a fixed-VA scratch
+ * region inside this process's own mapped slot.
+ *
+ * BUILD REQUIREMENT: this file must be compiled with -fno-gcse (see
+ * build_bootstrap.bat). build_body()'s VM branch picks between two `program`
+ * pointers (picoweb_default_program vs a loaded card in sc->program_words)
+ * before calling pv_vm_run() -- the identical pattern that hit a confirmed
+ * GCC 13.3 (aarch64-none-elf) -fgcse miscompile in user/capsvc_host.c (GCC
+ * merged the two branches' tails and used the wrong register for the
+ * `program` argument at -O2, producing a near-NULL pointer that faults
+ * inside pv_verify() with no diagnostic). Applied here preventatively for
+ * the same code shape, even though this path was previously untested.
  */
 #include "types.h"
 #include "proc.h"          /* struct kernel_api */
@@ -108,6 +120,37 @@ struct picoweb_host {
     struct pico_span spans[PICOWEB_MAX_SPANS];
     int span_count;
     int oom;
+};
+
+/* pv_ctx (include/picovm.h) is genuinely large (~65KB card/span/writer/queue
+ * tables) -- struct picoweb_host measures ~80KB via -Wframe-larger-than, and
+ * build_body() also needs a UHTTP_PICO_MAX/4 (4KB) program-word buffer on top
+ * of that. EL0 processes launched via proc_exec_from_mem_el0() get only a
+ * tiny fixed stack (entry_sp = linked_base + 0x20000, 128KB, shared downward
+ * with the loaded image -- roughly 51KB of real headroom here), so neither of
+ * these may ever be stack-allocated: doing so blows straight through the
+ * stack and corrupts the loaded code with no clean trap (an EC=0 "unknown
+ * reason" illegal-instruction fault on the very first real request; measured
+ * and reproduced while integrating user/capsvc_host.c's PicoScript execution,
+ * which hit the identical bug and fixed it the same way). Instead both live
+ * at a fixed VA inside this process's own mapped 2MiB slot, past the loaded
+ * image and its stack -- proc_exec_from_mem_el0()/
+ * mmu_user_table_build_split_el0_at() already map and zero the ENTIRE slot
+ * (not just the loaded bytes), so this is valid, private, RW, zero-
+ * initialized memory reachable with plain loads/stores -- not a "writable
+ * global" in the W^X sense (no static/global storage-class object exists;
+ * it is simply this process's own unused mapped RAM, reinterpreted), and
+ * single-threaded (one request at a time), so one shared scratch buffer at a
+ * well-known VA is safe. HTTPD_IMAGE_LINK_BASE must match user/httpd_el0.ld's
+ * fixed link VA (shared by both UHTTP_BRIDGE_INDEX=0 and =1 builds, which
+ * are separate processes/address spaces, never concurrent with each other). */
+#define HTTPD_IMAGE_LINK_BASE 0x2001000000ULL
+#define HTTPD_HEAP_OFFSET     0x100000ULL   /* 1MiB in: comfortably past this ~77KB image + stack, comfortably inside the 2MiB slot */
+#define HTTPD_HEAP_VA         (HTTPD_IMAGE_LINK_BASE + HTTPD_HEAP_OFFSET)
+
+struct httpd_scratch {
+    struct picoweb_host host;
+    u32 program_words[UHTTP_PICO_MAX / 4U];
 };
 
 static const u32 picoweb_default_program[] = {
@@ -697,19 +740,21 @@ static u32 build_body(struct uhttp_bridge *b, struct kernel_api *api, char *buf,
     buf[n] = 0;
     return n;
 #else
-    struct picoweb_host h;
-    u32 program_words[UHTTP_PICO_MAX / 4U];
+    /* Fixed scratch region, not a stack local -- see struct httpd_scratch's
+     * comment above. */
+    struct httpd_scratch *sc = (struct httpd_scratch *)(usize)HTTPD_HEAP_VA;
+    struct picoweb_host *h = &sc->host;
     const u32 *program = picoweb_default_program;
     u32 nwords = (u32)(sizeof(picoweb_default_program) / sizeof(picoweb_default_program[0]));
-    u32 loaded = load_program(b, program_words, UHTTP_PICO_MAX / 4U);
+    u32 loaded = load_program(b, sc->program_words, UHTTP_PICO_MAX / 4U);
     if (loaded > 0) {
-        program = program_words;
+        program = sc->program_words;
         nwords = loaded;
     }
 
-    picoweb_init(&h, b, api, reqs);
-    (void)pv_vm_run(&h.vm, program, (int)nwords);
-    if (h.vm.fault != PV_FAULT_NONE) {
+    picoweb_init(h, b, api, reqs);
+    (void)pv_vm_run(&h->vm, program, (int)nwords);
+    if (h->vm.fault != PV_FAULT_NONE) {
         const char *fault = "PicoScript fault\n";
         u32 fn = u_strlen(fault);
         if (fn >= cap) fn = cap - 1U;
@@ -718,11 +763,11 @@ static u32 build_body(struct uhttp_bridge *b, struct kernel_api *api, char *buf,
         if (status_out) *status_out = 500U;
         return fn;
     }
-    u32 st = (h.vm.http_status >= 100 && h.vm.http_status <= 599) ? (u32)h.vm.http_status : 200U;
+    u32 st = (h->vm.http_status >= 100 && h->vm.http_status <= 599) ? (u32)h->vm.http_status : 200U;
     if (status_out) *status_out = st;
-    u32 n = (u32)h.vm.out_len;
+    u32 n = (u32)h->vm.out_len;
     if (n >= cap) n = cap - 1U;
-    for (u32 i = 0; i < n; i++) buf[i] = (char)h.vm.out[i];
+    for (u32 i = 0; i < n; i++) buf[i] = (char)h->vm.out[i];
     buf[n] = 0;
     return n;
 #endif
@@ -748,6 +793,23 @@ void user_main(struct kernel_api *api)
     /* Push the whole Zone B control line to PoC so core 0 sees magic/pid even
      * though this core is about to park and never evict the line on its own. */
     uhttp_clean(&b->magic, UHTTP_LINE);
+
+    /* Write-once description, own dedicated line (Zone C) -- a plain string
+     * compiled into THIS binary (differs by UHTTP_BRIDGE_INDEX), read by the
+     * kernel-side dashboard/"services" command. Never hardcoded by the
+     * launcher: it genuinely lives in this .c file. */
+    {
+#if defined(UHTTP_BRIDGE_INDEX) && UHTTP_BRIDGE_INDEX == 1
+        const char *desc = "PicoScript VM HTTP worker (bridge 1, :83)";
+#else
+        const char *desc = "PicoScript VM HTTP worker (bridge 0, :82)";
+#endif
+        u32 n = u_strlen(desc);
+        if (n >= UHTTP_LINE) n = UHTTP_LINE - 1U;
+        for (u32 i = 0; i < n; i++) b->description[i] = desc[i];
+        b->description[n] = 0;
+        uhttp_clean(b->description, UHTTP_LINE);
+    }
 
 #ifndef PIOS_USER_EL0
     api->print("[httpd] attached, waiting on :81\n");

@@ -1,0 +1,2668 @@
+/*
+ * cyw43.c - CYW43455 WiFi FullMAC driver
+ *
+ * Broadcom/Cypress CYW43455 combo chip on Pi 5, via the BCM2712 SoC's
+ * dedicated SDIO2 controller (not RP1 -- see sdio.h).
+ * FullMAC: firmware handles 802.11/WPA2, host speaks SDPCM/BCDC.
+ *
+ * Architecture:
+ *   SDIO func 0: Common I/O Area (CCCR) — card management
+ *   SDIO func 1: Silicon Backplane — register/RAM access
+ *   SDIO func 2: WLAN data — Ethernet frames
+ *
+ * Backplane access: CMD52 sets a 32KB window, CMD53 moves data.
+ * SDPCM: framing protocol over func 2 — control + data channels.
+ * BCDC:  control messages within SDPCM control channel.
+ *
+ * Reference: Linux drivers/net/wireless/broadcom/brcm80211/brcmfmac/
+ *            Circle WiFi (bcm4343.cpp, hostap.cpp)
+ */
+
+#include "cyw43.h"
+#include "sdio.h"
+#include "fat32.h"
+#include "watchdog.h"
+#include "uart.h"
+#include "timer.h"
+#include "fb.h"
+
+/* ── Constants ── */
+
+/* SDIO func 1 backplane registers (CMD52 addresses within func 1) */
+#define SB_INT_STATUS           0x20
+#define SB_INT_HOST_MASK        0x24
+#define SB_FUNC_INT_MASK        0x34
+#define SB_TO_SB_MBOX           0x40
+#define SB_TO_SB_MBOX_DATA      0x48
+#define SB_TO_HOST_MBOX_DATA    0x4C
+
+/* Backplane window granularity */
+#define BACKPLANE_WIN_SIZE      0x8000  /* 32KB */
+#define BACKPLANE_WIN_MASK      0x7FFF
+#define BACKPLANE_ADDR_MASK     0xFFFFF8000ULL
+
+/* Core enumeration (for AXI cores) */
+#define CORE_CTRL               0x0408
+#define CORE_RESET_CTRL         0x0800
+#define CORE_RESET_STATUS       0x0804
+#define CORE_IOCTRL             0x0408
+#define CORE_RESETCTRL          0x0800
+
+/* IOCTRL bits */
+#define SICF_FGC                0x0002  /* Force gated clocks on */
+#define SICF_CLOCK_EN           0x0001  /* Force HT request */
+#define SICF_CPUHALT            0x0020  /* ARM core halt */
+#define D11_PHYRESET            0x0008
+#define D11_PHYCLOCKEN          0x0004
+
+/* RESETCTRL bits */
+#define AIRC_RESET              0x0001
+
+/* SOCSRAM wrapper */
+#define SOCSRAM_BANKX_IDX       0x10
+#define SOCSRAM_BANKX_PDA       0x44
+
+/* ARM CR4 TCM sizing registers. */
+#define ARMCR4_CAP              0x04
+#define ARMCR4_BANKIDX          0x40
+#define ARMCR4_BANKINFO         0x44
+#define ARMCR4_TCBANB_MASK      0x0F
+#define ARMCR4_TCBBNB_MASK      0xF0
+#define ARMCR4_TCBBNB_SHIFT     4
+#define ARMCR4_BSZ_MASK         0x7F
+#define ARMCR4_BLK_1K_MASK      0x200
+#define ARMCR4_BSZ_MULT         8192U
+
+/* Clock control status register (SDIO func 1) */
+#define SDIO_CLKCSR             0x1000E
+#define SDIO_PULLUPS            0x1000F
+#define SDIO_RFRAMEBC_LO        0x1001B
+#define SDIO_RFRAMEBC_HI        0x1001C
+#define SDIO_SLEEPCSR           0x1001F
+#define SLEEPCSR_KSO            (1U << 0)
+#define SLEEPCSR_DEVON          (1U << 1)
+#define CLKCSR_ForceALP         0x01
+#define CLKCSR_ForceHT          0x02
+#define CLKCSR_ReqALP           0x08
+#define CLKCSR_ReqHT            0x10
+#define CLKCSR_Nohwreq          0x20
+#define CLKCSR_ALPavail         0x40
+#define CLKCSR_HTavail          0x80
+
+/* Chipcommon GPIO pull registers */
+#define CC_GPIOPULLUP           0x58
+#define CC_GPIOPULLDOWN         0x5C
+
+/* SDIOD core register offsets */
+#define SDIOD_INTSTATUS         0x20
+#define SDIOD_INTMASK           0x24
+#define SDIOD_TOSBMAILBOX       0x40
+#define SDIOD_TOSBMAILBOXDATA   0x48
+#define SDIOD_TOHOSTMAILBOXDATA 0x4C
+#define SDIOD_I_HMB_FRAME_IND   (1U << 6)
+#define SDIOD_I_HMB_HOST_INT    (1U << 7)
+#define SDIOD_SMB_INT_ACK       (1U << 1)
+#define SDIOD_HMB_DEVREADY      (1U << 1)
+#define SDIOD_HMB_FWREADY       (1U << 3)
+
+/* Firmware upload block size */
+#define FW_UPLOAD_BLKSZ         64
+#define SDIO_FUNC1_BLKSZ        64
+#define SDIO_FUNC2_BLKSZ        512
+#define CYW_F1_BATCH_BLOCKS     64U
+#define CYW_F1_BATCH_BYTES      (CYW_F1_BATCH_BLOCKS * SDIO_FUNC1_BLKSZ)
+
+/* SDPCM frame tags */
+#define SDPCM_FRAMETAG_LEN_MASK 0xFFFF
+
+/* Maximum frame size */
+#define CYW_MAX_FRAME           4096
+#define CYW_SCAN_QUERY_BYTES    416U
+#define CYW_BCDC_GET_TIMEOUT_MS 5000ULL
+
+/* ── State ── */
+
+static u8 cyw_mac[CYW_MAC_LEN];
+static u32 cyw_link;
+static u8 cyw_tx_seq;
+static u8 cyw_tx_max;
+static u32 cyw_backplane_window;
+static bool sdpcm_frame_pending;
+static u32 sdpcm_next_len;
+
+/* RX/TX buffers — 64-byte aligned for SDIO DMA compatibility */
+static u8 cyw_tx_buf[CYW_MAX_FRAME] ALIGNED(64);
+static u8 cyw_rx_buf[CYW_MAX_FRAME] ALIGNED(64);
+#define CYW_EAPOL_MAX 512U
+static u8 cyw_eapol_frame[CYW_EAPOL_MAX] ALIGNED(64);
+static u32 cyw_eapol_len;
+
+/* BCDC request ID counter */
+static u16 bcdc_reqid;
+#define BCDC_RESPONSE_SLOTS     4U
+#define BCDC_RESPONSE_DATA_MAX  512U
+struct bcdc_cached_response {
+    bool valid;
+    u16 id;
+    u16 data_len;
+    u32 status;
+    u8 data[BCDC_RESPONSE_DATA_MAX];
+} ALIGNED(64);
+static struct bcdc_cached_response bcdc_responses[BCDC_RESPONSE_SLOTS];
+static u16 bcdc_ignore_through;
+
+/* Scan results */
+static struct cyw_scan_result scan_results[CYW_MAX_SCAN_RESULTS];
+static u32 scan_count;
+static bool scan_in_progress;
+static bool scan_results_pending;
+static u64 scan_ready_ms;
+static u32 scan_flush_remaining;
+
+/* Discovered core addresses (from EROM scan) */
+static u32 cyw_arm_ctl;
+static u32 cyw_arm_regs;
+static u32 cyw_d11_ctl;
+static u32 cyw_sram_ctl;
+static u32 cyw_sdio_regs;
+static u32 cyw_ram_base = CYW_RAM_BASE;  /* default, updated from EROM */
+static u32 cyw_ram_bytes;
+static struct cyw43_diag cyw_diag ALIGNED(64);
+static cyw43_progress_fn cyw_progress_hook;
+
+/* Pre-loaded blobs (loaded before cyw43_init disturbs SD) */
+#define CYW_FW_MAX_SIZE   (700 * 1024)
+#define CYW_NVRAM_MAX     4096
+#define CYW_CLM_MAX       16384
+static u8 fw_buf[CYW_FW_MAX_SIZE] ALIGNED(64);
+static u32 fw_buf_len;
+static const u8 *fw_data = fw_buf;
+static u8 nvram_buf[CYW_NVRAM_MAX];
+static u32 nvram_buf_len;
+static const u8 *nvram_data = nvram_buf;
+static u8 clm_buf[CYW_CLM_MAX];
+static u32 clm_buf_len;
+static const u8 *clm_data = clm_buf;
+static bool blobs_loaded;
+
+/* ── Backplane access ── */
+
+static bool bp_read32(u32 addr, u32 *val);
+
+static bool bp_set_window(u32 addr)
+{
+    u32 win = addr & (u32)BACKPLANE_ADDR_MASK;
+    if (win == cyw_backplane_window)
+        return true;
+
+    /* Write 3 bytes of the window address to SB window register */
+    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, CYW_BAK_WIN_ADDR + 0,
+                          (u8)((win >> 8) & 0xFF)))
+        return false;
+    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, CYW_BAK_WIN_ADDR + 1,
+                          (u8)((win >> 16) & 0xFF)))
+        return false;
+    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, CYW_BAK_WIN_ADDR + 2,
+                          (u8)((win >> 24) & 0xFF)))
+        return false;
+
+    cyw_backplane_window = win;
+    return true;
+}
+
+void cyw43_diag_snapshot(struct cyw43_diag *out)
+{
+    if (!out)
+        return;
+    *out = cyw_diag;
+}
+
+bool cyw43_install_blob(u32 kind, const u8 *data, u32 len)
+{
+    if (!data || len == 0U)
+        return false;
+    if (kind == CYW_BLOB_FIRMWARE) {
+        if (len > sizeof(fw_buf))
+            return false;
+        memcpy(fw_buf, data, len);
+        fw_data = fw_buf;
+        fw_buf_len = len;
+    } else if (kind == CYW_BLOB_NVRAM) {
+        if (len > sizeof(nvram_buf))
+            return false;
+        memcpy(nvram_buf, data, len);
+        nvram_data = nvram_buf;
+        nvram_buf_len = len;
+    } else if (kind == CYW_BLOB_CLM) {
+        if (len > sizeof(clm_buf))
+            return false;
+        memcpy(clm_buf, data, len);
+        clm_data = clm_buf;
+        clm_buf_len = len;
+    } else {
+        return false;
+    }
+    blobs_loaded = fw_buf_len != 0U && nvram_buf_len != 0U &&
+                   clm_buf_len != 0U;
+    cyw_diag.fw_len = fw_buf_len;
+    cyw_diag.nvram_len = nvram_buf_len;
+    cyw_diag.clm_len = clm_buf_len;
+    return true;
+}
+
+bool cyw43_blobs_ready(void)
+{
+    return blobs_loaded;
+}
+
+bool cyw43_runtime_ready(void)
+{
+    return cyw_diag.stage >= 25U && cyw_diag.func2_ready != 0U;
+}
+
+bool cyw43_d11_state(u32 *resetctrl, u32 *ioctrl)
+{
+    if (!resetctrl || !ioctrl || cyw_d11_ctl == 0U)
+        return false;
+    return bp_read32(cyw_d11_ctl + CORE_RESETCTRL, resetctrl) &&
+           bp_read32(cyw_d11_ctl + CORE_IOCTRL, ioctrl);
+}
+
+void cyw43_set_progress_hook(cyw43_progress_fn hook)
+{
+    cyw_progress_hook = hook;
+}
+
+u32 cyw43_ram_size(void)
+{
+    return cyw_ram_bytes;
+}
+
+/* CMD52-based 4-byte backplane read — avoids DAT line entirely */
+static bool bp_read32(u32 addr, u32 *val)
+{
+    if (!bp_set_window(addr)) {
+        uart_puts("[bpr] win fail @");
+        uart_hex(addr);
+        uart_puts("\n");
+        return false;
+    }
+
+    u32 off = addr & BACKPLANE_WIN_MASK;
+    u8 b0, b1, b2, b3;
+    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000), &b0)) {
+        uart_puts("[bpr] r52 fail off=");
+        uart_hex(off);
+        uart_puts("\n");
+        return false;
+    }
+    sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 1, &b1);
+    sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 2, &b2);
+    sdio_cmd52_read(SDIO_FUNC_BACKPLANE, (off | 0x8000) + 3, &b3);
+    *val = (u32)b0 | ((u32)b1 << 8) | ((u32)b2 << 16) | ((u32)b3 << 24);
+    return true;
+}
+
+/* CMD53 word-mode 4-byte backplane write — required for TCM RAM (CMD52 byte
+ * writes only work for register space; RAM enforces 4-byte atomic access). */
+static bool bp_write32(u32 addr, u32 val)
+{
+    if (!bp_set_window(addr)) {
+        uart_puts("[bpw] win fail @");
+        uart_hex(addr);
+        uart_puts("\n");
+        return false;
+    }
+
+    u32 off = addr & BACKPLANE_WIN_MASK;
+    u8 buf[4] = {
+        (u8)(val & 0xFF),
+        (u8)((val >> 8) & 0xFF),
+        (u8)((val >> 16) & 0xFF),
+        (u8)((val >> 24) & 0xFF),
+    };
+    if (!sdio_cmd53_write(SDIO_FUNC_BACKPLANE, off | 0x8000, buf, 4, true)) {
+        uart_puts("[bpw] c53w4 fail addr=");
+        uart_hex(addr);
+        uart_puts("\n");
+        return false;
+    }
+    return true;
+}
+
+static bool bp_read_buf(u32 addr, u8 *buf, u32 len)
+{
+    while (len > 0) {
+        if (!bp_set_window(addr))
+            return false;
+
+        u32 off = addr & BACKPLANE_WIN_MASK;
+        u32 chunk = BACKPLANE_WIN_SIZE - off;
+        if (chunk > len) chunk = len;
+        if (chunk > SDIO_FUNC1_BLKSZ) chunk = SDIO_FUNC1_BLKSZ;
+
+        if (!sdio_cmd53_read(SDIO_FUNC_BACKPLANE, off | 0x8000,
+                             buf, chunk, true))
+            return false;
+
+        addr += chunk;
+        buf += chunk;
+        len -= chunk;
+    }
+    return true;
+}
+
+static bool bp_write_buf(u32 addr, const u8 *buf, u32 len)
+{
+    if (addr & 3) {
+        uart_puts("[bpwb] unaligned addr=");
+        uart_hex(addr);
+        uart_puts("\n");
+        return false;
+    }
+
+    while (len > 0U) {
+        if (!bp_set_window(addr))
+            return false;
+        u32 off = addr & BACKPLANE_WIN_MASK;
+        u32 window_left = BACKPLANE_WIN_SIZE - off;
+        u32 full = len & ~(SDIO_FUNC1_BLKSZ - 1U);
+        if (full > window_left)
+            full = window_left & ~(SDIO_FUNC1_BLKSZ - 1U);
+        if (full > CYW_F1_BATCH_BYTES)
+            full = CYW_F1_BATCH_BYTES;
+
+        if (full != 0U) {
+            u32 nblks = full / SDIO_FUNC1_BLKSZ;
+            if (!sdio_cmd53_write_blocks(SDIO_FUNC_BACKPLANE,
+                                         off | 0x8000U, buf,
+                                         SDIO_FUNC1_BLKSZ, nblks, true))
+                return false;
+            addr += full;
+            buf += full;
+            len -= full;
+        } else {
+            u32 chunk = len < window_left ? len : window_left;
+            if (chunk > SDIO_FUNC1_BLKSZ)
+                chunk = SDIO_FUNC1_BLKSZ;
+            if (!sdio_cmd53_write(SDIO_FUNC_BACKPLANE,
+                                  off | 0x8000U, buf, chunk, true))
+                return false;
+            addr += chunk;
+            buf += chunk;
+            len -= chunk;
+        }
+        if ((addr & 0xFFFFU) == 0U) {
+            uart_puts("[bpwb] @");
+            uart_hex(addr);
+            uart_puts("\n");
+        }
+        watchdog_hw_pet();
+        if (cyw_progress_hook)
+            cyw_progress_hook();
+    }
+    return true;
+}
+
+static bool probe_f1_multiblock(void)
+{
+    static u8 write_buf[CYW_F1_BATCH_BYTES] ALIGNED(64);
+    static u8 read_buf[CYW_F1_BATCH_BYTES] ALIGNED(64);
+    for (u32 i = 0U; i < sizeof(write_buf); i++)
+        write_buf[i] = (u8)(0xA5U ^ i ^ (i >> 8));
+    memset(read_buf, 0, sizeof(read_buf));
+
+    if (!bp_set_window(cyw_ram_base))
+        return false;
+    u32 off = (cyw_ram_base & BACKPLANE_WIN_MASK) | 0x8000U;
+    if (!sdio_cmd53_write_blocks(SDIO_FUNC_BACKPLANE, off, write_buf,
+                                 SDIO_FUNC1_BLKSZ,
+                                 CYW_F1_BATCH_BLOCKS, true))
+        return false;
+    if (!sdio_cmd53_read_blocks(SDIO_FUNC_BACKPLANE, off, read_buf,
+                                SDIO_FUNC1_BLKSZ,
+                                CYW_F1_BATCH_BLOCKS, true))
+        return false;
+    return memcmp(write_buf, read_buf, sizeof(write_buf)) == 0;
+}
+
+/* ── Core control ── */
+
+static bool core_disable(u32 core_base, u32 prereset, u32 reset)
+{
+    u32 val;
+
+    /* Check if already in reset */
+    if (!bp_read32(core_base + CORE_RESETCTRL, &val))
+        return false;
+    if ((val & AIRC_RESET) == 0U) {
+        /* Match brcmf_chip_ai_coredisable: preserve required pre-reset flags
+         * while forcing clocks, assert reset, then configure the in-reset state. */
+        if (!bp_write32(core_base + CORE_IOCTRL,
+                        prereset | SICF_FGC | SICF_CLOCK_EN))
+            return false;
+        if (!bp_read32(core_base + CORE_IOCTRL, &val))
+            return false;
+        delay_cycles(1000);
+
+        if (!bp_write32(core_base + CORE_RESETCTRL, AIRC_RESET))
+            return false;
+        for (u32 i = 0; i < 50U; i++) {
+            if (bp_read32(core_base + CORE_RESETCTRL, &val) &&
+                (val & AIRC_RESET))
+                break;
+            timer_delay_us(50U);
+        }
+        if (!bp_read32(core_base + CORE_RESETCTRL, &val) ||
+            (val & AIRC_RESET) == 0U)
+            return false;
+    }
+
+    return bp_write32(core_base + CORE_IOCTRL,
+                      reset | SICF_FGC | SICF_CLOCK_EN);
+}
+
+static bool core_reset(u32 core_base, u32 prereset,
+                       u32 reset, u32 postreset)
+{
+    if (!core_disable(core_base, prereset, reset))
+        return false;
+
+    u32 val;
+    for (u32 i = 0; i < 50U; i++) {
+        if (!bp_read32(core_base + CORE_RESETCTRL, &val))
+            return false;
+        if ((val & AIRC_RESET) == 0U)
+            break;
+        if (!bp_write32(core_base + CORE_RESETCTRL, 0U))
+            return false;
+        timer_delay_us(50U);
+    }
+    if (!bp_read32(core_base + CORE_RESETCTRL, &val) ||
+        (val & AIRC_RESET))
+        return false;
+    if (!bp_write32(core_base + CORE_IOCTRL,
+                    postreset | SICF_CLOCK_EN))
+        return false;
+    return bp_read32(core_base + CORE_IOCTRL, &val);
+}
+
+static u32 cyw43_tcm_ramsize(void)
+{
+    u32 cap = 0;
+    if (!cyw_arm_regs ||
+        !bp_read32(cyw_arm_regs + ARMCR4_CAP, &cap))
+        return 0U;
+    u32 banks = (cap & ARMCR4_TCBANB_MASK) +
+                ((cap & ARMCR4_TCBBNB_MASK) >> ARMCR4_TCBBNB_SHIFT);
+    u32 bytes = 0;
+    uart_puts("[cyw] CR4 CAP=");
+    uart_hex(cap);
+    uart_puts(" banks=");
+    uart_hex(banks);
+    uart_puts("\n");
+    for (u32 idx = 0; idx < banks; idx++) {
+        u32 info = 0;
+        if (!bp_write32(cyw_arm_regs + ARMCR4_BANKIDX, idx) ||
+            !bp_read32(cyw_arm_regs + ARMCR4_BANKINFO, &info))
+            return 0U;
+        u32 block = (info & ARMCR4_BLK_1K_MASK) ?
+                    (ARMCR4_BSZ_MULT >> 3) : ARMCR4_BSZ_MULT;
+        bytes += ((info & ARMCR4_BSZ_MASK) + 1U) * block;
+        uart_puts("[cyw] CR4 bank=");
+        uart_hex(idx);
+        uart_puts(" info=");
+        uart_hex(info);
+        uart_puts(" total=");
+        uart_hex(bytes);
+        uart_puts("\n");
+    }
+    return bytes;
+}
+
+/* ── Chip identification ── */
+
+static bool chip_identify(void)
+{
+    u32 chip_id;
+    if (!bp_read32(CYW_CHIPCOMMON_BASE, &chip_id))
+        return false;
+
+    u16 id = (u16)(chip_id & 0xFFFF);
+    u16 rev = (u16)((chip_id >> 16) & 0xF);
+
+    uart_puts("[cyw] chip=");
+    uart_hex(id);
+    uart_puts(" r=");
+    uart_hex(rev);
+    uart_puts("\n");
+
+    if (id != CYW43455_CHIP_ID) {
+        uart_puts("[cyw] bad chip ID\n");
+        return false;
+    }
+    return true;
+}
+
+/* ── SDPCM / BCDC ── */
+
+static u32 sdpcm_pending_bytes(void);
+static bool sdpcm_recv(u8 *channel, u8 *data, u32 *len);
+static void handle_event(const u8 *data, u32 len);
+static void bcdc_cache_response(const u8 *frame, u32 len);
+static u32 load_le32(const u8 *p);
+static bool scan_store_bss(const u8 *bss, u32 record_len);
+
+static void capture_eapol(const u8 *data, u32 len)
+{
+    if (!data || len < 4U)
+        return;
+    u32 bdc_offset = 4U + ((u32)data[3] << 2);
+    if (bdc_offset > len || len - bdc_offset < 14U)
+        return;
+    const u8 *frame = data + bdc_offset;
+    u32 frame_len = len - bdc_offset;
+    if (frame[12] != 0x88U || frame[13] != 0x8EU)
+        return;
+
+    u32 copy_len = frame_len;
+    if (copy_len > sizeof(cyw_eapol_frame))
+        copy_len = sizeof(cyw_eapol_frame);
+    memcpy(cyw_eapol_frame, frame, copy_len);
+    cyw_eapol_len = copy_len;
+    cyw_diag.eapol_frames++;
+    cyw_diag.eapol_len = frame_len;
+    cyw_diag.eapol_key_info =
+        frame_len >= 21U ? ((u32)frame[19] << 8) | frame[20] : 0U;
+    cyw_diag.eapol_replay_hi =
+        frame_len >= 31U ? ((u32)frame[23] << 24) |
+                           ((u32)frame[24] << 16) |
+                           ((u32)frame[25] << 8) | frame[26] : 0U;
+    cyw_diag.eapol_replay_lo =
+        frame_len >= 31U ? ((u32)frame[27] << 24) |
+                           ((u32)frame[28] << 16) |
+                           ((u32)frame[29] << 8) | frame[30] : 0U;
+    memset(cyw_diag.eapol_words, 0, sizeof(cyw_diag.eapol_words));
+    u32 words = frame_len / 4U;
+    if (words > 11U)
+        words = 11U;
+    for (u32 i = 0U; i < words; i++)
+        cyw_diag.eapol_words[i] = load_le32(frame + i * 4U);
+    uart_puts("[cyw] EAPOL keyinfo=");
+    uart_hex(cyw_diag.eapol_key_info);
+    uart_puts(" replay=");
+    uart_hex(cyw_diag.eapol_replay_hi);
+    uart_puts(":");
+    uart_hex(cyw_diag.eapol_replay_lo);
+    uart_puts("\n");
+}
+
+#define CYW_SCAN_SEC_WPA2_PSK        (1U << 0)
+#define CYW_SCAN_SEC_PSK_SHA256      (1U << 1)
+#define CYW_SCAN_SEC_SAE             (1U << 2)
+#define CYW_SCAN_SEC_MFP_CAPABLE     (1U << 3)
+#define CYW_SCAN_SEC_MFP_REQUIRED    (1U << 4)
+
+static u32 sdpcm_build_header(u8 *buf, u32 payload_len, u8 channel)
+{
+    u32 total = SDPCM_HEADER_LEN + payload_len;
+
+    /* Frame tag: length + ~length */
+    buf[0] = (u8)(total & 0xFF);
+    buf[1] = (u8)((total >> 8) & 0xFF);
+    buf[2] = (u8)(~total & 0xFF);
+    buf[3] = (u8)((~total >> 8) & 0xFF);
+
+    /* Sequence, channel, next length, data offset */
+    buf[4] = cyw_tx_seq++;
+    buf[5] = channel;
+    buf[6] = 0;    /* next length */
+    buf[7] = SDPCM_HEADER_LEN;  /* data offset */
+
+    /* Flow control, max seq */
+    buf[8] = 0;
+    buf[9] = 0;
+    buf[10] = 0;
+    buf[11] = 0;
+
+    return SDPCM_HEADER_LEN;
+}
+
+static bool sdpcm_send(u8 channel, const u8 *data, u32 len)
+{
+    if (len + SDPCM_HEADER_LEN > CYW_MAX_FRAME)
+        return false;
+
+    /* Firmware owns the transmit window. Do not publish another frame until
+     * max_seq advances; drain queued responses/events to acquire credit. */
+    u64 credit_deadline = timer_monotonic_ms() + 30000ULL;
+    while ((u8)(cyw_tx_max - cyw_tx_seq) == 0U) {
+        if (sdpcm_pending_bytes() != 0U) {
+            u8 pending_channel = 0;
+            u32 pending_len = CYW_MAX_FRAME;
+            if (sdpcm_recv(&pending_channel, cyw_rx_buf, &pending_len)) {
+                if (pending_channel == SDPCM_EVENT_CHANNEL)
+                    handle_event(cyw_rx_buf, pending_len);
+                else if (pending_channel == SDPCM_CTL_CHANNEL)
+                    bcdc_cache_response(cyw_rx_buf, pending_len);
+            }
+        } else {
+            timer_delay_ms(1U);
+        }
+        if (timer_monotonic_ms() >= credit_deadline)
+            return false;
+    }
+
+    u32 hdr_len = sdpcm_build_header(cyw_tx_buf, len, channel);
+    memcpy(cyw_tx_buf + hdr_len, data, len);
+
+    u32 total = hdr_len + len;
+    /* Pad to 64-byte boundary for SDIO */
+    u32 padded = (total + 63) & ~63U;
+
+    /* Zero padding to avoid leaking stale buffer contents */
+    if (padded > total)
+        memset(cyw_tx_buf + total, 0, padded - total);
+
+    /* Use block mode for transfers >512 bytes */
+    if (padded > 512) {
+        u32 nblks = (padded + SDIO_FUNC2_BLKSZ - 1) / SDIO_FUNC2_BLKSZ;
+        return sdio_cmd53_write_blocks(SDIO_FUNC_WLAN, 0, cyw_tx_buf,
+                                       SDIO_FUNC2_BLKSZ, nblks, false);
+    }
+    return sdio_cmd53_write(SDIO_FUNC_WLAN, 0, cyw_tx_buf, padded, false);
+}
+
+static u32 sdpcm_pending_bytes(void)
+{
+    u8 lo = 0, hi = 0;
+    if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_RFRAMEBC_LO, &lo) ||
+        !sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_RFRAMEBC_HI, &hi))
+        return 0U;
+    u32 count = (u32)lo | ((u32)hi << 8);
+    cyw_diag.bcdc_rframe_count = count;
+    if (count == 0U) {
+        u32 intstatus = 0;
+        if (bp_read32(cyw_sdio_regs + SDIOD_INTSTATUS, &intstatus)) {
+            u32 active = intstatus & 0x200000F0U;
+            if (active)
+                (void)bp_write32(cyw_sdio_regs + SDIOD_INTSTATUS, active);
+            if (active & SDIOD_I_HMB_HOST_INT) {
+                u32 mailbox = 0;
+                if (bp_read32(cyw_sdio_regs + SDIOD_TOHOSTMAILBOXDATA,
+                              &mailbox)) {
+                    cyw_diag.sdiod_mailbox = mailbox;
+                    (void)bp_write32(cyw_sdio_regs + SDIOD_TOSBMAILBOX,
+                                     SDIOD_SMB_INT_ACK);
+                }
+            }
+            if (active & SDIOD_I_HMB_FRAME_IND)
+                sdpcm_frame_pending = true;
+            cyw_diag.sdiod_intstatus = intstatus;
+        }
+        u8 pending = 0;
+        if (sdio_cmd52_read(SDIO_FUNC_CIA, CCCR_INT_PENDING, &pending) &&
+            (pending & (1U << SDIO_FUNC_WLAN)))
+            sdpcm_frame_pending = true;
+        cyw_diag.bcdc_cccr_pending = pending;
+    }
+    if (count == 0U && sdpcm_next_len != 0U)
+        count = sdpcm_next_len;
+    else if (count == 0U && sdpcm_frame_pending)
+        count = 64U; /* header-first read discovers the exact frame length */
+    cyw_diag.bcdc_pending_bytes = count;
+    return count;
+}
+
+static bool sdpcm_recv(u8 *channel, u8 *data, u32 *len)
+{
+    u32 pending = sdpcm_pending_bytes();
+    if (pending < SDPCM_HEADER_LEN || pending > CYW_MAX_FRAME)
+        return false;
+    u32 reported = cyw_diag.bcdc_rframe_count;
+    if (reported == 0U && sdpcm_next_len != 0U)
+        reported = sdpcm_next_len;
+
+    /* A frame indication authorizes one header-first FIFO probe. If that probe
+     * fails, require a fresh RFRAMEBC/interrupt indication before retrying. */
+    sdpcm_frame_pending = false;
+    u32 first = pending < 64U ? ((pending + 3U) & ~3U) : 64U;
+    if (!sdio_cmd53_read(SDIO_FUNC_WLAN, 0, cyw_rx_buf, first, false))
+        return false;
+    sdpcm_next_len = 0U;
+
+    /* Parse frame tag */
+    u16 frame_len = (u16)cyw_rx_buf[0] | ((u16)cyw_rx_buf[1] << 8);
+    u16 frame_not = (u16)cyw_rx_buf[2] | ((u16)cyw_rx_buf[3] << 8);
+
+    if (frame_len == 0 || frame_len > CYW_MAX_FRAME)
+        return false;
+    if ((u16)(frame_len ^ frame_not) != 0xFFFF)
+        return false;
+    u32 rounded = (frame_len + 3U) & ~3U;
+    u32 transfer_len = rounded;
+    if (reported >= frame_len && reported <= CYW_MAX_FRAME)
+        transfer_len = (reported + 3U) & ~3U;
+    u32 have = first;
+    while (have < transfer_len) {
+        u32 chunk = transfer_len - have;
+        if (chunk > 512U) chunk = 512U;
+        if (!sdio_cmd53_read(SDIO_FUNC_WLAN, 0,
+                             cyw_rx_buf + have, chunk, false))
+            return false;
+        have += chunk;
+    }
+
+    *channel = cyw_rx_buf[5] & 0x0F;
+    sdpcm_next_len = (u32)cyw_rx_buf[6] << 4;
+    cyw_tx_max = cyw_rx_buf[9];
+    cyw_diag.bcdc_last_channel = *channel;
+    cyw_diag.bcdc_last_frame_len = frame_len;
+    u8 doff = cyw_rx_buf[7];
+    if (doff < SDPCM_HEADER_LEN || doff > frame_len)
+        return false;
+
+    u32 payload_len = frame_len - doff;
+    if (payload_len > (u32)(CYW_MAX_FRAME - doff))
+        return false;
+
+    memcpy(data, cyw_rx_buf + doff, payload_len);
+    *len = payload_len;
+    return true;
+}
+
+/* ── BCDC control messages ── */
+
+static bool bcdc_get_cmd(u32 cmd, u8 *data, u32 data_len, u32 *resp_len);
+
+static bool bcdc_response_ignored(u16 id)
+{
+    return bcdc_ignore_through != 0U &&
+           (u16)(bcdc_ignore_through - id) < 0x8000U;
+}
+
+static void bcdc_cache_response(const u8 *frame, u32 len)
+{
+    if (!frame || len < BCDC_HEADER_LEN)
+        return;
+    u16 id = (u16)frame[10] | ((u16)frame[11] << 8);
+    u32 status = (u32)frame[12] |
+                 ((u32)frame[13] << 8) |
+                 ((u32)frame[14] << 16) |
+                 ((u32)frame[15] << 24);
+    cyw_diag.bcdc_response_id = id;
+    cyw_diag.bcdc_status = status;
+    if (bcdc_response_ignored(id))
+        return;
+
+    u32 slot = BCDC_RESPONSE_SLOTS;
+    for (u32 i = 0U; i < BCDC_RESPONSE_SLOTS; i++) {
+        if (bcdc_responses[i].valid && bcdc_responses[i].id == id) {
+            slot = i;
+            break;
+        }
+        if (!bcdc_responses[i].valid && slot == BCDC_RESPONSE_SLOTS)
+            slot = i;
+    }
+    if (slot == BCDC_RESPONSE_SLOTS)
+        slot = id % BCDC_RESPONSE_SLOTS;
+
+    struct bcdc_cached_response *cached = &bcdc_responses[slot];
+    cached->id = id;
+    cached->status = status;
+    u32 data_len = len - BCDC_HEADER_LEN;
+    if (data_len > BCDC_RESPONSE_DATA_MAX)
+        data_len = BCDC_RESPONSE_DATA_MAX;
+    cached->data_len = (u16)data_len;
+    if (data_len != 0U)
+        memcpy(cached->data, frame + BCDC_HEADER_LEN, data_len);
+    cached->valid = true;
+}
+
+static bool bcdc_take_response(u16 id, u8 *data, u32 *data_len, u32 *status)
+{
+    for (u32 i = 0U; i < BCDC_RESPONSE_SLOTS; i++) {
+        struct bcdc_cached_response *cached = &bcdc_responses[i];
+        if (!cached->valid || cached->id != id)
+            continue;
+        if (status)
+            *status = cached->status;
+        if (data_len) {
+            u32 copy_len = cached->data_len;
+            if (copy_len > *data_len)
+                copy_len = *data_len;
+            if (data && copy_len != 0U)
+                memcpy(data, cached->data, copy_len);
+            *data_len = copy_len;
+        }
+        cached->valid = false;
+        return true;
+    }
+    return false;
+}
+
+static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len,
+                           bool wait_response)
+{
+    cyw_diag.bcdc_calls++;
+    u32 name_len = pios_strlen(name) + 1;
+    u32 body_len = name_len + data_len;
+    u32 payload_len = BCDC_HEADER_LEN + body_len;
+
+    if (payload_len > CYW_MAX_FRAME - SDPCM_HEADER_LEN)
+        return false;
+
+    static u8 buf[CYW_MAX_FRAME] ALIGNED(64);
+    if (payload_len > sizeof(buf))
+        return false;
+    u16 id = bcdc_reqid++;
+    cyw_diag.bcdc_request_id = id;
+
+    /* BCDC 16-byte header (little-endian) */
+    u32 cmd = WLC_SET_VAR;
+    buf[0]  = (u8)(cmd & 0xFF);
+    buf[1]  = (u8)((cmd >> 8) & 0xFF);
+    buf[2]  = (u8)((cmd >> 16) & 0xFF);
+    buf[3]  = (u8)((cmd >> 24) & 0xFF);
+    buf[4]  = (u8)(body_len & 0xFF);
+    buf[5]  = (u8)((body_len >> 8) & 0xFF);
+    buf[6]  = (u8)((body_len >> 16) & 0xFF);
+    buf[7]  = (u8)((body_len >> 24) & 0xFF);
+    u16 flags = BCDC_FLAG_SET;
+    buf[8]  = (u8)(flags & 0xFF);
+    buf[9]  = (u8)((flags >> 8) & 0xFF);
+    buf[10] = (u8)(id & 0xFF);
+    buf[11] = (u8)((id >> 8) & 0xFF);
+    buf[12] = 0; buf[13] = 0; buf[14] = 0; buf[15] = 0; /* status = 0 */
+
+    /* iovar name */
+    memcpy(buf + BCDC_HEADER_LEN, name, name_len);
+
+    /* data */
+    if (data && data_len > 0)
+        memcpy(buf + BCDC_HEADER_LEN + name_len, data, data_len);
+
+    if (!sdpcm_send(SDPCM_CTL_CHANNEL, buf, payload_len)) {
+        cyw_diag.bcdc_send_failures++;
+        return false;
+    }
+    if (!wait_response) {
+        bcdc_ignore_through = id;
+        return true;
+    }
+
+    /* Regulatory CLM processing can take several seconds before firmware
+     * emits the correlated BCDC response. Keep the wait bounded but long
+     * enough that its reply is not misclassified as stale by the next call. */
+    u64 deadline = timer_monotonic_ms() + 15000ULL;
+    u32 polls = 0U;
+    while (timer_monotonic_ms() < deadline) {
+        u32 status = 0U;
+        if (bcdc_take_response(id, NULL, NULL, &status)) {
+            cyw_diag.bcdc_response_id = id;
+            cyw_diag.bcdc_status = status;
+            return status == 0U;
+        }
+        if ((polls++ & 127U) == 0U)
+            watchdog_hw_pet();
+        if (sdpcm_pending_bytes() == 0U) {
+            timer_delay_ms(1U);
+            continue;
+        }
+        u8 channel = 0;
+        u32 rlen = CYW_MAX_FRAME;
+        if (!sdpcm_recv(&channel, cyw_rx_buf, &rlen))
+            continue;
+        if (channel == SDPCM_EVENT_CHANNEL) {
+            handle_event(cyw_rx_buf, rlen);
+            continue;
+        }
+        if (channel != SDPCM_CTL_CHANNEL || rlen < BCDC_HEADER_LEN)
+            continue;
+        bcdc_cache_response(cyw_rx_buf, rlen);
+    }
+    cyw_diag.bcdc_timeouts++;
+    (void)bp_read32(cyw_sdio_regs + SDIOD_INTSTATUS,
+                    &cyw_diag.sdiod_intstatus);
+    (void)bp_read32(cyw_sdio_regs + SDIOD_INTMASK,
+                    &cyw_diag.sdiod_intmask);
+    (void)bp_read32(cyw_sdio_regs + SDIOD_TOHOSTMAILBOXDATA,
+                    &cyw_diag.sdiod_mailbox);
+    /* WLC_SET_VAR is accepted asynchronously by this firmware. The command
+     * response may trail subsequent requests by tens of seconds; scan/join
+     * success is authoritatively reported by firmware events instead. */
+    return true;
+}
+
+static bool bcdc_get_iovar(const char *name, u8 *resp, u32 *resp_len)
+{
+    if (!name || !resp_len || *resp_len == 0U || *resp_len > 512U)
+        return false;
+    u32 name_len = pios_strlen(name) + 1;
+    if (name_len > *resp_len)
+        return false;
+
+    u8 query[512];
+    u32 query_len = *resp_len;
+    memset(query, 0, query_len);
+    memcpy(query, name, name_len);
+    u32 actual = query_len;
+    if (!bcdc_get_cmd(WLC_GET_VAR, query, query_len, &actual))
+        return false;
+    if (resp && actual != 0U)
+        memcpy(resp, query, actual);
+    *resp_len = actual;
+    return true;
+}
+
+static bool bcdc_set_cmd(u32 cmd, const void *data, u32 data_len,
+                         bool wait_response)
+{
+    u32 payload_len = BCDC_HEADER_LEN + data_len;
+    if (payload_len > sizeof(cyw_tx_buf) - SDPCM_HEADER_LEN)
+        return false;
+
+    static u8 buf[CYW_MAX_FRAME] ALIGNED(64);
+    if (payload_len > sizeof(buf))
+        return false;
+    u16 id = bcdc_reqid++;
+
+    /* BCDC 16-byte header (little-endian) */
+    buf[0]  = (u8)(cmd & 0xFF);
+    buf[1]  = (u8)((cmd >> 8) & 0xFF);
+    buf[2]  = (u8)((cmd >> 16) & 0xFF);
+    buf[3]  = (u8)((cmd >> 24) & 0xFF);
+    buf[4]  = (u8)(data_len & 0xFF);
+    buf[5]  = (u8)((data_len >> 8) & 0xFF);
+    buf[6]  = (u8)((data_len >> 16) & 0xFF);
+    buf[7]  = (u8)((data_len >> 24) & 0xFF);
+    u16 flags = BCDC_FLAG_SET;
+    buf[8]  = (u8)(flags & 0xFF);
+    buf[9]  = (u8)((flags >> 8) & 0xFF);
+    buf[10] = (u8)(id & 0xFF);
+    buf[11] = (u8)((id >> 8) & 0xFF);
+    buf[12] = 0; buf[13] = 0; buf[14] = 0; buf[15] = 0; /* status = 0 */
+
+    if (data && data_len > 0)
+        memcpy(buf + BCDC_HEADER_LEN, data, data_len);
+
+    if (!sdpcm_send(SDPCM_CTL_CHANNEL, buf, payload_len))
+        return false;
+    if (wait_response) {
+        u64 deadline = timer_monotonic_ms() + 15000ULL;
+        u32 polls = 0U;
+        while (timer_monotonic_ms() < deadline) {
+            u32 status = 0U;
+            if (bcdc_take_response(id, NULL, NULL, &status)) {
+                cyw_diag.bcdc_response_id = id;
+                cyw_diag.bcdc_status = status;
+                return status == 0U;
+            }
+            if ((polls++ & 127U) == 0U)
+                watchdog_hw_pet();
+            if (sdpcm_pending_bytes() == 0U) {
+                timer_delay_ms(1U);
+                continue;
+            }
+            u8 channel = 0U;
+            u32 rlen = CYW_MAX_FRAME;
+            if (!sdpcm_recv(&channel, cyw_rx_buf, &rlen))
+                continue;
+            if (channel == SDPCM_EVENT_CHANNEL)
+                handle_event(cyw_rx_buf, rlen);
+            else if (channel == SDPCM_CTL_CHANNEL)
+                bcdc_cache_response(cyw_rx_buf, rlen);
+        }
+        cyw_diag.bcdc_timeouts++;
+        return false;
+    }
+    bcdc_ignore_through = id;
+    return true;
+}
+
+static bool bcdc_get_cmd(u32 cmd, u8 *data, u32 data_len, u32 *resp_len)
+{
+    u32 payload_len = BCDC_HEADER_LEN + data_len;
+    if (!resp_len || payload_len > CYW_MAX_FRAME - SDPCM_HEADER_LEN)
+        return false;
+
+    static u8 buf[CYW_MAX_FRAME] ALIGNED(64);
+    u16 ids[3];
+    cyw_diag.bcdc_calls += 3U;
+
+    /* BCDC 16-byte header (little-endian) */
+    buf[0]  = (u8)(cmd & 0xFF);
+    buf[1]  = (u8)((cmd >> 8) & 0xFF);
+    buf[2]  = (u8)((cmd >> 16) & 0xFF);
+    buf[3]  = (u8)((cmd >> 24) & 0xFF);
+    buf[4]  = (u8)(data_len & 0xFF);
+    buf[5]  = (u8)((data_len >> 8) & 0xFF);
+    buf[6]  = (u8)((data_len >> 16) & 0xFF);
+    buf[7]  = (u8)((data_len >> 24) & 0xFF);
+    buf[8]  = 0; buf[9] = 0;   /* flags = 0 (GET) */
+    buf[12] = 0; buf[13] = 0; buf[14] = 0; buf[15] = 0; /* status = 0 */
+
+    if (data && data_len > 0U)
+        memcpy(buf + BCDC_HEADER_LEN, data, data_len);
+
+    for (u32 probe = 0U; probe < 3U; probe++) {
+        ids[probe] = bcdc_reqid++;
+        buf[10] = (u8)(ids[probe] & 0xFF);
+        buf[11] = (u8)((ids[probe] >> 8) & 0xFF);
+        cyw_diag.bcdc_request_id = ids[probe];
+        if (!sdpcm_send(SDPCM_CTL_CHANNEL, buf, payload_len)) {
+            cyw_diag.bcdc_send_failures++;
+            return false;
+        }
+    }
+
+    u64 deadline = timer_monotonic_ms() + CYW_BCDC_GET_TIMEOUT_MS;
+    u32 polls = 0U;
+    while (timer_monotonic_ms() < deadline) {
+        for (u32 probe = 0U; probe < 3U; probe++) {
+            u32 actual = data_len;
+            u32 status = 0U;
+            if (bcdc_take_response(ids[probe], data, &actual, &status)) {
+                cyw_diag.bcdc_response_id = ids[probe];
+                cyw_diag.bcdc_status = status;
+                *resp_len = actual;
+                return status == 0U;
+            }
+        }
+        if ((polls++ & 127U) == 0U)
+            watchdog_hw_pet();
+        if (sdpcm_pending_bytes() == 0U) {
+            timer_delay_ms(1U);
+            continue;
+        }
+        u8 channel = 0U;
+        u32 rlen = CYW_MAX_FRAME;
+        if (!sdpcm_recv(&channel, cyw_rx_buf, &rlen))
+            continue;
+        if (channel == SDPCM_EVENT_CHANNEL) {
+            handle_event(cyw_rx_buf, rlen);
+            continue;
+        }
+        if (channel != SDPCM_CTL_CHANNEL || rlen < BCDC_HEADER_LEN)
+            continue;
+        bcdc_cache_response(cyw_rx_buf, rlen);
+    }
+    cyw_diag.bcdc_timeouts++;
+    return false;
+}
+
+/* ── Event handling ── */
+
+static void handle_event(const u8 *data, u32 len)
+{
+    /* BDC data header(4) + Ethernet(14) + Broadcom header(10) +
+     * wl_event_msg(48). */
+    const u32 event_base = 4U;
+    if (len < event_base + 72U)
+        return;
+
+    /* wl_event_msg starts after BDC + Ethernet + Broadcom headers:
+     * version[0:2], flags[2:4], event_type[4:8], status[8:12]. */
+    u16 event_flags = ((u16)data[event_base + 26U] << 8) |
+                      (u16)data[event_base + 27U];
+    u32 event_type = ((u32)data[event_base + 28U] << 24) |
+                     ((u32)data[event_base + 29U] << 16) |
+                     ((u32)data[event_base + 30U] << 8) |
+                     (u32)data[event_base + 31U];
+    u32 status = ((u32)data[event_base + 32U] << 24) |
+                 ((u32)data[event_base + 33U] << 16) |
+                 ((u32)data[event_base + 34U] << 8) |
+                 (u32)data[event_base + 35U];
+    u32 reason = ((u32)data[event_base + 36U] << 24) |
+                 ((u32)data[event_base + 37U] << 16) |
+                 ((u32)data[event_base + 38U] << 8) |
+                 (u32)data[event_base + 39U];
+    cyw_diag.last_event_type = event_type;
+    cyw_diag.last_event_status = status;
+    cyw_diag.last_event_flags = event_flags;
+    cyw_diag.last_event_len = len;
+    cyw_diag.last_event_reason = reason;
+    cyw_diag.event_count++;
+    u32 capture = len < 36U ? len : 36U;
+    memset(cyw_diag.event_words, 0, sizeof(cyw_diag.event_words));
+    for (u32 i = 0U; i < capture; i++)
+        ((u8 *)cyw_diag.event_words)[i] = data[i];
+
+    switch (event_type) {
+    case CYW_E_AUTH:
+        if (status != CYW_E_STATUS_SUCCESS)
+            cyw_link = CYW_LINK_AUTH_FAIL;
+        break;
+
+    case CYW_E_ASSOC:
+        if (status != CYW_E_STATUS_SUCCESS)
+            cyw_link = CYW_LINK_AUTH_FAIL;
+        break;
+
+    case CYW_E_PSK_SUP:
+        if (status == CYW_E_STATUS_SUCCESS) {
+            scan_flush_remaining = 0U;
+        } else if (status == CYW_E_STATUS_TIMEOUT) {
+            cyw_link = CYW_LINK_AUTH_FAIL;
+        }
+        break;
+
+    case CYW_E_SET_SSID:
+        if (status == CYW_E_STATUS_SUCCESS) {
+            cyw_link = CYW_LINK_UP;
+            uart_puts("[cyw] connected\n");
+        } else {
+            cyw_link = CYW_LINK_AUTH_FAIL;
+            uart_puts("[cyw] conn fail st=");
+            uart_hex(status);
+            uart_puts("\n");
+        }
+        break;
+
+    case CYW_E_LINK:
+        if (status == CYW_E_STATUS_SUCCESS) {
+            if (event_flags & 1U) {
+                cyw_link = CYW_LINK_UP;
+                uart_puts("[cyw] link up\n");
+            } else {
+                cyw_link = CYW_LINK_DOWN;
+                uart_puts("[cyw] link down\n");
+            }
+        }
+        break;
+
+    case CYW_E_DISASSOC_IND:
+    case CYW_E_DEAUTH_IND:
+        cyw_link = CYW_LINK_DOWN;
+        uart_puts("[cyw] discon ev=");
+        uart_hex(event_type);
+        uart_puts(")\n");
+        break;
+
+    case CYW_E_ESCAN_RESULT:
+        if (status == CYW_E_STATUS_PARTIAL) {
+            /* Event payload starts after the 76-byte wrapped event. The
+             * escan_result fixed header is 12
+             * bytes, followed by packed brcmf_bss_info. */
+            const u32 bss = event_base + 84U;
+            if (bss + 8U <= len) {
+                u32 record_len = load_le32(data + bss + 4U);
+                if (record_len <= len - bss)
+                    (void)scan_store_bss(data + bss, record_len);
+            }
+        } else if (status == CYW_E_STATUS_SUCCESS) {
+            scan_in_progress = false;
+            scan_results_pending = false;
+            scan_flush_remaining = 0U;
+            uart_puts("[cyw] scan done n=");
+            uart_hex(scan_count);
+            uart_puts("\n");
+        }
+
+        break;
+
+    default:
+        break;
+    }
+}
+
+static u32 load_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) |
+           ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static bool scan_store_bss(const u8 *bss, u32 record_len)
+{
+    if (!bss || record_len < 128U)
+        return false;
+    u8 ssid_len = bss[18U];
+    if (ssid_len > CYW_SSID_MAX ||
+        19U + (u32)ssid_len > record_len)
+        return false;
+
+    u32 slot = scan_count;
+    for (u32 i = 0U; i < scan_count; i++) {
+        if (memcmp(scan_results[i].bssid, bss + 8U, CYW_MAC_LEN) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == scan_count) {
+        if (scan_count >= CYW_MAX_SCAN_RESULTS)
+            return true;
+        scan_count++;
+        memset(&scan_results[slot], 0, sizeof(scan_results[slot]));
+    }
+
+    struct cyw_scan_result *r = &scan_results[slot];
+    memcpy(r->bssid, bss + 8U, CYW_MAC_LEN);
+    r->capability = (u16)bss[16U] | ((u16)bss[17U] << 8);
+    r->ssid_len = ssid_len;
+    memcpy(r->ssid, bss + 19U, ssid_len);
+    r->rssi = (i16)((u16)bss[78U] | ((u16)bss[79U] << 8));
+    r->chanspec = (u16)bss[72U] | ((u16)bss[73U] << 8);
+    r->channel = bss[88U];
+    r->security = 0U;
+    u16 ie_offset = (u16)bss[116U] | ((u16)bss[117U] << 8);
+    u32 ie_length = load_le32(bss + 120U);
+    if (ie_offset <= record_len && ie_length <= record_len - ie_offset) {
+        const u8 *ie = bss + ie_offset;
+        u32 available = ie_length;
+        while (available >= 2U) {
+            u32 item_len = ie[1];
+            if (item_len + 2U > available)
+                break;
+            if (ie[0] == 48U && item_len >= 8U) {
+                const u8 *p = ie + 2U;
+                u32 left = item_len;
+                if (left < 8U)
+                    break;
+                p += 6U;
+                left -= 6U;
+                u16 pairwise_count = (u16)p[0] | ((u16)p[1] << 8);
+                p += 2U;
+                left -= 2U;
+                u32 pairwise_bytes = (u32)pairwise_count * 4U;
+                if (pairwise_bytes > left)
+                    break;
+                p += pairwise_bytes;
+                left -= pairwise_bytes;
+                if (left < 2U)
+                    break;
+                u16 akm_count = (u16)p[0] | ((u16)p[1] << 8);
+                p += 2U;
+                left -= 2U;
+                u32 akm_bytes = (u32)akm_count * 4U;
+                if (akm_bytes > left)
+                    break;
+                for (u32 i = 0U; i < akm_count; i++, p += 4U) {
+                    if (p[0] != 0x00U || p[1] != 0x0FU ||
+                        p[2] != 0xACU)
+                        continue;
+                    if (p[3] == 2U)
+                        r->security |= CYW_SCAN_SEC_WPA2_PSK;
+                    else if (p[3] == 6U)
+                        r->security |= CYW_SCAN_SEC_PSK_SHA256;
+                    else if (p[3] == 8U)
+                        r->security |= CYW_SCAN_SEC_SAE;
+                }
+                left -= akm_bytes;
+                if (left >= 2U) {
+                    u16 caps = (u16)p[0] | ((u16)p[1] << 8);
+                    if ((caps & (1U << 7)) != 0U)
+                        r->security |= CYW_SCAN_SEC_MFP_CAPABLE;
+                    if ((caps & (1U << 6)) != 0U)
+                        r->security |= CYW_SCAN_SEC_MFP_REQUIRED;
+                }
+                break;
+            }
+            ie += item_len + 2U;
+            available -= item_len + 2U;
+        }
+    }
+    cyw_diag.scan_result_count = scan_count;
+    return true;
+}
+
+static bool scan_parse_legacy_results(const u8 *data, u32 len)
+{
+    if (!data || len < 12U)
+        return false;
+
+    u32 buflen = load_le32(data);
+    u32 records = load_le32(data + 8U);
+    if (buflen < 12U)
+        return false;
+    bool truncated = buflen > len;
+    if (buflen < len)
+        len = buflen;
+
+    u32 offset = 12U;
+    scan_count = 0U;
+    for (u32 i = 0U; i < records; i++) {
+        if (offset > len || len - offset < 8U) {
+            if (truncated && scan_count > 0U)
+                break;
+            return false;
+        }
+        const u8 *bss = data + offset;
+        u32 record_len = load_le32(bss + 4U);
+        if (record_len < 128U)
+            return false;
+        if (record_len > len - offset) {
+            if (truncated && scan_count > 0U)
+                break;
+            return false;
+        }
+        if (!scan_store_bss(bss, record_len))
+            return false;
+        offset += record_len;
+    }
+    return true;
+}
+
+static bool scan_fetch_legacy_results(void)
+{
+    static u8 result_buf[CYW_SCAN_QUERY_BYTES] ALIGNED(64);
+    bool parsed = false;
+    for (u32 attempt = 0U; attempt < 2U; attempt++) {
+        memset(result_buf, 0, sizeof(result_buf));
+        result_buf[0] = (u8)(sizeof(result_buf) & 0xFFU);
+        result_buf[1] = (u8)((sizeof(result_buf) >> 8) & 0xFFU);
+        result_buf[4] = 109U; /* current brcmf_bss_info_le version */
+
+        u32 response_len = sizeof(result_buf);
+        if (!bcdc_get_cmd(WLC_SCAN_RESULTS, result_buf,
+                          sizeof(result_buf), &response_len))
+            continue;
+        if (scan_parse_legacy_results(result_buf, response_len)) {
+            parsed = true;
+            break;
+        }
+    }
+    if (!parsed)
+        return false;
+
+    scan_results_pending = false;
+    uart_puts("[cyw] legacy scan n=");
+    uart_hex(scan_count);
+    uart_puts("\n");
+    return true;
+}
+
+/* ── Firmware upload ── */
+
+/* upload_nvram is called from cyw43_load_firmware below */
+
+static bool upload_nvram(const u8 *nvram, u32 nvram_len)
+{
+    uart_puts("[cyw] uploading NVRAM (");
+    uart_hex(nvram_len);
+    uart_puts(" B)...\n");
+
+    /* NVRAM goes at the end of RAM, with a length token */
+    u32 ram_size = cyw_ram_bytes;
+    if (ram_size == 0U)
+        return false;
+
+    /* Condense NVRAM: strip comments/blanks, NUL-separate key=value pairs */
+    static u8 nvram_condensed[4096];
+    u32 clen = 0;
+    for (u32 i = 0; i < nvram_len; ) {
+        /* Skip comment lines */
+        if (nvram[i] == '#') {
+            while (i < nvram_len && nvram[i] != '\n') i++;
+            if (i < nvram_len) i++;
+            continue;
+        }
+        /* Skip blank lines */
+        if (nvram[i] == '\n' || nvram[i] == '\r') { i++; continue; }
+        /* Copy key=value until newline, terminate with NUL */
+        while (i < nvram_len && nvram[i] != '\n' && nvram[i] != '\r'
+               && clen < sizeof(nvram_condensed) - 2)
+            nvram_condensed[clen++] = nvram[i++];
+        nvram_condensed[clen++] = '\0';
+        while (i < nvram_len && (nvram[i] == '\n' || nvram[i] == '\r')) i++;
+    }
+    nvram_condensed[clen++] = '\0'; /* double-NUL terminator */
+
+    /* Pad to 4-byte boundary */
+    while (clen & 3) nvram_condensed[clen++] = '\0';
+
+    u32 nvram_offset = ram_size - 4 - clen;
+    nvram_offset &= ~0x3U;  /* word-align */
+
+    if (!bp_write_buf(cyw_ram_base + nvram_offset, nvram_condensed, clen)) {
+        uart_puts("[cyw] NVRAM write fail\n");
+        return false;
+    }
+
+    /* Write length token: complement of size-in-words in upper 16 bits */
+    u32 token = (~(clen / 4) << 16) | (clen / 4);
+    if (!bp_write32(cyw_ram_base + ram_size - 4, token)) {
+        uart_puts("[cyw] NVRAM token fail\n");
+        return false;
+    }
+
+    uart_puts("[cyw] nvram ");
+    uart_hex(clen);
+    uart_puts("B\n");
+    return true;
+}
+
+/* ── Backplane init (Issue #65) ── */
+
+static bool cyw43_backplane_init(void)
+{
+    /* ALP clock MUST be active before accessing core wrappers */
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, 0);
+    delay_cycles(5000);
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR,
+                     CLKCSR_Nohwreq | CLKCSR_ReqALP);
+    for (u32 i = 0; i < 1000; i++) {
+        u8 clk;
+        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk) &&
+            (clk & (CLKCSR_ALPavail | CLKCSR_HTavail)))
+            break;
+        delay_cycles(5000);
+    }
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR,
+                     CLKCSR_Nohwreq | CLKCSR_ForceALP);
+    delay_cycles(30000);
+    uart_puts("[cyw] ALP ok\n");
+
+    /* Core scan: read EROM to discover actual core addresses */
+    u32 eromptr;
+    if (!bp_read32(CYW_CHIPCOMMON_BASE + 0xFC, &eromptr)) {
+        uart_puts("[cyw] EROMPTR fail\n");
+        return false;
+    }
+    uart_puts("[cyw] EROM=");
+    uart_hex(eromptr);
+    uart_puts("\n");
+
+    /* Parse EROM entries to find ARM, D11, SOCSRAM, SDIOD cores */
+    u32 arm_ctl = 0, arm_regs = 0, d11_ctl = 0, sram_ctl = 0, sdio_regs = 0;
+    u32 coreid = 0;
+    for (u32 i = 0; i < 512; i += 4) {
+        u32 entry;
+        if (!bp_read32(eromptr + i, &entry))
+            break;
+        u32 tag = entry & 0xF;
+        if (tag == 0xF) break;  /* end marker */
+        if (tag == 0x1) {  /* component info */
+            u32 next;
+            if (!bp_read32(eromptr + i + 4, &next)) break;
+            if ((next & 0xF) == 0x1) {
+                coreid = (entry >> 8) & 0xFFF;
+                uart_puts("[e] c=");
+                uart_hex(coreid);
+                i += 4;
+            }
+        } else if (tag == 0x5) {  /* address descriptor */
+            u32 addr = entry & 0xFFFFF000U;
+            bool is_ctl = (entry & 0xC0) != 0;
+            uart_puts(is_ctl ? " W" : " M");
+            uart_hex(addr);
+            switch (coreid) {
+            case 0x83C: case 0x83E:  /* ARM CR4 / CA7 */
+                if (is_ctl && !arm_ctl) arm_ctl = addr;
+                if (!is_ctl && !arm_regs) arm_regs = addr;
+                break;
+            case 0x80E: case 0x135:  /* SOCSRAM / SOCRAM-es */
+                if (is_ctl && !sram_ctl) sram_ctl = addr;
+                break;
+            case 0x812:  /* D11 */
+                if (is_ctl && !d11_ctl) d11_ctl = addr;
+                break;
+            case 0x829:  /* SDIOD */
+                if (!is_ctl && !sdio_regs) sdio_regs = addr;
+                break;
+            }
+        }
+    }
+
+    uart_puts("[cyw] ARM=");
+    uart_hex(arm_ctl);
+    uart_puts(" r=");
+    uart_hex(arm_regs);
+    uart_puts(" SRAM=");
+    uart_hex(sram_ctl);
+    uart_puts(" SDIO=");
+    uart_hex(sdio_regs);
+    uart_puts("\n");
+
+    if (!arm_ctl) {
+        uart_puts("[cyw] no ARM core\n");
+        return false;
+    }
+
+    /* Store discovered addresses for firmware load */
+    cyw_arm_ctl = arm_ctl;
+    cyw_arm_regs = arm_regs;
+    cyw_d11_ctl = d11_ctl;
+    cyw_sram_ctl = sram_ctl;
+    cyw_sdio_regs = sdio_regs;
+    /* CYW43455 TCM RAM base is chip-specific, not from EROM.
+     * Linux brcmf_chip_tcm_rambase: 0x4345 → 0x198000.
+     * Keep the #define CYW_RAM_BASE default. */
+
+    cyw_ram_bytes = cyw43_tcm_ramsize();
+    if (cyw_ram_bytes == 0U || cyw_ram_bytes > 4U * 1024U * 1024U) {
+        uart_puts("[cyw] invalid RAM size\n");
+        return false;
+    }
+    uart_puts("[cyw] RAM base=");
+    uart_hex(cyw_ram_base);
+    uart_puts(" size=");
+    uart_hex(cyw_ram_bytes);
+    uart_puts("\n");
+
+    /* Match brcmf_chip_disable_arm() for CR4: leave the CPU halted. */
+    if (!core_reset(cyw_arm_ctl, SICF_CPUHALT,
+                    SICF_CPUHALT, SICF_CPUHALT)) {
+        uart_puts("[cyw] ARM!\n");
+        return false;
+    }
+
+    /* Match brcmf_chip_cr4_set_passive(): D11 remains disabled in reset;
+     * firmware, not the host, releases and configures it. */
+    if (cyw_d11_ctl &&
+        !core_disable(cyw_d11_ctl,
+                      D11_PHYRESET | D11_PHYCLOCKEN,
+                      D11_PHYCLOCKEN)) {
+        uart_puts("[cyw] D11!\n");
+        return false;
+    }
+
+    /* Clear pull-ups/pull-downs */
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_PULLUPS, 0);
+    bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLUP, 0);
+    bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLDOWN, 0);
+
+    return true;
+}
+
+/* ── Public API ── */
+
+bool cyw43_init(void)
+{
+    cyw_diag.stage = 1U;
+    cyw_diag.last_error = 0U;
+    cyw_link = CYW_LINK_DOWN;
+    cyw_tx_seq = 0;
+    cyw_tx_max = 4U;
+    cyw_backplane_window = 0;
+    sdpcm_frame_pending = false;
+    sdpcm_next_len = 0U;
+    bcdc_reqid = 1;
+    bcdc_ignore_through = 0U;
+    memset(bcdc_responses, 0, sizeof(bcdc_responses));
+    scan_count = 0;
+    cyw_diag.scan_result_count = 0U;
+    scan_in_progress = false;
+    scan_results_pending = false;
+    scan_ready_ms = 0ULL;
+    scan_flush_remaining = 0U;
+    cyw_diag.last_event_type = 0U;
+    cyw_diag.last_event_status = 0U;
+    cyw_diag.last_event_flags = 0U;
+    cyw_diag.last_event_len = 0U;
+    cyw_diag.event_count = 0U;
+    cyw_diag.scan_result_count = 0U;
+    cyw_diag.last_event_reason = 0U;
+    memset(cyw_diag.event_words, 0, sizeof(cyw_diag.event_words));
+    cyw_eapol_len = 0U;
+    cyw_diag.eapol_frames = 0U;
+    cyw_diag.eapol_len = 0U;
+    cyw_diag.eapol_key_info = 0U;
+    cyw_diag.eapol_replay_hi = 0U;
+    cyw_diag.eapol_replay_lo = 0U;
+    memset(cyw_diag.eapol_words, 0, sizeof(cyw_diag.eapol_words));
+    memset(cyw_mac, 0, CYW_MAC_LEN);
+
+    uart_puts("[cyw] init...\n");
+
+    /* Initialize SDIO controller and enumerate card */
+    if (!sdio_init()) {
+        cyw_diag.last_error = 1U;
+        uart_puts("[cyw] SDIO fail\n");
+        return false;
+    }
+
+    /* Enable backplane function (func 1) */
+    if (!sdio_enable_func(SDIO_FUNC_BACKPLANE)) {
+        cyw_diag.last_error = 2U;
+        uart_puts("[cyw] f1 enable fail\n");
+        return false;
+    }
+    sdio_set_block_size(SDIO_FUNC_BACKPLANE, SDIO_FUNC1_BLKSZ);
+
+    /* Enable 4-bit SDIO bus */
+    sdio_set_bus_width_4bit();
+
+    /* Identify chip via backplane */
+    if (!chip_identify()) {
+        cyw_diag.last_error = 3U;
+        uart_puts("[cyw] chip ID fail\n");
+        return false;
+    }
+
+    /* Backplane init: halt ARM, reset cores, setup clocks */
+    if (!cyw43_backplane_init()) {
+        cyw_diag.last_error = 4U;
+        uart_puts("[cyw] bp fail\n");
+        return false;
+    }
+
+    /* Enable function interrupts for backplane */
+    sdio_enable_func_irq(SDIO_FUNC_BACKPLANE);
+
+    /* NOTE: func 2 (WLAN) is enabled AFTER firmware load in cyw43_load_firmware(),
+     * because the WLAN function won't be ready until firmware boots. */
+
+    uart_puts("[cyw] init OK\n");
+    cyw_diag.stage = 2U;
+    return true;
+}
+
+bool cyw43_preload_blobs(void)
+{
+    if (blobs_loaded) {
+        uart_puts("[cyw-pre] using installed blobs fw=");
+        uart_hex(fw_buf_len);
+        uart_puts(" nv=");
+        uart_hex(nvram_buf_len);
+        uart_puts(" clm=");
+        uart_hex(clm_buf_len);
+        uart_puts("\n");
+        return true;
+    }
+
+    cyw_diag.stage = 10U;
+    fw_buf_len = nvram_buf_len = clm_buf_len = 0;
+    fw_data = fw_buf;
+    nvram_data = nvram_buf;
+    clm_data = clm_buf;
+
+    if (!fat32_init()) {
+        uart_puts("[cyw-pre] FAT32 fail\n");
+        return false;
+    }
+
+    /* Firmware */
+    {
+        fat32_file_t fw;
+        if (!fat32_open("/wifi/firmware.bin", &fw)) {
+            uart_puts("[cyw-pre] no fw\n");
+            return false;
+        }
+        if (fw.file_size > CYW_FW_MAX_SIZE) {
+            uart_puts("[cyw-pre] fw too big\n");
+            fat32_close(&fw);
+            return false;
+        }
+        u32 off = 0;
+        while (off < fw.file_size) {
+            u32 chunk = fw.file_size - off;
+            if (chunk > 4096) chunk = 4096;
+            u32 got = fat32_read(&fw, fw_buf + off, chunk);
+            if (got == 0) {
+                uart_puts("[cyw-pre] fw read err @");
+                uart_hex(off);
+                uart_puts("\n");
+                fat32_close(&fw);
+                return false;
+            }
+            off += got;
+        }
+        fat32_close(&fw);
+        fw_buf_len = off;
+        uart_puts("[cyw-pre] fw loaded ");
+        uart_hex(fw_buf_len);
+        uart_puts("\n");
+    }
+
+    /* NVRAM (optional) */
+    {
+        fat32_file_t nv;
+        if (fat32_open("/wifi/nvram.txt", &nv)) {
+            if (nv.file_size <= CYW_NVRAM_MAX) {
+                nvram_buf_len = fat32_read(&nv, nvram_buf, nv.file_size);
+                uart_puts("[cyw-pre] nvram loaded ");
+                uart_hex(nvram_buf_len);
+                uart_puts("\n");
+            }
+            fat32_close(&nv);
+        }
+    }
+
+    /* CLM (optional) */
+    {
+        fat32_file_t clm;
+        if (fat32_open("/wifi/clm.bin", &clm)) {
+            if (clm.file_size <= CYW_CLM_MAX) {
+                clm_buf_len = fat32_read(&clm, clm_buf, clm.file_size);
+                uart_puts("[cyw-pre] clm loaded ");
+                uart_hex(clm_buf_len);
+                uart_puts("\n");
+            }
+            fat32_close(&clm);
+        }
+    }
+
+    blobs_loaded = fw_buf_len != 0U && nvram_buf_len != 0U &&
+                   clm_buf_len != 0U;
+    cyw_diag.fw_len = fw_buf_len;
+    cyw_diag.nvram_len = nvram_buf_len;
+    cyw_diag.clm_len = clm_buf_len;
+    if (!blobs_loaded) {
+        cyw_diag.last_error = 10U;
+        uart_puts("[cyw-pre] incomplete blob set\n");
+        return false;
+    }
+    cyw_diag.stage = 11U;
+    return true;
+}
+
+bool cyw43_load_firmware(void)
+{
+    cyw_diag.stage = 20U;
+    cyw_diag.last_error = 0U;
+    cyw_diag.ram_base = cyw_ram_base;
+    cyw_diag.ram_size = cyw_ram_bytes;
+    cyw_diag.firmware_uploaded = 0U;
+    cyw_diag.firmware_verified = 0U;
+    cyw_diag.f1_batch_blocks = 0U;
+    cyw_diag.firmware_upload_ms = 0U;
+    cyw_diag.ht_available = 0U;
+    cyw_diag.func2_ready = 0U;
+    cyw_diag.clm_loaded = 0U;
+    /*
+     * Load firmware, NVRAM, and CLM blobs from preloaded RAM buffers
+     * (cyw43_preload_blobs() must be called BEFORE cyw43_init since
+     *  SDIO2 init disturbs the EMMC2 SD controller).
+     */
+
+    if (!blobs_loaded) {
+        cyw_diag.last_error = 20U;
+        uart_puts("[cyw] blobs not preloaded\n");
+        return false;
+    }
+    uart_puts("[cyw] using preloaded blobs fw=");
+    uart_hex(fw_buf_len);
+    uart_puts(" nv=");
+    uart_hex(nvram_buf_len);
+    uart_puts(" clm=");
+    uart_hex(clm_buf_len);
+    uart_puts("\n");
+
+    if (!probe_f1_multiblock()) {
+        cyw_diag.last_error = 27U;
+        uart_puts("[cyw] F1 multiblock verify failed\n");
+        return false;
+    }
+    cyw_diag.f1_batch_blocks = CYW_F1_BATCH_BLOCKS;
+    uart_puts("[cyw] F1 multiblock verified\n");
+
+    /* Request ALP clock for backplane memory access */
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqALP);
+    for (u32 i = 0; i < 1000; i++) {
+        u8 clk;
+        if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk) &&
+            (clk & CLKCSR_ALPavail))
+            break;
+        delay_cycles(5000);
+    }
+
+    /* Quick sanity: try writing 4 bytes at RAM base via bp_write32 */
+    uart_puts("[cyw] sanity bp_write32 @ rambase ");
+    uart_hex(cyw_ram_base);
+    uart_puts("...\n");
+    if (!bp_write32(cyw_ram_base, 0xDEADBEEF)) {
+        uart_puts("[cyw] sanity bp_write32 @ rambase FAILED\n");
+        return false;
+    }
+    uart_puts("[cyw] sanity bp_write32 @ rambase OK\n");
+    {
+        u32 rb = 0;
+        if (bp_read32(cyw_ram_base, &rb)) {
+            uart_puts("[cyw] readback rambase=");
+            uart_hex(rb);
+            uart_puts("\n");
+        } else {
+            uart_puts("[cyw] readback FAIL\n");
+        }
+    }
+
+    /* Clear end of RAM before upload */
+    uart_puts("[cyw] clear EOR @");
+    uart_hex(cyw_ram_base + cyw_ram_bytes - 4U);
+    uart_puts("\n");
+    if (!bp_write32(cyw_ram_base + cyw_ram_bytes - 4U, 0)) {
+        uart_puts("[cyw] EOR clear FAIL\n");
+        return false;
+    }
+    uart_puts("[cyw] EOR clear OK\n");
+
+    /* Capture reset vector (first 4 bytes of FW) for CR4 */
+    u32 resetvec = (u32)fw_data[0] | ((u32)fw_data[1] << 8) |
+                   ((u32)fw_data[2] << 16) | ((u32)fw_data[3] << 24);
+    cyw_diag.reset_vector = resetvec;
+
+    /* Upload firmware binary from preloaded buffer */
+    {
+        u64 upload_start_ms = timer_monotonic_ms();
+        uart_puts("[cyw] fw (");
+        uart_hex(fw_buf_len);
+        uart_puts(" bytes)...\n");
+
+        u32 offset = 0;
+        while (offset < fw_buf_len) {
+            u32 chunk = fw_buf_len - offset;
+            if (chunk > CYW_F1_BATCH_BYTES)
+                chunk = CYW_F1_BATCH_BYTES;
+            if (!bp_write_buf(cyw_ram_base + offset, fw_data + offset, chunk)) {
+                uart_puts("[cyw] fw wr err @");
+                uart_hex(offset);
+                uart_puts("\n");
+                return false;
+            }
+            offset += chunk;
+            if ((offset & 0xFFFF) == 0) { uart_putc('.'); }
+        }
+        uart_puts("[cyw] fw uploaded\n");
+        cyw_diag.firmware_uploaded = 1U;
+        cyw_diag.firmware_upload_ms =
+            (u32)(timer_monotonic_ms() - upload_start_ms);
+        cyw_diag.stage = 21U;
+        for (u32 sample = 0; sample < fw_buf_len; sample += 0x10000U) {
+            u32 got = 0;
+            u32 expected = (u32)fw_data[sample] |
+                           ((u32)fw_data[sample + 1U] << 8) |
+                           ((u32)fw_data[sample + 2U] << 16) |
+                           ((u32)fw_data[sample + 3U] << 24);
+            if (!bp_read32(cyw_ram_base + sample, &got) ||
+                got != expected) {
+                uart_puts("[cyw] fw verify fail @");
+                uart_hex(sample);
+                uart_puts(" got=");
+                uart_hex(got);
+                uart_puts(" exp=");
+                uart_hex(expected);
+                uart_puts("\n");
+                return false;
+            }
+        }
+        uart_puts("[cyw] fw verify OK\n");
+        cyw_diag.firmware_verified = 1U;
+        cyw_diag.stage = 22U;
+    }
+
+    /* Upload NVRAM from preloaded buffer */
+    if (nvram_buf_len > 0) {
+        uart_puts("[cyw] nvram (");
+        uart_hex(nvram_buf_len);
+        uart_puts(" B)\n");
+        if (!upload_nvram(nvram_data, nvram_buf_len)) {
+            cyw_diag.last_error = 21U;
+            uart_puts("[cyw] nvram fail\n");
+            return false;
+        }
+    } else {
+        uart_puts("[cyw] nvram def\n");
+        static const u8 default_nvram[] =
+            "boardtype=0x0646\0"
+            "boardrev=0x1101\0"
+            "boardflags=0x00404001\0"
+            "sromrev=11\0"
+            "boardflags3=0x08000188\0"
+            "macaddr=00:11:22:33:44:55\0"
+            "\0";
+        if (!upload_nvram(default_nvram, sizeof(default_nvram)))
+            return false;
+    }
+
+    /* Verify FW landed in TCM (read first 8 bytes back) */
+    {
+        u32 v0=0xDEADDEAD, v1=0xDEADDEAD;
+        bp_read32(cyw_ram_base, &v0);
+        bp_read32(cyw_ram_base + 4, &v1);
+        uart_puts("[cyw] fw[0]="); uart_hex(v0);
+        uart_puts(" fw[4]="); uart_hex(v1); uart_puts("\n");
+    }
+
+    /* Clear SDIOD interrupt status before ARM reset */
+    uart_puts("[cyw] post-nvram: clearing SDIOD INTSTATUS\n");
+    bp_write32(cyw_sdio_regs + SDIOD_INTSTATUS, 0xFFFFFFFF);
+
+    /* CR4 reset vector: write first 4 bytes of FW to backplane addr 0
+     * (ARM CR4 fetches PC=0 on release; this is the trampoline). */
+    if (resetvec != 0) {
+        uart_puts("[cyw] writing resetvec ");
+        uart_hex(resetvec);
+        uart_puts(" -> 0\n");
+        if (!bp_write32(0, resetvec)) {
+            uart_puts("[cyw] resetvec write fail\n");
+            return false;
+        }
+    }
+
+    /* Reset ARM core to start firmware */
+    uart_puts("[cyw] ARM reset out-of-halt...\n");
+    if (!core_reset(cyw_arm_ctl, SICF_CPUHALT, 0U, 0U)) {
+        cyw_diag.last_error = 22U;
+        uart_puts("[cyw] ARM reset fail\n");
+        return false;
+    }
+    uart_puts("[cyw] ARM reset OK\n");
+
+    /* Read CR4 state post-release */
+    {
+        u32 rc=0xDEADDEAD, ic=0xDEADDEAD;
+        bp_read32(cyw_arm_ctl + CORE_RESETCTRL, &rc);
+        bp_read32(cyw_arm_ctl + CORE_IOCTRL, &ic);
+        cyw_diag.cr4_resetctrl = rc;
+        cyw_diag.cr4_ioctrl = ic;
+        uart_puts("[cyw] CR4 RESETCTRL="); uart_hex(rc);
+        uart_puts(" IOCTRL="); uart_hex(ic); uart_puts("\n");
+    }
+
+    /* sbenable: request HT clock and wait (Issue #67) */
+    uart_puts("[cyw] CLKCSR=0...\n");
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, 0);
+    uart_puts("[cyw] CLKCSR=0 done\n");
+    delay_cycles(500000);
+    uart_puts("[cyw] CLKCSR=ReqHT...\n");
+    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqHT);
+    uart_puts("[cyw] CLKCSR=ReqHT done; polling HT...\n");
+    bool ht_ok = false;
+    for (u32 i = 0; i < 50; i++) {
+        u8 clk = 0;
+        bool rd = sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk);
+        cyw_diag.clkcsr = clk;
+        if (i < 3 || (i & 7) == 0) {
+            uart_puts("[cyw] HT poll i=");
+            uart_hex(i);
+            uart_puts(" rd=");
+            uart_hex(rd ? 1 : 0);
+            uart_puts(" clk=");
+            uart_hex(clk);
+            uart_puts("\n");
+        }
+        if (rd && (clk & CLKCSR_HTavail)) {
+            ht_ok = true;
+            cyw_diag.ht_available = 1U;
+            break;
+        }
+        delay_cycles(5000000);
+    }
+    if (!ht_ok) {
+        cyw_diag.last_error = 23U;
+        cyw_diag.stage = 23U;
+        uart_puts("[cyw] HT timeout\n");
+        return false;
+    }
+    {
+        u8 clk;
+        sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk);
+        sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR,
+                         clk | CLKCSR_ForceHT);
+    }
+    uart_puts("[cyw] HT ok\n");
+
+    /* Set protocol version */
+    bp_write32(cyw_sdio_regs + SDIOD_TOSBMAILBOXDATA, 4 << 16);
+
+    /* Linux HOSTINTMASK: all host-mailbox bits plus CHIPACTIVE. */
+    bp_write32(cyw_sdio_regs + SDIOD_INTMASK, 0x200000F0U);
+
+    /* Enable WLAN data function (func 2) — now that firmware is running */
+    if (!sdio_enable_func(SDIO_FUNC_WLAN)) {
+        cyw_diag.last_error = 24U;
+        uart_puts("[cyw] f2 fail\n");
+        return false;
+    }
+    sdio_set_block_size(SDIO_FUNC_WLAN, SDIO_FUNC2_BLKSZ);
+    sdio_enable_func_irq(SDIO_FUNC_WLAN);
+    cyw_diag.func2_ready = 1U;
+    cyw_diag.stage = 24U;
+
+    /* Firmware signals protocol readiness through the host mailbox. Clear
+     * SDIOD interrupt status and ACK the mailbox before issuing BCDC. */
+    {
+        u64 deadline = timer_monotonic_ms() + 3000ULL;
+        bool ready = false;
+        while (timer_monotonic_ms() < deadline) {
+            (void)sdpcm_pending_bytes();
+            u32 mailbox = cyw_diag.sdiod_mailbox;
+            if (mailbox & (SDIOD_HMB_DEVREADY | SDIOD_HMB_FWREADY)) {
+                ready = true;
+                break;
+            }
+            timer_delay_ms(1U);
+        }
+        if (!ready) {
+            cyw_diag.last_error = 25U;
+            return false;
+        }
+    }
+
+    /* Keep the SDIO core awake for protocol traffic. Without KSO the host TX
+     * FIFO asserts XMTDATA_AVAIL but firmware never consumes BCDC frames. */
+    {
+        bool awake = false;
+        for (u32 i = 0; i < 300U; i++) {
+            u8 sleepcsr = 0;
+            if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE,
+                                  SDIO_SLEEPCSR, SLEEPCSR_KSO))
+                break;
+            timer_delay_us(50U);
+            if (sdio_cmd52_read(SDIO_FUNC_BACKPLANE,
+                                SDIO_SLEEPCSR, &sleepcsr) &&
+                (sleepcsr & (SLEEPCSR_KSO | SLEEPCSR_DEVON)) ==
+                    (SLEEPCSR_KSO | SLEEPCSR_DEVON)) {
+                awake = true;
+                break;
+            }
+        }
+        if (!awake) {
+            cyw_diag.last_error = 26U;
+            return false;
+        }
+    }
+
+    /* Load CLM blob via 'clmload' iovar from preloaded buffer */
+    if (clm_buf_len > 0) {
+        uart_puts("[cyw] loading CLM (");
+        uart_hex(clm_buf_len);
+        uart_puts(" bytes)...\n");
+
+        static u8 ALIGNED(4) clm_chunk[1024 + 16];
+        u32 offset = 0;
+        bool clm_ok = true;
+
+        while (offset < clm_buf_len && clm_ok) {
+            u32 chunk = clm_buf_len - offset;
+            /* Keep BCDC+SDPCM below 512 bytes: multi-block F2 transfers are
+             * not reliable on BCM2712 SDIO2 during bring-up. */
+            if (chunk > 1400U) chunk = 1400U;
+
+            u16 flag = 0x1000U;
+            if (offset == 0U) flag |= 0x0002U;
+            if (offset + chunk >= clm_buf_len) flag |= 0x0004U;
+
+            clm_chunk[0] = flag & 0xFF;
+            clm_chunk[1] = (flag >> 8) & 0xFF;
+            clm_chunk[2] = 0x02;
+            clm_chunk[3] = 0x00;
+            clm_chunk[4] = chunk & 0xFF;
+            clm_chunk[5] = (chunk >> 8) & 0xFF;
+            clm_chunk[6] = (chunk >> 16) & 0xFF;
+            clm_chunk[7] = (chunk >> 24) & 0xFF;
+            clm_chunk[8] = 0; clm_chunk[9] = 0;
+            clm_chunk[10] = 0; clm_chunk[11] = 0;
+
+            for (u32 i = 0; i < chunk; i++)
+                clm_chunk[12 + i] = clm_data[offset + i];
+
+            if (!bcdc_set_iovar("clmload", clm_chunk, 12 + chunk, false))
+                clm_ok = false;
+
+            offset += chunk;
+        }
+        if (clm_ok) {
+            cyw_diag.clm_loaded = 1U;
+            uart_puts("[cyw] CLM ok\n");
+        } else {
+            cyw_diag.last_error = 28U;
+            uart_puts("[cyw] CLM fail\n");
+            return false;
+        }
+    } else {
+        uart_puts("[cyw] no CLM\n");
+    }
+
+    uart_puts("[cyw] fw ok\n");
+    cyw_diag.stage = 25U;
+    return true;
+}
+
+void cyw43_poll(void)
+{
+    if (sdpcm_pending_bytes() != 0U) {
+        /* Read a frame from func 2 */
+        u8 channel;
+        u32 len;
+        if (sdpcm_recv(&channel, cyw_rx_buf, &len)) {
+            switch (channel) {
+            case SDPCM_EVENT_CHANNEL:
+                handle_event(cyw_rx_buf, len);
+                break;
+
+            case SDPCM_DATA_CHANNEL:
+                capture_eapol(cyw_rx_buf, len);
+                break;
+
+            case SDPCM_CTL_CHANNEL:
+                bcdc_cache_response(cyw_rx_buf, len);
+                break;
+
+            default:
+                break;
+            }
+        }
+    }
+    if (scan_flush_remaining != 0U) {
+        u32 up = 0U;
+        if (!bcdc_set_cmd(WLC_UP, &up, sizeof(up), false)) {
+            scan_in_progress = false;
+            scan_results_pending = false;
+            scan_flush_remaining = 0U;
+        } else {
+            scan_flush_remaining--;
+        }
+    }
+}
+
+static bool cyw43_radio_enable(void)
+{
+    u32 zero = 0U;
+    u32 one = 1U;
+    u32 radio_enable = 1U << 16;
+    u32 scan_time = 40U;
+    if (!bcdc_set_cmd(WLC_UP, &zero, sizeof(zero), false) ||
+        !bcdc_set_cmd(WLC_SET_RADIO, &radio_enable,
+                      sizeof(radio_enable), false) ||
+        !bcdc_set_cmd(WLC_SET_INFRA, &one, sizeof(one), false) ||
+        !bcdc_set_cmd(WLC_SET_PM, &zero, sizeof(zero), false) ||
+        !bcdc_set_cmd(WLC_SET_PASSIVE_SCAN, &zero, sizeof(zero), false) ||
+        !bcdc_set_cmd(WLC_SET_SCAN_CHANNEL_TIME,
+                      &scan_time, sizeof(scan_time), false) ||
+        !bcdc_set_cmd(WLC_SET_SCAN_UNASSOC_TIME,
+                      &scan_time, sizeof(scan_time), false) ||
+        !bcdc_set_iovar("mpc", &zero, sizeof(zero), false))
+        return false;
+
+    bool radio_ready = false;
+    u64 radio_deadline = timer_monotonic_ms() + 2000ULL;
+    while (timer_monotonic_ms() < radio_deadline) {
+        u32 resetctrl = AIRC_RESET;
+        u32 ioctrl = 0U;
+        if (bp_read32(cyw_d11_ctl + CORE_RESETCTRL, &resetctrl) &&
+            bp_read32(cyw_d11_ctl + CORE_IOCTRL, &ioctrl) &&
+            (resetctrl & AIRC_RESET) == 0U &&
+            (ioctrl & SICF_CLOCK_EN) != 0U) {
+            radio_ready = true;
+            break;
+        }
+        watchdog_hw_pet();
+        timer_delay_ms(10U);
+    }
+    if (!radio_ready)
+        return false;
+
+    u8 evmask[16];
+    memset(evmask, 0, sizeof(evmask));
+    const u32 events[] = {
+        CYW_E_SET_SSID, CYW_E_JOIN, CYW_E_AUTH, CYW_E_DEAUTH,
+        CYW_E_DEAUTH_IND, CYW_E_ASSOC, CYW_E_DISASSOC,
+        CYW_E_DISASSOC_IND, CYW_E_LINK, CYW_E_PSK_SUP,
+        CYW_E_ESCAN_RESULT
+    };
+    for (u32 i = 0U; i < sizeof(events) / sizeof(events[0]); i++)
+        evmask[events[i] / 8U] |= (u8)(1U << (events[i] % 8U));
+    if (!bcdc_set_iovar("event_msgs", evmask, sizeof(evmask), false))
+        return false;
+    timer_delay_ms(100U);
+    return true;
+}
+
+bool cyw43_scan_start(void)
+{
+    scan_count = 0;
+    scan_in_progress = true;
+    scan_results_pending = true;
+    scan_ready_ms = timer_monotonic_ms() + 30000ULL;
+    scan_flush_remaining = 32U;
+
+    if (!cyw43_radio_enable()) {
+        scan_in_progress = false;
+        scan_results_pending = false;
+        return false;
+    }
+
+    struct {
+        u32 escan_version;
+        u16 action;
+        u16 sync_id;
+        u32 ssid_len;
+        u8  ssid[CYW_SSID_MAX];
+        u8  bssid[CYW_MAC_LEN];
+        i8  bss_type;
+        u8  scan_type;
+        u32 nprobes;
+        u32 active_time;
+        u32 passive_time;
+        u32 home_time;
+        u32 channel_num;
+    } PACKED escan;
+    _Static_assert(sizeof(escan) == 72U,
+                   "Broadcom v1 escan parameters must be 72 bytes");
+
+    memset(&escan, 0, sizeof(escan));
+    escan.escan_version = 1U;
+    escan.action = 1U;
+    escan.sync_id = 0x1234U;
+    memset(escan.bssid, 0xFF, CYW_MAC_LEN);
+    escan.bss_type = 2;  /* any */
+    escan.scan_type = 0U; /* active broadcast scan */
+    escan.nprobes = 0xFFFFFFFFU;
+    escan.active_time = 0xFFFFFFFFU;
+    escan.passive_time = 0xFFFFFFFFU;
+    escan.home_time = 0xFFFFFFFFU;
+
+    if (!bcdc_set_iovar("escan", &escan, sizeof(escan), false)) {
+        scan_in_progress = false;
+        scan_results_pending = false;
+        return false;
+    }
+    return true;
+}
+
+bool cyw43_scan_get_results(struct cyw_scan_result *results, u32 *count)
+{
+    if (scan_in_progress && scan_count == 0U)
+        return false;
+    if (scan_results_pending && scan_count == 0U &&
+        !scan_fetch_legacy_results())
+        return false;
+
+    u32 n = scan_count;
+    if (n > *count) n = *count;
+
+    memcpy(results, scan_results, n * sizeof(struct cyw_scan_result));
+    *count = n;
+    return true;
+}
+
+bool cyw43_scan_in_progress(void)
+{
+    if (scan_in_progress && scan_results_pending &&
+        timer_monotonic_ms() >= scan_ready_ms)
+        scan_in_progress = false;
+    return scan_in_progress && scan_count == 0U;
+}
+
+bool cyw43_radio_query(u32 *radio, u32 *channel)
+{
+    if (!radio || !channel)
+        return false;
+    u8 radio_buf[4] = {0};
+    u32 radio_len = sizeof(radio_buf);
+    if (!bcdc_get_cmd(WLC_GET_RADIO, radio_buf,
+                      sizeof(radio_buf), &radio_len) ||
+        radio_len < 4U)
+        return false;
+
+    u8 channel_buf[12] = {0};
+    u32 channel_len = sizeof(channel_buf);
+    if (!bcdc_get_cmd(WLC_GET_CHANNEL, channel_buf,
+                      sizeof(channel_buf), &channel_len) ||
+        channel_len < 4U)
+        return false;
+
+    *radio = (u32)radio_buf[0] | ((u32)radio_buf[1] << 8) |
+             ((u32)radio_buf[2] << 16) | ((u32)radio_buf[3] << 24);
+    *channel = (u32)channel_buf[0] | ((u32)channel_buf[1] << 8) |
+               ((u32)channel_buf[2] << 16) |
+               ((u32)channel_buf[3] << 24);
+    return true;
+}
+
+static bool bcdc_get_u32_cmd(u32 cmd, u32 *out)
+{
+    u8 buf[4] = {0};
+    u32 len = sizeof(buf);
+    if (!out || !bcdc_get_cmd(cmd, buf, sizeof(buf), &len) || len < 4U)
+        return false;
+    *out = (u32)buf[0] | ((u32)buf[1] << 8) |
+           ((u32)buf[2] << 16) | ((u32)buf[3] << 24);
+    return true;
+}
+
+static bool bcdc_get_u32_iovar(const char *name, u32 *out)
+{
+    u8 buf[4] = {0};
+    u32 len = sizeof(buf);
+    if (!out || !bcdc_get_iovar(name, buf, &len) || len < 4U)
+        return false;
+    *out = (u32)buf[0] | ((u32)buf[1] << 8) |
+           ((u32)buf[2] << 16) | ((u32)buf[3] << 24);
+    return true;
+}
+
+bool cyw43_join_diag_query(struct cyw_join_diag *out)
+{
+    if (!out || !cyw43_runtime_ready())
+        return false;
+    memset(out, 0, sizeof(*out));
+    if (bcdc_get_u32_cmd(WLC_GET_RADIO, &out->radio))
+        out->valid |= 1U << 0;
+    if (bcdc_get_u32_cmd(WLC_GET_CHANNEL, &out->channel))
+        out->valid |= 1U << 1;
+    if (bcdc_get_u32_cmd(WLC_GET_WSEC, &out->wsec))
+        out->valid |= 1U << 2;
+    if (bcdc_get_u32_cmd(WLC_GET_WPA_AUTH, &out->wpa_auth))
+        out->valid |= 1U << 3;
+    if (bcdc_get_u32_iovar("mfp", &out->mfp))
+        out->valid |= 1U << 4;
+    if (bcdc_get_u32_iovar("sup_wpa", &out->sup_wpa))
+        out->valid |= 1U << 5;
+    u32 bcmerror = 0U;
+    if (bcdc_get_u32_iovar("bcmerror", &bcmerror)) {
+        out->bcmerror = (i32)bcmerror;
+        out->valid |= 1U << 6;
+    }
+    u32 bssid_len = sizeof(out->bssid);
+    if (bcdc_get_cmd(WLC_GET_BSSID, out->bssid,
+                     sizeof(out->bssid), &bssid_len) &&
+        bssid_len >= CYW_MAC_LEN)
+        out->valid |= 1U << 7;
+    return out->valid != 0U;
+}
+
+bool cyw43_set_mac(const u8 mac[CYW_MAC_LEN])
+{
+    if (!mac || (mac[0] & 1U) != 0U)
+        return false;
+    if (!bcdc_set_iovar("cur_etheraddr", mac, CYW_MAC_LEN, false))
+        return false;
+    memcpy(cyw_mac, mac, CYW_MAC_LEN);
+    return true;
+}
+
+bool cyw43_fwlog(char *out, u32 max, u32 *out_len)
+{
+    if (!out || !out_len || max == 0U || cyw_ram_bytes < 4U)
+        return false;
+    u32 shared = 0U;
+    if (!bp_read32(cyw_ram_base + cyw_ram_bytes - 4U, &shared) ||
+        shared < cyw_ram_base ||
+        shared > cyw_ram_base + cyw_ram_bytes - 28U)
+        return false;
+    u32 console = 0U;
+    if (!bp_read32(shared + 20U, &console) ||
+        console < cyw_ram_base ||
+        console > cyw_ram_base + cyw_ram_bytes - 20U)
+        return false;
+    u32 log_buf = 0U;
+    u32 log_size = 0U;
+    u32 log_idx = 0U;
+    if (!bp_read32(console + 8U, &log_buf) ||
+        !bp_read32(console + 12U, &log_size) ||
+        !bp_read32(console + 16U, &log_idx) ||
+        log_size == 0U || log_size > 2024U || log_idx > log_size ||
+        log_buf < cyw_ram_base ||
+        log_buf > cyw_ram_base + cyw_ram_bytes - log_size)
+        return false;
+    static u8 console_buf[2024] ALIGNED(64);
+    if (!bp_read_buf(log_buf, console_buf, log_size))
+        return false;
+    u32 written = 0U;
+    for (u32 i = 0U; i < log_size && written + 1U < max; i++) {
+        u8 ch = console_buf[(log_idx + i) % log_size];
+        if (ch == 0U)
+            continue;
+        out[written++] = (ch == '\n' || ch == '\r' ||
+                          (ch >= 32U && ch < 127U)) ? (char)ch : '.';
+    }
+    out[written] = '\0';
+    *out_len = written;
+    return true;
+}
+
+bool cyw43_take_eapol(u8 *frame, u32 *len)
+{
+    if (!frame || !len || cyw_eapol_len == 0U)
+        return false;
+    if (*len < cyw_eapol_len)
+        return false;
+    memcpy(frame, cyw_eapol_frame, cyw_eapol_len);
+    *len = cyw_eapol_len;
+    cyw_eapol_len = 0U;
+    return true;
+}
+
+static bool cyw43_join_key(const char *ssid, u32 ssid_len,
+                           const u8 *key, u32 key_len, u16 key_flags,
+                           u32 security, bool sae)
+{
+    if (ssid_len == 0 || ssid_len > CYW_SSID_MAX)
+        return false;
+    if (!key || key_len > CYW_PASSPHRASE_MAX)
+        return false;
+    scan_flush_remaining = 0U;
+    uart_puts("[cyw] join radio\n");
+    if (!cyw43_radio_enable())
+        return false;
+
+    cyw_link = CYW_LINK_JOINING;
+
+    /* Set security type */
+    u32 wsec;
+    u32 wpa_auth;
+    if (security == WSEC_NONE) {
+        wsec = WSEC_NONE;
+        wpa_auth = WPA_AUTH_DISABLED;
+    } else {
+        wsec = WSEC_AES;
+        wpa_auth = sae ? WPA3_AUTH_SAE_PSK : WPA2_AUTH_PSK;
+    }
+    uart_puts("[cyw] join wsec\n");
+    if (!bcdc_set_cmd(WLC_SET_WSEC, &wsec, 4, false))
+        return false;
+
+    /* Configure the firmware WPA supplicant. */
+    if (security != WSEC_NONE && key_len > 0U) {
+        u32 supplicant = 1U;
+        uart_puts("[cyw] join supplicant\n");
+        if (!bcdc_set_iovar("sup_wpa", &supplicant,
+                            sizeof(supplicant), false))
+            return false;
+
+        timer_delay_ms(2U);
+        if (sae) {
+            struct {
+                u16 key_len;
+                u8 key[128];
+            } PACKED sae_password;
+            memset(&sae_password, 0, sizeof(sae_password));
+            sae_password.key_len = (u16)key_len;
+            memcpy(sae_password.key, key, key_len);
+            if (!bcdc_set_iovar("sae_password", &sae_password,
+                                sizeof(sae_password), false))
+                return false;
+        } else {
+            struct {
+                u16 key_len;
+                u16 flags;
+                u8  key[CYW_PASSPHRASE_MAX];
+            } PACKED wsec_pmk;
+            memset(&wsec_pmk, 0, sizeof(wsec_pmk));
+            wsec_pmk.key_len = (u16)key_len;
+            wsec_pmk.flags = key_flags;
+            memcpy(wsec_pmk.key, key, key_len);
+            if (!bcdc_set_cmd(WLC_SET_WSEC_PMK, &wsec_pmk,
+                              sizeof(wsec_pmk), false))
+                return false;
+        }
+    }
+
+    u32 auth = sae ? 3U : 0U;
+    u32 mfp = security == WSEC_NONE ? 0U : 1U;
+    uart_puts("[cyw] join auth\n");
+    if (!bcdc_set_cmd(WLC_SET_AUTH, &auth, sizeof(auth), false))
+        return false;
+    if (sae && !bcdc_set_iovar("mfp", &mfp, sizeof(mfp), false))
+        return false;
+    if (!bcdc_set_cmd(WLC_SET_WPA_AUTH, &wpa_auth,
+                      sizeof(wpa_auth), false))
+        return false;
+
+    /* Stable SET_SSID fallback. */
+    struct {
+        u32 ssid_len;
+        u8  ssid[CYW_SSID_MAX];
+    } PACKED ssid_params;
+    memset(&ssid_params, 0, sizeof(ssid_params));
+    ssid_params.ssid_len = ssid_len;
+    memcpy(ssid_params.ssid, ssid, ssid_len);
+    i32 best_rssi = -32768;
+    u32 best_channel = 0U;
+    for (u32 i = 0U; i < scan_count; i++) {
+        const struct cyw_scan_result *candidate = &scan_results[i];
+        if (candidate->ssid_len != ssid_len ||
+            memcmp(candidate->ssid, ssid, ssid_len) != 0 ||
+            candidate->rssi <= best_rssi)
+            continue;
+        best_rssi = candidate->rssi;
+        best_channel = candidate->channel;
+    }
+    if (best_channel != 0U &&
+        !bcdc_set_cmd(WLC_SET_CHANNEL, &best_channel,
+                      sizeof(best_channel), false))
+        return false;
+
+    uart_puts("[cyw] join SSID: ");
+    for (u32 i = 0; i < ssid_len; i++)
+        uart_putc(ssid[i]);
+    uart_puts("\n");
+
+    if (!bcdc_set_cmd(WLC_SET_SSID, &ssid_params,
+                      sizeof(ssid_params), false))
+        return false;
+
+    /* Poll for association result */
+    uart_puts("[cyw] joining...\n");
+    for (u32 i = 0; i < 3000U; i++) {  /* up to 30s */
+        if ((i & 63U) == 0U)
+            watchdog_hw_pet();
+        cyw43_poll();
+        u32 state = cyw43_link_state();
+        if (state == CYW_LINK_UP) {
+            uart_puts("[cyw] associated!\n");
+            return true;
+        }
+        if (state == CYW_LINK_AUTH_FAIL) {
+            uart_puts("[cyw] auth failed\n");
+            return false;
+        }
+        timer_delay_ms(10U);
+    }
+    uart_puts("[cyw] join timeout\n");
+    return false;
+}
+
+bool cyw43_join(const char *ssid, u32 ssid_len,
+                const char *passphrase, u32 pass_len,
+                u32 security)
+{
+    return cyw43_join_key(ssid, ssid_len, (const u8 *)passphrase,
+                          pass_len, 1U, security, false);
+}
+
+bool cyw43_join_pmk(const char *ssid, u32 ssid_len, const u8 pmk[32])
+{
+    return cyw43_join_key(ssid, ssid_len, pmk, 32U, 0U,
+                          WSEC_AES, false);
+}
+
+bool cyw43_join_sae(const char *ssid, u32 ssid_len,
+                    const char *password, u32 password_len)
+{
+    return cyw43_join_key(ssid, ssid_len, (const u8 *)password,
+                          password_len, 0U, WSEC_AES, true);
+}
+
+bool cyw43_disconnect(void)
+{
+    cyw_link = CYW_LINK_DOWN;
+    return bcdc_set_cmd(WLC_DISASSOC, NULL, 0, false);
+}
+
+u32 cyw43_link_state(void)
+{
+    return cyw_link;
+}
+
+bool cyw43_is_connected(void)
+{
+    return cyw_link == CYW_LINK_UP;
+}
+
+i32 cyw43_get_rssi(void)
+{
+    u8 resp[8];
+    u32 resp_len = sizeof(resp);
+    if (!bcdc_get_iovar("rssi", resp, &resp_len))
+        return -127;
+
+    if (resp_len >= 4)
+        return (i32)((u32)resp[0] | ((u32)resp[1] << 8) |
+                     ((u32)resp[2] << 16) | ((u32)resp[3] << 24));
+    return -127;
+}
+
+void cyw43_get_mac(u8 *mac)
+{
+    /* Check if MAC has been retrieved (all zeros = not yet) */
+    bool all_zero = true;
+    for (u32 i = 0; i < CYW_MAC_LEN; i++) {
+        if (cyw_mac[i] != 0) { all_zero = false; break; }
+    }
+    if (all_zero) {
+        /* Try reading from chip */
+        u8 resp[8];
+        u32 resp_len = sizeof(resp);
+        if (bcdc_get_iovar("cur_etheraddr", resp, &resp_len) && resp_len >= 6)
+            memcpy(cyw_mac, resp, 6);
+    }
+    memcpy(mac, cyw_mac, CYW_MAC_LEN);
+}
+
+bool cyw43_send_frame(const u8 *frame, u32 len)
+{
+    bool eapol = frame && len >= 14U &&
+                 frame[12] == 0x88U && frame[13] == 0x8EU;
+    if (!cyw43_is_connected() &&
+        !(cyw_link == CYW_LINK_JOINING && eapol))
+        return false;
+
+    /* Prepend 4-byte BDC data header before the Ethernet frame */
+    u32 bdc_len = 4 + len;
+    if (bdc_len > sizeof(cyw_tx_buf) - SDPCM_HEADER_LEN)
+        return false;
+
+    static u8 bdc_buf[CYW_MAX_FRAME] ALIGNED(64);
+    bdc_buf[0] = 0x20;  /* BDC version 2 */
+    bdc_buf[1] = 0x00;  /* flags */
+    bdc_buf[2] = 0x00;  /* header2 */
+    bdc_buf[3] = 0x00;  /* pad */
+    memcpy(bdc_buf + 4, frame, len);
+
+    return sdpcm_send(SDPCM_DATA_CHANNEL, bdc_buf, bdc_len);
+}
+
+bool cyw43_recv_frame(u8 *frame, u32 *len)
+{
+    u8 channel;
+    u32 rlen;
+
+    if (!sdpcm_recv(&channel, cyw_rx_buf, &rlen))
+        return false;
+
+    if (channel == SDPCM_EVENT_CHANNEL) {
+        handle_event(cyw_rx_buf, rlen);
+        return false;
+    }
+
+    if (channel != SDPCM_DATA_CHANNEL)
+        return false;
+
+    /* Strip BDC data header: 4 bytes + (data[3] * 4) bytes of padding */
+    if (rlen < 4)
+        return false;
+    u32 bdc_offset = 4 + ((u32)cyw_rx_buf[3] << 2);
+    if (bdc_offset >= rlen)
+        return false;
+    rlen -= bdc_offset;
+
+    if (rlen > *len)
+        rlen = *len;
+
+    memcpy(frame, cyw_rx_buf + bdc_offset, rlen);
+    *len = rlen;
+    return true;
+}

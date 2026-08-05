@@ -32,6 +32,13 @@ typedef enum {
     V3D_KERNEL_LOAD_STORE = 8,
     V3D_KERNEL_STORE_SSBO = 9,
     V3D_KERNEL_NOOP = 10,
+    V3D_KERNEL_PICOVM_ALU = 11,
+    V3D_KERNEL_MATVEC16 = 12,
+    V3D_KERNEL_GRAY_XOR64 = 13,
+    V3D_KERNEL_GRAY_RESIDUAL64 = 14,
+    V3D_KERNEL_MATVEC64 = 15,
+    V3D_KERNEL_MATMUL64X16 = 16,
+    V3D_KERNEL_BITNET_BITMAP64X16 = 17,
     V3D_KERNEL_MAX
 } v3d_kernel_id_t;
 
@@ -111,6 +118,14 @@ struct v3d_csd_debug {
     u32 current_cfg0;
     u32 current_cfg5;
     u32 current_cfg6;
+    u32 l2t_before_invalidate;
+    u32 l2t_after_invalidate;
+    u32 l2t_after_tmuwcf;
+    u32 l2t_after_clean;
+    u32 l2t_invalidate_wait_us;
+    u32 tmuwcf_wait_us;
+    u32 l2t_clean_wait_us;
+    u32 cache_clean_ok;
 };
 
 struct v3d_reset_debug {

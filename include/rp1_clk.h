@@ -14,15 +14,16 @@
 #pragma once
 #include "types.h"
 
-/* Clock IDs (matching Linux dt-bindings/clock/rp1.h) */
+/* Stable local table indices. Existing callers depend on these values. */
 #define RP1_CLK_SYS         0
 #define RP1_CLK_SLOW_SYS    1
+#define RP1_CLK_DMA         2
 #define RP1_CLK_UART        3
 #define RP1_CLK_ETH         4
 #define RP1_CLK_PWM0         5
 #define RP1_CLK_PWM1         6
 #define RP1_CLK_I2S         9
-#define RP1_CLK_ADC         16
+#define RP1_CLK_ADC         10
 
 void rp1_clk_init(void);
 bool rp1_clk_enable(u32 clk_id);

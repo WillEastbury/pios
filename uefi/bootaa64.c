@@ -18,7 +18,7 @@ typedef void *efi_event_t;
 #define ALLOCATE_ADDRESS 2U
 #define EFI_LOADER_DATA 2U
 #define STAGE2_LOAD_ADDR 0x40080000ULL
-#define STAGE2_MAX_BYTES (2U * 1024U * 1024U)
+#define STAGE2_MAX_BYTES (4U * 1024U * 1024U)
 #define STAGE2_MAX_MEMORY_BYTES (32U * 1024U * 1024U)
 #define STAGE2_PAGE_COUNT ((STAGE2_MAX_BYTES + 4095U) / 4096U)
 #define STAGE2_MAX_PAGE_COUNT ((STAGE2_MAX_MEMORY_BYTES + 4095U) / 4096U)
@@ -259,14 +259,14 @@ static void stage2_handoff_barrier(u64 addr, u64 size)
         ::: "x8", "memory");
 }
 
-static void publish_bootinfo(struct efi_system_table *st)
+static bool publish_bootinfo(struct efi_system_table *st)
 {
     struct pios_bootinfo *bi = (struct pios_bootinfo *)(usize)PIOS_BOOTINFO_ADDR;
     memset(bi, 0, sizeof(*bi));
     bi->magic = PIOS_BOOTINFO_MAGIC;
     bi->version = PIOS_BOOTINFO_VERSION;
     if (!st || !st->boot_services || !st->boot_services->locate_protocol)
-        return;
+        return false;
 
     static struct efi_guid gop_guid = {
         0x9042A9DEU, 0x23DCU, 0x4A38U,
@@ -275,7 +275,7 @@ static void publish_bootinfo(struct efi_system_table *st)
     struct efi_graphics_output *gop = 0;
     if (st->boot_services->locate_protocol(&gop_guid, 0, (void **)&gop) != EFI_SUCCESS ||
         !gop || !gop->mode || !gop->mode->info || !gop->mode->framebuffer_base)
-        return;
+        return false;
 
     bi->flags |= PIOS_BOOTINFO_FLAG_FRAMEBUFFER;
     bi->framebuffer_base = gop->mode->framebuffer_base;
@@ -283,6 +283,7 @@ static void publish_bootinfo(struct efi_system_table *st)
     bi->framebuffer_height = gop->mode->info->vertical_resolution;
     bi->framebuffer_pitch = gop->mode->info->pixels_per_scan_line * 4U;
     bi->framebuffer_format = gop->mode->info->pixel_format;
+    return true;
 }
 
 static bool find_stage2_entry(const u8 *image, u32 len, struct stage2_selection *sel)
@@ -406,7 +407,16 @@ efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
     } else {
         memcpy((void *)(usize)addr, pios_stage2_blob_start + sel.payload_offset, sel.payload_bytes);
     }
-    publish_bootinfo(st);
+    u64 bootinfo_addr = PIOS_BOOTINFO_ADDR;
+    if (!st->boot_services->allocate_pages ||
+        st->boot_services->allocate_pages(ALLOCATE_ADDRESS, EFI_LOADER_DATA, 1,
+                                          &bootinfo_addr) != EFI_SUCCESS ||
+        bootinfo_addr != PIOS_BOOTINFO_ADDR) {
+        puts_ascii("bootinfo page allocation failed\n");
+        return EFI_LOAD_ERROR;
+    }
+    puts_ascii(publish_bootinfo(st) ? "GOP framebuffer bootinfo ready\n" :
+                                     "GOP framebuffer unavailable\n");
 
     puts_ascii("stage2 selected; jumping\n");
     void (*entry)(efi_handle_t, struct efi_system_table *) =

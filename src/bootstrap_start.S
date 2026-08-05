@@ -1,6 +1,13 @@
 .section .text.boot
 .global _start
 
+#ifndef PIOS_PLATFORM
+#define PIOS_PLATFORM 1
+#endif
+#ifndef PIOS_PLATFORM_QEMU_VIRT
+#define PIOS_PLATFORM_QEMU_VIRT 2
+#endif
+
 _start:
     mrs     x0, mpidr_el1
     and     x0, x0, #0x3
@@ -67,6 +74,13 @@ _start:
      * just different addresses. board_detect_init() (src/board_detect.c)
      * also populates g_board_bases/g_board_family for later C-side use
      * (bootstrap.c/sd.c/fb.c's runtime peripheral base resolution). */
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    /* A QEMU-targeted stage0 build only ever runs under QEMU -cpu cortex-a53,
+     * which reports the SAME MIDR as a real BCM2837 -- runtime detection
+     * cannot (and need not) disambiguate the two. Skip board_detect_init()
+     * entirely and go straight to the QEMU-specific table below. */
+    b       .Lb_qemu_table
+#else
     bl      board_detect_init
     ldr     x0, =g_board_family
     ldr     w0, [x0]
@@ -80,6 +94,7 @@ _start:
      * assuming either board's addresses risks an external abort or worse
      * on whatever this actually is. */
     b       .Lhalt
+#endif
 
     /* ── EL1 MMU bring-up (required before touching SD/EMMC) ──
      * sd.c's EMMC PIO bring-up and the VideoCore mailbox are only proven
@@ -206,6 +221,44 @@ _start:
     mov     x3, #0x40000000
     orr     x4, x3, x2
     str     x4, [x0, #8]               /* L1[1]: QA7 + rest, Device       */
+    b       .Lb_mmu_enable
+
+    /* ── QEMU -M virt: peripherals (GICv2 @0x08000000, PL011 @0x09000000,
+     * virtio-mmio @0x0A000000+) all live inside the first 1 GiB, and RAM
+     * starts at 0x40000000 (NOT 0, unlike real hardware) -- this is where
+     * stage0 itself is linked/loaded and where BOOT_STAGING_ADDR/
+     * BOOT_TRAMP_ADDR/BOOT_DST_ADDR all live (see bootstrap.c). QEMU's TCG
+     * does not model CPU caches, so mapping the low 1 GiB (including the
+     * MMIO peripherals) as plain Normal-NC is safe here -- start.S already
+     * does exactly this for the existing direct-boot QEMU kernel, and it
+     * works today, so stage0 reuses the identical, proven layout:
+     *   L1[0]     first 1 GiB   Normal-NC  GIC/UART/virtio-mmio + low RAM
+     *   L1[1..3]  next 3 GiB    Normal-WB  RAM (stage0/stage2/staging/tramp)
+     */
+.Lb_qemu_table:
+    ldr     x0, =l1_table
+    mov     x1, #512
+.Lb_zero_l1_qemu:
+    str     xzr, [x0], #8
+    subs    x1, x1, #1
+    b.ne    .Lb_zero_l1_qemu
+
+    ldr     x0, =l1_table
+    mov     x2, #0x705                 /* ATTR(1) = Normal-NC             */
+    str     x2, [x0, #0]               /* L1[0]: first 1 GiB Normal-NC    */
+
+    mov     x2, #0x709                 /* ATTR(2) = Normal-WB             */
+    mov     x3, #0x40000000
+    orr     x4, x3, x2
+    str     x4, [x0, #8]               /* L1[1]                           */
+    ldr     x3, =0x80000000
+    orr     x4, x3, x2
+    str     x4, [x0, #16]              /* L1[2]                           */
+    ldr     x3, =0xC0000000
+    orr     x4, x3, x2
+    str     x4, [x0, #24]              /* L1[3]                           */
+
+    b       .Lb_mmu_enable
 
 .Lb_mmu_enable:
     dsb     sy

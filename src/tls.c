@@ -5,6 +5,8 @@
 #include "principal.h"
 #include "simd.h"
 #include "timer.h"
+#include "picotlsserver.h"
+#include "x509.h"
 
 #define TLS_MAGIC_CHLO   0x43484C4FU /* "CHLO" */
 #define TLS_MAGIC_SHLO   0x53484C4FU /* "SHLO" */
@@ -33,6 +35,12 @@ struct tls_conn_state {
     u8 rx_iv[TLS_IV_LEN];
     u64 tx_seq;
     u64 rx_seq;
+
+    /* Real RFC 8446 TLS 1.3 server path (tls_accept() only -- tls_connect()
+     * still uses the fake CHLO/SHLO exchange above; see the "Next steps"
+     * note in AGENTS.md about eventually porting the client role too). */
+    bool is_real_tls13;
+    picotlsserver_t tls13_server;
 };
 
 static struct tls_conn_state tls_conns[TLS_MAX_CONNECTIONS];
@@ -250,11 +258,60 @@ tls_conn_t tls_connect(tcp_conn_t tcp) {
     return id;
 }
 
+static bool pios_tls13_read_exact(void *ctx, u8 *out, u32 len)
+{
+    struct tls_conn_state *c = (struct tls_conn_state *)ctx;
+    return c && tcp_read_all(c->tcp, out, len);
+}
+
+static bool pios_tls13_write_all(void *ctx, const u8 *data, u32 len)
+{
+    struct tls_conn_state *c = (struct tls_conn_state *)ctx;
+    return c && tcp_write_all(c->tcp, data, len);
+}
+
+static bool pios_tls13_random(void *ctx, u8 *out, u32 len)
+{
+    (void)ctx;
+    if (!out)
+        return false;
+    for (u32 off = 0; off < len; off += 4U) {
+        u32 value = store_rand32();
+        u32 take = len - off;
+        if (take > 4U)
+            take = 4U;
+        for (u32 i = 0; i < take; i++)
+            out[off + i] = (u8)(value >> (i * 8U));
+    }
+    return true;
+}
+
+static bool pios_tls13_identity(void *ctx, const u8 **cert_der, u32 *cert_len,
+                                u8 p256_private_scalar[32])
+{
+    (void)ctx;
+    if (!cert_der || !cert_len || !p256_private_scalar)
+        return false;
+    *cert_der = x509_certificate_der(cert_len);
+    return *cert_der && *cert_len != 0 &&
+           x509_p256_private_scalar(p256_private_scalar);
+}
+
+static struct picotlsserver_ops pios_tls13_ops(struct tls_conn_state *c)
+{
+    struct picotlsserver_ops ops = {
+        .ctx = c,
+        .read_exact = pios_tls13_read_exact,
+        .write_all = pios_tls13_write_all,
+        .random_bytes = pios_tls13_random,
+        .identity = pios_tls13_identity,
+    };
+    return ops;
+}
+
 tls_conn_t tls_accept(tcp_conn_t tcp) {
     tls_conn_t id;
     struct tls_conn_state *c;
-    struct tls_handshake ch;
-    struct tls_handshake sh;
 
     if (tcp < 0) return -1;
     tls_diag.accept_attempts++;
@@ -268,44 +325,20 @@ tls_conn_t tls_accept(tcp_conn_t tcp) {
     c = &tls_conns[id];
     c->tcp = tcp;
     c->is_client = false;
+    picotlsserver_init(&c->tls13_server);
 
-    if (!tcp_read_all(tcp, (u8 *)&ch, sizeof(ch))) {
-        tls_diag.last_error = TLS_ERR_IO;
-        tls_diag.handshake_failures++;
-        tls_close(id);
-        return -1;
-    }
-    if (ch.magic != TLS_MAGIC_CHLO || ch.version != TLS_HS_VER) {
-        tls_diag.last_error = TLS_ERR_MAGIC;
-        tls_diag.handshake_failures++;
-        tls_close(id);
-        return -1;
-    }
-
-    sh.magic = TLS_MAGIC_SHLO;
-    sh.version = TLS_HS_VER;
-    for (u32 i = 0; i < sizeof(sh.random); i += 4) {
-        u32 r = store_rand32();
-        sh.random[i + 0] = (u8)r;
-        sh.random[i + 1] = (u8)(r >> 8);
-        sh.random[i + 2] = (u8)(r >> 16);
-        sh.random[i + 3] = (u8)(r >> 24);
-    }
-
-    if (!tcp_write_all(tcp, (const u8 *)&sh, sizeof(sh))) {
-        tls_diag.last_error = TLS_ERR_IO;
+    struct picotlsserver_ops ops = pios_tls13_ops(c);
+    if (!picotlsserver_accept(&c->tls13_server, &ops)) {
+        tls_diag.last_error = picotlsserver_last_error(&c->tls13_server);
+        if (tls_diag.last_error == PICOTLSSERVER_ERR_DECRYPT)
+            tls_diag.decrypt_failures++;
         tls_diag.handshake_failures++;
         tls_close(id);
         return -1;
     }
 
-    if (!tls_derive_keys(c, &ch, &sh)) {
-        tls_diag.last_error = TLS_ERR_KEY_DERIVE;
-        tls_diag.handshake_failures++;
-        tls_close(id);
-        return -1;
-    }
-
+    c->is_real_tls13 = true;
+    c->established = true;
     tls_diag.handshakes_ok++;
     tls_diag.last_error = TLS_ERR_NONE;
     return id;
@@ -325,6 +358,17 @@ i32 tls_write(tls_conn_t conn, const void *data, u32 len) {
         return -1;
     if (len == 0 || len > TLS_MAX_RECORD)
         return -1;
+
+    if (c->is_real_tls13) {
+        struct picotlsserver_ops ops = pios_tls13_ops(c);
+        i32 written = picotlsserver_write(&c->tls13_server, &ops, data, len);
+        if (written < 0) {
+            tls_diag.last_error = picotlsserver_last_error(&c->tls13_server);
+            return -1;
+        }
+        tls_diag.records_tx++;
+        return written;
+    }
 
     store_be16(header, (u16)len);
     tls_make_nonce(nonce, c->tx_iv, c->tx_seq);
@@ -357,6 +401,21 @@ i32 tls_read(tls_conn_t conn, void *buf, u32 len) {
     c = &tls_conns[conn];
     if (!c->established)
         return -1;
+
+    if (c->is_real_tls13) {
+        struct picotlsserver_ops ops = pios_tls13_ops(c);
+        i32 received = picotlsserver_read(&c->tls13_server, &ops, buf, len);
+        if (received < 0) {
+            tls_diag.last_error = picotlsserver_last_error(&c->tls13_server);
+            if (tls_diag.last_error == PICOTLSSERVER_ERR_DECRYPT)
+                tls_diag.decrypt_failures++;
+            return -1;
+        }
+        if (received > 0)
+            tls_diag.records_rx++;
+        tls_diag.last_error = TLS_ERR_NONE;
+        return received;
+    }
 
     if (!tcp_read_all(c->tcp, header, sizeof(header)))
         return -1;

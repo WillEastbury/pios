@@ -368,6 +368,135 @@ static bool x509_build_certificate_der(const char *cn)
     return true;
 }
 
+/* Self-signed P-256/ECDSA-SHA256 certificate, needed by the TLS 1.3 server
+ * (real clients require the leaf certificate's key type to match the
+ * signature_algorithms it negotiates for CertificateVerify -- Ed25519
+ * dev certs from x509_build_certificate_der() above can't be used with
+ * ecdsa_secp256r1_sha256, the one signature scheme guaranteed to be
+ * offered by essentially every real-world TLS 1.3 client). Mirrors
+ * x509_build_tbs()/x509_build_certificate_der() exactly, just with the
+ * P-256 SPKI/AlgorithmIdentifier/signature already used by
+ * x509_build_p256_csr_der() above. */
+static bool x509_build_tbs_p256(const char *cn, u8 *out, u32 out_cap, u32 *out_len)
+{
+    static const u8 alg_ecdsa_sha256[] = {
+        0x30U, 0x0AU, 0x06U, 0x08U, 0x2AU, 0x86U, 0x48U, 0xCEU,
+        0x3DU, 0x04U, 0x03U, 0x02U
+    };
+    u8 serial[8];
+    const u8 *serial_ptr;
+    u32 serial_len;
+    u8 issuer[160];
+    u8 subject[160];
+    u8 validity[48];
+    u8 spki[128];
+    u8 body[512];
+    u32 issuer_len = 0;
+    u32 subject_len = 0;
+    u32 validity_len = 0;
+    u32 spki_len = 0;
+    struct der_writer w;
+
+    simd_memcpy(serial, g_x509.public_id, sizeof(serial));
+    serial[0] &= 0x7FU;
+    serial[7] ^= (u8)g_x509.st.generation;
+    if ((serial[0] | serial[1] | serial[2] | serial[3] | serial[4] | serial[5] | serial[6] | serial[7]) == 0)
+        serial[7] = 1;
+    serial_ptr = serial;
+    serial_len = sizeof(serial);
+    while (serial_len > 1U && serial_ptr[0] == 0 && (serial_ptr[1] & 0x80U) == 0) {
+        serial_ptr++;
+        serial_len--;
+    }
+
+    if (!x509_build_name(cn, issuer, sizeof(issuer), &issuer_len))
+        return false;
+    if (!x509_build_name(cn, subject, sizeof(subject), &subject_len))
+        return false;
+    if (!x509_build_validity(validity, sizeof(validity), &validity_len))
+        return false;
+    if (!x509_build_spki_p256(g_x509.p256_public, spki, sizeof(spki), &spki_len))
+        return false;
+
+    derw_init(&w, body, sizeof(body));
+    derw_tlv(&w, 0x02U, serial_ptr, serial_len);
+    derw_raw(&w, alg_ecdsa_sha256, sizeof(alg_ecdsa_sha256));
+    derw_raw(&w, issuer, issuer_len);
+    derw_raw(&w, validity, validity_len);
+    derw_raw(&w, subject, subject_len);
+    derw_raw(&w, spki, spki_len);
+    if (!w.ok) return false;
+    return der_wrap(0x30U, body, w.len, out, out_cap, out_len);
+}
+
+static bool x509_build_certificate_der_p256(const char *cn)
+{
+    static const u8 alg_ecdsa_sha256[] = {
+        0x30U, 0x0AU, 0x06U, 0x08U, 0x2AU, 0x86U, 0x48U, 0xCEU,
+        0x3DU, 0x04U, 0x03U, 0x02U
+    };
+    u8 r[32];
+    u8 s[32];
+    u8 sig_der[80];
+    u8 sig_bits[1 + 80];
+    u8 sig_tlv[96];
+    u8 cert_body[X509_TBS_MAX + 128];
+    int sig_der_len;
+    u32 tbs_len = 0;
+    u32 sig_tlv_len = 0;
+    u32 cert_len = 0;
+    struct der_writer w;
+
+    if (!x509_build_tbs_p256(cn, g_x509.tbs_der, sizeof(g_x509.tbs_der), &tbs_len))
+        return false;
+
+    if (ecdsa_p256_sha256_sign(g_x509.p256_scalar, g_x509.tbs_der, tbs_len, r, s) != 0)
+        return false;
+    sig_der_len = ecdsa_p256_encode_der(r, s, sig_der, sizeof(sig_der));
+    if (sig_der_len <= 0) {
+        secure_zero(r, sizeof(r));
+        secure_zero(s, sizeof(s));
+        return false;
+    }
+
+    sig_bits[0] = 0;
+    simd_memcpy(sig_bits + 1, sig_der, (u32)sig_der_len);
+    if (!der_wrap(0x03U, sig_bits, (u32)sig_der_len + 1U, sig_tlv, sizeof(sig_tlv), &sig_tlv_len)) {
+        secure_zero(r, sizeof(r));
+        secure_zero(s, sizeof(s));
+        secure_zero(sig_der, sizeof(sig_der));
+        secure_zero(sig_bits, sizeof(sig_bits));
+        return false;
+    }
+
+    derw_init(&w, cert_body, sizeof(cert_body));
+    derw_raw(&w, g_x509.tbs_der, tbs_len);
+    derw_raw(&w, alg_ecdsa_sha256, sizeof(alg_ecdsa_sha256));
+    derw_raw(&w, sig_tlv, sig_tlv_len);
+    if (!w.ok) {
+        secure_zero(r, sizeof(r));
+        secure_zero(s, sizeof(s));
+        secure_zero(sig_der, sizeof(sig_der));
+        secure_zero(sig_bits, sizeof(sig_bits));
+        return false;
+    }
+    if (!der_wrap(0x30U, cert_body, w.len, g_x509.cert_der, sizeof(g_x509.cert_der), &cert_len)) {
+        secure_zero(r, sizeof(r));
+        secure_zero(s, sizeof(s));
+        secure_zero(sig_der, sizeof(sig_der));
+        secure_zero(sig_bits, sizeof(sig_bits));
+        return false;
+    }
+    g_x509.st.der_len = cert_len;
+
+    secure_zero(r, sizeof(r));
+    secure_zero(s, sizeof(s));
+    secure_zero(sig_der, sizeof(sig_der));
+    secure_zero(sig_bits, sizeof(sig_bits));
+    return true;
+}
+
+
 static bool x509_build_csr_info(const char *cn, u8 *out, u32 out_cap, u32 *out_len)
 {
     static const u8 version_zero[] = { 0x00U };
@@ -673,6 +802,31 @@ bool x509_generate_p256_csr(const char *common_name)
     return true;
 }
 
+bool x509_generate_p256_cert(const char *common_name)
+{
+    const char *cn = (common_name && common_name[0]) ? common_name : "PIOS kernel dev";
+    if (!g_x509.st.initialized)
+        x509_init();
+    if (!x509_ensure_p256_key())
+        return false;
+    g_x509.st.has_cert = false;
+    g_x509.st.der_ready = false;
+    g_x509.st.der_len = 0;
+    g_x509.st.generation++;
+    str_copy(g_x509.st.subject, sizeof(g_x509.st.subject), cn);
+    str_copy(g_x509.st.issuer, sizeof(g_x509.st.issuer), cn);
+    if (!x509_build_certificate_der_p256(cn)) {
+        g_x509.st.last_error = X509_ERR_DER;
+        build_cert_fingerprint();
+        return false;
+    }
+    g_x509.st.has_cert = true;
+    g_x509.st.der_ready = true;
+    build_cert_fingerprint();
+    g_x509.st.last_error = X509_ERR_NONE;
+    return true;
+}
+
 bool x509_import_certificate_der(const u8 *der, u32 len)
 {
     if (!g_x509.st.initialized)
@@ -725,6 +879,21 @@ const u8 *x509_csr_der(u32 *len)
     return g_x509.st.csr_ready ? g_x509.csr_der : NULL;
 }
 
+/* Direct access to the P-256 signing key material, for the TLS 1.3 server
+ * (src/tls.c) to sign its own CertificateVerify at handshake time --
+ * separate from CSR/cert generation, which only ever consume this key
+ * internally via x509_ensure_p256_key(). Returns false (and leaves *out
+ * untouched) if the P-256 key hasn't been derived yet; callers should
+ * call x509_generate_p256_cert()/x509_generate_p256_csr() at least once
+ * first (either populates it via the same keystore-derived scalar). */
+bool x509_p256_private_scalar(u8 out[P256_SCALAR_LEN])
+{
+    if (!g_x509.st.has_p256_key || !out) return false;
+    simd_memcpy(out, g_x509.p256_scalar, P256_SCALAR_LEN);
+    return true;
+}
+
+
 bool x509_selftest(void)
 {
     if (!x509_generate_dev_cert("PIOS selftest"))
@@ -741,5 +910,15 @@ bool x509_selftest(void)
         return false;
     if (g_x509.st.key_fingerprint == 0 || g_x509.st.cert_fingerprint == 0)
         return false;
+    if (!x509_generate_p256_cert("PIOS selftest"))
+        return false;
+    if (!g_x509.st.has_p256_key || !g_x509.st.has_cert || !g_x509.st.der_ready || g_x509.st.der_len == 0)
+        return false;
+    {
+        u8 scalar[P256_SCALAR_LEN];
+        if (!x509_p256_private_scalar(scalar))
+            return false;
+    }
     return x509_bind_tls();
 }
+

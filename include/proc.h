@@ -259,6 +259,7 @@ struct process {
     u32 affinity_core;
     u32 priority_class;
     u64 quantum_ticks;
+    u64 wake_deadline_ms; /* 0 = none; proc_park_timeout() sets this, cleared on wake */
     u8 *base;           /* 2MB slot start */
     u32 mem_size;
     struct proc_context ctx;
@@ -551,6 +552,12 @@ void proc_el0_diag_snapshot(i32 *launch_status, u32 *launch_pid, u32 *launch_slo
 void proc_trap_context(u32 *pid, u32 *capsule, u32 *generation, u32 *owner_principal);
 /* Block the current process until woken (BLOCKED + yield to scheduler). */
 void proc_park(void);
+/* Like proc_park(), but also returns if `ms` elapses with no wake (0 = same as
+ * proc_park(): no timeout). For capsules that ALSO have other schedulable
+ * foreground work: a FIFO-only endpoint capsule should just use proc_park()
+ * (wakes solely on FIFO arrival); a hybrid capsule uses this so it still gets
+ * its normal work quantum even while idle-waiting on its inbound FIFO. */
+void proc_park_timeout(u32 ms);
 /* Post a wake for `pid` onto `target_core`'s wake ring and SEV. Safe to call
  * from any core (including core 0); the target core's scheduler delivers it. */
 bool proc_post_remote_wake(u32 target_core, u32 pid);

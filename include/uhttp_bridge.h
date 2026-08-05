@@ -68,6 +68,12 @@ struct uhttp_bridge {
     volatile u32 dbg_loops;   /* userland increments each handler-loop pass      */
     volatile u32 dbg_phase;   /* userland publishes its current loop step (debug) */
     u8 _padB[UHTTP_LINE - 6U * 4U];
+    /* ── Zone C: userland -> core0, write-once at attach time. Own dedicated
+     * line so this (rarely-changing) string never shares a line with the hot
+     * per-request Zone A/B control fields. A plain C string compiled into the
+     * specific httpd.c binary that owns this bridge -- genuinely "embedded in
+     * the process", not hardcoded by the kernel-side launcher/dashboard. */
+    char description[UHTTP_LINE];
     /* ── Zone A: core0 -> userland(core2). core0 writes, httpd reads. One line. */
     volatile u32 req_seq;     /* core 0 increments when a request is ready       */
     volatile u32 req_len;     /* bytes in req[]                                  */

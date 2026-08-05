@@ -1,9 +1,12 @@
 /*
  * nic.c - Active NIC backend for Raspberry Pi 5
  *
- * Pi 5 networking is provided by RP1 Cadence MACB/GEM (Ethernet).
- * WiFi support (CYW43455 via SDIO) is parked in spike/wifi/ — see
- * GitHub issue. nic_init_wifi() is retained as a stub returning false.
+ * Pi 5 wired networking is provided by the BCM2712 SoC's own GEM/MACB
+ * Ethernet MAC (see macb.c / PIOS_GENET_BASE). WiFi (CYW43455 via the
+ * BCM2712 SoC's dedicated SDIO2 controller, see cyw43.c/sdio.c) is a
+ * second, explicitly-triggered backend: nic_init_wifi() brings it up and
+ * activates it as g_nic only when called (e.g. from the console "wifi"
+ * command), it is never auto-probed by nic_init() at boot.
  */
 
 #include "nic.h"
@@ -17,6 +20,10 @@
 #include "core_env.h"
 #include "platform.h"
 #include "pioscap.h"
+#if PIOS_HAS_WIFI_SDIO2
+#include "wifi_nic.h"
+#include "cyw43.h"
+#endif
 
 static bool tx_checksum_offload;
 static bool rx_checksum_offload;
@@ -82,6 +89,36 @@ static const struct nic_ops nic_backend_virtio = {
     .full_duplex = virtio_net_link_up,
     /* no offload hooks */
 };
+
+#if PIOS_HAS_WIFI_SDIO2
+/* WiFi is never auto-probed at boot (firmware upload is slow and may fail
+ * on real hardware that hasn't been validated yet) -- it is only activated
+ * by an explicit nic_init_wifi() call, so it lives outside nic_backends[]. */
+static bool wifi_backend_recv(u8 *frame, u32 *len, bool *checksum_trusted)
+{
+    if (checksum_trusted)
+        *checksum_trusted = false;   /* SDPCM/BCDC carries no csum-trust signal here */
+    return wifi_nic_recv(frame, len);
+}
+
+static u32 wifi_backend_link_mbps(void)
+{
+    return wifi_nic_link_up() ? 150U : 0U;  /* CYW43455 802.11n, single-stream */
+}
+
+static const struct nic_ops nic_backend_wifi = {
+    .name        = "wifi-cyw43455",
+    .probe       = NULL,   /* never auto-probed; see nic_init_wifi() */
+    .init        = wifi_nic_init,
+    .send        = wifi_nic_send,
+    .recv        = wifi_backend_recv,
+    .get_mac     = wifi_nic_get_mac,
+    .link_up     = wifi_nic_link_up,
+    .link_mbps   = wifi_backend_link_mbps,
+    .full_duplex = NULL,  /* WiFi is inherently half-duplex at the radio */
+    /* no offload hooks */
+};
+#endif
 
 static const struct nic_ops *const nic_backends[] = {
     &nic_backend_macb,
@@ -1016,13 +1053,37 @@ bool nic_init(void)
 
 bool nic_init_wifi(void)
 {
-    /* WiFi backend parked in spike/wifi/. Always fail. */
+#if PIOS_HAS_WIFI_SDIO2
+    /* Explicit, on-demand bring-up only. Preserve the active wired backend
+     * until association succeeds and nic_activate_wifi_loaded() is called. */
+    if (!nic_backend_wifi.init || !nic_backend_wifi.init())
+        return false;
+    return true;
+#else
     return false;
+#endif
+}
+
+bool nic_activate_wifi_loaded(void)
+{
+#if PIOS_HAS_WIFI_SDIO2
+    if (!cyw43_is_connected())
+        return false;
+    wifi_nic_adopt_loaded();
+    g_nic = &nic_backend_wifi;
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool nic_is_wifi(void)
 {
+#if PIOS_HAS_WIFI_SDIO2
+    return g_nic == &nic_backend_wifi;
+#else
     return false;
+#endif
 }
 
 bool nic_send(const u8 *frame, u32 len)

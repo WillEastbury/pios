@@ -46,25 +46,14 @@ static const u8 aes_rcon[15] = {
 };
 
 /* ---- SHA-256 constants ---- */
-
-static const u32 sha256_k[64] = {
-    0x428A2F98U,0x71374491U,0xB5C0FBCFU,0xE9B5DBA5U,0x3956C25BU,0x59F111F1U,0x923F82A4U,0xAB1C5ED5U,
-    0xD807AA98U,0x12835B01U,0x243185BEU,0x550C7DC3U,0x72BE5D74U,0x80DEB1FEU,0x9BDC06A7U,0xC19BF174U,
-    0xE49B69C1U,0xEFBE4786U,0x0FC19DC6U,0x240CA1CCU,0x2DE92C6FU,0x4A7484AAU,0x5CB0A9DCU,0x76F988DAU,
-    0x983E5152U,0xA831C66DU,0xB00327C8U,0xBF597FC7U,0xC6E00BF3U,0xD5A79147U,0x06CA6351U,0x14292967U,
-    0x27B70A85U,0x2E1B2138U,0x4D2C6DFCU,0x53380D13U,0x650A7354U,0x766A0ABBU,0x81C2C92EU,0x92722C85U,
-    0xA2BFE8A1U,0xA81A664BU,0xC24B8B70U,0xC76C51A3U,0xD192E819U,0xD6990624U,0xF40E3585U,0x106AA070U,
-    0x19A4C116U,0x1E376C08U,0x2748774CU,0x34B0BCB5U,0x391C0CB3U,0x4ED8AA4AU,0x5B9CCA4FU,0x682E6FF3U,
-    0x748F82EEU,0x78A5636FU,0x84C87814U,0x8CC70208U,0x90BEFFFAU,0xA4506CEBU,0xBEF9A3F7U,0xC67178F2U
-};
+/* SHA-256/HMAC/HKDF implementations now live in sha256_hkdf.c (extracted
+ * so that pure-logic code can be host-tested without the ARM
+ * crypto-extension inline asm below); this file keeps only the constants/
+ * helpers its own AES/AES-GCM code needs. */
 
 /* clang-format off */
 static const u8 zero_block[16] = {0};
 /* clang-format on */
-
-static inline u32 rotr32(u32 x, u32 n) {
-    return (x >> n) | (x << (32U - n));
-}
 
 static inline u32 load_be32(const u8 *p) {
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
@@ -87,6 +76,7 @@ static inline void store_be64(u8 *p, u64 v) {
     p[6] = (u8)(v >> 8);
     p[7] = (u8)v;
 }
+
 
 static inline u8 gf_xtime(u8 x) {
     return (u8)((x << 1) ^ ((x & 0x80) ? 0x1BU : 0x00U));
@@ -165,9 +155,27 @@ static inline void aes_round_arm(u8 *state, const u8 *rk, bool mix_columns) {
 }
 
 static void ghash_shift_right_one(u8 *v) {
+    /* GCM's GHASH treats a 128-bit block's bit 0 (the MSB of byte[0], the
+     * first-transmitted bit) as the coefficient of x^0 -- i.e. bit 0 is
+     * the LOWEST-degree term, not the highest (the well-known "bit-
+     * reflected" GHASH convention; see NIST SP 800-38D Section 6.3).
+     * "Multiply by x" therefore moves each coefficient from bit position
+     * p to p+1, which means carries must propagate from byte[k]'s LSB
+     * into byte[k+1]'s MSB -- LOW array index toward HIGH array index
+     * (byte[0] -> byte[1] -> ... -> byte[15]), with byte[15]'s ORIGINAL
+     * LSB (checked by the caller, ghash_shift_x, before this call) being
+     * the overall carry-out that triggers the reduction-polynomial XOR.
+     * A previous version of this function propagated the carry chain
+     * backwards (byte[15] -> byte[14] -> ... -> byte[0]), which silently
+     * computed a different, non-standard field multiplication: it stayed
+     * internally self-consistent (ghash_mul and ghash_mul_scalar_compat
+     * agreed with EACH OTHER, so crypto_selftest's cross-check passed)
+     * while producing GCM authentication tags that no external
+     * TLS/GCM implementation would ever accept. Found and fixed by
+     * checking against the official NIST SP 800-38D GCM Test Case 4
+     * known-answer tag (see crypto_selftest()). */
     u8 carry = 0;
-    for (u32 i = 0; i < 16; i++) {
-        u32 idx = 15 - i;
+    for (u32 idx = 0; idx < 16; idx++) {
         u8 new_carry = v[idx] & 1U;
         v[idx] = (u8)((v[idx] >> 1) | (carry << 7));
         carry = new_carry;
@@ -287,78 +295,7 @@ static void gcm_inc32(u8 *counter) {
     counter[15] = (u8)n;
 }
 
-static void sha256_transform(struct sha256_ctx *ctx, const u8 *block) {
-    u32 w[64];
-    for (u32 i = 0; i < 16; i++)
-        w[i] = load_be32(block + (i * 4));
-    for (u32 i = 16; i < 64; i++) {
-        u32 s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
-        u32 s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-    }
 
-    u32 a = ctx->state[0], b = ctx->state[1], c = ctx->state[2], d = ctx->state[3];
-    u32 e = ctx->state[4], f = ctx->state[5], g = ctx->state[6], h = ctx->state[7];
-
-    for (u32 i = 0; i < 64; i++) {
-        u32 S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
-        u32 ch = (e & f) ^ ((~e) & g);
-        u32 temp1 = h + S1 + ch + sha256_k[i] + w[i];
-        u32 S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
-        u32 maj = (a & b) ^ (a & c) ^ (b & c);
-        u32 temp2 = S0 + maj;
-
-        h = g;
-        g = f;
-        f = e;
-        e = d + temp1;
-        d = c;
-        c = b;
-        b = a;
-        a = temp1 + temp2;
-    }
-
-    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += d;
-    ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;
-}
-
-static void hmac_sha256_parts(const u8 *key, u32 key_len,
-                              const u8 *p1, u32 l1,
-                              const u8 *p2, u32 l2,
-                              const u8 *p3, u32 l3,
-                              u8 *mac) {
-    u8 k0[64];
-    u8 tk[32];
-    u8 ipad[64];
-    u8 opad[64];
-    u8 inner[32];
-    struct sha256_ctx s;
-
-    simd_zero(k0, sizeof(k0));
-    if (key_len > 64) {
-        sha256(key, key_len, tk);
-        simd_memcpy(k0, tk, 32);
-    } else if (key_len) {
-        simd_memcpy(k0, key, key_len);
-    }
-
-    for (u32 i = 0; i < 64; i++) {
-        ipad[i] = k0[i] ^ 0x36U;
-        opad[i] = k0[i] ^ 0x5CU;
-    }
-
-    sha256_init(&s);
-    sha256_update(&s, ipad, 64);
-    if (l1) sha256_update(&s, p1, l1);
-    if (l2) sha256_update(&s, p2, l2);
-    if (l3) sha256_update(&s, p3, l3);
-    sha256_final(&s, inner);
-
-    sha256_init(&s);
-    sha256_update(&s, opad, 64);
-    sha256_update(&s, inner, 32);
-    sha256_final(&s, mac);
-}
 
 void aes_key_expand(struct aes_key *ctx, const u8 *key, u32 key_bits) {
     u32 nk, nr;
@@ -407,12 +344,32 @@ void aes_encrypt_block(const struct aes_key *ctx, const u8 *in, u8 *out) {
         return;
 
     simd_memcpy(state, in, 16);
-    add_round_key(state, &ctx->round_keys[0]);
 
-    for (u32 r = 1; r < ctx->rounds; r++)
+    /* ARMv8 crypto-extension AES encryption round structure. AESE's own
+     * internal XOR (state XOR rk, done BEFORE SubBytes/ShiftRows) is
+     * offset by one round from the textbook FIPS-197 AddRoundKey (which
+     * happens AFTER SubBytes/ShiftRows/MixColumns): AESE(state, rk[i])
+     * fuses "round i's trailing AddRoundKey(rk[i])" with "round i+1's
+     * leading SubBytes+ShiftRows" into one instruction. That means:
+     *   - there is NO separate initial whitening XOR (rk[0]'s AddRoundKey
+     *     is exactly the XOR inside the very first AESE call below);
+     *   - the main loop's AESE calls consume rk[0..rounds-2] (NOT
+     *     rk[1..rounds-1] -- an earlier, since-fixed version of this
+     *     function did that, silently producing non-standard ciphertext
+     *     that only ever round-tripped against itself);
+     *   - the final round is AESE(rk[rounds-1]) with NO AESMC, followed
+     *     by one more PLAIN XOR with rk[rounds] -- the one AddRoundKey
+     *     that never gets fused into an AESE call, since there is no
+     *     "next round" to fuse it with.
+     * Verified against the official FIPS-197 Appendix B test vector (see
+     * tests -- host-tested indirectly is not possible here since this
+     * needs the real ARM AESE/AESMC instructions; validated via
+     * crypto_selftest()/tls13_record_selftest() on real hardware/QEMU). */
+    for (u32 r = 0; r < ctx->rounds - 1U; r++)
         aes_round_arm(state, &ctx->round_keys[r * 16], true);
 
-    aes_round_arm(state, &ctx->round_keys[ctx->rounds * 16], false);
+    aes_round_arm(state, &ctx->round_keys[(ctx->rounds - 1U) * 16], false);
+    add_round_key(state, &ctx->round_keys[ctx->rounds * 16]);
     simd_memcpy(out, state, 16);
 }
 
@@ -558,6 +515,54 @@ bool aes_gcm_decrypt(struct aes_gcm_ctx *ctx,
 
 bool crypto_selftest(void)
 {
+    /* ---- FIPS-197 Appendix B/C known-answer AES-ECB tests -----------
+     * crypto_selftest() previously ONLY round-tripped AES-GCM against
+     * itself (encrypt then decrypt with the SAME implementation), which
+     * cannot detect a bug that is wrong-but-internally-consistent. This
+     * caught exactly such a bug: aes_encrypt_block()'s ARM AESE/AESMC
+     * round-key indexing was off by one round (see the fix + comment on
+     * aes_encrypt_block above), silently producing non-standard AES
+     * output that nonetheless round-tripped fine against PIOS's own
+     * aes_decrypt_block (structurally independent -- plain scalar
+     * inverse rounds, never used by GCM). These two vectors are the
+     * official published FIPS-197 test vectors, not internally
+     * generated ones. */
+    {
+        static const u8 k128[16] = {
+            0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+        };
+        static const u8 pt128[16] = {
+            0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff
+        };
+        static const u8 ct128[16] = {
+            0x69,0xc4,0xe0,0xd8,0x6a,0x7b,0x04,0x30,0xd8,0xcd,0xb7,0x80,0x70,0xb4,0xc5,0x5a
+        };
+        struct aes_key ak;
+        u8 got[16];
+        aes_key_expand(&ak, k128, 128);
+        aes_encrypt_block(&ak, pt128, got);
+        for (u32 i = 0; i < 16; i++)
+            if (got[i] != ct128[i]) return false;
+    }
+    {
+        static const u8 k256[32] = {
+            0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+            0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f
+        };
+        static const u8 pt256[16] = {
+            0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff
+        };
+        static const u8 ct256[16] = {
+            0x8e,0xa2,0xb7,0xca,0x51,0x67,0x45,0xbf,0xea,0xfc,0x49,0x90,0x4b,0x49,0x60,0x89
+        };
+        struct aes_key ak;
+        u8 got[16];
+        aes_key_expand(&ak, k256, 256);
+        aes_encrypt_block(&ak, pt256, got);
+        for (u32 i = 0; i < 16; i++)
+            if (got[i] != ct256[i]) return false;
+    }
+
     static const u8 key[16] = {
         0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
         0x88,0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF
@@ -598,129 +603,55 @@ bool crypto_selftest(void)
         return false;
     for (u32 i = 0; i < sizeof(plain); i++)
         diff |= (u32)(out[i] ^ plain[i]);
-    return diff == 0;
-}
+    if (diff != 0)
+        return false;
 
-void sha256_init(struct sha256_ctx *ctx) {
-    if (!ctx) return;
-    ctx->state[0] = 0x6A09E667U;
-    ctx->state[1] = 0xBB67AE85U;
-    ctx->state[2] = 0x3C6EF372U;
-    ctx->state[3] = 0xA54FF53AU;
-    ctx->state[4] = 0x510E527FU;
-    ctx->state[5] = 0x9B05688CU;
-    ctx->state[6] = 0x1F83D9ABU;
-    ctx->state[7] = 0x5BE0CD19U;
-    ctx->total_len = 0;
-    ctx->buf_len = 0;
-}
-
-void sha256_update(struct sha256_ctx *ctx, const u8 *data, u32 len) {
-    if (!ctx || (!data && len)) return;
-
-    ctx->total_len += len;
-
-    if (ctx->buf_len) {
-        u32 need = 64 - ctx->buf_len;
-        if (need > len) need = len;
-        simd_memcpy(ctx->buf + ctx->buf_len, data, need);
-        ctx->buf_len += need;
-        data += need;
-        len -= need;
-        if (ctx->buf_len == 64) {
-            sha256_transform(ctx, ctx->buf);
-            ctx->buf_len = 0;
-        }
+    /* ---- NIST SP 800-38D GCM test vector (Test Case 4) --------------
+     * An independent, officially published AES-128-GCM known-answer
+     * test: real key/IV/AAD/plaintext -> real published ciphertext+tag,
+     * not just PIOS round-tripping against itself. */
+    {
+        static const u8 gk[16] = {
+            0xfe,0xff,0xe9,0x92,0x86,0x65,0x73,0x1c,0x6d,0x6a,0x8f,0x94,0x67,0x30,0x83,0x08
+        };
+        static const u8 gnonce[12] = {
+            0xca,0xfe,0xba,0xbe,0xfa,0xce,0xdb,0xad,0xde,0xca,0xf8,0x88
+        };
+        static const u8 gaad[20] = {
+            0xfe,0xed,0xfa,0xce,0xde,0xad,0xbe,0xef,0xfe,0xed,0xfa,0xce,0xde,0xad,0xbe,0xef,
+            0xab,0xad,0xda,0xd2
+        };
+        static const u8 gpt[60] = {
+            0xd9,0x31,0x32,0x25,0xf8,0x84,0x06,0xe5,0xa5,0x59,0x09,0xc5,0xaf,0xf5,0x26,0x9a,
+            0x86,0xa7,0xa9,0x53,0x15,0x34,0xf7,0xda,0x2e,0x4c,0x30,0x3d,0x8a,0x31,0x8a,0x72,
+            0x1c,0x3c,0x0c,0x95,0x95,0x68,0x09,0x53,0x2f,0xcf,0x0e,0x24,0x49,0xa6,0xb5,0x25,
+            0xb1,0x6a,0xed,0xf5,0xaa,0x0d,0xe6,0x57,0xba,0x63,0x7b,0x39
+        };
+        static const u8 gct[60] = {
+            0x42,0x83,0x1e,0xc2,0x21,0x77,0x74,0x24,0x4b,0x72,0x21,0xb7,0x84,0xd0,0xd4,0x9c,
+            0xe3,0xaa,0x21,0x2f,0x2c,0x02,0xa4,0xe0,0x35,0xc1,0x7e,0x23,0x29,0xac,0xa1,0x2e,
+            0x21,0xd5,0x14,0xb2,0x54,0x66,0x93,0x1c,0x7d,0x8f,0x6a,0x5a,0xac,0x84,0xaa,0x05,
+            0x1b,0xa3,0x0b,0x39,0x6a,0x0a,0xac,0x97,0x3d,0x58,0xe0,0x91
+        };
+        static const u8 gtag[16] = {
+            0x5b,0xc9,0x4f,0xbc,0x32,0x21,0xa5,0xdb,0x94,0xfa,0xe9,0x5a,0xe7,0x12,0x1a,0x47
+        };
+        struct aes_gcm_ctx gctx;
+        u8 gcipher[60], gtag_out[16], gout[60];
+        aes_gcm_init(&gctx, gk, 128);
+        if (!aes_gcm_encrypt(&gctx, gnonce, sizeof(gnonce), gaad, sizeof(gaad),
+                             gpt, sizeof(gpt), gcipher, gtag_out))
+            return false;
+        for (u32 i = 0; i < sizeof(gct); i++)
+            if (gcipher[i] != gct[i]) return false;
+        for (u32 i = 0; i < 16; i++)
+            if (gtag_out[i] != gtag[i]) return false;
+        if (!aes_gcm_decrypt(&gctx, gnonce, sizeof(gnonce), gaad, sizeof(gaad),
+                             gct, sizeof(gct), gout, gtag))
+            return false;
+        for (u32 i = 0; i < sizeof(gpt); i++)
+            if (gout[i] != gpt[i]) return false;
     }
 
-    while (len >= 64) {
-        sha256_transform(ctx, data);
-        data += 64;
-        len -= 64;
-    }
-
-    if (len) {
-        simd_memcpy(ctx->buf, data, len);
-        ctx->buf_len = len;
-    }
-}
-
-void sha256_final(struct sha256_ctx *ctx, u8 *hash) {
-    u64 bits_len;
-    u8 len_bytes[8];
-    if (!ctx || !hash) return;
-
-    bits_len = ctx->total_len * 8U;
-    store_be64(len_bytes, bits_len);
-
-    ctx->buf[ctx->buf_len++] = 0x80;
-    if (ctx->buf_len > 56) {
-        while (ctx->buf_len < 64) ctx->buf[ctx->buf_len++] = 0;
-        sha256_transform(ctx, ctx->buf);
-        ctx->buf_len = 0;
-    }
-    while (ctx->buf_len < 56) ctx->buf[ctx->buf_len++] = 0;
-    simd_memcpy(ctx->buf + 56, len_bytes, 8);
-    sha256_transform(ctx, ctx->buf);
-
-    for (u32 i = 0; i < 8; i++)
-        store_be32(hash + i * 4, ctx->state[i]);
-}
-
-void sha256(const u8 *data, u32 len, u8 *hash) {
-    struct sha256_ctx ctx;
-    sha256_init(&ctx);
-    sha256_update(&ctx, data, len);
-    sha256_final(&ctx, hash);
-}
-
-void hmac_sha256(const u8 *key, u32 key_len,
-                 const u8 *data, u32 data_len,
-                 u8 *mac) {
-    hmac_sha256_parts(key, key_len, data, data_len, NULL, 0, NULL, 0, mac);
-}
-
-void hkdf_extract(const u8 *salt, u32 salt_len,
-                  const u8 *ikm, u32 ikm_len,
-                  u8 *prk) {
-    u8 zero_salt[32];
-    if (!prk || (!ikm && ikm_len))
-        return;
-
-    if (!salt || salt_len == 0) {
-        simd_zero(zero_salt, sizeof(zero_salt));
-        hmac_sha256(zero_salt, sizeof(zero_salt), ikm, ikm_len, prk);
-        return;
-    }
-
-    hmac_sha256(salt, salt_len, ikm, ikm_len, prk);
-}
-
-void hkdf_expand(const u8 *prk, u32 prk_len,
-                 const u8 *info, u32 info_len,
-                 u8 *okm, u32 okm_len) {
-    u8 t[32];
-    u8 prev[32];
-    u32 produced = 0;
-    u8 ctr = 1;
-    u32 prev_len = 0;
-
-    if (!prk || !okm || prk_len == 0 || okm_len == 0)
-        return;
-
-    while (produced < okm_len) {
-        hmac_sha256_parts(prk, prk_len,
-                          prev, prev_len,
-                          info, info_len,
-                          &ctr, 1,
-                          t);
-
-        u32 chunk = okm_len - produced;
-        if (chunk > 32) chunk = 32;
-        simd_memcpy(okm + produced, t, chunk);
-        simd_memcpy(prev, t, 32);
-        prev_len = 32;
-        produced += chunk;
-        ctr++;
-    }
+    return true;
 }

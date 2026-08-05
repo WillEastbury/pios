@@ -133,7 +133,7 @@ class Smoke:
             code, body = get("/picoscript/config")
             self.check("picoscript config JSON",
                        code == 200 and '"capsule_prefix":"/api/capsule"' in body
-                       and "0x968CCEF1" in body,
+                       and "0x0DD8A3B3" in body,
                        body.strip()[:80])
         except Exception as e:
             self.check("picoscript config JSON", False, str(e))
@@ -269,7 +269,10 @@ class Smoke:
 
             # 4. Seed known users (QEMU-only), then confirm no-secret failure:
             #    a valid user+password must still fail closed without a secret.
-            term("sts testusers")
+            # Seeds two PBKDF2-120000 password records. This takes ~5s on an
+            # idle TCG run and can exceed the generic 8s terminal timeout
+            # immediately after the OTA/burst assertions above.
+            term("sts testusers", timeout=30)
             out = term("sts login admin1 pw-admin-123 wave-sts demo")
             self.check("sts no-secret fails closed",
                        "no_signing_secret" in out, out.strip()[:80])

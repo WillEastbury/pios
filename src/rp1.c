@@ -29,6 +29,7 @@
 #define PCICFG_CMD          0x04    /* Command/Status */
 #define PCICFG_BAR0         0x10    /* BAR0: RP1 MSI-X table/PBA window */
 #define PCICFG_BAR1         0x14    /* BAR1: RP1 peripheral register window */
+#define PCICFG_BAR2         0x18    /* BAR2: RP1 shared SRAM window */
 
 /* PCI command bits */
 #define PCI_CMD_MEM         (1U << 1)
@@ -67,6 +68,7 @@
  * (MSI-X capability reports table BIR0 offset 0, PBA offset 0x2000). */
 #define RP1_MSIX_TARGET_ADDR    (PCIE_TARGET_ADDR + 0x00700000U)
 #define RP1_MSIX_CPU_BASE       (RP1_BAR_BASE + 0x00700000UL)
+#define RP1_SRAM_TARGET_ADDR    (PCIE_TARGET_ADDR + RP1_SRAM_WINDOW)
 
 /* ---- Public API ---- */
 
@@ -235,8 +237,9 @@ bool rp1_init(void) {
     }
 
     /*
-     * Program BAR0/BAR1 to PCIe target addresses in our outbound window.
+     * Program BAR0/BAR1/BAR2 to PCIe target addresses in our outbound window.
      * BAR0 hosts the MSI-X table/PBA. BAR1 hosts RP1 peripheral registers.
+     * BAR2 hosts RP1's 64KB shared SRAM used by the M3 firmware mailbox.
      * The outbound ATU maps CPU RP1_BAR_BASE → PCIe PCIE_TARGET_ADDR,
      * so BAR1 must be at PCIE_TARGET_ADDR for the addresses to line up.
      */
@@ -244,6 +247,8 @@ bool rp1_init(void) {
                    (u32)RP1_MSIX_TARGET_ADDR);
     pcie_cfg_write(RP1_BUS, RP1_DEV, RP1_FN, PCICFG_BAR1,
                    (u32)PCIE_TARGET_ADDR);
+    pcie_cfg_write(RP1_BUS, RP1_DEV, RP1_FN, PCICFG_BAR2,
+                   (u32)RP1_SRAM_TARGET_ADDR);
     dmb();
 
     /* Enable memory space access + bus mastering on RP1 */

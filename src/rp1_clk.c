@@ -39,7 +39,7 @@ struct clk_regs {
 static const struct clk_regs clk_table[] = {
     [RP1_CLK_SYS]      = { 0x0014, 0x0018, 0x0020 },
     [RP1_CLK_SLOW_SYS] = { 0x0024, 0x0028, 0x0030 },
-    [2]                 = { 0x0044, 0x0048, 0x0050 }, /* DMA */
+    [RP1_CLK_DMA]      = { 0x0044, 0x0048, 0x0050 },
     [RP1_CLK_UART]     = { 0x0054, 0x0058, 0x0060 },
     [RP1_CLK_ETH]      = { 0x0064, 0x0068, 0x0070 },
     [RP1_CLK_PWM0]     = { 0x0074, 0x0078, 0x0080 },
@@ -47,6 +47,7 @@ static const struct clk_regs clk_table[] = {
     [7]                 = { 0x0094, 0x0098, 0x00A0 }, /* AUDIO_IN */
     [8]                 = { 0x00A4, 0x00A8, 0x00B0 }, /* AUDIO_OUT */
     [RP1_CLK_I2S]      = { 0x00B4, 0x00B8, 0x00C0 },
+    [RP1_CLK_ADC]      = { 0x0144, 0x0148, 0x0150 },
 };
 
 #define CLK_TABLE_SIZE  (sizeof(clk_table) / sizeof(clk_table[0]))

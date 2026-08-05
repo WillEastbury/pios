@@ -6,6 +6,7 @@
 
 bool nic_init(void);
 bool nic_init_wifi(void);
+bool nic_activate_wifi_loaded(void);
 bool nic_is_wifi(void);
 bool nic_send(const u8 *frame, u32 len);
 bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_len);

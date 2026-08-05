@@ -45,6 +45,8 @@
 #define PIOS_ENABLE_NATIVE_VIDEOCORE 0
 #define PIOS_HAS_HYPERV             0
 #define PIOS_HAS_VMBUS              0
+#define PIOS_HAS_WIFI_SDIO2         0
+#define PIOS_WIFI_SDIO2_BASE        0UL
 #elif PIOS_PLATFORM == PIOS_PLATFORM_HYPERV_ARM
 #define PIOS_PLATFORM_NAME          "hyperv-arm64"
 #define PIOS_PLATFORM_CORE_COUNT    4U
@@ -74,6 +76,8 @@
 #define PIOS_ENABLE_NATIVE_VIDEOCORE 0
 #define PIOS_HAS_HYPERV             1
 #define PIOS_HAS_VMBUS              1
+#define PIOS_HAS_WIFI_SDIO2         0
+#define PIOS_WIFI_SDIO2_BASE        0UL
 #elif PIOS_PLATFORM == PIOS_PLATFORM_HYPERV_AMD64
 #define PIOS_PLATFORM_NAME          "hyperv-amd64"
 #define PIOS_PLATFORM_CORE_COUNT    4U
@@ -103,6 +107,8 @@
 #define PIOS_ENABLE_NATIVE_VIDEOCORE 0
 #define PIOS_HAS_HYPERV             1
 #define PIOS_HAS_VMBUS              1
+#define PIOS_HAS_WIFI_SDIO2         0
+#define PIOS_WIFI_SDIO2_BASE        0UL
 #elif PIOS_PLATFORM == PIOS_PLATFORM_PI3 || PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
 /* BCM2837/BCM2837B0 (Pi3 B/B+) and BCM2710A1 (Pi Zero 2 W) share the same
  * die/peripheral generation and "low peripheral" memory map -- quad
@@ -147,6 +153,8 @@
 #define PIOS_ENABLE_NATIVE_VIDEOCORE 0
 #define PIOS_HAS_HYPERV             0
 #define PIOS_HAS_VMBUS              0
+#define PIOS_HAS_WIFI_SDIO2         0
+#define PIOS_WIFI_SDIO2_BASE        0UL
 #else
 #define PIOS_PLATFORM_NAME          "pi5-bcm2712"
 #define PIOS_PLATFORM_CORE_COUNT    4U
@@ -175,6 +183,12 @@
 #define PIOS_HAS_VIRTIO_NET         0
 #define PIOS_HAS_HYPERV             0
 #define PIOS_HAS_VMBUS              0
+/* Onboard CYW43455 WiFi/BT combo chip, over the BCM2712 SoC's dedicated
+ * SDIO2 controller (NOT RP1 -- see src/board_detect.c comment history and
+ * spike/wifi/sdio.c for the DTB-derived address). Driver lives in
+ * spike/wifi/ until re-enabled (see spike/wifi/README.md). */
+#define PIOS_HAS_WIFI_SDIO2         1
+#define PIOS_WIFI_SDIO2_BASE        0x1001100000UL
 #endif
 
 #define PIOS_CORE_PRIV_SIZE         0x01000000UL

@@ -7,6 +7,7 @@
 #include "build_version.h"
 #include "simd.h"
 #include "uart.h"
+#include "platform.h"
 
 #define KEYSTORE_MAGIC   0x5254534BU /* 'KSTR' */
 #define KEYSTORE_VERSION 1U
@@ -58,6 +59,33 @@ static u32 get32(const u8 *p)
 
 static bool board_serial(u8 out[8])
 {
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    /* QEMU has no VideoCore board serial. The virtual-SD image builder
+     * provisions a persistent, nonzero MBR disk signature; use that public
+     * device identity exactly as real hardware uses its public board serial.
+     * This stabilizes keystore wrapping across derives/reboots without
+     * pretending to provide CSPRNG entropy (random.c still fails closed). */
+    static u8 sector[SD_BLOCK_SIZE] ALIGNED(64);
+    if (!sd_read_block(0, sector) || sector[510] != 0x55 || sector[511] != 0xAA)
+        return false;
+    u32 disk_id = get32(sector + 440);
+    u32 p2_start = get32(sector + 0x1CE + 8);
+    u32 p2_size = get32(sector + 0x1CE + 12);
+    if (disk_id == 0 || p2_start == 0 || p2_size == 0)
+        return false;
+    put32(out + 0, disk_id);
+    put32(out + 4, disk_id ^ p2_start ^ p2_size ^ 0x51454D55U);
+    return true;
+#elif !PIOS_HAS_MAILBOX_FB
+    /* No VideoCore mailbox on this platform (QEMU/Hyper-V): MBOX_BASE is
+     * literally 0 here (see platform.h), so calling mbox_call() at all
+     * would dereference address 0 -- GCC's UB-based optimizer turns that
+     * provably-null MMIO access into a trap (brk) rather than a normal
+     * fault. derive_wrap_key() already falls back to the monotonic timer
+     * when this returns false, so just report "no serial" up front. */
+    (void)out;
+    return false;
+#else
     static volatile u32 buf[8] ALIGNED(16);
     simd_zero((void *)buf, sizeof(buf));
     buf[0] = sizeof(buf);
@@ -73,20 +101,32 @@ static bool board_serial(u8 out[8])
     put32(out + 0, buf[5]);
     put32(out + 4, buf[6]);
     return true;
+#endif
 }
+
+/* Returns the LBA of the sealed keystore record, or KEYSTORE_LBA_INVALID if
+ * WALFS hasn't established a partition location yet. Delegates entirely to
+ * walfs_status()'s already-authoritative discovery (walfs.c's
+ * discover_partition(), which correctly handles the p1-single-volume and
+ * whole-disk-fallback cases) instead of re-deriving/duplicating a
+ * simplified MBR re-scan here.
+ *
+ * IMPORTANT: this must NOT treat partition_lba==0 as "not found". A
+ * previous version conflated the two (returning 0 for both "WALFS isn't
+ * mounted" and "found, genuinely at LBA 0") -- but partition_lba==0 is a
+ * legitimate value on the QEMU no-attached-disk RAM fallback path (whole-
+ * disk volume, no MBR partition table), which made keystore_init() (and
+ * therefore x509/TLS 1.3 certificate provisioning) fail closed on every
+ * QEMU boot even though WALFS itself had mounted successfully. Use the
+ * explicit `mounted` flag as the only "is this valid" signal. */
+#define KEYSTORE_LBA_INVALID 0xFFFFFFFFU
 
 static u32 keystore_lba(void)
 {
-    u32 base = walfs_partition_lba();
-    static u8 mbr[SD_BLOCK_SIZE] ALIGNED(64);
-    if (sd_read_block(0, mbr) && mbr[510] == 0x55 && mbr[511] == 0xAA) {
-        u32 p2 = get32(&mbr[0x1CE + 8]);
-        u32 p2_size = get32(&mbr[0x1CE + 12]);
-        if (p2 != 0 && p2_size > (PIOS_USER_RECORDS_OFFSET / SD_BLOCK_SIZE))
-            base = p2;
-    }
-    if (base == 0) return 0;
-    return base + (PIOS_USER_RECORDS_OFFSET / SD_BLOCK_SIZE);
+    struct walfs_status_snapshot ws;
+    walfs_status(&ws);
+    if (!ws.mounted) return KEYSTORE_LBA_INVALID;
+    return ws.partition_lba + (PIOS_USER_RECORDS_OFFSET / SD_BLOCK_SIZE);
 }
 
 static void derive_wrap_key(u8 key[32], bool *serial_ok)
@@ -173,7 +213,7 @@ bool keystore_init(void)
     simd_zero(&g_ks, sizeof(g_ks));
     u32 lba = keystore_lba();
     g_ks.user_records_lba = lba;
-    if (!lba) {
+    if (lba == KEYSTORE_LBA_INVALID) {
         g_ks.last_error = KS_ERR_LBA;
         return false;
     }
@@ -261,7 +301,7 @@ bool keystore_derive_secret(const char *label, u8 *out, u32 out_len)
     if (!label || !out || out_len == 0 || out_len > 32 || !g_ks.sealed)
         return false;
     u32 lba = keystore_lba();
-    if (!lba || !sd_read_block(lba, ks_sector))
+    if (lba == KEYSTORE_LBA_INVALID || !sd_read_block(lba, ks_sector))
         return false;
     struct keystore_record rec;
     simd_memcpy(&rec, ks_sector, sizeof(rec));

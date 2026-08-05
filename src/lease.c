@@ -620,7 +620,9 @@ static void lease_selftest_cleanup(u32 karena, u32 carena)
     kspin_lock(lk);
     for (u32 i = 0; i < LEASE_POOL_MAX; i++) {
         struct lease_descriptor *s = &g_pool[i];
-        if (s->arena_id != karena && s->arena_id != carena)
+        bool test_slot = (karena != LEASE_ARENA_NONE && s->arena_id == karena) ||
+                         (carena != LEASE_ARENA_NONE && s->arena_id == carena);
+        if (!test_slot)
             continue;
         if (s->state != LEASE_STATE_FREE && g_stats.slots_live)
             g_stats.slots_live--;
@@ -638,12 +640,27 @@ static void lease_selftest_cleanup(u32 karena, u32 carena)
     for (u32 i = 0; i < LEASE_ARENA_MAX; i++) {
         if (!g_arenas[i].in_use)
             continue;
-        if (g_arenas[i].arena_id != karena && g_arenas[i].arena_id != carena)
+        bool test_arena = (karena != LEASE_ARENA_NONE && g_arenas[i].arena_id == karena) ||
+                          (carena != LEASE_ARENA_NONE && g_arenas[i].arena_id == carena);
+        if (!test_arena)
             continue;
         lease_zero(&g_arenas[i], sizeof(g_arenas[i]));
         if (g_stats.arenas)
             g_stats.arenas--;
     }
+    kspin_unlock(lk);
+}
+
+static void lease_selftest_restore_reject_stats(const struct lease_stats *before)
+{
+    struct kspinlock *lk = lease_lock();
+    kspin_lock(lk);
+    /* These counters are deliberately exercised by the stale/invalid/MMU
+     * rejection cases below. Restore their pre-test values so a successful
+     * diagnostic run does not leave false red flags on the workbench. */
+    g_stats.mmu_rejects = before->mmu_rejects;
+    g_stats.stale_rejects = before->stale_rejects;
+    g_stats.state_rejects = before->state_rejects;
     kspin_unlock(lk);
 }
 
@@ -653,7 +670,18 @@ bool lease_selftest(void)
     u32 karena = LEASE_ARENA_NONE;
     u32 carena = LEASE_ARENA_NONE;
     bool test_mmu_safe = false;
+    struct lease_stats reject_before;
+    struct lease_stats before;
+#ifdef PIOS_HOST_TYPES_SHIM
+    /* Host lease_init() intentionally resets between independent unit cases;
+     * preserve the caller-visible reject counters across that reset too. */
+    lease_get_stats(&reject_before);
+#endif
     lease_init();
+#ifndef PIOS_HOST_TYPES_SHIM
+    lease_get_stats(&reject_before);
+#endif
+    lease_get_stats(&before);
     {
         struct kspinlock *lk = lease_lock();
         kspin_lock(lk);
@@ -798,13 +826,20 @@ bool lease_selftest(void)
 
     struct lease_stats st;
     lease_get_stats(&st);
-    if (st.acquires < 4 || st.releases < 4 || st.copies < 1 ||
-        st.transfers < 1 || st.stale_rejects < 1 || st.mmu_rejects < 1 ||
-        (test_mmu_safe && (st.grants < 1 || st.revokes < 1)))
+    if ((u32)(st.acquires - before.acquires) < 4U ||
+        (u32)(st.releases - before.releases) < 4U ||
+        (u32)(st.copies - before.copies) < 1U ||
+        (u32)(st.transfers - before.transfers) < 1U ||
+        (u32)(st.stale_rejects - before.stale_rejects) < 1U ||
+        (u32)(st.mmu_rejects - before.mmu_rejects) < 1U ||
+        (test_mmu_safe &&
+         ((u32)(st.grants - before.grants) < 1U ||
+          (u32)(st.revokes - before.revokes) < 1U)))
         goto done;
 
     ok = true;
 done:
     lease_selftest_cleanup(karena, carena);
+    lease_selftest_restore_reject_stats(&reject_before);
     return ok;
 }

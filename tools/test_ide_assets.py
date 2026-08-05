@@ -16,7 +16,7 @@ Checks, with zero network/toolchain requirements:
   4. Hook namespaces: the embedded ../picoscript/vm/pico_hooks.js exposes the
      updated host-hook namespaces.
   5. kernel.c serving: the /picoscript route family, the /picoscript/config JSON
-     (with the current hook table version 0x968CCEF1 and endpoint prefixes), and
+     (with the current hook table version 0x0DD8A3B3 and endpoint prefixes), and
      the generated ide_assets symbols are wired in src/kernel.c.
 
 Run: python tools/test_ide_assets.py
