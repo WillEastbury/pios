@@ -219,7 +219,8 @@ Inter-core communication uses `struct fifo_msg` (64 bytes). When adding new mess
 
 ### Code Size Discipline
 
-The entire kernel is ~259KB. Keep strings short (prefixes: `[mac]`, `[wal]`, `[bt]`, `[cyw]`, `[fat]`, `[sdio]`, etc). No unused code. `-O2` optimization. If a function is only called once, the compiler will inline it — don't fight this.
+The stage0 loader is ~27 KiB and the stage2 OS image is ~3.45 MiB (~2.28 MiB of that is the
+embedded PicoScript IDE web assets in `src/ide_assets.c`); see `docs/size.md`. Keep strings short (prefixes: `[mac]`, `[wal]`, `[bt]`, `[cyw]`, `[fat]`, `[sdio]`, etc). No unused code. `-O2` optimization. If a function is only called once, the compiler will inline it — don't fight this.
 
 ### WiFi — CYW43455 via BCM2712 SDIO2 (WIP)
 

@@ -33,7 +33,7 @@ pios/
 - **Flow:** Saves full context → calls C handlers in `exception.c` → restores context → `eret`
 - **Interactions:** IRQ handler calls `irq_dispatch()`, sync handler calls `sync_handler()`
 
-### `src/kernel.c` — Main Kernel (178KB)
+### `src/kernel.c` — Main Kernel (~1.0MB source, ~0.63MB in image)
 - **Role:** Boot orchestration, console shell, UI rendering, system integration
 - **Boot sequence:** Phase 0-7: EL2→MMU→GIC→timer→DMA→PCIe/RP1/USB→SD/WALFS→NIC→net→multicore
 - **Console:** ~60 commands (help, ls, cat, cp, netcfg, wifi, ps, kill, launch, edit, batch, svc, db, etc.)
@@ -201,7 +201,7 @@ pios/
 
 ## Process Management & IPC
 
-### `src/proc.c` — Process Scheduler (110KB)
+### `src/proc.c` — Process Scheduler (~230KB source, ~68KB in image)
 - **Role:** Per-core cooperative scheduler, process lifecycle, syscall dispatch
 - **Features:** Priority levels (lazy→realtime), affinity, process states, filesystem syscalls, tensor syscalls
 - **API:** `proc_create()`, `proc_kill()`, `proc_schedule()`, `proc_syscall()`

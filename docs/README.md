@@ -22,5 +22,6 @@
 | [tensor.md](tensor.md) | NEON/QPU tensor compute, SIMD operations |
 | [serial.md](serial.md) | Serial console setup — adapter pinout, wiring, terminal settings |
 | [deployment.md](deployment.md) | SD card preparation, hardware wiring, boot process |
+| [size.md](size.md) | Measured image size analysis — stage0/stage2 totals, per-subsystem and per-object breakdown, raw-slot headroom |
 | [../CONSOLE.md](../CONSOLE.md) | Operator console, Web Admin, log tailing, OTA hot-flash, remote reboot, and firewall commands |
 | [../DISKLAYOUT.md](../DISKLAYOUT.md) | FAT boot partition, partition-2 reserved system area, second-stage slot, and WALFS layout |

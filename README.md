@@ -1,7 +1,8 @@
 # PIOS — Pi 5 Bare Metal Microkernel
 
 A bare-metal operating system for the Raspberry Pi 5 (BCM2712 / Cortex-A76).
-No Linux. No libc. 4 dedicated CPU cores. ~240KB kernel image.
+No Linux. No libc. 4 dedicated CPU cores. A 27 KiB stage0 loader plus a ~3.5 MiB stage2 OS image
+(drivers + network/TLS stack + WALFS/picowal DB + web application stack + PicoScript VM).
 
 ## What is this?
 
@@ -93,10 +94,16 @@ Outputs: `kernel8.img` (minimal stage0) and `PIOSSTG2.PKG` (stage2 package)
 ### Verify
 
 ```bash
-aarch64-none-elf-size kernel8.elf
-# text    data    bss     dec     hex     filename
-# ~15000  14      276288  290000  ...     kernel8.elf
+aarch64-none-elf-size real_kernel.elf
+#    text     data      bss      dec      hex  filename
+# 3525084    91480  7146400 10762964   a43ad4  real_kernel.elf
+
+ls -l kernel8.img real_kernel.img
+#    27536  kernel8.img      (stage0 loader)
+# 3618816  real_kernel.img   (stage2 package = PIOSSTG2.PKG)
 ```
+
+See [docs/size.md](docs/size.md) for the per-subsystem breakdown.
 
 ## Deployment
 
@@ -222,8 +229,8 @@ The gateway MAC **must** be set manually (no ARP by default). Find it with
 ```
 Address             Size    Purpose
 ─────────────────────────────────────────────────────
-0x00080000          ~240KB  Kernel image (.text + .rodata + .data)
-0x00080000+         ~1MB    BSS (stacks, static buffers)
+0x00080000          ~3.4MB  Stage2 image (.text + .rodata + .data)
+0x00080000+         ~6.8MB  BSS (stacks, rings, arenas, static buffers)
 0x00200000          16MB    Core 0 private RAM (Kernel/Network/Disk service)
 0x01200000          16MB    Core 1 private RAM (User M)
 0x02200000          16MB    Core 2 private RAM (User 0)
