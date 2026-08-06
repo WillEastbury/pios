@@ -442,6 +442,13 @@ For WiFi, do not debug WPA before proving:
 
 ## Related documents
 
+- `architecture_system.md` - cores, scheduling/quanta, the software-interrupt
+  and quantum model, FIFOs, IPC, EL levels and memory isolation.
+- `network_stack.md` - NIC/IP/TCP/UDP implementation detail, the cross-core FIFO
+  network path, and TLS 1.3 termination with capsule offload.
+- `boot_storage.md` - two-stage boot, A/B OTA, WALFS, users, logging and
+  perf/monitoring.
+- `gotchas.md` - failed attempts, reverted changes and non-obvious traps.
 - `architecture.md` - core assignment, memory map and boot architecture.
 - `kernel_dma_irq.md` - DMA, IRQ and core-0 reactor behavior.
 - `ipc.md` - FIFO ownership, publication and wake contracts.

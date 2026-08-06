@@ -299,10 +299,81 @@ static u32 cap_build_error_response(const char *reason, u8 *out, u32 cap)
     return off;
 }
 
+/* ADR-018 soak endpoint: GET /spin/<n> busy-loops for n * 1,000,000 iterations
+ * inside this EL0 process without yielding, parking, or issuing a syscall.
+ *
+ * Purpose is narrow and deliberate: preemption (ADR-012/013) is only genuinely
+ * proven when a user process actually OVERRUNS its quantum. Every other EL0
+ * process here parks almost immediately, so the timer IRQ always lands on an
+ * idle core and PREEMPT counters stay at 0 -- which proves nothing. This loop
+ * forces the timer PPI to fire on the hosting core while a process is mid-
+ * computation, so the IRQ has to cross the EL2 stage-2 cage and ctx_switch out
+ * of a running EL0 context (ADR-014's untested path).
+ *
+ * `volatile` on the accumulator is load-bearing: without it -O2 deletes the
+ * whole loop and the test silently measures nothing. */
+static u32 cap_spin_iters(const u8 *p, u32 n)
+{
+    u32 v = 0;
+    for (u32 i = 0; i < n && p[i] >= '0' && p[i] <= '9'; i++) {
+        if (v > 100000U) break;      /* bounded before it can overflow */
+        v = v * 10U + (u32)(p[i] - '0');
+    }
+    if (v == 0U) v = 1U;
+    if (v > 2000U) v = 2000U;        /* hard ceiling: never an unbounded loop */
+    return v;
+}
+
+static bool cap_try_spin(struct capsvc_slot *slot, u32 req_len)
+{
+    static const char pfx[] = "/spin/";
+    const u32 pfx_n = 6U;
+
+    u32 ps, pn;
+    cap_req_bounds(slot->data, req_len, &ps, &pn);
+    if (pn <= pfx_n)
+        return false;
+    for (u32 i = 0; i < pfx_n; i++)
+        if (slot->data[ps + i] != (u8)pfx[i])
+            return false;
+
+    u32 units = cap_spin_iters(slot->data + ps + pfx_n, pn - pfx_n);
+
+    volatile u32 acc = 0;
+    for (u32 u = 0; u < units; u++)
+        for (u32 i = 0; i < 1000000U; i++)
+            acc = acc + i;
+
+    char *dst = (char *)slot->data;
+    u32 boff = 0;
+    char body[96];
+    cap_append(body, &boff, sizeof(body), "{\"ok\":true,\"spin_units\":");
+    cap_append_u32(body, &boff, sizeof(body), units);
+    cap_append(body, &boff, sizeof(body), ",\"acc\":");
+    cap_append_u32(body, &boff, sizeof(body), (u32)acc);
+    cap_append(body, &boff, sizeof(body), "}");
+
+    u32 off = 0;
+    cap_append(dst, &off, CAPSVC_SLOT_DATA_MAX, "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
+    cap_append_u32(dst, &off, CAPSVC_SLOT_DATA_MAX, boff);
+    cap_append(dst, &off, CAPSVC_SLOT_DATA_MAX, "\r\n\r\n");
+    for (u32 i = 0; i < boff && off < CAPSVC_SLOT_DATA_MAX; i++)
+        dst[off++] = body[i];
+
+    capsvc_clean(slot->data, off);
+    slot->hdr.resp_len = off;
+    slot->hdr.state = CAPSVC_SLOT_REPLY;
+    capsvc_clean(&slot->hdr, CAPSVC_LINE);
+    return true;
+}
+
 static void cap_process_slot(struct capsvc_slot *slot, struct capsvc_program *prog)
 {
     u32 req_len = slot->hdr.req_len;
     if (req_len > CAPSVC_SLOT_DATA_MAX) req_len = CAPSVC_SLOT_DATA_MAX;
+
+    if (cap_try_spin(slot, req_len))
+        return;
 
     /* Fixed scratch region, not a stack local -- see struct cap_scratch's
      * comment. Single-threaded host: only one request is ever processed at

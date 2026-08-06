@@ -475,8 +475,6 @@ void irq_dispatch(struct irq_frame *frame) {
         irq_diag.unhandled++;
     }
 
-    proc_irq_maybe_preempt(frame);
-
     if (irq_trace->magic == IRQ_TRACE_MAGIC)
         irq_trace->pre_eoi++;
     if (trace_enabled) {
@@ -492,6 +490,13 @@ void irq_dispatch(struct irq_frame *frame) {
     }
     if (irq_trace->magic == IRQ_TRACE_MAGIC)
         irq_trace->post_eoi++;
+
+    /* Preemption happens AFTER the EOI, never before. Preempting between IAR
+     * and EOIR would leave this interrupt active in the GIC for as long as the
+     * preempted process stays descheduled, blocking every same-or-lower
+     * priority interrupt on this core -- including the timer that drives
+     * preemption itself. */
+    proc_irq_maybe_preempt(frame);
 
     /* Stop-the-world debug freeze: check AFTER EOI so the GIC's IAR/EOIR
      * pairing for THIS interrupt is already closed out cleanly, then never

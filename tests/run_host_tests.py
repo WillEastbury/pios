@@ -81,6 +81,40 @@ TESTS_MANIFEST = {
     # src/tls13_handshake.c.
     "test_tls13_handshake_builders.c": ["src/tls13_handshake.c", "src/sha256_hkdf.c",
                                         "src/p256.c", "src/ecdsa.c"],
+    # Asynchronous driver framework (src/adrv.c). Pure logic: time, watchdog
+    # and liveness are injected hooks, so the contracts can be pinned with a
+    # deterministic fake clock. These tests exist because the CYW43455
+    # bring-up hit the same failures repeatedly -- core-0 starvation, watchdog
+    # misuse, and cadence inversion. The critical assertions are that a stalled
+    # operation NEVER pets the watchdog, and that the system SCHEDULES rather
+    # than overruns: admission control refuses work that does not fit the pass
+    # budget, and a step returning late is quarantined on first offence.
+    "test_adrv.c": ["src/adrv.c"],
+    # Software interrupt queue + prioritized dispatcher (src/airq.c). Hardware
+    # IRQ handlers only enqueue bounded records (top half); the reactor
+    # dispatches them by software priority under a time budget (bottom half).
+    # Pins that an interrupt storm becomes a bounded backlog rather than a
+    # takeover of the core, and that strict priority never starves the
+    # cross-core FIFO doorbell that user cores are parked on.
+    "test_airq.c": ["src/airq.c"],
+    # EL0 -> EL1 process control line (src/pctl.c). The trap-free channel that
+    # replaces the PARK/EXIT syscalls: async/await over queues with the
+    # scheduler as executor. Pins the sticky-wake rule -- a reply landing
+    # between "decide to await" and "publish AWAITING" must not be lost -- and
+    # that untrusted EL0 input fails closed rather than being clamped.
+    "test_pctl.c": ["src/pctl.c"],
+    # CPU quantum banking (src/qbank.c). Cooperative yield/await earn spendable
+    # credit; preemption earns none. Pins the guard that keeps mandatory
+    # preemption intact -- credit buys IDLE cpu only and is unspendable while
+    # another process is runnable -- plus the anti-gaming property that banking
+    # is lossy and a tight yield loop farms nothing.
+    "test_qbank.c": ["src/qbank.c"],
+    # Per-core scheduler wake FIFO (src/swake.c), the kernel -> process half of
+    # the syscall-free scheduling contract. Pins the rule that FIFO replies,
+    # empty timer messages and preempt requests all advance ONE per-process
+    # sequence, and carries the end-to-end Thread.Sleep(1000) round trip driven
+    # through swake + pctl with no syscall anywhere.
+    "test_swake.c": ["src/swake.c", "src/pctl.c"],
 }
 
 

@@ -34,7 +34,7 @@ bool abi_selftest(void)
            st.user_ttbr_split &&
            st.svc_trap_ready &&
            !st.el0_ready &&
-           st.el0_spsr == PROC_ENTRY_SPSR_EL0_DAIF &&
+           st.el0_spsr == PROC_ENTRY_SPSR_EL0 &&
            st.kernel_api_version != 0;
 }
 

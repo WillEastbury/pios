@@ -30,8 +30,88 @@
 #include "picowal_db.h"
 #include "pix.h"
 #include "watchdog.h"
+#include "ksvc.h"
+#include "airq.h"
+
+/*
+ * Per-core kernel service identities for the scheduler and the FIFO/doorbell
+ * drain. These are real consumers of core time, so they must be visible in the
+ * process/service map rather than being invisible work attributed to nobody.
+ * procs.c is compiled once and executed by every core, so this table is
+ * per-core with cache-line isolation: each core writes only its own record.
+ */
+struct proc_core_svc {
+    i32 sched_id;
+    i32 fifo_id;
+    u32 registered;
+    u8 reserved[52];
+} ALIGNED(64);
+
+_Static_assert(sizeof(struct proc_core_svc) == 64U,
+               "per-core service identities must occupy one cache line");
+
+static struct proc_core_svc proc_core_svc[NUM_CORES];
+
+/* Static names: no dynamic formatting anywhere near the scheduler. */
+static const char *const proc_sched_svc_names[NUM_CORES] = {
+    "sched-core0", "sched-core1", "sched-core2", "sched-core3"
+};
+static const char *const proc_fifo_svc_names[NUM_CORES] = {
+    "fifo-core0", "fifo-core1", "fifo-core2", "fifo-core3"
+};
+
+static void proc_register_core_services(void)
+{
+    u32 c = core_id() & 3U;
+    if (proc_core_svc[c].registered)
+        return;
+    proc_core_svc[c].sched_id =
+        ksvc_register(proc_sched_svc_names[c], KSVC_KIND_POLL, c, 110);
+    proc_core_svc[c].fifo_id =
+        ksvc_register(proc_fifo_svc_names[c], KSVC_KIND_POLL, c, 105);
+    proc_core_svc[c].registered = 1U;
+    dmb_ishst();
+}
 
 static struct process  procs[MAX_PROCS_PER_CORE] ALIGNED(64);
+
+/*
+ * ADR-021: per-process EL1 exception stacks.
+ *
+ * An EL0 process runs with IRQs enabled (PROC_ENTRY_SPSR_EL0), so the PE takes
+ * the timer PPI to EL1, forces SPSel=1, and pushes a 272-byte trap frame onto
+ * SP_EL1. Two properties are required of whatever SP_EL1 points at, and the old
+ * `ctx.sp = entry_sp` satisfied neither:
+ *
+ *  1. It must NOT overlap the EL0 user stack. They previously shared one address
+ *     and grew down into each other, so a trap taken at arbitrary EL0 stack depth
+ *     would have written its frame straight through live EL0 frames. This was
+ *     latent only because IRQs were masked at EL0.
+ *
+ *  2. It must NOT be reachable from EL0. The trap frame holds SPSR, and
+ *     RESTORE_CONTEXT (vectors.S) does `msr spsr_el1` directly from it -- a
+ *     process able to edit its own saved frame could set SPSR to EL1h and
+ *     escalate on the next eret. Kernel .bss is mirrored into every user table
+ *     by map_user_kernel_low() with PTE_AP_RW_EL1 (EL1 RW, EL0 no access) and
+ *     with attributes copied verbatim from l2_table_low, so it satisfies both the
+ *     privilege requirement and the "no conflicting attributes" MMU invariant.
+ *     Do NOT move these into the process slot to save memory.
+ *
+ * Sized for one trap frame plus the irq_dispatch/ctx_switch C frames above it;
+ * the preempt path switches to the scheduler's own stack, so nothing nests
+ * further here. procs[] is 6 slots system-wide, so this costs 96 KiB total.
+ */
+#define PROC_KSTACK_SIZE  16384U
+static u8 proc_kstack[MAX_PROCS_PER_CORE][PROC_KSTACK_SIZE] ALIGNED(64);
+_Static_assert((PROC_KSTACK_SIZE & 63U) == 0U,
+               "per-process EL1 stacks must not share cache lines");
+
+/* Top of slot `s`'s EL1 exception stack, 16-byte aligned per AAPCS64. */
+static inline u64 proc_kstack_top(u32 s)
+{
+    return ((u64)(usize)&proc_kstack[s][PROC_KSTACK_SIZE]) & ~15ULL;
+}
+
 /* rc-percore-sched: the scheduler's saved context, the current-process index,
  * and the round-robin cursor are PER-CORE. procs[] stays shared (each core
  * filters by affinity_core), but a single global scheduler_ctx would let two
@@ -467,7 +547,7 @@ u32 proc_entry_contract_flags(void)
 
 u32 proc_entry_contract_spsr(void)
 {
-    return PROC_ENTRY_SPSR_EL0_DAIF;
+    return PROC_ENTRY_SPSR_EL0;
 }
 
 static bool proc_entry_contract_validate(const struct process *p)
@@ -488,7 +568,7 @@ static bool proc_entry_contract_validate(const struct process *p)
         return false;
     if ((p->entry_flags & proc_entry_contract_flags()) != proc_entry_contract_flags())
         return false;
-    return p->entry_spsr == PROC_ENTRY_SPSR_EL0_DAIF;
+    return p->entry_spsr == PROC_ENTRY_SPSR_EL0;
 }
 
 bool proc_entry_contract_selftest(void)
@@ -503,7 +583,7 @@ bool proc_entry_contract_selftest(void)
     p.arena_base = ((u64)(usize)fake_slot + 4096U + L3_PAGE_SIZE - 1U) & ~(u64)(L3_PAGE_SIZE - 1U);
     p.arena_limit = (u64)(usize)fake_slot + PROC_SLOT_SIZE - 65536ULL;
     p.entry_sp = (u64)(usize)(fake_slot + PROC_SLOT_SIZE - 16U);
-    p.entry_spsr = PROC_ENTRY_SPSR_EL0_DAIF;
+    p.entry_spsr = PROC_ENTRY_SPSR_EL0;
     p.entry_flags = proc_entry_contract_flags();
     return proc_entry_contract_validate(&p);
 }
@@ -1352,7 +1432,6 @@ static i32   sys_tensor_scale(void *b, const void *a, float scalar);
 static i32   sys_tensor_bind_kernel_blob(u32 kernel_id, const void *uniform_data, u32 uniform_bytes,
                                          const u64 *shader_code, u32 shader_insts);
 static i32   sys_tensor_bind_kernel_csd(u32 kernel_id, const u32 *csd_cfg, u32 qpu_count);
-static void  proc_preempt_trampoline(void);
 static void  proc_handle_bench_echo(void);
 static void  proc_note_desched(u32 reason);
 static void  proc_park_note(u32 which);
@@ -1791,7 +1870,7 @@ static NORETURN void proc_trampoline(void)
     __builtin_unreachable();
 }
 
-extern void proc_el0_enter(u64 entry_pc, u64 entry_sp) NORETURN;
+extern void proc_el0_enter(u64 entry_pc, u64 entry_sp, u64 spsr) NORETURN;
 
 static NORETURN void proc_el0_trampoline(void)
 {
@@ -1800,13 +1879,10 @@ static NORETURN void proc_el0_trampoline(void)
     el0_enter_pid = p->pid;
     el0_enter_pc = p->entry_pc;
     el0_enter_sp = p->entry_sp;
-    proc_el0_enter(p->entry_pc, p->entry_sp);
+    /* Pass the contract SPSR through rather than letting the asm hardcode it,
+     * so proc_entry_contract_validate() and the actual eret cannot disagree. */
+    proc_el0_enter(p->entry_pc, p->entry_sp, (u64)p->entry_spsr);
     __builtin_unreachable();
-}
-
-static void proc_preempt_trampoline(void)
-{
-    proc_yield();
 }
 
 static void proc_handle_bench_echo(void)
@@ -2075,7 +2151,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     icache_invalidate_range((u64)(usize)base, loaded);
 
     p->entry_sp = (u64)(usize)(base + PROC_SLOT_SIZE - 16);
-    p->entry_spsr = PROC_ENTRY_SPSR_EL0_DAIF;
+    p->entry_spsr = PROC_ENTRY_SPSR_EL0;
     p->entry_flags = proc_entry_contract_flags();
     if (!proc_entry_contract_validate(p)) {
         uart_puts("[proc] invalid entry contract\n");
@@ -2228,7 +2304,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     icache_invalidate_range((u64)(usize)base, loaded);
 
     p->entry_sp = (u64)(usize)(base + PROC_SLOT_SIZE - 16);
-    p->entry_spsr = PROC_ENTRY_SPSR_EL0_DAIF;
+    p->entry_spsr = PROC_ENTRY_SPSR_EL0;
     p->entry_flags = proc_entry_contract_flags();
     if (!proc_entry_contract_validate(p)) {
         uart_puts("[proc] mem-exec: bad entry contract\n");
@@ -2370,12 +2446,13 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     icache_invalidate_range((u64)(usize)base, loaded);
 
     p->entry_sp = linked_base + 0x20000U;
-    p->entry_spsr = PROC_ENTRY_SPSR_EL0_DAIF;
+    p->entry_spsr = PROC_ENTRY_SPSR_EL0;
     p->entry_flags = proc_entry_contract_flags();
 
     simd_zero(&p->ctx, sizeof(p->ctx));
     p->ctx.x19_x30[11] = (u64)(usize)proc_el0_trampoline;
-    p->ctx.sp = p->entry_sp;
+    /* EL1 exception stack, deliberately NOT p->entry_sp -- see proc_kstack. */
+    p->ctx.sp = proc_kstack_top((u32)slot);
 
     if (!mmu_user_table_build_split_el0_at(core_id(), (u32)slot, linked_base, (u64)(usize)base,
                                            PROC_SLOT_SIZE, loaded)) {
@@ -2445,6 +2522,13 @@ void proc_schedule(void)
     if (!initialized)
         proc_init();
 
+    /* Publish this core's scheduler and FIFO-drain identities so both appear
+     * in the service/process map with their real owner core. */
+    proc_register_core_services();
+    const u32 svc_core = core_id() & 3U;
+    const i32 svc_sched = proc_core_svc[svc_core].sched_id;
+    const i32 svc_fifo = proc_core_svc[svc_core].fifo_id;
+
     if (user) {
         core_mark_online(core_id(), 6);
         sched_diag[uc].start_ticks = proc_sched_counter_ticks();
@@ -2459,16 +2543,39 @@ void proc_schedule(void)
         if (debug_freeze_is_requested(core_id()))
             debug_freeze_cooperative_point();
         watchdog_touch(core_id());
+        /* One counter read serves both nested intervals; see ksvc.h (ADR-017/Q7).
+         * Previously this loop cost 4 counter reads and 2 64-bit divides per
+         * iteration, at full spin rate on an idle core. */
+        u64 svc_sched_t0 = ksvc_now_ticks();
+        ksvc_begin_at(svc_sched);
         workq_drain(8);
         if (cohdiag_consumer_arm)
             proc_cohdiag_consumer_tick();
+        /* FIFO / cross-core doorbell drain: accounted separately from the
+         * scheduler itself so an operator can see which of the two is
+         * consuming a core. */
+        u64 svc_fifo_t0 = svc_sched_t0;
+        ksvc_begin_at(svc_fifo);
+        /* Unified per-core quantum: drain this core's prioritized software
+         * interrupt queue (bounded, so the scheduler is guaranteed its share),
+         * then fall through to process dispatch with the remainder. This is
+         * the only software interrupt a user core needs. */
+        {
+            u64 sched_ms = 0ULL;
+            (void)airq_quantum(core_id() & 3U, PROC_PREEMPT_QUANTUM_MS,
+                               &sched_ms);
+        }
         proc_drain_remote_wakes();
         proc_sched_heartbeat();
         proc_sched_stage(10);
         proc_handle_bench_echo();
         proc_sched_stage(11);
         proc_handle_launch_request();
-        proc_sched_stage(12);
+        {
+            u64 svc_now = ksvc_now_ticks();
+            ksvc_end_at(svc_fifo, svc_fifo_t0, svc_now, false);
+            ksvc_end_at(svc_sched, svc_sched_t0, svc_now, false);
+        }        proc_sched_stage(12);
         bool found = false;
         for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
             /* Only reap processes homed to this core. procs[] is shared across
@@ -2774,9 +2881,15 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
      * but inactive -- abi el0_ready=false), stage-2 is the only thing isolating
      * them. Once processes run at EL0, stage-1 EL0 perms isolate and this whole
      * per-core split can go away. */
+    /* Preemption is mandatory on every user core, so every user core needs its
+     * GIC CPU interface up to receive the timer PPI. The historical split (no
+     * GIC interface on the process-hosting core, to avoid an interrupt landing
+     * across the per-dispatch EL2 stage-2 cage toggle) is incompatible with a
+     * preemptive kernel: a core that cannot take a timer interrupt cannot be
+     * preempted, and an unpreemptable core is exactly the failure this
+     * invariant exists to prevent. */
     bool hosts_process = (proc_hosts_process_arr[core_id()].v != 0U);
-    if (!hosts_process)
-        gic_cpu_init();
+    gic_cpu_init();
 
     if (timer_hz == 0)
         timer_hz = 1;
@@ -2791,13 +2904,21 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
     preempt_quantum_ticks(uc) = q;
     preempt_pending(uc) = false;
     preempt_armed(uc) = false;
-    /* Preemption stays OFF: the timer PPI never reached user cores before the
-     * CPU-interface fix, so the scheduler has always run cooperatively. Now that
-     * the timer fires, leaving preemption enabled would activate the (untested)
-     * IRQ descheduling trampoline and corrupt a running process (observed: httpd
-     * on core 2 wedged). Cooperative behaviour is unchanged from the baseline;
-     * re-enabling preemption is a separate task that must validate the trampoline. */
-    preempt_enabled(uc) = false;
+    /*
+     * PREEMPTION IS MANDATORY. It is a hard invariant of this OS, not a tuning
+     * option: a cooperatively-scheduled core is one runaway process away from
+     * never answering a FIFO reply, never draining a queue, and never yielding
+     * the core back. "Cooperative" means "correct only while every process
+     * behaves", which is not a property a kernel may assume.
+     *
+     * This was previously left disabled because the preemption path redirected
+     * ELR into a C trampoline, which destroyed the interrupted process's x30
+     * and caller-saved registers (see proc_irq_maybe_preempt for the full
+     * analysis). That mechanism is gone: preemption now switches contexts from
+     * IRQ context after the EOI, where the saved IRQ frame plus the
+     * callee-saved context form a complete, correct process state.
+     */
+    preempt_enabled(uc) = true;
     /* The timer tick hook is registered once, centrally, as the single unified
      * pios_tick_hook (kernel.c) by each core's main(); proc_preempt_init no
      * longer installs its own hook, so the reactor (core 0) and preemption
@@ -2831,16 +2952,16 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
      * On-demand wakes come from the SGI doorbell. (The hosting core never enabled
      * its GIC interface, so its timer PPI is generated but never delivered -- left
      * free-running, harmless.) */
-    if (!hosts_process) {
-        __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(2UL)); /* IMASK=1, ENABLE=0 */
-        isb();
-        gic_disable_irq(GIC_TIMER_NS_PHYS);
-    }
+    /* The periodic CNTP timer PPI must stay armed on EVERY user core: it is the
+     * clock that drives quantum expiry, and disabling it would silently make
+     * that core cooperative again. The old "idle cores don't need a tick"
+     * optimisation traded preemption for a fraction of a percent of CPU, which
+     * is not a trade a preemptive kernel may make. */
+    (void)hosts_process;
 
-    /* The SGI doorbell only wakes interrupt-driven cores; the hosting core has no
-     * GIC CPU interface up, so skip arming it there (it would never be delivered). */
-    if (!hosts_process)
-        proc_sgi_wake_setup();
+    /* Arm the SGI doorbell on every user core; with the GIC CPU interface now
+     * up everywhere, it is delivered everywhere. */
+    proc_sgi_wake_setup();
 
     /* Do not write per-core startup banners directly to the single UART stream:
      * cores 1-3 initialise concurrently and byte-interleave. `proc sched`,
@@ -2911,8 +3032,41 @@ void proc_irq_maybe_preempt(struct irq_frame *frame)
     diag_clean_word(&sched_diag[uc]);
     DTRACE(DTRACE_CAT_SCHED, DT_SCHED_PREEMPT, p->pid, uc, p->preemptions, core_id());
     proc_note_desched(3U);
-    frame->x[30] = frame->elr;
-    frame->elr = (u64)(usize)proc_preempt_trampoline;
+
+    /*
+     * Switch to the scheduler directly from IRQ context.
+     *
+     * This is the ONLY correct way to preempt here, and the previous
+     * ELR-redirect trampoline was not merely untested -- it was incapable of
+     * working. It stashed the interrupted PC into x30, destroying the
+     * process's live link register, and then called proc_yield(), whose
+     * AAPCS contract lets it clobber every caller-saved register (x0-x18)
+     * that the interrupted code still held. Any process preempted mid-function
+     * resumed with a corrupted register file; that is what wedged httpd.
+     *
+     * The register state is already complete without any of that: vectors.S
+     * SAVE_CONTEXT pushed x0-x30/ELR/SPSR onto THIS process's own stack, and
+     * ctx_switch() saves the callee-saved half plus SP into p->ctx. Frame +
+     * proc_context together are the whole context. When this process is next
+     * dispatched, ctx_switch() returns right here, the IRQ epilogue pops the
+     * frame, and the ERET resumes the exact interrupted instruction with the
+     * process's own PSTATE restored from SPSR_EL1.
+     *
+     * Ordering requirement: irq_dispatch() calls this AFTER gic_end_of_interrupt(),
+     * so the IAR/EOIR pair for this interrupt is already closed. Preempting
+     * before the EOI would leave the interrupt active for the entire time the
+     * process stays descheduled and would deadlock the timer that drives
+     * preemption.
+     *
+     * DAIF: we are running with IRQs masked from exception entry, and
+     * ctx_switch does not restore PSTATE. Unmask before handing the core back
+     * to the scheduler (which must be interruptible or preemption stops after
+     * the first switch), and re-mask on resume so the IRQ epilogue's ERET sees
+     * the masked state it expects.
+     */
+    __asm__ volatile("msr daifclr, #2" ::: "memory");
+    ctx_switch(&p->ctx, &scheduler_ctx);
+    __asm__ volatile("msr daifset, #2" ::: "memory");
 }
 
 u64 proc_preemptions(void)

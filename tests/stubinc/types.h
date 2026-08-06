@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>   /* memset/memcpy/memcmp: declared by the real types.h */
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -42,6 +43,13 @@ typedef size_t   usize;
 static inline void dmb(void) {}
 static inline void dsb(void) {}
 static inline void isb(void) {}
+/* Inner-shareable scoped variants used by publication/consumption contracts
+ * (e.g. src/adrv.c's call stamp). No-ops on the host. */
+static inline void dmb_ish(void) {}
+static inline void dmb_ishst(void) {}
+static inline void dmb_ishld(void) {}
+static inline void dsb_ish(void) {}
+static inline void dsb_ishst(void) {}
 static inline void sev(void) {}
 static inline void wfe(void) {}
 static inline u32  core_id(void) { return 0; }

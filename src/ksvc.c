@@ -167,8 +167,40 @@ void ksvc_end(i32 id, u64 start_ticks, bool error)
     }
 }
 
-void ksvc_mark_error(i32 id)
+u64 ksvc_now_ticks(void)
 {
+    return ksvc_counter_ticks();
+}
+
+/* Mark RUNNING without reading the counter; caller already has `now`. */
+void ksvc_begin_at(i32 id)
+{
+    struct ksvc_entry *e = ksvc_get(id);
+    if (e && e->state != KSVC_STATE_PAUSED && e->state != KSVC_STATE_FAULTED)
+        e->state = KSVC_STATE_RUNNING;
+}
+
+/* Close an interval using a counter value the caller already read. Deliberately
+ * does NOT touch last_run_ms: that call is a 64-bit divide and is meaningless
+ * for a continuously-running service. See ksvc.h. */
+void ksvc_end_at(i32 id, u64 start_ticks, u64 now_ticks, bool error)
+{
+    struct ksvc_entry *e = ksvc_get(id);
+    if (!e) return;
+    u64 dt = now_ticks >= start_ticks ? (now_ticks - start_ticks) : 0;
+    e->calls++;
+    e->total_ticks += dt;
+    e->last_duration_ticks = dt;
+    if (dt > e->max_duration_ticks) e->max_duration_ticks = dt;
+    if (error) {
+        e->errors++;
+        e->state = KSVC_STATE_FAULTED;
+    } else if (e->state == KSVC_STATE_RUNNING) {
+        e->state = KSVC_STATE_REGISTERED;
+    }
+}
+
+void ksvc_mark_error(i32 id){
     ksvc_mark_error_code(id, 1U);
 }
 

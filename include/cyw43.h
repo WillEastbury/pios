@@ -123,6 +123,7 @@
 #define CYW_MAC_LEN             6
 #define CYW_MAX_SCAN_RESULTS    32
 #define CYW_PASSPHRASE_MAX      64
+#define CYW_EVENT_HISTORY_CAP   16U
 
 #define CYW_BLOB_FIRMWARE       1U
 #define CYW_BLOB_NVRAM          2U
@@ -192,6 +193,28 @@ struct cyw43_diag {
 _Static_assert(sizeof(struct cyw43_diag) == 256U,
                "CYW43455 diagnostics must occupy four cache lines");
 
+struct cyw_event_record {
+    u32 type;
+    u32 status;
+    u32 reason;
+    u32 flags;
+    u64 timestamp_ms;
+    u64 reserved;
+};
+
+_Static_assert(sizeof(struct cyw_event_record) == 32U,
+               "CYW43455 event records must have a fixed stride");
+
+struct cyw_event_history {
+    u32 first;
+    u32 count;
+    u32 reserved[14];
+    struct cyw_event_record records[CYW_EVENT_HISTORY_CAP];
+} ALIGNED(64);
+
+_Static_assert(sizeof(struct cyw_event_history) == 576U,
+               "CYW43455 event history must use whole cache lines");
+
 struct cyw_join_diag {
     u32 valid;
     u32 radio;
@@ -217,9 +240,11 @@ struct cyw_join_diag {
 bool cyw43_init(void);
 u32 cyw43_ram_size(void);
 void cyw43_diag_snapshot(struct cyw43_diag *out);
+void cyw43_event_history_snapshot(struct cyw_event_history *out);
 bool cyw43_install_blob(u32 kind, const u8 *data, u32 len);
 bool cyw43_blobs_ready(void);
 bool cyw43_runtime_ready(void);
+bool cyw43_poll_busy(void);
 bool cyw43_d11_state(u32 *resetctrl, u32 *ioctrl);
 bool cyw43_radio_query(u32 *radio, u32 *channel);
 bool cyw43_join_diag_query(struct cyw_join_diag *out);

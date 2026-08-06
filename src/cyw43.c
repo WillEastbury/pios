@@ -119,6 +119,11 @@
 #define CYW_MAX_FRAME           4096
 #define CYW_SCAN_QUERY_BYTES    416U
 #define CYW_BCDC_GET_TIMEOUT_MS 5000ULL
+/* Bounded frames consumed per reactor poll pass. */
+#define CYW_POLL_BURST_FRAMES   32U
+/* Bounded RF-neutral bus pokes issued while a scan is running. */
+#define CYW_SCAN_KICK_INTERVAL_MS 250ULL
+#define CYW_SCAN_KICKS_MAX        60U
 
 /* ── State ── */
 
@@ -157,7 +162,14 @@ static u32 scan_count;
 static bool scan_in_progress;
 static bool scan_results_pending;
 static u64 scan_ready_ms;
-static u32 scan_flush_remaining;
+static bool scan_result_request_pending;
+static u16 scan_result_request_id;
+static u64 scan_result_request_deadline_ms;
+static u32 scan_kicks_remaining;
+static u64 scan_next_kick_ms;
+static u32 join_kicks_remaining;
+static u64 join_next_kick_ms;
+static u8 scan_result_buf[CYW_SCAN_QUERY_BYTES] ALIGNED(64);
 
 /* Discovered core addresses (from EROM scan) */
 static u32 cyw_arm_ctl;
@@ -168,6 +180,7 @@ static u32 cyw_sdio_regs;
 static u32 cyw_ram_base = CYW_RAM_BASE;  /* default, updated from EROM */
 static u32 cyw_ram_bytes;
 static struct cyw43_diag cyw_diag ALIGNED(64);
+static struct cyw_event_history cyw_event_history ALIGNED(64);
 static cyw43_progress_fn cyw_progress_hook;
 
 /* Pre-loaded blobs (loaded before cyw43_init disturbs SD) */
@@ -215,6 +228,22 @@ void cyw43_diag_snapshot(struct cyw43_diag *out)
     if (!out)
         return;
     *out = cyw_diag;
+}
+
+void cyw43_event_history_snapshot(struct cyw_event_history *out)
+{
+    if (!out)
+        return;
+    *out = cyw_event_history;
+}
+
+/* True while WiFi has work in flight and therefore justifies the fast reactor
+ * poll cadence. Reads owned state only: safe from the timer tick. Polling SDIO
+ * at the fast cadence when the radio is idle burns core 0 for nothing. */
+bool cyw43_poll_busy(void)
+{
+    return scan_in_progress || scan_result_request_pending ||
+           cyw_link != CYW_LINK_DOWN;
 }
 
 bool cyw43_install_blob(u32 kind, const u8 *data, u32 len)
@@ -634,7 +663,11 @@ static bool sdpcm_send(u8 channel, const u8 *data, u32 len)
         return false;
 
     /* Firmware owns the transmit window. Do not publish another frame until
-     * max_seq advances; drain queued responses/events to acquire credit. */
+     * max_seq advances; drain queued responses/events to acquire credit.
+     * This loop deliberately does NOT pet the hardware watchdog: a credit
+     * stall must remain visible to the watchdog so the board reboots and
+     * self-heals rather than hanging indefinitely. Callers that must not
+     * block (reactor/association pokes) check credit before calling. */
     u64 credit_deadline = timer_monotonic_ms() + 30000ULL;
     while ((u8)(cyw_tx_max - cyw_tx_seq) == 0U) {
         if (sdpcm_pending_bytes() != 0U) {
@@ -1093,6 +1126,33 @@ static bool bcdc_get_cmd(u32 cmd, u8 *data, u32 data_len, u32 *resp_len)
 
 /* ── Event handling ── */
 
+static void event_history_reset(void)
+{
+    memset(&cyw_event_history, 0, sizeof(cyw_event_history));
+}
+
+static void event_history_append(u32 type, u32 status, u32 reason, u32 flags)
+{
+    u32 index;
+    if (cyw_event_history.count < CYW_EVENT_HISTORY_CAP) {
+        index = (cyw_event_history.first + cyw_event_history.count) %
+                CYW_EVENT_HISTORY_CAP;
+        cyw_event_history.count++;
+    } else {
+        index = cyw_event_history.first;
+        cyw_event_history.first = (cyw_event_history.first + 1U) %
+                                  CYW_EVENT_HISTORY_CAP;
+    }
+
+    struct cyw_event_record *record = &cyw_event_history.records[index];
+    record->type = type;
+    record->status = status;
+    record->reason = reason;
+    record->flags = flags;
+    record->timestamp_ms = timer_monotonic_ms();
+    record->reserved = 0U;
+}
+
 static void handle_event(const u8 *data, u32 len)
 {
     /* BDC data header(4) + Ethernet(14) + Broadcom header(10) +
@@ -1123,6 +1183,7 @@ static void handle_event(const u8 *data, u32 len)
     cyw_diag.last_event_len = len;
     cyw_diag.last_event_reason = reason;
     cyw_diag.event_count++;
+    event_history_append(event_type, status, reason, event_flags);
     u32 capture = len < 36U ? len : 36U;
     memset(cyw_diag.event_words, 0, sizeof(cyw_diag.event_words));
     for (u32 i = 0U; i < capture; i++)
@@ -1140,9 +1201,7 @@ static void handle_event(const u8 *data, u32 len)
         break;
 
     case CYW_E_PSK_SUP:
-        if (status == CYW_E_STATUS_SUCCESS) {
-            scan_flush_remaining = 0U;
-        } else if (status == CYW_E_STATUS_TIMEOUT) {
+        if (status == CYW_E_STATUS_TIMEOUT) {
             cyw_link = CYW_LINK_AUTH_FAIL;
         }
         break;
@@ -1193,7 +1252,7 @@ static void handle_event(const u8 *data, u32 len)
         } else if (status == CYW_E_STATUS_SUCCESS) {
             scan_in_progress = false;
             scan_results_pending = false;
-            scan_flush_remaining = 0U;
+            scan_kicks_remaining = 0U;
             uart_puts("[cyw] scan done n=");
             uart_hex(scan_count);
             uart_puts("\n");
@@ -1369,6 +1428,109 @@ static bool scan_fetch_legacy_results(void)
     uart_hex(scan_count);
     uart_puts("\n");
     return true;
+}
+
+static bool scan_result_request_start(void)
+{
+    static u8 buf[BCDC_HEADER_LEN + CYW_SCAN_QUERY_BYTES] ALIGNED(64);
+    memset(scan_result_buf, 0, sizeof(scan_result_buf));
+    scan_result_buf[0] = (u8)(sizeof(scan_result_buf) & 0xFFU);
+    scan_result_buf[1] = (u8)((sizeof(scan_result_buf) >> 8) & 0xFFU);
+    scan_result_buf[4] = 109U;
+
+    u16 id = bcdc_reqid++;
+    u32 cmd = WLC_SCAN_RESULTS;
+    buf[0] = (u8)cmd;
+    buf[1] = (u8)(cmd >> 8);
+    buf[2] = (u8)(cmd >> 16);
+    buf[3] = (u8)(cmd >> 24);
+    buf[4] = (u8)sizeof(scan_result_buf);
+    buf[5] = (u8)(sizeof(scan_result_buf) >> 8);
+    buf[6] = 0U;
+    buf[7] = 0U;
+    buf[8] = 0U;
+    buf[9] = 0U;
+    buf[10] = (u8)id;
+    buf[11] = (u8)(id >> 8);
+    memset(buf + 12U, 0, 4U);
+    memcpy(buf + BCDC_HEADER_LEN, scan_result_buf, sizeof(scan_result_buf));
+    if (!sdpcm_send(SDPCM_CTL_CHANNEL, buf, sizeof(buf)))
+        return false;
+
+    scan_result_request_id = id;
+    scan_result_request_pending = true;
+    scan_result_request_deadline_ms =
+        timer_monotonic_ms() + CYW_BCDC_GET_TIMEOUT_MS;
+    return true;
+}
+
+static void scan_bus_kick(void)
+{
+    /* Never block: this runs from the reactor and from the association poll
+     * loop, so it must fail closed when the firmware transmit window is
+     * exhausted rather than entering sdpcm_send()'s credit wait. */
+    if ((u8)(cyw_tx_max - cyw_tx_seq) == 0U)
+        return;
+
+    /* The firmware publishes queued SDPCM frames in response to host bus
+     * activity. The previous implementation used WLC_UP for this, which
+     * reopens the radio (`wl_open`) and disrupts the scan in progress.
+     * Re-sending the idempotent event mask is RF-neutral: it pokes the bus
+     * without changing radio, channel or scan state. */
+    u8 evmask[16];
+    memset(evmask, 0, sizeof(evmask));
+    const u32 events[] = {
+        CYW_E_SET_SSID, CYW_E_JOIN, CYW_E_AUTH, CYW_E_DEAUTH,
+        CYW_E_DEAUTH_IND, CYW_E_ASSOC, CYW_E_DISASSOC,
+        CYW_E_DISASSOC_IND, CYW_E_LINK, CYW_E_PSK_SUP,
+        CYW_E_ESCAN_RESULT
+    };
+    for (u32 i = 0U; i < sizeof(events) / sizeof(events[0]); i++)
+        evmask[events[i] / 8U] |= (u8)(1U << (events[i] % 8U));
+    (void)bcdc_set_iovar("event_msgs", evmask, sizeof(evmask), false);
+}
+
+static void scan_result_poll(void)
+{
+    if (scan_result_request_pending) {
+        u32 len = sizeof(scan_result_buf);
+        u32 status = 0U;
+        if (bcdc_take_response(scan_result_request_id, scan_result_buf,
+                               &len, &status)) {
+            scan_result_request_pending = false;
+            scan_in_progress = false;
+            if (status == 0U && scan_parse_legacy_results(scan_result_buf, len))
+                scan_results_pending = false;
+            return;
+        }
+        if (timer_monotonic_ms() >= scan_result_request_deadline_ms) {
+            scan_result_request_pending = false;
+            scan_in_progress = false;
+            cyw_diag.bcdc_timeouts++;
+        }
+        return;
+    }
+    if (scan_in_progress && timer_monotonic_ms() >= scan_ready_ms) {
+        (void)scan_result_request_start();
+        return;
+    }
+    /* While the scan runs, poke the bus on a bounded cadence so the firmware
+     * flushes queued escan event frames to the host. */
+    if (scan_in_progress && scan_kicks_remaining != 0U &&
+        timer_monotonic_ms() >= scan_next_kick_ms) {
+        scan_kicks_remaining--;
+        scan_next_kick_ms = timer_monotonic_ms() + CYW_SCAN_KICK_INTERVAL_MS;
+        scan_bus_kick();
+    }
+    /* The association window needs the same RF-neutral poke: without it the
+     * firmware queues its AUTH/ASSOC/LINK/PSK_SUP events without publishing
+     * them, so the host observes an association that never reports progress. */
+    if (cyw_link == CYW_LINK_JOINING && join_kicks_remaining != 0U &&
+        timer_monotonic_ms() >= join_next_kick_ms) {
+        join_kicks_remaining--;
+        join_next_kick_ms = timer_monotonic_ms() + CYW_SCAN_KICK_INTERVAL_MS;
+        scan_bus_kick();
+    }
 }
 
 /* ── Firmware upload ── */
@@ -1584,7 +1746,11 @@ bool cyw43_init(void)
     scan_in_progress = false;
     scan_results_pending = false;
     scan_ready_ms = 0ULL;
-    scan_flush_remaining = 0U;
+    scan_result_request_pending = false;
+    scan_kicks_remaining = 0U;
+    scan_next_kick_ms = 0ULL;
+    join_kicks_remaining = 0U;
+    join_next_kick_ms = 0ULL;
     cyw_diag.last_event_type = 0U;
     cyw_diag.last_event_status = 0U;
     cyw_diag.last_event_flags = 0U;
@@ -1593,6 +1759,7 @@ bool cyw43_init(void)
     cyw_diag.scan_result_count = 0U;
     cyw_diag.last_event_reason = 0U;
     memset(cyw_diag.event_words, 0, sizeof(cyw_diag.event_words));
+    event_history_reset();
     cyw_eapol_len = 0U;
     cyw_diag.eapol_frames = 0U;
     cyw_diag.eapol_len = 0U;
@@ -2053,6 +2220,19 @@ bool cyw43_load_firmware(void)
         }
     }
 
+    /* Re-assert HOSTINTMASK now that function 2 and KSO are up. The value
+     * written before F2 was enabled does not survive the firmware's own SDIO
+     * core initialization, and a zero mask suppresses the host-mailbox frame
+     * indication that publishes queued event frames such as escan results. */
+    {
+        (void)bp_write32(cyw_sdio_regs + SDIOD_INTMASK, 0x200000F0U);
+        (void)bp_read32(cyw_sdio_regs + SDIOD_INTMASK,
+                        &cyw_diag.sdiod_intmask);
+        uart_puts("[cyw] intmask=");
+        uart_hex(cyw_diag.sdiod_intmask);
+        uart_puts("\n");
+    }
+
     /* Load CLM blob via 'clmload' iovar from preloaded buffer */
     if (clm_buf_len > 0) {
         uart_puts("[cyw] loading CLM (");
@@ -2111,39 +2291,37 @@ bool cyw43_load_firmware(void)
 
 void cyw43_poll(void)
 {
-    if (sdpcm_pending_bytes() != 0U) {
-        /* Read a frame from func 2 */
+    /* Drain a bounded burst rather than a single frame. An escan publishes one
+     * event frame per BSS plus a completion event; consuming only one frame per
+     * reactor pass throttles delivery below the firmware's publication rate and
+     * loses results when the queue is serviced too slowly. */
+    for (u32 drained = 0U; drained < CYW_POLL_BURST_FRAMES; drained++) {
+        if (sdpcm_pending_bytes() == 0U)
+            break;
+
         u8 channel;
         u32 len;
-        if (sdpcm_recv(&channel, cyw_rx_buf, &len)) {
-            switch (channel) {
-            case SDPCM_EVENT_CHANNEL:
-                handle_event(cyw_rx_buf, len);
-                break;
+        if (!sdpcm_recv(&channel, cyw_rx_buf, &len))
+            break;
 
-            case SDPCM_DATA_CHANNEL:
-                capture_eapol(cyw_rx_buf, len);
-                break;
+        switch (channel) {
+        case SDPCM_EVENT_CHANNEL:
+            handle_event(cyw_rx_buf, len);
+            break;
 
-            case SDPCM_CTL_CHANNEL:
-                bcdc_cache_response(cyw_rx_buf, len);
-                break;
+        case SDPCM_DATA_CHANNEL:
+            capture_eapol(cyw_rx_buf, len);
+            break;
 
-            default:
-                break;
-            }
+        case SDPCM_CTL_CHANNEL:
+            bcdc_cache_response(cyw_rx_buf, len);
+            break;
+
+        default:
+            break;
         }
     }
-    if (scan_flush_remaining != 0U) {
-        u32 up = 0U;
-        if (!bcdc_set_cmd(WLC_UP, &up, sizeof(up), false)) {
-            scan_in_progress = false;
-            scan_results_pending = false;
-            scan_flush_remaining = 0U;
-        } else {
-            scan_flush_remaining--;
-        }
-    }
+    scan_result_poll();
 }
 
 static bool cyw43_radio_enable(void)
@@ -2205,7 +2383,9 @@ bool cyw43_scan_start(void)
     scan_in_progress = true;
     scan_results_pending = true;
     scan_ready_ms = timer_monotonic_ms() + 30000ULL;
-    scan_flush_remaining = 32U;
+    scan_result_request_pending = false;
+    scan_kicks_remaining = CYW_SCAN_KICKS_MAX;
+    scan_next_kick_ms = timer_monotonic_ms() + CYW_SCAN_KICK_INTERVAL_MS;
 
     if (!cyw43_radio_enable()) {
         scan_in_progress = false;
@@ -2227,9 +2407,10 @@ bool cyw43_scan_start(void)
         u32 passive_time;
         u32 home_time;
         u32 channel_num;
+        u16 channel_list[38];
     } PACKED escan;
-    _Static_assert(sizeof(escan) == 72U,
-                   "Broadcom v1 escan parameters must be 72 bytes");
+    _Static_assert(sizeof(escan) == 148U,
+                   "Broadcom v1 escan parameters must carry the channel list");
 
     memset(&escan, 0, sizeof(escan));
     escan.escan_version = 1U;
@@ -2242,6 +2423,17 @@ bool cyw43_scan_start(void)
     escan.active_time = 0xFFFFFFFFU;
     escan.passive_time = 0xFFFFFFFFU;
     escan.home_time = 0xFFFFFFFFU;
+    u32 channels = 0U;
+    for (u32 channel = 1U; channel <= 13U; channel++)
+        escan.channel_list[channels++] = (u16)(0x2B00U | channel);
+    static const u8 channels_5g[] = {
+        36U, 40U, 44U, 48U, 52U, 56U, 60U, 64U,
+        100U, 104U, 108U, 112U, 116U, 120U, 124U, 128U,
+        132U, 136U, 140U, 144U, 149U, 153U, 157U, 161U, 165U
+    };
+    for (u32 i = 0U; i < sizeof(channels_5g); i++)
+        escan.channel_list[channels++] = (u16)(0x1B00U | channels_5g[i]);
+    escan.channel_num = channels;
 
     if (!bcdc_set_iovar("escan", &escan, sizeof(escan), false)) {
         scan_in_progress = false;
@@ -2423,7 +2615,22 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
         return false;
     if (!key || key_len > CYW_PASSPHRASE_MAX)
         return false;
-    scan_flush_remaining = 0U;
+    scan_kicks_remaining = 0U;
+    const struct cyw_scan_result *best = NULL;
+    i32 best_rssi = -32768;
+    for (u32 i = 0U; i < scan_count; i++) {
+        const struct cyw_scan_result *candidate = &scan_results[i];
+        if (candidate->ssid_len != ssid_len ||
+            memcmp(candidate->ssid, ssid, ssid_len) != 0 ||
+            candidate->rssi <= best_rssi ||
+            candidate->chanspec == 0U)
+            continue;
+        best = candidate;
+        best_rssi = candidate->rssi;
+    }
+    if (!best)
+        return false;
+
     uart_puts("[cyw] join radio\n");
     if (!cyw43_radio_enable())
         return false;
@@ -2491,37 +2698,35 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
                       sizeof(wpa_auth), false))
         return false;
 
-    /* Stable SET_SSID fallback. */
+    /* WLC_SET_SSID takes brcmf_join_params. Supplying the scanned BSSID and
+     * chanspec avoids the firmware's malformed zero-chanspec path. */
     struct {
         u32 ssid_len;
         u8  ssid[CYW_SSID_MAX];
-    } PACKED ssid_params;
-    memset(&ssid_params, 0, sizeof(ssid_params));
-    ssid_params.ssid_len = ssid_len;
-    memcpy(ssid_params.ssid, ssid, ssid_len);
-    i32 best_rssi = -32768;
-    u32 best_channel = 0U;
-    for (u32 i = 0U; i < scan_count; i++) {
-        const struct cyw_scan_result *candidate = &scan_results[i];
-        if (candidate->ssid_len != ssid_len ||
-            memcmp(candidate->ssid, ssid, ssid_len) != 0 ||
-            candidate->rssi <= best_rssi)
-            continue;
-        best_rssi = candidate->rssi;
-        best_channel = candidate->channel;
-    }
-    if (best_channel != 0U &&
-        !bcdc_set_cmd(WLC_SET_CHANNEL, &best_channel,
-                      sizeof(best_channel), false))
-        return false;
+        u8  bssid[CYW_MAC_LEN];
+        u32 chanspec_num;
+        u16 chanspec_list[1];
+    } join_params;
+    _Static_assert(sizeof(join_params) == 52U,
+                   "Broadcom join parameters must include association data");
+    memset(&join_params, 0, sizeof(join_params));
+    join_params.ssid_len = ssid_len;
+    memcpy(join_params.ssid, ssid, ssid_len);
+    memcpy(join_params.bssid, best->bssid, CYW_MAC_LEN);
+    join_params.chanspec_num = 1U;
+    join_params.chanspec_list[0] = best->chanspec;
 
     uart_puts("[cyw] join SSID: ");
     for (u32 i = 0; i < ssid_len; i++)
         uart_putc(ssid[i]);
     uart_puts("\n");
 
-    if (!bcdc_set_cmd(WLC_SET_SSID, &ssid_params,
-                      sizeof(ssid_params), false))
+    /* Keep only this association attempt's asynchronous evidence. */
+    event_history_reset();
+    join_kicks_remaining = CYW_SCAN_KICKS_MAX;
+    join_next_kick_ms = timer_monotonic_ms() + CYW_SCAN_KICK_INTERVAL_MS;
+    if (!bcdc_set_cmd(WLC_SET_SSID, &join_params,
+                      sizeof(join_params), false))
         return false;
 
     /* Poll for association result */
@@ -2530,6 +2735,14 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
         if ((i & 63U) == 0U)
             watchdog_hw_pet();
         cyw43_poll();
+        /* This loop owns core 0 for up to 30 seconds. Without draining the
+         * wired GEM ring here it fills (896/896), latches BNA and halts RX
+         * DMA -- and because no further ETH IRQ can then be raised, the
+         * reactor's IRQ-driven recovery never runs and the wired management
+         * path is lost permanently. The progress hook pairs net_poll() with
+         * the MAC recovery checks and pets the watchdog. */
+        if (cyw_progress_hook)
+            cyw_progress_hook();
         u32 state = cyw43_link_state();
         if (state == CYW_LINK_UP) {
             uart_puts("[cyw] associated!\n");

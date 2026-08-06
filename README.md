@@ -50,7 +50,7 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 | **QPU Tensor Compute** | VideoCore VII dispatch framework with bound-kernel gating; NEON remains default fallback. |
 | **MMU** | Identity-mapped page tables. Cacheable RAM, device memory for MMIO. |
 | **GIC-400 Interrupts** | Full interrupt controller with timer IRQ support. |
-| **User Scheduling** | Cores 1-3 run priority-based cooperative schedulers; timer/preemption metadata exists but IRQ preemption remains disabled. |
+| **User Scheduling** | Cores 1-3 run priority-based **preemptive** schedulers; EL0 processes run with IRQs enabled and are preempted on quantum expiry (proven on hardware: 440 preemptions under load, see ADR-021). |
 | **EL2→EL1 Boot** | Proper exception level transition with NEON/timer access enabled. |
 | **PCIe + RP1 Southbridge** | PCIe root complex init; RP1 GPIO, clock, UART, and USB xHCI. |
 | **USB xHCI + HID Keyboard** | USB host via xHCI on RP1; HID keyboard and mass storage class drivers. |
@@ -224,6 +224,19 @@ The gateway MAC **must** be set manually (no ARP by default). Find it with
 
 ## Architecture
 
+**Reference documentation** (written from the code, kept current):
+
+| Document | Covers |
+|---|---|
+| [`docs/architecture_decision_log.md`](docs/architecture_decision_log.md) | **Every significant architectural decision, who made it, and what was rejected.** Architecture changes require the owner's approval and must be logged here |
+| [`docs/architecture_system.md`](docs/architecture_system.md) | Cores, scheduling and quanta, mandatory preemption, the syscall-free EL0 scheduling contract (`pctl`/`swake`/`qbank`), the software-interrupt privilege model and per-core quantum, FIFOs, IPC, EL levels, memory isolation, processes and capsules |
+| [`docs/boot_storage.md`](docs/boot_storage.md) | Two-stage bootloader, A/B OTA, disk layout, WALFS, users and identity, logging, perf and monitoring |
+| [`docs/network_stack.md`](docs/network_stack.md) | NIC backends, IP/ICMP/ARP/DNS, TCP, the cross-core FIFO network path, TLS 1.3 termination and capsule offload |
+| [`docs/network.md`](docs/network.md) | Operational network map, counters and commands |
+| [`docs/gotchas.md`](docs/gotchas.md) | **Failed attempts, reverted changes and non-obvious traps.** Read before "fixing" something that looks obviously wrong |
+
+The summary below is a quick orientation; the documents above are authoritative.
+
 ### Memory Map
 
 ```
@@ -246,10 +259,13 @@ Address             Size    Purpose
 
 | Core | Role | Loop | Private RAM |
 |------|------|------|-------------|
-| 0 | **Kernel + Network + Disk** | `net_poll()` + FIFO requests + serial console | 16MB @ 0x00800000 |
-| 1 | **User (USERM)** | Cooperative process scheduler + SGI FIFO doorbell | 16MB @ 0x01800000 |
-| 2 | **User (USER0)** | Cooperative process scheduler | 16MB @ 0x02800000 |
-| 3 | **User (USER1)** | Cooperative process scheduler | 16MB @ 0x03800000 |
+| 0 | **Kernel + Network + Disk** | Event-driven reactor: prioritized software-interrupt dispatch, `net_poll()`, FIFO requests, services, console | 16MB @ 0x00800000 |
+| 1 | **User (USERM)** | Preemptive process scheduler + per-core quantum (queue drain then dispatch) | 16MB @ 0x01800000 |
+| 2 | **User (USER0)** | Preemptive process scheduler | 16MB @ 0x02800000 |
+| 3 | **User (USER1)** | Preemptive process scheduler | 16MB @ 0x03800000 |
+
+Preemption is mandatory on every user core — see
+[`docs/architecture_system.md`](docs/architecture_system.md).
 
 ### Inter-Core Communication
 
@@ -475,7 +491,7 @@ pios/
 - [x] TCP stack + BSD-like socket API
 - [x] DNS resolution
 - [x] WALFS append-only filesystem
-- [x] Cooperative user-space process schedulers (all user cores; IRQ preemption scaffold retained)
+- [x] Preemptive user-space process schedulers (all user cores; EL0 preempted on quantum expiry)
 - [x] Capsule isolation + EL2 stage-2 groundwork
 - [ ] Hardened DHCP
 

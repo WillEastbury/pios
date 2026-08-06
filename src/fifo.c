@@ -10,6 +10,7 @@
 #include "fb.h"
 #include "dtrace.h"
 #include "gic.h"
+#include "airq.h"
 #include "mmu.h"
 
 #define FIFO_GRID_ENTRIES       16U
@@ -148,6 +149,14 @@ u32 fifo_irq_sent(u32 core) {
 }
 
 static inline void fifo_notify(u32 src, u32 dst) {
+    /* Publish a HIGH-priority software-interrupt record for the destination
+     * core before ringing the doorbell. The SGI only wakes the core; this
+     * record is what tells the target's dispatcher that a cross-core message
+     * is waiting and lets it be prioritised against that core's other work.
+     * Posting is bounded and allocation-free, so it is safe from any context
+     * including a hardware IRQ handler. */
+    (void)airq_post_from(src, AIRQ_SRC_FIFO_CORE(dst), dst);
+
     if (fifo_irq_ready(dst)) {
         struct fifo_irq_counter *counter = get_irq_counter(src, dst);
         fifo_store_release(&counter->sent, counter->sent + 1U);

@@ -242,7 +242,20 @@ struct appf_service_record {
 #define PROC_ENTRY_FLAG_STACK_16_ALIGN  0x00000010U
 #define PROC_ENTRY_FLAG_API_IN_X0       0x00000020U
 #define PROC_ENTRY_FLAG_SVC_REQUIRED    0x00000040U
-#define PROC_ENTRY_SPSR_EL0_DAIF        0x000003C0U
+/*
+ * PSTATE for an EL0 process: EL0t, with D/A/F masked and **IRQs enabled**.
+ *
+ * The I bit MUST stay clear. It is not a privilege grant -- the interrupt is
+ * taken to EL1 on the kernel's own vectors either way, and EL0 cannot re-mask it
+ * because SCTLR_EL1.UMA is never set. Clearing I only permits the CPU to *leave*
+ * EL0, which is the sole mechanism by which the kernel can ever reclaim the core
+ * from a running process. Setting it makes the core cooperative in practice no
+ * matter what the scheduler believes (see ADR-021 / docs/gotchas.md).
+ *
+ * Single source of truth: proc_el0_enter() takes this as an argument rather than
+ * hardcoding it in asm, so the C contract and the actual eret can never drift.
+ */
+#define PROC_ENTRY_SPSR_EL0             0x00000340U
 
 /* Saved context for cooperative context switch (callee-saved only) */
 struct proc_context {

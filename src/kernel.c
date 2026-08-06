@@ -109,6 +109,8 @@
 #include "random.h"
 #include "sts.h"
 #include "sts_token.h"
+#include "adrv.h"
+#include "airq.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -302,6 +304,8 @@ static u64 https_tls_last_activity_ms;
 static bool http_reboot_pending;
 static i32 ksvc_net_id = -1;
 static i32 ksvc_tcp_id = -1;
+static i32 ksvc_sched0_id = -1;
+static i32 ksvc_fifo0_id = -1;
 static i32 ksvc_debug_id = -1;
 static i32 ksvc_ui_id = -1;
 static i32 ksvc_dashboard_id = -1;
@@ -847,6 +851,75 @@ static void http_append_u64(char *out, u32 *len, u32 max, u64 v)
     while (n && *len < max - 1)
         out[(*len)++] = tmp[--n];
     out[*len] = 0;
+}
+
+static void http_append_hex32(char *out, u32 *len, u32 max, u32 v);
+
+static const char *wifi_psk_sup_state_name(u32 status)
+{
+    switch (status) {
+    case 4U: return "wait-m1";
+    case 5U: return "prep-m2";
+    case 6U: return "completed";
+    case 7U: return "timeout";
+    case 8U: return "wait-m3";
+    case 9U: return "prep-m4";
+    case 10U: return "wait-g1";
+    case 11U: return "prep-g2";
+    default: return "unknown";
+    }
+}
+
+static const char *wifi_psk_sup_reason_name(u32 reason)
+{
+    switch (reason) {
+    case 0U: return "other";
+    case 1U: return "decrypt-key-data";
+    case 6U: return "msg3-too-many-ie";
+    case 7U: return "msg3-ie-mismatch";
+    case 8U: return "msg3-no-install";
+    case 9U: return "msg3-no-gtk";
+    case 12U: return "gtk-decrypt-fail";
+    case 13U: return "send-fail";
+    case 14U: return "deauth";
+    case 15U: return "psk-timeout";
+    case 16U: return "m1-timeout";
+    case 17U: return "m3-timeout";
+    default: return "unknown";
+    }
+}
+
+static void wifi_append_event_history(char *out, u32 *len, u32 max)
+{
+    struct cyw_event_history history;
+    cyw43_event_history_snapshot(&history);
+    http_append(out, len, max, "WiFi event history count=");
+    http_append_u64(out, len, max, history.count);
+    http_append(out, len, max, "\n");
+
+    for (u32 i = 0U; i < history.count; i++) {
+        const struct cyw_event_record *record =
+            &history.records[(history.first + i) % CYW_EVENT_HISTORY_CAP];
+        http_append(out, len, max, " event=");
+        http_append_u64(out, len, max, record->type);
+        http_append(out, len, max, " status=");
+        http_append_u64(out, len, max, record->status);
+        if (record->type == CYW_E_PSK_SUP) {
+            http_append(out, len, max, " psk=");
+            http_append(out, len, max,
+                        wifi_psk_sup_state_name(record->status));
+            http_append(out, len, max, " psk_reason=");
+            http_append(out, len, max,
+                        wifi_psk_sup_reason_name(record->reason));
+        }
+        http_append(out, len, max, " reason=");
+        http_append_u64(out, len, max, record->reason);
+        http_append(out, len, max, " flags=");
+        http_append_hex32(out, len, max, record->flags);
+        http_append(out, len, max, " ms=");
+        http_append_u64(out, len, max, record->timestamp_ms);
+        http_append(out, len, max, "\n");
+    }
 }
 
 static void http_append_ip4(char *out, u32 *len, u32 max, u32 ip)
@@ -3645,6 +3718,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         } else {
             u32 ssid_len = pios_strlen(argv[2]);
             u32 pass_len = pios_strlen(argv[3]);
+            cyw43_set_progress_hook(wifi_upload_progress);
             bool ok = ssid_len <= CYW_SSID_MAX &&
                       pass_len <= 128U &&
                       cyw43_join_sae(argv[2], ssid_len,
@@ -3664,12 +3738,14 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                         "ERR: usage wifi joinpmk <ssid> <64-hex-pmk>\n");
         } else {
             u32 ssid_len = pios_strlen(argv[2]);
+            cyw43_set_progress_hook(wifi_upload_progress);
             bool ok = ssid_len <= CYW_SSID_MAX &&
                       cyw43_join_pmk(argv[2], ssid_len, pmk);
             memset(pmk, 0, sizeof(pmk));
             http_append(out, &len, max,
                         ok ? "WiFi join OK\n" : "WiFi join FAILED\n");
             if (!ok) {
+                wifi_append_event_history(out, &len, max);
                 static char fwlog[2025];
                 u32 fwlog_len = 0U;
                 if (cyw43_fwlog(fwlog, sizeof(fwlog), &fwlog_len)) {
@@ -3692,6 +3768,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         } else {
             u32 ssid_len = pios_strlen(argv[2]);
             u32 pass_len = pios_strlen(argv[3]);
+            cyw43_set_progress_hook(wifi_upload_progress);
             bool ok = ssid_len <= CYW_SSID_MAX &&
                       pass_len <= CYW_PASSPHRASE_MAX &&
                       cyw43_join(argv[2], ssid_len, argv[3], pass_len,
@@ -3701,6 +3778,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                 while (timer_monotonic_ms() < deadline &&
                        cyw43_link_state() == CYW_LINK_JOINING) {
                     cyw43_poll();
+                    wifi_upload_progress();
                     timer_delay_ms(10U);
                     watchdog_hw_pet();
                 }
@@ -4689,7 +4767,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
     } else if (http_streq(cmd, "proc sched")) {
         struct proc_sched_core_snapshot ps[3];
         u32 pn = proc_sched_snapshot(ps, 3);
-        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST\n");
+        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST TIMER_IRQ\n");
         for (u32 i = 0; i < pn; i++) {
             http_append_u64(out, &len, max, ps[i].core);
             http_append(out, &len, max, " ");
@@ -4708,6 +4786,12 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append_u64(out, &len, max, ps[i].soft_events);
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, ps[i].soft_boosts);
+            /* Per-core timer IRQ count. Without this a PREEMPT of 0 is
+             * ambiguous: it cannot distinguish "quantum never overran" from
+             * "this core never received a timer interrupt at all", and those
+             * have completely different root causes. */
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, timer_ticks_core(ps[i].core));
             http_append(out, &len, max, "\n");
         }
     } else if (http_streq(cmd, "core status")) {
@@ -20664,6 +20748,10 @@ static u32 spin_counter;
 #define CORE0_IO_MAINT   (1U << 4)
 #define CORE0_IO_DASH    (1U << 5)
 #define CORE0_IO_CPUCLK  (1U << 6)
+/* WiFi SDPCM draining must not depend on wired Ethernet IRQ activity: the
+ * CYW43455 has no host IRQ line here, so its receive path is discovered by
+ * polling RFRAMEBC/interrupt status. Give it its own cadence. */
+#define CORE0_IO_WIFI    (1U << 7)
 
 static void spin_update(void) {
     static const char frames[] = "|/-\\";
@@ -22254,6 +22342,20 @@ static void core0_io_tick_hook(u32 core, u64 tick)
     if ((tick & 7U) == 0)
         flags |= CORE0_IO_NET | CORE0_IO_TCP;
 #endif
+    /* WiFi frame draining is deliberately independent of CORE0_IO_NET: on Pi 5
+     * that flag is set purely by the wired ETH IRQ, so a quiet wired link would
+     * otherwise stall CYW43455 event delivery (escan results, link/PSK events)
+     * for as long as no Ethernet frame arrives.
+     * The cadence is adaptive: SDIO has no host IRQ line here, so every poll
+     * costs real CMD52/CMD53 bus transactions on core 0. Run fast (~125Hz) only
+     * while a scan/association/link is actually in flight, and idle-poll
+     * (~8Hz) otherwise -- a free-running fast cadence pinned core 0 at 99%. */
+    if (cyw43_poll_busy()) {
+        if ((tick & 7U) == 0)
+            flags |= CORE0_IO_WIFI;
+    } else if ((tick & 127U) == 0) {
+        flags |= CORE0_IO_WIFI;
+    }
     if ((tick % 100U) == 0)
         flags |= CORE0_IO_MAINT;
     /* Dashboard renders at 1Hz. The CPU-clock perf measurement also samples at
@@ -22291,8 +22393,46 @@ static void core0_eth_irq_handler(void)
     core0_eth_irq_last_mip = rp1_mip_host_status_l();
     core0_eth_irq_deferred_quench = true;
     core0_eth_irq_count++;
+    /* Top half: record and return. The record carries the MIP status so the
+     * bottom half needs no further hardware read to know why it was woken. */
+    (void)airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, core0_eth_irq_last_mip);
     core0_io_flags |= CORE0_IO_NET | CORE0_IO_TCP;
     sev();
+}
+
+/* Bottom half for a NIC receive interrupt. Runs in reactor context under the
+ * dispatcher's budget, never in IRQ context. CRITICAL priority: if this is
+ * starved the GEM RX ring fills, BNA latches, and the wired fail-safe path is
+ * gone -- the failure this whole layering exists to prevent. */
+static void airq_eth_rx_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    core0_io_flags |= CORE0_IO_NET | CORE0_IO_TCP;
+}
+
+/* Cross-core doorbell. HIGH priority because another core is parked waiting on
+ * a reply only this core can produce; making it wait is a scheduling failure,
+ * not a latency detail. */
+static void airq_fifo_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    core0_io_flags |= CORE0_IO_TCP;
+}
+
+static void airq_wifi_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    core0_io_flags |= CORE0_IO_WIFI;
+}
+
+static void airq_console_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    core0_io_flags |= CORE0_IO_UART;
 }
 
 /* Arm RP1 Ethernet RX → GIC HOST6 delivery to core 0 (the proven sequence,
@@ -22590,6 +22730,26 @@ NORETURN void core0_main(void) {
 
         core0_io_wake_count++;
         core0_io_last_flags = flags;
+        /* Core 0's reactor is itself a scheduler: account every dispatch pass
+         * so its cost is attributable in the service map alongside the user
+         * cores' schedulers. */
+        u64 svc_sched0 = ksvc_begin(ksvc_sched0_id);
+
+        /* Bottom half first: drain queued software interrupts in priority
+         * order under a bounded budget. CRITICAL (NIC drain) is never batched
+         * and never starved; LOW runs only on leftover budget. This is what
+         * keeps a hardware interrupt storm a bounded backlog instead of a
+         * takeover of core 0. */
+        if (airq_pending(CORE_NET)) {
+            u64 svc_fifo0 = ksvc_begin(ksvc_fifo0_id);
+            (void)airq_dispatch(CORE_NET, ADRV_PASS_BUDGET_MS);
+            ksvc_end(ksvc_fifo0_id, svc_fifo0, false);
+            flags |= core0_io_flags;
+            core0_io_flags = 0;
+        }
+
+        /* Scheduled asynchronous driver work (bounded, admission-controlled). */
+        adrv_service();
 
         if (flags & CORE0_IO_NET) {
             u64 svc_start = ksvc_begin(ksvc_net_id);
@@ -22741,6 +22901,11 @@ NORETURN void core0_main(void) {
             ksvc_end(ksvc_ui_id, svc_start, false);
         }
 
+        if (flags & CORE0_IO_WIFI) {
+            if (cyw43_runtime_ready())
+                cyw43_poll();
+        }
+
         if (flags & CORE0_IO_MAINT) {
             ksvc_run(ksvc_timer_id);
         }
@@ -22752,6 +22917,7 @@ NORETURN void core0_main(void) {
             perf_cpu_clock_measure(2000U);
 
         fb_present();   /* flush any dirty back-buffer rows to the scanout */
+        ksvc_end(ksvc_sched0_id, svc_sched0, false);
         watchdog_hw_pet();
         env->poll_count++;
     }
@@ -23729,6 +23895,37 @@ void kernel_main(void) {
     ksvc_init_core();
     ksvc_net_id = ksvc_register("net-poll", KSVC_KIND_POLL | KSVC_KIND_NETWORK, CORE_NET, 100);
     ksvc_tcp_id = ksvc_register("tcp-http-tls", KSVC_KIND_POLL | KSVC_KIND_NETWORK | KSVC_KIND_TLS, CORE_NET, 90);
+    /* Core 0 never enters proc_schedule(), so its reactor and cross-core FIFO
+     * drain must register themselves here. Without these two, core 0's own
+     * scheduling and doorbell work is invisible in the service/process map --
+     * the very work that starves the board when it goes wrong. */
+    ksvc_sched0_id = ksvc_register("sched-core0", KSVC_KIND_POLL, CORE_NET, 110);
+    ksvc_fifo0_id = ksvc_register("fifo-core0", KSVC_KIND_POLL, CORE_NET, 105);
+
+    /* Software interrupt privilege levels. Hardware handlers only enqueue;
+     * these handlers run in reactor context under the dispatcher's budget. */
+    airq_init();
+    airq_set_now_hook(timer_monotonic_ms);
+    (void)airq_register(AIRQ_SRC_ETH_RX, AIRQ_PRIO_CRITICAL, CORE_NET,
+                        airq_eth_rx_handler, NULL);
+    /* One FIFO doorbell source per target core: the record must land on the
+     * core that will service it. Cores 1-3 drain theirs from airq_quantum()
+     * in their scheduler loop. */
+    for (u32 c = 0U; c < AIRQ_CORES; c++)
+        (void)airq_register(AIRQ_SRC_FIFO_CORE(c), AIRQ_PRIO_HIGH, c,
+                            airq_fifo_handler, NULL);
+    (void)airq_register(AIRQ_SRC_WIFI, AIRQ_PRIO_NORMAL, CORE_NET,
+                        airq_wifi_handler, NULL);
+    (void)airq_register(AIRQ_SRC_CONSOLE, AIRQ_PRIO_LOW, CORE_NET,
+                        airq_console_handler, NULL);
+
+    /* Asynchronous driver framework: same clock, watchdog petted only on
+     * proven progress, and the liveness hook that keeps the wired fail-safe
+     * path draining while any long operation is in flight. */
+    adrv_init();
+    adrv_set_now_hook(timer_monotonic_ms);
+    adrv_set_watchdog_hook(watchdog_hw_pet);
+    adrv_set_liveness_hook(wifi_upload_progress);
     ksvc_debug_id = ksvc_register_poll("debug-console", KSVC_KIND_POLL | KSVC_KIND_CONSOLE, CORE_NET, 50, ksvc_debug_poll, NULL);
     ksvc_ui_id = ksvc_register("ui-input", KSVC_KIND_POLL | KSVC_KIND_UI, CORE_NET, 40);
     ksvc_dashboard_id = ksvc_register_poll("dashboard", KSVC_KIND_POLL | KSVC_KIND_UI, CORE_NET, 20, ksvc_dashboard_poll, NULL);

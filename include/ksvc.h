@@ -60,6 +60,24 @@ i32  ksvc_register_poll(const char *name, u32 kind, u32 owner_core, u32 priority
 bool ksvc_run(i32 id);
 u64  ksvc_begin(i32 id);
 void ksvc_end(i32 id, u64 start_ticks, bool error);
+
+/*
+ * Hot-path variants for callers inside the scheduler loop (ADR-017/Q7).
+ *
+ * ksvc_begin/ksvc_end each read the cycle counter, and ksvc_end additionally
+ * calls timer_monotonic_ms() -- a 64-bit divide. Two nested begin/end pairs per
+ * scheduler iteration therefore cost 4 counter reads and 2 divides, paid at full
+ * spin rate on an idle core. That perturbs the very thing it measures, which the
+ * "diagnostics must not perturb scheduling" invariant forbids.
+ *
+ * ksvc_now_ticks() lets a caller read the counter ONCE and hand the same value
+ * to several ksvc_end_at() calls. ksvc_end_at() skips both the redundant counter
+ * read and the divide; last_run_ms is not updated, which is meaningless anyway
+ * for a service that runs continuously.
+ */
+u64  ksvc_now_ticks(void);
+void ksvc_begin_at(i32 id);
+void ksvc_end_at(i32 id, u64 start_ticks, u64 now_ticks, bool error);
 void ksvc_mark_error(i32 id);
 bool ksvc_mark_error_code(i32 id, u32 error_code);
 bool ksvc_pause(i32 id);

@@ -3,8 +3,385 @@
 Primary agent instructions live in [`.github/copilot-instructions.md`](.github/copilot-instructions.md)
 (build commands, architecture, hard scan invariants, hardware-debugging strategy). Read that first.
 
+---
+
+## Continuation note — preemption made real (2026-08-06)
+
+### Status: ADR-021 implemented and proven on live Pi 5.
+
+**Preemption was inert, not merely untested.** ADR-012/013 declared it mandatory and
+fixed the ctx-switch mechanism, but `src/el0_entry.S` was eret-ing to EL0 with
+`SPSR_EL1 = 0x3C0` — **DAIF all masked, including I**. Every PIOS user process is
+EL0, so the timer PPI could never be delivered while one ran, and `PREEMPT` read 0
+forever. Found with `tools/qemu_preempt_soak.py` plus a new per-core `TIMER_IRQ`
+column on `proc sched`; without that column a `PREEMPT` of 0 cannot be told apart
+from "this core never got a timer interrupt".
+
+**Two changes, which had to land together:**
+1. `proc_kstack[6][16384]` in kernel `.bss` gives each process a private EL1
+   exception stack. Previously `ctx.sp == entry_sp`, so EL1 trap frames and the EL0
+   user stack were the same region. It must be kernel-only: the frame holds `SPSR`
+   and `RESTORE_CONTEXT` reloads it directly, so a process that could edit its own
+   frame could `eret` itself to EL1. `map_user_kernel_low()` already mirrors kernel
+   `.bss` into every user table as `PTE_AP_RW_EL1` with attributes copied verbatim.
+2. `PROC_ENTRY_SPSR_EL0` = `0x340` (D/A/F masked, **I clear**), passed to
+   `proc_el0_enter()` as an argument instead of being hardcoded in asm — the value
+   previously existed twice and could drift.
+
+**Proof.** Same workload before/after, 16 concurrent CPU-bound `/spin/40` requests
+against the EL0 capsule host on core 3:
+
+| | core 1 | core 2 | core 3 (runs the process) |
+|---|---|---|---|
+| Before | 0 preempts | 0 | **0** |
+| After (QEMU) | 0 | 0 | **626** |
+| After (live Pi 5 `v20260806.121032`) | 0 | 0 | **440** |
+
+Cores 1–2 correctly stay 0 — their processes are parked, nothing overruns. All
+responses stayed byte-correct across every preemption, validating ADR-013's
+ctx-switch-from-IRQ path end-to-end. This also closes ADR-014's untested claim: a
+timer IRQ now crosses the EL2 stage-2 cage into a running EL0 process on real
+BCM2712 under load. Pi 5 selftests 14/14, QEMU 29/29 + load battery, host tests
+all pass, `rx_wedge=0`, `rx_hole_recover=0`.
+
+### Key architectural facts established this session
+
+- **The `I` bit is not a privilege grant.** The IRQ is taken *to EL1* on kernel
+  vectors either way; EL0 cannot re-mask it (`SCTLR_EL1.UMA` is never set).
+  Clearing it only permits the CPU to *leave* EL0 — the sole mechanism by which the
+  kernel can reclaim a core from a running process.
+- **EL0 cannot raise an SGI**, and does not need to. `SCTLR_EL1 = 0x30D00800`
+  leaves `nTWI`/`nTWE` clear, so `WFE`/`WFI` at EL0 **traps to EL1** (`EC=0x01`).
+  That is the trap-free doorbell for ADR-023's "ready to sleep": it carries no
+  operation selector, so unlike `SVC` it cannot be used to request anything.
+- **"FIFOs only" depends on preemption**, it does not merely coexist with it. With
+  no syscalls, the timer IRQ is the *only* kernel re-entry path from a running EL0
+  process.
+
+### Next steps
+
+**The theme of the remaining work is decoupling processes from cores.** ADR-024
+(dynamic allocation) is a hard prerequisite for ADR-025 (balancing/migration): a
+process cannot move while its memory lives inside the owning core's 16 MB region.
+
+1. **[#84] ADR-024 — dynamic per-process memory.** What actually caps process
+   count is the memory map, not `MAX_PROCS_PER_CORE`: 2 MB slots from `+1 MB` in a
+   16 MB per-core region fit ~7, and `procs[]` is 6 **system-wide**. Move process
+   memory to one global arena above `0x04E00000`, keeping fixed reservations only
+   for kernel, per-core stacks/scheduler state, FIFO signalling, DMA NET/DISK and
+   IPC. Watch: `src/el2.c` hardcodes the `[+1 MB, +13 MB)` stage-2 window; page
+   tables cost 28 KB per slot per core (`src/mmu.c:53-58`) so they need a pool
+   too; and the arena must be mapped with final attributes **from the first MMU
+   enable**.
+2. **[#85] ADR-025 — core as a scheduling capability.** Split `affinity_core` into
+   `pinned` (hard, that core only), `last_core` (soft hint for cache warmth) and
+   an eligible set of cores 1-3, with **core 0 excepted** as the reactor.
+   Migration stays message-passing; `procs[]` slot ownership must be
+   generation-checked once entries are no longer core-partitioned.
+3. **Wire up ADR-023/026.** `pctl`, `swake` and `qbank` are implemented and
+   host-tested but **not yet wired into the live scheduler**. Integration order:
+   `swake_seq()` feeds `pctl_evaluate()`; `swake_timer_expire()` replaces the
+   `wake_deadline_ms` scan in `proc_timer_tick()`; `qbank` hooks the deschedule
+   and dispatch paths.
+4. **ADR-022 — then** delete the EL0 syscall surface (`GETPID` trivially; `PARK`
+   becomes a `pctl` publication plus the trapped `WFE`).
+5. Still open: **Q1/Q2** (CYW43455 assoc on `adrv`, `adrv_supervise()`), WiFi
+   issues #65/#68/#69, and WPA2 association.
+
+### Done this session beyond ADR-021
+
+- **Q6** — trimmed `airq`'s never-used HARDWARE level (~9 KB). **The self-diagonal
+  is NOT dead and must not be trimmed**: `airq_post_from(CORE_NET,
+  AIRQ_SRC_ETH_RX, …)` is core 0 → core 0 and carries the NIC RX bottom half.
+- **Q7** — `ksvc_now_ticks()`/`ksvc_begin_at()`/`ksvc_end_at()` cut the scheduler
+  loop from 4 counter reads + 2 64-bit divides per iteration to 2 reads + 0
+  divides, keeping per-core visibility.
+- **ADR-023 logic** — `pctl` (process → kernel control line, 27 checks) and
+  `swake` (kernel → process wake FIFO, 70 checks, incl. the full
+  `Thread.Sleep(1000)` round trip). Three stop reasons: `AWAITING` (retains its
+  quantum, resumable *this* round), `YIELDED` (DoEvents, forfeits it), and
+  preemption (never process-declared). All wake sources — FIFO reply, empty timer
+  message, preempt request — advance **one** per-process sequence, which is what
+  makes the sticky-wake rule cover them uniformly.
+- **ADR-026 logic** — `qbank` (33 checks). Await accrues 75%, yield 50%,
+  preemption nothing; the *ordering* `yield < await < 100` is a `_Static_assert`,
+  not a comment. Processes are **burstable but bounded three ways**: only on an
+  otherwise-idle core, at most 100% of one quantum per slice (the DoS bound,
+  enforced inside `qbank_grant()` so no caller can widen it), and never past the
+  hard cap. Plus a catch-up boost crediting only the *excess* wait, so a process
+  starved by a slow kernel isn't punished.
+
+> ## ⚠ Architecture decisions require the owner's approval
+>
+> **The repository owner decides architecture. ASK BEFORE making a significant
+> architectural decision, and log every one in
+> [`docs/architecture_decision_log.md`](docs/architecture_decision_log.md).**
+>
+> Ask first if the change would alter a kernel invariant (scheduling, preemption,
+> watchdog policy, ownership/publication contracts, memory attributes, isolation);
+> change who owns a core, a cadence or an interrupt; add or remove a framework or
+> subsystem; change an on-disk, on-wire or cross-core format; **reverse a previous
+> decision**; change fail-safe behaviour; or trade safety against performance.
+>
+> Proceed without asking for: bug fixes that restore documented intent,
+> non-perturbing diagnostics, tests, docs, and mechanical refactors with no
+> behavioural change.
+>
+> If unsure, ask. An unlogged architecture change is a defect.
+
+**Architecture reference** (written from the code, kept current):
+
+- [`docs/architecture_decision_log.md`](docs/architecture_decision_log.md) — **every significant
+  architectural decision, who made it, and what was rejected.** Read before proposing a change.
+- [`docs/architecture_system.md`](docs/architecture_system.md) — cores, scheduling and quanta,
+  mandatory preemption, the software-interrupt privilege model and per-core quantum, FIFOs, IPC,
+  EL levels, memory isolation, processes and capsules.
+- [`docs/boot_storage.md`](docs/boot_storage.md) — two-stage boot, A/B OTA, disk layout, WALFS,
+  users/identity, logging and perf/monitoring.
+- [`docs/network_stack.md`](docs/network_stack.md) — NIC backends, IP/ICMP/ARP/DNS, TCP, the
+  cross-core FIFO network path, TLS 1.3 termination and capsule offload.
+- [`docs/network.md`](docs/network.md) — operational network map and commands.
+- [`docs/gotchas.md`](docs/gotchas.md) — **failed attempts, reverted changes and non-obvious
+  traps.** Check here before "fixing" something that looks obviously wrong; it may already have
+  been tried, measured and reverted.
+
 This file carries a **continuation note** so in-progress work survives a machine rebuild
 (the per-session `plan.md` / checkpoints live under the user profile, not in the repo).
+
+---
+
+## PIOS driver philosophy: asynchronous, bounded, self-healing
+
+PIOS is an event-driven reactor OS. **Core 0 belongs to the kernel completely — and precisely
+because it is ours, it must be protected.** It owns the network, disk and console hot paths, it is
+the fail-safe management path for the whole board, and it is the only core that can answer the
+FIFO requests cores 1-3 are parked on. Time spent blocking on core 0 is time stolen from every one
+of those obligations.
+
+Every serious lockup this project has suffered — across multiple sessions and multiple agents — has
+come from the same root: **a driver that borrowed core 0 and blocked on hardware.**
+
+The three failure modes are always the same, and they compound:
+
+1. **Core-0 starvation.** A driver owning core 0 for seconds stops `net_poll()`. The wired GEM RX
+   ring fills (`896/896`), BNA latches and RX DMA halts. Because `CORE0_IO_NET` is raised *only* by
+   the ETH IRQ, no further IRQ can arrive once BNA is latched, so the reactor's own recovery never
+   runs. The board is alive but permanently unreachable, and only a power cycle recovers it.
+2. **Watchdog misuse.** Either the blocking loop never pets and a legitimately slow operation
+   reboots the board mid-work, or it pets unconditionally and a genuine stall becomes a *permanent
+   hang* instead of a self-healing reboot. Both are worse than failing.
+3. **Cadence inversion.** A driver's polling is gated behind an unrelated subsystem's interrupt, so
+   that subsystem going quiet silently starves this one. WiFi RX was gated behind the wired
+   Ethernet IRQ; a quiet LAN stopped CYW43455 event delivery entirely.
+
+These are not bugs to be fixed one at a time. They are the absence of an abstraction.
+
+### The rules
+
+- **Preemption is mandatory, not optional.** Every user core runs its scheduler preemptively. A
+  cooperatively-scheduled core is one runaway process away from never answering a FIFO reply and
+  never yielding the core back; "cooperative" means "correct only while every process behaves",
+  which is not a property a kernel may assume. Every user core therefore keeps its GIC CPU
+  interface up and its CNTP timer PPI armed — a core that cannot take a timer interrupt cannot be
+  preempted.
+- **Preempt by switching context from IRQ context, after the EOI.** `vectors.S:SAVE_CONTEXT`
+  already pushes x0–x30/ELR/SPSR onto the interrupted process's own stack, so `ctx_switch()` from
+  inside the IRQ handler yields a *complete* context (IRQ frame + callee-saved + SP). Never
+  redirect `ELR` into a C trampoline: the previous implementation did exactly that, stashing the
+  interrupted PC in x30 — destroying the process's live link register — and then called
+  `proc_yield()`, which is free to clobber every caller-saved register the interrupted code still
+  held. It corrupted any process preempted mid-function. Preempting *before* `gic_end_of_interrupt()`
+  is equally fatal: the interrupt stays active for as long as the process is descheduled and
+  deadlocks the very timer that drives preemption.
+- **Never block core 0.** Any operation that can take more than a few milliseconds is a state
+  machine driven by the reactor, not a loop. If you are writing `while (...) { poll(); delay(); }`
+  in a command handler, you are writing a future lockup.
+- **The system schedules; it does not overrun.** Measuring an overrun after the fact is admitting
+  the schedule already failed. Every step declares a budget, and a step is *admitted* only if that
+  budget fits the time remaining in the pass — otherwise it waits for the next pass. Core-0 time in
+  driver code is bounded *a priori*, not observed afterwards. A step that returns later than the
+  deadline it was handed has broken the schedule: it fails closed and is quarantined on first
+  offence, because hardware side effects cannot be rolled back.
+- **Hardware IRQ handlers enqueue; they do not work.** An IRQ handler is not scheduled, cannot be
+  budgeted, and preempts the very reactor that polices time — so doing real work there borrows a
+  core without anyone deciding to. Hardware is **trigger level 0**: the top half acknowledges the
+  line and posts a bounded record. Every executable privilege level sits *above* it in software,
+  dispatched in scheduled context under budget. Registering work at level 0 is refused outright.
+- **User cores need exactly one software interrupt: the quantum.** Not a zoo of SGI types — one
+  message meaning *"drain your inbound queue, then run the scheduler with what's left."* The drain
+  is capped at a fraction of the quantum, so the scheduler is guaranteed a share and a queue flood
+  can never starve process execution. This collapses the cross-core doorbell and scheduler
+  preemption into a single, budgeted mechanism.
+- **The watchdog is a liveness proof, not a formality.** Pet it *only* on proven forward progress.
+  Never pet on a timer, never pet inside a wait, never pet "to get through" a slow section. A
+  stalled operation must be allowed to reach the watchdog so the board reboots and self-heals.
+  Feeding the watchdog during a stall is strictly worse than not feeding it at all.
+- **Every wait has a deadline, and expiry fails closed.** No unbounded waits, ever. An operation
+  without a deadline is an outage waiting for the right timing.
+- **A declared deadline is a promise to return, not a hint.** When the kernel says it will return
+  by a time, it must actually return by then. Lateness is not a cosmetic detail — it means a step
+  overran its budget and every caller that trusted that contract was left waiting. Measure it
+  (`max_deadline_lateness_ms`) and treat a non-zero value as a defect, not noise.
+- **Answer other cores when they expect it.** Cores 1-3 park on FIFO replies that only core 0 can
+  produce. A blocked core 0 does not just lose packets — it silently stalls every user core waiting
+  on a tagged reply. Servicing cross-core FIFOs is part of the kernel's obligation while it is
+  busy, not something that resumes afterwards.
+- **A subsystem owns its own service cadence.** Never gate one driver's polling on another
+  driver's interrupt. If hardware has no IRQ line (SDIO here), that driver gets its own reactor
+  flag.
+- **Polling costs core 0, so cadence must be adaptive.** Poll fast only while work is genuinely in
+  flight; idle-poll otherwise. A free-running fast cadence pinned core 0 at 99% (`busy=992pm`).
+- **No operation may starve the fail-safe path.** While any long operation is in flight, something
+  must keep draining the wired NIC, running its recovery checks, and servicing cross-core FIFOs.
+  Losing `.201` means losing the ability to diagnose or fix anything remotely.
+- **Bounded budgets, and overruns must be attributable.** Every loop has a limit; every step is
+  time-boxed; when a contract is broken, the diagnostics must name the offender.
+
+### The framework
+
+`include/adrv.h`, `src/adrv.c` and `tests/test_adrv.c` implement the scheduling half; `include/airq.h`,
+`src/airq.c` and `tests/test_airq.c` implement the interrupt half. **Both are wired into the live
+path** (see "Wiring" below). Together they mean each driver no longer has to remember these rules:
+
+**`adrv` — scheduled asynchronous work**
+- drivers expose a non-blocking `step(ctx, deadline_ms)`; the framework never waits;
+- the step is *handed* its return-by deadline so it can chunk its own work;
+- admission control: a step runs only if its declared budget fits the remaining pass budget,
+  otherwise it is deferred — so a pass cannot overrun;
+- returning late fails the operation closed and quarantines the step (first offence);
+- the watchdog is petted **only** on `ADRV_STEP_PROGRESS`/`DONE`;
+- deadlines and budgets are mandatory at submit time; lateness is measured;
+- a liveness hook runs whenever work is in flight — it must drain the wired NIC, run MAC recovery,
+  and service cross-core FIFOs so parked user cores still get their replies;
+- fixed-capacity table, no allocation, generation-poisoned handles.
+
+**`airq` — software privilege for interrupts, routing, and the quantum**
+- **hardware is level 0: a trigger only.** `airq_post()` is IRQ-safe — bounded, allocation-free,
+  no handler invocation. Registering work to execute at level 0 is refused;
+- executable software privilege levels above it: `CRITICAL` (NIC RX drain, fault escalation),
+  `HIGH` (cross-core FIFO doorbells; user cores are parked on these), `NORMAL` (device work),
+  `LOW` (console/UI/diagnostics);
+- **routing**: an IRQ taken on one core can enqueue work *owned* by another. Each
+  (producer core, target core, priority) triple has its own SPSC lane, so no ring is ever
+  multi-producer and no low-priority record can head-block a critical one;
+- **the quantum** (`airq_quantum`): the single software interrupt cores 1–3 need. It drains the
+  core's queue within a capped share of the quantum, then hands the remaining budget to the
+  scheduler — process progress is guaranteed, never negotiable;
+- **graded batch sizes** set the latency/throughput dial per level: `CRITICAL` is never batched
+  (1 record, re-check after every message), `HIGH` takes up to 2, `NORMAL` up to 4, and `LOW` gets
+  no batch of its own — it runs on whatever budget is left over;
+- **a batch never waits to fill.** It takes whatever is already queued up to the batch size and
+  returns the moment the level runs dry. A batch size is a ceiling on work per re-scan, never a
+  threshold to reach — waiting would add latency proportional to arrival rate and stall completely
+  when a source goes quiet;
+- per-level quotas (strictly smaller than lane capacity) turn an interrupt storm into a bounded
+  backlog that takes several passes, instead of a takeover;
+- a reserved share per level means strict priority can never permanently starve a lower one;
+- lane overflow is explicit and counted per level, never silently lost.
+
+The framework is pure logic — time, watchdog and liveness are injected hooks — so its contracts are
+pinned by host tests with a deterministic fake clock (`python tests\run_host_tests.py`). The most
+important tests assert that a stalled operation **never** pets the watchdog, that a pass **cannot**
+exceed its budget, that a saturated `CRITICAL` source **cannot** silence the cross-core FIFO
+doorbell, and that a queue flood **cannot** starve the scheduler out of its quantum.
+
+### Wiring (live as of `v20260806.101152`)
+
+The end-to-end path is now:
+
+```text
+hardware IRQ (level 0, trigger only)
+  core0_eth_irq_handler()  -> airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, mip)
+                              quiesce line, set flags, sev(), return
+        |
+core 0 reactor (scheduled context, budgeted)
+  airq_dispatch(CORE_NET, ADRV_PASS_BUDGET_MS)
+      CRITICAL  eth-rx      1 at a time, never batched, never starved
+      HIGH      fifo-core0  batches of <=2
+      NORMAL    wifi        batches of <=4
+      LOW       console     leftover budget only
+  adrv_service()            admission-controlled async driver steps
+        |
+cross-core: fifo_push() -> fifo_notify(src, dst)
+  airq_post_from(src, AIRQ_SRC_FIFO_CORE(dst), dst)   /* routed to dst's lanes */
+  + SGI GIC_SGI_WAKE (with SEV backstop)
+        |
+core 1-3 scheduler loop
+  airq_quantum(core, PROC_PREEMPT_QUANTUM_MS, &sched_ms)
+      drain own queue (capped share)  -> then dispatch a process with the rest
+```
+
+Key points:
+
+- Each cross-core FIFO doorbell has **its own source per target core**
+  (`AIRQ_SRC_FIFO_CORE(n)`), because a source is bound to one owning core at registration. The
+  record must land on the core that will service it, not the core that took the interrupt.
+- `adrv`'s liveness hook is `wifi_upload_progress` (net_poll + MAC recovery + watchdog pet), so any
+  long async operation keeps the wired fail-safe path draining.
+- `adrv`'s watchdog hook is `watchdog_hw_pet`, called **only** on proven forward progress.
+- Core 0's reactor and FIFO drain are registered as `sched-core0`/`fifo-core0` in the service map,
+  and each user core registers `sched-coreN`/`fifo-coreN`, so scheduler and doorbell time is
+  attributable per core instead of being invisible work.
+
+Live proof on `v20260806.101152`: Pi 5 selftests 14/14, QEMU smoke 29/29, EL0 capsules on `:82`,
+`:83`, `:8090` serving, `error=0`, `rx_wedge=0`, and cross-core delivery visible as rising
+`SOFT_EVT` on the capsule-hosting core under load.
+
+### Why not stack capture and rollback?
+
+A tempting design is to snapshot core 0's stack on entry and roll back any call that overruns.
+It does not work here, and the reason is worth stating so it is not re-proposed:
+
+- **Hardware state does not roll back.** You cannot un-write an MMIO register, un-issue a CMD53, or
+  un-publish a DMA descriptor. Undo is meaningless at the driver boundary.
+- **Unwinding a timed-out call is corruption.** Longjmp-ing out of a stalled step leaves rings
+  half-programmed and ownership ambiguous — the exact failure class these invariants exist to
+  prevent.
+- **Per-call capture is pure latency.** Copying stacks on every step, at reactor cadence, buys
+  nothing in the overwhelmingly common case where the step returns promptly.
+
+The resilient variant keeps the intent and drops the cost:
+
+1. **Stamp, don't copy.** `struct adrv_stamp` is one cache line published before entering a step:
+   which operation, since when, against which deadline. One store, no copying.
+2. **Supervise out of band.** Core 0 cannot police itself while it is blocked. The stamp is
+   designed to be read by *another* core (`adrv_supervise()`) or by the pre-timeout watchdog
+   handler. The supervisor records and escalates; it never unwinds the servicing core.
+3. **Capture the stack only when it matters.** The real context dump belongs in the watchdog
+   pre-timeout path (reusing `coredump.c`), where it costs nothing in the happy path.
+4. **Quarantine instead of undo.** A step that blows the hard budget is failed closed and refused
+   re-entry until explicitly re-armed. This is the achievable form of "disallow updates that time
+   out": the offending subsystem degrades, and the wired fail-safe path survives.
+5. **Atomicity comes from publication order.** Linear descriptor ownership already makes partial
+   work invisible until it is published, so timing out before publication is naturally atomic —
+   no transaction machinery required.
+
+**New drivers, and any rework of existing blocking paths, should use `adrv` rather than
+hand-rolling another blocking loop.** The CYW43455 association path is the reference migration
+target: it is the last remaining seconds-long blocking loop on core 0.
+
+---
+
+## Windows build environment
+
+- Do not assume `make` is installed or that either the AArch64 toolchain or Visual Studio tools
+  are on `PATH`.
+- The verified full Pi 5 build command is:
+
+  ```powershell
+  cmd.exe /d /c "C:\source\pios\build_bootstrap.bat"
+  ```
+
+  This batch file pins the AArch64 GNU toolchain to
+  `C:\aarch64-none-elf\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-aarch64-none-elf\bin`
+  and produces the Pi 5 stage-0, stage-2, and QEMU payloads. It completed successfully on
+  2026-08-05.
+- Some automation wrappers can deny an invocation through `$env:ComSpec`; retry the direct
+  `cmd.exe /d /c` form above before treating the bootstrap build as blocked.
+- Visual Studio is installed but may not be on `PATH`. For an MSVC-only tool, locate its
+  installation first and call its environment setup script (for example, `vcvars64.bat`) and the
+  dependent command in the same `cmd.exe` process. The normal PIOS bootstrap build does not
+  require Visual Studio.
 
 ---
 
@@ -97,6 +474,88 @@ This file carries a **continuation note** so in-progress work survives a machine
   post-`SET_SSID` probe experiments; valid GET probes still caused watchdog resets during join and
   were not retained. Pi5 selftests pass 14/14, QEMU smoke passes 29/29, and wired diagnostics remain
   `error=0`, `rx_wedge=0`, `rx_hole_recover=0`.
+- Passive #76 instrumentation on `v20260805.180039` retained a bounded per-join event ring and
+  firmware log without association-time GETs. The firmware emitted no `WLC_E_PSK_SUP` (46)
+  transition; event 54 is `WLC_E_IF`, not a supplicant event. Decode PSK states as 4=WAIT_M1,
+  5=PREP_M2, 6=completed, 7=timeout, 8=WAIT_M3, 9=PREP_M4, 10=WAIT_G1, 11=PREP_G2.
+- The same trace reports `malformed chanspec 0x0` for a no-scan join. `escan` now carries explicit
+  20 MHz chanspecs for channels 1-13 and common 5 GHz channels; it discovered `PIOS_Test_Guest`
+  once on channel 36 but subsequent fresh scans did not reproduce it. The join path now fails
+  closed unless that scan cache supplies the target BSSID and chanspec, then sends the complete
+  52-byte `WLC_SET_SSID` join descriptor rather than raw `WLC_SET_CHANNEL`. Never scan after a
+  failed join without a clean `wifi init`/reboot; #69 remains open until discovery is repeatable
+  and the targeted join has a hardware proof.
+
+### Scan discovery root-caused and fixed (2026-08-05, image `v20260805.222428`)
+
+Nondeterministic scan discovery had three independent causes, all now fixed:
+
+1. **WiFi RX was gated behind the wired Ethernet IRQ.** `cyw43_poll()` was called only inside the
+   `CORE0_IO_NET` branch, and on Pi 5 that flag is set *purely* by the RP1/GEM ETH IRQ. A quiet
+   wired link therefore starved CYW43455 event delivery entirely. This is the same class of bug as
+   the earlier LAN RX issue: one subsystem's drain cadence owned by another subsystem's interrupt.
+   Fixed with a dedicated `CORE0_IO_WIFI` reactor flag driven at 125 Hz from `core0_io_tick_hook`.
+2. **`cyw43_poll()` drained a single frame per pass.** An escan publishes one event frame per BSS
+   plus a completion event, so single-frame draining fell behind firmware publication and lost
+   results. Now drains a bounded burst (`CYW_POLL_BURST_FRAMES = 32`).
+3. **`HOSTINTMASK` did not survive firmware init.** It was written before function 2 was enabled
+   and read back `0`, suppressing the host-mailbox frame indication. It is now re-asserted after
+   F2 + KSO are up and the readback is logged (`[cyw] intmask=`), confirmed `200000F0` live.
+
+The legacy `WLC_UP` scan queue-kick is gone. It reopened the radio (`wl_open`) every ~170 ms and
+was the source of the scan disruption. It is replaced by `scan_bus_kick()`, an RF-neutral,
+credit-checked re-send of the idempotent `event_msgs` iovar on a 250 ms cadence, bounded to 60
+pokes. `scan_bus_kick()` returns immediately when the SDPCM transmit window is exhausted so it can
+never enter `sdpcm_send()`'s credit wait from the reactor.
+
+Live proof on `v20260805.222428`: a single `wifi scan` returned 7 deduplicated BSS records with one
+`wl_open` in the firmware console, including both `PIOS_Test_Guest` mesh BSSIDs
+(`72:a2:f4:64:a3:ba` ch8 -34 dBm, `6a:a2:f4:64:e0:b2` ch6 -53 dBm, `sec=0x0D`). Repeat scans stayed
+reliable; the guest AP roams between ch6/ch8/ch36, which explains the earlier apparent absence.
+
+The targeted join then sends a valid chanspec — `malformed chanspec 0x0` no longer appears — and the
+same RF-neutral poke is armed for the association window.
+
+### Open hazard: association wedges the WIRED NIC (root-caused 2026-08-05)
+
+`v20260805.224239` left the board unreachable to both HTTP and ICMP. The live symptom was
+`896/896` with `BNA=Y`: the **wired** GEM RX ring was completely full and RX DMA had halted. The
+board was not hung — its wired management path was dead.
+
+Root cause: `cyw43_join_key()` owns core 0 for up to 30 seconds in its association poll loop. During
+that window `net_poll()` never runs, so the 896-descriptor GEM ring fills and latches BNA. Once BNA
+is latched no further ETH IRQ can be raised, and on Pi 5 `CORE0_IO_NET` is set *only* by that IRQ —
+so the reactor's `macb_rx_recover()` path never runs and the wedge is permanent. The
+`CORE0_IO_MAINT` recovery cadence cannot help either, because the reactor itself is not running
+while the join loop blocks.
+
+Fix (`v20260805.231100`): the association poll loop now invokes the existing `wifi_upload_progress`
+hook every iteration, which pairs `net_poll()` with `macb_rx_recover()` /
+`macb_rx_hole_recover()` / `macb_rx_liveness_recover()` and pets the watchdog. The hook is now
+installed for `wifi joinpmk`, `wifi join` and `wifi join3` as well as `wifi init` / `wifi load`.
+
+**Rule: any WiFi path that blocks core 0 for more than a few milliseconds must drive
+`wifi_upload_progress()` (or an equivalent net_poll + MAC recovery pairing).** Blocking core 0
+without it silently destroys the wired fail-safe management path.
+
+### Reactor cadence must be adaptive (`v20260806.000238`)
+
+The dashboard showed `busy=992pm` (core 0 at 99.2%). The CYW43455 has no host IRQ line here, so
+every `cyw43_poll()` costs real CMD52/CMD53 bus transactions; a free-running 125 Hz WiFi cadence
+therefore pins core 0 even with the radio idle. `core0_io_tick_hook` now runs the fast (~125 Hz)
+`CORE0_IO_WIFI` cadence only while `cyw43_poll_busy()` is true (scan in flight, scan-result request
+outstanding, or link not down) and falls back to ~8 Hz idle polling otherwise.
+
+The correct longer-term fix is to make association fully asynchronous/event-driven like the scan
+path, so no WiFi operation ever owns core 0 for seconds at a time.
+
+**Do not pet the hardware watchdog inside SDPCM credit/stall waits.** An experimental
+`watchdog_hw_pet()` in `sdpcm_send()`'s credit loop was reverted: feeding the watchdog during a
+stall converts a self-healing reboot into a permanent hang, which is exactly what a fail-closed
+bring-up path must not do. Callers that must not block check transmit credit *before* calling
+`sdpcm_send()` instead.
+
+
 
 ---
 
