@@ -1,0 +1,429 @@
+#include "pipe.h"
+#include "ipc_queue.h"
+#include "ipc_stream.h"
+#include "kspin.h"
+
+#define PIPE_IPC_PREFIX "/ipc/"
+#define PIPE_NET_PREFIX "/net/"
+#define PIPE_FS_PREFIX  "/fs/"
+#define PIPE_HW_PREFIX  "/hw/"
+
+struct pipe_obj {
+    bool used;
+    u32 generation;
+    u8 path[PIPE_PATH_MAX + 1];
+    u32 type;
+    u32 domain;
+    u32 flags;
+    u32 depth;
+    u32 frame_max;
+    i32 backend;
+    i32 stream_sub;
+    u32 open_count;
+    u32 _pad[4];
+} ALIGNED(64);
+
+static struct pipe_obj g_pipes[PIPE_MAX_OBJECTS];
+static struct kspinlock *const g_pipe_lock = (struct kspinlock *)(usize)(KSPIN_SHARED_BASE + 2U * 64U);
+_Static_assert((sizeof(struct pipe_obj) & 63U) == 0U,
+               "pipe descriptors must have cache-line stride");
+
+#define PIPE_POISON_U32 0xDEAD717EU
+#define PIPE_POISON_I32 ((i32)-0x717)
+
+static u32 pipe_bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void pipe_poison(struct pipe_obj *p)
+{
+    if (!p)
+        return;
+    u32 gen = pipe_bump_generation(p->generation);
+    memset(p, 0xA5, sizeof(*p));
+    p->used = false;
+    p->generation = gen;
+    p->type = PIPE_POISON_U32;
+    p->domain = PIPE_POISON_U32;
+    p->flags = PIPE_POISON_U32;
+    p->depth = 0;
+    p->frame_max = 0;
+    p->backend = PIPE_POISON_I32;
+    p->stream_sub = PIPE_POISON_I32;
+    p->open_count = 0;
+}
+
+static void copy_bytes(void *dst, const void *src, u32 n)
+{
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    for (u32 i = 0; i < n; i++) d[i] = s[i];
+}
+
+static bool cstr_len_max(const char *s, u32 max_len, u32 *len_out)
+{
+    if (!s || max_len == 0) return false;
+    for (u32 i = 0; i <= max_len; i++) {
+        u8 c = (u8)s[i];
+        if (c == 0) {
+            if (i == 0) return false;
+            if (len_out) *len_out = i;
+            return true;
+        }
+        if (c < 0x20 || c > 0x7E) return false;
+    }
+    return false;
+}
+
+static bool starts_with(const char *s, const char *prefix, u32 *prefix_len_out)
+{
+    u32 i = 0;
+    while (prefix[i]) {
+        if (s[i] != prefix[i]) return false;
+        i++;
+    }
+    if (prefix_len_out) *prefix_len_out = i;
+    return true;
+}
+
+static bool parse_path(const char *path, u32 *domain_out, const char **name_out, u32 *path_len_out)
+{
+    u32 plen = 0;
+    u32 prefix_len = 0;
+
+    if (!cstr_len_max(path, PIPE_PATH_MAX, &plen)) return false;
+    if (starts_with(path, PIPE_IPC_PREFIX, &prefix_len)) {
+        if (domain_out) *domain_out = PIPE_DOMAIN_IPC;
+    } else if (starts_with(path, PIPE_NET_PREFIX, &prefix_len)) {
+        if (domain_out) *domain_out = PIPE_DOMAIN_NET;
+    } else if (starts_with(path, PIPE_FS_PREFIX, &prefix_len)) {
+        if (domain_out) *domain_out = PIPE_DOMAIN_FS;
+    } else if (starts_with(path, PIPE_HW_PREFIX, &prefix_len)) {
+        if (domain_out) *domain_out = PIPE_DOMAIN_HW;
+    } else {
+        return false;
+    }
+
+    if (plen <= prefix_len) return false;
+    const char *name = path + prefix_len;
+    if (!cstr_len_max(name, IPC_NAME_MAX, NULL)) return false;
+    for (u32 i = 0; name[i]; i++) {
+        if (name[i] == '/') return false;
+    }
+
+    if (name_out) *name_out = name;
+    if (path_len_out) *path_len_out = plen;
+    return true;
+}
+
+static bool build_backend_name(u32 domain, const char *name, u8 out[IPC_NAME_MAX + 1])
+{
+    const char *prefix = "";
+    if (domain == PIPE_DOMAIN_NET) prefix = "net.";
+    else if (domain == PIPE_DOMAIN_FS) prefix = "fs.";
+    else if (domain == PIPE_DOMAIN_HW) prefix = "hw.";
+
+    u32 pi = 0;
+    while (prefix[pi]) pi++;
+    u32 ni = 0;
+    while (name[ni]) ni++;
+    if (pi + ni > IPC_NAME_MAX) return false;
+
+    u32 o = 0;
+    for (u32 i = 0; i < pi; i++) out[o++] = (u8)prefix[i];
+    for (u32 i = 0; i < ni; i++) out[o++] = (u8)name[i];
+    out[o] = 0;
+    return true;
+}
+
+static struct pipe_obj *pipe_from_id(i32 pipe_id)
+{
+    if (pipe_id < 0 || pipe_id >= PIPE_MAX_OBJECTS) return NULL;
+    if (!g_pipes[pipe_id].used) return NULL;
+    return &g_pipes[pipe_id];
+}
+
+static i32 pipe_find(const char *path, u32 type)
+{
+    for (u32 i = 0; i < PIPE_MAX_OBJECTS; i++) {
+        if (!g_pipes[i].used) continue;
+        if (type != PIPE_TYPE_ANY && g_pipes[i].type != type) continue;
+        u32 j = 0;
+        while (j <= PIPE_PATH_MAX) {
+            if (g_pipes[i].path[j] != (u8)path[j]) break;
+            if (path[j] == 0) return (i32)i;
+            j++;
+        }
+    }
+    return IPC_ERR_NOENT;
+}
+
+static i32 pipe_alloc_slot(void)
+{
+    for (u32 i = 0; i < PIPE_MAX_OBJECTS; i++) {
+        if (!g_pipes[i].used) return (i32)i;
+    }
+    return IPC_ERR_NOSPC;
+}
+
+static i32 backend_create_ipc(const char *name, u32 type, u32 depth, u32 flags, u32 frame_max, i32 *stream_sub_out)
+{
+    if (type == PIPE_SLOT) {
+        if (stream_sub_out) *stream_sub_out = -1;
+        return ipc_queue_create(name, depth, flags, frame_max);
+    }
+    if (type == PIPE_STREAM) {
+        i32 topic = ipc_topic_create(name, depth, flags, frame_max);
+        if (topic < 0) return topic;
+        i32 sub = ipc_topic_subscribe(topic);
+        if (sub < 0) return sub;
+        if (stream_sub_out) *stream_sub_out = sub;
+        return topic;
+    }
+    return IPC_ERR_INVAL;
+}
+
+static i32 backend_open_ipc(const char *name, u32 type, i32 *stream_sub_out)
+{
+    if (type == PIPE_SLOT) {
+        if (stream_sub_out) *stream_sub_out = -1;
+        return ipc_queue_open(name);
+    }
+    if (type == PIPE_STREAM) {
+        i32 topic = ipc_topic_open(name);
+        if (topic < 0) return topic;
+        i32 sub = ipc_topic_subscribe(topic);
+        if (sub < 0) return sub;
+        if (stream_sub_out) *stream_sub_out = sub;
+        return topic;
+    }
+    return IPC_ERR_INVAL;
+}
+
+void pipe_init(void)
+{
+    kspin_init(g_pipe_lock);
+    kspin_lock(g_pipe_lock);
+    for (u32 i = 0; i < PIPE_MAX_OBJECTS; i++)
+        pipe_poison(&g_pipes[i]);
+    kspin_unlock(g_pipe_lock);
+}
+
+static i32 pipe_create_unlocked(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
+{
+    u32 domain = 0;
+    const char *name = NULL;
+    u32 path_len = 0;
+    if (!parse_path(path, &domain, &name, &path_len)) return IPC_ERR_INVAL;
+    if (type != PIPE_SLOT && type != PIPE_STREAM) return IPC_ERR_INVAL;
+    if (pipe_find(path, type) >= 0) return IPC_ERR_EXISTS;
+
+    i32 slot = pipe_alloc_slot();
+    if (slot < 0) return slot;
+
+    u8 backend_name[IPC_NAME_MAX + 1];
+    if (!build_backend_name(domain, name, backend_name))
+        return IPC_ERR_TOOLONG;
+
+    i32 stream_sub = -1;
+    i32 backend = backend_create_ipc((const char *)backend_name, type, depth, flags, frame_max, &stream_sub);
+    if (backend < 0) return backend;
+
+    struct pipe_obj *p = &g_pipes[slot];
+    u32 gen = pipe_bump_generation(p->generation);
+    memset(p, 0, sizeof(*p));
+    p->used = true;
+    p->generation = gen;
+    p->type = type;
+    p->domain = domain;
+    p->flags = flags;
+    p->depth = depth;
+    p->frame_max = frame_max;
+    p->backend = backend;
+    p->stream_sub = stream_sub;
+    p->open_count = 1;
+    copy_bytes(p->path, path, path_len + 1);
+    return slot;
+}
+
+static i32 pipe_open_unlocked(const char *path, u32 type)
+{
+    u32 domain = 0;
+    const char *name = NULL;
+    u32 path_len = 0;
+    if (!parse_path(path, &domain, &name, &path_len)) return IPC_ERR_INVAL;
+    if (type != PIPE_SLOT && type != PIPE_STREAM && type != PIPE_TYPE_ANY) return IPC_ERR_INVAL;
+
+    i32 existing = pipe_find(path, type);
+    if (existing >= 0) {
+        g_pipes[existing].open_count++;
+        return existing;
+    }
+
+    if (type == PIPE_TYPE_ANY)
+        return IPC_ERR_INVAL;
+
+    i32 slot = pipe_alloc_slot();
+    if (slot < 0) return slot;
+
+    u8 backend_name[IPC_NAME_MAX + 1];
+    if (!build_backend_name(domain, name, backend_name))
+        return IPC_ERR_TOOLONG;
+
+    i32 stream_sub = -1;
+    i32 backend = backend_open_ipc((const char *)backend_name, type, &stream_sub);
+    if (backend < 0) return backend;
+
+    struct pipe_obj *p = &g_pipes[slot];
+    u32 gen = pipe_bump_generation(p->generation);
+    memset(p, 0, sizeof(*p));
+    p->used = true;
+    p->generation = gen;
+    p->type = type;
+    p->domain = domain;
+    p->flags = 0;
+    p->depth = 0;
+    p->frame_max = IPC_FRAME_MAX;
+    p->backend = backend;
+    p->stream_sub = stream_sub;
+    p->open_count = 1;
+    copy_bytes(p->path, path, path_len + 1);
+    return slot;
+}
+
+static i32 pipe_close_unlocked(i32 pipe_id)
+{
+    struct pipe_obj *p = pipe_from_id(pipe_id);
+    if (!p) return IPC_ERR_INVAL;
+    if (p->open_count == 0) return IPC_ERR_INVAL;
+    p->open_count--;
+    if (p->open_count == 0)
+        pipe_poison(p);
+    return IPC_OK;
+}
+
+static i32 pipe_read_unlocked(i32 pipe_id, void *buf, u32 len)
+{
+    struct pipe_obj *p = pipe_from_id(pipe_id);
+    if (!p || !buf || len == 0) return IPC_ERR_INVAL;
+    if (p->type != PIPE_STREAM) return IPC_ERR_UNSUPPORTED;
+    u32 out_len = 0;
+    i32 r = ipc_topic_read(p->stream_sub, buf, len, &out_len);
+    if (r != IPC_OK) return r;
+    return (i32)out_len;
+}
+
+static i32 pipe_write_unlocked(i32 pipe_id, const void *buf, u32 len)
+{
+    struct pipe_obj *p = pipe_from_id(pipe_id);
+    if (!p || !buf || len == 0) return IPC_ERR_INVAL;
+    if (p->type != PIPE_STREAM) return IPC_ERR_UNSUPPORTED;
+    i32 r = ipc_topic_publish(p->backend, buf, len);
+    if (r != IPC_OK) return r;
+    return (i32)len;
+}
+
+static i32 pipe_send_unlocked(i32 pipe_id, const void *msg, u32 len)
+{
+    struct pipe_obj *p = pipe_from_id(pipe_id);
+    if (!p || !msg || len == 0) return IPC_ERR_INVAL;
+    if (p->type != PIPE_SLOT) return IPC_ERR_UNSUPPORTED;
+    i32 r = ipc_queue_push(p->backend, msg, len);
+    if (r != IPC_OK) return r;
+    return (i32)len;
+}
+
+static i32 pipe_recv_unlocked(i32 pipe_id, void *msg, u32 len)
+{
+    struct pipe_obj *p = pipe_from_id(pipe_id);
+    if (!p || !msg || len == 0) return IPC_ERR_INVAL;
+    if (p->type != PIPE_SLOT) return IPC_ERR_UNSUPPORTED;
+    u32 out_len = 0;
+    i32 r = ipc_queue_pop(p->backend, msg, len, &out_len);
+    if (r != IPC_OK) return r;
+    return (i32)out_len;
+}
+
+static i32 pipe_stat_unlocked(i32 pipe_id, struct pipe_stat *out)
+{
+    struct pipe_obj *p = pipe_from_id(pipe_id);
+    if (!p || !out) return IPC_ERR_INVAL;
+
+    memset(out, 0, sizeof(*out));
+    out->id = (u32)pipe_id;
+    out->type = p->type;
+    out->domain = p->domain;
+    out->flags = p->flags;
+    out->depth = p->depth;
+    out->frame_max = p->frame_max;
+    out->backend_handle = p->backend;
+    out->open_count = p->open_count;
+    copy_bytes(out->path, p->path, PIPE_PATH_MAX + 1);
+    return IPC_OK;
+}
+
+i32 pipe_create(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max)
+{
+    kspin_lock(g_pipe_lock);
+    i32 rc = pipe_create_unlocked(path, type, depth, flags, frame_max);
+    kspin_unlock(g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_open(const char *path, u32 type)
+{
+    kspin_lock(g_pipe_lock);
+    i32 rc = pipe_open_unlocked(path, type);
+    kspin_unlock(g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_close(i32 pipe_id)
+{
+    kspin_lock(g_pipe_lock);
+    i32 rc = pipe_close_unlocked(pipe_id);
+    kspin_unlock(g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_read(i32 pipe_id, void *buf, u32 len)
+{
+    kspin_lock(g_pipe_lock);
+    i32 rc = pipe_read_unlocked(pipe_id, buf, len);
+    kspin_unlock(g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_write(i32 pipe_id, const void *buf, u32 len)
+{
+    kspin_lock(g_pipe_lock);
+    i32 rc = pipe_write_unlocked(pipe_id, buf, len);
+    kspin_unlock(g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_send(i32 pipe_id, const void *msg, u32 len)
+{
+    kspin_lock(g_pipe_lock);
+    i32 rc = pipe_send_unlocked(pipe_id, msg, len);
+    kspin_unlock(g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_recv(i32 pipe_id, void *msg, u32 len)
+{
+    kspin_lock(g_pipe_lock);
+    i32 rc = pipe_recv_unlocked(pipe_id, msg, len);
+    kspin_unlock(g_pipe_lock);
+    return rc;
+}
+
+i32 pipe_stat(i32 pipe_id, struct pipe_stat *out)
+{
+    kspin_lock(g_pipe_lock);
+    i32 rc = pipe_stat_unlocked(pipe_id, out);
+    kspin_unlock(g_pipe_lock);
+    return rc;
+}

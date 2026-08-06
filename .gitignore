@@ -1,0 +1,73 @@
+# Build artifacts
+build/
+build_boot/
+build_uefi/
+build_qemu_stage2/
+build_qemu_full/
+build_hyperv_amd64*/
+build_pi3/
+build_pizero2w/
+hyperv_amd64_esp/
+build_uefi_live*/
+qemu_*.pid
+*.o
+*.elf
+*.img
+*.bin
+*.PKG
+*.map
+*.rsp
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+tags
+TAGS
+compile_commands.json
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Toolchain downloads
+arm-toolchain/
+*.zip
+*.tar.gz
+*.tar.xz
+
+# Debug
+__pycache__/
+tools/__pycache__/
+*.log
+*.ppm
+qemu_uefi_boot.png
+qemu_uefi_os_boot.png
+qemu_uefi_*.png
+qemu_*.png
+qemu_*.ppm
+qemu_*.log
+core.*
+
+# WiFi credentials (add manually, never commit)
+wifi_config.h
+tools/wifi_config.local.json
+
+# WiFi firmware blobs (binary, not for source repo)
+/wifi/
+sd_diff.txt
+fixup4.dat
+
+# QEMU debug capture artifacts
+qemu_vnet.pcap
+virt_dump.dtb
+*.pcap
+
+# host unit test build output
+tests/_build/
+tests/_corpus/
+tests/_cov/

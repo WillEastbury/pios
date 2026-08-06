@@ -1,0 +1,620 @@
+# PIOS Console, Admin, and Operations Guide
+
+PIOS exposes the same operator command set through several surfaces:
+
+- **UART serial console** on the Pi 5 GPIO header, `115200 8N1`, no flow control.
+- **HDMI F3 terminal panel**, confined to the lower half of the framebuffer.
+- **TCP debug console** on port `2323` after `unlock pios`.
+- **Web Admin Console** on `http://192.168.0.201/`.
+- **HTTP operator endpoints** on ports `8080`, `8081`, and `8082`.
+
+## UART and HDMI console
+
+Use a serial terminal on the host:
+
+```text
+COM17 at 115200 8N1, no flow control
+```
+
+The prompt is:
+
+```text
+PIOS Serial Console is online
+Type Help for assistance!
+ready>
+```
+
+UART always echoes to the serial terminal. When F3 console mode is active, input and command output
+are also rendered inside the lower HDMI terminal panel; the upper dashboard area is not cleared or
+used for terminal scrolling.
+
+### VT/ANSI terminal contract
+
+The UART console is intended to behave like a clean remote terminal. Driver TX/RX chatter should stay quiet; diagnostics go to remote logs unless they are true warnings/errors.
+
+Client consoles should support the following minimal VT/ANSI features:
+
+```text
+ESC[0m              reset style
+ESC[2J              clear screen
+ESC[H               cursor home
+ESC[{row};{col}H    cursor move, 1-based
+ESC[1;32;40m        bright green on black
+ESC[1;36;40m        bright cyan on black
+ESC[1;33;40m        bright yellow on black
+ESC]0;title BEL      xterm/OSC window title
+BEL / 0x07          bell
+UTF-8               box drawing characters
+```
+
+PIOS emits UTF-8 single-line box drawing by default:
+
+```text
+┌────────────────────────┐
+│ PIOS SECOND STAGE      │
+└────────────────────────┘
+```
+
+The firmware keeps an ASCII fallback compile-time switch (`UART_VT_UTF8_BOXES=0`) for minimal serial clients:
+
+```text
++------------------------+
+| PIOS SECOND STAGE      |
++------------------------+
+```
+
+Suggested client-console behavior:
+
+1. Open COM17 at `115200 8N1`, no flow control.
+2. Set the terminal character set to UTF-8. In PuTTY: `Window -> Translation -> Remote character set -> UTF-8`.
+3. Interpret ANSI SGR colour and cursor-control sequences above.
+4. Interpret OSC title sequence `ESC]0;PIOS Admin Console BEL` where supported.
+5. Render Unicode box drawing if available; fall back to ASCII if not.
+6. Treat `BEL` as an optional audible/visual alert unless it terminates an OSC sequence.
+7. Preserve scrollback.
+8. Do not inject local echo unless the UART device echo is disabled; PIOS echoes input.
+9. Keep command prompt rendering exactly as sent by PIOS.
+
+Common commands:
+
+```text
+help
+help status
+help firewall
+help core
+status
+ps
+netstat
+processes
+mem analyze
+ls /
+users
+firewall list
+watchdog status
+tls status
+brotli selftest
+reboot confirm
+peek 0x1000FFF000 4
+dumpmem 0x80000 128
+```
+
+`help core`, `help fs`, `help net`, `help svc`, and `help dev` are documentation groups only. Do not prefix commands with the group name. For example, use `status` and `ps`, not `core status ps`.
+
+### Memory inspector commands
+
+The debug/admin console includes direct memory inspection commands:
+
+```text
+mem analyze
+peek <addr> [1|2|4|8]
+poke <addr> <value> [1|2|4|8]
+dumpmem <addr> [bytes]
+```
+
+`mem analyze` is read-only and safe for the TCP/Web terminal. It reports the running kernel image footprint, raw-slot free space, linker section addresses, per-core process slot layout, and current process arena/span memory telemetry before retrying risky process work.
+
+Examples:
+
+```text
+peek 0x1000FFF000 4
+poke 0x1000FFF000 0x1 4
+dumpmem 0x80000 256
+```
+
+These commands directly access live kernel/device memory and are intended for admin/debug use only.
+
+## First-boot OOBE
+
+When the first-boot marker is missing, PIOS runs a setup sequence before normal operation.
+
+It currently asks for:
+
+- Locale: `en-GB` or `en-US`
+- Keyboard layout: `uk` or `us`
+- Timezone offset: UK/GMT (`UTC+0`) or US/Eastern (`UTC-5`)
+
+The values are persisted in Picowal card `0`, record `3`:
+
+```text
+locale=en-GB
+keyboard=uk
+timezone_offset_minutes=0
+```
+
+The initial implementation intentionally supports only UK/US English options. More locales, keyboard maps, and daylight-saving rules are future work.
+
+## TCP console
+
+The TCP debug console listens on port `2323`.
+
+```text
+telnet 192.168.0.201 2323
+unlock pios
+firewall list
+```
+
+Port `2323` is allowed through the default inbound firewall. The unlock step is intentionally required because commands run on the live kernel.
+
+The parser accepts bare CR, bare LF, and CRLF as one terminator, supports backspace editing, rejects
+overlong lines while discarding the remainder of that line, and returns to the `pios>` prompt.
+
+Built-in debugger commands are available on UART, TCP-2323, and the HTTP terminal:
+
+```text
+break [core]       freeze one secondary core, or all secondaries when omitted
+freeze status      show requested/frozen state for cores 0-3
+regs <core>        dump x0-x30, ELR, saved PSTATE, timestamp, and interrupt source
+resume [core]      resume one frozen core, or all secondaries when omitted
+```
+
+Core 0 is never frozen by an unqualified `break`, preserving the control session. IRQ-capable cores
+capture at interrupt exit; process-hosting cores capture at a scheduler safe point.
+
+## Web Admin Console
+
+Open:
+
+```text
+http://192.168.0.201/
+```
+
+Tabs render as structured cards/tables and include a manual refresh button plus an auto-refresh checkbox with a millisecond interval control on live data tabs.
+
+HTTP admin sessions clean up normal peer-close states without treating `CLOSE_WAIT` as an operator error, so routine browser refreshes should not flood the hot log with repeated `http-error` entries.
+
+Tabs include:
+
+- **Overview**: `/api/status` JSON, including `version` and `build`.
+- **System**: terminal `status` output as summary cards/table plus raw text.
+- **Netstat**: TCP diagnostics as a connection/session table.
+- **Processes**: process snapshot table with PPID, arena/span memory columns, and graph section.
+- **Users**: user/principal table.
+- **Logs**: operator log tail and process logs in side-by-side cards.
+- **WALFS**: root WALFS browser/status table.
+- **Firewall**: live firewall rules table plus mutation examples.
+- **Terminal**: green-screen HTTP terminal.
+- **Admin**: links to log stream, OTA update, and reboot endpoints.
+
+## HDMI post-boot dashboard
+
+After initialization, HDMI switches from verbose boot/diagnostic text to a clean status dashboard that updates once per second.
+
+It shows:
+
+- `PIOS>` banner and second-stage build label.
+- Uptime, heartbeat, and IP address.
+- Per-core activity estimate and RAM use.
+- Packet totals and firewall/drop counters.
+- Listening TCP ports and owner labels.
+- Process summary and a few active process rows.
+- Lower warning/error hot-log tail.
+
+Detailed logs and diagnostics should use the remote log endpoints rather than noisy HDMI/UART output.
+
+The dashboard keeps the static frame on screen and refreshes only dynamic content rows to avoid full-screen flicker.
+
+## Logs
+
+Operator log stream:
+
+```text
+http://192.168.0.201:8080/logs
+http://192.168.0.201:8080/logs?tail=24
+http://192.168.0.201/api/admin/log-stream?tail=24
+```
+
+`ps`, `/api/terminal?cmd=processes`, HDMI process views, and the Web Admin Processes tab include parent PID (`PPID`) and a simple process graph/tree section. The kernel is exposed as synthetic PID `0` with `PPID=-1`, so root user processes appear under the kernel node.
+
+Safe process image diagnostics:
+
+```text
+process validate <path>
+/api/process?action=validate&path=<path>
+```
+
+Validation is read-only and bounded to the image header from the TCP/Web terminal path. It reports `format=flat|pix|elf64`, the current launch verdict (`flat-compatible` or `blocked-loader-required`), entry offset, load span, section sizes, and PIX import/relocation counts. HTTP/API process launch and restart remain blocked in this development build until loader dispatch and the process crash root cause are resolved.
+
+Local process launch is also fail-closed for recognized loader formats: PIX/ELF64 images are refused with `blocked-loader-required` until the process launch path dispatches through the loader instead of flat-entering byte zero.
+
+Read-only WALFS discovery from the Web/TCP terminal:
+
+```text
+ls [absolute-path]
+fsinspect [absolute-path]
+```
+
+These commands list/stat at most a bounded page of directory entries and are intended for finding live artifacts to pass to `process validate`.
+
+Process memory columns:
+
+```text
+ACAP   arena capacity KiB available after loaded code and guard space
+AUSED  current arena KiB in use by bump allocations plus rented spans
+AHI    high-water/max arena KiB observed
+ABUMP  KiB used through the process bump/sbrk arena
+ASPAN  KiB currently held by rented spans
+SCNT   active rented span count
+```
+
+PIOS userland also exposes arena span primitives through the kernel API:
+
+```c
+void *span_rent(u32 bytes, u32 align, u32 type);
+i32 span_release(void *ptr);
+```
+
+Rented spans grow downward from the top of the process data arena, while `sbrk` grows upward. Allocation fails before the two regions can overlap.
+
+Process memory protection:
+
+- Loaded program image pages are mapped read-only/executable in the process slot.
+- The process arena and stack start at the next 4 KiB page and are mapped read/write plus execute-never.
+- The process slot uses W^X permissions; writable data pages are not executable.
+- The low kernel/ABI region remains mapped for the current direct-call kernel API and is outside the process-slot W^X claim.
+
+Use `tail=N` to limit the returned ring entries.
+
+## Remote reboot
+
+Remote reboot uses PSCI `SYSTEM_RESET` on Pi 5, with a legacy watchdog fallback.
+
+From the local/TCP console:
+
+```text
+reboot confirm
+```
+
+The confirmation word is required to avoid accidental resets.
+
+From HTTP:
+
+```text
+http://192.168.0.201:8081/?confirm=1
+http://192.168.0.201/api/admin/reboot?confirm=1
+```
+
+## OTA hot-flash
+
+The raw second-stage slot is updated over port `8082` using begin/chunk/commit.
+
+Host helper:
+
+```powershell
+Set-Location C:\source\pios
+python tools\pios_ota_update.py real_kernel.img --host 192.168.0.201 --reboot
+```
+
+Manual status:
+
+```text
+http://192.168.0.201:8082/?confirm=1&action=status
+```
+
+The FAT `kernel8.img` should be the stable stage0 loader. The second-stage kernel lives in the raw partition-2 slot and is what OTA updates.
+
+## DMA diagnostics
+
+DMA memcpy is self-tested during boot and can be checked from the console or Web Admin terminal:
+
+```text
+dma status
+dma selftest
+```
+
+On BCM2712, PIOS uses the `dma32` controller with physical low-RAM DMA addresses, not the old `0xC0000000` legacy alias. The working memcpy path uses the 32-byte control-block format with shifted CB address mode; startup keeps the NEON fallback disabled only after the DMA selftest passes.
+
+## Kernel TLS diagnostics
+
+PIOS keeps TLS termination in kernel space. The current kernel layer provides a PSK/HKDF/AES-GCM record wrapper plus a PicoWeb-style bridge boundary that parses decrypted plaintext HTTP requests before handing them to a kernel service or future process-hosted webserver. AES rounds use ARM crypto instructions and GHASH uses a precomputed nibble table in the AES-GCM context.
+
+Console/Web Admin terminal:
+
+```text
+tls status
+tls selftest
+tls bridge
+```
+
+`tls selftest` verifies that client and server key agreement produce compatible AES-GCM record keys. `tls bridge` parses a fixed sample HTTP request through the same complete/need-more/error convention used by PicoWeb's TLS-to-HTTP bridge.
+
+PIOS also listens on TCP port `443` as `kernel/tls443` and serves a fixed plaintext HTTP test response inside the current kernel TLS-style record wrapper. This is the kernel TLS boundary test path; browser-compatible X.509/ACME HTTPS is tracked separately.
+
+## Kernel X.509 certificate service
+
+PIOS has a kernel-only X.509 service foundation for certificate/key lifecycle work. It derives Ed25519 private key seed material from the sealed keystore, keeps private material kernel-only, and exposes only non-secret fingerprints. The current implementation generates a self-signed ASN.1 DER X.509 certificate, a PKCS#10 Ed25519 CSR, DER certificate import plumbing, and TLS binding state. Browser-compatible HTTPS still needs TLS certificate integration plus an ACME-compatible P-256 ECDSA certificate path; Let's Encrypt does not issue Ed25519 leaf certificates.
+
+Console/Web Admin terminal:
+
+```text
+x509 status
+x509 generate [common-name]
+x509 csr [common-name]
+x509 p256 [common-name]
+x509 bind
+x509 import-self
+x509 selftest
+```
+
+`der_ready=yes` means a signed DER certificate is available in kernel memory. `csr_ready=yes` means a signed PKCS#10 CSR is available in kernel memory for future export/ACME plumbing. `x509 csr` emits the Ed25519 CSR path; `x509 p256` emits the ECDSA P-256/SHA-256 CSR path that ACME CAs such as Let's Encrypt can issue against. `x509 import-self` re-imports the current DER certificate to exercise the bounded import path; real ACME import should pass only the leaf DER certificate, then call `x509 bind` after validation.
+
+## ACME / Let's Encrypt foundation
+
+PIOS has a kernel ACME foundation for HTTP-01 issuance. It keeps account state kernel-owned, prepares an ACME-compatible P-256 CSR through the X.509 service, stores bounded HTTP-01 challenge state, and serves `/.well-known/acme-challenge/<token>` without requiring admin authentication. The outbound ACME JWS/order/finalize client is still pending before real Let's Encrypt issuance can complete end-to-end.
+
+Console/Web Admin terminal:
+
+```text
+acme status
+acme prepare <domain>
+acme challenge <token> <key-authorization>
+acme clear
+acme selftest
+```
+
+`acme prepare` generates a P-256 CSR for the requested domain. `acme challenge` arms the HTTP-01 response path; ACME clients should publish the exact key authorization value returned by the CA workflow.
+
+## Kernel service/plugin registry
+
+PIOS exposes a kernel-internal service registry for EL1 services that still run in the monolithic loop today. This is the first slice of the plugin/threading model: existing direct calls keep their exact order, while the registry records owner core, priority, service kind, mailbox counters, call counts, errors, and duration ticks.
+
+Console/Web Admin terminal:
+
+```text
+ksvc status
+ksvc selftest
+ksvc pause <id>
+ksvc resume <id>
+ksvc restart <id>
+ksvc fault <id>
+```
+
+`ksvc selftest` round-trips a bounded core-local mailbox message and exercises pause/resume/fault/restart lifecycle metadata. Mailboxes are EL1 service-to-service plumbing only in this slice; they do not yet schedule services through indirect callbacks or move them to EL0. Lifecycle controls update service metadata and counters; direct-call services still run in the existing core loop until scheduler-owned callbacks land.
+
+Low-risk services (`debug-console`, `dashboard`, and `tcp-timers`) are scheduler-owned callbacks; core network/TCP/TLS poll ordering remains direct and unchanged.
+
+## IRQ diagnostics
+
+PIOS exposes interrupt dispatch telemetry without changing the polling service model.
+
+```text
+irq status
+irq probe
+irq selftest
+```
+
+The status includes total/handled/unhandled/spurious IRQs, timer IRQ count, last interrupt ID/core/tick, per-core totals, vector state, timer state, and current GIC register readings. `irq probe` is read-only and samples a small set of plausible BCM2712/RPi5 GIC distributor/interface windows so the current zero-register blocker can be diagnosed before any IRQ-driven service-loop retry.
+
+## Kernel/user ABI transition
+
+PIOS exposes the current user ABI transition state. Today processes still enter through the direct PIKEE/KPI table while ksvc provides EL1 service foundations. The EL0 entry contract is defined and validated for process launches: entry PC must be aligned and inside the loaded image, SP must be 16-byte aligned in the stack band, code/data split assumptions must be present, and the future EL0 return SPSR is fixed. The synchronous exception path now dispatches AArch64 SVC traps through the process ABI decoder and reports SVC counters; full KPI migration remains pending.
+
+```text
+abi status
+abi selftest
+```
+
+## QPU / tensor diagnostics
+
+PIOS tensor operations keep deterministic NEON fallback enabled unless validated V3D/QPU shader descriptors are bound. QPU work should start from diagnostics before attempting new shader dispatch because failed dispatch paths quarantine kernels and fall back to NEON.
+
+Console/Web Admin terminal:
+
+```text
+qpu status
+qpu selftest
+tensor status
+tensor selftest
+```
+
+`qpu status` reports V3D availability, dispatch support, fallback state, bound-kernel masks, disabled-kernel masks, native probe/selftest/MMU state, CSD status, tiny-kernel readiness masks, and V3D identity registers. `tensor selftest` verifies the safe NEON fallback kernels without touching QPU dispatch.
+
+Native V3D hardware bring-up should proceed in this order:
+
+```text
+PIOS_ENABLE_NATIVE_VIDEOCORE=1       -> qpu status: native=yes tv=71
+PIOS_ENABLE_NATIVE_V3D_COMPUTE=1     -> qpu status: nmmu=yes nself=yes
+PIOS_ENABLE_TINY_QPU_KERNELS=1       -> one-element tensor add/ReLU only
+```
+
+If `nself=no`, `nmmu=no`, CSD is busy, or a tiny kernel is quarantined, leave the board on the NEON fallback path and inspect the V3D status fields before attempting wider dispatch.
+
+## Brotli codec diagnostics
+
+PIOS includes a no-external-dependency Brotli codec library. The encoder emits conservative stored Brotli streams; the decoder supports stored streams plus the compressed subset emitted by PicoWeb's micro-Brotli encoder. Large copies use the kernel SIMD copy path.
+
+Console/Web Admin terminal:
+
+```text
+brotli selftest
+```
+
+The selftest round-trips a stored stream and decodes a compressed PicoWeb micro-Brotli fixture.
+
+## Pack/Card resource addresses
+
+PIOS accepts WAL-style resource addresses in the form:
+
+```text
+kind:pack/card[/tail]
+```
+
+`kind` is one of `wal`, `tcp`, `udp`, `stream`, `dev`, or `file`. Bare `pack/card` means `wal:pack/card`.
+
+Examples:
+
+```text
+addr wal:0/3
+addr tcp:0/80
+addr udp:0/7001
+addr stream:1/42
+addr dev:0/1/uart0
+addr file:0/12/etc/init.pis
+```
+
+For Picowal-backed storage, `wal:pack/card` maps to the existing database tuple `card=pack, record=card`, so old and new DB syntax both work:
+
+```text
+db get 0 3
+db get wal:0/3
+db put wal:0/3 hello
+db list wal:0/0
+```
+
+Network resource addresses reserve `pack` as a namespace and use `card` as the TCP/UDP port number. For example, `tcp:0/2323` names the debug console listener.
+
+## PicoScript compiler / assembler
+
+PicoScript source files (`.pis`) are newline-delimited console commands. The kernel `source` command can run `.pis` directly or compiled `.pbc` bytecode.
+
+Host compiler:
+
+```powershell
+python tools\picoscript.py compile script.pis script.pbc
+python tools\picoscript.py asm script.pasm script.pbc
+python tools\picoscript.py disasm script.pbc
+```
+
+The `.pbc` format stores validated command records and executes them through the existing console command dispatcher, so compiled scripts preserve current command behavior.
+
+## User keystore / root of trust
+
+PIOS seeds a sealed user root key into partition-2 reserved User Records block zero (`PIOS_USER_RECORDS_OFFSET`, currently LBA `12288` on the standard layout). The plaintext root key is never stored on disk and is not kept globally in memory.
+
+The wrapping key is derived at boot from the board serial via HKDF-SHA256. The sealed record uses AES-GCM and stores only nonce, ciphertext, tag, and metadata. If VideoCore board-serial lookup fails, the status reports `serial=fallback` and the keystore remains unavailable or fallback-derived depending on boot state.
+
+Console/Web Admin terminal:
+
+```text
+keystore status
+keystore derive <label>
+```
+
+`keystore status` prints non-secret metadata and a root fingerprint. `keystore derive <label>` prints a non-secret fingerprint for a label-derived key; it does not expose key material.
+
+## Network diagnostics
+
+Console/Web Admin terminal:
+
+```text
+netcfg
+netcfg routes
+netcfg neighbors
+netcfg trace
+dns resolve <hostname>
+dns status
+http get <ip-or-cached-host> [path] [port] [timeout_ms]
+https get <ip-or-cached-host> [path] [port] [timeout_ms]
+arp probe
+nic dump on|off
+nic counters
+```
+
+`netcfg routes` shows the bounded route table used by outbound TCP/UDP. `netcfg neighbors` shows the dynamic/static ARP neighbor snapshot with state, retry, consistency, and age fields. `netcfg trace` shows the last outbound route lookup, next hop, MAC source, UDP send result, and counters for missing routes/MACs. Use it after `dns resolve`, `http get`, or `https get` attempts to separate routing/ARP/firewall/TX issues from remote timeout behavior.
+`http get` and `https get` accept raw IPv4 addresses or hostnames that are already in the DNS cache. Use `dns resolve <hostname>` and wait for `dns status` to show `state=2` before fetching by hostname.
+`arp probe` sends a gratuitous ARP (a TX-path liveness test) and reports `requests_sent`, `learned`, and `conflicts`. `nic dump on|off` toggles a raw pre-dispatch packet dump; `nic counters` reports `processed`, `dropped`, `firewalled`, and `rate_limited`.
+
+## Firewall command
+
+Defaults:
+
+- Inbound: deny
+- Outbound: allow
+- New rules insert at index `0`, so the most recent rule wins before default service allows.
+
+Syntax:
+
+```text
+firewall list
+firewall reset
+firewall clear
+firewall default in deny out allow
+firewall allow|deny <in|out|both> <tcp|udp|icmp|ip|arp> [port N|toport N|fromport N] [src SPEC] [dst SPEC]
+```
+
+`SPEC` supports:
+
+```text
+any
+192.168.218.9
+192.168.218.0/24
+192.168.218.0/255.255.255.0
+192.168.1.10-192.168.1.50
+```
+
+Examples:
+
+```text
+firewall allow in tcp port 2323 src 192.168.218.9
+firewall deny in tcp port 80 src 192.168.218.0/24
+firewall allow out udp toport 53 dst 192.168.218.1
+firewall deny both ip src 192.168.1.10-192.168.1.50
+```
+
+## Storage integrity and cache statistics
+
+WALFS integrity and LRU cache telemetry are available from both the UART/TCP
+console and the HTTP terminal:
+
+```text
+walfs status            mount/root/super state, record count, WAL head
+walfs verify            verify WAL metadata + record-chain integrity
+walfs compact           non-destructive WAL compaction (rewrite live records)
+walfs format confirm    DESTRUCTIVE reserved-base reformat (wipes WALFS)
+cachestats              WAL inode/path, DNS, and ARP LRU hit/miss/evict
+```
+
+`disk verify` and `disk compact` are aliases for `walfs verify` / `walfs
+compact`. `walfs verify` reports `super`, `wal_head`, `valid_records`,
+`crc_errors`, `header_errors`, `open_tx`, and `scan_end`; use it to decide
+between a non-destructive `walfs compact` (WAL bloat / stale records) and a
+`walfs format confirm` (structural corruption). The keystore root-of-trust lives
+in a separate partition area and is not touched by `walfs format`.
+
+`cachestats` surfaces the WAL inode/path cache, the DNS resolver cache, and the
+ARP index cache hit/miss/eviction counters (`lru_stats`) for tuning and leak
+diagnosis.
+
+## Crypto self-test
+
+```text
+crypto selftest
+```
+
+Runs the AES-GCM encrypt/decrypt round trip plus the nibble-table GHASH
+validation (the same self-test wired into `tls selftest`).
+
+## Build/version display
+
+Each build generates:
+
+```text
+SECOND STAGE LOADER vYYYYMMDD.HHMMSS
+```
+
+The value is shown on:
+
+- boot screen,
+- UART boot text,
+- `/api/status`,
+- `:8080/` status,
+- Web Admin Overview.

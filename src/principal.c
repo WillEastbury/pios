@@ -1,0 +1,387 @@
+/*
+ * principal.c - User / principal identity and capability system
+ *
+ * Persistent principal store in WALFS using Picowal deck mapping:
+ *   deck 1 (principals) record 1 -> /var/picowal/c1/r1.rec
+ * On first boot, creates root principal with default credentials.
+ * Per-core current principal tracked in a static array (no locks).
+ */
+
+#include "principal.h"
+#include "walfs.h"
+#include "simd.h"
+#include "uart.h"
+#include "timer.h"
+
+#define PRINCIPAL_STORE_DIR   "/var/picowal/c1"
+#define PRINCIPAL_STORE_PATH  "/var/picowal/c1/r1.rec"
+
+static bool ensure_principal_store_path(void)
+{
+    u64 var_id = walfs_find("/var");
+    if (!var_id) {
+        var_id = walfs_create(WALFS_ROOT_INODE, "var", WALFS_DIR, 0755);
+        if (!var_id) return false;
+    }
+    u64 picowal_id = walfs_find("/var/picowal");
+    if (!picowal_id) {
+        picowal_id = walfs_create(var_id, "picowal", WALFS_DIR, 0755);
+        if (!picowal_id) return false;
+    }
+    u64 c1_id = walfs_find(PRINCIPAL_STORE_DIR);
+    if (!c1_id) {
+        c1_id = walfs_create(picowal_id, "c1", WALFS_DIR, 0755);
+        if (!c1_id) return false;
+    }
+    if (!walfs_find(PRINCIPAL_STORE_PATH)) {
+        u64 rid = walfs_create(c1_id, "r1.rec", WALFS_FILE, 0600);
+        if (!rid) return false;
+    }
+    return true;
+}
+
+/* Constant-time comparison to prevent timing side-channel attacks */
+static bool ct_eq(const u8 *a, const u8 *b, u32 len) {
+    u8 diff = 0;
+    for (u32 i = 0; i < len; i++) diff |= a[i] ^ b[i];
+    return diff == 0;
+}
+
+static void name_pack_32(const char *src, u8 out[32])
+{
+    simd_zero(out, 32);
+    if (!src) return;
+    for (u32 i = 0; i < 31; i++) {
+        u8 c = (u8)src[i];
+        out[i] = c;
+        if (c == 0) return;
+    }
+}
+
+struct principal_core_word {
+    volatile u32 v;
+    u32 _pad[15];
+} ALIGNED(64);
+_Static_assert(sizeof(struct principal_core_word) == 64, "principal core word must be one cache line");
+
+static struct principal principals[PRINCIPAL_MAX];
+static u32 principal_count;
+static struct principal_core_word current_principal[4];  /* one cache line per core */
+
+/* ---- Internal helpers ---- */
+
+/* Iterate CRC32C 100K times with username salt for strengthened hash.
+ * Still only 32 bits — real fix requires SHA-256 (issue #19).
+ * 100K iterations at ~8B/cycle ≈ 40µs per attempt on A76. */
+static void hash_pass_salted(const char *user, const char *pass, u8 out[4])
+{
+    u32 h = hw_crc32c(pass, pios_strlen(pass));
+    h = hw_crc32c(&h, 4) ^ hw_crc32c(user, pios_strlen(user)); /* salt with username */
+    for (u32 i = 0; i < 100000; i++)
+        h = hw_crc32c(&h, 4);
+    out[0] = (u8)(h);
+    out[1] = (u8)(h >> 8);
+    out[2] = (u8)(h >> 16);
+    out[3] = (u8)(h >> 24);
+}
+
+/* Legacy compat wrapper — used during migration */
+static void hash_pass(const char *pass, u8 out[4])
+{
+    hash_pass_salted("", pass, out);
+}
+
+/* Write principal table to deck 1 / record 1. */
+static bool flush_principals(void)
+{
+    u64 fid = walfs_find(PRINCIPAL_STORE_PATH);
+    if (!fid) return false;
+    return walfs_write(fid, 0, principals,
+                       principal_count * sizeof(struct principal));
+}
+
+/* Read password from UART without echo (prints '*' per char) */
+static u32 read_secret(char *buf, u32 max)
+{
+    u32 i = 0;
+    while (i < max - 1) {
+        char c = uart_getc();
+        if (c == '\r' || c == '\n') break;
+        if (c == '\b' || c == 127) {
+            if (i > 0) { i--; uart_puts("\b \b"); }
+            continue;
+        }
+        buf[i++] = c;
+        uart_putc('*');
+    }
+    buf[i] = 0;
+    uart_puts("\r\n");
+    return i;
+}
+
+/* Find principal by name. Returns index or -1. */
+static i32 find_by_name(const char *name)
+{
+    if (!name) return -1;
+    u32 n = pios_strlen(name);
+    if (n >= sizeof(principals[0].name)) return -1;
+    u32 len = pios_strlen(name) + 1;
+    for (u32 i = 0; i < principal_count; i++) {
+        if (memcmp(principals[i].name, name, len) == 0)
+            return (i32)i;
+    }
+    return -1;
+}
+
+/* ---- Public API ---- */
+
+bool principal_init(void)
+{
+    simd_zero(principals, sizeof(principals));
+    simd_zero(current_principal, sizeof(current_principal));
+    principal_count = 0;
+
+    if (!ensure_principal_store_path())
+        return false;
+
+    u64 fid = walfs_find(PRINCIPAL_STORE_PATH);
+    if (fid) {
+        u32 n = walfs_read(fid, 0, principals, sizeof(principals));
+        principal_count = n / sizeof(struct principal);
+        if (principal_count > 0)
+            return true;
+    }
+
+    /* Seed with root principal (all capabilities) */
+    struct principal *r = &principals[0];
+    r->id    = PRINCIPAL_ROOT;
+    r->flags = PRINCIPAL_ADMIN | PRINCIPAL_NET | PRINCIPAL_DISK |
+               PRINCIPAL_EXEC | PRINCIPAL_IPC;
+    memcpy(r->name, "root", 5);
+    hash_pass("pios", r->secret_hash);
+    principal_count = 1;
+
+    uart_puts("[principal] created root account\r\n");
+    return flush_principals();
+}
+
+bool principal_auth(const char *name, const char *pass, u32 *id_out)
+{
+    if (!name || !pass) return false;
+
+    u8 h[4];
+    u8 name32[32];
+    u8 chosen_hash[4] = {0, 0, 0, 0};
+    u32 chosen_id = PRINCIPAL_ROOT;
+    bool found = false;
+
+    name_pack_32(name, name32);
+    hash_pass(pass, h);
+
+    for (u32 i = 0; i < principal_count; i++) {
+        bool match = ct_eq(principals[i].name, name32, 32);
+        u8 mask = (u8)(0U - (u8)match);
+        for (u32 j = 0; j < 4; j++)
+            chosen_hash[j] = (u8)((chosen_hash[j] & (u8)~mask) |
+                                  (principals[i].secret_hash[j] & mask));
+        chosen_id = (chosen_id & ~(u32)mask) | (principals[i].id & (u32)mask);
+        found = found || match;
+    }
+    if (!found || !ct_eq(chosen_hash, h, 4))
+        return false;
+
+    current_principal[core_id()].v = chosen_id;
+    if (id_out) *id_out = chosen_id;
+    return true;
+}
+
+u32 principal_current(void)
+{
+    return current_principal[core_id()].v;
+}
+
+u32 principal_current_for(u32 core)
+{
+    if (core > 3) return PRINCIPAL_ROOT;
+    return current_principal[core].v;
+}
+
+void principal_set_current(u32 id)
+{
+    current_principal[core_id()].v = id;
+}
+
+bool principal_has_cap(u32 id, u32 cap_flag)
+{
+    if (id == PRINCIPAL_ROOT) return true;
+    for (u32 i = 0; i < principal_count; i++) {
+        if (principals[i].id == id) {
+            if (cap_flag == PRINCIPAL_IPC &&
+                (principals[i].flags & PRINCIPAL_ADMIN))
+                return true;
+            return (principals[i].flags & cap_flag) != 0;
+        }
+    }
+    return false;
+}
+
+bool principal_create(const char *name, const char *pass, u32 flags)
+{
+    if (principal_count >= PRINCIPAL_MAX) return false;
+    if (find_by_name(name) >= 0) return false;
+    if (flags & PRINCIPAL_ADMIN) flags |= PRINCIPAL_IPC;
+
+    struct principal *p = &principals[principal_count];
+    simd_zero(p, sizeof(*p));
+    p->id    = principal_count;
+    p->flags = flags;
+
+    u32 len = pios_strlen(name);
+    if (len > 31) len = 31;
+    memcpy(p->name, name, len);
+    p->name[len] = 0;
+    hash_pass(pass, p->secret_hash);
+    principal_count++;
+
+    return flush_principals();
+}
+
+bool principal_set_password(const char *name, const char *pass)
+{
+    i32 idx = find_by_name(name);
+    if (idx < 0) return false;
+    if (!pass || pass[0] == '\0') return false;
+    hash_pass(pass, principals[idx].secret_hash);
+    return flush_principals();
+}
+
+bool principal_set_flags(const char *name, u32 flags)
+{
+    i32 idx = find_by_name(name);
+    if (idx < 0) return false;
+    if (flags & PRINCIPAL_ADMIN) flags |= PRINCIPAL_IPC;
+    principals[idx].flags = flags & (PRINCIPAL_ADMIN | PRINCIPAL_NET |
+                                     PRINCIPAL_DISK | PRINCIPAL_EXEC |
+                                     PRINCIPAL_IPC);
+    return flush_principals();
+}
+
+u32 principal_snapshot(struct principal_ui_entry *out, u32 max_entries)
+{
+    if (!out || max_entries == 0)
+        return 0;
+    u32 n = principal_count < max_entries ? principal_count : max_entries;
+    for (u32 i = 0; i < n; i++) {
+        out[i].id = principals[i].id;
+        out[i].flags = principals[i].flags;
+        for (u32 j = 0; j < sizeof(out[i].name); j++)
+            out[i].name[j] = (char)principals[i].name[j];
+        out[i].name[sizeof(out[i].name) - 1] = 0;
+    }
+    return n;
+}
+
+bool principal_tls_psk(u32 id, u8 *out, u32 out_len)
+{
+    if (!out || out_len == 0) return false;
+    const struct principal *p = NULL;
+    for (u32 i = 0; i < principal_count; i++) {
+        if (principals[i].id == id) {
+            p = &principals[i];
+            break;
+        }
+    }
+    if (!p) return false;
+
+    struct {
+        u32 id;
+        u32 flags;
+        u8  secret_hash[4];
+        u32 ctr;
+        u32 domain;
+    } PACKED seed;
+    seed.id = p->id;
+    seed.flags = p->flags;
+    for (u32 i = 0; i < 4; i++) seed.secret_hash[i] = p->secret_hash[i];
+    seed.domain = 0x50494F53U; /* "PIOS" */
+
+    for (u32 off = 0; off < out_len; off += 4) {
+        seed.ctr = off / 4;
+        u32 v = hw_crc32c(&seed, sizeof(seed));
+        out[off + 0] = (u8)v;
+        if (off + 1 < out_len) out[off + 1] = (u8)(v >> 8);
+        if (off + 2 < out_len) out[off + 2] = (u8)(v >> 16);
+        if (off + 3 < out_len) out[off + 3] = (u8)(v >> 24);
+    }
+    return true;
+}
+
+bool principal_root_present(void)
+{
+    return find_by_name("root") >= 0;
+}
+
+bool principal_root_uses_default_secret(void)
+{
+    i32 idx = find_by_name("root");
+    if (idx < 0) return false;
+    u8 h[4];
+    hash_pass("pios", h);
+    return ct_eq(principals[idx].secret_hash, h, 4);
+}
+
+/*
+ * Permission model: root (id 0) bypasses all checks.
+ * Non-root principals are checked against the "other" permission
+ * bits of the inode mode (bits 2-0) since inodes carry no owner field.
+ */
+
+bool principal_can_read(u32 principal_id, const struct walfs_inode *inode)
+{
+    if (principal_id == PRINCIPAL_ROOT) return true;
+    return (inode->mode & 0x04) != 0;  /* other-read */
+}
+
+bool principal_can_write(u32 principal_id, const struct walfs_inode *inode)
+{
+    if (principal_id == PRINCIPAL_ROOT) return true;
+    return (inode->mode & 0x02) != 0;  /* other-write */
+}
+
+bool principal_can_exec(u32 principal_id, const struct walfs_inode *inode)
+{
+    if (principal_id == PRINCIPAL_ROOT) return true;
+    return (inode->mode & 0x01) != 0;  /* other-exec */
+}
+
+void principal_login_prompt(void)
+{
+    char user[32], pass[32];
+    u32 tries = 0;
+
+    for (;;) {
+        uart_puts("login: ");
+        uart_getline(user, sizeof(user));
+        uart_puts("password: ");
+        read_secret(pass, sizeof(pass));
+
+        /* Scrub password from stack after hashing */
+        u32 id;
+        if (principal_auth(user, pass, &id)) {
+            simd_zero(pass, sizeof(pass));
+            uart_puts("authenticated as ");
+            uart_puts(user);
+            uart_puts("\r\n");
+            return;
+        }
+
+        simd_zero(pass, sizeof(pass));
+        tries++;
+        uart_puts("auth failed\r\n");
+        if (tries >= 3) {
+            uart_puts("locked out 10s\r\n");
+            timer_delay_ms(10000);
+            tries = 0;
+        }
+    }
+}

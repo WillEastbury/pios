@@ -1,0 +1,36 @@
+.section .stage2_manifest, "a"
+.balign 8
+.global qemu_stage2_manifest_start
+.global qemu_stage2_manifest_end
+
+.equ PIOS_STAGE2_MANIFEST_MAGIC, 0x32534750
+.equ PIOS_STAGE2_MANIFEST_VERSION, 1
+.equ PIOS_STAGE2_PLATFORM_QEMU_VIRT, 2
+.equ PIOS_STAGE2_FEAT_AARCH64, 0x0000000000000001
+.equ PIOS_STAGE2_FEAT_GENERIC_TIMER, 0x0000000000000002
+.equ PIOS_STAGE2_FEAT_GICV2, 0x0000000000000004
+.equ PIOS_STAGE2_FEAT_PL011, 0x0000000000000008
+.equ PIOS_STAGE2_FEAT_RAM_WALFS, 0x0000000000000400
+.equ PIOS_STAGE2_FEAT_UEFI, 0x0000000000000800
+
+qemu_stage2_manifest_start:
+    .word   PIOS_STAGE2_MANIFEST_MAGIC
+    .hword  PIOS_STAGE2_MANIFEST_VERSION
+    .hword  32
+    .hword  1
+    .hword  64
+    .word   0
+    .quad   0x0000000040080000
+    .quad   0x0000000001400000
+
+    .word   PIOS_STAGE2_PLATFORM_QEMU_VIRT
+    .word   0
+    .quad   0
+    .quad   PIOS_STAGE2_FEAT_AARCH64 | PIOS_STAGE2_FEAT_GENERIC_TIMER | \
+            PIOS_STAGE2_FEAT_GICV2 | PIOS_STAGE2_FEAT_PL011 | \
+            PIOS_STAGE2_FEAT_RAM_WALFS | PIOS_STAGE2_FEAT_UEFI
+    .quad   0
+    .asciz  "qemu-virt"
+    .zero   22
+
+qemu_stage2_manifest_end:

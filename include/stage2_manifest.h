@@ -1,0 +1,81 @@
+#pragma once
+#include "types.h"
+
+#define PIOS_STAGE2_MANIFEST_MAGIC   0x32534750  /* 'PGS2' little-endian */
+#define PIOS_STAGE2_MANIFEST_VERSION 1
+#define PIOS_STAGE2_MANIFEST_FLAG_PACKAGED (1U << 0)
+#define PIOS_STAGE2_PAYLOAD_FLAG_COMPRESSED (1U << 0)
+#define PIOS_STAGE2_PAYLOAD_CODEC_NONE       0U
+#define PIOS_STAGE2_PAYLOAD_CODEC_PICOCOMPRESS 1U
+
+#define PIOS_STAGE2_PLATFORM_PI5        1U
+#define PIOS_STAGE2_PLATFORM_QEMU_VIRT  2U
+#define PIOS_STAGE2_PLATFORM_UEFI       3U
+#define PIOS_STAGE2_PLATFORM_HYPERV_ARM 4U
+#define PIOS_STAGE2_PLATFORM_HYPERV_AMD64 5U
+/* Pi3 B/B+/A+ and Pi Zero 2 W (BCM2837(B0)/BCM2710A1) share one payload
+ * entry: both boot the SAME compiled kernel image (see
+ * include/platform.h PIOS_PLATFORM_PI3/_PIZERO2W, which resolve to
+ * identical peripheral base addresses), so there is no need for two
+ * separate manifest entries. Runtime-detected via MIDR_EL1 in stage0
+ * (see include/board_detect.h), not hardcoded like the other platform IDs. */
+#define PIOS_STAGE2_PLATFORM_BCM2837_FAMILY 6U
+
+#define PIOS_STAGE2_FEAT_AARCH64        (1ULL << 0)
+#define PIOS_STAGE2_FEAT_X86_64         (1ULL << 16)
+#define PIOS_STAGE2_FEAT_GENERIC_TIMER  (1ULL << 1)
+#define PIOS_STAGE2_FEAT_GICV2          (1ULL << 2)
+#define PIOS_STAGE2_FEAT_PL011          (1ULL << 3)
+#define PIOS_STAGE2_FEAT_PI_FIRMWARE    (1ULL << 4)
+#define PIOS_STAGE2_FEAT_RP1            (1ULL << 5)
+#define PIOS_STAGE2_FEAT_PCIE           (1ULL << 6)
+#define PIOS_STAGE2_FEAT_SD             (1ULL << 7)
+#define PIOS_STAGE2_FEAT_GENET          (1ULL << 8)
+#define PIOS_STAGE2_FEAT_MAILBOX_FB     (1ULL << 9)
+#define PIOS_STAGE2_FEAT_RAM_WALFS      (1ULL << 10)
+#define PIOS_STAGE2_FEAT_UEFI           (1ULL << 11)
+#define PIOS_STAGE2_FEAT_HYPERV         (1ULL << 12)
+#define PIOS_STAGE2_FEAT_VMBUS          (1ULL << 13)
+#define PIOS_STAGE2_FEAT_HV_NETVSC      (1ULL << 14)
+#define PIOS_STAGE2_FEAT_HV_STORVSC     (1ULL << 15)
+
+struct pios_stage2_manifest_header {
+    u32 magic;
+    u16 version;
+    u16 header_bytes;
+    u16 entry_count;
+    u16 entry_bytes;
+    u32 flags;
+    u64 image_base_hint;
+    u64 image_size;
+} PACKED;
+
+struct pios_stage2_manifest_entry {
+    u32 platform_id;
+    u32 config_id;
+    u64 entry_offset;
+    u64 required_features;
+    u64 optional_features;
+    char name[32];
+} PACKED;
+
+#define PIOS_STAGE2_PACKAGED_ENTRY_BYTES 96U
+#define PIOS_STAGE2_PACKAGED_ENTRY_BYTES_V2 112U
+
+struct pios_stage2_packaged_entry {
+    struct pios_stage2_manifest_entry base;
+    u64 payload_offset;
+    u64 payload_size;
+    u64 load_addr;
+    u64 memory_size;
+} PACKED;
+
+struct pios_stage2_packaged_entry_v2 {
+    struct pios_stage2_packaged_entry v1;
+    u32 payload_flags;
+    u32 payload_codec;
+    u64 uncompressed_size;
+} PACKED;
+
+extern const u8 pios_stage2_manifest_start[];
+extern const u8 pios_stage2_manifest_end[];

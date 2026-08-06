@@ -1,0 +1,643 @@
+/*
+ * proc.h - Cooperative process manager for user cores (2-3)
+ *
+ * Each user core runs an independent scheduler with up to 6 processes.
+ * Processes occupy fixed 2MB slots within the core's 16MB private RAM.
+ * Scheduling is preemptive on user cores via timer quanta and cooperative yield.
+ */
+
+#pragma once
+#include "types.h"
+#include "pipe.h"
+#include "mem_arena.h"
+#include "core_env.h"   /* PROC_ARENA_BASE/SIZE for PROC_SLOT_PHYS */
+#include "ipc_proc.h"
+struct irq_frame;
+
+struct paged_io_stat {
+    u64 inode_id;
+    u64 file_size;
+    u32 page_size;
+    u32 flags;
+} PACKED;
+
+struct proc_ui_entry {
+    u32 pid;
+    u32 parent_pid;
+    u32 principal_id;
+    u32 state;
+    u32 affinity_core;
+    u32 priority_class;
+    u32 mem_kib;
+    u32 arena_capacity_kib;
+    u32 arena_used_kib;
+    u32 arena_high_kib;
+    u32 arena_bump_kib;
+    u32 arena_span_kib;
+    u32 arena_span_count;
+    u32 cpu_percent;
+    u32 preemptions;
+    u64 runtime_ticks;
+    char image_path[96];
+} PACKED;
+
+struct proc_capsule_ui_entry {
+    u32 pid;
+    u32 principal_id;
+    u32 state;
+    u32 affinity_core;
+    u32 capsule_id;
+    u32 capsule_hash;
+    char group[32];
+    char vfs_root[96];
+} PACKED;
+
+struct proc_security_stats {
+    u64 integrity_checks;
+    u64 integrity_failures;
+    u64 capsule_kills;
+    u64 port_policy_denies;
+    u64 port_claim_denies;
+} PACKED;
+
+struct proc_sched_core_snapshot {
+    u32 core;
+    u32 busy_permille;
+    u32 active_count;
+    u64 idle_count;
+    u64 wake_count;
+    u64 idle_ticks;
+    u64 total_ticks;
+    u64 preemptions;
+    u64 soft_events;
+    u64 soft_boosts;
+} PACKED;
+
+#define PROC_SOFT_EVENT_IPC_FIFO  1U
+#define PROC_SW_INT_F_BOOST       0x00000001U
+
+struct proc_ipc_bench_result {
+    u32 iterations;
+    u32 desc_size;
+    i32 fifo_handle;
+    u32 errors;
+    u64 svc_ticks;
+    u64 span_ticks;
+    u64 span_fast_ticks;
+    u64 copy64_ticks;
+    u64 copy512_ticks;
+    u64 memcpy2048_ticks;
+    u64 span2048_ticks;
+    u32 fifo_irq_delta;
+    u32 _fifo_irq_pad;
+    u64 cross_fifo_ticks;
+    u64 cross_batch_ticks;
+    u64 cross_micro_full_ticks;
+    u64 cross_micro_partial_ticks;
+    u64 cross_ring_batch_ticks;
+    u64 cross_span_ring_ticks;
+    u64 cross_span_all_ticks;
+    u64 span_rt_base_ticks;
+    u64 span_rt_ish_ticks;
+    u64 span_rt_acqrel_ticks;
+    u64 span_rt_asm_ticks;
+    u64 sev_ticks;
+} PACKED;
+
+struct proc_cohdiag_result {
+    /* Part B - effective stage-1 attributes (PAR_EL1[63:56]=MAIR byte,
+     * [9:8]=shareability). attr 0xFF=Normal WB cacheable, 0x44=Normal-NC,
+     * 0x00=Device-nGnRnE. sh 3=inner, 2=outer, 0=non-shareable. */
+    u32 attr_fifo;     u32 sh_fifo;      /* 0x04800000 shared FIFO ring   */
+    u32 attr_dma_net;  u32 sh_dma_net;   /* 0x04900000 DMA_NET (stays NC)  */
+    u32 attr_ipc;      u32 sh_ipc;       /* 0x04D00000 IPC SHM / bridge    */
+    u32 attr_wb;       u32 sh_wb;        /* WB-IS core-0 RAM scratch       */
+    u32 attr_nc;       u32 sh_nc;        /* .bss NC scratch                */
+    u32 attr_code;     u32 sh_code;      /* kernel text (expect WB)        */
+    u32 par_fault;                       /* 1 if any AT S1E1R faulted      */
+
+    /* Part C - write cost in picoseconds/write (ticks*18518/count). */
+    u64 nc_seq_ps;     u64 nc_scatter_ps;
+    u64 wb_seq_ps;     u64 wb_scatter_ps;   u64 wb_hot_ps;
+
+    /* Part A - cross-core publish/observe. mismatch>0 with a stable seq is a
+     * real ordering/coherency failure; tears (seq moved mid-read) are benign. */
+    u32 consumer_core;
+    u32 producer_seqs;
+    u32 wb_safe;                          /* WB scratch validated WB+free  */
+    u32 wb_checks;       u32 wb_mismatch;       u32 wb_tears;       u32 wb_timeout;
+    u32 wb_noacq_checks; u32 wb_noacq_mismatch; u32 wb_noacq_tears; u32 wb_noacq_timeout;
+    u32 nc_checks;       u32 nc_mismatch;       u32 nc_tears;       u32 nc_timeout;
+};
+
+#define PROC_IMAGE_FORMAT_NONE     0U
+#define PROC_IMAGE_FORMAT_FLAT     1U
+#define PROC_IMAGE_FORMAT_PIX      2U
+#define PROC_IMAGE_FORMAT_ELF64    3U
+
+#define PROC_IMAGE_STATUS_OK              0U
+#define PROC_IMAGE_STATUS_NOT_FOUND       1U
+#define PROC_IMAGE_STATUS_STAT_FAILED     2U
+#define PROC_IMAGE_STATUS_DIRECTORY       3U
+#define PROC_IMAGE_STATUS_INVALID_SIZE    4U
+#define PROC_IMAGE_STATUS_READ_FAILED     5U
+#define PROC_IMAGE_STATUS_UNSUPPORTED     6U
+#define PROC_IMAGE_STATUS_HEADER_INVALID  7U
+#define PROC_IMAGE_STATUS_HEADER_PARTIAL  8U
+
+#define PROC_IMAGE_LAUNCH_BLOCKED       0U
+#define PROC_IMAGE_LAUNCH_FLAT_DIRECT   1U
+#define PROC_IMAGE_LAUNCH_LOADER_NEEDED 2U
+
+struct proc_image_validation {
+    u32 status;
+    u32 format;
+    u32 launch_mode;
+    u32 file_bytes;
+    u32 header_bytes;
+    u32 image_type;
+    u32 image_flags;
+    u32 validator_status;
+    u64 entry_offset;
+    u64 code_size;
+    u64 data_size;
+    u64 bss_size;
+    u64 load_span;
+    u64 stack_size;
+    u64 min_memory;
+    u32 reloc_count;
+    u32 import_count;
+};
+
+#define APPF_EVENT_DATA_MAX   224U
+#define APPF_LOG_MSG_MAX      224U
+#define APPF_SERVICE_NAME_MAX 31U
+
+struct appf_event_record {
+    u32 seq;
+    u32 type;
+    u32 len;
+    u8  data[APPF_EVENT_DATA_MAX];
+} PACKED;
+
+struct appf_log_record {
+    u32 seq;
+    u32 level;
+    u32 len;
+    u8  msg[APPF_LOG_MSG_MAX];
+} PACKED;
+
+struct proc_log_ui_entry {
+    u32 core;
+    u32 seq;
+    u32 level;
+    u32 len;
+    char msg[APPF_LOG_MSG_MAX + 1];
+} PACKED;
+
+struct appf_service_record {
+    char name[APPF_SERVICE_NAME_MAX + 1];
+    u32 kind;
+    u32 endpoint;
+    u32 owner_principal;
+    u32 flags;
+} PACKED;
+
+/*
+ * Total concurrent process slots, system-wide (procs[] is shared and filtered
+ * by affinity, so this is NOT per core despite the historical name).
+ *
+ * Raised from 6 to 8 (issues #84/#86). Root cause of the #86 regression was
+ * NOT process count or hot-loop cost -- it was kernel .bss growth: mmu.c's
+ * per-slot page-table arrays ([3][MAX_PROCS_PER_CORE][512], ~28 KB per slot
+ * per user core) used to live in the generic .bss output section, which sits
+ * directly below the per-core kernel stacks and __heap_start in
+ * link.ld/link_qemu_full.ld. Growing them therefore pushed the stacks upward
+ * in lockstep, eventually displacing them into CORE0_RAM_BASE -- proven on
+ * QEMU via a stack-boundary canary trip with far==CORE0_RAM_BASE at 12/16
+ * slots. Fixed by moving those arrays (plus user_table_valid) into their own
+ * ".pgtbl_pool" linker section placed AFTER the now fixed-size stack block,
+ * so raising this constant can never again move the stacks. Both linker
+ * scripts also gained a build-time ASSERT against the relevant next-core RAM
+ * boundary so a future regression fails the link instead of silently
+ * tripping a boot-time canary. See mmu.c's comment above user_l1 and
+ * link.ld / link_qemu_full.ld / link_2m.ld for the full mechanism.
+ *
+ * 8 is NOT the process-arena ceiling (that allows up to 16, see the
+ * _Static_assert below) -- it is the practical ceiling on QEMU today. QEMU's
+ * whole kernel image (text+rodata+data+bss+stacks+.pgtbl_pool) must fit below
+ * CORE0_RAM_BASE (0x42000000), and measurement after this fix shows the
+ * non-pgtbl part of that image alone already uses ~30.6 MiB of the ~31.5 MiB
+ * budget, leaving well under 1 MiB for .pgtbl_pool. At ~84 KiB/slot that
+ * caps QEMU at ~10 slots with zero safety margin; 8 was chosen to leave a
+ * real (128 KiB+) margin, verified via `python tools/qemu_smoke.py --build`
+ * (ipc bench errors=0) after this change. Going higher (toward the
+ * arena's 16-slot ceiling) needs either shrinking the QEMU kernel image or
+ * moving CORE0_RAM_BASE further up QEMU's `-m 1G` RAM -- both are
+ * architecture-level changes out of scope for #86 and need owner sign-off,
+ * not just this linker-layout fix. Pi 5 has no comparable constraint (over
+ * 11 MiB of margin measured at 16 slots), so if the two platforms ever need
+ * different limits this constant would need to become per-platform.
+ */
+#define MAX_PROCS_PER_CORE  8
+#define PROC_UI_KERNEL_PID 0U
+#define PROC_UI_KERNEL_PARENT_PID 0xFFFFFFFFU
+#define PROC_SLOT_SIZE      (2 * 1024 * 1024)   /* 2MB per process */
+#define PROC_SLOT_OFFSET    0x100000             /* legacy: slots 1MB into core RAM */
+
+/* Physical base of arena slot `s`. Replaces the old
+ * CORE_RAM_BASE + PROC_SLOT_OFFSET + s * PROC_SLOT_SIZE computation, which tied
+ * a process's memory to whichever core happened to launch it. */
+#define PROC_SLOT_PHYS(s)   (PROC_ARENA_BASE + (u64)(s) * PROC_SLOT_SIZE)
+
+/* The arena must actually hold every slot the process table can allocate. */
+_Static_assert((u64)MAX_PROCS_PER_CORE * PROC_SLOT_SIZE <= PROC_ARENA_SIZE,
+               "process arena too small for MAX_PROCS_PER_CORE slots");
+/* Slots are 2 MB and the boot map gives the arena 2 MB blocks, so the arena
+ * must be 2 MB aligned or a slot would straddle two attribute regions. */
+_Static_assert((PROC_ARENA_BASE & 0x1FFFFFULL) == 0ULL,
+               "process arena must be 2MB aligned");
+
+/* Fixed load address for kernel-embedded flat EL1 userland binaries: process
+ * arena slot 0 (ADR-024). Must match the link address in user/user.ld.
+ * proc_exec_from_mem refuses any other slot, so absolute relocations in the
+ * flat image always resolve correctly. */
+#define PROC_EMBED_BASE     PROC_ARENA_BASE
+
+/* Process states */
+#define PROC_EMPTY    0
+#define PROC_READY    1
+#define PROC_RUNNING  2
+#define PROC_BLOCKED  3
+#define PROC_DEAD     4
+/* Transient: reserved by find_empty_slot() under its lock, before the
+ * caller either finishes initializing the process (-> PROC_READY) or
+ * fails and releases it back to PROC_EMPTY (proc_mark_empty()). Appended
+ * rather than inserted, so PROC_READY/RUNNING/BLOCKED/DEAD keep their
+ * existing numeric values. */
+#define PROC_CLAIMED  5
+
+/* Priority classes (low preempt interval = more frequent scheduling) */
+#define PROC_PRIO_LAZY      0
+#define PROC_PRIO_LOW       1
+#define PROC_PRIO_NORMAL    2
+#define PROC_PRIO_HIGH      3
+#define PROC_PRIO_REALTIME  4
+#define PROC_CAPSULE_ID_NONE 0xFFFFFFFFU
+
+#define PROC_ENTRY_FLAG_DIRECT_KPI      0x00000001U
+#define PROC_ENTRY_FLAG_EL0_CONTRACT    0x00000002U
+#define PROC_ENTRY_FLAG_CODE_RX_RO      0x00000004U
+#define PROC_ENTRY_FLAG_DATA_RW_XN      0x00000008U
+#define PROC_ENTRY_FLAG_STACK_16_ALIGN  0x00000010U
+#define PROC_ENTRY_FLAG_API_IN_X0       0x00000020U
+#define PROC_ENTRY_FLAG_SVC_REQUIRED    0x00000040U
+/*
+ * PSTATE for an EL0 process: EL0t, with D/A/F masked and **IRQs enabled**.
+ *
+ * The I bit MUST stay clear. It is not a privilege grant -- the interrupt is
+ * taken to EL1 on the kernel's own vectors either way, and EL0 cannot re-mask it
+ * because SCTLR_EL1.UMA is never set. Clearing I only permits the CPU to *leave*
+ * EL0, which is the sole mechanism by which the kernel can ever reclaim the core
+ * from a running process. Setting it makes the core cooperative in practice no
+ * matter what the scheduler believes (see ADR-021 / docs/gotchas.md).
+ *
+ * Single source of truth: proc_el0_enter() takes this as an argument rather than
+ * hardcoding it in asm, so the C contract and the actual eret can never drift.
+ */
+#define PROC_ENTRY_SPSR_EL0             0x00000340U
+
+/* Saved context for cooperative context switch (callee-saved only) */
+struct proc_context {
+    u64 x19_x30[12];   /* x19-x30 (12 callee-saved registers) */
+    u64 sp;
+} ALIGNED(64);
+
+struct process {
+    u32 pid;
+    u32 generation;
+    u32 parent_pid;
+    u32 state;
+    u32 principal_id;
+    u32 affinity_core;
+    u32 priority_class;
+    u64 quantum_ticks;
+    u64 wake_deadline_ms; /* 0 = none; proc_park_timeout() sets this, cleared on wake */
+    u8 *base;           /* 2MB slot start */
+    u32 mem_size;
+    struct proc_context ctx;
+    u64 ticks;          /* tick count at last schedule */
+    u64 runtime_ticks;  /* accumulated runtime ticks */
+    u32 exit_code;
+    u32 preemptions;
+    bool capsule_enabled;
+    u32 capsule_manifest_hash;
+    bool capsule_allow_spawn;
+    bool capsule_allow_wait;
+    bool capsule_allow_nprocs;
+    char capsule_group[32];
+    char capsule_vfs_root[96];
+    u32 capsule_fs_prefix_count;
+    char capsule_fs_prefix[8][64];
+    u32 capsule_ipc_prefix_count;
+    char capsule_ipc_prefix[8][32];
+    u32 capsule_pipe_prefix_count;
+    char capsule_pipe_prefix[8][64];
+    u32 capsule_card_range_count;
+    struct {
+        u16 lo;
+        u16 hi;
+    } capsule_card_ranges[8];
+    u32 capsule_port_range_count;
+    struct {
+        u16 lo;
+        u16 hi;
+    } capsule_port_ranges[8];
+    u32 ipc_shm_map_refs;
+    u32 capsule_id;
+    char image_path[96];
+    u32 quota_mem_kib;
+    u32 quota_cpu_ms;
+    u32 quota_ipc_objs;
+    u32 quota_fs_write_kib;
+    u32 usage_ipc_objs;
+    u64 usage_fs_write_bytes;
+    u32 exec_image_size;
+    u32 exec_hash_baseline;
+    u32 exec_hash_last;
+    u64 exec_hash_next_check_tick;
+    u32 exec_hash_check_nonce;
+    u64 entry_pc;
+    u64 entry_sp;
+    u64 entry_spsr;
+    u32 entry_flags;
+    bool run_at_el0;
+    u64 arena_base;
+    u64 arena_limit;
+    u32 arena_capacity_bytes;
+    u32 arena_high_bytes;
+    u32 arena_span_bytes;
+    u32 arena_span_high_bytes;
+    u32 arena_span_count;
+    u32 arena_span_high_count;
+} ALIGNED(64);
+
+/* PIKEE (Pi Kernel Execution Environment) API table passed to processes in x0 at entry.
+ * This is the COMPLETE userland API surface.
+ * All pointers passed by userland are bounds-checked. */
+struct kernel_api {
+    /* ---- Process control ---- */
+    i32 (*yield)(void);
+    i32 (*exit)(u32 code);
+    u32 (*getpid)(void);
+    i32 (*park)(void);              /* block until woken by a soft event */
+
+    /* ---- Console I/O ---- */
+    void (*print)(const char *msg);
+    void (*putc)(char c);
+    i32  (*getc)(void);             /* blocking keyboard read */
+    i32  (*try_getc)(void);         /* non-blocking, returns -1 if none */
+
+    /* ---- Timer ---- */
+    u64 (*ticks)(void);
+    void (*sleep_ms)(u64 ms);
+    void (*sleep_us)(u64 us);
+    u64 (*runtime_ms)(void);
+    u64 (*monotonic_ms)(void);
+    u64 (*utc_ms)(void);
+    i32 (*set_utc_ms)(u64 utc_ms);
+    u64 (*rtc_ms)(void);
+    i32 (*set_tz_offset_min)(i32 offset_min);
+    i32 (*get_tz_offset_min)(void);
+    i32 (*list_tz_offsets)(i32 *out_offsets, u32 max_entries);
+
+    /* ---- Filesystem (WALFS via FIFO to Core 1) ---- */
+    i32 (*open)(const char *path, u32 flags);
+    i32 (*creat)(const char *path, u32 flags, u32 mode); /* create new file/dir */
+    i32 (*read)(i32 fd, void *buf, u32 len);
+    i32 (*write)(i32 fd, const void *buf, u32 len);
+    i32 (*pread)(i32 fd, void *buf, u32 len, u64 offset);  /* positioned read */
+    i32 (*pwrite)(i32 fd, const void *buf, u32 len, u64 offset); /* positioned write */
+    i32 (*close)(i32 fd);
+    i32 (*stat)(const char *path, void *out);  /* fills walfs_inode */
+    i32 (*mkdir)(const char *path);
+    i32 (*unlink)(const char *path);
+    i32 (*readdir)(const char *path, void *entries, u32 max_entries); /* list directory */
+    i32 (*page_open)(const char *path, u32 page_size, u32 flags);
+    i32 (*page_read)(i32 page_id, u64 page_idx, void *out_page, u32 out_len);
+    i32 (*page_write)(i32 page_id, u64 page_idx, const void *in_page, u32 in_len);
+    i32 (*page_flush)(i32 page_id);
+    i32 (*page_stat)(i32 page_id, struct paged_io_stat *out);
+    i32 (*page_close)(i32 page_id);
+
+    /* ---- Framebuffer ---- */
+    void (*fb_putc)(char c);
+    void (*fb_print)(const char *s);
+    void (*fb_color)(u32 fg, u32 bg);
+    void (*fb_clear)(u32 color);
+    void (*fb_pixel)(u32 x, u32 y, u32 color);
+
+    /* ---- Networking: sockets ---- */
+    i32 (*socket)(u32 type);
+    i32 (*bind)(i32 fd, u32 ip, u16 port);
+    i32 (*connect)(i32 fd, u32 ip, u16 port);
+    i32 (*listen)(i32 fd, u32 backlog);
+    i32 (*accept)(i32 fd, u32 *client_ip, u16 *client_port);
+    i32 (*send)(i32 fd, const void *data, u32 len);
+    i32 (*recv)(i32 fd, void *buf, u32 len);
+    i32 (*sendto)(i32 fd, const void *data, u32 len, u32 ip, u16 port);
+    i32 (*recvfrom)(i32 fd, void *buf, u32 len, u32 *src_ip, u16 *src_port);
+    i32 (*sock_close)(i32 fd);
+
+    /* ---- DNS ---- */
+    i32 (*resolve)(const char *hostname, u32 *ip_out);
+
+    /* ---- Identity ---- */
+    u32 (*whoami)(void);
+    i32 (*auth)(const char *user, const char *pass);
+
+    /* ---- Memory ---- */
+    void *(*sbrk)(i32 increment);
+    void *(*memset)(void *dst, i32 c, u32 n);
+    void *(*memcpy)(void *dst, const void *src, u32 n);
+    i32   (*span_copy)(void *dst, u32 dst_cap, const void *src, u32 src_len, u32 *copied);
+
+    /* ---- Process management ---- */
+    i32 (*spawn)(const char *path);     /* load + start child process */
+    i32 (*wait)(i32 pid);               /* wait for child to exit, return exit code */
+    u32 (*nprocs)(void);                /* count active processes on this core */
+
+    /* ---- Inter-process sync ---- */
+    i32 (*sem_create)(u32 initial);     /* create semaphore, returns id */
+    i32 (*sem_wait)(i32 id);            /* decrement (blocks if 0) */
+    i32 (*sem_post)(i32 id);            /* increment */
+    i32 (*lock_create)(void);           /* binary lock (mutex-like), returns id */
+    i32 (*lock_acquire)(i32 id);        /* acquire lock */
+    i32 (*lock_release)(i32 id);        /* release lock */
+
+    /* ---- Local KV store (Picowal model) ---- */
+    i32 (*kv_put)(u32 key, const void *data, u32 len);
+    i32 (*kv_get)(u32 key, void *out, u32 out_len);
+    i32 (*kv_del)(u32 key);
+    i32 (*kv_list)(u16 card, u32 *out_keys, u32 max_keys);
+
+    /* ---- App foundations: events, logs, service registry, hooks ---- */
+    i32 (*event_emit)(u32 type, const void *data, u32 len);
+    i32 (*event_next)(struct appf_event_record *out);
+    i32 (*log_write)(u32 level, const char *msg, u32 len);
+    i32 (*log_next)(struct appf_log_record *out);
+    i32 (*svc_register)(const char *name, u32 kind, u32 endpoint, u32 flags);
+    i32 (*svc_resolve)(const char *name, struct appf_service_record *out);
+    i32 (*svc_list)(struct appf_service_record *out, u32 max_entries);
+    i32 (*hook_bind)(u32 hook_type, const char *service_name);
+    i32 (*hook_emit)(u32 hook_type, const void *data, u32 len);
+
+    /* ---- In-memory IPC ---- */
+    i32 (*queue_create)(const char *name, u32 depth, u32 flags, u32 frame_max);
+    i32 (*queue_push)(i32 qid, const void *data, u32 len);
+    i32 (*queue_pop)(i32 qid, void *out, u32 out_max);      /* returns frame len */
+    i32 (*queue_len)(i32 qid);
+    i32 (*stack_create)(const char *name, u32 depth, u32 flags, u32 frame_max);
+    i32 (*stack_push)(i32 sid, const void *data, u32 len);
+    i32 (*stack_pop)(i32 sid, void *out, u32 out_max);      /* returns frame len */
+    i32 (*stack_len)(i32 sid);
+    i32 (*topic_create)(const char *name, u32 replay_window, u32 flags, u32 event_max);
+    i32 (*topic_publish)(i32 tid, const void *data, u32 len);
+    i32 (*topic_subscribe)(i32 tid);                        /* returns subscriber handle */
+    i32 (*topic_read)(i32 sub_id, void *out, u32 out_max); /* returns event len */
+
+    /* ---- Unified virtual device stream IPC (pipes) ---- */
+    i32 (*pipe_create)(const char *path, u32 type, u32 depth, u32 flags, u32 frame_max);
+    i32 (*pipe_open)(const char *path, u32 type);
+    i32 (*pipe_close)(i32 pipe_id);
+    i32 (*pipe_read)(i32 pipe_id, void *buf, u32 len);        /* stream-only */
+    i32 (*pipe_write)(i32 pipe_id, const void *buf, u32 len); /* stream-only */
+    i32 (*pipe_send)(i32 pipe_id, const void *msg, u32 len);  /* slot-only */
+    i32 (*pipe_recv)(i32 pipe_id, void *msg, u32 len);        /* slot-only */
+    i32 (*pipe_stat)(i32 pipe_id, struct pipe_stat *out);
+
+    /* ---- Kernel-enforced IPC channels + shared regions ---- */
+    i32 (*ipc_fifo_create)(const char *name, u32 peer_principal, u32 owner_acl,
+                           u32 peer_acl, u32 depth, u32 msg_max);
+    i32 (*ipc_fifo_open)(const char *name, u32 want_acl);
+    i32 (*ipc_fifo_send)(i32 channel_id, const void *data, u32 len);
+    i32 (*ipc_fifo_send_span)(i32 channel_id, const void *addr, u32 len, u32 flags, u64 tag);
+    i32 (*ipc_fifo_recv)(i32 channel_id, void *out, u32 out_max); /* returns msg len */
+    i32 (*ipc_fifo_poll)(i32 channel_id);
+    i32 (*ipc_shm_create)(const char *name, u32 peer_principal, u32 owner_acl,
+                          u32 peer_acl, u32 size);
+    i32 (*ipc_shm_open)(const char *name, u32 want_acl);
+    i32 (*ipc_shm_map)(i32 region_id, u32 flags, void **addr_out, u32 *size_out);
+    i32 (*ipc_shm_unmap)(i32 map_handle);
+    i32 (*sw_int_kernel)(i32 channel_id, u32 event_type, u32 flags);
+
+    /* ---- Tensor / GPU compute ---- */
+    i32 (*tensor_alloc)(void *t, u32 rows, u32 cols, u32 elem_size);
+    void (*tensor_free)(void *t);
+    void (*tensor_upload)(void *t, const void *data);
+    void (*tensor_download)(const void *t, void *data);
+    i32 (*tensor_matmul)(void *c, const void *a, const void *b);
+    i32 (*tensor_relu)(void *b, const void *a);
+    i32 (*tensor_softmax)(void *b, const void *a);
+    i32 (*tensor_add)(void *c, const void *a, const void *b);
+    i32 (*tensor_dot)(void *result, const void *a, const void *b);
+    i32 (*tensor_mul)(void *c, const void *a, const void *b);
+    i32 (*tensor_scale)(void *b, const void *a, float scalar);
+    i32 (*tensor_bind_kernel_blob)(u32 kernel_id, const void *uniform_data, u32 uniform_bytes,
+                                   const u64 *shader_code, u32 shader_insts);
+    i32 (*tensor_bind_kernel_csd)(u32 kernel_id, const u32 *csd_cfg, u32 qpu_count);
+
+    /* ---- Arena/span allocation extensions ---- */
+    void *(*span_rent)(u32 bytes, u32 align, u32 type);
+    i32   (*span_release)(void *ptr);
+};
+
+typedef struct kernel_api pikee_api;
+
+/* Assembly context switch: save callee-saved regs to old, restore from new */
+extern void ctx_switch(struct proc_context *old, struct proc_context *new_ctx);
+
+void proc_init(void);              /* init scheduler on this core */
+void proc_init_shared(void);       /* init single-instance shared proc tables once (core 0, pre-SMP) */
+void proc_mark_core_hosts_process(u32 core);
+i32  proc_exec(const char *path);  /* load + start process from WALFS */
+void proc_yield(void);             /* cooperative context switch */
+NORETURN void proc_exit(u32 code); /* terminate current process */
+void proc_schedule(void);          /* run scheduler loop (called from coreN_main) */
+u32  proc_count(void);             /* number of active processes on this core */
+bool proc_handle_fault(u64 esr, u64 elr, u64 far); /* kill faulting user proc */
+bool proc_handle_svc(struct irq_frame *frame, u64 esr);
+bool proc_svc_selftest(void);
+u64  proc_svc_calls(void);
+u64  proc_svc_bad_calls(void);
+
+/* Preemption (user cores only) */
+#define PROC_PREEMPT_TIMER_HZ    1000U
+#define PROC_PREEMPT_QUANTUM_MS  5U
+void proc_preempt_init(u32 timer_hz, u32 quantum_ms);
+void proc_irq_maybe_preempt(struct irq_frame *frame);
+/* Preemption-accounting half of the unified timer tick hook (see kernel.c). */
+void proc_timer_tick(u32 core, u64 tick);
+u64  proc_preemptions(void);
+u32  proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries);
+bool proc_soft_event(u32 target_pid, u32 event_type, bool boost);
+bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out);
+bool proc_cohdiag(u32 iters, u32 consumer_core, struct proc_cohdiag_result *out);
+void proc_cohdiag_consumer_tick(void);
+u32  proc_snapshot(struct proc_ui_entry *out, u32 max_entries);
+void *proc_span_rent(u32 bytes, u32 align, u32 type);
+bool proc_span_release(void *ptr);
+u32  proc_log_snapshot(struct proc_log_ui_entry *out, u32 max_entries);
+u32  proc_capsule_snapshot(struct proc_capsule_ui_entry *out, u32 max_entries);
+void proc_security_stats_snapshot(struct proc_security_stats *out);
+bool proc_entry_contract_selftest(void);
+u32  proc_entry_contract_flags(void);
+u32  proc_entry_contract_spsr(void);
+bool proc_kill_pid(u32 pid, u32 code);
+i32  proc_restart_pid(u32 pid, u32 code);
+i32  proc_launch_on_core(u32 target_core, const char *path);
+i32  proc_launch_on_core_as(u32 target_core, const char *path, u32 principal_id);
+i32  proc_launch_on_core_as_prio(u32 target_core, const char *path, u32 principal_id, u32 priority_class);
+/* Launch a flat binary embedded in the kernel image (no WALFS). Must be called
+ * on the target core; the blob must be linked at PROC_EMBED_BASE. */
+i32  proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
+                        u32 priority_class, u32 affinity_core);
+i32  proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
+                            u64 linked_base, u64 physical_base,
+                            u32 priority_class, u32 affinity_core);
+void proc_el0_probe_snapshot(u32 *seen, u32 *pid, u32 *spsr, u64 *arg, u64 *elr, u32 *exits);
+void proc_el0_diag_snapshot(i32 *launch_status, u32 *launch_pid, u32 *launch_slot,
+                            u64 *launch_base, u32 *enter_count, u32 *enter_pid,
+                            u64 *enter_pc, u64 *enter_sp, u32 *fault_pid,
+                            u64 *fault_esr, u64 *fault_elr, u64 *fault_far,
+                            u64 *fault_l1e, u64 *fault_l2e, u64 *fault_l3e,
+                            u64 *fault_par0w, u64 *fault_par0r, u64 *fault_par1w);
+void proc_trap_context(u32 *pid, u32 *capsule, u32 *generation, u32 *owner_principal);
+/* Block the current process until woken (BLOCKED + yield to scheduler). */
+void proc_park(void);
+/* Like proc_park(), but also returns if `ms` elapses with no wake (0 = same as
+ * proc_park(): no timeout). For capsules that ALSO have other schedulable
+ * foreground work: a FIFO-only endpoint capsule should just use proc_park()
+ * (wakes solely on FIFO arrival); a hybrid capsule uses this so it still gets
+ * its normal work quantum even while idle-waiting on its inbound FIFO. */
+void proc_park_timeout(u32 ms);
+/* Post a wake for `pid` onto `target_core`'s wake ring and SEV. Safe to call
+ * from any core (including core 0); the target core's scheduler delivers it. */
+bool proc_post_remote_wake(u32 target_core, u32 pid);
+/* Delivery counter for the GIC SGI wake doorbell on `core` (0-3). */
+u32  proc_sgi_wake_count(u32 core);
+/* Diagnostics for the cross-core wake ring. */
+void proc_rwake_stats(u32 *posted, u32 *drained, u32 *full);
+u32  proc_sched_loops(u32 core);
+void proc_sched_ctx_stats(u32 core, u32 *enter, u32 *exit, u32 *last_pid);
+u32  proc_sched_stage_get(u32 core);
+void proc_rwake_dbg(u32 *iters, u32 *pid, u32 *zero, u32 *calls, u32 *noslot, u32 *state);
+void proc_rwake_park_dbg(u32 core, u32 *rescued, u32 *reason,
+                         u32 *p_enter, u32 *p_early, u32 *p_block, u32 *p_resume);
+void proc_rwake_live(u32 core, u32 *live_state, u32 *live_pid, u32 *disp, u32 *wfe);
+bool proc_set_priority(u32 pid, u32 priority_class);
+bool proc_set_affinity(u32 pid, u32 core);
+bool proc_validate_image_path(const char *path, struct proc_image_validation *out);
+const char *proc_image_format_name(u32 format);
+const char *proc_image_status_name(u32 status);
+const char *proc_image_launch_mode_name(u32 mode);

@@ -1,0 +1,508 @@
+#include "ipc_proc.h"
+#include "principal.h"
+#include "core_env.h"
+#include "simd.h"
+
+struct proc_fifo_channel {
+    bool used;
+    u32 generation;
+    u8 name[PROC_IPC_NAME_MAX + 1];
+    u32 owner_core;
+    u32 owner_principal;
+    u32 owner_pid;
+    u32 peer_principal;
+    u32 owner_acl;
+    u32 peer_acl;
+    u32 depth;
+    u32 msg_max;
+    u32 flags;
+    u32 head;
+    u32 count;
+    u16 lens[PROC_IPC_FIFO_DEPTH_MAX];
+    u8  frames[PROC_IPC_FIFO_DEPTH_MAX][PROC_IPC_FIFO_MSG_MAX];
+} ALIGNED(64);
+
+struct proc_shm_region {
+    bool used;
+    u32 generation;
+    u8 name[PROC_IPC_NAME_MAX + 1];
+    u32 owner_core;
+    u32 owner_principal;
+    u32 owner_pid;
+    u32 peer_principal;
+    u32 owner_acl;
+    u32 peer_acl;
+    u32 size;
+    u32 offset;
+} ALIGNED(64);
+
+struct proc_shm_map {
+    bool used;
+    u32 generation;
+    i32 region_id;
+    u32 core;
+    u32 principal;
+    u32 pid;
+    u32 flags;
+    u32 _pad[9];
+} ALIGNED(64);
+
+static struct proc_fifo_channel g_fifos[PROC_IPC_FIFO_MAX];
+static struct proc_shm_region g_regions[PROC_IPC_SHM_MAX_REGIONS];
+static struct proc_shm_map g_maps[PROC_IPC_SHM_MAX_MAPS];
+static u32 g_shm_pool_off;
+static volatile u32 g_shm_alloc_lock;
+_Static_assert((sizeof(struct proc_fifo_channel) & 63U) == 0U,
+               "proc FIFO channel descriptors must have cache-line stride");
+_Static_assert((sizeof(struct proc_shm_region) & 63U) == 0U,
+               "proc SHM region descriptors must have cache-line stride");
+_Static_assert(sizeof(struct proc_shm_map) == 64,
+               "proc SHM map descriptors must be one cache line");
+
+#define PROC_IPC_POISON_U32 0xDEAD1C00U
+#define PROC_IPC_POISON_I32 ((i32)-0x1EC)
+
+static u32 bump_generation(u32 old)
+{
+    u32 g = old + 1U;
+    return g ? g : 1U;
+}
+
+static void poison_fifo(struct proc_fifo_channel *ch)
+{
+    u32 g = bump_generation(ch ? ch->generation : 0);
+    if (!ch) return;
+    memset(ch, 0xA5, sizeof(*ch));
+    ch->used = false;
+    ch->generation = g;
+    ch->owner_core = PROC_IPC_POISON_U32;
+    ch->owner_principal = PROC_IPC_POISON_U32;
+    ch->owner_pid = PROC_IPC_POISON_U32;
+    ch->peer_principal = PROC_IPC_POISON_U32;
+}
+
+static void poison_region(struct proc_shm_region *r)
+{
+    u32 g = bump_generation(r ? r->generation : 0);
+    if (!r) return;
+    memset(r, 0xA5, sizeof(*r));
+    r->used = false;
+    r->generation = g;
+    r->owner_core = PROC_IPC_POISON_U32;
+    r->owner_principal = PROC_IPC_POISON_U32;
+    r->owner_pid = PROC_IPC_POISON_U32;
+    r->peer_principal = PROC_IPC_POISON_U32;
+    r->size = 0;
+    r->offset = PROC_IPC_POISON_U32;
+}
+
+static void poison_map(struct proc_shm_map *m)
+{
+    u32 g = bump_generation(m ? m->generation : 0);
+    if (!m) return;
+    memset(m, 0xA5, sizeof(*m));
+    m->used = false;
+    m->generation = g;
+    m->region_id = PROC_IPC_POISON_I32;
+    m->core = PROC_IPC_POISON_U32;
+    m->principal = PROC_IPC_POISON_U32;
+    m->pid = PROC_IPC_POISON_U32;
+    m->flags = PROC_IPC_POISON_U32;
+}
+
+static void shm_alloc_lock(void)
+{
+    for (;;) {
+        if (__sync_lock_test_and_set(&g_shm_alloc_lock, 1) == 0)
+            break;
+        wfe();
+    }
+}
+
+static void shm_alloc_unlock(void)
+{
+    __sync_lock_release(&g_shm_alloc_lock);
+    sev();
+}
+
+static bool ascii_name_ok(const char *name)
+{
+    if (!name) return false;
+    for (u32 i = 0; i <= PROC_IPC_NAME_MAX; i++) {
+        u8 c = (u8)name[i];
+        if (c == 0) return i != 0;
+        if (c < 0x20 || c > 0x7E) return false;
+    }
+    return false;
+}
+
+static bool name_eq(const u8 *a, const char *b)
+{
+    for (u32 i = 0; i <= PROC_IPC_NAME_MAX; i++) {
+        if (a[i] != (u8)b[i]) return false;
+        if (a[i] == 0) return true;
+    }
+    return false;
+}
+
+static void copy_bytes(void *dst, const void *src, u32 n)
+{
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    for (u32 i = 0; i < n; i++) d[i] = s[i];
+}
+
+static i32 fifo_find_by_name(const char *name)
+{
+    for (u32 i = 0; i < PROC_IPC_FIFO_MAX; i++) {
+        if (!g_fifos[i].used) continue;
+        if (name_eq(g_fifos[i].name, name)) return (i32)i;
+    }
+    return PROC_IPC_ERR_NOENT;
+}
+
+static i32 region_find_by_name(const char *name)
+{
+    for (u32 i = 0; i < PROC_IPC_SHM_MAX_REGIONS; i++) {
+        if (!g_regions[i].used) continue;
+        if (name_eq(g_regions[i].name, name)) return (i32)i;
+    }
+    return PROC_IPC_ERR_NOENT;
+}
+
+static u32 principal_acl(u32 principal, u32 owner_principal, u32 peer_principal,
+                         u32 owner_acl, u32 peer_acl)
+{
+    if (principal == PRINCIPAL_ROOT) return 0xFFFFFFFFU;
+    if (principal == owner_principal) return owner_acl;
+    if (peer_principal == PROC_IPC_PEER_ANY || principal == peer_principal)
+        return peer_acl;
+    return 0;
+}
+
+void ipc_proc_init(void)
+{
+    for (u32 i = 0; i < PROC_IPC_FIFO_MAX; i++)
+        poison_fifo(&g_fifos[i]);
+    for (u32 i = 0; i < PROC_IPC_SHM_MAX_REGIONS; i++)
+        poison_region(&g_regions[i]);
+    for (u32 i = 0; i < PROC_IPC_SHM_MAX_MAPS; i++)
+        poison_map(&g_maps[i]);
+    simd_zero((void *)(usize)IPC_SHM_BASE, IPC_SHM_SIZE);
+    g_shm_pool_off = 0;
+    dsb();
+}
+
+i32 ipc_proc_fifo_create(u32 owner_principal, u32 owner_pid, const char *name,
+                         u32 peer_principal, u32 owner_acl, u32 peer_acl,
+                         u32 depth, u32 msg_max)
+{
+    if (!ascii_name_ok(name)) return PROC_IPC_ERR_INVAL;
+    if (peer_principal != PROC_IPC_PEER_ANY && peer_principal >= PRINCIPAL_MAX)
+        return PROC_IPC_ERR_INVAL;
+    if (depth == 0 || depth > PROC_IPC_FIFO_DEPTH_MAX) return PROC_IPC_ERR_INVAL;
+    if (msg_max == 0 || msg_max > PROC_IPC_FIFO_MSG_MAX) return PROC_IPC_ERR_INVAL;
+    u32 flags = (msg_max == sizeof(struct proc_ipc_span_desc)) ? PROC_IPC_FIFO_F_SPAN_DESC : 0;
+    if (fifo_find_by_name(name) >= 0) return PROC_IPC_ERR_EXISTS;
+    if ((owner_acl & (PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV)) == 0)
+        return PROC_IPC_ERR_INVAL;
+    if ((peer_acl & (PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV)) == 0 &&
+        peer_principal != owner_principal && peer_principal != PROC_IPC_PEER_ANY)
+        return PROC_IPC_ERR_INVAL;
+
+    for (u32 i = 0; i < PROC_IPC_FIFO_MAX; i++) {
+        if (g_fifos[i].used) continue;
+        struct proc_fifo_channel *ch = &g_fifos[i];
+        u32 gen = bump_generation(ch->generation);
+        memset(ch, 0, sizeof(*ch));
+        ch->used = true;
+        ch->generation = gen;
+        ch->owner_core = core_id();
+        ch->owner_principal = owner_principal;
+        ch->owner_pid = owner_pid;
+        ch->peer_principal = peer_principal;
+        ch->owner_acl = owner_acl;
+        ch->peer_acl = peer_acl;
+        ch->depth = depth;
+        ch->msg_max = msg_max;
+        ch->flags = flags;
+        copy_bytes(ch->name, name, PROC_IPC_NAME_MAX + 1);
+        dmb();
+        return (i32)i;
+    }
+    return PROC_IPC_ERR_NOSPC;
+}
+
+i32 ipc_proc_fifo_open(u32 principal, u32 pid, const char *name, u32 want_acl)
+{
+    (void)pid;
+    i32 id = fifo_find_by_name(name);
+    if (id < 0) return id;
+    struct proc_fifo_channel *ch = &g_fifos[id];
+    if (ch->owner_core != core_id()) return PROC_IPC_ERR_UNSUPPORTED;
+    u32 acl = principal_acl(principal, ch->owner_principal, ch->peer_principal,
+                            ch->owner_acl, ch->peer_acl);
+    if ((want_acl & ~(PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV)) != 0)
+        return PROC_IPC_ERR_INVAL;
+    if ((acl & want_acl) != want_acl)
+        return PROC_IPC_ERR_ACCESS;
+    return id;
+}
+
+i32 ipc_proc_fifo_send(u32 principal, i32 channel_id, const void *data, u32 len)
+{
+    if (!data || len == 0) return PROC_IPC_ERR_INVAL;
+    if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX) return PROC_IPC_ERR_INVAL;
+    struct proc_fifo_channel *ch = &g_fifos[channel_id];
+    if (!ch->used) return PROC_IPC_ERR_NOENT;
+    if (ch->owner_core != core_id()) return PROC_IPC_ERR_UNSUPPORTED;
+    u32 acl = principal_acl(principal, ch->owner_principal, ch->peer_principal,
+                            ch->owner_acl, ch->peer_acl);
+    if ((acl & PROC_IPC_PERM_SEND) == 0) return PROC_IPC_ERR_ACCESS;
+    if (len > ch->msg_max) return PROC_IPC_ERR_TOOLONG;
+    if (ch->count == ch->depth) return PROC_IPC_ERR_FULL;
+
+    u32 idx = (ch->head + ch->count) % ch->depth;
+    ch->lens[idx] = (u16)len;
+    copy_bytes(ch->frames[idx], data, len);
+    dmb(); /* payload visible before queue metadata update */
+    ch->count++;
+    sev();
+    return PROC_IPC_OK;
+}
+
+i32 ipc_proc_fifo_recv(u32 principal, i32 channel_id, void *out, u32 out_max, u32 *len_out)
+{
+    if (!out || !len_out) return PROC_IPC_ERR_INVAL;
+    if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX) return PROC_IPC_ERR_INVAL;
+    struct proc_fifo_channel *ch = &g_fifos[channel_id];
+    if (!ch->used) return PROC_IPC_ERR_NOENT;
+    if (ch->owner_core != core_id()) return PROC_IPC_ERR_UNSUPPORTED;
+    u32 acl = principal_acl(principal, ch->owner_principal, ch->peer_principal,
+                            ch->owner_acl, ch->peer_acl);
+    if ((acl & PROC_IPC_PERM_RECV) == 0) return PROC_IPC_ERR_ACCESS;
+    if (ch->count == 0) return PROC_IPC_ERR_EMPTY;
+
+    dmb(); /* consume queue metadata before reading payload */
+    u32 idx = ch->head;
+    u32 len = ch->lens[idx];
+    if (out_max < len) return PROC_IPC_ERR_TOOLONG;
+    copy_bytes(out, ch->frames[idx], len);
+    dmb(); /* payload consumed before head/count advance */
+    ch->head = (ch->head + 1) % ch->depth;
+    ch->count--;
+    *len_out = len;
+    return PROC_IPC_OK;
+}
+
+i32 ipc_proc_fifo_count(u32 principal, i32 channel_id)
+{
+    if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX) return PROC_IPC_ERR_INVAL;
+    struct proc_fifo_channel *ch = &g_fifos[channel_id];
+    if (!ch->used) return PROC_IPC_ERR_NOENT;
+    if (ch->owner_core != core_id()) return PROC_IPC_ERR_UNSUPPORTED;
+    u32 acl = principal_acl(principal, ch->owner_principal, ch->peer_principal,
+                            ch->owner_acl, ch->peer_acl);
+    if ((acl & (PROC_IPC_PERM_SEND | PROC_IPC_PERM_RECV)) == 0)
+        return PROC_IPC_ERR_ACCESS;
+    return (i32)ch->count;
+}
+
+static struct proc_fifo_channel *fifo_for_access(u32 principal, i32 channel_id, u32 perm)
+{
+    if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX)
+        return NULL;
+    struct proc_fifo_channel *ch = &g_fifos[channel_id];
+    if (!ch->used || ch->owner_core != core_id())
+        return NULL;
+    u32 acl = principal_acl(principal, ch->owner_principal, ch->peer_principal,
+                            ch->owner_acl, ch->peer_acl);
+    if ((acl & perm) == 0)
+        return NULL;
+    if ((ch->flags & PROC_IPC_FIFO_F_SPAN_DESC) == 0)
+        return NULL;
+    return ch;
+}
+
+i32 ipc_proc_fifo_send_span(u32 principal, i32 channel_id, const struct proc_ipc_span_desc *desc)
+{
+    if (!desc) return PROC_IPC_ERR_INVAL;
+    struct proc_fifo_channel *ch = fifo_for_access(principal, channel_id, PROC_IPC_PERM_SEND);
+    if (!ch) return PROC_IPC_ERR_ACCESS;
+    if (ch->count == ch->depth) return PROC_IPC_ERR_FULL;
+    u32 idx = (ch->head + ch->count) % ch->depth;
+    *((struct proc_ipc_span_desc *)ch->frames[idx]) = *desc;
+    ch->lens[idx] = (u16)sizeof(*desc);
+    dmb();
+    ch->count++;
+    sev();
+    return PROC_IPC_OK;
+}
+
+i32 ipc_proc_fifo_recv_span(u32 principal, i32 channel_id, struct proc_ipc_span_desc *out)
+{
+    if (!out) return PROC_IPC_ERR_INVAL;
+    struct proc_fifo_channel *ch = fifo_for_access(principal, channel_id, PROC_IPC_PERM_RECV);
+    if (!ch) return PROC_IPC_ERR_ACCESS;
+    if (ch->count == 0) return PROC_IPC_ERR_EMPTY;
+    dmb();
+    u32 idx = ch->head;
+    if (ch->lens[idx] != sizeof(*out))
+        return PROC_IPC_ERR_INVAL;
+    *out = *((const struct proc_ipc_span_desc *)ch->frames[idx]);
+    dmb();
+    ch->head = (ch->head + 1) % ch->depth;
+    ch->count--;
+    return PROC_IPC_OK;
+}
+
+u32 ipc_proc_fifo_owner_pid(i32 channel_id)
+{
+    if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX)
+        return 0;
+    struct proc_fifo_channel *ch = &g_fifos[channel_id];
+    if (!ch->used || ch->owner_core != core_id())
+        return 0;
+    return ch->owner_pid;
+}
+
+bool ipc_proc_fifo_is_span_desc(i32 channel_id)
+{
+    if (channel_id < 0 || channel_id >= PROC_IPC_FIFO_MAX)
+        return false;
+    struct proc_fifo_channel *ch = &g_fifos[channel_id];
+    return ch->used && ch->owner_core == core_id() &&
+           ((ch->flags & PROC_IPC_FIFO_F_SPAN_DESC) != 0);
+}
+
+i32 ipc_proc_shm_create(u32 owner_principal, u32 owner_pid, const char *name,
+                        u32 peer_principal, u32 owner_acl, u32 peer_acl,
+                        u32 size)
+{
+    i32 ret = PROC_IPC_ERR_NOSPC;
+
+    if (!ascii_name_ok(name)) return PROC_IPC_ERR_INVAL;
+    if (peer_principal != PROC_IPC_PEER_ANY && peer_principal >= PRINCIPAL_MAX)
+        return PROC_IPC_ERR_INVAL;
+    if (size == 0 || size > PROC_IPC_SHM_REGION_MAX) return PROC_IPC_ERR_INVAL;
+    if ((owner_acl & (PROC_IPC_PERM_MAP_READ | PROC_IPC_PERM_MAP_WRITE)) == 0)
+        return PROC_IPC_ERR_INVAL;
+    if ((peer_acl & (PROC_IPC_PERM_MAP_READ | PROC_IPC_PERM_MAP_WRITE)) == 0 &&
+        peer_principal != owner_principal && peer_principal != PROC_IPC_PEER_ANY)
+        return PROC_IPC_ERR_INVAL;
+    if (size > (0xFFFFFFFFU - 63U)) return PROC_IPC_ERR_INVAL;
+
+    shm_alloc_lock();
+    if (region_find_by_name(name) >= 0) {
+        ret = PROC_IPC_ERR_EXISTS;
+        goto out_unlock;
+    }
+
+    u32 aligned = (size + 63U) & ~63U;
+    if (aligned < size || aligned == 0 || aligned > IPC_SHM_SIZE) {
+        ret = PROC_IPC_ERR_INVAL;
+        goto out_unlock;
+    }
+    if (g_shm_pool_off > (IPC_SHM_SIZE - aligned)) {
+        ret = PROC_IPC_ERR_NOSPC;
+        goto out_unlock;
+    }
+
+    for (u32 i = 0; i < PROC_IPC_SHM_MAX_REGIONS; i++) {
+        if (g_regions[i].used) continue;
+        struct proc_shm_region *r = &g_regions[i];
+        u32 gen = bump_generation(r->generation);
+        memset(r, 0, sizeof(*r));
+        r->used = true;
+        r->generation = gen;
+        r->owner_core = core_id();
+        r->owner_principal = owner_principal;
+        r->owner_pid = owner_pid;
+        r->peer_principal = peer_principal;
+        r->owner_acl = owner_acl;
+        r->peer_acl = peer_acl;
+        r->size = size;
+        r->offset = g_shm_pool_off;
+        copy_bytes(r->name, name, PROC_IPC_NAME_MAX + 1);
+        simd_zero((void *)(usize)(IPC_SHM_BASE + r->offset), aligned);
+        g_shm_pool_off += aligned;
+        dmb();
+        ret = (i32)i;
+        goto out_unlock;
+    }
+
+out_unlock:
+    shm_alloc_unlock();
+    return ret;
+}
+
+i32 ipc_proc_shm_open(u32 principal, u32 pid, const char *name, u32 want_acl)
+{
+    (void)pid;
+    i32 id = region_find_by_name(name);
+    if (id < 0) return id;
+    struct proc_shm_region *r = &g_regions[id];
+    if (r->owner_core != core_id()) return PROC_IPC_ERR_UNSUPPORTED;
+    u32 acl = principal_acl(principal, r->owner_principal, r->peer_principal,
+                            r->owner_acl, r->peer_acl);
+    if ((want_acl & ~(PROC_IPC_PERM_MAP_READ | PROC_IPC_PERM_MAP_WRITE)) != 0)
+        return PROC_IPC_ERR_INVAL;
+    if ((acl & want_acl) != want_acl)
+        return PROC_IPC_ERR_ACCESS;
+    return id;
+}
+
+i32 ipc_proc_shm_map(u32 principal, u32 pid, i32 region_id, u32 req_flags,
+                     void **addr_out, u32 *size_out)
+{
+    if (!addr_out || !size_out) return PROC_IPC_ERR_INVAL;
+    if (region_id < 0 || region_id >= PROC_IPC_SHM_MAX_REGIONS) return PROC_IPC_ERR_INVAL;
+    if ((req_flags & (PROC_IPC_MAP_READ | PROC_IPC_MAP_WRITE)) == 0) return PROC_IPC_ERR_INVAL;
+    if ((req_flags & PROC_IPC_MAP_EXEC) != 0) return PROC_IPC_ERR_UNSUPPORTED;
+    if ((req_flags & ~(PROC_IPC_MAP_READ | PROC_IPC_MAP_WRITE | PROC_IPC_MAP_EXEC)) != 0)
+        return PROC_IPC_ERR_INVAL;
+
+    struct proc_shm_region *r = &g_regions[region_id];
+    if (!r->used) return PROC_IPC_ERR_NOENT;
+    if (r->owner_core != core_id()) return PROC_IPC_ERR_UNSUPPORTED;
+
+    u32 acl = principal_acl(principal, r->owner_principal, r->peer_principal,
+                            r->owner_acl, r->peer_acl);
+    u32 needed = 0;
+    if (req_flags & PROC_IPC_MAP_READ) needed |= PROC_IPC_PERM_MAP_READ;
+    if (req_flags & PROC_IPC_MAP_WRITE) needed |= PROC_IPC_PERM_MAP_WRITE;
+    if ((acl & needed) != needed) return PROC_IPC_ERR_ACCESS;
+
+    for (u32 i = 0; i < PROC_IPC_SHM_MAX_MAPS; i++) {
+        if (g_maps[i].used) continue;
+        u32 gen = bump_generation(g_maps[i].generation);
+        memset(&g_maps[i], 0, sizeof(g_maps[i]));
+        g_maps[i].used = true;
+        g_maps[i].generation = gen;
+        g_maps[i].region_id = region_id;
+        g_maps[i].core = core_id();
+        g_maps[i].principal = principal;
+        g_maps[i].pid = pid;
+        g_maps[i].flags = req_flags;
+        dmb(); /* map metadata committed before address handoff */
+        *addr_out = (void *)(usize)(IPC_SHM_BASE + r->offset);
+        *size_out = r->size;
+        dmb(); /* address/size visible before caller consumes handle */
+        return (i32)i;
+    }
+    return PROC_IPC_ERR_NOSPC;
+}
+
+i32 ipc_proc_shm_unmap(u32 principal, u32 pid, i32 map_handle)
+{
+    if (map_handle < 0 || map_handle >= PROC_IPC_SHM_MAX_MAPS) return PROC_IPC_ERR_INVAL;
+    struct proc_shm_map *m = &g_maps[map_handle];
+    if (!m->used) return PROC_IPC_ERR_NOENT;
+    if (m->core != core_id()) return PROC_IPC_ERR_UNSUPPORTED;
+    if (m->principal != principal || m->pid != pid)
+        return PROC_IPC_ERR_ACCESS;
+    dmb(); /* caller must complete writes before releasing map handle */
+    poison_map(m);
+    dmb();
+    return PROC_IPC_OK;
+}

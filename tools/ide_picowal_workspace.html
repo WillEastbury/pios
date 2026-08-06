@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<!-- ide_picowal_workspace.html -- the PIOS PicoWAL workspace, embedded into the
+     vendored PicoScript WebIDE portal at /picoscript/picowal.html and opened
+     from that portal's "PicoWAL" tab via an iframe (CSS-isolated from the
+     portal). This page is authored for PIOS: it drives the kernel's own
+     core0-safe HTTP endpoints -- /api/walfs, /api/capsule, /api/terminal -- and
+     hosts a Fast Serial (BSO1) panel backed by the vendored BareMetal.Binary.js
+     codec (served at /picoscript/baremetal-binary.js). There is no external
+     PicoWAL daemon and no PicoSTS auth. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PIOS PicoWAL Workspace</title>
+<style>
+  :root { --bg:#16213e; --panel:#1b2a4a; --edge:#26406e; --fg:#dce6ff; --muted:#8fa6d4; --accent:#4fd1c5; --act:#f6ad55; --err:#fc8181; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--edge); }
+  header h1 { font-size:14px; margin:0; color:var(--accent); font-weight:600; }
+  header .sub { color:var(--muted); font-size:11px; }
+  nav { display:flex; gap:4px; padding:6px 12px; background:var(--panel); border-bottom:1px solid var(--edge); flex-wrap:wrap; }
+  nav button { background:transparent; color:var(--muted); border:1px solid transparent; border-radius:6px; padding:5px 12px; cursor:pointer; font:inherit; }
+  nav button.active { color:var(--fg); background:var(--bg); border-color:var(--edge); }
+  main { padding:12px; }
+  .view { display:none; }
+  .view.active { display:block; }
+  .row { display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  input,textarea,select { background:var(--bg); color:var(--fg); border:1px solid var(--edge); border-radius:6px; padding:6px 8px; font:inherit; }
+  input[type=text],input[type=number] { min-width:80px; }
+  textarea { width:100%; min-height:220px; resize:vertical; }
+  button.go { background:var(--edge); color:var(--fg); border:1px solid var(--edge); border-radius:6px; padding:6px 12px; cursor:pointer; font:inherit; }
+  button.go.act { background:var(--act); color:#241a06; border-color:var(--act); }
+  .list { border:1px solid var(--edge); border-radius:6px; max-height:260px; overflow:auto; }
+  .list div { padding:5px 10px; cursor:pointer; border-bottom:1px solid var(--edge); }
+  .list div:hover { background:var(--panel); }
+  .list div.dir { color:var(--accent); }
+  .status { color:var(--muted); font-size:11px; min-height:16px; margin-top:6px; }
+  .status.err { color:var(--err); }
+  pre { background:var(--bg); border:1px solid var(--edge); border-radius:6px; padding:8px; overflow:auto; max-height:320px; white-space:pre-wrap; word-break:break-word; }
+  label { color:var(--muted); }
+  .hint { color:var(--muted); font-size:11px; margin:4px 0 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PicoWAL Workspace</h1>
+  <span class="sub" id="buildInfo">on-board WALFS + capsule store</span>
+</header>
+<nav id="tabs">
+  <button data-view="walfs" class="active">WALFS Browser</button>
+  <button data-view="capsule">Capsule Store</button>
+  <button data-view="terminal">Terminal</button>
+  <button data-view="bso1">Fast Serial (BSO1)</button>
+</nav>
+<main>
+  <!-- WALFS -->
+  <section id="view-walfs" class="view active">
+    <div class="row">
+      <label>path</label>
+      <input type="text" id="walfsPath" value="/" size="40">
+      <button class="go" id="walfsList">List</button>
+      <select id="walfsMode"><option value="text">text</option><option value="hex">hex</option></select>
+    </div>
+    <div class="list" id="walfsEntries"></div>
+    <div class="status" id="walfsStatus"></div>
+    <pre id="walfsView" style="display:none"></pre>
+  </section>
+  <!-- Capsule -->
+  <section id="view-capsule" class="view">
+    <div class="row">
+      <label>pack</label><input type="number" id="capPack" value="0" min="0">
+      <button class="go" id="capList">List cards</button>
+      <label>card</label><input type="number" id="capCard" value="0" min="0">
+      <button class="go" id="capGet">Read</button>
+      <select id="capMode"><option value="text">text</option><option value="hex">hex</option></select>
+      <button class="go act" id="capPut">Write</button>
+    </div>
+    <div class="hint">Read/Write use /api/capsule (chunked: get max=4096 B, puthex 1024 B/call).</div>
+    <div class="list" id="capCards"></div>
+    <textarea id="capData" placeholder="card contents (text or hex per selector)"></textarea>
+    <div class="status" id="capStatus"></div>
+  </section>
+  <!-- Terminal -->
+  <section id="view-terminal" class="view">
+    <div class="row">
+      <label>cmd</label>
+      <input type="text" id="termCmd" value="help" size="48">
+      <button class="go act" id="termRun">Run</button>
+    </div>
+    <div class="hint">Passthrough to /api/terminal?cmd= (same commands as the UART/TCP console).</div>
+    <pre id="termOut"></pre>
+    <div class="status" id="termStatus"></div>
+  </section>
+  <!-- BSO1 -->
+  <section id="view-bso1" class="view">
+    <div class="hint">BSO1 codec vendored from baremetaljstools (BareMetal.Binary.js). Encodes a JSON value to a BSO1 frame and decodes it back to prove the on-board codec round-trips.</div>
+    <div class="row"><label>JSON</label><input type="text" id="bsoInput" value='{"pid":7,"name":"core1","ok":true}' size="48">
+      <button class="go act" id="bsoRun">Encode + Decode</button></div>
+    <pre id="bsoOut"></pre>
+    <div class="status" id="bsoStatus"></div>
+  </section>
+</main>
+<script src="/picoscript/baremetal-binary.js"></script>
+<script>
+(function () {
+  "use strict";
+  var CFG = { capsule_prefix: "/api/capsule", walfs_prefix: "/api/walfs", terminal_prefix: "/api/terminal" };
+  function byId(id) { return document.getElementById(id); }
+  function setStatus(el, msg, isErr) { el.textContent = msg || ""; el.className = "status" + (isErr ? " err" : ""); }
+  function j(url) { return fetch(url, { credentials: "same-origin" }).then(function (r) { return r.json(); }); }
+
+  var HEX = "0123456789abcdef";
+  function bytesToHex(b) { var s = ""; for (var i = 0; i < b.length; i++) { var v = b[i] & 255; s += HEX[v >> 4] + HEX[v & 15]; } return s; }
+  function hexToBytes(h) { h = (h || "").replace(/[^0-9a-fA-F]/g, ""); if (h.length & 1) h = h.slice(0, -1); var o = new Uint8Array(h.length / 2); for (var i = 0; i < o.length; i++) o[i] = parseInt(h.substr(i * 2, 2), 16); return o; }
+  function utf8Bytes(s) { if (window.TextEncoder) return new TextEncoder().encode(s); var u = unescape(encodeURIComponent(s)), a = new Uint8Array(u.length); for (var i = 0; i < u.length; i++) a[i] = u.charCodeAt(i); return a; }
+  function utf8Decode(b) { if (window.TextDecoder) return new TextDecoder().decode(b); var s = ""; for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); try { return decodeURIComponent(escape(s)); } catch (e) { return s; } }
+
+  /* tabs */
+  byId("tabs").addEventListener("click", function (e) {
+    var v = e.target && e.target.getAttribute("data-view"); if (!v) return;
+    document.querySelectorAll("#tabs button").forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-view") === v); });
+    document.querySelectorAll(".view").forEach(function (s) { s.classList.toggle("active", s.id === "view-" + v); });
+  });
+
+  /* config (best-effort; falls back to defaults) */
+  fetch("/picoscript/config", { credentials: "same-origin" }).then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (c) {
+      if (!c) return;
+      if (c.capsule_prefix) CFG.capsule_prefix = c.capsule_prefix;
+      if (c.walfs_prefix) CFG.walfs_prefix = c.walfs_prefix;
+      if (c.terminal_prefix) CFG.terminal_prefix = c.terminal_prefix;
+      var info = byId("buildInfo");
+      if (c.build) info.textContent = "build " + c.build + " \u00b7 hooks " + (c.hook_table_version || "?");
+    }).catch(function () { });
+
+  /* ---------- WALFS ---------- */
+  function walfsList() {
+    var path = byId("walfsPath").value || "/";
+    var mode = byId("walfsMode").value;
+    byId("walfsView").style.display = "none";
+    j(CFG.walfs_prefix + "?path=" + encodeURIComponent(path) + "&mode=" + mode)
+      .then(function (r) {
+        if (!r.ok) { setStatus(byId("walfsStatus"), r.error || "not found", true); byId("walfsEntries").innerHTML = ""; return; }
+        if (r.dir) {
+          var box = byId("walfsEntries"); box.innerHTML = "";
+          (r.entries || []).forEach(function (ent) {
+            var d = document.createElement("div");
+            d.textContent = (ent.dir ? "[dir] " : "      ") + ent.name + (ent.dir ? "" : "  (" + ent.size + " B)");
+            if (ent.dir) d.className = "dir";
+            d.addEventListener("click", function () {
+              byId("walfsPath").value = (path === "/" ? "" : path.replace(/\/+$/, "")) + "/" + ent.name;
+              walfsList();
+            });
+            box.appendChild(d);
+          });
+          setStatus(byId("walfsStatus"), r.count + " entries in " + r.path);
+        } else {
+          byId("walfsEntries").innerHTML = "";
+          var pre = byId("walfsView"); pre.style.display = "block"; pre.textContent = r.data || "";
+          setStatus(byId("walfsStatus"), r.name + " \u00b7 " + r.size + " B \u00b7 view " + r.view);
+        }
+      }).catch(function (e) { setStatus(byId("walfsStatus"), e.message, true); });
+  }
+  byId("walfsList").addEventListener("click", walfsList);
+
+  /* ---------- Capsule ---------- */
+  var GET_CHUNK = 4096, PUT_CHUNK = 1024;
+  function capList() {
+    var pack = byId("capPack").value | 0;
+    j(CFG.capsule_prefix + "?op=list&pack=" + pack).then(function (r) {
+      var box = byId("capCards"); box.innerHTML = "";
+      if (!r.ok) { setStatus(byId("capStatus"), r.error || "list failed", true); return; }
+      (r.cards || []).forEach(function (c) {
+        var d = document.createElement("div");
+        d.textContent = "card " + c.card + "  [" + (c.role || "") + "]";
+        d.addEventListener("click", function () { byId("capCard").value = c.card; capGet(); });
+        box.appendChild(d);
+      });
+      setStatus(byId("capStatus"), r.count + " cards in pack " + pack);
+    }).catch(function (e) { setStatus(byId("capStatus"), e.message, true); });
+  }
+  function capGet() {
+    var pack = byId("capPack").value | 0, card = byId("capCard").value | 0, mode = byId("capMode").value;
+    var acc = [];
+    function step(off) {
+      return j(CFG.capsule_prefix + "?op=get&pack=" + pack + "&card=" + card + "&offset=" + off + "&max=" + GET_CHUNK)
+        .then(function (r) {
+          if (!r.ok) throw new Error(r.error || "read failed");
+          var chunk = hexToBytes(r.data || ""); acc.push(chunk);
+          var next = off + chunk.length;
+          if (r.truncated && chunk.length && next < r.totalBytes) return step(next);
+          var all = new Uint8Array(next), p = 0; acc.forEach(function (c) { all.set(c, p); p += c.length; });
+          all = all.subarray(0, r.totalBytes || next);
+          byId("capData").value = (mode === "hex") ? bytesToHex(all) : utf8Decode(all);
+          setStatus(byId("capStatus"), "read " + all.length + " B from card " + card);
+        });
+    }
+    step(0).catch(function (e) { setStatus(byId("capStatus"), e.message, true); });
+  }
+  function capPut() {
+    var pack = byId("capPack").value | 0, card = byId("capCard").value | 0, mode = byId("capMode").value;
+    var raw = byId("capData").value;
+    var bytes = (mode === "hex") ? hexToBytes(raw) : utf8Bytes(raw);
+    var chain = Promise.resolve();
+    for (var off = 0; off < bytes.length; off += PUT_CHUNK) (function (o) {
+      chain = chain.then(function () {
+        var slice = bytes.subarray(o, Math.min(o + PUT_CHUNK, bytes.length));
+        return j(CFG.capsule_prefix + "?op=puthex&pack=" + pack + "&card=" + card + "&offset=" + o + "&hex=" + bytesToHex(slice))
+          .then(function (r) { if (!r.ok) throw new Error(r.error || "write failed"); });
+      });
+    })(off);
+    if (bytes.length === 0) chain = j(CFG.capsule_prefix + "?op=puthex&pack=" + pack + "&card=" + card + "&offset=0&hex=");
+    chain.then(function () { setStatus(byId("capStatus"), "wrote " + bytes.length + " B to card " + card); })
+      .catch(function (e) { setStatus(byId("capStatus"), e.message, true); });
+  }
+  byId("capList").addEventListener("click", capList);
+  byId("capGet").addEventListener("click", capGet);
+  byId("capPut").addEventListener("click", capPut);
+
+  /* ---------- Terminal ---------- */
+  function termRun() {
+    var cmd = byId("termCmd").value || "";
+    setStatus(byId("termStatus"), "running...");
+    fetch(CFG.terminal_prefix + "?cmd=" + encodeURIComponent(cmd), { credentials: "same-origin" })
+      .then(function (r) { return r.text(); })
+      .then(function (t) { byId("termOut").textContent = t; setStatus(byId("termStatus"), "ok"); })
+      .catch(function (e) { setStatus(byId("termStatus"), e.message, true); });
+  }
+  byId("termRun").addEventListener("click", termRun);
+  byId("termCmd").addEventListener("keydown", function (e) { if (e.key === "Enter") termRun(); });
+
+  /* ---------- BSO1 ---------- */
+  function bso1Codec() {
+    return (window.BareMetal && (window.BareMetal.Binary || window.BareMetal)) ||
+           window.BareMetalBinary || window.BSO1 || null;
+  }
+  byId("bsoRun").addEventListener("click", function () {
+    var out = byId("bsoOut"), st = byId("bsoStatus");
+    var codec = bso1Codec();
+    if (!codec) { setStatus(st, "BareMetal.Binary.js not loaded", true); return; }
+    var val;
+    try { val = JSON.parse(byId("bsoInput").value); } catch (e) { setStatus(st, "invalid JSON: " + e.message, true); return; }
+    try {
+      var enc = codec.encode ? codec.encode(val) : (codec.serialize ? codec.serialize(val) : null);
+      if (!enc) throw new Error("codec exposes no encode()/serialize()");
+      var bytes = (enc instanceof Uint8Array) ? enc : new Uint8Array(enc);
+      var dec = codec.decode ? codec.decode(bytes) : (codec.deserialize ? codec.deserialize(bytes) : null);
+      out.textContent =
+        "encoded " + bytes.length + " bytes:\n" + bytesToHex(bytes) +
+        "\n\ndecoded:\n" + JSON.stringify(dec, null, 2);
+      setStatus(st, "round-trip ok");
+    } catch (e) { setStatus(st, "codec error: " + e.message, true); }
+  });
+
+  /* initial */
+  walfsList();
+})();
+</script>
+</body>
+</html>
