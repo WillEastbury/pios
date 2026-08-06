@@ -527,7 +527,14 @@ void mmu_init(void) {
             continue;
         }
         bool cache = (addr >= CORE0_RAM_BASE && addr < SHARED_FIFO_BASE) ||
-                     (addr >= FB_BACK_BASE && addr < FB_BACK_BASE + FB_BACK_SIZE);
+                     (addr >= FB_BACK_BASE && addr < FB_BACK_BASE + FB_BACK_SIZE) ||
+                     /* Global process arena (ADR-024). Given its FINAL Normal-WB
+                      * attributes here, at the first MMU enable -- never mapped
+                      * NC and tightened later. A boot-time WB<->NC transition on
+                      * a live region is exactly what produced the RX
+                      * descriptor-hole bug (docs/gotchas.md). */
+                     (addr >= PROC_ARENA_BASE &&
+                      addr < PROC_ARENA_BASE + PROC_ARENA_SIZE);
         l2[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);
     }
     l1[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;

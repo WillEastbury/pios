@@ -1757,7 +1757,15 @@ static u8 *core_ram_base(void)
 
 static u8 *slot_base(u32 slot)
 {
-    return core_ram_base() + PROC_SLOT_OFFSET + (u64)slot * PROC_SLOT_SIZE;
+    /*
+     * ADR-024: slots come from the global process arena, NOT the calling core's
+     * private RAM. The old computation (core_ram_base() + PROC_SLOT_OFFSET +
+     * slot * PROC_SLOT_SIZE) meant a slot's physical address depended on which
+     * core happened to launch it, which capped the system at ~6 slots and made
+     * migration impossible -- the same slot index resolved to different memory
+     * on different cores.
+     */
+    return (u8 *)(usize)PROC_SLOT_PHYS(slot);
 }
 
 /* Guards the scan-and-claim in find_empty_slot(): cores 2/3 (per the fixed
@@ -2213,7 +2221,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
      * matching the pattern proc_exec_from_mem_el0() already uses for its
      * caller-supplied physical_base. This function currently has no
      * callers (dead code), but a latent trap like this shouldn't ship. */
-    u64 expected_lo = (u64)(usize)core_ram_base() + PROC_SLOT_OFFSET;
+    u64 expected_lo = PROC_ARENA_BASE;
     if (PROC_EMBED_BASE < expected_lo || (PROC_EMBED_BASE - expected_lo) % PROC_SLOT_SIZE != 0)
         return -1;
     u32 required_slot = (u32)((PROC_EMBED_BASE - expected_lo) / PROC_SLOT_SIZE);
@@ -2363,7 +2371,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
         return -1;
     }
 
-    u64 expected_lo = (u64)(usize)core_ram_base() + PROC_SLOT_OFFSET;
+    u64 expected_lo = PROC_ARENA_BASE;
     if (physical_base < expected_lo || (physical_base - expected_lo) % PROC_SLOT_SIZE != 0) {
         el0_launch_status = -5;
         return -1;

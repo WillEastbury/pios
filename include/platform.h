@@ -221,6 +221,33 @@
 #define PIOS_IPC_SHM_SIZE           0x00100000UL
 #define PIOS_FB_BACK_SIZE           0x01000000UL
 
+/*
+ * Global process arena (ADR-024 / issue #84).
+ *
+ * Process memory used to be carved out of the owning core's fixed 16 MB private
+ * region, which capped the whole system at ~6 slots and — more importantly —
+ * made a process's memory *belong to a core*, so it could never migrate (#85).
+ * Slots now come from one global arena instead. Only signalling and buffering
+ * keep fixed per-core/shared reservations.
+ *
+ * Placement rules, both load-bearing:
+ *   - clear of the stage0 staging/trampoline window (Pi5 0x08000000 /
+ *     0x07FFF000, QEMU 0x48000000 / 0x47FFF000), or an OTA would overwrite live
+ *     process memory;
+ *   - clear of FB_BACK and every other reservation above.
+ *
+ * Pi5 sits at 256 MB, inside L1[0]/l2_table_low, and is given Normal-WB
+ * attributes at the FIRST MMU enable (see mmu_init) — never mapped one way and
+ * tightened later, which is the boot-time WB->NC transition that caused the RX
+ * descriptor-hole bug. QEMU sits inside the L1[1] 1 GB block, above staging.
+ */
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+#define PIOS_PROC_ARENA_BASE        0x50000000UL
+#else
+#define PIOS_PROC_ARENA_BASE        0x10000000UL
+#endif
+#define PIOS_PROC_ARENA_SIZE        0x02000000UL   /* 32 MB = 16 x 2 MB slots */
+
 /* Experimental native VideoCore probe.
  * 0 = keep the stable firmware-mailbox framebuffer path only.
  * 1 = additionally run a read-only VC6/V3D register visibility probe.

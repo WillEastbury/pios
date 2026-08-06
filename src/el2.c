@@ -826,15 +826,11 @@ bool el2_stage2_selftest(void)
     bool ca_was_enabled = g_stage2[IDC].enabled;
 
     bool ok = true;
-    /* Use the free tail of core2/core3 private RAM as dummy PA windows:
-     * slots occupy [core_base+PROC_SLOT_OFFSET, core_base+PROC_SLOT_OFFSET+
-     * MAX_PROCS_PER_CORE*PROC_SLOT_SIZE) = [+1MB, +13MB) on each core, so
-     * +14MB is guaranteed clear of any real, currently-configured capsule
-     * (now that isolation is mandatory by default, real boot processes do
-     * occupy real stage-2 ranges at the low end of each core's RAM -- an
-     * earlier version of this test collided with one of those and the new
-     * overlap check correctly rejected it). Using two different cores'
-     * RAM keeps the two windows trivially disjoint from each other too. */
+    /* Use the free tail of core2/core3 private RAM as dummy PA windows. Since
+     * ADR-024 real process slots live in the global process arena
+     * (PROC_ARENA_BASE), entirely outside per-core RAM, so these scratch
+     * windows are trivially clear of any real capsule. Using two different
+     * cores' RAM keeps the two windows disjoint from each other too. */
     u64 pa_a = CORE2_RAM_BASE + (14UL << 20);
     u64 pa_b = CORE3_RAM_BASE + (14UL << 20);
 

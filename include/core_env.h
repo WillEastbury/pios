@@ -47,6 +47,12 @@
 #define FB_BACK_BASE        PIOS_FB_BACK_BASE
 #define FB_BACK_SIZE        PIOS_FB_BACK_SIZE
 
+/* Global process arena (ADR-024). Process slots are allocated from here rather
+ * than from the owning core's private RAM, so process memory no longer belongs
+ * to a core. Mapped Normal-WB at the first MMU enable. */
+#define PROC_ARENA_BASE     PIOS_PROC_ARENA_BASE
+#define PROC_ARENA_SIZE     PIOS_PROC_ARENA_SIZE
+
 /* Core 0's first 4 KiB is reserved for the core_env owner record plus small
  * cross-core control objects that require WB Inner-Shareable memory (notably
  * exclusive-access spinlocks). The bump allocator starts after this page. */

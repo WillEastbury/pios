@@ -8954,9 +8954,9 @@ static void http_append_mem_analyze(char *out, u32 *len, u32 max)
         http_append(out, len, max, " ");
         http_append_u64(out, len, max, base);
         http_append(out, len, max, " ");
-        http_append_u64(out, len, max, base + PROC_SLOT_OFFSET);
+        http_append_u64(out, len, max, PROC_ARENA_BASE);
         http_append(out, len, max, " ");
-        http_append_u64(out, len, max, base + PROC_SLOT_OFFSET + ((u64)MAX_PROCS_PER_CORE * PROC_SLOT_SIZE));
+        http_append_u64(out, len, max, PROC_ARENA_BASE + ((u64)MAX_PROCS_PER_CORE * PROC_SLOT_SIZE));
         http_append(out, len, max, "\n");
     }
     http_append(out, len, max, "PROC PID CORE STATE MEMK ACAP AUSED AHI ABUMP ASPAN SCNT IMAGE\n");
@@ -13721,9 +13721,9 @@ static void ui_cmd_mem(u32 argc, char **argv)
         ui_console_write(" ");
         ui_console_hex_fixed(core_ram_bases[c], 16);
         ui_console_write(" ");
-        ui_console_hex_fixed(core_ram_bases[c] + PROC_SLOT_OFFSET, 16);
+        ui_console_hex_fixed(PROC_ARENA_BASE, 16);
         ui_console_write(" ");
-        ui_console_hex_fixed(core_ram_bases[c] + PROC_SLOT_OFFSET + ((u64)MAX_PROCS_PER_CORE * PROC_SLOT_SIZE), 16);
+        ui_console_hex_fixed(PROC_ARENA_BASE + ((u64)MAX_PROCS_PER_CORE * PROC_SLOT_SIZE), 16);
         ui_console_write("\n");
     }
     ui_console_write("PROC PID CORE STATE MEMK ACAP AUSED AHI ABUMP ASPAN SCNT IMAGE\n");
@@ -22999,34 +22999,33 @@ extern const u8 user_el0_pico_end[];
 extern const u8 user_capsvc_host0_start[];
 extern const u8 user_capsvc_host0_end[];
 
-/* Physical slot bases for the kernel-embedded EL0 HTTP workers, derived from
- * the platform core RAM map so the identical launch path works on Pi5 and
- * QEMU. proc_exec_from_mem_el0() recomputes the slot from
- * (physical_base - core_ram_base - PROC_SLOT_OFFSET) / PROC_SLOT_SIZE and
- * refuses a mismatch, so each value must equal slot_base(slot) for its core.
- * core 2 uses slot 0; core 3 deliberately uses slot 1. The linked base is the
+/* Physical slot bases for the kernel-embedded EL0 workers.
+ *
+ * ADR-024: these now come from the GLOBAL process arena, so a slot's address no
+ * longer depends on which core launches it. procs[] was already a shared array
+ * with global slot indices; previously the *address* was core-relative while the
+ * *index* was global, which is why slot 2 below had to be hand-picked against
+ * core 3's base. Now index and address agree: PROC_SLOT_PHYS(n).
+ *
+ * proc_exec_from_mem_el0() recomputes the slot from the arena base and refuses a
+ * mismatch, so each value must equal slot_base(slot). The linked base is the
  * high EL0 image VA (mmu.c USER_HIGH_LINK_BASE). */
 #define HTTPD_VM_EL0_LINK_BASE   0x2001000000ULL
 #define HTTPD_VM_EL0_CORE2_SLOT  0U
 #define HTTPD_VM_EL0_CORE3_SLOT  1U
-#define HTTPD_VM_EL0_CORE2_PHYS  \
-    (CORE2_RAM_BASE + PROC_SLOT_OFFSET + (u64)HTTPD_VM_EL0_CORE2_SLOT * PROC_SLOT_SIZE)
-#define HTTPD_VM_EL0_CORE3_PHYS  \
-    (CORE3_RAM_BASE + PROC_SLOT_OFFSET + (u64)HTTPD_VM_EL0_CORE3_SLOT * PROC_SLOT_SIZE)
+#define HTTPD_VM_EL0_CORE2_PHYS  PROC_SLOT_PHYS(HTTPD_VM_EL0_CORE2_SLOT)
+#define HTTPD_VM_EL0_CORE3_PHYS  PROC_SLOT_PHYS(HTTPD_VM_EL0_CORE3_SLOT)
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI5
-_Static_assert(HTTPD_VM_EL0_CORE2_PHYS == 0x02900000ULL,
-               "core2 EL0 slot base must stay 0x02900000 on Pi5");
-_Static_assert(HTTPD_VM_EL0_CORE3_PHYS == 0x03B00000ULL,
-               "core3 EL0 slot base must stay 0x03B00000 on Pi5");
+_Static_assert(HTTPD_VM_EL0_CORE2_PHYS == 0x10000000ULL,
+               "core2 EL0 slot base must be arena slot 0 on Pi5");
+_Static_assert(HTTPD_VM_EL0_CORE3_PHYS == 0x10200000ULL,
+               "core3 EL0 slot base must be arena slot 1 on Pi5");
 #endif
-/* Generic capsvc host, capsule 0: procs[] is a SHARED array across all 4
- * cores (rc-percore-sched, src/proc.c), so slot indices are GLOBAL, not
- * per-core -- slot 0 is core2's httpd-vm-el0, slot 1 is core3's
- * httpd-vm1-el0 (both already in use), so this must use a different slot
- * number entirely, not "slot 0 relative to this core" again. Slot 2 is free. */
+/* Generic capsvc host, capsule 0. Slot indices are GLOBAL (procs[] is shared
+ * across cores), so this needs its own index; slots 0 and 1 are the two httpd
+ * workers. */
 #define CAPSVC_HOST0_SLOT 2U
-#define CAPSVC_HOST0_PHYS \
-    (CORE3_RAM_BASE + PROC_SLOT_OFFSET + (u64)CAPSVC_HOST0_SLOT * PROC_SLOT_SIZE)
+#define CAPSVC_HOST0_PHYS PROC_SLOT_PHYS(CAPSVC_HOST0_SLOT)
 NORETURN void core2_main(void) {
     core_mark_online(CORE_USER0, 1);
     core_env_init(CORE_USER0);

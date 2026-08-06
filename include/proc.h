@@ -10,6 +10,7 @@
 #include "types.h"
 #include "pipe.h"
 #include "mem_arena.h"
+#include "core_env.h"   /* PROC_ARENA_BASE/SIZE for PROC_SLOT_PHYS */
 #include "ipc_proc.h"
 struct irq_frame;
 
@@ -202,17 +203,52 @@ struct appf_service_record {
     u32 flags;
 } PACKED;
 
+/*
+ * Total concurrent process slots, system-wide (procs[] is shared and filtered
+ * by affinity, so this is NOT per core despite the historical name).
+ *
+ * STILL 6 -- see issue #84. The address-space half of ADR-024 is done: slots now
+ * come from the global process arena (PROC_SLOT_PHYS) instead of the owning
+ * core's private RAM, so a process's memory no longer belongs to a core and the
+ * old "~7 slots fit in a 16 MB region" ceiling is gone.
+ *
+ * Raising this is blocked on a measured regression, not on address space:
+ * `ipc bench 256` fails with errors scaling LINEARLY with this value
+ * (6 -> 0 errors, 12 -> 5, 16 -> 10) while `desc` stays 24. Partial failure that
+ * tracks slot count points at the per-slot scans on the hot path
+ * (proc_timer_tick's deadline sweep at 1 kHz, proc_drain_remote_wakes, the reap
+ * loop, proc_spans) rather than at anything structural. Fix that first; do not
+ * simply raise the number until `ipc bench` is clean.
+ *
+ * The other ceiling to remember when it is raised: mmu.c's per-slot page tables
+ * (user_l1, user_l2_low, user_l2_phys, user_l2_high, user_l3_proc, user_l3_ipc)
+ * cost ~28 KB per slot per user core, so they need a pool rather than static
+ * [3][MAX_PROCS_PER_CORE][512] arrays before this goes much higher.
+ */
 #define MAX_PROCS_PER_CORE  6
 #define PROC_UI_KERNEL_PID 0U
 #define PROC_UI_KERNEL_PARENT_PID 0xFFFFFFFFU
 #define PROC_SLOT_SIZE      (2 * 1024 * 1024)   /* 2MB per process */
-#define PROC_SLOT_OFFSET    0x100000             /* slots start 1MB into core RAM */
+#define PROC_SLOT_OFFSET    0x100000             /* legacy: slots 1MB into core RAM */
 
-/* Fixed load address for kernel-embedded flat userland binaries: core 2
- * (CORE_USER0) RAM base 0x02800000 + PROC_SLOT_OFFSET, i.e. slot 0. Must match
- * the link address in user/user.ld. proc_exec_from_mem refuses any other slot
- * so absolute relocations in the flat image always resolve correctly. */
-#define PROC_EMBED_BASE     0x02900000UL
+/* Physical base of arena slot `s`. Replaces the old
+ * CORE_RAM_BASE + PROC_SLOT_OFFSET + s * PROC_SLOT_SIZE computation, which tied
+ * a process's memory to whichever core happened to launch it. */
+#define PROC_SLOT_PHYS(s)   (PROC_ARENA_BASE + (u64)(s) * PROC_SLOT_SIZE)
+
+/* The arena must actually hold every slot the process table can allocate. */
+_Static_assert((u64)MAX_PROCS_PER_CORE * PROC_SLOT_SIZE <= PROC_ARENA_SIZE,
+               "process arena too small for MAX_PROCS_PER_CORE slots");
+/* Slots are 2 MB and the boot map gives the arena 2 MB blocks, so the arena
+ * must be 2 MB aligned or a slot would straddle two attribute regions. */
+_Static_assert((PROC_ARENA_BASE & 0x1FFFFFULL) == 0ULL,
+               "process arena must be 2MB aligned");
+
+/* Fixed load address for kernel-embedded flat EL1 userland binaries: process
+ * arena slot 0 (ADR-024). Must match the link address in user/user.ld.
+ * proc_exec_from_mem refuses any other slot, so absolute relocations in the
+ * flat image always resolve correctly. */
+#define PROC_EMBED_BASE     PROC_ARENA_BASE
 
 /* Process states */
 #define PROC_EMPTY    0
