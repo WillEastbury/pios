@@ -112,6 +112,44 @@ static inline u64 proc_kstack_top(u32 s)
     return ((u64)(usize)&proc_kstack[s][PROC_KSTACK_SIZE]) & ~15ULL;
 }
 
+/*
+ * High-water mark: one past the highest slot index ever claimed.
+ *
+ * Bounds the scheduler's hot per-slot loops (dispatch scan, ready scan, reap
+ * sweep, and proc_timer_tick's 1 kHz deadline sweep on every core) by the slots
+ * actually in use rather than the configured MAX_PROCS_PER_CORE ceiling, so loop
+ * cost tracks real process count instead of the compile-time maximum.
+ *
+ * NOTE: this was written to test the hypothesis that hot-loop cost was what made
+ * `ipc bench` fail as MAX_PROCS_PER_CORE rose. **It was not** -- the error count
+ * was completely unchanged (issue #86). Kept because it is correct and cheap and
+ * verified neutral (smoke 29/29 + load battery at 6 slots), but do not mistake it
+ * for a fix.
+ *
+ * Monotonic and never decreases: a freed slot stays within the scanned range,
+ * which keeps it safe -- a stale high water costs a few empty iterations, never a
+ * missed process. Written under g_slot_alloc_lock alongside the claim it
+ * describes.
+ */
+static volatile u32 proc_slot_high_water;
+
+static inline u32 proc_slot_scan_limit(void)
+{
+    u32 hw = proc_slot_high_water;
+    if (hw > MAX_PROCS_PER_CORE)
+        hw = MAX_PROCS_PER_CORE;
+    /* Never 0: the round-robin dispatch scan takes a modulo of this. Scanning
+     * one empty slot before the first process exists is harmless. */
+    return hw ? hw : 1U;
+}
+
+/* Extend the scanned range to cover a newly claimed slot. */
+static inline void proc_slot_note_used(u32 slot)
+{
+    if (slot < MAX_PROCS_PER_CORE && slot + 1U > proc_slot_high_water)
+        proc_slot_high_water = slot + 1U;
+}
+
 /* rc-percore-sched: the scheduler's saved context, the current-process index,
  * and the round-robin cursor are PER-CORE. procs[] stays shared (each core
  * filters by affinity_core), but a single global scheduler_ctx would let two
@@ -1860,6 +1898,7 @@ static i32 find_empty_slot(void)
 
     i32 chosen = (i32)empty[pick];
     procs[chosen].state = PROC_CLAIMED;
+    proc_slot_note_used((u32)chosen);
     __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
     return chosen;
 }
@@ -2238,6 +2277,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     bool busy = (procs[required_slot].state != PROC_EMPTY);
     if (!busy)
         procs[required_slot].state = PROC_CLAIMED;
+        proc_slot_note_used(required_slot);
     __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
     if (busy) {
         uart_puts("[proc] mem-exec: required slot busy\n");
@@ -2383,6 +2423,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     }
     i32 slot = (i32)linked_slot;
     el0_launch_slot = linked_slot;
+    proc_slot_note_used(linked_slot);
     if (procs[linked_slot].state != PROC_EMPTY) {
         uart_puts("[proc] el0 mem-exec: linked slot busy\n");
         el0_launch_status = -7;
@@ -2583,9 +2624,12 @@ void proc_schedule(void)
             u64 svc_now = ksvc_now_ticks();
             ksvc_end_at(svc_fifo, svc_fifo_t0, svc_now, false);
             ksvc_end_at(svc_sched, svc_sched_t0, svc_now, false);
-        }        proc_sched_stage(12);
+        }
+        proc_sched_stage(12);
         bool found = false;
-        for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+        /* Hot: bounded by slots actually in use, not the configured ceiling. */
+        const u32 scan_n = proc_slot_scan_limit();
+        for (u32 i = 0; i < scan_n; i++) {
             /* Only reap processes homed to this core. procs[] is shared across
              * the per-core schedulers; without this gate one core could reap a
              * DEAD slot another core still owns. */
@@ -2612,7 +2656,7 @@ void proc_schedule(void)
         proc_sched_stage(13);
 
         bool has_non_lazy_ready = false;
-        for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+        for (u32 i = 0; i < scan_n; i++) {
             if (procs[i].affinity_core != core_id())
                 continue;
             if (procs[i].state == PROC_READY && procs[i].priority_class != PROC_PRIO_LAZY) {
@@ -2623,8 +2667,8 @@ void proc_schedule(void)
 
         u32 chosen = 0xFFFFFFFFU;
         u32 best_prio = 0;
-        for (u32 step = 0; step < MAX_PROCS_PER_CORE; step++) {
-            u32 i = (rr_cursor + 1 + step) % MAX_PROCS_PER_CORE;
+        for (u32 step = 0; step < scan_n; step++) {
+            u32 i = (rr_cursor + 1 + step) % scan_n;
             if (procs[i].state != PROC_READY)
                 continue;
             /* Dispatch only processes homed to this core. Each core builds its
@@ -2994,7 +3038,8 @@ void proc_timer_tick(u32 core, u64 tick)
      * preempt a RUNNING one, so it must not be gated by the quantum-preempt
      * early-return below. */
     u64 now_ms = timer_monotonic_ms();
-    for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+    const u32 tick_scan_n = proc_slot_scan_limit();
+    for (u32 i = 0; i < tick_scan_n; i++) {
         struct process *bp = &procs[i];
         if (bp->affinity_core != core || bp->state != PROC_BLOCKED)
             continue;

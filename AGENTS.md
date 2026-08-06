@@ -5,7 +5,105 @@ Primary agent instructions live in [`.github/copilot-instructions.md`](.github/c
 
 ---
 
-## Continuation note — preemption made real (2026-08-06)
+## Operational quick reference (build / OTA / diagnostics / console)
+
+Verified working this session. Read this first after a machine restart.
+
+### Environment
+
+There is **no `make`** and the toolchain is **not on PATH**. Everything goes
+through the `.bat` files, which pin
+`C:\aarch64-none-elf\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-aarch64-none-elf\bin`.
+PowerShell mangles `-march` if you try to invoke the compiler directly, and
+`& $env:ComSpec /c ...` has been permission-denied here — use `cmd.exe /d /c`.
+
+```powershell
+cmd.exe /d /c "C:\source\pios\build_bootstrap.bat"    # Pi 5 stage0 + stage2 (real_kernel.img, PIOSSTG2.PKG)
+cmd.exe /d /c "C:\source\pios\build_qemu_full.bat"     # QEMU direct-boot image (build_qemu_full\PIOS_QEMU_FULL.BIN)
+```
+
+`include/build_version.h` is **regenerated on every build**. Always
+`git checkout -- include/build_version.h` before staging, or it shows up as a
+spurious diff.
+
+### Test
+
+```powershell
+python tests\run_host_tests.py                                    # pure-logic suites (adrv, airq, pctl, qbank, swake, ...)
+$env:PYTHONIOENCODING="utf-8"; python tools\qemu_smoke.py          # 29/29 + load battery
+python tools\qemu_smoke.py --no-load                              # smoke only (faster)
+python tools\qemu_smoke.py --build                                # build then smoke
+python tools\qemu_preempt_soak.py                                 # ADR-018 preemption proof (QEMU)
+python tools\qemu_preempt_soak.py --host 192.168.0.201 --units 60 # same, against the live board
+```
+
+### Deploy to the live Pi 5 (`192.168.0.201`)
+
+```powershell
+cmd.exe /d /c "C:\source\pios\build_bootstrap.bat"
+python tools\pios_ota_update.py --chunked --reboot
+```
+
+`--chunked --reboot` is the **reliable** path; the plain streaming path silently
+failed to commit once. A/B slots plus auto-rollback protect a bad image, so an
+OTA is a safe way to test — but the board must be reachable first.
+
+### Diagnostics
+
+Every terminal command is available over HTTP (and the same dispatcher backs the
+UART/TCP console, so output is identical):
+
+```powershell
+$c=[uri]::EscapeDataString("proc sched")
+(Invoke-WebRequest -Uri "http://192.168.0.201/api/terminal?cmd=$c" -TimeoutSec 30 -UseBasicParsing).Content
+```
+
+| Command | Shows |
+|---|---|
+| `selftest` | the 14-test battery (expect `14/14 ALL PASS`) |
+| `proc sched` | per-core `BUSY_PERMILLE / IDLE / WAKE / PREEMPT / SOFT_EVT / TIMER_IRQ` |
+| `processes` | pid, core, state, memory, plus the process graph |
+| `services` | listening ports with owning pid/core/process and self-published description |
+| `netstat`, `arp`, `route` | network state |
+| `macbdiag` | wired NIC health — `rx_wedge`, `rx_hole_recover`, `rx_recover` must be 0 |
+| `ipc bench 256` | cross-core FIFO/span benchmark (see issue #86) |
+| `sgi stat`, `core status` | doorbell delivery and per-core liveness |
+| `wifi ...` | `scan`, `status`, `fwlog`, `join` |
+
+`/api/status` is the cheap liveness/version probe used by every harness.
+
+### Consoles
+
+- **UART serial console** — physical UART on the Pi 5, always available even when
+  the network is wedged. This is the fail-safe path; a wedge that kills HTTP
+  usually leaves UART alive.
+- **TCP console on port 2323** — same command surface as UART, over the network.
+- **HTTP `/api/terminal`** — same shared dispatcher again
+  (`http_exec_terminal_command`), which is why a command added to one appears on
+  all three.
+
+Under QEMU the serial console is redirected to a file
+(`-serial file:qemu_smoke_serial.log`), which is where boot hangs show up.
+
+### Two traps that have cost real time
+
+1. **CRLF.** The edit tool has silently rewritten whole files as CRLF three
+   times (`src/exception.c`, `README.md`, `src/ksvc.c`, `src/abi.c`, `src/el2.c`,
+   `user/user.ld`), producing thousand-line phantom diffs. **Always check
+   `git ls-files --eol <files>` before committing** and normalise with
+   `[IO.File]::ReadAllText($p) -replace "\`r\`n","\`n"`. Note `include/cyw43.h`,
+   `src/cyw43.c` and `docs/network.md` are legitimately CRLF in the index.
+2. **Never switch the `gh` account.** Select the account per command:
+   `gh auth token --hostname github.com --user WillEastbury`. For `git push`, use
+   a command-scoped header rather than changing global config:
+   ```powershell
+   $t = gh auth token --hostname github.com --user WillEastbury
+   $b = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$t"))
+   git -c http.extraheader="AUTHORIZATION: basic $b" push origin main
+   ```
+   `AUTHORIZATION: bearer` does **not** work for git-over-HTTPS; it must be basic.
+
+---
 
 ### Status: ADR-021 implemented and proven on live Pi 5.
 

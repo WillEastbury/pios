@@ -207,18 +207,20 @@ struct appf_service_record {
  * Total concurrent process slots, system-wide (procs[] is shared and filtered
  * by affinity, so this is NOT per core despite the historical name).
  *
- * STILL 6 -- see issue #84. The address-space half of ADR-024 is done: slots now
- * come from the global process arena (PROC_SLOT_PHYS) instead of the owning
- * core's private RAM, so a process's memory no longer belongs to a core and the
- * old "~7 slots fit in a 16 MB region" ceiling is gone.
+ * STILL 6 -- see issues #84 and #86. The address-space half of ADR-024 is done:
+ * slots now come from the global process arena (PROC_SLOT_PHYS) instead of the
+ * owning core's private RAM, so a process's memory no longer belongs to a core
+ * and the old "~7 slots fit in a 16 MB region" ceiling is gone.
  *
- * Raising this is blocked on a measured regression, not on address space:
- * `ipc bench 256` fails with errors scaling LINEARLY with this value
- * (6 -> 0 errors, 12 -> 5, 16 -> 10) while `desc` stays 24. Partial failure that
- * tracks slot count points at the per-slot scans on the hot path
- * (proc_timer_tick's deadline sweep at 1 kHz, proc_drain_remote_wakes, the reap
- * loop, proc_spans) rather than at anything structural. Fix that first; do not
- * simply raise the number until `ipc bench` is clean.
+ * Raising this is blocked on a measured, unexplained regression (#86), NOT on
+ * address space: `ipc bench 256` fails with errors scaling with this value
+ * (6 -> 0 errors, 12 -> 5, 16 -> 10) while `desc` stays 24.
+ *
+ * Do NOT assume it is hot-loop cost. That hypothesis was tested and DISPROVEN:
+ * proc_slot_high_water now bounds every hot per-slot scan (dispatch, ready,
+ * reap, and proc_timer_tick's 1 kHz deadline sweep) by slots actually in use, so
+ * with three processes the scans are identical at 6 and 16 -- and the error
+ * count was unchanged at exactly 10. Root cause is still open.
  *
  * The other ceiling to remember when it is raised: mmu.c's per-slot page tables
  * (user_l1, user_l2_low, user_l2_phys, user_l2_high, user_l3_proc, user_l3_ipc)
