@@ -658,6 +658,16 @@ static u32 sdpcm_build_header(u8 *buf, u32 payload_len, u8 channel)
     return SDPCM_HEADER_LEN;
 }
 
+static bool sdpcm_can_send(u8 channel)
+{
+    if (channel >= 8U)
+        return false;
+    if ((u8)(cyw_tx_max - cyw_tx_seq) == 0U)
+        return false;
+    return channel != SDPCM_DATA_CHANNEL ||
+           (cyw_tx_fcmask & (u8)(1U << SDPCM_DATA_CHANNEL)) == 0U;
+}
+
 static bool sdpcm_send(u8 channel, const u8 *data, u32 len)
 {
     if (channel >= 8U)
@@ -673,7 +683,8 @@ static bool sdpcm_send(u8 channel, const u8 *data, u32 len)
      * block (reactor/association pokes) check credit before calling. */
     u64 credit_deadline = timer_monotonic_ms() + 30000ULL;
     while ((u8)(cyw_tx_max - cyw_tx_seq) == 0U ||
-           (cyw_tx_fcmask & (u8)(1U << channel)) != 0U) {
+           (channel == SDPCM_DATA_CHANNEL &&
+            (cyw_tx_fcmask & (u8)(1U << SDPCM_DATA_CHANNEL)) != 0U)) {
         if (sdpcm_pending_bytes() != 0U) {
             u8 pending_channel = 0;
             u32 pending_len = CYW_MAX_FRAME;
@@ -1406,38 +1417,12 @@ static bool scan_parse_legacy_results(const u8 *data, u32 len)
     return true;
 }
 
-static bool scan_fetch_legacy_results(void)
-{
-    static u8 result_buf[CYW_SCAN_QUERY_BYTES] ALIGNED(64);
-    bool parsed = false;
-    for (u32 attempt = 0U; attempt < 2U; attempt++) {
-        memset(result_buf, 0, sizeof(result_buf));
-        result_buf[0] = (u8)(sizeof(result_buf) & 0xFFU);
-        result_buf[1] = (u8)((sizeof(result_buf) >> 8) & 0xFFU);
-        result_buf[4] = 109U; /* current brcmf_bss_info_le version */
-
-        u32 response_len = sizeof(result_buf);
-        if (!bcdc_get_cmd(WLC_SCAN_RESULTS, result_buf,
-                          sizeof(result_buf), &response_len))
-            continue;
-        if (scan_parse_legacy_results(result_buf, response_len)) {
-            parsed = true;
-            break;
-        }
-    }
-    if (!parsed)
-        return false;
-
-    scan_results_pending = false;
-    uart_puts("[cyw] legacy scan n=");
-    uart_hex(scan_count);
-    uart_puts("\n");
-    return true;
-}
-
 static bool scan_result_request_start(void)
 {
     static u8 buf[BCDC_HEADER_LEN + CYW_SCAN_QUERY_BYTES] ALIGNED(64);
+    if (!sdpcm_can_send(SDPCM_CTL_CHANNEL))
+        return false;
+
     memset(scan_result_buf, 0, sizeof(scan_result_buf));
     scan_result_buf[0] = (u8)(sizeof(scan_result_buf) & 0xFFU);
     scan_result_buf[1] = (u8)((sizeof(scan_result_buf) >> 8) & 0xFFU);
@@ -1474,7 +1459,7 @@ static void scan_bus_kick(void)
     /* Never block: this runs from the reactor and from the association poll
      * loop, so it must fail closed when the firmware transmit window is
      * exhausted rather than entering sdpcm_send()'s credit wait. */
-    if ((u8)(cyw_tx_max - cyw_tx_seq) == 0U)
+    if (!sdpcm_can_send(SDPCM_CTL_CHANNEL))
         return;
 
     /* The firmware publishes queued SDPCM frames in response to host bus
@@ -2141,13 +2126,15 @@ bool cyw43_load_firmware(void)
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqHT);
     uart_puts("[cyw] CLKCSR=ReqHT done; polling HT...\n");
     bool ht_ok = false;
-    for (u32 i = 0; i < 50; i++) {
+    u32 ht_polls = 0U;
+    u64 ht_deadline = timer_monotonic_ms() + 5000ULL;
+    while (timer_monotonic_ms() < ht_deadline) {
         u8 clk = 0;
         bool rd = sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk);
         cyw_diag.clkcsr = clk;
-        if (i < 3 || (i & 7) == 0) {
+        if (ht_polls < 3U || (ht_polls & 31U) == 0U) {
             uart_puts("[cyw] HT poll i=");
-            uart_hex(i);
+            uart_hex(ht_polls);
             uart_puts(" rd=");
             uart_hex(rd ? 1 : 0);
             uart_puts(" clk=");
@@ -2159,7 +2146,11 @@ bool cyw43_load_firmware(void)
             cyw_diag.ht_available = 1U;
             break;
         }
-        delay_cycles(5000000);
+        ht_polls++;
+        if (cyw_progress_hook)
+            cyw_progress_hook();
+        watchdog_hw_pet();
+        timer_delay_ms(10U);
     }
     if (!ht_ok) {
         cyw_diag.last_error = 23U;
@@ -2461,10 +2452,8 @@ bool cyw43_scan_start(void)
 
 bool cyw43_scan_get_results(struct cyw_scan_result *results, u32 *count)
 {
-    if (scan_in_progress && scan_count == 0U)
-        return false;
-    if (scan_results_pending && scan_count == 0U &&
-        !scan_fetch_legacy_results())
+    if ((scan_in_progress || scan_result_request_pending ||
+         scan_results_pending) && scan_count == 0U)
         return false;
 
     u32 n = scan_count;
@@ -2477,10 +2466,9 @@ bool cyw43_scan_get_results(struct cyw_scan_result *results, u32 *count)
 
 bool cyw43_scan_in_progress(void)
 {
-    if (scan_in_progress && scan_results_pending &&
-        timer_monotonic_ms() >= scan_ready_ms)
-        scan_in_progress = false;
-    return scan_in_progress && scan_count == 0U;
+    scan_result_poll();
+    return (scan_in_progress || scan_result_request_pending ||
+            scan_results_pending) && scan_count == 0U;
 }
 
 bool cyw43_radio_query(u32 *radio, u32 *channel)
