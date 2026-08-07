@@ -111,6 +111,7 @@
 #include "sts_token.h"
 #include "adrv.h"
 #include "airq.h"
+#include "rp1_i2c.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -3838,6 +3839,16 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max,
                     media_hw_probe_pisp_be() ? "PiSP-BE probe OK\n" :
                                                "PiSP-BE probe FAILED\n");
+    } else if (http_streq(cmd, "i2c status")) {
+        struct rp1_i2c_diag d;
+        bool ok = rp1_i2c_init(100000U);
+        rp1_i2c_diag_snapshot(&d);
+        http_append(out, &len, max, ok ? "I2C1 ready type=" :
+                                        "I2C1 unavailable type=");
+        http_append_hex32(out, &len, max, d.comp_type);
+        http_append(out, &len, max, " version=");
+        http_append_hex32(out, &len, max, d.comp_version);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "rp1fw") ||
                http_streq(cmd, "rp1fw status")) {
         struct rp1_fw_diag d;
