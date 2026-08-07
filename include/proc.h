@@ -207,7 +207,7 @@ struct appf_service_record {
  * Total concurrent process slots, system-wide (procs[] is shared and filtered
  * by affinity, so this is NOT per core despite the historical name).
  *
- * Raised from 6 to 8 (issues #84/#86). Root cause of the #86 regression was
+ * Raised from 6 to 16 (issues #84/#86). Root cause of the #86 regression was
  * NOT process count or hot-loop cost -- it was kernel .bss growth: mmu.c's
  * per-slot page-table arrays ([3][MAX_PROCS_PER_CORE][512], ~28 KB per slot
  * per user core) used to live in the generic .bss output section, which sits
@@ -223,23 +223,15 @@ struct appf_service_record {
  * tripping a boot-time canary. See mmu.c's comment above user_l1 and
  * link.ld / link_qemu_full.ld / link_2m.ld for the full mechanism.
  *
- * 8 is NOT the process-arena ceiling (that allows up to 16, see the
- * _Static_assert below) -- it is the practical ceiling on QEMU today. QEMU's
+ * 16 is the process-arena ceiling (see the _Static_assert below). QEMU's
  * whole kernel image (text+rodata+data+bss+stacks+.pgtbl_pool) must fit below
- * CORE0_RAM_BASE (0x42000000), and measurement after this fix shows the
- * non-pgtbl part of that image alone already uses ~30.6 MiB of the ~31.5 MiB
- * budget, leaving well under 1 MiB for .pgtbl_pool. At ~84 KiB/slot that
- * caps QEMU at ~10 slots with zero safety margin; 8 was chosen to leave a
- * real (128 KiB+) margin, verified via `python tools/qemu_smoke.py --build`
- * (ipc bench errors=0) after this change. Going higher (toward the
- * arena's 16-slot ceiling) needs either shrinking the QEMU kernel image or
- * moving CORE0_RAM_BASE further up QEMU's `-m 1G` RAM -- both are
- * architecture-level changes out of scope for #86 and need owner sign-off,
- * not just this linker-layout fix. Pi 5 has no comparable constraint (over
- * 11 MiB of margin measured at 16 slots), so if the two platforms ever need
- * different limits this constant would need to become per-platform.
+ * CORE0_RAM_BASE (now 0x42200000 on QEMU), and the 2MB upward relocation of
+ * QEMU's private/shared RAM map would otherwise leave the 16-slot image about
+ * 444KB past the old boundary; the 2MB relocation leaves roughly 1.6MB before
+ * the new boundary. The linker keeps a 128KB minimum margin. Pi 5 has no
+ * comparable constraint, so both platforms can use the same 16-slot ceiling.
  */
-#define MAX_PROCS_PER_CORE  8
+#define MAX_PROCS_PER_CORE  16
 #define PROC_UI_KERNEL_PID 0U
 #define PROC_UI_KERNEL_PARENT_PID 0xFFFFFFFFU
 #define PROC_SLOT_SIZE      (2 * 1024 * 1024)   /* 2MB per process */

@@ -1719,9 +1719,19 @@ static bool cyw43_backplane_init(void)
     }
 
     /* Clear pull-ups/pull-downs */
-    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_PULLUPS, 0);
-    bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLUP, 0);
-    bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLDOWN, 0);
+    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_PULLUPS, 0) ||
+        !bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLUP, 0) ||
+        !bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLDOWN, 0)) {
+        uart_puts("[cyw] GPIO pulls fail\n");
+        return false;
+    }
+
+    /* Do not write ChipControl index 1 on CYW43455. Circle's reference
+     * driver applies the bits 13:11 SDIO drive-strength write only to the
+     * older 4330/43362 parts and returns before it for 4345. On the Pi 5
+     * CYW43455, forcing 0b111 there prevents the post-firmware HT clock from
+     * becoming available (stage 23), so the safe target-specific behavior is
+     * to leave the firmware/platform pad configuration unchanged. */
 
     return true;
 }

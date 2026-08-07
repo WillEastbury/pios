@@ -71,7 +71,9 @@ __bss_size = (__bss_end - __bss_start) >> 3;
 __pgtbl_pool_size = (__pgtbl_pool_end - __pgtbl_pool_start) >> 3;
 
 /* Build-time guard (issue #86): fail the link instead of tripping a boot-time
- * stack canary. CORE0_RAM_BASE for QEMU is 0x42000000 (include/platform.h);
- * keep in sync. 512KB margin covers early-boot stack usage below __image_end. */
-ASSERT(__image_end + 0x20000 <= 0x42000000,
-       "kernel image (text+data+bss+stacks+pgtbl_pool) leaves less than 128KB before CORE0_RAM_BASE (0x42000000) -- reduce MAX_PROCS_PER_CORE or shrink another static, see issue #86")
+ * stack canary. CORE0_RAM_BASE for QEMU is 0x42200000 (include/platform.h).
+ * The QEMU private/shared RAM map is offset upward by 2MB so the 16-slot
+ * image has substantial room below core 0's private region while the existing
+ * 0x48000000 staging window remains unchanged. */
+ASSERT(__image_end + 0x20000 <= 0x42200000,
+       "kernel image (text+data+bss+stacks+pgtbl_pool) leaves less than 128KB before CORE0_RAM_BASE (0x42200000) -- reduce MAX_PROCS_PER_CORE or shrink another static, see issue #86")
