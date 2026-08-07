@@ -68,6 +68,8 @@ bool xhci_stop_endpoint(u32 slot, u32 dci);
 bool xhci_control_transfer(u32 slot, u8 bmReq, u8 bReq, u16 wVal,
                             u16 wIdx, u16 wLen, void *data, u32 *actual);
 bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual);
+bool xhci_interrupt_submit(u32 slot, u8 ep_addr, void *data, u32 len);
+bool xhci_interrupt_poll(u32 *actual, bool *complete);
 
 /* Instrumentation */
 const struct xhci_stats *xhci_get_stats(void);

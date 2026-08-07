@@ -196,6 +196,13 @@ static u32 cmd_enq, cmd_cycle;
 static u32 evt_deq, evt_cycle;
 static u32 selected_controller;
 
+static struct {
+    bool pending;
+    u64 trb_dma;
+    void *data;
+    u32 length;
+} interrupt_xfer;
+
 /* ---- Instrumentation ---- */
 
 static struct xhci_stats stats;
@@ -287,21 +294,28 @@ static void UNUSED free_ep_ring(u32 ri) {
 
 /* ---- Event Ring ---- */
 
+static bool evt_try_poll(struct xhci_trb *out)
+{
+    dcache_invalidate_range((u64)(usize)&evt_ring[evt_deq],
+                            sizeof(struct xhci_trb));
+    struct xhci_trb *trb = &evt_ring[evt_deq];
+    dmb();
+    if ((trb->control & TRB_CYCLE) != (evt_cycle ? 1U : 0U))
+        return false;
+    *out = *trb;
+    stats.evt_polled++;
+    evt_deq++;
+    if (evt_deq >= RING_SIZE) { evt_deq = 0; evt_cycle ^= 1; }
+    u64 erdp = dma_addr(&evt_ring[evt_deq]);
+    rtw(IR0_ERDP_LO, (u32)erdp | (1U << 3));
+    rtw(IR0_ERDP_HI, (u32)(erdp >> 32));
+    return true;
+}
+
 static bool evt_poll(struct xhci_trb *out, u32 timeout_ms) {
     for (u32 i = 0; i < timeout_ms * 100; i++) {
-        dcache_invalidate_range((u64)(usize)&evt_ring[evt_deq], sizeof(struct xhci_trb));
-        struct xhci_trb *trb = &evt_ring[evt_deq];
-        dmb();
-        if ((trb->control & TRB_CYCLE) == (evt_cycle ? 1U : 0U)) {
-            *out = *trb;
-            stats.evt_polled++;
-            evt_deq++;
-            if (evt_deq >= RING_SIZE) { evt_deq = 0; evt_cycle ^= 1; }
-            u64 erdp = dma_addr(&evt_ring[evt_deq]);
-            rtw(IR0_ERDP_LO, (u32)erdp | (1U << 3));
-            rtw(IR0_ERDP_HI, (u32)(erdp >> 32));
+        if (evt_try_poll(out))
             return true;
-        }
         timer_delay_us(10);
     }
     return false;
@@ -439,6 +453,7 @@ bool xhci_init(void) {
 
     /* Reset instrumentation counters */
     memset(&stats, 0, sizeof(stats));
+    memset(&interrupt_xfer, 0, sizeof(interrupt_xfer));
     stats.init_stage = 1U;
 
     if (!xhci_dma_layout_valid()) {
@@ -918,6 +933,7 @@ bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual) 
             stats.xfer_fail++;
             return false;
         }
+
         ptr += chunk;
     }
 
@@ -936,6 +952,73 @@ bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual) 
     if (actual)
         *actual = len - (evt.status & 0xFFFFFF);
     stats.xfer_ok++;
+    return true;
+}
+
+bool xhci_interrupt_submit(u32 slot, u8 ep_addr, void *data, u32 len)
+{
+    if (interrupt_xfer.pending || !data || len == 0U)
+        return false;
+    u32 ep_num = ep_addr & 0x0FU;
+    u32 dir = (ep_addr & 0x80U) ? 1U : 0U;
+    if (!dir)
+        return false;
+    u32 dci = ep_num * 2U + dir;
+    u8 ri = dci_map[dci];
+    if (ri >= NUM_EP_RINGS)
+        return false;
+    u64 data_dma;
+    if (!rp1_pcie_dma_addr(data, len, &data_dma))
+        return false;
+
+    struct xhci_trb *ring = ep_rings[ri];
+    u32 *enq = &ep_enq[ri], *cyc = &ep_cyc[ri];
+    u32 trb_index = *enq;
+    if (trb_index >= RING_SIZE - 1U)
+        return false;
+    u64 trb_dma = dma_addr(&ring[trb_index]);
+    dcache_invalidate_range((u64)(usize)data, len);
+    if (!ring_enqueue(ring, enq, cyc, data_dma, len,
+                      TRB_TYPE(TRB_NORMAL) | TRB_IOC))
+        return false;
+    dcache_clean_range((u64)(usize)ring,
+                       sizeof(struct xhci_trb) * RING_SIZE);
+    dmb();
+    interrupt_xfer.pending = true;
+    interrupt_xfer.trb_dma = trb_dma;
+    interrupt_xfer.data = data;
+    interrupt_xfer.length = len;
+    ring_db(slot, dci);
+    return true;
+}
+
+bool xhci_interrupt_poll(u32 *actual, bool *complete)
+{
+    if (complete) *complete = false;
+    if (!interrupt_xfer.pending)
+        return false;
+    struct xhci_trb evt;
+    if (!evt_try_poll(&evt))
+        return true;
+    if (TRB_GET_TYPE(evt.control) != TRB_TRANSFER_EVT ||
+        evt.param != interrupt_xfer.trb_dma) {
+        stats.xfer_fail++;
+        interrupt_xfer.pending = false;
+        return false;
+    }
+    u32 cc = TRB_COMP_CODE(evt.status);
+    if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
+        stats.xfer_fail++;
+        interrupt_xfer.pending = false;
+        return false;
+    }
+    u32 done = interrupt_xfer.length - (evt.status & 0xFFFFFFU);
+    dcache_invalidate_range((u64)(usize)interrupt_xfer.data,
+                            interrupt_xfer.length);
+    interrupt_xfer.pending = false;
+    stats.xfer_ok++;
+    if (actual) *actual = done;
+    if (complete) *complete = true;
     return true;
 }
 
