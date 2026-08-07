@@ -21,7 +21,8 @@ struct macb_rx_config {
     u8 *buffers;            /* contiguous RX buffer pool (ring_count buffers)   */
     u32 ring_count;         /* descriptors == buffers                           */
     u32 buffer_size;        /* bytes per RX buffer                              */
-    u32 dma_high;           /* high 32 bits of the DMA address (addr_hi word)   */
+    u64 ring_dma;           /* full device address of descriptor ring           */
+    u64 buffers_dma;        /* full device address of contiguous buffer pool    */
     u32 trailing_bytes;     /* bytes after the logical ring before next object  */
     bool checksum_enabled;  /* RX checksum offload currently active in NCFGR    */
 };

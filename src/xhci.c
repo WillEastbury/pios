@@ -200,18 +200,27 @@ static u32 selected_controller;
 
 static struct xhci_stats stats;
 
-/*
- * RP1 DMA address translation: the xHCI controller lives inside RP1
- * which accesses system RAM via PCIe inbound translation.
- *
- * The firmware may have configured inbound windows. Try identity mapping
- * first (offset=0) since the firmware may map PCIe 0x00 → AXI 0x00.
- * The PCIe BAR2 inbound maps PCIe 0x10_00000000 → CPU 0x00_00000000.
- * So the xHCI controller (inside RP1, on PCIe) needs DMA addresses
- * with this offset added to access system RAM.
- */
-#define RP1_DMA_OFFSET  0x1000000000ULL
-static inline u64 dma_addr(const void *p) { return (u64)(usize)p + RP1_DMA_OFFSET; }
+static inline u64 dma_addr(const void *p)
+{
+    u64 addr = 0ULL;
+    return rp1_pcie_dma_addr(p, 1ULL, &addr) ? addr : 0ULL;
+}
+
+static bool xhci_dma_layout_valid(void)
+{
+    u64 addr;
+    if (!rp1_pcie_dma_addr(dcbaa, sizeof(dcbaa), &addr) ||
+        !rp1_pcie_dma_addr(cmd_ring, sizeof(cmd_ring), &addr) ||
+        !rp1_pcie_dma_addr(evt_ring, sizeof(evt_ring), &addr) ||
+        !rp1_pcie_dma_addr(ep_rings, sizeof(ep_rings), &addr) ||
+        !rp1_pcie_dma_addr(erst, sizeof(erst), &addr) ||
+        !rp1_pcie_dma_addr(dev_ctx_buf, sizeof(dev_ctx_buf), &addr) ||
+        !rp1_pcie_dma_addr(input_ctx_buf, sizeof(input_ctx_buf), &addr) ||
+        !rp1_pcie_dma_addr(scratchpad_bufs, sizeof(scratchpad_bufs), &addr) ||
+        !rp1_pcie_dma_addr(scratchpad_array, sizeof(scratchpad_array), &addr))
+        return false;
+    return true;
+}
 
 /* DCI → ep_rings index. 0xFF = unmapped. DCI 1 = EP0 always ring 0. */
 static u8 dci_map[32];
@@ -432,6 +441,11 @@ bool xhci_init(void) {
     memset(&stats, 0, sizeof(stats));
     stats.init_stage = 1U;
 
+    if (!xhci_dma_layout_valid()) {
+        uart_puts("[xhci] DMA layout outside RP1 inbound window\n");
+        return false;
+    }
+
     /* Enable USB VBUS power via GPIO 38 */
     uart_puts("[xhci] Enabling VBUS (GPIO38)...\n");
     rp1_gpio_set_function(USB_VBUS_GPIO, 5);
@@ -596,8 +610,8 @@ bool xhci_init(void) {
         uart_puts(" REMAP=");
         uart_hex(remap_hi); uart_puts(":"); uart_hex(remap_lo);
         uart_puts(" offset=");
-        uart_hex((u32)(RP1_DMA_OFFSET >> 32)); uart_puts(":");
-        uart_hex((u32)RP1_DMA_OFFSET);
+        uart_hex((u32)(RP1_PCIE_DMA_BASE >> 32)); uart_puts(":");
+        uart_hex((u32)RP1_PCIE_DMA_BASE);
         uart_puts("\n");
 
         /* Warn if DCBAA DMA address looks unusually high (above 4GB) and
@@ -802,10 +816,13 @@ bool xhci_control_transfer(u32 slot, u8 bmReq, u8 bReq, u16 wVal,
 
     /* Data Stage */
     if (wLen > 0 && data) {
+        u64 data_dma;
+        if (!rp1_pcie_dma_addr(data, wLen, &data_dma))
+            return false;
         u32 dc = TRB_TYPE(TRB_DATA);
         if (bmReq & 0x80) dc |= TRB_DIR_IN;
         dcache_clean_range((u64)(usize)data, wLen);
-        if (!ring_enqueue(ring, enq, cyc, dma_addr(data), wLen, dc))
+        if (!ring_enqueue(ring, enq, cyc, data_dma, wLen, dc))
             return false;
     }
 
@@ -895,7 +912,9 @@ bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual) 
         else
             flags |= TRB_IOC;
 
-        if (!ring_enqueue(ring, enq, cyc, dma_addr(ptr), chunk, flags)) {
+        u64 data_dma;
+        if (!rp1_pcie_dma_addr(ptr, chunk, &data_dma) ||
+            !ring_enqueue(ring, enq, cyc, data_dma, chunk, flags)) {
             stats.xfer_fail++;
             return false;
         }
