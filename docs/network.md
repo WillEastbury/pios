@@ -145,9 +145,10 @@ coexists with static neighbor entries. Route lookup chooses a connected route
 or gateway, then resolves the next-hop MAC. Resolution failure is explicit;
 send paths do not fabricate success.
 
-`TCP_BUF_SIZE` remains 4096. Raising it to 8192 or 16384 caused reproducible
-QEMU parallel/bursty load regressions and must not be retried without first
-finding the fixed-capacity ring or descriptor constraint.
+`TCP_BUF_SIZE` is 8192. The earlier concurrent-QEMU failure was caused by the
+extra static fallback TCB storage crossing the old QEMU core-0 RAM boundary,
+not by virtio descriptor capacity. The relocated QEMU memory map and linker
+assertion now leave 580 KiB of measured margin at this size.
 
 ## NIC backends
 

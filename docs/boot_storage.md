@@ -159,11 +159,11 @@ Staging is `ota_stage_buf` (highmem when available, capacity
 `pios_bootctrl_mark_pending()`. A partial or aborted stream leaves the slot
 uncommitted.
 
-Baseline push throughput: ~17 KB/s, bounded by the board's fixed 4 KB
-`TCP_BUF_SIZE` receive window.
+The original push throughput was ~17 KB/s with a 4 KB receive window.
+`TCP_BUF_SIZE` is now 8192.
 
-> `TCP_BUF_SIZE` stays 4096. Raising it has been tried and reverted — see
-> [`gotchas.md`](gotchas.md).
+> ADR-019 records the QEMU static-memory-layout fix required before the larger
+> OTA receive window was safe.
 
 ---
 

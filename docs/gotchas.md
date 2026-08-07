@@ -309,20 +309,22 @@ The selftest now carries FIPS-197 Appendix B/C and NIST SP 800-38D Test Case 4.
 
 ## Network
 
-### Do not raise `TCP_BUF_SIZE`
+### `TCP_BUF_SIZE` growth moves the QEMU static image
 
-**Tried:** 8192 and 16384, to lift OTA push throughput above ~17 KB/s.
+**Symptom:** 8192 passed smoke but intermittently failed concurrent QEMU load
+with `RemoteDisconnected`.
 
-**Result:** QEMU's 29-test smoke suite still passed, but the load battery's
-parallel/bursty phases failed with `RemoteDisconnected` at **8192 already** — a
-real regression under concurrent load, confirmed by a clean 4096 re-run.
-Reverted.
+**Disproved:** virtio ring exhaustion. Enlarging both queues from 32 to 128 did
+not change the failure; `tx_drop` and `rx_starve` stayed zero.
 
-**Root cause not yet isolated.** Suspect a fixed-capacity virtio-net TX
-ring/descriptor assumption sized against the old window — *not* a `struct tcb`
-stack overflow, since the tcb is never stack-copied.
+**Root cause:** QEMU uses the static 128-entry fallback TCB table. Each TCB has
+both an RX and TX ring, so 4096 -> 8192 adds roughly 1 MiB to `.bss`. Before
+issue #86's RAM relocation this pushed the kernel/stacks/pgtbl layout through
+the old `CORE0_RAM_BASE`, producing load-sensitive corruption.
 
-**Rule:** `TCP_BUF_SIZE` stays 4096 until that ring limit is found and fixed.
+**Rule:** static buffer growth is allowed only while the QEMU linker assertion
+keeps a real margin below `CORE0_RAM_BASE`. At 8192 the image ends at
+`0x4216F000`, leaving 580 KiB before the relocated `0x42200000` boundary.
 
 ### First packet to an unresolved neighbour
 

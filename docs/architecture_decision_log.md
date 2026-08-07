@@ -68,7 +68,7 @@ decision)
 | [016](#adr-016) | Dedicated `CORE0_IO_WIFI` flag with adaptive cadence | Agent, **owner-ratified** | Accepted |
 | [017](#adr-017) | Per-core scheduler/FIFO service registration | Agent — **under review** | Proposed |
 | [018](#adr-018) | CPU-bound soak test required to prove ADR-014 | Owner | Accepted |
-| [019](#adr-019) | Investigate and fix the virtio-net ring limit behind `TCP_BUF_SIZE` | Owner | Accepted |
+| [019](#adr-019) | Raise `TCP_BUF_SIZE` after fixing the QEMU memory-layout limit | Owner | Implemented |
 | [020](#adr-020) | Migrate processes from EL1 to EL0 | Owner (direction), design TBD | Proposed |
 | [021](#adr-021) | Make EL0 processes actually preemptible (separate EL1 stack + `I` clear) | Agent, under ADR-012 | **Accepted — proven on Pi 5** |
 | [022](#adr-022) | EL0 talks to the kernel via FIFOs/shared state, never syscalls | Owner | Proposed |
@@ -431,17 +431,25 @@ advance, that capsules keep serving, and that wired health stays clean.
 ---
 
 <a name="adr-019"></a>
-## ADR-019 — Investigate and fix the virtio-net ring limit behind `TCP_BUF_SIZE`
+## ADR-019 — Raise `TCP_BUF_SIZE` after fixing the QEMU memory-layout limit
 
-**Date:** 2026-08-06 · **Decider:** Owner · **Status:** Accepted
+**Date:** 2026-08-06 · **Decider:** Owner · **Status:** Implemented
 
 **Context.** `TCP_BUF_SIZE` is pinned at 4096 because 8192 failed the QEMU load
-battery's parallel/bursty phases with `RemoteDisconnected`. Root cause was never
-isolated. It currently caps OTA push at ~17 KB/s.
+battery's parallel/bursty phases with `RemoteDisconnected`. It currently caps
+OTA push at ~17 KB/s.
 
-**Decision.** Worth scheduling: find the fixed-capacity ring/descriptor
-assumption (suspected virtio-net TX) and fix it, rather than leaving the window
-permanently pinned.
+**Finding.** The suspected virtio-net ring limit was disproven: increasing both
+queues from 32 to 128 entries did not change the failure, and `vnetdiag`
+reported `tx_drop=0 rx_starve=0`. The real limit was static memory placement.
+QEMU uses the 128-entry fallback TCB table; doubling both per-TCB rings adds
+about 1 MiB to `.bss`, which pushed the old image past `CORE0_RAM_BASE`.
+
+**Decision.** Keep the QEMU private/shared RAM map 2 MiB higher
+(`CORE0_RAM_BASE=0x42200000`) with the linker margin assertion, and raise
+`TCP_BUF_SIZE` to 8192. The resulting image ends at `0x4216F000`, leaving
+`0x91000` (580 KiB) before core 0 RAM. Verified with QEMU smoke 29/29 and five
+consecutive no-retry load batteries.
 
 ---
 
@@ -638,7 +646,7 @@ proven by the ADR-018 soak before any of the above is safe.
 | Q1 | Should the CYW43455 association path be migrated onto `adrv`? | **Owner asked for detail 2026-08-06** — proposal below, awaiting decision. |
 | Q2 | Should `adrv_supervise()` run from a user core's quantum? | **Owner asked for detail 2026-08-06** — proposal below, awaiting decision. |
 | Q3 | Is a CPU-bound soak test required before ADR-014 is considered proven? | **Answered: yes.** See ADR-018. |
-| Q4 | Should `TCP_BUF_SIZE` remain 4096 permanently, or is finding the virtio-net ring limit worth scheduling? | **Answered: worth scheduling.** See ADR-019. |
+| Q4 | Should `TCP_BUF_SIZE` remain 4096 permanently, or is finding the virtio-net ring limit worth scheduling? | **Answered and implemented:** 8192 is safe after the QEMU static-memory-layout fix; the ring hypothesis was disproven. See ADR-019. |
 | Q5 | Should EL1 processes migrate to EL0 so stage-1 permissions replace the stage-2 cage? | **Direction agreed, design to be discussed.** See ADR-020. |
 | Q6 | ADR-015 lane matrix costs ~45 KB, ~9 KB of it provably dead. Trim it? | **Done — trimmed the HARDWARE level only (~9 KB).** The self-diagonal is NOT dead: `airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, …)` is core 0 → core 0 and is the hottest path in the system. My original "trim the diagonal" advice was wrong. |
 | Q7 | ADR-017 puts `ksvc` accounting inside the scheduler hot loop. Does that breach "diagnostics must not perturb scheduling"? | **Done — made lighter.** `ksvc_now_ticks()`/`ksvc_begin_at()`/`ksvc_end_at()` cut the loop from 4 counter reads + 2 divides to 2 reads + 0 divides; per-core visibility preserved. |

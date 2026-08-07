@@ -12,7 +12,7 @@
 #include "types.h"
 
 #define TCP_MAX_CONNECTIONS 128
-#define TCP_BUF_SIZE        4096
+#define TCP_BUF_SIZE        8192
 #define TCP_MSS             1460
 #define TCP_DEFAULT_WINDOW  TCP_BUF_SIZE
 
@@ -132,6 +132,8 @@ typedef struct {
     u64 active_rst;
     u64 active_bad_ack;
     u64 active_timeout;
+    u64 rx_out_of_order;
+    u64 rx_no_space;
     u32 active_last_local_ip;
     u32 active_last_remote_ip;
     u16 active_last_local_port;

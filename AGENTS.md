@@ -1251,18 +1251,14 @@ could not advance past the missing ownership publication.
       the board rebooted and came back on the new version (uptime 47s post-reboot), proving stage0
       correctly reads the FAT package, activates raw slot A, and boots it. The RX descriptor-hole
       investigation and the persistent-stage0 bring-up are both closed.
-- [x] Baseline OTA push throughput measured 2026-07-23 (single connection, no client-side pacing
-      left in `tools\pios_ota_update.py`): 3,274,240 bytes in 192.35s (~17 KB/s), bounded by the
-      board's fixed 4 KB `TCP_BUF_SIZE` receive window (`include/tcp.h`). Tried raising
-      `TCP_BUF_SIZE` to 8192/16384 to benchmark a fix: QEMU's 29-test smoke suite still passed, but
-      the `load battery`'s `parallel`/`bursty` phases failed with `RemoteDisconnected` at **8192
-      already** (not just 16384) — a real regression under concurrent load, not a QEMU flake
-      (confirmed by a clean 4096-baseline re-run passing both smoke and load battery). Root cause
-      not yet isolated (suspect a fixed-capacity virtio-net TX ring/descriptor assumption sized
-      against the old window, not a TCP_BUF_SIZE-derived stack overflow — `struct tcb` is never
-      stack-copied). Change was reverted; `include/tcp.h` is back at `TCP_BUF_SIZE=4096`, live Pi5
-      untouched throughout. Do not blindly re-raise `TCP_BUF_SIZE` without first finding and fixing
-      the virtio-net ring-capacity limit under parallel/bursty QEMU load.
+- [x] ADR-019 / issue #91 resolved 2026-08-07. `TCP_BUF_SIZE` is now 8192.
+      The suspected virtio ring limit was disproven (32 -> 128 descriptors did
+      not affect the failure; `tx_drop=0 rx_starve=0`). QEMU's static 128-TCB
+      fallback table adds about 1 MiB of `.bss` when both rings double; before
+      the issue #86 RAM relocation that crossed the old core-0 boundary. With
+      `CORE0_RAM_BASE=0x42200000`, the image ends at `0x4216F000` (580 KiB
+      margin). Verified QEMU smoke 29/29 and five consecutive no-retry load
+      batteries.
 
 ### Next steps
 1. WiFi bring-up (CYW43455 over BCM2712 SDIO2) is the active work item — CMD5 (IO_SEND_OP_COND)

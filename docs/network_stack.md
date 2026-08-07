@@ -181,11 +181,12 @@ wrapper.
 
 ## 5. TCP
 
-`TCP_BUF_SIZE` **4096**, `TCP_MSS` 1460, `TCP_MAX_CONNECTIONS` **128**,
+`TCP_BUF_SIZE` **8192**, `TCP_MSS` 1460, `TCP_MAX_CONNECTIONS` **128**,
 `LISTEN_BACKLOG` 64.
 
-> `TCP_BUF_SIZE` stays 4096; raising it has been tried and reverted. See
-> [`gotchas.md`](gotchas.md).
+> QEMU's 128-entry fallback TCB table makes this a significant static-memory
+> setting. ADR-019 records the QEMU RAM relocation and linker guard that make
+> 8192 safe.
 
 `struct tcb` holds the 4-tuple, state, sequence state, TX/RX rings,
 retransmission timers, RTT estimator, Reno congestion state, FIN/TIME_WAIT

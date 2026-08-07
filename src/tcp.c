@@ -1021,8 +1021,13 @@ static bool seq_acceptable(struct tcb *t, u32 seg_seq, u32 seg_len) {
 
 static u32 tcp_rx_ingest_in_order(struct tcb *t, u32 seg_seq, const u8 *data, u32 data_len)
 {
-    if (data_len == 0 || seg_seq != t->rcv_nxt)
+    if (data_len == 0)
         return 0;
+    if (seg_seq != t->rcv_nxt) {
+        if (seq_gt(seg_seq, t->rcv_nxt))
+            tcp_diag_counts.rx_out_of_order++;
+        return 0;
+    }
     /* Atomic accept: never PARTIALLY buffer a segment. If the whole segment
      * does not fit in the receive ring, drop it entirely and leave rcv_nxt on
      * the segment boundary. Advancing rcv_nxt by a partial amount (what a
@@ -1036,8 +1041,10 @@ static u32 tcp_rx_ingest_in_order(struct tcb *t, u32 seg_seq, const u8 *data, u3
      * advertising the window and the sender's in-flight data arriving. The
      * dropped segment is dup-ACKed by handle_established, so the sender
      * retransmits it whole once the window reopens. */
-    if (ring_free(&t->rx_buf) < data_len)
+    if (ring_free(&t->rx_buf) < data_len) {
+        tcp_diag_counts.rx_no_space++;
         return 0;
+    }
     u32 written = ring_write(&t->rx_buf, data, data_len);
     t->rcv_nxt += written;
     t->rcv_wnd = ring_free(&t->rx_buf);

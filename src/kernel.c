@@ -3059,6 +3059,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, td->tx_no_mac);
         http_append(out, &len, max, " tx_fail=");
         http_append_u64(out, &len, max, td->tx_send_fail);
+        http_append(out, &len, max, " rx_ooo=");
+        http_append_u64(out, &len, max, td->rx_out_of_order);
+        http_append(out, &len, max, " rx_nospace=");
+        http_append_u64(out, &len, max, td->rx_no_space);
         http_append(out, &len, max, " arp_req=");
         http_append_u64(out, &len, max, ad ? ad->requests_sent : 0);
         http_append(out, &len, max, " arp_learn=");
@@ -4656,6 +4660,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, td->tx_no_mac);
         http_append(out, &len, max, " txfail=");
         http_append_u64(out, &len, max, td->tx_send_fail);
+        http_append(out, &len, max, " rx_ooo=");
+        http_append_u64(out, &len, max, td->rx_out_of_order);
+        http_append(out, &len, max, " rx_nospace=");
+        http_append_u64(out, &len, max, td->rx_no_space);
         http_append(out, &len, max, " short=");
         http_append_u64(out, &len, max, td->in_short);
         http_append(out, &len, max, " badcsum=");
