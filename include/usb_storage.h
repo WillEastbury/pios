@@ -21,5 +21,5 @@ u32  usb_storage_block_size(void);
 u64  usb_storage_num_blocks(void);
 
 /* Block I/O (LBA addressing, count in blocks) */
-bool usb_storage_read(u32 lba, u32 count, void *buf);
-bool usb_storage_write(u32 lba, u32 count, const void *buf);
+bool usb_storage_read(u64 lba, u32 count, void *buf);
+bool usb_storage_write(u64 lba, u32 count, const void *buf);

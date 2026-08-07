@@ -13606,6 +13606,17 @@ static void ui_cmd_usb(u32 argc, char **argv)
                   st->xfer_ok, st->xfer_fail, st->evt_polled,
                   st->evt_stale_drained, st->ep_resets, st->ep_stalls,
                   st->ring_full);
+        ui_console_write("USB dev=");
+        ui_console_write(dev ? "yes" : "no");
+        ui_console_write(" kbd=");
+        ui_console_write(usb_kbd_available() ? "ready" : "not-ready");
+        ui_console_write(" xhci_stage=0x");
+        ui_console_hex_fixed(st->init_stage, 8);
+        ui_console_write(" gusb3=0x");
+        ui_console_hex_fixed(st->gusb3_before, 8);
+        ui_console_write("->0x");
+        ui_console_hex_fixed(st->gusb3_after, 8);
+        ui_console_write("\n");
         ui_console_write("usage: usb status|reinit|poll\n");
         return;
     }

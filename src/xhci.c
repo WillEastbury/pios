@@ -28,6 +28,7 @@
 #define DWC3_GCTL           (DWC3_GLOBALS + 0x10)
 #define DWC3_GSNPSID        (DWC3_GLOBALS + 0x20)
 #define DWC3_GUSB2PHYCFG    (DWC3_GLOBALS + 0x100)
+#define DWC3_GUSB3PIPECTL   (DWC3_GLOBALS + 0x1C0)
 
 #define GCTL_PRTCAP_MASK    (3U << 12)
 #define GCTL_PRTCAP_HOST    (1U << 12)
@@ -35,6 +36,8 @@
 #define GCTL_CORESOFTRESET  (1U << 11)
 #define GUSB2_PHYSOFTRST    (1U << 31)
 #define GUSB2_SUSPHY        (1U << 6)
+#define GUSB3_PHYSOFTRST    (1U << 31)
+#define GUSB3_SUSPHY        (1U << 17)
 
 /* ---- xHCI Capability Registers ---- */
 
@@ -373,20 +376,31 @@ static bool dwc3_init(u64 base) {
     mmio_write(base + DWC3_GCTL, gctl);
     timer_delay_us(100);
 
-    /* PHY soft reset. Keep the USB2 PHY out of suspend in host mode; DWC3
-     * controllers can otherwise report transaction errors on full-speed
-     * devices during Address Device. */
+    /* Reset both PHYs while the core is held in reset. Preserve RP1 firmware's
+     * electrical tuning (LFPS, elastic buffer, deemphasis and P3 quirks), but
+     * keep both PHYs out of suspend in host mode. */
     u32 phycfg = mmio_read(base + DWC3_GUSB2PHYCFG);
+    u32 pipectl = mmio_read(base + DWC3_GUSB3PIPECTL);
+    stats.gusb3_before = pipectl;
     uart_puts("[xhci] DWC3 GUSB2PHYCFG before=");
     uart_hex(phycfg);
+    uart_puts(" GUSB3PIPECTL before=");
+    uart_hex(pipectl);
     uart_puts("\n");
     phycfg &= ~GUSB2_SUSPHY;
+    pipectl &= ~GUSB3_SUSPHY;
     mmio_write(base + DWC3_GUSB2PHYCFG, phycfg | GUSB2_PHYSOFTRST);
+    mmio_write(base + DWC3_GUSB3PIPECTL, pipectl | GUSB3_PHYSOFTRST);
     timer_delay_us(100);
     mmio_write(base + DWC3_GUSB2PHYCFG, phycfg & ~(GUSB2_PHYSOFTRST | GUSB2_SUSPHY));
+    mmio_write(base + DWC3_GUSB3PIPECTL,
+               pipectl & ~(GUSB3_PHYSOFTRST | GUSB3_SUSPHY));
     timer_delay_ms(10);
     uart_puts("[xhci] DWC3 GUSB2PHYCFG after=");
     uart_hex(mmio_read(base + DWC3_GUSB2PHYCFG));
+    uart_puts(" GUSB3PIPECTL after=");
+    stats.gusb3_after = mmio_read(base + DWC3_GUSB3PIPECTL);
+    uart_hex(stats.gusb3_after);
     uart_puts("\n");
 
     /* Clear core reset, set host mode */
@@ -416,6 +430,7 @@ bool xhci_init(void) {
 
     /* Reset instrumentation counters */
     memset(&stats, 0, sizeof(stats));
+    stats.init_stage = 1U;
 
     /* Enable USB VBUS power via GPIO 38 */
     uart_puts("[xhci] Enabling VBUS (GPIO38)...\n");
@@ -428,6 +443,7 @@ bool xhci_init(void) {
         (selected_controller ? XHCI_USB1_OFFSET : XHCI_USB0_OFFSET);
 
     if (!dwc3_init(xhci_base)) return false;
+    stats.init_stage = 2U;
 
     u32 caplength = xr(CAP_CAPLENGTH) & 0xFF;
     u32 hcsparams1 = xr(CAP_HCSPARAMS1);
@@ -485,6 +501,7 @@ bool xhci_init(void) {
         return false;
     }
     uart_puts("[xhci] Reset OK\n");
+    stats.init_stage = 3U;
 
     /* Allow multiple device slots — cap to hw max, but at least 4 */
     {
@@ -554,6 +571,7 @@ bool xhci_init(void) {
         uart_puts("[xhci] Failed to start\n");
         return false;
     }
+    stats.init_stage = 4U;
 
     uart_puts("[xhci] Controller running");
     /* Dump PCIe inbound BAR config (set by firmware) for DMA validation */

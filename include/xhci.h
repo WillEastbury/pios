@@ -29,6 +29,9 @@ struct xhci_ep_info {
 
 /* Lightweight instrumentation counters */
 struct xhci_stats {
+    u32 init_stage;
+    u32 gusb3_before;
+    u32 gusb3_after;
     u32 cmd_submitted;
     u32 cmd_completed;
     u32 cmd_timeout;
