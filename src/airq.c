@@ -12,6 +12,12 @@
 
 #include "types.h"
 #include "airq.h"
+#include "adrv.h"
+#include "core.h"
+
+/* The host airq unit is linked without adrv.c; the full kernel supplies the
+ * strong implementation. Keep the standalone pure-logic test target intact. */
+extern bool adrv_supervise(u64 now_ms) __attribute__((weak));
 
 #define AIRQ_MAX_SOURCES 16U
 
@@ -363,6 +369,13 @@ u32 airq_quantum(u32 core, u64 quantum_ms, u64 *sched_ms_out)
     const u64 start = airq_now();
     u32 dispatched = airq_dispatch(core, drain_budget);
     const u64 spent = airq_now() - start;
+
+    /* Core 1 is outside the packet path and can observe core 0's published
+     * adrv stamp without adding work to the reactor. The stamp is in the
+     * shared kernel image mapped with the same attributes on every TTBR, and
+     * adrv_supervise() performs the acquire-side barrier before reading it. */
+    if (core == CORE_USERM && adrv_supervise)
+        (void)adrv_supervise(airq_now());
 
     /* Hand the remainder to the caller's scheduler. Even if draining somehow
      * consumed the whole quantum, the scheduler still gets a non-zero slice:
