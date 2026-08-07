@@ -233,6 +233,9 @@ Credentials belong only in ignored `tools/wifi_config.local.json`. Never print
 or commit them.
 
 ```powershell
+# Recreate the pinned official Pi5 firmware set after a machine reformat.
+python tools\fetch_wifi_firmware.py
+
 # Stream firmware, NVRAM, and CLM into the running board.
 python tools\pios_wifi_upload.py --host 192.168.0.201 --dir wifi_fw_staging
 
