@@ -131,6 +131,7 @@ static u8 cyw_mac[CYW_MAC_LEN];
 static u32 cyw_link;
 static u8 cyw_tx_seq;
 static u8 cyw_tx_max;
+static u8 cyw_tx_fcmask;
 static u32 cyw_backplane_window;
 static bool sdpcm_frame_pending;
 static u32 sdpcm_next_len;
@@ -659,6 +660,8 @@ static u32 sdpcm_build_header(u8 *buf, u32 payload_len, u8 channel)
 
 static bool sdpcm_send(u8 channel, const u8 *data, u32 len)
 {
+    if (channel >= 8U)
+        return false;
     if (len + SDPCM_HEADER_LEN > CYW_MAX_FRAME)
         return false;
 
@@ -669,7 +672,8 @@ static bool sdpcm_send(u8 channel, const u8 *data, u32 len)
      * self-heals rather than hanging indefinitely. Callers that must not
      * block (reactor/association pokes) check credit before calling. */
     u64 credit_deadline = timer_monotonic_ms() + 30000ULL;
-    while ((u8)(cyw_tx_max - cyw_tx_seq) == 0U) {
+    while ((u8)(cyw_tx_max - cyw_tx_seq) == 0U ||
+           (cyw_tx_fcmask & (u8)(1U << channel)) != 0U) {
         if (sdpcm_pending_bytes() != 0U) {
             u8 pending_channel = 0;
             u32 pending_len = CYW_MAX_FRAME;
@@ -788,6 +792,7 @@ static bool sdpcm_recv(u8 *channel, u8 *data, u32 *len)
 
     *channel = cyw_rx_buf[5] & 0x0F;
     sdpcm_next_len = (u32)cyw_rx_buf[6] << 4;
+    cyw_tx_fcmask = cyw_rx_buf[8];
     cyw_tx_max = cyw_rx_buf[9];
     cyw_diag.bcdc_last_channel = *channel;
     cyw_diag.bcdc_last_frame_len = frame_len;
@@ -1745,6 +1750,7 @@ bool cyw43_init(void)
     cyw_link = CYW_LINK_DOWN;
     cyw_tx_seq = 0;
     cyw_tx_max = 4U;
+    cyw_tx_fcmask = 0U;
     cyw_backplane_window = 0;
     sdpcm_frame_pending = false;
     sdpcm_next_len = 0U;
