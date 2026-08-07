@@ -166,6 +166,7 @@ static u64 scan_ready_ms;
 static bool scan_result_request_pending;
 static u16 scan_result_request_id;
 static u64 scan_result_request_deadline_ms;
+static u32 scan_result_request_attempts;
 static u32 scan_kicks_remaining;
 static u64 scan_next_kick_ms;
 static u32 join_kicks_remaining;
@@ -1449,6 +1450,7 @@ static bool scan_result_request_start(void)
 
     scan_result_request_id = id;
     scan_result_request_pending = true;
+    scan_result_request_attempts++;
     scan_result_request_deadline_ms =
         timer_monotonic_ms() + CYW_BCDC_GET_TIMEOUT_MS;
     return true;
@@ -1459,7 +1461,11 @@ static void scan_bus_kick(void)
     /* Never block: this runs from the reactor and from the association poll
      * loop, so it must fail closed when the firmware transmit window is
      * exhausted rather than entering sdpcm_send()'s credit wait. */
-    if (!sdpcm_can_send(SDPCM_CTL_CHANNEL))
+    /* Preserve the last advertised TX credit for the actual result request.
+     * Kicks are optional progress nudges; consuming the final credit makes
+     * result retrieval impossible if the firmware has no event to publish. */
+    if (!sdpcm_can_send(SDPCM_CTL_CHANNEL) ||
+        (u8)(cyw_tx_max - cyw_tx_seq) <= 1U)
         return;
 
     /* The firmware publishes queued SDPCM frames in response to host bus
@@ -1488,21 +1494,37 @@ static void scan_result_poll(void)
         if (bcdc_take_response(scan_result_request_id, scan_result_buf,
                                &len, &status)) {
             scan_result_request_pending = false;
-            scan_in_progress = false;
-            if (status == 0U && scan_parse_legacy_results(scan_result_buf, len))
+            if (status == 0U && scan_parse_legacy_results(scan_result_buf, len)) {
+                scan_result_request_attempts = 0U;
+                scan_in_progress = false;
                 scan_results_pending = false;
+            } else if (scan_result_request_attempts < 3U) {
+                scan_ready_ms = timer_monotonic_ms() + 250ULL;
+                scan_next_kick_ms = timer_monotonic_ms();
+            } else {
+                scan_in_progress = false;
+                scan_results_pending = false;
+            }
             return;
         }
         if (timer_monotonic_ms() >= scan_result_request_deadline_ms) {
             scan_result_request_pending = false;
-            scan_in_progress = false;
             cyw_diag.bcdc_timeouts++;
+            if (scan_result_request_attempts < 3U) {
+                scan_ready_ms = timer_monotonic_ms() + 250ULL;
+                if (scan_kicks_remaining == 0U)
+                    scan_kicks_remaining = 4U;
+                scan_next_kick_ms = timer_monotonic_ms();
+            } else {
+                scan_in_progress = false;
+                scan_results_pending = false;
+            }
         }
         return;
     }
     if (scan_in_progress && timer_monotonic_ms() >= scan_ready_ms) {
-        (void)scan_result_request_start();
-        return;
+        if (scan_result_request_start())
+            return;
     }
     /* While the scan runs, poke the bus on a bounded cadence so the firmware
      * flushes queued escan event frames to the host. */
@@ -2389,8 +2411,11 @@ bool cyw43_scan_start(void)
     scan_count = 0;
     scan_in_progress = true;
     scan_results_pending = true;
-    scan_ready_ms = timer_monotonic_ms() + 30000ULL;
+    /* Keep result retrieval inside the 15-second bounded bus-kick window so
+     * the firmware still has opportunities to publish a credit/response. */
+    scan_ready_ms = timer_monotonic_ms() + 10000ULL;
     scan_result_request_pending = false;
+    scan_result_request_attempts = 0U;
     scan_kicks_remaining = CYW_SCAN_KICKS_MAX;
     scan_next_kick_ms = timer_monotonic_ms() + CYW_SCAN_KICK_INTERVAL_MS;
 
