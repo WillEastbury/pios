@@ -1060,19 +1060,23 @@ static bool sdpcm_send(u8 channel, const u8 *data, u32 len)
     memcpy(cyw_tx_buf + hdr_len, data, len);
 
     u32 total = hdr_len + len;
-    /* Pad to 64-byte boundary for SDIO */
-    u32 padded = (total + 63) & ~63U;
+    /* The SDPCM FIFO requires word alignment for short transfers, not a full
+     * function-1-style 64-byte block. Writing 192 bytes for a declared
+     * 151-byte EAPOL frame left trailing bytes in the FIFO; Circle and
+     * brcmfmac round short function-2 transfers to 4 bytes. */
+    u32 padded = (total + 3U) & ~3U;
 
-    /* Zero padding to avoid leaking stale buffer contents */
-    if (padded > total)
-        memset(cyw_tx_buf + total, 0, padded - total);
-
-    /* Use block mode for transfers >512 bytes */
+    /* Use full 512-byte blocks only when the frame actually exceeds one. */
     if (padded > 512) {
         u32 nblks = (padded + SDIO_FUNC2_BLKSZ - 1) / SDIO_FUNC2_BLKSZ;
+        u32 transfer = nblks * SDIO_FUNC2_BLKSZ;
+        if (transfer > total)
+            memset(cyw_tx_buf + total, 0, transfer - total);
         return sdio_cmd53_write_blocks(SDIO_FUNC_WLAN, 0, cyw_tx_buf,
                                        SDIO_FUNC2_BLKSZ, nblks, false);
     }
+    if (padded > total)
+        memset(cyw_tx_buf + total, 0, padded - total);
     return sdio_cmd53_write(SDIO_FUNC_WLAN, 0, cyw_tx_buf, padded, false);
 }
 
@@ -3065,19 +3069,20 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
     cyw_link = CYW_LINK_JOINING;
 
     static const u8 wpa2_ccmp_psk_rsn[] = {
-        0x30U, 0x14U,             /* RSN IE, 20-byte payload */
-        0x01U, 0x00U,             /* version 1 */
-        0x00U, 0x0FU, 0xACU, 0x04U, /* group CCMP */
+        0x30U, 0x14U,
         0x01U, 0x00U,
-        0x00U, 0x0FU, 0xACU, 0x04U, /* one pairwise CCMP */
+        0x00U, 0x0FU, 0xACU, 0x04U,
         0x01U, 0x00U,
-        0x00U, 0x0FU, 0xACU, 0x02U, /* one AKM: PSK */
-        0x00U, 0x00U              /* no PMF requirement */
+        0x00U, 0x0FU, 0xACU, 0x04U,
+        0x01U, 0x00U,
+        0x00U, 0x0FU, 0xACU, 0x02U,
+        0x00U, 0x00U
     };
     if (!sae && security != WSEC_NONE &&
         !bcdc_set_iovar("wpaie", wpa2_ccmp_psk_rsn,
                         sizeof(wpa2_ccmp_psk_rsn), false))
         return false;
+
 
     u32 wsec;
     u32 wpa_auth;
