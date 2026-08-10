@@ -16,8 +16,8 @@ BASE = (
 )
 FILES = {
     "firmware.bin": (
-        "cypress/cyfmac43455-sdio-minimal.bin",
-        "3075cb0bdc4b28ed4f08e01b1a216d0ebc70f4022d9d3272a4a43b3c90456e60",
+        "cypress/cyfmac43455-sdio-standard.bin",
+        "d608f866582519c0a28d86db43040f4f1b98dd1d153e72e9752586546b4a36c3",
     ),
     "nvram.txt": (
         "brcm/brcmfmac43455-sdio.txt",

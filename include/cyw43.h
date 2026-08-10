@@ -124,6 +124,7 @@
 #define CYW_MAX_SCAN_RESULTS    32
 #define CYW_PASSPHRASE_MAX      64
 #define CYW_EVENT_HISTORY_CAP   16U
+#define CYW_EAPOL_MAX           512U
 
 #define CYW_BLOB_FIRMWARE       1U
 #define CYW_BLOB_NVRAM          2U
@@ -139,6 +140,8 @@ struct cyw_scan_result {
     i16 rssi;
     u16 capability;
     u32 security;
+    u8  rsn_ie_len;
+    u8  rsn_ie[66];
 };
 
 struct cyw43_diag {
@@ -187,7 +190,9 @@ struct cyw43_diag {
     u32 eapol_key_info;
     u32 eapol_replay_hi;
     u32 eapol_replay_lo;
-    u32 eapol_words[11];
+    u32 eapol_m2_sent;
+    u32 eapol_m2_fail;
+    u32 eapol_words[9];
 } ALIGNED(64);
 
 _Static_assert(sizeof(struct cyw43_diag) == 256U,
@@ -228,6 +233,14 @@ struct cyw_join_diag {
     u8 reserved[2];
 };
 
+struct cyw_wpa_debug {
+    u32 m1_len;
+    u32 m2_len;
+    u8 snonce[32];
+    u8 m1[CYW_EAPOL_MAX];
+    u8 m2[CYW_EAPOL_MAX];
+};
+
 /* WiFi link state */
 #define CYW_LINK_DOWN           0
 #define CYW_LINK_JOINING        1
@@ -251,6 +264,7 @@ bool cyw43_join_diag_query(struct cyw_join_diag *out);
 bool cyw43_set_mac(const u8 mac[CYW_MAC_LEN]);
 bool cyw43_fwlog(char *out, u32 max, u32 *out_len);
 bool cyw43_take_eapol(u8 *frame, u32 *len);
+void cyw43_wpa_debug_snapshot(struct cyw_wpa_debug *out);
 typedef void (*cyw43_progress_fn)(void);
 void cyw43_set_progress_hook(cyw43_progress_fn hook);
 

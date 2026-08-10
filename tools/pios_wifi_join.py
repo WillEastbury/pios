@@ -58,13 +58,11 @@ def main() -> int:
                 break
         else:
             raise SystemExit(f"SSID {ssid!r} not found before scan timeout")
-        while time.monotonic() < deadline:
-            status = terminal_command(host, "wifi status", args.timeout)
-            if "event type=69 status=0" in status:
-                break
-            time.sleep(2.0)
-        else:
-            raise SystemExit("escan did not report completion before timeout")
+        # cyw43_scan_get_results() now returns data only after the driver's
+        # asynchronous completion/result state is settled. The latest-event
+        # diagnostic is not an authoritative completion latch: a late partial
+        # BSS event may legitimately overwrite event 69/status 0.
+        print(terminal_command(host, "wifi init", args.timeout))
 
     try:
         if mode == "wpa3":
@@ -88,7 +86,29 @@ def main() -> int:
         print(f"WiFi join request failed: {exc}")
         return 1
     print(result)
-    if "WiFi join OK" not in result:
+    if "WiFi join started" not in result and "WiFi join OK" not in result:
+        return 1
+
+    deadline = time.monotonic() + args.timeout
+    stable_since: float | None = None
+    while time.monotonic() < deadline:
+        time.sleep(1.0)
+        status = terminal_command(host, "wifi status", args.timeout)
+        if " link=2 " in status:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            if time.monotonic() - stable_since >= 10.0:
+                print("WiFi join OK (stable 10s)")
+                break
+            continue
+        stable_since = None
+        if " link=3 " in status:
+            print(status)
+            print(terminal_command(host, "wifi fwlog", args.timeout))
+            return 1
+    else:
+        print(terminal_command(host, "wifi status", args.timeout))
+        print(terminal_command(host, "wifi fwlog", args.timeout))
         return 1
 
     if activate:

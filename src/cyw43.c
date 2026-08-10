@@ -25,6 +25,7 @@
 #include "uart.h"
 #include "timer.h"
 #include "fb.h"
+#include "crypto.h"
 
 /* ── Constants ── */
 
@@ -139,9 +140,10 @@ static u32 sdpcm_next_len;
 /* RX/TX buffers — 64-byte aligned for SDIO DMA compatibility */
 static u8 cyw_tx_buf[CYW_MAX_FRAME] ALIGNED(64);
 static u8 cyw_rx_buf[CYW_MAX_FRAME] ALIGNED(64);
-#define CYW_EAPOL_MAX 512U
 static u8 cyw_eapol_frame[CYW_EAPOL_MAX] ALIGNED(64);
 static u32 cyw_eapol_len;
+static u8 cyw_m2_frame[CYW_EAPOL_MAX] ALIGNED(64);
+static u32 cyw_m2_len;
 
 /* BCDC request ID counter */
 static u16 bcdc_reqid;
@@ -172,6 +174,22 @@ static u64 scan_next_kick_ms;
 static u32 join_kicks_remaining;
 static u64 join_next_kick_ms;
 static u8 scan_result_buf[CYW_SCAN_QUERY_BYTES] ALIGNED(64);
+
+struct cyw_wpa_host {
+    bool nonce_ready;
+    bool enabled;
+    bool m2_sent;
+    bool keys_installed;
+    u8 pmk[32];
+    u8 snonce[32];
+    u8 anonce[32];
+    u8 ptk[64];
+    u8 ap_mac[CYW_MAC_LEN];
+    u8 rsn_ie[66];
+    u8 rsn_ie_len;
+    u64 replay;
+};
+static struct cyw_wpa_host wpa_host;
 
 /* Discovered core addresses (from EROM scan) */
 static u32 cyw_arm_ctl;
@@ -245,7 +263,7 @@ void cyw43_event_history_snapshot(struct cyw_event_history *out)
 bool cyw43_poll_busy(void)
 {
     return scan_in_progress || scan_result_request_pending ||
-           cyw_link != CYW_LINK_DOWN;
+           cyw_link == CYW_LINK_JOINING;
 }
 
 bool cyw43_install_blob(u32 kind, const u8 *data, u32 len)
@@ -581,8 +599,304 @@ static u32 sdpcm_pending_bytes(void);
 static bool sdpcm_recv(u8 *channel, u8 *data, u32 *len);
 static void handle_event(const u8 *data, u32 len);
 static void bcdc_cache_response(const u8 *frame, u32 len);
+static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len,
+                           bool wait_response);
 static u32 load_le32(const u8 *p);
 static bool scan_store_bss(const u8 *bss, u32 record_len);
+
+struct wpa_sha1 {
+    u32 h[5];
+    u64 bytes;
+    u8 block[64];
+    u32 used;
+};
+
+static u32 wpa_rol32(u32 v, u32 n) { return (v << n) | (v >> (32U - n)); }
+
+static void wpa_sha1_block(struct wpa_sha1 *s, const u8 *p)
+{
+    u32 w[80];
+    for (u32 i = 0U; i < 16U; i++)
+        w[i] = ((u32)p[i * 4U] << 24) | ((u32)p[i * 4U + 1U] << 16) |
+               ((u32)p[i * 4U + 2U] << 8) | p[i * 4U + 3U];
+    for (u32 i = 16U; i < 80U; i++)
+        w[i] = wpa_rol32(w[i - 3U] ^ w[i - 8U] ^ w[i - 14U] ^ w[i - 16U], 1U);
+    u32 a=s->h[0], b=s->h[1], c=s->h[2], d=s->h[3], e=s->h[4];
+    for (u32 i = 0U; i < 80U; i++) {
+        u32 f, k;
+        if (i < 20U) { f = (b & c) | (~b & d); k = 0x5A827999U; }
+        else if (i < 40U) { f = b ^ c ^ d; k = 0x6ED9EBA1U; }
+        else if (i < 60U) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCU; }
+        else { f = b ^ c ^ d; k = 0xCA62C1D6U; }
+        u32 t = wpa_rol32(a, 5U) + f + e + k + w[i];
+        e=d; d=c; c=wpa_rol32(b,30U); b=a; a=t;
+    }
+    s->h[0]+=a; s->h[1]+=b; s->h[2]+=c; s->h[3]+=d; s->h[4]+=e;
+}
+
+static void wpa_sha1_init(struct wpa_sha1 *s)
+{
+    s->h[0]=0x67452301U; s->h[1]=0xEFCDAB89U; s->h[2]=0x98BADCFEU;
+    s->h[3]=0x10325476U; s->h[4]=0xC3D2E1F0U;
+    s->bytes=0U; s->used=0U;
+}
+
+static void wpa_sha1_update(struct wpa_sha1 *s, const u8 *p, u32 len)
+{
+    s->bytes += len;
+    while (len) {
+        u32 n = 64U - s->used;
+        if (n > len) n = len;
+        memcpy(s->block + s->used, p, n);
+        s->used += n; p += n; len -= n;
+        if (s->used == 64U) { wpa_sha1_block(s, s->block); s->used = 0U; }
+    }
+}
+
+static void wpa_sha1_final(struct wpa_sha1 *s, u8 out[20])
+{
+    u64 bits = s->bytes * 8ULL;
+    s->block[s->used++] = 0x80U;
+    if (s->used > 56U) {
+        while (s->used < 64U) s->block[s->used++] = 0U;
+        wpa_sha1_block(s, s->block); s->used = 0U;
+    }
+    while (s->used < 56U) s->block[s->used++] = 0U;
+    for (u32 i = 0U; i < 8U; i++)
+        s->block[56U + i] = (u8)(bits >> (56U - i * 8U));
+    wpa_sha1_block(s, s->block);
+    for (u32 i = 0U; i < 5U; i++) {
+        out[i*4U]=(u8)(s->h[i]>>24); out[i*4U+1U]=(u8)(s->h[i]>>16);
+        out[i*4U+2U]=(u8)(s->h[i]>>8); out[i*4U+3U]=(u8)s->h[i];
+    }
+}
+
+static void wpa_hmac_sha1(const u8 *key, u32 key_len,
+                          const u8 *data, u32 data_len, u8 out[20])
+{
+    u8 k[64], inner[20];
+    memset(k, 0, sizeof(k));
+    if (key_len > 64U) {
+        struct wpa_sha1 sh; wpa_sha1_init(&sh);
+        wpa_sha1_update(&sh, key, key_len); wpa_sha1_final(&sh, k);
+    } else memcpy(k, key, key_len);
+    for (u32 i=0U;i<64U;i++) k[i]^=0x36U;
+    struct wpa_sha1 sh; wpa_sha1_init(&sh);
+    wpa_sha1_update(&sh,k,64U); wpa_sha1_update(&sh,data,data_len);
+    wpa_sha1_final(&sh,inner);
+    for (u32 i=0U;i<64U;i++) k[i]^=(0x36U^0x5CU);
+    wpa_sha1_init(&sh); wpa_sha1_update(&sh,k,64U);
+    wpa_sha1_update(&sh,inner,20U); wpa_sha1_final(&sh,out);
+    memset(k,0,sizeof(k)); memset(inner,0,sizeof(inner));
+}
+
+static int wpa_bytes_cmp(const u8 *a, const u8 *b, u32 n)
+{
+    for (u32 i=0U;i<n;i++) if (a[i]!=b[i]) return a[i]<b[i]?-1:1;
+    return 0;
+}
+
+static void wpa_derive_ptk(void)
+{
+    static const u8 label[] = "Pairwise key expansion";
+    u8 data[76], input[100], mac[20];
+    const u8 *mac1 = cyw_mac, *mac2 = wpa_host.ap_mac;
+    if (wpa_bytes_cmp(mac1,mac2,6U)>0) { const u8 *t=mac1;mac1=mac2;mac2=t; }
+    memcpy(data,mac1,6U); memcpy(data+6U,mac2,6U);
+    const u8 *n1=wpa_host.snonce,*n2=wpa_host.anonce;
+    if (wpa_bytes_cmp(n1,n2,32U)>0) { const u8 *t=n1;n1=n2;n2=t; }
+    memcpy(data+12U,n1,32U); memcpy(data+44U,n2,32U);
+    u32 off=0U; memcpy(input+off,label,sizeof(label)-1U);off+=sizeof(label)-1U;
+    input[off++]=0U; memcpy(input+off,data,sizeof(data));off+=sizeof(data);
+    for (u32 i=0U;i<4U;i++) {
+        input[off]= (u8)i;
+        wpa_hmac_sha1(wpa_host.pmk,32U,input,off+1U,mac);
+        u32 n = (64U-i*20U)>20U?20U:(64U-i*20U);
+        memcpy(wpa_host.ptk+i*20U,mac,n);
+    }
+    memset(data,0,sizeof(data)); memset(input,0,sizeof(input)); memset(mac,0,sizeof(mac));
+}
+
+static bool wpa_send_m2(const u8 *m1, u32 frame_len)
+{
+    if (frame_len < 113U || wpa_host.rsn_ie_len == 0U)
+        return false;
+    const u32 eapol = 14U, key = 18U;
+    u32 body_len = 95U + wpa_host.rsn_ie_len;
+    u32 total = 14U + 4U + body_len;
+    if (total > CYW_EAPOL_MAX)
+        return false;
+    static u8 frame[CYW_EAPOL_MAX] ALIGNED(64);
+    memset(frame,0,total);
+    memcpy(frame,m1+6U,6U); memcpy(frame+6U,cyw_mac,6U);
+    frame[12]=0x88U; frame[13]=0x8EU;
+    frame[eapol]=m1[eapol]; frame[eapol+1U]=3U;
+    frame[eapol+2U]=(u8)(body_len>>8); frame[eapol+3U]=(u8)body_len;
+    frame[key]=2U; frame[key+1U]=0x01U; frame[key+2U]=0x0AU;
+    frame[key+3U]=m1[key+3U]; frame[key+4U]=m1[key+4U];
+    memcpy(frame+key+5U,m1+key+5U,8U);
+    memcpy(frame+key+13U,wpa_host.snonce,32U);
+    frame[key+93U]=0U; frame[key+94U]=wpa_host.rsn_ie_len;
+    memcpy(frame+key+95U,wpa_host.rsn_ie,wpa_host.rsn_ie_len);
+    u8 mic[20];
+    wpa_hmac_sha1(wpa_host.ptk,16U,frame+eapol,4U+body_len,mic);
+    memcpy(frame+key+77U,mic,16U);
+    memset(mic,0,sizeof(mic));
+    memcpy(cyw_m2_frame,frame,total);
+    cyw_m2_len=total;
+    return cyw43_send_frame(frame,total);
+}
+
+static bool wpa_mic_valid(const u8 *frame, u32 frame_len)
+{
+    if (frame_len < 113U)
+        return false;
+    u32 body_len=((u32)frame[16]<<8)|frame[17];
+    if (body_len+18U>frame_len || body_len<95U)
+        return false;
+    u8 copy[CYW_EAPOL_MAX], mac[20], wire[16];
+    u32 eapol_len=4U+body_len;
+    if (eapol_len>sizeof(copy))
+        return false;
+    memcpy(copy,frame+14U,eapol_len);
+    memcpy(wire,copy+81U,16U);
+    memset(copy+81U,0,16U);
+    wpa_hmac_sha1(wpa_host.ptk,16U,copy,eapol_len,mac);
+    u8 diff=0U;
+    for(u32 i=0U;i<16U;i++) diff|=wire[i]^mac[i];
+    memset(copy,0,sizeof(copy));memset(mac,0,sizeof(mac));memset(wire,0,sizeof(wire));
+    return diff==0U;
+}
+
+static bool wpa_aes_unwrap(const u8 *wrapped,u32 wrapped_len,u8 *plain,u32 *plain_len)
+{
+    if (!wrapped || !plain || !plain_len || wrapped_len<16U ||
+        (wrapped_len&7U)!=0U)
+        return false;
+    u32 n=wrapped_len/8U-1U;
+    if (*plain_len<n*8U)
+        return false;
+    u8 a[8],block[16],out[16];
+    memcpy(a,wrapped,8U);memcpy(plain,wrapped+8U,n*8U);
+    struct aes_key aes;
+    aes_key_expand(&aes,wpa_host.ptk+16U,128U);
+    for(i32 j=5;j>=0;j--) {
+        for(i32 i=(i32)n;i>=1;i--) {
+            u64 t=(u64)n*(u64)j+(u64)i;
+            memcpy(block,a,8U);
+            for(u32 k=0U;k<8U;k++)
+                block[7U-k]^=(u8)(t>>(k*8U));
+            memcpy(block+8U,plain+(u32)(i-1)*8U,8U);
+            aes_decrypt_block(&aes,block,out);
+            memcpy(a,out,8U);
+            memcpy(plain+(u32)(i-1)*8U,out+8U,8U);
+        }
+    }
+    static const u8 iv[8]={0xA6U,0xA6U,0xA6U,0xA6U,0xA6U,0xA6U,0xA6U,0xA6U};
+    bool ok=memcmp(a,iv,8U)==0;
+    *plain_len=ok?n*8U:0U;
+    memset(&aes,0,sizeof(aes));memset(a,0,sizeof(a));memset(block,0,sizeof(block));memset(out,0,sizeof(out));
+    return ok;
+}
+
+static bool wpa_install_key(u32 index,const u8 *key,u32 key_len,
+                            bool pairwise,const u8 *peer,u64 rsc)
+{
+    if (!key || key_len==0U || key_len>32U)
+        return false;
+    u8 params[164],*p=params;
+    memset(params,0,sizeof(params));
+#define WPA_PUT32(v) do { u32 _v=(v);p[0]=(u8)_v;p[1]=(u8)(_v>>8);p[2]=(u8)(_v>>16);p[3]=(u8)(_v>>24);p+=4; } while(0)
+#define WPA_PUT16(v) do { u16 _v=(v);p[0]=(u8)_v;p[1]=(u8)(_v>>8);p+=2; } while(0)
+    WPA_PUT32(pairwise?0U:index);
+    WPA_PUT32(key_len);
+    memcpy(p,key,key_len);p+=32U+72U;
+    WPA_PUT32(4U);                 /* CRYPTO_ALGO_AES_CCM */
+    WPA_PUT32(pairwise?0U:2U);     /* PRIMARY_KEY for GTK */
+    p+=12U;
+    WPA_PUT32(0U);                 /* IV not initialized by host */
+    WPA_PUT32((u32)(rsc>>16));
+    WPA_PUT16((u16)rsc);
+    p+=10U;
+    if(pairwise&&peer) memcpy(p,peer,CYW_MAC_LEN);
+#undef WPA_PUT32
+#undef WPA_PUT16
+    bool ok=bcdc_set_iovar("wsec_key",params,sizeof(params),false);
+    memset(params,0,sizeof(params));
+    return ok;
+}
+
+static bool wpa_find_gtk(const u8 *data,u32 len,u8 *gtk,u32 *gtk_len,u32 *key_id)
+{
+    u32 off=0U;
+    while(off+2U<=len) {
+        u32 item=data[off+1U]+2U;
+        if(item<2U||item>len-off) return false;
+        if(data[off]==0xDDU&&item>=24U&&
+           data[off+2U]==0x00U&&data[off+3U]==0x0FU&&
+           data[off+4U]==0xACU&&data[off+5U]==0x01U) {
+            u32 n=item-8U;
+            if(n>32U||*gtk_len<n) return false;
+            *key_id=data[off+6U]&3U;
+            memcpy(gtk,data+off+8U,n);*gtk_len=n;
+            return true;
+        }
+        off+=item;
+    }
+    return false;
+}
+
+static bool wpa_send_m4(const u8 *m3,u32 frame_len)
+{
+    if(frame_len<113U) return false;
+    static u8 frame[113] ALIGNED(64);
+    memset(frame,0,sizeof(frame));
+    memcpy(frame,m3,14U);
+    frame[14]=m3[14];frame[15]=3U;frame[16]=0U;frame[17]=95U;
+    frame[18]=2U;frame[19]=0x03U;frame[20]=0x0AU;
+    frame[21]=m3[21];frame[22]=m3[22];
+    memcpy(frame+23U,m3+23U,8U);
+    u8 mac[20];
+    wpa_hmac_sha1(wpa_host.ptk,16U,frame+14U,99U,mac);
+    memcpy(frame+95U,mac,16U);memset(mac,0,sizeof(mac));
+    return cyw43_send_frame(frame,sizeof(frame));
+}
+
+static bool wpa_handle_m3(const u8 *frame,u32 frame_len)
+{
+    const u32 key=18U;
+    if(frame_len<113U||!wpa_mic_valid(frame,frame_len))
+        return false;
+    if(memcmp(frame+key+13U,wpa_host.anonce,32U)!=0)
+        return false;
+    u64 replay=((u64)frame[23]<<56)|((u64)frame[24]<<48)|
+               ((u64)frame[25]<<40)|((u64)frame[26]<<32)|
+               ((u64)frame[27]<<24)|((u64)frame[28]<<16)|
+               ((u64)frame[29]<<8)|frame[30];
+    if(replay<wpa_host.replay)
+        return false;
+    u32 kd_len=((u32)frame[key+93U]<<8)|frame[key+94U];
+    if(key+95U+kd_len>frame_len)
+        return false;
+    u8 plain[256],gtk[32];u32 plain_len=sizeof(plain),gtk_len=sizeof(gtk),key_id=0U;
+    u16 info=((u16)frame[19]<<8)|frame[20];
+    const u8 *kd=frame+key+95U;
+    if(info&0x1000U) {
+        if(kd_len>sizeof(plain)||!wpa_aes_unwrap(kd,kd_len,plain,&plain_len))
+            return false;
+        kd=plain;kd_len=plain_len;
+    }
+    if(!wpa_find_gtk(kd,kd_len,gtk,&gtk_len,&key_id))
+        return false;
+    u64 rsc=0ULL;
+    for(u32 i=0U;i<8U;i++) rsc=(rsc<<8)|frame[key+61U+i];
+    bool ok=wpa_install_key(0U,wpa_host.ptk+32U,16U,true,wpa_host.ap_mac,0ULL)&&
+            wpa_install_key(key_id,gtk,gtk_len,false,NULL,rsc)&&
+            wpa_send_m4(frame,frame_len);
+    memset(plain,0,sizeof(plain));memset(gtk,0,sizeof(gtk));
+    if(ok){wpa_host.keys_installed=true;cyw_link=CYW_LINK_UP;}
+    return ok;
+}
 
 static void capture_eapol(const u8 *data, u32 len)
 {
@@ -615,8 +929,8 @@ static void capture_eapol(const u8 *data, u32 len)
                            ((u32)frame[29] << 8) | frame[30] : 0U;
     memset(cyw_diag.eapol_words, 0, sizeof(cyw_diag.eapol_words));
     u32 words = frame_len / 4U;
-    if (words > 11U)
-        words = 11U;
+    if (words > 9U)
+        words = 9U;
     for (u32 i = 0U; i < words; i++)
         cyw_diag.eapol_words[i] = load_le32(frame + i * 4U);
     uart_puts("[cyw] EAPOL keyinfo=");
@@ -626,6 +940,46 @@ static void capture_eapol(const u8 *data, u32 len)
     uart_puts(":");
     uart_hex(cyw_diag.eapol_replay_lo);
     uart_puts("\n");
+
+    if (wpa_host.enabled && frame_len >= 113U) {
+        u16 key_info = ((u16)frame[19] << 8) | frame[20];
+        bool pairwise = (key_info & 0x0008U) != 0U;
+        bool ack = (key_info & 0x0080U) != 0U;
+        bool mic = (key_info & 0x0100U) != 0U;
+        if (pairwise && ack && !mic) {
+            memcpy(wpa_host.ap_mac,frame+6U,6U);
+            memcpy(wpa_host.anonce,frame+31U,32U);
+            wpa_host.replay =
+                ((u64)frame[23]<<56)|((u64)frame[24]<<48)|
+                ((u64)frame[25]<<40)|((u64)frame[26]<<32)|
+                ((u64)frame[27]<<24)|((u64)frame[28]<<16)|
+                ((u64)frame[29]<<8)|frame[30];
+            if (!wpa_host.nonce_ready) {
+                u8 seed[28];
+                memcpy(seed,cyw_mac,6U);
+                memcpy(seed+6U,wpa_host.ap_mac,6U);
+                u64 now=timer_monotonic_ms();
+                for (u32 i=0U;i<8U;i++)
+                    seed[12U+i]=(u8)(now>>(i*8U));
+                u64 ticks=timer_ticks();
+                for (u32 i=0U;i<8U;i++)
+                    seed[20U+i]=(u8)(ticks>>(i*8U));
+                hmac_sha256(wpa_host.pmk,32U,seed,sizeof(seed),
+                            wpa_host.snonce);
+                memset(seed,0,sizeof(seed));
+                wpa_host.nonce_ready=true;
+            }
+            wpa_derive_ptk();
+            if (wpa_send_m2(frame,frame_len)) {
+                wpa_host.m2_sent = true;
+                cyw_diag.eapol_m2_sent++;
+            } else {
+                cyw_diag.eapol_m2_fail++;
+            }
+        } else if (pairwise && ack && mic) {
+            (void)wpa_handle_m3(frame,frame_len);
+        }
+    }
 }
 
 #define CYW_SCAN_SEC_WPA2_PSK        (1U << 0)
@@ -1225,7 +1579,8 @@ static void handle_event(const u8 *data, u32 len)
 
     case CYW_E_SET_SSID:
         if (status == CYW_E_STATUS_SUCCESS) {
-            cyw_link = CYW_LINK_UP;
+            if (!wpa_host.enabled || wpa_host.keys_installed)
+                cyw_link = CYW_LINK_UP;
             uart_puts("[cyw] connected\n");
         } else {
             cyw_link = CYW_LINK_AUTH_FAIL;
@@ -1238,7 +1593,8 @@ static void handle_event(const u8 *data, u32 len)
     case CYW_E_LINK:
         if (status == CYW_E_STATUS_SUCCESS) {
             if (event_flags & 1U) {
-                cyw_link = CYW_LINK_UP;
+                if (!wpa_host.enabled || wpa_host.keys_installed)
+                    cyw_link = CYW_LINK_UP;
                 uart_puts("[cyw] link up\n");
             } else {
                 cyw_link = CYW_LINK_DOWN;
@@ -1330,6 +1686,11 @@ static bool scan_store_bss(const u8 *bss, u32 record_len)
             if (item_len + 2U > available)
                 break;
             if (ie[0] == 48U && item_len >= 8U) {
+                u32 rsn_len = item_len + 2U;
+                if (rsn_len <= sizeof(r->rsn_ie)) {
+                    memcpy(r->rsn_ie, ie, rsn_len);
+                    r->rsn_ie_len = (u8)rsn_len;
+                }
                 const u8 *p = ie + 2U;
                 u32 left = item_len;
                 if (left < 8U)
@@ -1764,8 +2125,11 @@ bool cyw43_init(void)
     bcdc_reqid = 1;
     bcdc_ignore_through = 0U;
     memset(bcdc_responses, 0, sizeof(bcdc_responses));
-    scan_count = 0;
-    cyw_diag.scan_result_count = 0U;
+    /* Preserve the last completed scan cache across a clean firmware
+     * reinitialization. Association needs fresh SDPCM credits after scanning,
+     * but still needs the selected BSSID/chanspec from that scan. A new
+     * cyw43_scan_start() remains the authoritative cache reset. */
+    cyw_diag.scan_result_count = scan_count;
     scan_in_progress = false;
     scan_results_pending = false;
     scan_ready_ms = 0ULL;
@@ -1779,18 +2143,22 @@ bool cyw43_init(void)
     cyw_diag.last_event_flags = 0U;
     cyw_diag.last_event_len = 0U;
     cyw_diag.event_count = 0U;
-    cyw_diag.scan_result_count = 0U;
+    cyw_diag.scan_result_count = scan_count;
     cyw_diag.last_event_reason = 0U;
     memset(cyw_diag.event_words, 0, sizeof(cyw_diag.event_words));
     event_history_reset();
     cyw_eapol_len = 0U;
+    cyw_m2_len = 0U;
     cyw_diag.eapol_frames = 0U;
     cyw_diag.eapol_len = 0U;
     cyw_diag.eapol_key_info = 0U;
     cyw_diag.eapol_replay_hi = 0U;
     cyw_diag.eapol_replay_lo = 0U;
+    cyw_diag.eapol_m2_sent = 0U;
+    cyw_diag.eapol_m2_fail = 0U;
     memset(cyw_diag.eapol_words, 0, sizeof(cyw_diag.eapol_words));
     memset(cyw_mac, 0, CYW_MAC_LEN);
+    memset(&wpa_host, 0, sizeof(wpa_host));
 
     uart_puts("[cyw] init...\n");
 
@@ -2313,6 +2681,18 @@ bool cyw43_load_firmware(void)
         uart_puts("[cyw] no CLM\n");
     }
 
+    /* Use a stable locally-administered address. Leaving cyw_mac zero makes
+     * WiFi activation build ARP/Ethernet frames with an invalid source MAC if
+     * the synchronous cur_etheraddr GET is delayed or unsupported. */
+    {
+        static const u8 pios_wifi_mac[CYW_MAC_LEN] =
+            { 0x02U, 0x50U, 0x49U, 0x4FU, 0x53U, 0x01U };
+        if (!cyw43_set_mac(pios_wifi_mac)) {
+            uart_puts("[cyw] MAC set fail\n");
+            return false;
+        }
+    }
+
     uart_puts("[cyw] fw ok\n");
     cyw_diag.stage = 25U;
     return true;
@@ -2477,8 +2857,8 @@ bool cyw43_scan_start(void)
 
 bool cyw43_scan_get_results(struct cyw_scan_result *results, u32 *count)
 {
-    if ((scan_in_progress || scan_result_request_pending ||
-         scan_results_pending) && scan_count == 0U)
+    if (scan_in_progress || scan_result_request_pending ||
+        scan_results_pending)
         return false;
 
     u32 n = scan_count;
@@ -2492,8 +2872,8 @@ bool cyw43_scan_get_results(struct cyw_scan_result *results, u32 *count)
 bool cyw43_scan_in_progress(void)
 {
     scan_result_poll();
-    return (scan_in_progress || scan_result_request_pending ||
-            scan_results_pending) && scan_count == 0U;
+    return scan_in_progress || scan_result_request_pending ||
+           scan_results_pending;
 }
 
 bool cyw43_radio_query(u32 *radio, u32 *channel)
@@ -2636,6 +3016,20 @@ bool cyw43_take_eapol(u8 *frame, u32 *len)
     return true;
 }
 
+void cyw43_wpa_debug_snapshot(struct cyw_wpa_debug *out)
+{
+    if (!out)
+        return;
+    memset(out,0,sizeof(*out));
+    out->m1_len=cyw_eapol_len;
+    out->m2_len=cyw_m2_len;
+    memcpy(out->snonce,wpa_host.snonce,sizeof(out->snonce));
+    if (out->m1_len <= sizeof(out->m1))
+        memcpy(out->m1,cyw_eapol_frame,out->m1_len);
+    if (out->m2_len <= sizeof(out->m2))
+        memcpy(out->m2,cyw_m2_frame,out->m2_len);
+}
+
 static bool cyw43_join_key(const char *ssid, u32 ssid_len,
                            const u8 *key, u32 key_len, u16 key_flags,
                            u32 security, bool sae)
@@ -2660,13 +3054,31 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
     if (!best)
         return false;
 
+    bool host_supplicant =
+        !sae && key_len == 32U && key_flags == 0U;
+    wpa_host.enabled = false;
+    wpa_host.m2_sent = false;
+
     uart_puts("[cyw] join radio\n");
     if (!cyw43_radio_enable())
         return false;
-
     cyw_link = CYW_LINK_JOINING;
 
-    /* Set security type */
+    static const u8 wpa2_ccmp_psk_rsn[] = {
+        0x30U, 0x14U,             /* RSN IE, 20-byte payload */
+        0x01U, 0x00U,             /* version 1 */
+        0x00U, 0x0FU, 0xACU, 0x04U, /* group CCMP */
+        0x01U, 0x00U,
+        0x00U, 0x0FU, 0xACU, 0x04U, /* one pairwise CCMP */
+        0x01U, 0x00U,
+        0x00U, 0x0FU, 0xACU, 0x02U, /* one AKM: PSK */
+        0x00U, 0x00U              /* no PMF requirement */
+    };
+    if (!sae && security != WSEC_NONE &&
+        !bcdc_set_iovar("wpaie", wpa2_ccmp_psk_rsn,
+                        sizeof(wpa2_ccmp_psk_rsn), false))
+        return false;
+
     u32 wsec;
     u32 wpa_auth;
     if (security == WSEC_NONE) {
@@ -2676,20 +3088,19 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
         wsec = WSEC_AES;
         wpa_auth = sae ? WPA3_AUTH_SAE_PSK : WPA2_AUTH_PSK;
     }
+
     uart_puts("[cyw] join wsec\n");
     if (!bcdc_set_cmd(WLC_SET_WSEC, &wsec, 4, false))
         return false;
 
     /* Configure the firmware WPA supplicant. */
     if (security != WSEC_NONE && key_len > 0U) {
-        u32 supplicant = 1U;
-        uart_puts("[cyw] join supplicant\n");
-        if (!bcdc_set_iovar("sup_wpa", &supplicant,
-                            sizeof(supplicant), false))
-            return false;
-
-        timer_delay_ms(2U);
-        if (sae) {
+        if (host_supplicant) {
+            u32 zero=0U;
+            if (!bcdc_set_iovar("eap_restrict",&zero,sizeof(zero),false) ||
+                !bcdc_set_iovar("wsec_restrict",&zero,sizeof(zero),false))
+                return false;
+        } else if (sae) {
             struct {
                 u16 key_len;
                 u8 key[128];
@@ -2701,6 +3112,12 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
                                 sizeof(sae_password), false))
                 return false;
         } else {
+            u32 supplicant = 1U;
+            uart_puts("[cyw] join supplicant\n");
+            if (!bcdc_set_iovar("sup_wpa", &supplicant,
+                                sizeof(supplicant), false))
+                return false;
+            timer_delay_ms(2U);
             struct {
                 u16 key_len;
                 u16 flags;
@@ -2758,33 +3175,21 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
                       sizeof(join_params), false))
         return false;
 
-    /* Poll for association result */
-    uart_puts("[cyw] joining...\n");
-    for (u32 i = 0; i < 3000U; i++) {  /* up to 30s */
-        if ((i & 63U) == 0U)
-            watchdog_hw_pet();
-        cyw43_poll();
-        /* This loop owns core 0 for up to 30 seconds. Without draining the
-         * wired GEM ring here it fills (896/896), latches BNA and halts RX
-         * DMA -- and because no further ETH IRQ can then be raised, the
-         * reactor's IRQ-driven recovery never runs and the wired management
-         * path is lost permanently. The progress hook pairs net_poll() with
-         * the MAC recovery checks and pets the watchdog. */
-        if (cyw_progress_hook)
-            cyw_progress_hook();
-        u32 state = cyw43_link_state();
-        if (state == CYW_LINK_UP) {
-            uart_puts("[cyw] associated!\n");
-            return true;
-        }
-        if (state == CYW_LINK_AUTH_FAIL) {
-            uart_puts("[cyw] auth failed\n");
-            return false;
-        }
-        timer_delay_ms(10U);
+    if (host_supplicant) {
+        wpa_host.nonce_ready=false;
+        memcpy(wpa_host.pmk,key,32U);
+        memcpy(wpa_host.ap_mac,best->bssid,CYW_MAC_LEN);
+        memcpy(wpa_host.rsn_ie,wpa2_ccmp_psk_rsn,
+               sizeof(wpa2_ccmp_psk_rsn));
+        wpa_host.rsn_ie_len=sizeof(wpa2_ccmp_psk_rsn);
+        wpa_host.enabled=true;
     }
-    uart_puts("[cyw] join timeout\n");
-    return false;
+
+    /* Association is asynchronous. The core-0 reactor owns SDPCM/event
+     * draining; blocking here used to starve the wired fail-safe path and
+     * erase diagnostics in a watchdog reboot. */
+    uart_puts("[cyw] joining async\n");
+    return true;
 }
 
 bool cyw43_join(const char *ssid, u32 ssid_len,

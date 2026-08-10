@@ -3538,8 +3538,12 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, cd.eapol_replay_hi);
         http_append(out, &len, max, ":");
         http_append_hex32(out, &len, max, cd.eapol_replay_lo);
+        http_append(out, &len, max, " m2=");
+        http_append_u64(out, &len, max, cd.eapol_m2_sent);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, cd.eapol_m2_fail);
         http_append(out, &len, max, "\neapol raw=");
-        for (u32 i = 0U; i < 11U; i++)
+        for (u32 i = 0U; i < 9U; i++)
             http_append_hex32(out, &len, max, cd.eapol_words[i]);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "wifi probe")) {
@@ -3700,6 +3704,26 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append_u64(out, &len, max, cd.last_event_reason);
             http_append(out, &len, max, "\n");
         }
+    } else if (http_streq(cmd, "wifi wpadiag")) {
+        static struct cyw_wpa_debug wd;
+        static const char hex[] = "0123456789abcdef";
+        cyw43_wpa_debug_snapshot(&wd);
+        http_append(out, &len, max, "snonce=");
+        for (u32 i=0U;i<sizeof(wd.snonce);i++) {
+            char b[3]={hex[wd.snonce[i]>>4],hex[wd.snonce[i]&15U],0};
+            http_append(out,&len,max,b);
+        }
+        http_append(out,&len,max,"\nm1=");
+        for (u32 i=0U;i<wd.m1_len;i++) {
+            char b[3]={hex[wd.m1[i]>>4],hex[wd.m1[i]&15U],0};
+            http_append(out,&len,max,b);
+        }
+        http_append(out,&len,max,"\nm2=");
+        for (u32 i=0U;i<wd.m2_len;i++) {
+            char b[3]={hex[wd.m2[i]>>4],hex[wd.m2[i]&15U],0};
+            http_append(out,&len,max,b);
+        }
+        http_append(out,&len,max,"\n");
     } else if (http_streq(cmd, "wifi fwlog")) {
         static char fwlog[2025];
         u32 fwlog_len = 0U;
@@ -3729,7 +3753,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                       cyw43_join_sae(argv[2], ssid_len,
                                      argv[3], pass_len);
             http_append(out, &len, max,
-                        ok ? "WiFi join OK\n" : "WiFi join FAILED\n");
+                        ok ? "WiFi join started\n" : "WiFi join FAILED\n");
         }
     } else if (http_starts_with(cmd, "wifi joinpmk ")) {
         char *argv[5];
@@ -3748,7 +3772,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                       cyw43_join_pmk(argv[2], ssid_len, pmk);
             memset(pmk, 0, sizeof(pmk));
             http_append(out, &len, max,
-                        ok ? "WiFi join OK\n" : "WiFi join FAILED\n");
+                        ok ? "WiFi join started\n" : "WiFi join FAILED\n");
             if (!ok) {
                 wifi_append_event_history(out, &len, max);
                 static char fwlog[2025];
@@ -3778,19 +3802,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                       pass_len <= CYW_PASSPHRASE_MAX &&
                       cyw43_join(argv[2], ssid_len, argv[3], pass_len,
                                  WSEC_AES);
-            if (ok) {
-                u64 deadline = timer_monotonic_ms() + 20000ULL;
-                while (timer_monotonic_ms() < deadline &&
-                       cyw43_link_state() == CYW_LINK_JOINING) {
-                    cyw43_poll();
-                    wifi_upload_progress();
-                    timer_delay_ms(10U);
-                    watchdog_hw_pet();
-                }
-                ok = cyw43_is_connected();
-            }
             http_append(out, &len, max,
-                        ok ? "WiFi join OK\n" : "WiFi join FAILED\n");
+                        ok ? "WiFi join started\n" : "WiFi join FAILED\n");
         }
     } else if (http_streq(cmd, "wifi activate")) {
         if (!nic_activate_wifi_loaded()) {
@@ -22372,6 +22385,12 @@ static void core0_io_tick_hook(u32 core, u64 tick)
     if ((tick & 7U) == 0)
         flags |= CORE0_IO_NET | CORE0_IO_TCP;
 #endif
+    /* The CYW43455 has no wired-MAC IRQ to drive net_poll(). Once WiFi is the
+     * active backend, schedule the normal network/TCP path at the fast device
+     * cadence so SDPCM data frames reach ARP/IP/TCP instead of being consumed
+     * by the control-only WiFi poller. */
+    if (nic_is_wifi() && (tick & 7U) == 0U)
+        flags |= CORE0_IO_NET | CORE0_IO_TCP;
     /* WiFi frame draining is deliberately independent of CORE0_IO_NET: on Pi 5
      * that flag is set purely by the wired ETH IRQ, so a quiet wired link would
      * otherwise stall CYW43455 event delivery (escan results, link/PSK events)
@@ -22829,7 +22848,7 @@ NORETURN void core0_main(void) {
                 core0_eth_irq_deferred_quench = false;
                 core0_eth_irq_drain_and_quench(false);
             }
-            if (cyw43_runtime_ready())
+            if (cyw43_runtime_ready() && !nic_is_wifi())
                 cyw43_poll();
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
             /* Recovered from a poll-only livelock fallback: after a cooldown
@@ -22932,7 +22951,7 @@ NORETURN void core0_main(void) {
         }
 
         if (flags & CORE0_IO_WIFI) {
-            if (cyw43_runtime_ready())
+            if (cyw43_runtime_ready() && !nic_is_wifi())
                 cyw43_poll();
         }
 
