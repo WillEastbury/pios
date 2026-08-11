@@ -19,6 +19,7 @@
 #include "uart.h"
 #include "fb.h"
 #include "fifo.h"
+#include "picovm_fifo.h"
 #include "sd.h"
 #include "nic.h"
 #include "macb.h"
@@ -112,6 +113,7 @@
 #include "adrv.h"
 #include "airq.h"
 #include "rp1_i2c.h"
+#include "rp1_spi.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -585,6 +587,14 @@ static u32 http_build_pcap_response(char *out, u32 max, const u8 *req, u32 req_l
 static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, u32 req_len);
 static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len);
 static void pios_bootctrl_mark_success(void);
+/* Crashdump pack: SD handoff records are archived here on the next boot. */
+#define CRASHDUMP_PACK_PATH  "/var/crash/crashdump.pack"
+#define CRASHDUMP_PACK_MAX   (64U * 1024U)
+/* Uptime after which a boot counts as healthy for crash-loop purposes. */
+#define CRASH_HEALTHY_UPTIME_MS (60U * 1000U)
+static bool http_walfs_recreate_file(const char *path, u64 *id_out);
+static bool crashdump_archive_pending(void);
+static bool crashdump_open_pack(bool recreate, u64 *id_out);
 static void core0_sched_snapshot(u64 *wake, u64 *wfi_count, u64 *idle_ticks,
                                  u64 *total_ticks, u32 *busy_permille,
                                  u32 *last_flags);
@@ -1638,6 +1648,54 @@ static void http_append_hex64(char *out, u32 *len, u32 max, u64 v)
         s[i] = hx[(v >> ((15 - i) * 4)) & 0xF];
     s[16] = 0;
     http_append(out, len, max, s);
+}
+
+/* Render the stall payload of a crash record. Kinds other than STALL carry no
+ * payload, so this emits nothing for them. */
+static void http_append_crash_stall(char *out, u32 *len, u32 max,
+                                    const struct exception_crash_record *cr)
+{
+    if (cr->kind != EXCEPTION_CRASH_KIND_STALL)
+        return;
+    http_append(out, len, max, "stall reason=");
+    http_append_u64(out, len, max, cr->reason);
+    if (cr->label[0]) {
+        char label[EXCEPTION_CRASH_LABEL_MAX];
+        u32 i = 0;
+        while (i + 1U < sizeof(label) && cr->label[i]) {
+            char c = cr->label[i];
+            label[i] = (c >= 32 && c < 127) ? c : '?';
+            i++;
+        }
+        label[i] = 0;
+        http_append(out, len, max, " \"");
+        http_append(out, len, max, label);
+        http_append(out, len, max, "\"");
+    }
+    http_append(out, len, max, "\n");
+
+    /* Slot names are defined alongside the reason code in exception.h. */
+    static const char *const cyw_credit[EXCEPTION_CRASH_VALUES_MAX] = {
+        "credits", "tx_seq", "tx_max", "fcmask",
+        "channel", "cyw_stage", "rframe", "events"
+    };
+    u32 count = cr->value_count;
+    if (count > EXCEPTION_CRASH_VALUES_MAX)
+        count = EXCEPTION_CRASH_VALUES_MAX;
+    for (u32 i = 0; i < count; i++) {
+        const char *name =
+            (cr->reason == EXCEPTION_STALL_CYW_TX_CREDIT) ? cyw_credit[i] : NULL;
+        http_append(out, len, max, "  ");
+        if (name) {
+            http_append(out, len, max, name);
+        } else {
+            http_append(out, len, max, "v");
+            http_append_u64(out, len, max, i);
+        }
+        http_append(out, len, max, "=");
+        http_append_u64(out, len, max, cr->values[i]);
+        http_append(out, len, max, "\n");
+    }
 }
 
 static void http_append_json_metric(char *out, u32 *len, u32 max,
@@ -3485,6 +3543,12 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, cd.bcdc_cccr_pending);
         http_append(out, &len, max, " rframe=");
         http_append_u64(out, &len, max, cd.bcdc_rframe_count);
+        http_append(out, &len, max, " rxprobe=");
+        http_append_u64(out, &len, max, cd.rx_probe_attempts);
+        http_append(out, &len, max, " rxframes=");
+        http_append_u64(out, &len, max, cd.rx_frames);
+        http_append(out, &len, max, " cardirq=");
+        http_append_u64(out, &len, max, cd.rx_card_irqs);
         http_append(out, &len, max, "\nframe ch=");
         http_append_u64(out, &len, max, cd.bcdc_last_channel);
         http_append(out, &len, max, " len=");
@@ -3628,6 +3692,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                     }
                     http_append(out, &len, max, " ch=");
                     http_append_u64(out, &len, max, results[i].channel);
+                    http_append(out, &len, max, " cs=");
+                    http_append_hex32(out, &len, max, results[i].chanspec);
                     http_append(out, &len, max, " rssi=");
                     if (results[i].rssi < 0) {
                         http_append(out, &len, max, "-");
@@ -3639,6 +3705,16 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                     }
                     http_append(out, &len, max, " sec=");
                     http_append_hex32(out, &len, max, results[i].security);
+                    http_append(out, &len, max, " rsn=");
+                    for (u32 j=0U;j<results[i].rsn_ie_len;j++) {
+                        static const char digits[]="0123456789abcdef";
+                        char hex[3]={
+                            digits[results[i].rsn_ie[j]>>4],
+                            digits[results[i].rsn_ie[j]&0x0FU],
+                            '\0'
+                        };
+                        http_append(out,&len,max,hex);
+                    }
                     http_append(out, &len, max, "\n");
                 }
             }
@@ -3704,6 +3780,38 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append_u64(out, &len, max, cd.last_event_reason);
             http_append(out, &len, max, "\n");
         }
+    } else if (http_streq(cmd, "wifi assocreq")) {
+        static u8 ies[512];
+        u32 ies_len = 0U;
+        u32 req_reported = 0U;
+        u32 resp_reported = 0U;
+        u32 assoc_stage = 0U;
+        if (!cyw43_assoc_req_ies(ies, sizeof(ies), &ies_len,
+                                 &req_reported, &resp_reported,
+                                 &assoc_stage)) {
+            http_append(out, &len, max,
+                        "WiFi association request IEs unavailable stage=");
+            http_append_u64(out, &len, max, assoc_stage);
+            http_append(out, &len, max, " req=");
+            http_append_u64(out, &len, max, req_reported);
+            http_append(out, &len, max, " resp=");
+            http_append_u64(out, &len, max, resp_reported);
+            http_append(out, &len, max, "\n");
+        } else {
+            static const char hex[] = "0123456789abcdef";
+            http_append(out, &len, max, "assoc_req_ies len=");
+            http_append_u64(out, &len, max, ies_len);
+            http_append(out, &len, max, " hex=");
+            for (u32 i = 0U; i < ies_len; i++) {
+                char b[3] = {
+                    hex[ies[i] >> 4],
+                    hex[ies[i] & 0x0FU],
+                    0
+                };
+                http_append(out, &len, max, b);
+            }
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "wifi wpadiag")) {
         static struct cyw_wpa_debug wd;
         static const char hex[] = "0123456789abcdef";
@@ -3756,21 +3864,37 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                         ok ? "WiFi join started\n" : "WiFi join FAILED\n");
         }
     } else if (http_starts_with(cmd, "wifi joinpmk ")) {
-        char *argv[5];
-        u32 argc = http_split_args(cmd, argv, 5);
+        char *argv[6];
+        u32 argc = http_split_args(cmd, argv, 6);
         u8 pmk[32];
+        u8 target_bssid[CYW_MAC_LEN];
         bool parsed = argc >= 4 && pios_strlen(argv[3]) == 64U;
         for (u32 i = 0U; parsed && i < sizeof(pmk); i++)
             parsed = pixe_parse_hex_byte_pair(argv[3] + i * 2U, &pmk[i]);
+        bool target_parsed = argc >= 6 &&
+                             pios_strlen(argv[4]) == 12U &&
+                             pios_strlen(argv[5]) == 4U;
+        for (u32 i=0U;target_parsed&&i<CYW_MAC_LEN;i++)
+            target_parsed =
+                pixe_parse_hex_byte_pair(argv[4]+i*2U,&target_bssid[i]);
+        u8 cs_hi=0U,cs_lo=0U;
+        if (target_parsed)
+            target_parsed =
+                pixe_parse_hex_byte_pair(argv[5],&cs_hi) &&
+                pixe_parse_hex_byte_pair(argv[5]+2U,&cs_lo);
         if (!parsed || !cyw43_blobs_ready()) {
             http_append(out, &len, max,
-                        "ERR: usage wifi joinpmk <ssid> <64-hex-pmk>\n");
+                        "ERR: usage wifi joinpmk <ssid> <64-hex-pmk> [bssid12 chanspec4]\n");
         } else {
             u32 ssid_len = pios_strlen(argv[2]);
             cyw43_set_progress_hook(wifi_upload_progress);
+            if (target_parsed)
+                (void)cyw43_set_join_target(target_bssid,
+                                             ((u16)cs_hi<<8)|cs_lo);
             bool ok = ssid_len <= CYW_SSID_MAX &&
                       cyw43_join_pmk(argv[2], ssid_len, pmk);
             memset(pmk, 0, sizeof(pmk));
+            memset(target_bssid,0,sizeof(target_bssid));
             http_append(out, &len, max,
                         ok ? "WiFi join started\n" : "WiFi join FAILED\n");
             if (!ok) {
@@ -3805,6 +3929,61 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max,
                         ok ? "WiFi join started\n" : "WiFi join FAILED\n");
         }
+    } else if (http_starts_with(cmd, "wifi rsncaps")) {
+        char *argv[3];
+        u32 argc = http_split_args(cmd, argv, 3);
+        bool bad = false;
+        if (argc >= 3) {
+            if (http_streq(argv[2], "auto")) {
+                cyw43_set_rsn_caps(0U, false);
+            } else {
+                u8 hi = 0U;
+                u8 lo = 0U;
+                if (pixe_parse_hex_byte_pair(argv[2], &hi) &&
+                    pixe_parse_hex_byte_pair(argv[2] + 2U, &lo))
+                    cyw43_set_rsn_caps((u16)(((u32)hi << 8) | lo), true);
+                else
+                    bad = true;
+            }
+        }
+        if (bad) {
+            http_append(out, &len, max,
+                        "ERR: usage wifi rsncaps <hhll|auto>\n");
+        } else {
+            u16 caps = 0U;
+            bool override = false;
+            cyw43_get_rsn_caps(&caps, &override);
+            http_append(out, &len, max, "WiFi RSN caps ");
+            http_append(out, &len, max,
+                        override ? "override=0x" : "auto=0x");
+            http_append_hex32(out, &len, max, caps);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "wifi rxprobe")) {
+        char *argv[3];
+        u32 argc = http_split_args(cmd, argv, 3);
+        if (argc >= 3)
+            cyw43_set_rx_probe(http_streq(argv[2], "on"));
+        http_append(out, &len, max, "WiFi RX header probe ");
+        http_append(out, &len, max, cyw43_get_rx_probe() ? "on\n" : "off\n");
+    } else if (http_streq(cmd, "wifi irq")) {
+        u32 status = 0U, enable = 0U, mask = 0U;
+        u32 gic_enable = 0U, gic_pending = 0U, gic_target = 0U;
+        sdio_irq_snapshot(&status, &enable, &mask,
+                          &gic_enable, &gic_pending, &gic_target);
+        http_append(out, &len, max, "SDIO irq status=");
+        http_append_hex32(out, &len, max, status);
+        http_append(out, &len, max, " signal_enable=");
+        http_append_hex32(out, &len, max, enable);
+        http_append(out, &len, max, " mask=");
+        http_append_hex32(out, &len, max, mask);
+        http_append(out, &len, max, " gic=274 enable=");
+        http_append_hex32(out, &len, max, gic_enable);
+        http_append(out, &len, max, " pending=");
+        http_append_hex32(out, &len, max, gic_pending);
+        http_append(out, &len, max, " target=");
+        http_append_hex32(out, &len, max, gic_target);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "wifi activate")) {
         if (!nic_activate_wifi_loaded()) {
             http_append(out, &len, max, "WiFi activate FAILED\n");
@@ -3861,7 +4040,123 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, d.comp_type);
         http_append(out, &len, max, " version=");
         http_append_hex32(out, &len, max, d.comp_version);
+        http_append(out, &len, max, " timeouts=");
+        http_append_u64(out, &len, max, d.timeouts);
+        http_append(out, &len, max, " abort=");
+        http_append_hex32(out, &len, max, d.abort_source);
         http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "i2c scan")) {
+        char *argv[3];
+        u32 argc = http_split_args(cmd, argv, 3);
+        u32 hz = 100000U;
+        if (argc >= 3 && http_streq(argv[2], "400"))
+            hz = 400000U;
+        if (!rp1_i2c_init(hz)) {
+            http_append(out, &len, max, "I2C1 unavailable\n");
+        } else {
+            u8 found[16];
+            u32 count = rp1_i2c_scan(found, sizeof(found));
+            http_append(out, &len, max, "I2C1 scan hz=");
+            http_append_u64(out, &len, max, hz);
+            http_append(out, &len, max, " devices=");
+            http_append_u64(out, &len, max, count);
+            http_append(out, &len, max, "\n");
+            for (u32 addr = 0x08U; addr <= 0x77U; addr++) {
+                if (found[addr >> 3] & (1U << (addr & 7U))) {
+                    http_append(out, &len, max, "  0x");
+                    http_append_hex8(out, &len, max, (u8)addr);
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        }
+    } else if (http_starts_with(cmd, "spi status")) {
+        for (u32 i = 0U; i < RP1_SPI_COUNT; i++) {
+            struct rp1_spi_diag d;
+            bool present = rp1_spi_probe(i);
+            rp1_spi_diag_snapshot(i, &d);
+            http_append(out, &len, max, "spi");
+            http_append_u64(out, &len, max, i);
+            if (!present) {
+                http_append(out, &len, max,
+                            (i == 4U || i == 7U) ? " target/absent\n"
+                                                 : " absent\n");
+                continue;
+            }
+            http_append(out, &len, max, " present version=");
+            http_append_hex32(out, &len, max, d.version);
+            http_append(out, &len, max, " fifo=");
+            http_append_u64(out, &len, max, d.fifo_depth);
+            http_append(out, &len, max, " dfs32=");
+            http_append_u64(out, &len, max, d.dfs32 ? 1U : 0U);
+            http_append(out, &len, max, " quad_capable=");
+            http_append_u64(out, &len, max, d.enhanced_frf ? 1U : 0U);
+            if (d.ready) {
+                http_append(out, &len, max, " sck=");
+                http_append_u64(out, &len, max, d.sck_hz);
+                http_append(out, &len, max, " xfers=");
+                http_append_u64(out, &len, max, d.transfers);
+                http_append(out, &len, max, " timeouts=");
+                http_append_u64(out, &len, max, d.timeouts);
+            }
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "spi init ")) {
+        char *argv[6];
+        u32 argc = http_split_args(cmd, argv, 6);
+        u32 inst = 0U, hz = 1000000U, mode = 0U, bits = 8U;
+        bool ok = argc >= 4 && http_parse_u32(argv[2], &inst) &&
+                  http_parse_u32(argv[3], &hz);
+        if (ok && argc >= 5) ok = http_parse_u32(argv[4], &mode);
+        if (ok && argc >= 6) ok = http_parse_u32(argv[5], &bits);
+        if (!ok) {
+            http_append(out, &len, max,
+                        "ERR: usage spi init <instance> <hz> [mode] [bits]\n");
+        } else if (!rp1_spi_init(inst, hz, mode, bits)) {
+            http_append(out, &len, max, "spi init FAILED\n");
+        } else {
+            struct rp1_spi_diag d;
+            rp1_spi_diag_snapshot(inst, &d);
+            http_append(out, &len, max, "spi");
+            http_append_u64(out, &len, max, inst);
+            http_append(out, &len, max, " ready sck=");
+            http_append_u64(out, &len, max, d.sck_hz);
+            http_append(out, &len, max, " baudr=");
+            http_append_u64(out, &len, max, d.baudr);
+            http_append(out, &len, max, " bits=");
+            http_append_u64(out, &len, max, bits);
+            http_append(out, &len, max, " mode=");
+            http_append_u64(out, &len, max, mode);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "spi xfer ")) {
+        char *argv[5];
+        u32 argc = http_split_args(cmd, argv, 5);
+        u32 inst = 0U, cs = 0U;
+        bool ok = argc >= 5 && http_parse_u32(argv[2], &inst) &&
+                  http_parse_u32(argv[3], &cs);
+        static u8 tx[256];
+        static u8 rx[256];
+        u32 n = 0U;
+        if (ok) {
+            const char *hex = argv[4];
+            u32 hex_len = pios_strlen(hex);
+            ok = (hex_len % 2U) == 0U && hex_len > 0U &&
+                 hex_len / 2U <= sizeof(tx);
+            for (u32 i = 0U; ok && i < hex_len / 2U; i++)
+                ok = pixe_parse_hex_byte_pair(hex + i * 2U, &tx[i]);
+            n = hex_len / 2U;
+        }
+        if (!ok) {
+            http_append(out, &len, max,
+                        "ERR: usage spi xfer <instance> <cs> <hexbytes>\n");
+        } else if (!rp1_spi_transfer(inst, cs, tx, rx, n)) {
+            http_append(out, &len, max, "spi xfer FAILED\n");
+        } else {
+            http_append(out, &len, max, "spi xfer ok rx=");
+            for (u32 i = 0U; i < n; i++)
+                http_append_hex8(out, &len, max, rx[i]);
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "rp1fw") ||
                http_streq(cmd, "rp1fw status")) {
         struct rp1_fw_diag d;
@@ -5904,6 +6199,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, " ticks=");
             http_append_u64(out, &len, max, cr.ticks);
             http_append(out, &len, max, "\n");
+            http_append_crash_stall(out, &len, max, &cr);
         }
     } else if (http_streq(cmd, "crashlba")) {
         /* Read the SD-persisted crash record (survives the watchdog reset that
@@ -5936,10 +6232,37 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, " ticks=");
             http_append_u64(out, &len, max, cr.ticks);
             http_append(out, &len, max, "\n");
+            http_append_crash_stall(out, &len, max, &cr);
         }
     } else if (http_streq(cmd, "crashlba clear")) {
         exception_crash_sd_clear();
         http_append(out, &len, max, "crashlba cleared\n");
+    } else if (http_streq(cmd, "crashdump")) {
+        u64 id = walfs_find(CRASHDUMP_PACK_PATH);
+        if (!id) {
+            http_append(out, &len, max,
+                        "crashdump none (" CRASHDUMP_PACK_PATH " absent)\n");
+        } else {
+            struct walfs_inode ino;
+            u32 size = walfs_stat(id, &ino) ? (u32)ino.size : 0U;
+            /* Tail the pack: the newest entries matter and the response buffer
+             * is bounded. */
+            u32 room = len + 1U < max ? max - len - 1U : 0U;
+            if (room > 0U) {
+                u32 want = size < room ? size : room;
+                u64 off = size - want;
+                u32 got = walfs_read(id, off, out + len, want);
+                len += got;
+                out[len] = '\0';
+            }
+            if (size == 0U)
+                http_append(out, &len, max, "crashdump empty\n");
+        }
+    } else if (http_streq(cmd, "crashdump clear")) {
+        u64 id = 0;
+        bool ok = crashdump_open_pack(true, &id);
+        http_append(out, &len, max,
+                    ok ? "crashdump cleared\n" : "crashdump clear FAILED\n");
     } else if (http_streq(cmd, "irq selftest")) {
         http_append(out, &len, max, irq_diag_selftest() ? "IRQ selftest OK\n" : "IRQ selftest FAILED\n");
     } else if (http_starts_with(cmd, "irq cntpns step ")) {
@@ -6768,7 +7091,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, "/");
         http_append_u64(out, &len, max, d ? d->global_reapply_count : 0U);
         http_append(out, &len, max, "\n");
-    } else if (http_streq(cmd, "tensor picoscript") ||
+    } else if (http_streq(cmd, "qpu enable") ||
+               http_streq(cmd, "tensor picoscript") ||
                http_streq(cmd, "tensor picoscript selftest") ||
                http_streq(cmd, "qpu picoscript")) {
         bool ok = tensor_picovm_selftest();
@@ -6796,6 +7120,27 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                 http_append_u64(out, &len, max, qpu_ns);
             }
         }
+        http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "qpu vm enable")) {
+        u64 cpu_ns = 0U;
+        u64 qpu_ns = 0U;
+        bool ok = tensor_picovm_kernel_selftest() &&
+                  tensor_picovm_kernel_bench(32U, &cpu_ns, &qpu_ns);
+        http_append(out, &len, max,
+                    ok ? "PicoVM QPU execution 1 verified"
+                       : "PicoVM QPU execution 1 FAILED");
+        http_append(out, &len, max, " cpu_ns=");
+        http_append_u64(out, &len, max, cpu_ns);
+        http_append(out, &len, max, " qpu_ns=");
+        http_append_u64(out, &len, max, qpu_ns);
+        http_append(out, &len, max, " selected=cpu\n");
+    } else if (http_streq(cmd, "qpu vm status")) {
+        const struct v3d_kernel_desc *single =
+            v3d_kernel_desc_get(V3D_KERNEL_PICOVM_ALU);
+        http_append(out, &len, max, "qpu_vm single=");
+        http_append(out, &len, max,
+                    single && single->verified ? "verified" : "pending");
+        http_append(out, &len, max, " selected=cpu");
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "bitnet picoscript") ||
                http_streq(cmd, "tensor bitnet")) {
@@ -6846,7 +7191,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                http_streq(cmd, "tensor media")) {
         bool ok = tensor_picovm_media_selftest();
         http_append(out, &len, max,
-                    ok ? "Media superinstructions OK: QPU grayscale XOR + CPU H264; HEVC pending"
+                    ok ? "Media superinstructions OK: QPU grayscale XOR + QPU H264 luma verified; HEVC pending"
                        : "Media superinstructions FAILED");
         http_append(out, &len, max, " stage=");
         http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
@@ -6857,6 +7202,49 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, "\n");
         if (!ok)
             http_append_tensor_tail(out, &len, max);
+    } else if (http_streq(cmd, "media status")) {
+        http_append(out, &len, max, "media gray_xor=");
+        http_append(out, &len, max,
+                    tensor_picovm_media_accel_ready() ? "qpu" : "cpu");
+        http_append(out, &len, max, " h264_luma=");
+        http_append(out, &len, max,
+                    tensor_picovm_h264_accel_ready() ? "qpu" : "cpu");
+        http_append(out, &len, max, " h264_selected=");
+        http_append(out, &len, max,
+                    tensor_prefer_qpu_h264() ? "qpu" : "cpu");
+        http_append(out, &len, max, " async=");
+        http_append(out, &len, max,
+                    tensor_picovm_async_accel_ready() ? "qpu" : "pending");
+        http_append(out, &len, max,
+                    " hevc=unavailable pisp=pending hvs=pending\n");
+    } else if (http_streq(cmd, "media bench")) {
+        u64 cpu_ns = 0U;
+        u64 qpu_ns = 0U;
+        bool ok = tensor_picovm_media_bench(8U, &cpu_ns, &qpu_ns);
+        http_append(out, &len, max,
+                    ok ? "Media 4KiB luma residual+restore benchmark"
+                       : "Media benchmark unavailable");
+        if (ok) {
+            http_append(out, &len, max, " cpu_ns=");
+            http_append_u64(out, &len, max, cpu_ns);
+            http_append(out, &len, max, " qpu_ns=");
+            http_append_u64(out, &len, max, qpu_ns);
+            http_append(out, &len, max, " selected=");
+            http_append(out, &len, max, qpu_ns < cpu_ns ? "qpu" : "cpu");
+        }
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "media async") ||
+               http_streq(cmd, "qpu async")) {
+        u32 cpu_work = 0U;
+        bool ok = tensor_picovm_async_selftest(&cpu_work);
+        http_append(out, &len, max,
+                    ok ? "PicoScript Async QPU media OK"
+                       : "PicoScript Async QPU media FAILED");
+        http_append(out, &len, max, " cpu_work=");
+        http_append_u64(out, &len, max, cpu_work);
+        if (!ok)
+            http_append_tensor_tail(out, &len, max);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "tensor tiny noop") || http_streq(cmd, "qpu tiny noop")) {
         bool ok = tensor_tiny_noop_proof();
         http_append(out, &len, max, ok ? "Tensor tiny noop proof OK" : "Tensor tiny noop proof FAILED");
@@ -11014,6 +11402,129 @@ static bool http_walfs_recreate_file(const char *path, u64 *id_out)
     if (!id)
         return false;
     if (id_out) *id_out = id;
+    return true;
+}
+
+/* ---- Crashdump pack ------------------------------------------------------
+ *
+ * The SD handoff sector (LBA 24) is a single slot: the next panic overwrites
+ * it. On each boot we copy any unarchived record into an append-only pack on
+ * WALFS so the history survives, is listable next to the rest of the
+ * filesystem, and can be pulled off the board with the normal static-file
+ * routes. */
+static bool crash_boot_marked_healthy;
+
+/* Resolve the crashdump pack, creating /var, /var/crash and the file as needed.
+ *
+ * Deliberately does not reuse http_walfs_ensure_file(): that helper confines
+ * paths to /var/www/static/, and a crash record exposes kernel addresses
+ * (elr/sp/ttbr0) that must not be reachable from the unauthenticated static
+ * file route. */
+static bool crashdump_open_pack(bool recreate, u64 *id_out)
+{
+    static const char *const dirs[] = { "/var", "/var/crash" };
+    static const char *const names[] = { "var", "crash" };
+    u64 parent = WALFS_ROOT_INODE;
+
+    if (id_out)
+        *id_out = 0;
+
+    for (u32 i = 0; i < 2U; i++) {
+        u64 id = walfs_find(dirs[i]);
+        if (!id) {
+            id = walfs_create(parent, names[i], WALFS_DIR, 0700);
+            if (!id)
+                return false;
+        } else {
+            struct walfs_inode ino;
+            if (!walfs_stat(id, &ino) || !(ino.flags & WALFS_DIR))
+                return false;
+        }
+        parent = id;
+    }
+
+    u64 id = walfs_find(CRASHDUMP_PACK_PATH);
+    if (id && recreate) {
+        if (!walfs_delete(id))
+            return false;
+        id = 0;
+    }
+    if (!id) {
+        id = walfs_create(parent, "crashdump.pack", WALFS_FILE, 0600);
+        if (!id)
+            return false;
+    }
+    if (id_out)
+        *id_out = id;
+    return true;
+}
+
+static void crashdump_append_kv(char *buf, u32 *len, u32 max,
+                                const char *key, u64 value, bool hex)
+{
+    http_append(buf, len, max, key);
+    http_append(buf, len, max, "=");
+    if (hex) {
+        http_append(buf, len, max, "0x");
+        http_append_hex64(buf, len, max, value);
+    } else {
+        http_append_u64(buf, len, max, value);
+    }
+    http_append(buf, len, max, "\n");
+}
+
+/* Copy the pending SD crash record into the WALFS pack. Safe to call on every
+ * boot: records are marked archived, so nothing is duplicated. */
+static bool crashdump_archive_pending(void)
+{
+    struct exception_crash_record cr;
+    if (!exception_crash_sd_read(&cr))
+        return false;
+    if (cr.archived)
+        return false;
+
+    static char entry[1536];
+    u32 len = 0;
+    entry[0] = 0;
+    http_append(entry, &len, sizeof(entry),
+                "---- PIOS crashdump ----\narchived_by_build=");
+    http_append(entry, &len, sizeof(entry), PIOS_BUILD_LABEL);
+    http_append(entry, &len, sizeof(entry), "\n");
+    crashdump_append_kv(entry, &len, sizeof(entry), "kind", cr.kind, false);
+    crashdump_append_kv(entry, &len, sizeof(entry), "consecutive",
+                        cr.consecutive, false);
+    crashdump_append_kv(entry, &len, sizeof(entry), "core", cr.core, false);
+    crashdump_append_kv(entry, &len, sizeof(entry), "el", cr.current_el, false);
+    crashdump_append_kv(entry, &len, sizeof(entry), "ec", cr.ec, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "esr", cr.esr, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "elr", cr.elr, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "far", cr.far, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "sp", cr.sp, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "ttbr0", cr.ttbr0, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "pid", cr.pid, false);
+    crashdump_append_kv(entry, &len, sizeof(entry), "ticks", cr.ticks, false);
+    http_append_crash_stall(entry, &len, sizeof(entry), &cr);
+    http_append(entry, &len, sizeof(entry), "\n");
+
+    u64 id = 0;
+    if (!crashdump_open_pack(false, &id) || !id)
+        return false;
+
+    struct walfs_inode ino;
+    u64 offset = 0;
+    if (walfs_stat(id, &ino))
+        offset = ino.size;
+    /* Bounded: once the pack is full, start it over rather than growing without
+     * limit on a board that keeps crashing. */
+    if (offset + len > CRASHDUMP_PACK_MAX) {
+        if (!crashdump_open_pack(true, &id) || !id)
+            return false;
+        offset = 0;
+    }
+    if (!walfs_write(id, offset, entry, len))
+        return false;
+
+    exception_crash_mark_archived();
     return true;
 }
 
@@ -21216,6 +21727,27 @@ static void dash_hw_row(u32 row, u32 c_dev, u32 c_active, u32 c_load,
     dash_put_trunc(caps, 44U);
 }
 
+static void dash_hw_row_state(u32 row, u32 c_dev, u32 c_state, u32 c_load,
+                              u32 c_ram, u32 c_caps, const char *dev,
+                              const char *state, u32 state_color,
+                              const char *load, const char *ram,
+                              const char *caps)
+{
+    fb_set_cursor(c_dev, row);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    dash_put_trunc(dev, c_state > c_dev ? c_state - c_dev - 1U : 10U);
+    fb_set_cursor(c_state, row);
+    fb_set_color(state_color, 0x00000000);
+    dash_put_trunc(state, c_load > c_state ? c_load - c_state - 1U : 8U);
+    fb_set_cursor(c_load, row);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    dash_put_trunc(load, c_ram > c_load ? c_ram - c_load - 1U : 20U);
+    fb_set_cursor(c_ram, row);
+    dash_put_trunc(ram, c_caps > c_ram ? c_caps - c_ram - 1U : 12U);
+    fb_set_cursor(c_caps, row);
+    dash_put_trunc(caps, 44U);
+}
+
 static void dash_hw_row_u64_hex(u32 row, u32 c_dev, u32 c_active, u32 c_load,
                                 u32 c_ram, u32 c_caps, const char *dev,
                                 bool active, const char *prefix, u64 addr,
@@ -21584,9 +22116,34 @@ static void hdmi_dashboard_render(void)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "NIC", PIOS_HAS_GENET && perf.nic_link_mbps != 0,
                             "MMIO ", PIOS_GENET_BASE, "rings", PIOS_HAS_GENET ? "GENET/MACB Ethernet" : "no active NIC backend");
-    if (hw_r < hw_end)
-        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
-                    "WiFi/BT", false, "not loaded", "0", "CYW/BT parked; no active driver");
+    if (hw_r < hw_end) {
+        bool wifi_runtime = cyw43_runtime_ready();
+        u32 wifi_link = cyw43_link_state();
+        const char *wifi_state = !PIOS_HAS_WIFI_SDIO2 ? "N/A" :
+                                 (nic_is_wifi() ? "ACTIVE" :
+                                 (wifi_link == CYW_LINK_UP ? "LINKED" :
+                                  (wifi_link == CYW_LINK_JOINING ? "JOINING" :
+                                   (wifi_link == CYW_LINK_AUTH_FAIL ? "AUTHFAIL" :
+                                    (wifi_runtime ? "READY" : "AVAILABLE")))));
+        u32 wifi_color = !PIOS_HAS_WIFI_SDIO2 ? 0x00AAAAAA :
+                         (nic_is_wifi() || wifi_link == CYW_LINK_UP
+            ? 0x0000FF80 : (wifi_link == CYW_LINK_AUTH_FAIL
+                                ? 0x00FF4040 : 0x00FFAA00));
+        const char *wifi_load = !PIOS_HAS_WIFI_SDIO2 ? "not present" :
+                                (wifi_runtime ? "CYW43455/SDIO2" : "driver ready");
+        const char *wifi_memory = !PIOS_HAS_WIFI_SDIO2 ? "0" :
+                                  (wifi_runtime ? "fw+clm" : "on-demand");
+        const char *wifi_caps = !PIOS_HAS_WIFI_SDIO2
+            ? "no onboard WiFi on this platform"
+            : (nic_is_wifi()
+            ? "CYW43455 SDIO2 WiFi is the active NIC"
+            : (wifi_runtime
+                   ? "CYW43455 ready; wired fail-safe remains selected"
+                   : "CYW43455 SDIO2 driver ready; firmware init on demand; BT pending"));
+        dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                          "WiFi/BT", wifi_state, wifi_color, wifi_load,
+                          wifi_memory, wifi_caps);
+    }
     if (hw_r < hw_end)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "USB/HID", PIOS_HAS_RP1, "RP1 ", PIOS_RP1_BAR_BASE,
@@ -21637,6 +22194,9 @@ static void hdmi_dashboard_render(void)
         const u32 t_detail_w = tns_w > (t_detail - tns_col) + 2U
                                    ? tns_w - (t_detail - tns_col) - 2U : 20U;
         bool v3d_ready = tensor_picovm_accel_ready();
+        bool v3d_hw_ready = tns.v3d_dispatch_supported &&
+                            tns.v3d_native_compute_enabled &&
+                            tns.v3d_native_mmu_ready;
         fb_set_color(0x00AAAAAA, 0x00000000);
         fb_set_cursor(t_back, tns_r);
         fb_puts("BACKEND");
@@ -21650,7 +22210,7 @@ static void hdmi_dashboard_render(void)
         fb_puts("CPU NEON");
         fb_set_color(0x00FFFFFF, 0x00000000);
         fb_set_cursor(t_state, tns_r);
-        fb_puts("ready");
+        fb_puts("enabled");
         fb_set_cursor(t_detail, tns_r);
         dash_put_trunc("FP32 add/mul/scale/dot/matmul/matvec/relu/softmax",
                        t_detail_w);
@@ -21660,37 +22220,45 @@ static void hdmi_dashboard_render(void)
         fb_puts("CPU INT");
         fb_set_color(0x00FFFFFF, 0x00000000);
         fb_set_cursor(t_state, tns_r);
-        fb_puts("ready");
+        fb_puts("enabled");
         fb_set_cursor(t_detail, tns_r);
-        dash_put_trunc("I8 dot/matvec; I32 add/mul/scale/relu/norm/rope/softmax",
+        dash_put_trunc("I8 dot/matvec NEON; I32 scalar add/mul/scale/relu/norm/rope/softmax",
                        t_detail_w);
         tns_r++;
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_set_cursor(t_back, tns_r);
         fb_puts("V3D QPU");
-        fb_set_color(v3d_ready ? 0x0000FF80 : (tns.v3d_available ? 0x00FFAA00 : 0x00FF4040),
+        fb_set_color(v3d_ready ? 0x0000FF80 :
+                     (v3d_hw_ready ? 0x00FFAA00 : 0x00FF4040),
                      0x00000000);
         fb_set_cursor(t_state, tns_r);
-        fb_puts(v3d_ready ? "enabled" : (tns.v3d_dispatch_supported ? "probe" : "off"));
+        fb_puts(v3d_ready ? "verified" : (v3d_hw_ready ? "ready" : "off"));
         fb_set_color(0x00FFFFFF, 0x00000000);
         fb_set_cursor(t_detail, tns_r);
         dash_put_trunc(v3d_ready
-                           ? "PicoScript: DotI8 MatVecI8"
-                           : "QPU quarantined until PicoScript Tensor selftest  cmd: tensor picoscript",
+                           ? "PicoScript DotI8/MatVecI8 verified"
+                           : (v3d_hw_ready
+                                  ? "Native V3D 7.1 CSD ready  cmd: qpu enable"
+                                  : "V3D compute unavailable"),
                        t_detail_w);
         tns_r++;
         fb_set_color(0x00CC99FF, 0x00000000);
         fb_set_cursor(t_back, tns_r);
         fb_puts("QPU VM");
-        fb_set_color((alu_desc && alu_desc->verified) ? 0x0000FF80 : 0x00FFAA00,
+        bool alu_verified = alu_desc && alu_desc->verified;
+        fb_set_color(alu_verified ? 0x0000FF80 :
+                     (v3d_hw_ready ? 0x00FFAA00 : 0x00FF4040),
                      0x00000000);
         fb_set_cursor(t_state, tns_r);
-        fb_puts((alu_desc && alu_desc->verified) ? "enabled" : "probe");
+        fb_puts(alu_verified ? "verified" :
+                (v3d_hw_ready ? "ready" : "off"));
         fb_set_color(0x00FFFFFF, 0x00000000);
         fb_set_cursor(t_detail, tns_r);
         dash_put_trunc((alu_desc && alu_desc->verified)
-                           ? "Arithmetic block: ADD+MUL (24-bit bounded)"
-                           : "Arithmetic block pending  cmd: tensor picovm kernel",
+                           ? "ADD+MUL verified; CPU selected (QPU proof only)"
+                           : (v3d_hw_ready
+                                  ? "Bounded ADD+MUL  cmd: qpu vm enable"
+                                  : "V3D compute unavailable"),
                        t_detail_w);
         tns_r++;
         fb_set_color(0x00FFCC66, 0x00000000);
@@ -21718,7 +22286,13 @@ static void hdmi_dashboard_render(void)
         fb_puts(tensor_picovm_media_accel_ready() ? "enabled" : "CPU");
         fb_set_cursor(t_detail, tns_r);
         dash_put_trunc(tensor_picovm_media_accel_ready()
-                           ? "QPU Gray XOR codec; H264 CPU; HEVC/PiSP/HVS pending"
+                           ? (tensor_picovm_h264_accel_ready()
+                                  ? (tensor_prefer_qpu_h264()
+                                         ? "QPU Gray XOR + H264 luma selected; HEVC/PiSP/HVS pending"
+                                         : (tensor_picovm_async_accel_ready()
+                                                ? "H264 sync CPU; Async QPU ready; HEVC/PiSP/HVS pending"
+                                                : "QPU H264 verified, CPU selected; HEVC/PiSP/HVS pending"))
+                                  : "QPU Gray XOR; H264 CPU; HEVC/PiSP/HVS pending")
                            : "Gray delta + H264 residual; HEVC/PiSP/HVS pending",
                        t_detail_w);
     }
@@ -22891,6 +23465,7 @@ NORETURN void core0_main(void) {
             if (dt_http > dt_phase_thresh)
                 DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_HTTP, dt_http, 0, 0, 0);
             capsvc_poll();   /* generic capsule-service dispatcher (docs/net_capsule_fifo.md) */
+            picovm_kernel_fifo_poll();
             ksvc_end(ksvc_tcp_id, svc_start, false);
             ksvc_run(ksvc_debug_id);
         }
@@ -22957,6 +23532,13 @@ NORETURN void core0_main(void) {
 
         if (flags & CORE0_IO_MAINT) {
             ksvc_run(ksvc_timer_id);
+            /* Once we have run cleanly for a while, declare the boot healthy so
+             * crash-loop protection re-arms for the next genuine fault. */
+            if (!crash_boot_marked_healthy &&
+                timer_monotonic_ms() >= CRASH_HEALTHY_UPTIME_MS) {
+                crash_boot_marked_healthy = true;
+                exception_crash_mark_healthy();
+            }
         }
 
         if ((flags & CORE0_IO_DASH) && ui_mode == UI_MODE_NONE)
@@ -23745,6 +24327,7 @@ void kernel_main(void) {
     bp_log("[ipc] ipc_stream_init...");
     ipc_stream_init();
     ipc_proc_init();
+    picovm_kernel_fifo_init();
     lease_init();   /* lease fabric (P0): descriptor-ownership pool init */
     ota_staging_init();   /* pre-allocate OTA RAM staging so uploads don't block core0 on SD */
     http_conns_init();    /* allocate the multi-connection HTTP :80 pool */
@@ -23802,9 +24385,13 @@ void kernel_main(void) {
                 uart_puts("\n");
             }
             watchdog_hw_pet();
+            bp_log("[walfs] crashdump archive...");
+            if (crashdump_archive_pending())
+                bp_warn("[crash] previous boot ended in a PiSOD — archived to "
+                        CRASHDUMP_PACK_PATH);
+            watchdog_hw_pet();
             bp_log("[walfs] principal_init...");
-            principal_init();
-            bp_log("[walfs] picowal_db_init...");
+            principal_init();            bp_log("[walfs] picowal_db_init...");
             if (!picowal_db_init()) {
                 bp_warn("[walfs] picowal_db init FAILED — continuing");
             }
@@ -23930,7 +24517,16 @@ void kernel_main(void) {
                                           "[vc] native probe disabled");
     bp_log("[gpu] tensor_init...");
     tensor_init();
-    bp_ok("[gpu] tensor compute ready");
+    struct tensor_boot_accel_status accel_boot;
+    bool accel_boot_ok = tensor_boot_enable_accelerators(&accel_boot);
+    if (!accel_boot.supported) {
+        bp_ok("[gpu] tensor CPU/NEON ready; V3D unavailable");
+    } else if (accel_boot_ok) {
+        bp_ok("[gpu] PicoScript QPU superinstructions verified");
+    } else {
+        bp_warn("[gpu] QPU proof incomplete; measured CPU fallbacks retained");
+    }
+    watchdog_hw_pet();
 
     /* Core 0 environment */
     bp_log("[core] core_env_init...");

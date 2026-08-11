@@ -150,6 +150,11 @@ bool tensor_picovm_bitnet_selftest(i32 *argmax_out, i32 *checksum_out,
 bool tensor_matvec_batch_selftest(u32 rows);
 bool tensor_picovm_media_selftest(void);
 bool tensor_picovm_media_accel_ready(void);
+bool tensor_picovm_h264_accel_ready(void);
+bool tensor_picovm_async_accel_ready(void);
+bool tensor_picovm_media_bench(u32 reps, u64 *cpu_ns, u64 *qpu_ns);
+bool tensor_picovm_async_selftest(u32 *cpu_work_out);
+bool tensor_prefer_qpu_h264(void);
 bool tensor_picovm_bitlinear_selftest(u64 *elapsed_ns);
 
 struct tensor_accel_profile {
@@ -166,6 +171,21 @@ bool tensor_accel_profile_run(struct tensor_accel_profile *out);
 bool tensor_prefer_qpu_int8(void);
 bool tensor_prefer_qpu_fp32(void);
 bool tensor_prefer_qpu_ternary(void);
+
+struct tensor_boot_accel_status {
+    bool supported;
+    bool picoscript;
+    bool profile;
+    bool bitlinear_batch;
+    bool bitnet_program;
+    bool media;
+    bool media_profile;
+    bool async_media;
+    bool vm;
+    u64 media_cpu_ns;
+    u64 media_qpu_ns;
+};
+bool tensor_boot_enable_accelerators(struct tensor_boot_accel_status *out);
 
 /* Benchmark harness: time one (op, shape, backend); returns per-iter ns. */
 #define TENSOR_BENCH_ADD    0U

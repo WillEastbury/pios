@@ -18,6 +18,12 @@
 #define PV_NUM_REGS   16
 #define PV_MAX_CARDS  2048      /* open-addressed; must be a power of two */
 #define PV_MAX_CALL   256
+#ifndef PV_MAX_SYS_FRAMES
+#define PV_MAX_SYS_FRAMES 32
+#endif
+#ifndef PV_MAX_SYS_INDEX
+#define PV_MAX_SYS_INDEX 256
+#endif
 #ifndef PV_MAX_OUT
 #define PV_MAX_OUT    8192      /* response/output buffer; override for large bodies */
 #endif
@@ -50,6 +56,9 @@
 #endif
 #ifndef PV_MAX_LOGS
 #define PV_MAX_LOGS   128       /* Log.* table: handle = 1-based sequence id, 0 = null */
+#endif
+#ifndef PV_MAX_EVENTS
+#define PV_MAX_EVENTS 128       /* Event.* queue + record table: handle = 1-based id, 0 = null */
 #endif
 #ifndef PV_MAX_ERR_HANDLERS
 #define PV_MAX_ERR_HANDLERS 32  /* Error.* handler stack depth (nested try/except) */
@@ -120,9 +129,13 @@ enum {
     PV_CAP_DEVICE  = 1 << 12,  /* Device.* (enumerate/open a streaming device) */
     PV_CAP_DMA     = 1 << 13,  /* Stream.* (DMA-ring buffers) */
     PV_CAP_EVENT   = 1 << 14,  /* Event.* (reactive event queue; UI/async dispatch) */
-    PV_CAP_UI      = 1 << 15   /* Ui.* (retained scene tree / remote windowing) */
+    PV_CAP_UI      = 1 << 15,  /* Ui.* (retained scene tree / remote windowing) */
+    PV_CAP_PROCESS = 1 << 16,  /* Process and Env */
+    PV_CAP_TIMER   = 1 << 17,  /* Timer and Scheduler */
+    PV_CAP_PRINCIPAL = 1 << 18,/* Principal, Capability, Sandbox */
+    PV_CAP_CAPSULE_EXEC = 1 << 19 /* Capsule.* execution */
 };
-#define PV_CAP_ALL  0xFFFFu    /* default grant: every binding (host restricts to gate) */
+#define PV_CAP_ALL  0xFFFFFu   /* default grant: every binding (host restricts to gate) */
 
 typedef struct pv_ctx pv_ctx;
 
@@ -136,6 +149,10 @@ typedef void (*pv_host_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int 
  * own pack/card store without modifying the runtime. */
 typedef int (*pv_storage_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
 extern pv_storage_fn pv_storage_hook;
+
+/* Optional raw block-device provider used by Block.*. */
+typedef int (*pv_block_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
+extern pv_block_fn pv_block_hook;
 
 /* Optional native tensor accelerator. Return non-zero when handled; returning
  * zero falls through to the deterministic pure-C Tensor.* implementation. */
@@ -160,8 +177,25 @@ extern pv_media_fn pv_media_hook;
 typedef int (*pv_bitlinear_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
 extern pv_bitlinear_fn pv_bitlinear_hook;
 
+/* Optional multi-target host provider (time / entropy / environment).
+ * Installed by host/pv_host_provider.c via pv_host_install(). Freestanding
+ * builds leave this NULL; pure hooks and stubs behave as before. */
+typedef int (*pv_host_provider_dispatch_fn)(pv_ctx *ctx, int hook, int rd,
+                                            int rs1, int rs2);
+extern pv_host_provider_dispatch_fn pv_host_provider_dispatch_hook;
+
 struct pv_ctx {
     int32_t   regs[PV_NUM_REGS];
+    uint64_t  xregs[PV_NUM_REGS]; /* systems ISA native-width register class */
+    int32_t   sys_frame_r[PV_MAX_SYS_FRAMES][PV_NUM_REGS];
+    uint64_t  sys_frame_x[PV_MAX_SYS_FRAMES][PV_NUM_REGS];
+    int       sys_frame_sp;
+    uint64_t  sys_index_handle[PV_MAX_SYS_INDEX];
+    uint32_t  sys_index_record[PV_MAX_SYS_INDEX];
+    uint32_t  sys_index_value[PV_MAX_SYS_INDEX];
+    uint8_t   sys_index_used[PV_MAX_SYS_INDEX];
+    uint32_t  sys_index_results[PV_MAX_SYS_INDEX];
+    uint32_t  sys_index_result_count;
 
     uint16_t  card_key[PV_MAX_CARDS];
     int32_t   card_val[PV_MAX_CARDS];
@@ -246,8 +280,13 @@ struct pv_ctx {
     int32_t   raise_active;
 
     uint32_t  caps;            /* granted binding capabilities (PV_CAP_*); default PV_CAP_ALL */
+    uint32_t  cap_ceiling;     /* immutable max grantable via Capability.Request */
     int       no_alloc;        /* when set, arena allocation in a hook faults (INV-5 hot path) */
     int       host_status;     /* INV-18: typed status of the last fallible hook (0 = OK) */
+    void     *block_device;    /* caller-owned host/block pv_block_dev */
+    uint64_t  block_offset;    /* active byte offset for Block.Read/Write */
+    uint64_t  block_lba;       /* active LBA for block transfers */
+    int32_t   block_status;    /* last PV_BLOCK_* result */
     uint32_t  const_floor;     /* INV-9: lowest literal const-pool address; [floor,0x8000) is RO */
     uint8_t   const_used[4096];/* bitset for initialized literal const bytes below 0x8000 */
 
@@ -350,6 +389,19 @@ struct pv_ctx {
     int       fifo_depth[PV_MAX_FIFOS];
     uint8_t   fifo_used[PV_MAX_FIFOS];
     int       fifo_count;
+
+    /* Event.*: VM-local reactive queue + record table so hosted timer/socket
+     * helpers and the in-VM Event hooks share one deterministic state model. */
+    int32_t   event_type[PV_MAX_EVENTS];
+    int32_t   event_target[PV_MAX_EVENTS];
+    int32_t   event_span[PV_MAX_EVENTS];
+    uint8_t   event_used[PV_MAX_EVENTS];
+    int32_t   event_queue[PV_MAX_EVENTS];
+    int       event_qhead;
+    int       event_qtail;
+    int       event_seq;
+    int32_t   event_slice_off;
+    int32_t   event_slice_len;
 
     /* Html.*: a real, pure, deterministic DOM node table (no host state
      * needed -- see docs/NAMESPACE_STATUS.md's "HTML DOM + HTTP parsing"
@@ -474,5 +526,9 @@ void    pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm
 
 /* Binding capability class required by a host hook (PV_CAP_*; 0 = pure, always allowed). */
 uint32_t pv_hook_cap(int hook);
+
+/* Copy raw bytes into the VM bump arena and return a span handle (0 on empty).
+ * Used by host providers for Environment.* string results and RandomBytes. */
+int pv_span_from_bytes(pv_ctx *ctx, const void *data, uint32_t len);
 
 #endif /* PICOVM_H */

@@ -196,7 +196,7 @@ sub_u8x4(nir_builder *b, nir_def *x, nir_def *y)
 static nir_shader *
 build_builtin_nir(const char *name)
 {
-    struct nir_shader_compiler_options nir_opts = {0};
+    static const struct nir_shader_compiler_options nir_opts = {0};
     nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &nir_opts,
                                                    "pios_%s", name);
     b.shader->info.workgroup_size[0] = 1;
@@ -380,6 +380,25 @@ build_builtin_nir(const char *name)
                              nir_iadd_imm(&b, dst_base, i * 4),
                              .write_mask = 1, .align_mul = 4, .align_offset = 0);
         }
+        nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+        return b.shader;
+    }
+
+    if (!strcmp(name, "gray_residual_tiles") ||
+        !strcmp(name, "gray_restore_tiles")) {
+        b.shader->info.workgroup_size[0] = 16;
+        nir_def *wg = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+        nir_def *idx = nir_iadd(&b, nir_imul_imm(&b, wg, 16),
+                                nir_load_local_invocation_index(&b));
+        nir_def *byte_off = nir_imul_imm(&b, idx, 4);
+        nir_def *src = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), byte_off,
+                                     .access = 0, .align_mul = 4);
+        nir_def *pred = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 1), byte_off,
+                                      .access = 0, .align_mul = 4);
+        nir_def *out = !strcmp(name, "gray_restore_tiles")
+            ? add_u8x4(&b, src, pred) : sub_u8x4(&b, src, pred);
+        nir_store_ssbo(&b, out, nir_imm_int(&b, 2), byte_off,
+                       .write_mask = 1, .align_mul = 4, .align_offset = 0);
         nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
         return b.shader;
     }

@@ -668,9 +668,10 @@ bring-up path must not do. Callers that must not block check transmit credit *be
 - PicoVM's native hook accelerates the BitNet-critical `Tensor.DotI8` and `Tensor.MatVecI8`
   operations through verified QPU float staging; i8 products/sums stay exact within the reviewed
   1024-element bound. Every other PicoScript Tensor primitive retains the pure-C fallback.
-- Acceleration remains quarantined after boot. Run `tensor picoscript`; it verifies cache
-  coherence, Add/Mul/ReLU kernels, two consecutive QPU dots, PicoVM host dispatch, and a two-row
-  MatVec before enabling. Only then does the workbench show **V3D QPU PicoScript enabled**.
+- ADR-027 now runs accelerator proofs during boot. It verifies cache coherence,
+  Add/Mul/ReLU kernels, QPU dots, PicoVM host dispatch, batched MatVec/BitLinear,
+  the compiled BitNet PicoScript fixture, Media, and QPU VM execution 1 before
+  publishing dashboard state. Failures retain deterministic CPU/NEON fallback.
 - Live Pi5 image `v20260724.235015`: guarded test passes repeatedly, kernel selftests 14/14,
   `error=0`, `rx_wedge=0`, `rx_hole_recover=0`.
 - QEMU still has no V3D. Final regression is 29/29 plus load battery PASS with the hook disabled
@@ -682,6 +683,11 @@ bring-up path must not do. Callers that must not block check transmit credit *be
   (`(7 + -3) * 11 = 44`) but Mesa lowers integer multiply to `umul24`. Measured on Pi5:
   CPU ~1 ns vs QPU ~4.42 us per block. Fine-grained interpreter replacement is not viable; only
   large, range-proven straight-line batches could amortize dispatch.
+- Follow-up batching on 2026-08-11 tested dynamically indexed SSBO grids at 16/64/256/1024
+  operations and straight-line global-memory kernels at 16/32/64 operations. Every variant
+  CSD-completed with clean cache/MMU diagnostics but performed no stores; inputs, uniforms and
+  shader addresses were verified live. The failed batch kernels were removed. Keep QPU VM
+  execution 1 as a verified single-block proof with CPU selected; do not advertise a batch path.
 - Real BitNet fixture: `examples/bitnet_pi5_wq.pc` runs token-3 embedding through layer-0 Wq from
   `RP2350B_Bitnet/bitnet-shard/artifacts/packed-tiny` using the QPU MatVec hook, then PicoScript
   ArgMax. Expected/observed: argmax 57, projection checksum 170896.
@@ -732,8 +738,13 @@ bring-up path must not do. Callers that must not block check transmit credit *be
 - Dense single-vector INT8 stays on NEON. Packed ternary batches and persistent FP32 tiles select
   QPU. QEMU remains CPU/NEON-only and passes 29/29 plus load battery.
 - Media: QPU grayscale XOR residual/restore is verified. Grayscale delta and H.264 arithmetic
-  residual/restore have deterministic CPU implementations; QPU H.264 and hardware HEVC remain
-  pending/fail-closed.
+  residual/restore have deterministic CPU implementations. Separate Mesa-generated packed-byte
+  QPU kernels now verify 64-byte H.264-style luma residual and restore, with one workgroup per
+  tile. Zero-copy profiling at the current single-dispatch limit (4 KiB) measured CPU ~0.8 us
+  versus QPU ~16.5 us, so the QPU path remains a verified proof backend while synchronous runtime
+  selection correctly stays on CPU. A slower QPU path may only be chosen for parallel CPU relief
+  through a future non-blocking `Async.*` job provider; synchronous calls cannot provide overlap.
+  Hardware HEVC remains pending/fail-closed.
 
 ---
 

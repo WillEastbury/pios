@@ -31,6 +31,7 @@
 #include "pico_hooks.h"
 #include "walfs.h"
 #include "ipc_proc.h"
+#include "picovm_fifo.h"
 
 /* Minimal freestanding mem primitives (also satisfy implicit compiler calls). */
 void *memcpy(void *d, const void *s, unsigned long n)
@@ -120,6 +121,8 @@ struct picoweb_host {
     struct pico_span spans[PICOWEB_MAX_SPANS];
     int span_count;
     int oom;
+    i32 kernel_fifo;
+    u64 kernel_sequence;
 };
 
 /* pv_ctx (include/picovm.h) is genuinely large (~65KB card/span/writer/queue
@@ -506,6 +509,40 @@ static void picoweb_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int im
 {
     struct picoweb_host *h = (struct picoweb_host *)ctx;
     (void)imm16;
+    if (hook == PV_HOOK_KERNEL_WAITIRQ ||
+        hook == PV_HOOK_KERNEL_WAITSWIRQ ||
+        hook == PV_HOOK_KERNEL_FIRESWIRQ ||
+        hook == PV_HOOK_KERNEL_PROFILESTART ||
+        hook == PV_HOOK_KERNEL_PROFILEEND ||
+        hook == PV_HOOK_KERNEL_TRACEPOINT) {
+        struct picovm_kernel_fifo_request req;
+        struct picovm_kernel_fifo_reply reply;
+        for (u32 i = 0U; i < sizeof(req) / sizeof(u64); i++)
+            ((u64 *)&req)[i] = 0U;
+        req.version = PICOVM_KERNEL_FIFO_VERSION;
+        req.hook = (u32)hook;
+        req.rd = rd;
+        req.rs1 = rs1;
+        req.rs2 = rs2;
+        req.imm16 = imm16;
+        req.arg0 = ctx->regs[rs1];
+        req.arg1 = ctx->regs[rs2];
+        req.sequence = ++h->kernel_sequence;
+        if (!h->api || h->kernel_fifo < 0 ||
+            h->api->ipc_fifo_send(h->kernel_fifo, &req, sizeof(req)) != PROC_IPC_OK ||
+            h->api->ipc_fifo_recv(h->kernel_fifo, &reply, sizeof(reply)) != sizeof(reply) ||
+            reply.version != PICOVM_KERNEL_FIFO_VERSION ||
+            reply.sequence != req.sequence) {
+            ctx->regs[rd] = 0;
+            ctx->host_status = 40;
+            return;
+        }
+        ctx->regs[rd] = reply.result;
+        ctx->host_status = reply.status;
+        if (reply.status < 0)
+            ctx->fault = PV_FAULT_CAPABILITY;
+        return;
+    }
     switch (hook) {
     case PV_HOOK_CONTEXT_GETVERB:
     case PV_HOOK_CONTEXT_GETPATH:
@@ -643,6 +680,10 @@ static void picoweb_init(struct picoweb_host *h, struct uhttp_bridge *b, struct 
     h->spans[0].ptr = 0;
     h->spans[0].len = 0;
     h->oom = 0;
+    h->kernel_fifo = api ? api->ipc_fifo_open(PICOVM_KERNEL_FIFO_NAME,
+                                               PROC_IPC_PERM_SEND |
+                                               PROC_IPC_PERM_RECV) : -1;
+    h->kernel_sequence = 0;
 }
 
 static bool req_is_api(struct uhttp_bridge *b)

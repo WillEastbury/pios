@@ -138,3 +138,38 @@ void rp1_i2c_diag_snapshot(struct rp1_i2c_diag *out)
 {
     if (out) *out = i2c_diag;
 }
+
+bool rp1_i2c_probe(u8 address)
+{
+    if (!i2c_ready || address > 0x7FU)
+        return false;
+    /* A one-byte read is the least intrusive probe: it does not write to any
+     * register on the target, so scanning cannot corrupt device state the way
+     * a write probe can. An absent device NAKs its address and the transfer
+     * aborts. */
+    u8 scratch = 0U;
+    u32 before = i2c_diag.timeouts;
+    bool ok = rp1_i2c_write_read(address, NULL, 0U, &scratch, 1U);
+    /* A timeout means the bus is wedged, not that the device is absent. */
+    if (i2c_diag.timeouts != before)
+        return false;
+    return ok;
+}
+
+u32 rp1_i2c_scan(u8 *found, u32 found_len)
+{
+    if (!found || found_len < 16U)
+        return 0U;
+    for (u32 i = 0U; i < 16U; i++)
+        found[i] = 0U;
+    u32 count = 0U;
+    /* 0x00-0x07 and 0x78-0x7F are reserved by the I2C specification; probing
+     * them can trigger general-call or 10-bit addressing behaviour. */
+    for (u8 addr = 0x08U; addr <= 0x77U; addr++) {
+        if (rp1_i2c_probe(addr)) {
+            found[addr >> 3] |= (u8)(1U << (addr & 7U));
+            count++;
+        }
+    }
+    return count;
+}

@@ -356,6 +356,28 @@ Do not repeat these blindly; each has been tried on hardware.
 | SAE (`wifi join3`) and extended-join | Reset this firmware; quarantined |
 | Scanning after a failed join | Watchdog reboot — always `wifi init`/reboot first |
 | Replacing firmware to fix `sup_wpa` | Both 7.45.265 and 7.45.286 report `sup_wpa` unsupported; firmware version is not the issue |
+| BDC EAPOL priority 7 | Linux classifies EAPOL as 802.1D network-control; setting `bdc_buf[1]=7` changed nothing. Reverted |
+| Settling delays between `wpaie`/`wpa_auth`/`auth`/`wsec` | 10 ms gaps matching Circle's sequence changed nothing. Reverted |
+| Visible 2.4 GHz BSS versus hidden 5 GHz parent | Both multi-BSSID targets fail identically |
+| `assoc_info` / `assoc_req_ies` / `WLC_GET_PKTCNTS` during association | Firmware does not service these GETs while associating (`stage=2`, or BCME -14 with a small buffer). Cannot be used to prove whether M2 was transmitted |
+
+**EAPOL msg 2/4 and msg 4/4 must carry `key_length = 0` for RSN.** Echoing M1's
+key length is WPA-only behaviour; `wpa_supplicant_send_2_of_4()` writes zero for
+`WPA_PROTO_RSN`. Some APs silently drop a non-zero M2 key length, which is
+indistinguishable from the AP ignoring M2 entirely.
+
+**A reply frame must not reuse the received frame's Ethernet header.** M4 was
+built with `memcpy(frame, m3, 14)`, addressing the reply to ourselves with the
+AP as source. The AP never saw M4 and deauthed with reason 2 — which looked
+exactly like a rejected handshake rather than a lost reply. Replies use
+dest = received source, src = `cyw_mac`.
+
+**Do not require an explicit RX indication.** RFRAMEBC reads 0 permanently on
+this board and no HMB/CCCR frame indication ever fires, so any driver that waits
+to be told about a frame will stop receiving as soon as a next-length chain ends
+— taking TX credit, scans and events down with it. `brcmf_sdio_readframes()`
+probes speculatively and validates the SDPCM length/~length tag; PIOS now does
+the same (`wifi rxprobe`).
 
 **`escan` needs an explicit channel list.** With the default zero-channel
 request the guest AP was intermittently undiscovered; with explicit 2.4/5 GHz

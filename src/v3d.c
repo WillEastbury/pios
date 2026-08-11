@@ -1,5 +1,6 @@
 #include "v3d.h"
 
+#include "core.h"
 #include "gpu.h"
 #include "highmem.h"
 #include "mailbox.h"
@@ -13,6 +14,7 @@
 #include "v3d_tiny_qpu.h"
 #include "v3d_gray_xor_qpu.h"
 #include "v3d_gray_residual_qpu.h"
+#include "v3d_gray_restore_qpu.h"
 #include "v3d_matvec64_qpu.h"
 #include "v3d_matmul64x16_qpu.h"
 #include "v3d_bitnet_bitmap_qpu.h"
@@ -150,6 +152,15 @@
 static struct v3d_caps g_v3d_caps;
 static struct v3d_csd_debug g_csd_debug;
 static struct v3d_reset_debug g_reset_debug;
+struct v3d_async_dispatch {
+    u32 active;
+    u32 completed_before;
+    u64 deadline_ms;
+    u8 reserved[48];
+} ALIGNED(64);
+_Static_assert(sizeof(struct v3d_async_dispatch) == 64U,
+               "V3D async state must own one cache line");
+static struct v3d_async_dispatch g_async_dispatch;
 static bool g_mmio_auto_quarantined;
 static bool g_mmio_auto_warned;
 static u32 g_kernel_uniform_handle[V3D_KERNEL_MAX];
@@ -175,6 +186,7 @@ static struct v3d_kernel_desc g_kernels[V3D_KERNEL_MAX] = {
     [V3D_KERNEL_MATVEC64]    = { .id = V3D_KERNEL_MATVEC64,    .name = "matvec64",    .qpu_count = 4 },
     [V3D_KERNEL_MATMUL64X16] = { .id = V3D_KERNEL_MATMUL64X16, .name = "matmul64x16", .qpu_count = 4 },
     [V3D_KERNEL_BITNET_BITMAP64X16] = { .id = V3D_KERNEL_BITNET_BITMAP64X16, .name = "bitnet_bitmap64x16", .qpu_count = 4 },
+    [V3D_KERNEL_GRAY_RESTORE64] = { .id = V3D_KERNEL_GRAY_RESTORE64, .name = "gray_restore64", .qpu_count = 4 },
 };
 struct v3d_kernel_blob {
     u32 control_handle;
@@ -467,6 +479,9 @@ static void v3d_kernel_blobs_init(void)
 
 void v3d_init(void)
 {
+    g_async_dispatch.active = 0U;
+    g_async_dispatch.completed_before = 0U;
+    g_async_dispatch.deadline_ms = 0U;
     g_v3d_caps.mailbox_qpu = false;
     g_v3d_caps.native_probe_ok = false;
     g_v3d_caps.native_compute_enabled = PIOS_ENABLE_NATIVE_V3D_COMPUTE ? true : false;
@@ -636,7 +651,8 @@ v3d_status_t v3d_kernel_bind_csd(v3d_kernel_id_t id, const u32 *csd_cfg, u32 qpu
         id != V3D_KERNEL_PICOVM_ALU && id != V3D_KERNEL_MATVEC16 &&
         id != V3D_KERNEL_GRAY_XOR64 && id != V3D_KERNEL_GRAY_RESIDUAL64 &&
         id != V3D_KERNEL_MATVEC64 && id != V3D_KERNEL_MATMUL64X16 &&
-        id != V3D_KERNEL_BITNET_BITMAP64X16)
+        id != V3D_KERNEL_BITNET_BITMAP64X16 &&
+        id != V3D_KERNEL_GRAY_RESTORE64)
         return V3D_STATUS_NOT_IMPLEMENTED;
     if (qpu_count == 0U || qpu_count > V3D_QPU_MAX_DISPATCH)
         return V3D_STATUS_INVALID;
@@ -744,7 +760,15 @@ v3d_status_t v3d_kernel_bind_builtin_qpu_grid(v3d_kernel_id_t id,
             dst_shader = (u64 *)(usize)(V3D_TINY_BLOB_BASE + 20U * V3D_TINY_BLOB_STRIDE);
             dst_uniforms = (u32 *)(usize)(V3D_TINY_BLOB_BASE + 21U * V3D_TINY_BLOB_STRIDE);
             shader_words = V3D_TINY_GRAY_RESIDUAL64_QPU_WORDS;
-            uniform_count = 6U;
+            uniform_count = V3D_TINY_GRAY_RESIDUAL64_QPU_UNIFORMS;
+            wg_size = 16U;
+        } else if (id == V3D_KERNEL_GRAY_RESTORE64) {
+            src_shader = v3d_tiny_gray_restore64_qpu;
+            dst_shader = (u64 *)(usize)(V3D_TINY_BLOB_BASE + 31U * V3D_TINY_BLOB_STRIDE);
+            dst_uniforms = (u32 *)(usize)(V3D_TINY_BLOB_BASE + 32U * V3D_TINY_BLOB_STRIDE);
+            shader_words = V3D_TINY_GRAY_RESTORE64_QPU_WORDS;
+            uniform_count = V3D_TINY_GRAY_RESTORE64_QPU_UNIFORMS;
+            wg_size = 16U;
         } else if (id == V3D_KERNEL_MATVEC64) {
             src_shader = v3d_tiny_matvec64_qpu;
             dst_shader = (u64 *)(usize)(V3D_TINY_BLOB_BASE + 22U * V3D_TINY_BLOB_STRIDE);
@@ -809,7 +833,19 @@ v3d_status_t v3d_kernel_bind_builtin_qpu_grid(v3d_kernel_id_t id,
         u32 uniform_storage_bytes = (uniform_count * sizeof(u32) + 63U) & ~63U;
         if (dst_uniforms)
             simd_zero(dst_uniforms, uniform_storage_bytes);
-        if (id == V3D_KERNEL_BITNET_BITMAP64X16 &&
+        if ((id == V3D_KERNEL_GRAY_RESIDUAL64 ||
+             id == V3D_KERNEL_GRAY_RESTORE64) &&
+            uniform_bytes == 3U * sizeof(u32)) {
+            const u32 *buffers = (const u32 *)uniform_data;
+            const u8 *kinds = id == V3D_KERNEL_GRAY_RESIDUAL64
+                ? v3d_tiny_gray_residual64_qpu_uniform_kind
+                : v3d_tiny_gray_restore64_qpu_uniform_kind;
+            const u32 *data = id == V3D_KERNEL_GRAY_RESIDUAL64
+                ? v3d_tiny_gray_residual64_qpu_uniform_data
+                : v3d_tiny_gray_restore64_qpu_uniform_data;
+            for (u32 i = 0; i < uniform_count; i++)
+                dst_uniforms[i] = kinds[i] == 53U ? buffers[data[i]] : data[i];
+        } else if (id == V3D_KERNEL_BITNET_BITMAP64X16 &&
             uniform_bytes == 3U * sizeof(u32)) {
             const u32 *buffers = (const u32 *)uniform_data;
             simd_zero(g_bitnet_spill, sizeof(g_bitnet_spill));
@@ -922,10 +958,31 @@ v3d_status_t v3d_kernel_bind_builtin_qpu_grid(v3d_kernel_id_t id,
                                     v3d_tiny_gray_xor64_qpu,
                                     V3D_TINY_GRAY_XOR64_QPU_WORDS);
     case V3D_KERNEL_GRAY_RESIDUAL64:
-        return v3d_kernel_bind_blob(id,
-                                    uniform_data, uniform_bytes,
-                                    v3d_tiny_gray_residual64_qpu,
-                                    V3D_TINY_GRAY_RESIDUAL64_QPU_WORDS);
+    case V3D_KERNEL_GRAY_RESTORE64: {
+        if (!uniform_data || uniform_bytes != 3U * sizeof(u32))
+            return V3D_STATUS_INVALID;
+        const u32 *buffers = (const u32 *)uniform_data;
+        const u8 *kinds = id == V3D_KERNEL_GRAY_RESIDUAL64
+            ? v3d_tiny_gray_residual64_qpu_uniform_kind
+            : v3d_tiny_gray_restore64_qpu_uniform_kind;
+        const u32 *data = id == V3D_KERNEL_GRAY_RESIDUAL64
+            ? v3d_tiny_gray_residual64_qpu_uniform_data
+            : v3d_tiny_gray_restore64_qpu_uniform_data;
+        u32 count = id == V3D_KERNEL_GRAY_RESIDUAL64
+            ? V3D_TINY_GRAY_RESIDUAL64_QPU_UNIFORMS
+            : V3D_TINY_GRAY_RESTORE64_QPU_UNIFORMS;
+        u32 uniforms[V3D_TINY_GRAY_RESIDUAL64_QPU_UNIFORMS];
+        for (u32 i = 0; i < count; i++)
+            uniforms[i] = kinds[i] == 53U ? buffers[data[i]] : data[i];
+        return v3d_kernel_bind_blob(
+            id, uniforms, count * sizeof(u32),
+            id == V3D_KERNEL_GRAY_RESIDUAL64
+                ? v3d_tiny_gray_residual64_qpu
+                : v3d_tiny_gray_restore64_qpu,
+            id == V3D_KERNEL_GRAY_RESIDUAL64
+                ? V3D_TINY_GRAY_RESIDUAL64_QPU_WORDS
+                : V3D_TINY_GRAY_RESTORE64_QPU_WORDS);
+    }
     case V3D_KERNEL_MATVEC64:
         return v3d_kernel_bind_blob(id,
                                     uniform_data, uniform_bytes,
@@ -1065,8 +1122,42 @@ v3d_status_t v3d_reg_write(u32 reg_off, u32 val)
     return V3D_STATUS_OK;
 }
 
-static v3d_status_t v3d_dispatch_mmio_csd(const struct v3d_dispatch_cfg *cfg, u32 timeout_ms)
+static void v3d_dispatch_snapshot(u32 st)
 {
+    g_csd_debug.status_after_wait = st;
+    g_csd_debug.core_int_sts =
+        mmio_read(g_v3d_caps.reg_base + V3D_CORE_INT_STS_OFF);
+    g_csd_debug.hub_int_sts =
+        mmio_read(g_v3d_caps.hub_base + V3D_HUB_INT_STS_OFF);
+    g_csd_debug.err_stat =
+        mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
+    g_csd_debug.mmu_ctl =
+        mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
+    g_csd_debug.mmu_illegal_addr =
+        mmio_read(g_v3d_caps.hub_base + V3D_MMU_ILLEGAL_ADDR_OFF);
+    g_csd_debug.mmu_vio_addr =
+        mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ADDR_OFF);
+    g_csd_debug.mmu_vio_id =
+        mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ID_OFF);
+    g_csd_debug.gmp_status =
+        mmio_read(g_v3d_caps.reg_base + V3D_GMP_STATUS_V71_OFF);
+    g_csd_debug.gmp_cfg =
+        mmio_read(g_v3d_caps.reg_base + V3D_GMP_CFG_V71_OFF);
+    g_csd_debug.gmp_vio_addr =
+        mmio_read(g_v3d_caps.reg_base + V3D_GMP_VIO_ADDR_V71_OFF);
+    g_csd_debug.current_cfg0 =
+        mmio_read(g_v3d_caps.reg_base + V3D_CSD_CURRENT_CFG0_V71_OFF);
+    g_csd_debug.current_cfg5 =
+        mmio_read(g_v3d_caps.reg_base + V3D_CSD_CURRENT_CFG5_V71_OFF);
+    g_csd_debug.current_cfg6 =
+        mmio_read(g_v3d_caps.reg_base + V3D_CSD_CURRENT_CFG6_V71_OFF);
+}
+
+static v3d_status_t
+v3d_dispatch_mmio_csd_begin(const struct v3d_dispatch_cfg *cfg, u32 timeout_ms)
+{
+    if (core_id() != CORE_NET)
+        return V3D_STATUS_UNSUPPORTED;
     if (!g_v3d_caps.native_compute_enabled)
         return V3D_STATUS_UNSUPPORTED;
     if (!g_v3d_caps.native_selftest_ok)
@@ -1075,29 +1166,22 @@ static v3d_status_t v3d_dispatch_mmio_csd(const struct v3d_dispatch_cfg *cfg, u3
         return V3D_STATUS_UNSUPPORTED;
     if (!cfg->csd_cfg_valid)
         return V3D_STATUS_NOT_IMPLEMENTED;
+    if (g_async_dispatch.active != 0U)
+        return V3D_STATUS_NOT_READY;
 
-    /* Wait for CSD idle before submitting a new queue entry. */
-    for (u32 i = 0; i < timeout_ms * 1000U; i++) {
-        u32 st = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
-        if ((st & V3D_CSD_STATUS_BUSY_MASK) == 0U)
-            break;
-        if (i + 1U == timeout_ms * 1000U)
-            return V3D_STATUS_TIMEOUT;
-        timer_delay_us(1);
-    }
+    u32 st = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
+    if ((st & V3D_CSD_STATUS_BUSY_MASK) != 0U)
+        return V3D_STATUS_NOT_READY;
 
-    g_csd_debug.status_before = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
-    u32 completed_before = g_csd_debug.status_before & V3D_CSD_STATUS_COMPLETED_MASK;
+    g_csd_debug.status_before = st;
     g_csd_debug.mmu_vio_addr = 0U;
     g_csd_debug.mmu_vio_id = 0U;
     (void)v3d_gmp_allow_all();
     mmio_write(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF, 0xFFFFFFFFU);
-    /* MMU fault status bits are W1C. Linux clears them by writing the current
-     * MMU_CTL value back before the next job; preserve the configured abort/
-     * interrupt policy while clearing stale WRV/PTI/CAP status. */
     mmio_write(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF,
                mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF));
-    mmio_write(g_v3d_caps.reg_base + V3D_CORE_INT_CLR_OFF, V3D_CORE_INT_CSDDONE_V71);
+    mmio_write(g_v3d_caps.reg_base + V3D_CORE_INT_CLR_OFF,
+               V3D_CORE_INT_CSDDONE_V71);
     if (!v3d_invalidate_caches())
         return V3D_STATUS_FAILED;
 
@@ -1109,62 +1193,80 @@ static v3d_status_t v3d_dispatch_mmio_csd(const struct v3d_dispatch_cfg *cfg, u3
     dmb();
     mmio_write(g_v3d_caps.reg_base + v3d_csd_cfg6_off(), cfg->csd_cfg[6]);
     if (g_v3d_caps.tech_version >= 71U)
-        mmio_write(g_v3d_caps.reg_base + V3D_CSD_QUEUED_CFG7_V71_OFF, 0);
+        mmio_write(g_v3d_caps.reg_base + V3D_CSD_QUEUED_CFG7_V71_OFF, 0U);
+    dmb();
+
+    g_async_dispatch.completed_before =
+        st & V3D_CSD_STATUS_COMPLETED_MASK;
+    g_async_dispatch.deadline_ms =
+        timer_monotonic_ms() + (u64)timeout_ms;
+    g_async_dispatch.active = 1U;
     dmb();
     mmio_write(g_v3d_caps.reg_base + v3d_csd_cfg0_off(), cfg->csd_cfg[0]);
     dmb();
-    g_csd_debug.status_after_kick = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
+    g_csd_debug.status_after_kick =
+        mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
+    return V3D_STATUS_OK;
+}
 
-    for (u32 i = 0; i < timeout_ms * 1000U; i++) {
-        u32 st = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
-        u32 mmu_st = mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
-        if ((mmu_st & (V3D_MMU_CTL_WRITE_VIOLATION |
-                       V3D_MMU_CTL_PT_INVALID |
-                       V3D_MMU_CTL_CAP_EXCEEDED)) != 0U &&
-            g_csd_debug.mmu_vio_id == 0U) {
-            g_csd_debug.mmu_ctl = mmu_st;
-            g_csd_debug.mmu_vio_addr =
-                mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ADDR_OFF);
-            g_csd_debug.mmu_vio_id =
-                mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ID_OFF);
-        }
-        if ((st & V3D_CSD_STATUS_COMPLETED_MASK) != completed_before &&
-            (st & V3D_CSD_STATUS_BUSY_MASK) == 0U) {
-            g_csd_debug.status_after_wait = st;
-            g_csd_debug.core_int_sts = mmio_read(g_v3d_caps.reg_base + V3D_CORE_INT_STS_OFF);
-            g_csd_debug.hub_int_sts = mmio_read(g_v3d_caps.hub_base + V3D_HUB_INT_STS_OFF);
-            g_csd_debug.err_stat = mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
-            if (g_csd_debug.mmu_ctl == 0U)
-                g_csd_debug.mmu_ctl = mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
-            g_csd_debug.mmu_illegal_addr = mmio_read(g_v3d_caps.hub_base + V3D_MMU_ILLEGAL_ADDR_OFF);
-            if (g_csd_debug.mmu_vio_id == 0U) {
-                g_csd_debug.mmu_vio_addr = mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ADDR_OFF);
-                g_csd_debug.mmu_vio_id = mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ID_OFF);
-            }
-            g_csd_debug.gmp_status = mmio_read(g_v3d_caps.reg_base + V3D_GMP_STATUS_V71_OFF);
-            g_csd_debug.gmp_cfg = mmio_read(g_v3d_caps.reg_base + V3D_GMP_CFG_V71_OFF);
-            g_csd_debug.gmp_vio_addr = mmio_read(g_v3d_caps.reg_base + V3D_GMP_VIO_ADDR_V71_OFF);
-            g_csd_debug.current_cfg0 = mmio_read(g_v3d_caps.reg_base + V3D_CSD_CURRENT_CFG0_V71_OFF);
-            g_csd_debug.current_cfg5 = mmio_read(g_v3d_caps.reg_base + V3D_CSD_CURRENT_CFG5_V71_OFF);
-            g_csd_debug.current_cfg6 = mmio_read(g_v3d_caps.reg_base + V3D_CSD_CURRENT_CFG6_V71_OFF);
-            if (!v3d_clean_caches())
-                return V3D_STATUS_FAILED;
-            dmb();
-            return V3D_STATUS_OK;
-        }
-        timer_delay_us(1);
+v3d_status_t v3d_dispatch_poll(bool *done)
+{
+    if (!done)
+        return V3D_STATUS_INVALID;
+    *done = false;
+    if (core_id() != CORE_NET)
+        return V3D_STATUS_UNSUPPORTED;
+    if (g_async_dispatch.active == 0U)
+        return V3D_STATUS_NOT_READY;
+
+    u32 st = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
+    u32 mmu_st = mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
+    if ((mmu_st & (V3D_MMU_CTL_WRITE_VIOLATION |
+                   V3D_MMU_CTL_PT_INVALID |
+                   V3D_MMU_CTL_CAP_EXCEEDED)) != 0U) {
+        v3d_dispatch_snapshot(st);
+        g_async_dispatch.active = 0U;
+        return V3D_STATUS_FAILED;
     }
-    g_csd_debug.status_after_wait = mmio_read(g_v3d_caps.reg_base + V3D_CSD_STATUS_OLD_OFF);
-    g_csd_debug.core_int_sts = mmio_read(g_v3d_caps.reg_base + V3D_CORE_INT_STS_OFF);
-    g_csd_debug.hub_int_sts = mmio_read(g_v3d_caps.hub_base + V3D_HUB_INT_STS_OFF);
-    g_csd_debug.err_stat = mmio_read(g_v3d_caps.reg_base + V3D_ERR_STAT_OFF);
-    g_csd_debug.mmu_ctl = mmio_read(g_v3d_caps.hub_base + V3D_MMU_CTL_OFF);
-    g_csd_debug.mmu_vio_addr = mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ADDR_OFF);
-    g_csd_debug.mmu_vio_id = mmio_read(g_v3d_caps.hub_base + V3D_MMU_VIO_ID_OFF);
-    g_csd_debug.gmp_status = mmio_read(g_v3d_caps.reg_base + V3D_GMP_STATUS_V71_OFF);
-    g_csd_debug.gmp_cfg = mmio_read(g_v3d_caps.reg_base + V3D_GMP_CFG_V71_OFF);
-    g_csd_debug.gmp_vio_addr = mmio_read(g_v3d_caps.reg_base + V3D_GMP_VIO_ADDR_V71_OFF);
-    return V3D_STATUS_TIMEOUT;
+    if ((st & V3D_CSD_STATUS_COMPLETED_MASK) !=
+            g_async_dispatch.completed_before &&
+        (st & V3D_CSD_STATUS_BUSY_MASK) == 0U) {
+        v3d_dispatch_snapshot(st);
+        g_async_dispatch.active = 0U;
+        if (!v3d_clean_caches())
+            return V3D_STATUS_FAILED;
+        dmb();
+        *done = true;
+        return V3D_STATUS_OK;
+    }
+    if (timer_monotonic_ms() >= g_async_dispatch.deadline_ms) {
+        v3d_dispatch_snapshot(st);
+        g_async_dispatch.active = 0U;
+        return V3D_STATUS_TIMEOUT;
+    }
+    return V3D_STATUS_IN_PROGRESS;
+}
+
+bool v3d_dispatch_in_flight(void)
+{
+    return g_async_dispatch.active != 0U;
+}
+
+static v3d_status_t
+v3d_dispatch_mmio_csd(const struct v3d_dispatch_cfg *cfg, u32 timeout_ms)
+{
+    v3d_status_t status = v3d_dispatch_mmio_csd_begin(cfg, timeout_ms);
+    if (status != V3D_STATUS_OK)
+        return status;
+    for (;;) {
+        bool done = false;
+        status = v3d_dispatch_poll(&done);
+        if (status == V3D_STATUS_OK && done)
+            return V3D_STATUS_OK;
+        if (status != V3D_STATUS_IN_PROGRESS)
+            return status;
+        timer_delay_us(1U);
+    }
 }
 
 static v3d_status_t v3d_dispatch_mailbox(const struct v3d_dispatch_cfg *cfg, u32 timeout_ms)
@@ -1432,6 +1534,30 @@ v3d_status_t v3d_dispatch_kernel(v3d_kernel_id_t id, u32 timeout_ms)
     cfg.timeout_ms = timeout_ms;
     cfg.backend = V3D_BACKEND_AUTO;
     return v3d_dispatch_compute(&cfg);
+}
+
+v3d_status_t v3d_dispatch_kernel_begin(v3d_kernel_id_t id, u32 timeout_ms)
+{
+    if (id >= V3D_KERNEL_MAX)
+        return V3D_STATUS_INVALID;
+    const struct v3d_kernel_desc *k = &g_kernels[id];
+    if (!k->ready || !k->native_csd || k->qpu_count == 0U)
+        return V3D_STATUS_NOT_IMPLEMENTED;
+    if (timeout_ms == 0U)
+        timeout_ms = V3D_DEFAULT_TIMEOUT_MS;
+    if (timeout_ms > V3D_MAX_TIMEOUT_MS)
+        return V3D_STATUS_INVALID;
+
+    struct v3d_dispatch_cfg cfg;
+    cfg.qpu_count = k->qpu_count;
+    cfg.control_list_bus = 0U;
+    for (u32 i = 0; i < 7U; i++)
+        cfg.csd_cfg[i] = k->csd_cfg[i];
+    cfg.csd_cfg_valid = true;
+    cfg.noflush = k->noflush;
+    cfg.timeout_ms = timeout_ms;
+    cfg.backend = V3D_BACKEND_MMIO_CSD;
+    return v3d_dispatch_mmio_csd_begin(&cfg, timeout_ms);
 }
 
 v3d_status_t v3d_kernel_bind(v3d_kernel_id_t id, u32 uniform_bus, u32 shader_bus)

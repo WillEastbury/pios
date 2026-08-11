@@ -36,6 +36,13 @@ def main() -> int:
     ssid = str(config.get("ssid", ""))
     password = str(config.get("password", ""))
     mode = str(config.get("mode", "wpa2")).lower()
+    bssid = str(config.get("bssid", "")).replace(":", "").lower()
+    chanspec_raw = config.get("chanspec", "")
+    chanspec = (
+        int(chanspec_raw, 0)
+        if isinstance(chanspec_raw, str) and chanspec_raw
+        else int(chanspec_raw or 0)
+    )
     activate = args.activate or bool(config.get("activate", False))
     if not ssid or not password:
         raise SystemExit(
@@ -45,15 +52,17 @@ def main() -> int:
     if any(ch.isspace() for ch in ssid) or any(ch.isspace() for ch in password):
         raise SystemExit("PIOS wifi join currently requires values without spaces.")
 
-    if not args.no_scan:
+    fixed_target = len(bssid) == 12 and chanspec != 0
+    if not args.no_scan and not fixed_target:
         print(terminal_command(host, "wifi scan", args.timeout))
         deadline = time.monotonic() + args.timeout
         while time.monotonic() < deadline:
             time.sleep(2.0)
             scan = terminal_command(host, "wifi results", args.timeout)
-            if "WiFi scan count=" in scan and any(
+            found = any(
                 line.startswith(f"{ssid} ") for line in scan.splitlines()
-            ):
+            )
+            if "WiFi scan count=" in scan and found:
                 print(scan)
                 break
         else:
@@ -78,7 +87,10 @@ def main() -> int:
                 32,
             ).hex()
             result = terminal_command(
-                host, f"wifi joinpmk {ssid} {pmk}", args.timeout
+                host,
+                f"wifi joinpmk {ssid} {pmk}"
+                + (f" {bssid} {chanspec:04x}" if fixed_target else ""),
+                args.timeout,
             )
         else:
             raise ValueError("mode must be 'wpa2' or 'wpa3'")

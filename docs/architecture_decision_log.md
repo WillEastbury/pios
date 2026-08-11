@@ -76,6 +76,8 @@ decision)
 | [024](#adr-024) | Dynamic per-process memory allocation ([#84](https://github.com/WillEastbury/pios/issues/84)) | Owner | Proposed |
 | [025](#adr-025) | A core is a scheduling capability ([#85](https://github.com/WillEastbury/pios/issues/85)) | Owner | Proposed |
 | [026](#adr-026) | Bank unused quanta for cooperative processes | Owner | Proposed |
+| [027](#adr-027) | Guarded PicoScript accelerator enablement during boot | Owner | Accepted |
+| [028](#adr-028) | Core-0-owned asynchronous PicoScript QPU jobs | Owner | Accepted |
 
 ---
 
@@ -1099,6 +1101,67 @@ behind.
 `tests/test_qbank.c` (33 checks), including: a full bank on a fully idle core
 still cannot exceed one quantum; a contended core grants **zero** regardless of
 balance; and 1000 no-op yields bank nothing.
+
+---
+
+<a name="adr-027"></a>
+## ADR-027 — Guarded PicoScript accelerator enablement during boot
+
+**Date:** 2026-08-11 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** *"lets make these accelerators work inside picoscript as
+batched superinstructions"* and *"lets run the tests and enablement on boot
+please"*.
+
+**Decision.** Keep acceleration behind PicoScript's existing coarse host hooks:
+`Tensor.MatVecI8`, `BitLinear.MatMulBitmapBatch`, and `Media.*`. Do not add
+per-operation VM bytecodes or offload scalar interpreter instructions. During
+boot, after V3D/Tensor initialisation, run the guarded PicoScript/QPU proofs,
+representative tensor profile, media proof/profile, and QPU VM proof.
+
+Only a backend that passes its proof is published as verified. Selection remains
+measurement-based: packed-ternary and representative FP32 batches may select
+QPU, while dense INT8, fine-grained VM arithmetic, and small H.264 luma
+residuals remain on CPU/NEON when faster. Any failed proof leaves the
+deterministic CPU fallback active and boot continues.
+
+Synchronous calls always choose the fastest measured backend. Choosing a slower
+QPU path to free CPU capacity uses the non-blocking `Async.*` provider defined
+by ADR-028; merely forcing a synchronous QPU call provides no parallelism.
+
+**Rationale.** This removes misleading post-boot `probe` states and makes the
+PicoScript superinstruction surface usable immediately, without weakening the
+existing fail-closed/quarantine contract. The extra boot work is bounded and
+contains no unbounded waits; the watchdog is petted only after the complete
+accelerator phase returns.
+
+---
+
+<a name="adr-028"></a>
+## ADR-028 — Core-0-owned asynchronous PicoScript QPU jobs
+
+**Date:** 2026-08-11 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** *"please do the async"* and permit QPU offload when the CPU
+has independent background work.
+
+**Decision.** Native CSD dispatch is split into bounded `begin` and `poll`
+operations; the synchronous API is a wrapper over the same state machine.
+PicoScript uses its existing `Async.Submit/Wait/Result` hooks with a bounded
+`QPA1` request (`1=residual`, `2=restore`, payload length a multiple of 64 up to
+4 KiB).
+
+V3D submission remains core-0-owned. The provider uses a fixed-capacity,
+generation-checked job table with one cache line per slot. QPU output is written
+to per-job staging, invalidated on completion, then copied into the PicoScript
+result span before publication. Invalid spans, stale handles, busy hardware,
+MMU/cache faults and timeouts fail closed.
+
+Synchronous Media still selects CPU because it is faster. Async submission is
+an explicit throughput/CPU-relief choice: the compiled PicoScript proof submits
+QPU work, executes 1,000 CPU-loop iterations, then waits and receives the
+bit-exact result. Direct non-owner submission is rejected; cross-core EL0 use
+will require a FIFO bridge to this core-0 provider.
 
 ---
 

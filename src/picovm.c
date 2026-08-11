@@ -191,11 +191,13 @@ static uint8_t pv_arena_get(pv_ctx *ctx, uint32_t a)
  * NULL by default; a native deployment sets this to compile in its own
  * pack/card store. Return non-zero if the hook was handled. */
 pv_storage_fn pv_storage_hook = 0;
+pv_block_fn pv_block_hook = 0;
 pv_tensor_fn pv_tensor_hook = 0;
 pv_compute_fn pv_compute_hook = 0;
 pv_net_fn pv_net_hook = 0;
 pv_media_fn pv_media_hook = 0;
 pv_bitlinear_fn pv_bitlinear_hook = 0;
+pv_host_provider_dispatch_fn pv_host_provider_dispatch_hook = 0;
 static int pv_span_make(pv_ctx *ctx, uint32_t ptr, int32_t len)
 {
     if (len < 0) len = 0;
@@ -234,6 +236,13 @@ static int pv_span_from_cbytes(pv_ctx *ctx, const char *s, int n)
     if (!s || n <= 0) return 0;
     for (int i = 0; i < n; i++) pv_arena_put(ctx, &k, (uint8_t)s[i]);
     return pv_arena_finish(ctx, k);
+}
+
+/* Public entry for host providers (Time/Env/RandomBytes results). */
+int pv_span_from_bytes(pv_ctx *ctx, const void *data, uint32_t len)
+{
+    if (!data || len == 0) return 0;
+    return pv_span_from_cbytes(ctx, (const char *)data, (int)len);
 }
 /* Case-insensitive lookup of a header value in ctx->req_headers (name is a C
  * string of length nn). Returns a span of the trimmed value, or 0 if absent.
@@ -1341,8 +1350,9 @@ uint32_t pv_hook_cap(int hook)
     if (hook >= 0x10 && hook <= 0x14) return PV_CAP_QUEUE;   /* Queue.* */
     if ((hook >= 0x15 && hook <= 0x1F) || hook == 0x38 || hook == 0x39) return PV_CAP_NET;  /* Resp.* */
     if (hook == PV_HOOK_RANDOM_U32) return PV_CAP_RANDOM;    /* Random.U32 */
-    if ((hook >= 0x60 && hook <= 0x6F) || (hook >= 0x1A0 && hook <= 0x1A4)) return PV_CAP_STORAGE; /* Storage.* */
-    if (hook >= 0xB0 && hook <= 0xBA) return PV_CAP_TIME;    /* DateTime.* */
+    if ((hook >= 0x60 && hook <= 0x6F) || (hook >= 0x1A0 && hook <= 0x1AB) ||
+        (hook >= 0x3B0 && hook <= 0x3DC)) return PV_CAP_STORAGE; /* Storage/Block */
+    if (hook >= 0xB0 && hook <= 0xBE) return PV_CAP_TIME;    /* DateTime.* incl. Year/Month/Day */
     if (hook >= 0xC0 && hook <= 0xC6) return PV_CAP_ENV;     /* Locale.* */
     if (hook >= 0xD0 && hook <= 0xD8) return PV_CAP_ENV;     /* Environment.* */
     if (hook >= 0xE0 && hook <= 0xEE) return PV_CAP_CONTEXT; /* Context.* */
@@ -1355,9 +1365,18 @@ uint32_t pv_hook_cap(int hook)
     if ((hook >= 0x180 && hook <= 0x186) || (hook >= 0x1B3 && hook <= 0x1B5)) return PV_CAP_EVENT;   /* Event.* */
     if (hook >= 0x188 && hook <= 0x193) return PV_CAP_UI;      /* Ui.* */
     if ((hook >= 0x1D0 && hook <= 0x1DF) || (hook >= 0x200 && hook <= 0x20B)) return PV_CAP_STORAGE; /* Search.* over card packs */
+    if (hook >= 0x280 && hook <= 0x28B) return PV_CAP_PROCESS; /* Process + Env */
+    if (hook >= 0x290 && hook <= 0x294) return PV_CAP_TIMER;   /* Timer + Scheduler */
+    if (hook >= 0x2A0 && hook <= 0x2A6) return PV_CAP_PRINCIPAL; /* Principal/Capability/Sandbox */
+    if (hook >= 0x2B0 && hook <= 0x2B3) return PV_CAP_CAPSULE_EXEC; /* Capsule.* */
     if (hook >= 0x370 && hook <= 0x37B) return PV_CAP_DEVICE;  /* Tensor host/CatQ/Async */
     if (hook >= 0x37C && hook <= 0x37D) return PV_CAP_STORAGE; /* Shard.* */
     if ((hook >= 0x2E0 && hook <= 0x2E6) || (hook >= 0x37E && hook <= 0x380)) return PV_CAP_NET; /* Net.* */
+    if (hook >= 0x360 && hook <= 0x36A) return PV_CAP_DEVICE; /* Media.* */
+    if (hook == 0x381) return PV_CAP_DEVICE; /* BitLinear.MatVecCatQ */
+    if (hook >= 0x382 && hook <= 0x386) return PV_CAP_DEVICE; /* Tensor F32 ops */
+    if (hook >= 0x387 && hook <= 0x389) return PV_CAP_DEVICE; /* MoE.* */
+    if (hook == 0x38A) return PV_CAP_DEVICE; /* CatQ.CalibrateTarget */
     return 0;                                                /* pure: String/Number/Maths/Span/... */
 }
 
@@ -2528,8 +2547,8 @@ static int pv_tensor_default(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
     return 1;
 }
 
-    static int pv_media_default(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
-    {
+static int pv_media_default(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
+{
         if (hook == PV_HOOK_MEDIA_SETSHAPE) {
             ctx->media_width = ctx->regs[rs1] < 0 ? 0 : ctx->regs[rs1];
             ctx->media_height = ctx->regs[rs2] < 0 ? 0 : ctx->regs[rs2];
@@ -2674,6 +2693,21 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
     /* INV-17: bindings are not ambient -- deny the hook unless its class is granted. */
     uint32_t need = pv_hook_cap(hook);
     if (need && !(ctx->caps & need)) { pv_set_fault(ctx, PV_FAULT_CAPABILITY, ctx->cur_pc, hook); return; }
+    /* Multi-target host provider (Time / Random / Environment). Optional;
+     * freestanding builds leave the hook NULL and fall through to stubs. */
+    if (pv_host_provider_dispatch_hook &&
+        pv_host_provider_dispatch_hook(ctx, hook, rd, rs1, rs2))
+        return;
+    /* In-VM multi-target emulators (pure DateTime, Gpio/Stream/Ui, Auth, …). */
+    {
+        extern int pv_emu_dispatch(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
+        if (pv_emu_dispatch(ctx, hook, rd, rs1, rs2)) return;
+    }
+    /* Extended shippable crypto (SHA-512/HMAC/MD5/SHA1/Blake2b/Sign/…). */
+    {
+        extern int pv_crypto_ext_dispatch(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
+        if (pv_crypto_ext_dispatch(ctx, hook, rd, rs1, rs2)) return;
+    }
     /* Map.* first-class dictionary (active-handle model; see docs/MAP.md). */
     if (hook >= PV_HOOK_MAP_NEW && hook <= PV_HOOK_MAP_USE) {
         if (pv_map_hook(ctx, hook, rd, rs1, rs2)) return;
@@ -2687,8 +2721,12 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
      * native binary compile in its own pack/card store (e.g. file-backed or
      * PicoWAL) without coupling it to the runtime. */
     if (pv_storage_hook &&
-        ((hook >= 0x60 && hook <= 0x6F) || (hook >= 0x1A0 && hook <= 0x1A4))) {
+        ((hook >= 0x60 && hook <= 0x6F) || (hook >= 0x1A0 && hook <= 0x1AB) ||
+         (hook >= 0x3B0 && hook <= 0x3C3))) {
         if (pv_storage_hook(ctx, hook, rd, rs1, rs2)) return;
+    }
+    if (pv_block_hook && hook >= PV_HOOK_BLOCK_READY && hook <= PV_HOOK_BLOCK_STATUS) {
+        if (pv_block_hook(ctx, hook, rd, rs1, rs2)) return;
     }
     if (hook >= PV_HOOK_TENSOR_SETSHAPE && hook <= PV_HOOK_TENSOR_HASACCEL) {
         if (pv_tensor_hook && pv_tensor_hook(ctx, hook, rd, rs1, rs2)) return;
@@ -2976,6 +3014,44 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
     if (hook == PV_HOOK_THREAD_YIELDCOUNTED) {
         ctx->thread_yield_count++;
         ctx->regs[rd] = (int32_t)ctx->thread_yield_count;
+        return;
+    }
+    if (hook >= PV_HOOK_TENSOR_MAP && hook <= PV_HOOK_SHARD_SAVE) {
+        if (pv_compute_hook && pv_compute_hook(ctx, hook, rd, rs1, rs2)) return;
+        ctx->regs[rd] = 0;
+        ctx->host_status = 1;
+        return;
+    }
+    if (hook == PV_HOOK_BITLINEAR_MATVECCATQ) {
+        if (pv_compute_hook && pv_compute_hook(ctx, hook, rd, rs1, rs2)) return;
+        ctx->regs[rd] = 0;
+        ctx->host_status = 1;
+        return;
+    }
+    if (hook >= PV_HOOK_TENSOR_ADD && hook <= PV_HOOK_TENSOR_RELEASE) {
+        if (pv_compute_hook && pv_compute_hook(ctx, hook, rd, rs1, rs2)) return;
+        ctx->regs[rd] = 0;
+        ctx->host_status = 1;
+        return;
+    }
+    if (hook >= PV_HOOK_MOE_FORWARD && hook <= PV_HOOK_MOE_SELECTEDEXPERT) {
+        if (pv_compute_hook && pv_compute_hook(ctx, hook, rd, rs1, rs2)) return;
+        ctx->regs[rd] = 0;
+        ctx->host_status = 1;
+        return;
+    }
+    if (hook == PV_HOOK_CATQ_CALIBRATETARGET) {
+        if (pv_compute_hook && pv_compute_hook(ctx, hook, rd, rs1, rs2)) return;
+        ctx->regs[rd] = 0;
+        ctx->host_status = 1;
+        return;
+    }
+    if ((hook >= PV_HOOK_NET_LISTEN && hook <= PV_HOOK_NET_REGISTER) ||
+        (hook >= PV_HOOK_NET_CONNECT && hook <= PV_HOOK_NET_RECVSPAN)) {
+        if (pv_net_hook && pv_net_hook(ctx, hook, rd, rs1, rs2)) return;
+        ctx->regs[rd] = (hook == PV_HOOK_NET_READ || hook == PV_HOOK_NET_RECVSPAN)
+            ? pv_arena_finish(ctx, 0) : 0;
+        ctx->host_status = 1;
         return;
     }
     /* Reserved namespaces: genuinely external/host-injected state this
@@ -4113,6 +4189,7 @@ void pv_init(pv_ctx *ctx)
     ctx->rng_state = 0x2545F4914F6CDD1DULL;
     ctx->max_steps = 1000000L;
     ctx->caps = PV_CAP_ALL;     /* default: every binding granted; host restricts to gate (INV-17) */
+    ctx->cap_ceiling = PV_CAP_ALL;
     ctx->const_floor = 0x8000;  /* INV-9: empty const region until literals are written */
     ctx->span_count = 1;        /* handle 0 reserved as the null span */
     ctx->arena_top = 0x8000;    /* bump pointer for span results (matches PicoVM) */
@@ -4165,6 +4242,144 @@ static void pv_noop(pv_ctx *ctx, int rd, int rs1, int rs2, int imm16)
     /* else genuine NOOP */
 }
 
+/* Fixed two-word systems ISA. The 0x5xxx NOOP range is the escape header and
+ * the following word is always payload/register/offset data. */
+#define PV_SYS_REG 0x80000000u
+static void pv_sys_copy(void *dst, const void *src, unsigned long n)
+{ unsigned char *d=(unsigned char*)dst;const unsigned char*s=(const unsigned char*)src;for(unsigned long i=0;i<n;i++)d[i]=s[i]; }
+static void pv_sys_move(unsigned char *d, const unsigned char *s, unsigned long n)
+{ if(d<s){for(unsigned long i=0;i<n;i++)d[i]=s[i];}else if(d>s){while(n){n--;d[n]=s[n];}} }
+static void pv_sys_fill(unsigned char *d, unsigned char v, unsigned long n)
+{ for(unsigned long i=0;i<n;i++)d[i]=v; }
+static uint64_t pv_sys_operand(pv_ctx *ctx, uint32_t p)
+{
+    return ((p & 0xFFFFFFF0u) == PV_SYS_REG) ? ctx->xregs[p & 15u] : (uint64_t)p;
+}
+static int32_t pv_sys_host(pv_ctx *ctx, int hook, int32_t a, int32_t b)
+{
+    int32_t saved[PV_NUM_REGS], result;
+    pv_sys_copy(saved, ctx->regs, sizeof(saved));
+    ctx->regs[13] = a; ctx->regs[14] = b; ctx->regs[12] = 0;
+    (ctx->host ? ctx->host : pv_default_host)(ctx, hook, 12, 13, 14, 0);
+    result = ctx->regs[12]; pv_sys_copy(ctx->regs, saved, sizeof(saved)); return result;
+}
+static void pv_sys_select(pv_ctx *ctx, uint64_t h, int selector_hook)
+{
+    pv_sys_host(ctx, PV_HOOK_STORAGE_USEPACK, (int32_t)(h & 0x3FFu), 0);
+    if (selector_hook) pv_sys_host(ctx, selector_hook, (int32_t)(h >> 16), 0);
+}
+static uint64_t pv_sys_handle(unsigned kind, uint32_t pack, uint32_t selector)
+{
+    return ((uint64_t)(kind & 15u) << 60) | ((uint64_t)selector << 16) | (pack & 0x3FFu);
+}
+static int pv_system(pv_ctx *ctx, int family, int sysop, int type,
+                     int rd, int rs1, uint32_t payload, int pc)
+{
+    uint64_t a = ctx->xregs[rs1], b = pv_sys_operand(ctx, payload), r = 0;
+    if (family == 1) { /* INT64 */
+        if (sysop >= 0x20 && sysop <= 0x25) {
+            int yes;
+            if (type == 0) {
+                int64_t sa=(int64_t)a,sb=(int64_t)b;
+                yes = sysop==0x20?sa==sb:sysop==0x21?sa!=sb:sysop==0x22?sa<sb:
+                      sysop==0x23?sa>sb:sysop==0x24?sa<=sb:sa>=sb;
+            } else yes = sysop==0x20?a==b:sysop==0x21?a!=b:sysop==0x22?a<b:
+                         sysop==0x23?a>b:sysop==0x24?a<=b:a>=b;
+            ctx->regs[rd]=yes; return 1;
+        }
+        switch(sysop) {
+        case 0x01:r=a;break; case 0x02:r=(type==0)?(uint64_t)(int64_t)(int32_t)payload:payload;break;
+        case 0x03:r=a+b;break; case 0x04:r=a-b;break; case 0x05:r=a*b;break;
+        case 0x06:r=b?(type==0?(uint64_t)((int64_t)a/(int64_t)b):a/b):0;break;
+        case 0x07:r=a&b;break; case 0x08:r=a|b;break; case 0x09:r=a^b;break;
+        case 0x0A:r=a<<(b&63);break; case 0x0B:r=type==0?(uint64_t)((int64_t)a>>(b&63)):a>>(b&63);break;
+        case 0x0C:r=type==0?(uint64_t)(int64_t)ctx->regs[rs1]:(uint32_t)ctx->regs[rs1];break;
+        case 0x0D:ctx->regs[rd]=(int32_t)(uint32_t)a;return 1;
+        default:return 0;
+        }
+        ctx->xregs[rd]=r; return 1;
+    }
+    if (family == 2) { /* MEMORY */
+        unsigned width = sysop==1||sysop==0x11?1:sysop==2||sysop==0x12?2:
+                         sysop==3||sysop==0x13||sysop==0x31?4:
+                         sysop==4||sysop==0x14||sysop==0x30?8:0;
+        if (width) {
+            int32_t d=(int32_t)payload; uint64_t p=a+(int64_t)d;
+            if (!ctx->mem || p+width>(uint64_t)ctx->mem_size) { pv_set_fault(ctx,PV_FAULT_BAD_JUMP,pc,(int)p); return 1; }
+            if (sysop<0x10||sysop==0x30) { r=0; for(unsigned n=0;n<width;n++)r|=(uint64_t)ctx->mem[p+n]<<(8*n);ctx->xregs[rd]=r; }
+            else for(unsigned n=0;n<width;n++)ctx->mem[p+n]=(uint8_t)(ctx->xregs[rd]>>(8*n));
+            return 1;
+        }
+        if (sysop==0x20||sysop==0x21) {
+            size_t n=(size_t)b, dp=(size_t)ctx->xregs[rd], sp=(size_t)a;
+            if(dp+n>(size_t)ctx->mem_size||(sysop==0x20&&sp+n>(size_t)ctx->mem_size)){pv_set_fault(ctx,PV_FAULT_BAD_JUMP,pc,0);return 1;}
+            if(sysop==0x20)pv_sys_move(ctx->mem+dp,ctx->mem+sp,n);else pv_sys_fill(ctx->mem+dp,(uint8_t)a,n);
+            return 1;
+        }
+    }
+    if (family == 3) { /* POINTER */
+        if(sysop==1||sysop==2)ctx->xregs[rd]=a+b;
+        else if(sysop==3)ctx->xregs[rd]=a-b;
+        else if(sysop==4)ctx->xregs[rd]=a+b*(1u<<(type&3)); else return 0;
+        return 1;
+    }
+    if (family == 4) { /* FRAME */
+        if(sysop==0x10){
+            if(ctx->sys_frame_sp>=PV_MAX_SYS_FRAMES){pv_set_fault(ctx,PV_FAULT_CALL_OVERFLOW,pc,0);return 1;}
+            pv_sys_copy(ctx->sys_frame_r[ctx->sys_frame_sp],ctx->regs,sizeof(ctx->regs));
+            pv_sys_copy(ctx->sys_frame_x[ctx->sys_frame_sp],ctx->xregs,sizeof(ctx->xregs));ctx->sys_frame_sp++;
+            ctx->xregs[15]-=payload;ctx->xregs[14]=ctx->xregs[15];return 1;
+        }
+        if(sysop==0x11){
+            int32_t rr=ctx->regs[rd];uint64_t rx=ctx->xregs[rs1],heap=0;int hi=-1;
+            if((payload&0xFFFFFFF0u)==PV_SYS_REG){hi=payload&15;heap=ctx->xregs[hi];}
+            if(ctx->sys_frame_sp<=0){pv_set_fault(ctx,PV_FAULT_RET_UNDERFLOW,pc,0);return 1;}
+            --ctx->sys_frame_sp;pv_sys_copy(ctx->regs,ctx->sys_frame_r[ctx->sys_frame_sp],sizeof(ctx->regs));
+            pv_sys_copy(ctx->xregs,ctx->sys_frame_x[ctx->sys_frame_sp],sizeof(ctx->xregs));
+            if(type&1)ctx->regs[rd]=rr;if(type&2)ctx->xregs[rs1]=rx;if(hi>=0)ctx->xregs[hi]=heap;return 1;
+        }
+        if(sysop>=0x12&&sysop<=0x15){
+            unsigned width=(sysop==0x12||sysop==0x13)?4:8;uint64_t p=ctx->xregs[14]+(int32_t)payload;
+            if(!ctx->mem||p+width>(uint64_t)ctx->mem_size){pv_set_fault(ctx,PV_FAULT_BAD_JUMP,pc,(int)p);return 1;}
+            if(sysop==0x12||sysop==0x14){r=0;for(unsigned n=0;n<width;n++)r|=(uint64_t)ctx->mem[p+n]<<(8*n);ctx->xregs[rd]=r;}
+            else for(unsigned n=0;n<width;n++)ctx->mem[p+n]=(uint8_t)(ctx->xregs[rd]>>(8*n));return 1;
+        }
+        if(sysop==0x16){ctx->xregs[rd]=ctx->xregs[14]+(int32_t)payload;return 1;}
+    }
+    if (family == 0xA) { /* STORAGE / PicoWAL / INDEX / FTS */
+        uint32_t rv=((payload&0xFFFFFFF0u)==PV_SYS_REG)?(uint32_t)ctx->regs[payload&15]:payload;
+        if(sysop==1){ctx->xregs[rd]=pv_sys_host(ctx,PV_HOOK_STORAGE_READY,0,0)?pv_sys_handle(1,0,0):0;return 1;}
+        if(sysop==2){ctx->xregs[rd]=pv_sys_handle(1,rv,0);return 1;}
+        if(sysop==0x20){ctx->xregs[rd]=pv_sys_handle(2,(uint32_t)(a&0x3FF),rv);return 1;}
+        if(sysop==0x40){ctx->xregs[rd]=pv_sys_handle(3,(uint32_t)(a&0x3FF),rv);return 1;}
+        if(sysop>=3&&sysop<=8){
+            static const int hooks[]={0,0,0,PV_HOOK_STORAGE_PUTCARD,PV_HOOK_STORAGE_PUTCARD,
+                PV_HOOK_STORAGE_READEXACT,PV_HOOK_STORAGE_DELETEEXACT,PV_HOOK_STORAGE_EXISTS,PV_HOOK_STORAGE_SCANNEXT};
+            int32_t record=ctx->regs[rd];pv_sys_select(ctx,a,0);
+            if(sysop==4&&pv_sys_host(ctx,PV_HOOK_STORAGE_EXISTS,record,0))ctx->regs[rd]=3;
+            else ctx->regs[rd]=pv_sys_host(ctx,hooks[sysop],record,(int32_t)rv);return 1;
+        }
+        if(sysop==9||sysop==10){ctx->regs[rd]=pv_sys_host(ctx,sysop==9?PV_HOOK_STORAGE_SYNC:PV_HOOK_STORAGE_RECOVER,0,0);return 1;}
+        if(sysop>=0x21&&sysop<=0x25){
+            uint32_t record=(uint32_t)ctx->regs[rd];int free_slot=-1;
+            if(sysop==0x21){for(int n=0;n<PV_MAX_SYS_INDEX;n++){if(ctx->sys_index_used[n]&&ctx->sys_index_handle[n]==a&&ctx->sys_index_record[n]==record){ctx->sys_index_value[n]=rv;ctx->regs[rd]=1;return 1;}if(!ctx->sys_index_used[n]&&free_slot<0)free_slot=n;}if(free_slot<0){ctx->regs[rd]=0;return 1;}ctx->sys_index_used[free_slot]=1;ctx->sys_index_handle[free_slot]=a;ctx->sys_index_record[free_slot]=record;ctx->sys_index_value[free_slot]=rv;ctx->regs[rd]=1;return 1;}
+            if(sysop==0x22){for(int n=0;n<PV_MAX_SYS_INDEX;n++)if(ctx->sys_index_used[n]&&ctx->sys_index_handle[n]==a&&ctx->sys_index_record[n]==record)ctx->sys_index_used[n]=0;ctx->regs[rd]=1;return 1;}
+            if(sysop==0x23||sysop==0x24){ctx->sys_index_result_count=0;for(int n=0;n<PV_MAX_SYS_INDEX;n++)if(ctx->sys_index_used[n]&&ctx->sys_index_handle[n]==a&&ctx->sys_index_value[n]==record)ctx->sys_index_results[ctx->sys_index_result_count++]=ctx->sys_index_record[n];ctx->regs[rd]=(int32_t)ctx->sys_index_result_count;return 1;}
+            ctx->regs[rd]=record<ctx->sys_index_result_count?(int32_t)ctx->sys_index_results[record]:-1;return 1;
+        }
+        if(sysop>=0x41&&sysop<=0x44){int hook=sysop==0x41?PV_HOOK_STORAGE_FULLTEXTUPSERT:sysop==0x42?PV_HOOK_STORAGE_FULLTEXTDELETE:sysop==0x43?PV_HOOK_STORAGE_FULLTEXTFIND:PV_HOOK_STORAGE_FULLTEXTRESULT;pv_sys_select(ctx,a,PV_HOOK_STORAGE_FULLTEXTFIELD);if(sysop==0x43)pv_sys_host(ctx,PV_HOOK_STORAGE_FULLTEXTMODE,(int32_t)rv,0);ctx->regs[rd]=pv_sys_host(ctx,hook,ctx->regs[rd],sysop==0x41?(int32_t)rv:0);return 1;}
+    }
+    if (family == 9) { /* GRAPH */
+        uint32_t rv=((payload&0xFFFFFFF0u)==PV_SYS_REG)?(uint32_t)ctx->regs[payload&15]:payload;
+        if(sysop==1){ctx->xregs[rd]=pv_sys_handle(4,(uint32_t)(a&0x3FF),rv);return 1;}
+        pv_sys_select(ctx,a,PV_HOOK_STORAGE_GRAPHRELATION);
+        if(sysop==2){ctx->regs[rd]=pv_sys_host(ctx,PV_HOOK_STORAGE_GRAPHWEIGHTSET,ctx->regs[rd],0);return 1;}
+        {int hook=sysop==3?PV_HOOK_STORAGE_GRAPHADD:sysop==4?PV_HOOK_STORAGE_GRAPHDELETE:sysop==5?PV_HOOK_STORAGE_GRAPHWEIGHT:sysop==6||sysop==7?PV_HOOK_STORAGE_GRAPHOUT:sysop==8?PV_HOOK_STORAGE_GRAPHRESULTNODE:sysop==9?PV_HOOK_STORAGE_GRAPHRESULTWEIGHT:0;if(hook){int32_t second=sysop==7?1:sysop==6?0:(int32_t)rv;ctx->regs[rd]=pv_sys_host(ctx,hook,ctx->regs[rd],second);return 1;}}
+        if(sysop==10){ctx->regs[rd]=pv_sys_host(ctx,PV_HOOK_STORAGE_GRAPHPATH,ctx->regs[rd],(int32_t)rv);return 1;}
+    }
+    return 0;
+}
+
 /* INV-10: static verification before execution. Reject a program whose static (immediate)
  * JUMP/CALL/BRANCH targets are out of range, before running any instruction (fail-fast;
  * rejects a tampered/corrupt module up front). Register/indexed jumps are dynamic and stay
@@ -4177,6 +4392,10 @@ int pv_verify(const uint32_t *program, int len, int *fault_pc, int *fault_detail
         int rs2   = (int)((w >> 16) & 0xF);
         int imm16 = (int)(w & 0xFFFF);
         int tgt;
+        if (op == PV_OP_NOOP && (imm16 & 0xF000) == 0x5000) {
+            if (i + 1 >= len) { if(fault_pc)*fault_pc=i;if(fault_detail)*fault_detail=0;return PV_FAULT_BAD_OPCODE; }
+            i++; continue;
+        }
         if (op == PV_OP_JUMP) {
             if (rs2 != PV_ADDR_IMM) continue;               /* register/indexed = dynamic */
             tgt = imm16;
@@ -4217,6 +4436,9 @@ long pv_vm_run(pv_ctx *ctx, const uint32_t *program, int len)
     int pc = 0;
     ctx->halted = 0;
     ctx->steps = 0;
+    pv_bzero(ctx->xregs, sizeof(ctx->xregs));
+    ctx->xregs[14] = ctx->xregs[15] = ctx->mem_size > 0 ? (uint64_t)ctx->mem_size : 0;
+    ctx->sys_frame_sp = 0;
     int vpc = 0, vdetail = 0;                                /* INV-10: verify before execution */
     int vf = pv_verify(program, len, &vpc, &vdetail);
     if (vf != PV_FAULT_NONE) { pv_set_fault(ctx, vf, vpc, vdetail); return ctx->steps; }
@@ -4233,6 +4455,17 @@ long pv_vm_run(pv_ctx *ctx, const uint32_t *program, int len)
         int rs2   = (int)((w >> 16) & 0xF);
         int imm16 = (int)(w & 0xFFFF);
         pc++;
+
+        if (op == PV_OP_NOOP && (imm16 & 0xF000) == 0x5000) {
+            uint32_t payload;
+            int family = rs2, sysop = (imm16 >> 4) & 0xFF, type = imm16 & 15;
+            if (pc >= len) { pv_set_fault(ctx, PV_FAULT_BAD_OPCODE, cur, 0); break; }
+            payload = program[pc++];
+            if (!pv_system(ctx, family, sysop, type, rd, rs1, payload, cur))
+                pv_set_fault(ctx, PV_FAULT_BAD_OPCODE, cur, (family << 8) | sysop);
+            if (ctx->pending_jump_set) { pc=ctx->pending_jump;ctx->pending_jump_set=0; }
+            continue;
+        }
 
         switch (op) {
         case PV_OP_NOOP:

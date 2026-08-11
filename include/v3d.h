@@ -6,6 +6,7 @@
 
 typedef enum {
     V3D_STATUS_OK = 0,
+    V3D_STATUS_IN_PROGRESS = 1,
     V3D_STATUS_UNSUPPORTED = -1,
     V3D_STATUS_INVALID = -2,
     V3D_STATUS_TIMEOUT = -3,
@@ -39,6 +40,7 @@ typedef enum {
     V3D_KERNEL_MATVEC64 = 15,
     V3D_KERNEL_MATMUL64X16 = 16,
     V3D_KERNEL_BITNET_BITMAP64X16 = 17,
+    V3D_KERNEL_GRAY_RESTORE64 = 18,
     V3D_KERNEL_MAX
 } v3d_kernel_id_t;
 
@@ -157,6 +159,9 @@ v3d_status_t v3d_native_selftest(void);
 v3d_status_t v3d_native_mmu_setup(void);
 const struct v3d_kernel_desc *v3d_kernel_desc_get(v3d_kernel_id_t id);
 v3d_status_t v3d_dispatch_kernel(v3d_kernel_id_t id, u32 timeout_ms);
+v3d_status_t v3d_dispatch_kernel_begin(v3d_kernel_id_t id, u32 timeout_ms);
+v3d_status_t v3d_dispatch_poll(bool *done);
+bool v3d_dispatch_in_flight(void);
 v3d_status_t v3d_kernel_bind(v3d_kernel_id_t id, u32 uniform_bus, u32 shader_bus);
 v3d_status_t v3d_kernel_bind_csd(v3d_kernel_id_t id, const u32 *csd_cfg, u32 qpu_count);
 v3d_status_t v3d_kernel_bind_builtin_qpu(v3d_kernel_id_t id,

@@ -335,8 +335,12 @@ the same tick as the framebuffer-heavy render.
 
 - `PIOS WORKBENCH` — version, uptime, `WIRED IP` and `WIRELESS IP` rows
 - `HARDWARE / CAPABILITIES`
-- `PARALLEL / VECTOR ACCELERATION` — CPU FP32, CPU integer, verified PicoScript
-  QPU ops, QPU VM arithmetic, batched QPU MatVec, Media state
+- `PARALLEL / VECTOR ACCELERATION` — CPU FP32, CPU integer, native V3D 7.1 CSD
+  readiness, verified PicoScript QPU ops, QPU VM arithmetic, batched QPU MatVec,
+  Media state. ADR-027 runs the guarded proofs and representative profiles during
+  boot; the commands remain available for explicit re-verification. CPU FP32/NEON
+  and CPU integer are always enabled; the integer row combines NEON INT8
+  dot/matvec with scalar/C I32 primitives.
 - `NETWORK / PROCESS MAP` — listening ports mapped to owning pid/core/process
 - `WARNINGS / ERRORS`
 - Optional right column: `NIC / MAC RX-TX`, `DMA ENGINE`, `FIFO / LEASE ARENAS`
