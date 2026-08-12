@@ -287,6 +287,8 @@ _Static_assert((PROC_ARENA_BASE & 0x1FFFFFULL) == 0ULL,
 #define PROC_PRIO_HIGH      3
 #define PROC_PRIO_REALTIME  4
 #define PROC_CAPSULE_ID_NONE 0xFFFFFFFFU
+#define PROC_CORE_NONE      0xFFFFFFFFU
+#define PROC_ELIGIBLE_USER_MASK ((1U << CORE_USERM) | (1U << CORE_USER0) | (1U << CORE_USER1))
 
 #define PROC_ENTRY_FLAG_DIRECT_KPI      0x00000001U
 #define PROC_ENTRY_FLAG_EL0_CONTRACT    0x00000002U
@@ -322,6 +324,10 @@ struct process {
     u32 state;
     u32 principal_id;
     u32 affinity_core;
+    volatile u32 owner_core;
+    u32 pinned_core;
+    u32 eligible_core_mask;
+    u32 last_core;
     u32 priority_class;
     u64 quantum_ticks;
     u64 active_quantum_ticks;

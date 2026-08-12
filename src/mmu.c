@@ -947,6 +947,13 @@ bool mmu_switch_to_user(u32 core, u32 slot)
     return true;
 }
 
+bool mmu_user_table_ready(u32 core, u32 slot)
+{
+    if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
+        return false;
+    return user_table_valid[user_core_index(core)][slot].v != 0U;
+}
+
 void mmu_switch_to_kernel(void)
 {
     /* ASID 0, reserved for the shared kernel table (see mmu_switch_to_user). */

@@ -23570,6 +23570,7 @@ NORETURN void core1_main(void) {
     core_mark_online(CORE_USERM, 3);
     timer_init(PROC_PREEMPT_TIMER_HZ);
     core_mark_online(CORE_USERM, 4);
+    proc_mark_core_hosts_process(CORE_USERM);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     timer_set_tick_hook(pios_tick_hook);
     core_mark_online(CORE_USERM, 5);

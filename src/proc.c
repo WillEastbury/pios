@@ -36,6 +36,8 @@
 #include "swake.h"
 #include "adrv.h"
 
+#define PROC_OWNER_LOCKED 0x80000000U
+
 /*
  * Per-core kernel service identities for the scheduler and the FIFO/doorbell
  * drain. These are real consumers of core time, so they must be visible in the
@@ -336,6 +338,9 @@ struct proc_launch_req {
     u32 migrate_exec_hash_last;
     u64 migrate_exec_hash_next_check_tick;
     u32 migrate_exec_hash_check_nonce;
+    u32 migrate_pinned_core;
+    u32 migrate_eligible_core_mask;
+    u32 migrate_last_core;
     u32 has_migrate_state;
     char path[PROC_LAUNCH_PATH_MAX];
 } ALIGNED(64);
@@ -781,16 +786,77 @@ static void proc_el0_control_clear(u32 slot, const struct process *p)
     el0_sched_clean((volatile void *)line, sizeof(*line));
 }
 
+static bool proc_eligible_on_core(const struct process *p, u32 core);
+
+static bool proc_owner_try_claim(volatile u32 *owner, u32 expected, u32 desired)
+{
+    u32 observed;
+    u32 status;
+    __asm__ volatile(
+        "1: ldaxr %w0, [%2]\n"
+        "   cmp %w0, %w3\n"
+        "   b.ne 2f\n"
+        "   stlxr %w1, %w4, [%2]\n"
+        "   cbnz %w1, 1b\n"
+        "2:"
+        : "=&r"(observed), "=&r"(status)
+        : "r"(owner), "r"(expected), "r"(desired)
+        : "cc", "memory");
+    return observed == expected;
+}
+
 static bool proc_qbank_others_runnable(u32 chosen)
 {
     u32 limit = proc_slot_scan_limit();
     for (u32 i = 0; i < limit; i++) {
-        if (i == chosen || procs[i].affinity_core != core_id())
+        if (i == chosen || !proc_eligible_on_core(&procs[i], core_id()))
             continue;
         if (procs[i].state == PROC_READY)
             return true;
     }
     return false;
+}
+
+static bool proc_eligible_on_core(const struct process *p, u32 core)
+{
+    if (!p || core < CORE_USERM || core > CORE_USER1)
+        return false;
+    if ((p->eligible_core_mask & (1U << core)) == 0U)
+        return false;
+    return p->pinned_core == PROC_CORE_NONE || p->pinned_core == core;
+}
+
+static bool proc_claim_owner(struct process *p, u32 core)
+{
+    if (!p || !proc_eligible_on_core(p, core))
+        return false;
+    u32 owner = p->owner_core;
+    if (p->state != PROC_READY)
+        return false;
+    u32 generation = p->generation;
+    if (!proc_owner_try_claim(&p->owner_core, owner,
+                              PROC_OWNER_LOCKED | core))
+        return false;
+    if (p->generation != generation || p->state != PROC_READY) {
+        p->owner_core = owner;
+        return false;
+    }
+    p->state = PROC_CLAIMED;
+    p->owner_core = core;
+    dmb_ishst();
+    return true;
+}
+
+static bool proc_prepare_user_table(u32 core, u32 slot, struct process *p)
+{
+    if (mmu_user_table_ready(core, slot))
+        return true;
+    if (p->run_at_el0)
+        return mmu_user_table_build_split_el0_at(
+            core, slot, p->entry_pc, (u64)(usize)p->base,
+            PROC_SLOT_SIZE, p->exec_image_size);
+    return mmu_user_table_build_split(core, slot, (u64)(usize)p->base,
+                                      PROC_SLOT_SIZE, p->exec_image_size);
 }
 
 static bool proc_drain_el0_commands(struct irq_frame *frame)
@@ -999,6 +1065,9 @@ static void proc_handle_launch_request(void)
             p->exec_hash_last = launch_req[uc].migrate_exec_hash_last;
             p->exec_hash_next_check_tick = launch_req[uc].migrate_exec_hash_next_check_tick;
             p->exec_hash_check_nonce = launch_req[uc].migrate_exec_hash_check_nonce;
+            p->pinned_core = launch_req[uc].migrate_pinned_core;
+            p->eligible_core_mask = launch_req[uc].migrate_eligible_core_mask;
+            p->last_core = launch_req[uc].migrate_last_core;
             if (launch_req[uc].migrate_heap_used > 0) {
                 u64 cur = heap_top[(u32)slot];
                 u64 want = (u64)(usize)p->base + launch_req[uc].migrate_heap_used;
@@ -2304,6 +2373,10 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     proc_wake_pending[slot].v = 0;
     p->principal_id = principal_current();
     p->affinity_core = affinity_core;
+    p->owner_core = affinity_core;
+    p->pinned_core = PROC_CORE_NONE;
+    p->eligible_core_mask = PROC_ELIGIBLE_USER_MASK;
+    p->last_core = affinity_core;
     p->priority_class = priority_class;
     p->quantum_ticks = proc_quantum_for_prio(priority_class);
     p->active_quantum_ticks = p->quantum_ticks;
@@ -2479,6 +2552,10 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     proc_wake_pending[slot].v = 0;
     p->principal_id = PRINCIPAL_ROOT;   /* trusted: embedded in kernel image */
     p->affinity_core = affinity_core;
+    p->owner_core = affinity_core;
+    p->pinned_core = PROC_CORE_NONE;
+    p->eligible_core_mask = PROC_ELIGIBLE_USER_MASK;
+    p->last_core = affinity_core;
     p->priority_class = priority_class;
     p->quantum_ticks = proc_quantum_for_prio(priority_class);
     p->active_quantum_ticks = p->quantum_ticks;
@@ -2628,6 +2705,10 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     proc_wake_pending[slot].v = 0;
     p->principal_id = PRINCIPAL_ROOT;
     p->affinity_core = affinity_core;
+    p->owner_core = affinity_core;
+    p->pinned_core = PROC_CORE_NONE;
+    p->eligible_core_mask = PROC_ELIGIBLE_USER_MASK;
+    p->last_core = affinity_core;
     p->priority_class = priority_class;
     p->quantum_ticks = proc_quantum_for_prio(priority_class);
     p->active_quantum_ticks = p->quantum_ticks;
@@ -2808,7 +2889,7 @@ void proc_schedule(void)
         (void)swake_drain(core_id() & 3U, 16U);
         for (u32 si = 0; si < proc_slot_scan_limit(); si++) {
             struct process *sp = &procs[si];
-            if (!sp->run_at_el0 || sp->affinity_core != core_id())
+            if (!sp->run_at_el0 || sp->owner_core != core_id())
                 continue;
             sp->el0_inbound_seq = swake_seq(si);
             if (sp->state == PROC_BLOCKED &&
@@ -2835,7 +2916,7 @@ void proc_schedule(void)
             /* Only reap processes homed to this core. procs[] is shared across
              * the per-core schedulers; without this gate one core could reap a
              * DEAD slot another core still owns. */
-            if (procs[i].affinity_core != core_id())
+            if (procs[i].owner_core != core_id())
                 continue;
             if (procs[i].state == PROC_DEAD) {
                 if (procs[i].pid != 0) {
@@ -2859,7 +2940,7 @@ void proc_schedule(void)
 
         bool has_non_lazy_ready = false;
         for (u32 i = 0; i < scan_n; i++) {
-            if (procs[i].affinity_core != core_id())
+            if (!proc_eligible_on_core(&procs[i], core_id()))
                 continue;
             if (procs[i].state == PROC_READY && procs[i].priority_class != PROC_PRIO_LAZY) {
                 has_non_lazy_ready = true;
@@ -2873,15 +2954,15 @@ void proc_schedule(void)
             u32 i = (rr_cursor + 1 + step) % scan_n;
             if (procs[i].state != PROC_READY)
                 continue;
-            /* Dispatch only processes homed to this core. Each core builds its
-             * OWN per-core user page table for a slot (mmu_user_table_build_split
-             * runs on the creating core); a non-owner core would fail
-             * mmu_switch_to_user and wrongly mark the process DEAD. */
-            if (procs[i].affinity_core != core_id())
+            if (!proc_eligible_on_core(&procs[i], core_id()))
                 continue;
+            bool warm = procs[i].last_core == core_id();
             if (has_non_lazy_ready && procs[i].priority_class == PROC_PRIO_LAZY)
                 continue;
-            if (chosen == 0xFFFFFFFFU || procs[i].priority_class > best_prio) {
+            if (chosen == 0xFFFFFFFFU ||
+                procs[i].priority_class > best_prio ||
+                (procs[i].priority_class == best_prio && warm &&
+                 procs[chosen].last_core != core_id())) {
                 chosen = i;
                 best_prio = procs[i].priority_class;
             }
@@ -2889,6 +2970,8 @@ void proc_schedule(void)
         proc_sched_stage(14);
 
         if (chosen != 0xFFFFFFFFU) {
+            if (!proc_claim_owner(&procs[chosen], core_id()))
+                continue;
             found = true;
             proc_sched_stage(20);
             if (!proc_integrity_maybe_check(chosen))
@@ -2896,6 +2979,14 @@ void proc_schedule(void)
             proc_sched_stage(30);
             rr_cursor = chosen;
             current_proc = chosen;
+            procs[chosen].last_core = core_id();
+            procs[chosen].affinity_core = core_id();
+            if (!proc_prepare_user_table(core_id(), chosen, &procs[chosen])) {
+                procs[chosen].state = PROC_DEAD;
+                procs[chosen].exit_code = 0xFFFF0008U;
+                proc_publish_control(chosen);
+                continue;
+            }
             if (procs[chosen].run_at_el0)
                 proc_el0_control_clear(chosen, &procs[chosen]);
             {
@@ -3256,7 +3347,7 @@ void proc_timer_tick(u32 core, u64 tick)
     const u32 tick_scan_n = proc_slot_scan_limit();
     for (u32 i = 0; i < tick_scan_n; i++) {
         struct process *bp = &procs[i];
-        if (bp->affinity_core != core || bp->state != PROC_BLOCKED)
+        if (bp->owner_core != core || bp->state != PROC_BLOCKED)
             continue;
         if (bp->wake_deadline_ms == 0U || now_ms < bp->wake_deadline_ms)
             continue;
@@ -3512,6 +3603,9 @@ static inline void proc_irq_restore(u64 daif) {
 bool proc_post_remote_wake(u32 target_core, u32 pid) {
     if (target_core >= 4U || pid == 0)
         return false;
+    i32 owner_slot = proc_find_slot_by_pid(pid);
+    if (owner_slot >= 0 && procs[(u32)owner_slot].owner_core < 4U)
+        target_core = procs[(u32)owner_slot].owner_core;
     volatile struct proc_rwake_ring *r = &PROC_RWAKE_SHARED->ring[target_core];
     u64 daif = proc_irq_save();
     u32 head = r->head;        /* this core's own prior store: cached read is fine */
@@ -5006,6 +5100,9 @@ i32 proc_launch_on_core_as_prio(u32 target_core, const char *path, u32 principal
     launch_req[uc].migrate_exec_hash_last = 0;
     launch_req[uc].migrate_exec_hash_next_check_tick = 0;
     launch_req[uc].migrate_exec_hash_check_nonce = 0;
+    launch_req[uc].migrate_pinned_core = PROC_CORE_NONE;
+    launch_req[uc].migrate_eligible_core_mask = PROC_ELIGIBLE_USER_MASK;
+    launch_req[uc].migrate_last_core = target_core;
     launch_req[uc].has_migrate_state = 0;
     dmb();
     launch_req[uc].seq = seq;
@@ -5043,8 +5140,14 @@ bool proc_set_affinity(u32 pid, u32 core)
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
         if (procs[i].pid != pid) continue;
         if (procs[i].state == PROC_READY || procs[i].state == PROC_RUNNING || procs[i].state == PROC_BLOCKED) {
-            if (procs[i].affinity_core == core)
+            if (procs[i].pinned_core == core)
                 return true;
+            if (procs[i].owner_core == core) {
+                procs[i].pinned_core = core;
+                procs[i].eligible_core_mask |= 1U << core;
+                procs[i].last_core = core;
+                return true;
+            }
             if (procs[i].image_path[0] == 0)
                 return false;
             u32 uc = core - CORE_USERM;
@@ -5093,6 +5196,9 @@ bool proc_set_affinity(u32 pid, u32 core)
             launch_req[uc].migrate_exec_hash_last = procs[i].exec_hash_last;
             launch_req[uc].migrate_exec_hash_next_check_tick = procs[i].exec_hash_next_check_tick;
             launch_req[uc].migrate_exec_hash_check_nonce = procs[i].exec_hash_check_nonce;
+            launch_req[uc].migrate_pinned_core = core;
+            launch_req[uc].migrate_eligible_core_mask = procs[i].eligible_core_mask | (1U << core);
+            launch_req[uc].migrate_last_core = core;
             launch_req[uc].has_migrate_state = 1;
             dmb();
             launch_req[uc].seq = seq;

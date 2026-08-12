@@ -23,13 +23,15 @@ Companion documents:
 
 ## 1. Cores
 
-PIOS assigns cores statically. There is no global scheduler that moves work
-between them.
+PIOS reserves core 0 for the reactor, while cores 1-3 are scheduling
+capabilities. Processes have an eligible-core mask, an optional hard pin, and a
+last-core cache-warmth hint; ownership transfers through an atomic scheduler
+claim and destination-core page-table preparation.
 
 | Core | Constant | Role | Main loop |
 |---|---|---|---|
 | 0 | `CORE_NET` / `CORE_DISK` | Kernel: network, disk, console, services | `core0_main()` reactor (`kernel.c`) |
-| 1 | `CORE_USERM` | User management | `proc_schedule()` (`proc.c`) |
+| 1 | `CORE_USERM` | User scheduling/management | `proc_schedule()` (`proc.c`) |
 | 2 | `CORE_USER0` | User processes | `proc_schedule()` |
 | 3 | `CORE_USER1` | User processes | `proc_schedule()` |
 
@@ -45,9 +47,10 @@ and from every user core parked on a reply only core 0 can produce.
 ### 2.1 The process table
 
 `procs[MAX_PROCS_PER_CORE]` (`proc.c`) is a **single shared array**, not
-per-core. `MAX_PROCS_PER_CORE` is 6. Ownership is by field, not by table:
-`proc_schedule()` only considers entries whose `affinity_core == core_id()`,
-and only the owning core may reap or mutate them.
+per-core. `MAX_PROCS_PER_CORE` is 16. Each process has an eligible-core mask,
+an optional `pinned_core`, a `last_core` hint, and an owner claim. Only the
+owner may reap or mutate a process; dispatch claims use an ARMv8-safe
+load-exclusive/store-exclusive transition through `PROC_CLAIMED`.
 
 Per-core scheduler state is held in separate cache-line-isolated arrays indexed
 by core: `scheduler_ctx_arr`, `current_proc_arr`, `rr_cursor_arr`, `sched_diag`.
