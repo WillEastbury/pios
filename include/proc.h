@@ -12,6 +12,7 @@
 #include "mem_arena.h"
 #include "core_env.h"   /* PROC_ARENA_BASE/SIZE for PROC_SLOT_PHYS */
 #include "ipc_proc.h"
+#include "qbank.h"
 struct irq_frame;
 
 struct paged_io_stat {
@@ -324,6 +325,8 @@ struct process {
     u32 affinity_core;
     u32 priority_class;
     u64 quantum_ticks;
+    u64 active_quantum_ticks;
+    u64 qbank_grant_ticks;
     u64 wake_deadline_ms; /* 0 = none; proc_park_timeout() sets this, cleared on wake */
     u8 *base;           /* 2MB slot start */
     u32 mem_size;
@@ -331,6 +334,7 @@ struct process {
     u64 ticks;          /* tick count at last schedule */
     u64 runtime_ticks;  /* accumulated runtime ticks */
     u64 el0_inbound_seq; /* kernel-owned wake sequence exposed to EL0 */
+    struct qbank quantum_bank;
     u32 exit_code;
     u32 preemptions;
     bool capsule_enabled;

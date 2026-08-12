@@ -33,6 +33,7 @@
 #include "ksvc.h"
 #include "airq.h"
 #include "el0_scheduler.h"
+#include "swake.h"
 
 /*
  * Per-core kernel service identities for the scheduler and the FIFO/doorbell
@@ -469,6 +470,7 @@ static void proc_mark_empty(u32 slot)
     proc_bump_generation(slot);
     procs[slot].state = PROC_EMPTY;
     procs[slot].pid = 0;
+    swake_slot_reset(slot);
     el0_sched_reset(slot, procs[slot].generation);
     proc_publish_control(slot);
 }
@@ -588,6 +590,28 @@ static void proc_account_runtime(struct process *p)
         p->state = PROC_DEAD;
         p->exit_code = 0xFFFF0006U;
     }
+
+}
+
+static void proc_qbank_deschedule(struct process *p, enum qbank_reason reason)
+{
+    if (!p || p->state != PROC_RUNNING)
+        return;
+    u64 now = timer_ticks();
+    u64 elapsed = now >= p->ticks ? now - p->ticks : 0;
+    u64 unused = elapsed < p->active_quantum_ticks ?
+                 p->active_quantum_ticks - elapsed : 0;
+    u64 cap = p->quantum_ticks > (~0ULL / 10ULL) ?
+              ~0ULL : p->quantum_ticks * 10ULL;
+    (void)qbank_accrue(&p->quantum_bank, reason, unused, cap);
+    if (elapsed > p->quantum_ticks) {
+        u64 extra = elapsed - p->quantum_ticks;
+        if (extra > p->qbank_grant_ticks)
+            extra = p->qbank_grant_ticks;
+        qbank_spend(&p->quantum_bank, extra);
+    }
+    p->active_quantum_ticks = p->quantum_ticks;
+    p->qbank_grant_ticks = 0;
 }
 
 static u32 proc_arena_bump_bytes(u32 slot)
@@ -757,6 +781,40 @@ static bool proc_handle_el0_command(struct irq_frame *frame,
     }
 }
 
+static enum pctl_verdict proc_el0_control_verdict(u32 slot,
+                                                   const struct process *p)
+{
+    volatile struct pctl_line *line =
+        &el0_sched_slot_kernel(slot)->control;
+    el0_sched_invalidate((volatile void *)line, sizeof(*line));
+    return pctl_evaluate((const struct pctl_line *)(const void *)line,
+                         p->generation, swake_seq(slot));
+}
+
+static void proc_el0_control_clear(u32 slot, const struct process *p)
+{
+    if (!p || slot >= EL0_SCHED_SLOT_COUNT)
+        return;
+    volatile struct pctl_line *line =
+        &el0_sched_slot_kernel(slot)->control;
+    line->state = PCTL_STATE_RUNNABLE;
+    line->generation = p->generation;
+    line->observed_seq = swake_seq(slot);
+    el0_sched_clean((volatile void *)line, sizeof(*line));
+}
+
+static bool proc_qbank_others_runnable(u32 chosen)
+{
+    u32 limit = proc_slot_scan_limit();
+    for (u32 i = 0; i < limit; i++) {
+        if (i == chosen || procs[i].affinity_core != core_id())
+            continue;
+        if (procs[i].state == PROC_READY)
+            return true;
+    }
+    return false;
+}
+
 static bool proc_drain_el0_commands(struct irq_frame *frame)
 {
     if (!frame || !on_user_core() || current_proc >= MAX_PROCS_PER_CORE)
@@ -794,6 +852,29 @@ bool proc_handle_wfx(struct irq_frame *frame, u64 esr)
     if (!frame || !on_user_core())
         return false;
     (void)proc_drain_el0_commands(frame);
+    if (current_proc < EL0_SCHED_SLOT_COUNT) {
+        struct process *p = &procs[current_proc];
+        if (p->run_at_el0) {
+            enum pctl_verdict verdict =
+                proc_el0_control_verdict(current_proc, p);
+            if (verdict == PCTL_DESCHEDULE_AWAIT) {
+                proc_park();
+                return true;
+            }
+            if (verdict == PCTL_DESCHEDULE_YIELD) {
+                proc_yield();
+                return true;
+            }
+            if (verdict == PCTL_REAP) {
+                proc_exit(0);
+                __builtin_unreachable();
+            }
+            if (verdict == PCTL_REJECT) {
+                proc_exit(0xFFFF0011U);
+                __builtin_unreachable();
+            }
+        }
+    }
     frame->x[0] = 0;
     return true;
 }
@@ -2102,6 +2183,7 @@ void proc_init_shared(void)
 {
     if (initialized)
         return;
+    swake_reset();
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
         procs[i].state = PROC_EMPTY;
         procs[i].pid = 0;
@@ -2262,6 +2344,8 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     struct process *p = &procs[slot];
     proc_bump_generation((u32)slot);
     el0_sched_reset((u32)slot, p->generation);
+    swake_slot_reset((u32)slot);
+    qbank_reset(&p->quantum_bank);
     p->pid = next_pid++;
     p->parent_pid = 0;
     /* p->state stays PROC_CLAIMED (set by find_empty_slot()) through the rest
@@ -2277,6 +2361,8 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->affinity_core = affinity_core;
     p->priority_class = priority_class;
     p->quantum_ticks = proc_quantum_for_prio(priority_class);
+    p->active_quantum_ticks = p->quantum_ticks;
+    p->qbank_grant_ticks = 0;
     p->base = base;
     p->mem_size = PROC_SLOT_SIZE;
     p->ticks = timer_ticks();
@@ -2438,6 +2524,8 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     struct process *p = &procs[slot];
     proc_bump_generation((u32)slot);
     el0_sched_reset((u32)slot, p->generation);
+    swake_slot_reset((u32)slot);
+    qbank_reset(&p->quantum_bank);
     p->pid = next_pid++;
     p->parent_pid = 0;
     /* p->state stays PROC_CLAIMED through setup; see the identical note in
@@ -2448,6 +2536,8 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     p->affinity_core = affinity_core;
     p->priority_class = priority_class;
     p->quantum_ticks = proc_quantum_for_prio(priority_class);
+    p->active_quantum_ticks = p->quantum_ticks;
+    p->qbank_grant_ticks = 0;
     p->base = base;
     p->mem_size = PROC_SLOT_SIZE;
     p->ticks = timer_ticks();
@@ -2583,6 +2673,8 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     struct process *p = &procs[slot];
     proc_bump_generation((u32)slot);
     el0_sched_reset((u32)slot, p->generation);
+    swake_slot_reset((u32)slot);
+    qbank_reset(&p->quantum_bank);
     p->pid = next_pid++;
     p->parent_pid = 0;
     /* p->state stays PROC_EMPTY->(implicitly claimed by the busy-check above)
@@ -2593,6 +2685,8 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     p->affinity_core = affinity_core;
     p->priority_class = priority_class;
     p->quantum_ticks = proc_quantum_for_prio(priority_class);
+    p->active_quantum_ticks = p->quantum_ticks;
+    p->qbank_grant_ticks = 0;
     p->base = base;
     p->mem_size = PROC_SLOT_SIZE;
     p->ticks = timer_ticks();
@@ -2609,6 +2703,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     p->exec_hash_next_check_tick = proc_integrity_next_tick(p->pid, p->exec_hash_check_nonce);
     p->entry_pc = linked_base;
     p->run_at_el0 = true;
+    (void)swake_arm((u32)slot, SWAKE_ANY);
     p->arena_base = ((u64)(usize)base + loaded + L3_PAGE_SIZE - 1) & ~(L3_PAGE_SIZE - 1);
     p->arena_limit = (u64)(usize)base + PROC_SLOT_SIZE - 65536ULL;
     if (p->arena_base >= p->arena_limit) {
@@ -2676,6 +2771,7 @@ void proc_yield(void)
         preempt_armed(uc) = false;
         preempt_pending(uc) = false;
     }
+    proc_qbank_deschedule(p, QBANK_YIELDED);
     proc_account_runtime(p);
     if (p->state == PROC_RUNNING)
         p->state = PROC_READY;
@@ -2760,6 +2856,20 @@ void proc_schedule(void)
                                &sched_ms);
         }
         proc_drain_remote_wakes();
+        (void)swake_timer_expire(core_id() & 3U, core_id() & 3U,
+                                 timer_monotonic_ms());
+        (void)swake_drain(core_id() & 3U, 16U);
+        for (u32 si = 0; si < proc_slot_scan_limit(); si++) {
+            struct process *sp = &procs[si];
+            if (!sp->run_at_el0 || sp->affinity_core != core_id())
+                continue;
+            sp->el0_inbound_seq = swake_seq(si);
+            if (sp->state == PROC_BLOCKED &&
+                proc_el0_control_verdict(si, sp) == PCTL_KEEP_RUNNING) {
+                sp->state = PROC_READY;
+                proc_publish_control(si);
+            }
+        }
         proc_sched_heartbeat();
         proc_sched_stage(10);
         proc_handle_bench_echo();
@@ -2839,6 +2949,18 @@ void proc_schedule(void)
             proc_sched_stage(30);
             rr_cursor = chosen;
             current_proc = chosen;
+            if (procs[chosen].run_at_el0)
+                proc_el0_control_clear(chosen, &procs[chosen]);
+            {
+                struct process *qp = &procs[chosen];
+                bool others = proc_qbank_others_runnable(chosen);
+                u64 grant = qbank_grant(&qp->quantum_bank, others,
+                                        qp->quantum_ticks);
+                qp->qbank_grant_ticks = grant;
+                qp->active_quantum_ticks =
+                    qp->quantum_ticks > (~0ULL - grant) ?
+                    ~0ULL : qp->quantum_ticks + grant;
+            }
             procs[chosen].state = PROC_RUNNING;
             proc_publish_control(chosen);
             proc_diag_note_dispatch();
@@ -3191,6 +3313,8 @@ void proc_timer_tick(u32 core, u64 tick)
             continue;
         if (bp->wake_deadline_ms == 0U || now_ms < bp->wake_deadline_ms)
             continue;
+        if (bp->run_at_el0)
+            continue;
         bp->wake_deadline_ms = 0U;
         bp->el0_inbound_seq++;
         bp->state = PROC_READY;
@@ -3206,7 +3330,7 @@ void proc_timer_tick(u32 core, u64 tick)
         return;
 
     u64 elapsed = tick - p->ticks;
-    if (elapsed >= p->quantum_ticks)
+    if (elapsed >= p->active_quantum_ticks)
         preempt_pending(uc) = true;
 }
 
@@ -3226,6 +3350,7 @@ void proc_irq_maybe_preempt(struct irq_frame *frame)
     }
 
     preempt_pending(uc) = false;
+    proc_qbank_deschedule(p, QBANK_PREEMPTED);
     proc_account_runtime(p);
     p->state = PROC_READY;
     p->preemptions++;
@@ -3297,6 +3422,13 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
         return false;
 
     struct process *p = &procs[(u32)slot];
+    if (p->run_at_el0) {
+        if (!swake_post(core_id() & 3U, core_id() & 3U,
+                        (u32)slot, SWAKE_FIFO))
+            return false;
+        sev();
+        return true;
+    }
     /* Latch the wake STICKILY before touching state. The old code only flipped
      * BLOCKED->READY, dropping the wake whenever the target had not yet committed
      * to BLOCKED (still RUNNING/READY mid park-transition) — the port-81 504
@@ -3759,8 +3891,11 @@ void proc_park_timeout(u32 ms) {
         proc_park_note(1U); /* park_early++ */
         return;
     }
+    proc_qbank_deschedule(p, QBANK_AWAITED);
     proc_account_runtime(p);
     p->wake_deadline_ms = (ms != 0U) ? (timer_monotonic_ms() + (u64)ms) : 0U;
+    if (p->run_at_el0)
+        (void)swake_timer_set((u32)current_proc, p->wake_deadline_ms);
     p->state = PROC_BLOCKED;
     proc_publish_control((u32)current_proc);
     proc_park_note(2U); /* park_block++ */
@@ -3769,6 +3904,8 @@ void proc_park_timeout(u32 ms) {
     ctx_switch(&p->ctx, &scheduler_ctx);
     proc_park_note(3U); /* park_resume++ */
     p->wake_deadline_ms = 0U;
+    if (p->run_at_el0)
+        (void)swake_timer_set((u32)current_proc, 0);
     proc_wake_pending[current_proc].v = 0;   /* consume the wake that dispatched us */
     if (user && preempt_enabled(uc) && p->state == PROC_RUNNING)
         preempt_armed(uc) = true;

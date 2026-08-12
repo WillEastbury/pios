@@ -2,19 +2,21 @@
 
 #include "types.h"
 #include "platform.h"
+#include "pctl.h"
 
 /*
  * EL0 scheduler ABI.
  *
  * The process slot is mapped through the existing Normal-NC IPC alias. EL0
- * owns the command-ring head and entries; the kernel owns the tail and the
- * metadata line. A generation in every command makes slot reuse fail closed.
+ * owns the pctl intent line and command-ring head/entries; the kernel owns the
+ * ring tail and metadata line. A generation in every publication makes slot
+ * reuse fail closed.
  */
 #define EL0_SCHED_ALIAS_BASE   0x2003000000ULL
 #define EL0_SCHED_OFFSET       0x00080000UL
 #define EL0_SCHED_SLOT_COUNT   6U
 #define EL0_SCHED_RING_DEPTH   8U
-#define EL0_SCHED_SLOT_STRIDE  704U
+#define EL0_SCHED_SLOT_STRIDE  768U
 
 enum {
     EL0_SCHED_OP_PARK = 1U,
@@ -58,6 +60,7 @@ struct el0_sched_ring {
 
 struct el0_sched_slot {
     struct el0_sched_meta meta;
+    struct pctl_line control;
     struct el0_sched_ring ring;
 } ALIGNED(64);
 
@@ -123,8 +126,20 @@ static inline void el0_sched_report(u64 value)
         __asm__ volatile("wfe" ::: "memory");
 }
 
+static inline void el0_sched_publish_control(u32 state, u64 observed_seq)
+{
+    struct el0_sched_slot *slot = el0_sched_slot();
+    slot->control.observed_seq = observed_seq;
+    slot->control.state = state;
+    slot->control.generation = slot->meta.generation;
+    dmb_ishst();
+    slot->control.publish_seq++;
+    dmb_ishst();
+}
+
 static inline NORETURN void el0_sched_exit(u64 code)
 {
+    el0_sched_publish_control(PCTL_STATE_EXITING, 0);
     while (!el0_sched_publish(EL0_SCHED_OP_EXIT, 0, code, 0))
         __asm__ volatile("wfe" ::: "memory");
     for (;;)
@@ -134,8 +149,13 @@ static inline NORETURN void el0_sched_exit(u64 code)
 static inline void el0_sched_park(void)
 {
     struct el0_sched_slot *slot = el0_sched_slot();
-    while (!el0_sched_publish(EL0_SCHED_OP_PARK,
-                              slot->meta.inbound_seq, 0, 0))
-        __asm__ volatile("wfe" ::: "memory");
+    el0_sched_publish_control(PCTL_STATE_AWAITING,
+                              slot->meta.inbound_seq);
+    __asm__ volatile("wfe" ::: "memory");
+}
+
+static inline void el0_sched_yield(void)
+{
+    el0_sched_publish_control(PCTL_STATE_YIELDED, 0);
     __asm__ volatile("wfe" ::: "memory");
 }
