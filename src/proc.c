@@ -34,6 +34,7 @@
 #include "airq.h"
 #include "el0_scheduler.h"
 #include "swake.h"
+#include "adrv.h"
 
 /*
  * Per-core kernel service identities for the scheduler and the FIFO/doorbell
@@ -2833,6 +2834,8 @@ void proc_schedule(void)
         if (debug_freeze_is_requested(core_id()))
             debug_freeze_cooperative_point();
         watchdog_touch(core_id());
+        if (core_id() == CORE_USERM)
+            (void)adrv_supervise(timer_monotonic_ms());
         /* One counter read serves both nested intervals; see ksvc.h (ADR-017/Q7).
          * Previously this loop cost 4 counter reads and 2 64-bit divides per
          * iteration, at full spin rate on an idle core. */
