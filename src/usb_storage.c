@@ -213,9 +213,11 @@ static u32 load_be32(const u8 *p) {
            ((u32)p[2] << 8) | (u32)p[3];
 }
 
+#if PIOS_ENABLE_SCSI_CAPACITY16
 static u64 load_be64(const u8 *p) {
     return ((u64)load_be32(p) << 32) | load_be32(p + 4);
 }
+#endif
 
 static bool scsi_geometry_valid(u32 block_size) {
     return block_size >= 512U && block_size <= 4096U &&
