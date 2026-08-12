@@ -675,7 +675,7 @@ proven by the ADR-018 soak before any of the above is safe.
 
 | # | Question | Status |
 |---|---|---|
-| Q1 | Should the CYW43455 association path be migrated onto `adrv`? | **Owner asked for detail 2026-08-06** — proposal below, awaiting decision. |
+| Q1 | Should the CYW43455 association path be migrated onto `adrv`? | **Answered: after WPA2 association succeeds.** See the decision below. |
 | Q2 | Should `adrv_supervise()` run from a user core's quantum? | **Owner asked for detail 2026-08-06** — proposal below, awaiting decision. |
 | Q3 | Is a CPU-bound soak test required before ADR-014 is considered proven? | **Answered: yes.** See ADR-018. |
 | Q4 | Should `TCP_BUF_SIZE` remain 4096 permanently, or is finding the virtio-net ring limit worth scheduling? | **Answered and implemented:** 8192 is safe after the QEMU static-memory-layout fix; the ring hypothesis was disproven. See ADR-019. |
@@ -1196,6 +1196,14 @@ will require a FIFO bridge to this core-0 provider.
 ---
 
 ## Proposal for Q1 — migrate CYW43455 association onto `adrv`
+
+### Decision (owner, 2026-08-12)
+
+Defer the `adrv` migration until the current WPA2 association path has
+successfully associated. Preserve the current bounded/liveness-petted path as
+the comparison baseline while #76 diagnoses the PSK_SUP failure. Once WPA2 is
+green, migrate the join into the four-step `adrv` state machine below, retaining
+the 30-second deadline and progress-only watchdog contract.
 
 **Today.** `cyw43_join_key()` is one blocking function that owns core 0 for up
 to 30 s: it sets radio state, writes `wsec`/`wpa_auth`/PMK, issues `SET_SSID`,
