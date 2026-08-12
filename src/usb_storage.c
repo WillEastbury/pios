@@ -222,6 +222,7 @@ static bool scsi_geometry_valid(u32 block_size) {
            (block_size & (block_size - 1U)) == 0U;
 }
 
+#if PIOS_ENABLE_SCSI_CAPACITY16
 static bool scsi_read_capacity16(void) {
     u8 cmd[16] = {
         0x9E, 0x10, 0, 0, 0, 0, 0, 0,
@@ -239,6 +240,7 @@ static bool scsi_read_capacity16(void) {
     num_blocks = last_lba + 1ULL;
     return true;
 }
+#endif
 
 static bool scsi_read_capacity(void) {
     u8 cmd[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -250,8 +252,13 @@ static bool scsi_read_capacity(void) {
     u32 last_lba = load_be32(scsi_buf);
     u32 block_size = load_be32(scsi_buf + 4);
     if (last_lba == 0xFFFFFFFFU) {
+#if PIOS_ENABLE_SCSI_CAPACITY16
         if (!scsi_read_capacity16())
             return false;
+#else
+        uart_puts("[usb_stor] >2TB media requires gated READ CAPACITY(16)\n");
+        return false;
+#endif
     } else {
         if (!scsi_geometry_valid(block_size))
             return false;
