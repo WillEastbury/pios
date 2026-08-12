@@ -32,6 +32,12 @@
 #include "walfs.h"
 #include "ipc_proc.h"
 #include "picovm_fifo.h"
+#include "el0_scheduler.h"
+
+#ifdef PIOS_USER_EL0
+#define el0_getpid() el0_sched_getpid()
+#define el0_wait_event() el0_sched_park()
+#endif
 
 /* Minimal freestanding mem primitives (also satisfy implicit compiler calls). */
 void *memcpy(void *d, const void *s, unsigned long n)
@@ -74,29 +80,6 @@ static void u_append_u32(char *dst, u32 *off, u32 cap, u32 v)
     rev[i] = 0;
     u_append(dst, off, cap, rev);
 }
-
-#ifdef PIOS_USER_EL0
-static inline u32 el0_getpid(void)
-{
-    register u64 x0 __asm__("x0");
-    __asm__ volatile("svc #1" : "=r"(x0) :: "memory");
-    return (u32)x0;
-}
-
-static inline void el0_wait_event(void)
-{
-#ifdef PIOS_USER_SPIN_WAIT
-    __asm__ volatile("" ::: "memory");
-#else
-#ifdef PIOS_USER_WFE_WAIT
-    __asm__ volatile("wfe" ::: "memory");
-#else
-    register u64 x0 __asm__("x0");
-    __asm__ volatile("svc #4" : "=r"(x0) :: "memory");
-#endif
-#endif
-}
-#endif
 
 #define PICOWEB_MEM_SIZE        8192U
 #define PICOWEB_MAX_SPANS       64U

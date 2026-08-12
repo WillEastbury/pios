@@ -32,6 +32,7 @@
 #include "watchdog.h"
 #include "ksvc.h"
 #include "airq.h"
+#include "el0_scheduler.h"
 
 /*
  * Per-core kernel service identities for the scheduler and the FIFO/doorbell
@@ -74,6 +75,55 @@ static void proc_register_core_services(void)
 }
 
 static struct process  procs[MAX_PROCS_PER_CORE] ALIGNED(64);
+
+static inline volatile struct el0_sched_slot *el0_sched_slot_kernel(u32 slot)
+{
+    u64 ttbr;
+    __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr));
+    bool user_table = (ttbr & ~0xFFFFULL) != (shared_ttbr0 & ~0xFFFFULL);
+    u64 base = user_table ? EL0_SCHED_ALIAS_BASE : PIOS_IPC_SHM_BASE;
+    return (volatile struct el0_sched_slot *)(usize)
+        (base + EL0_SCHED_OFFSET +
+         (u64)slot * sizeof(struct el0_sched_slot));
+}
+
+static inline void el0_sched_clean(volatile void *p, u64 len)
+{
+    dcache_clean_range((u64)(usize)p, len);
+    dsb_ishst();
+}
+
+static inline void el0_sched_invalidate(volatile void *p, u64 len)
+{
+    dcache_invalidate_range((u64)(usize)p, len);
+    dsb_ish();
+}
+
+static void el0_sched_reset(u32 slot, u32 generation)
+{
+    if (slot >= EL0_SCHED_SLOT_COUNT)
+        return;
+    volatile struct el0_sched_slot *s = el0_sched_slot_kernel(slot);
+    simd_zero((void *)(usize)s, sizeof(*s));
+    s->meta.generation = generation;
+    s->meta.state = PROC_EMPTY;
+    el0_sched_clean((volatile void *)s, sizeof(*s));
+}
+
+static void el0_sched_publish_meta(u32 slot, const struct process *p)
+{
+    if (slot >= EL0_SCHED_SLOT_COUNT || !p)
+        return;
+    volatile struct el0_sched_meta *m = &el0_sched_slot_kernel(slot)->meta;
+    m->pid = p->pid;
+    m->generation = p->generation;
+    m->state = p->state;
+    m->priority_class = p->priority_class;
+    m->preemptions = p->preemptions;
+    m->inbound_seq = p->el0_inbound_seq;
+    m->runtime_ticks = p->runtime_ticks;
+    el0_sched_clean((volatile void *)m, sizeof(*m));
+}
 
 /*
  * ADR-021: per-process EL1 exception stacks.
@@ -382,6 +432,7 @@ static bool proc_prio_valid(u32 p)
 static inline void proc_publish_control(u32 slot)
 {
     if (slot < MAX_PROCS_PER_CORE) {
+        el0_sched_publish_meta(slot, &procs[slot]);
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
         dcache_clean_range((u64)(usize)&procs[slot], 64U);
 #else
@@ -418,6 +469,7 @@ static void proc_mark_empty(u32 slot)
     proc_bump_generation(slot);
     procs[slot].state = PROC_EMPTY;
     procs[slot].pid = 0;
+    el0_sched_reset(slot, procs[slot].generation);
     proc_publish_control(slot);
 }
 
@@ -676,6 +728,76 @@ static u32 proc_current_pid_for_svc(void)
     return procs[current_proc].pid;
 }
 
+static bool proc_handle_el0_command(struct irq_frame *frame,
+                                    volatile struct el0_sched_cmd *cmd,
+                                    struct process *p)
+{
+    if (!frame || !cmd || !p || cmd->generation != p->generation)
+        return false;
+
+    switch (cmd->op) {
+    case EL0_SCHED_OP_PARK:
+        if (cmd->observed_seq > p->el0_inbound_seq)
+            return false;
+        if (cmd->observed_seq == p->el0_inbound_seq)
+            proc_park();
+        return true;
+    case EL0_SCHED_OP_YIELD:
+        proc_yield();
+        return true;
+    case EL0_SCHED_OP_EXIT:
+        proc_exit((u32)cmd->arg0);
+        __builtin_unreachable();
+    case EL0_SCHED_OP_REPORT:
+        el0_probe_arg = cmd->arg0;
+        frame->x[0] = 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool proc_drain_el0_commands(struct irq_frame *frame)
+{
+    if (!frame || !on_user_core() || current_proc >= MAX_PROCS_PER_CORE)
+        return false;
+    struct process *p = &procs[current_proc];
+    if (!p->run_at_el0 || current_proc >= EL0_SCHED_SLOT_COUNT)
+        return false;
+
+    volatile struct el0_sched_ring *ring =
+        &el0_sched_slot_kernel(current_proc)->ring;
+    el0_sched_invalidate((volatile void *)&ring->head, sizeof(ring->head));
+    if (ring->head.value >= EL0_SCHED_RING_DEPTH ||
+        ring->tail.value >= EL0_SCHED_RING_DEPTH) {
+        proc_exit(0xFFFF0010U);
+        __builtin_unreachable();
+    }
+    bool handled = false;
+    while (ring->tail.value != ring->head.value) {
+        u32 index = ring->tail.value;
+        volatile struct el0_sched_cmd *cmd = &ring->cmds[index];
+        el0_sched_invalidate((volatile void *)cmd, sizeof(*cmd));
+        ring->tail.value = (index + 1U) & (EL0_SCHED_RING_DEPTH - 1U);
+        el0_sched_clean((volatile void *)&ring->tail, sizeof(ring->tail));
+        if (cmd->generation == p->generation &&
+            proc_handle_el0_command(frame, cmd, p))
+            handled = true;
+        el0_sched_invalidate((volatile void *)&ring->head, sizeof(ring->head));
+    }
+    return handled;
+}
+
+bool proc_handle_wfx(struct irq_frame *frame, u64 esr)
+{
+    (void)esr;
+    if (!frame || !on_user_core())
+        return false;
+    (void)proc_drain_el0_commands(frame);
+    frame->x[0] = 0;
+    return true;
+}
+
 static bool proc_handle_svc_inner(struct irq_frame *frame, u64 esr, bool account)
 {
     u32 imm = (u32)(esr & 0xFFFFU);
@@ -833,6 +955,7 @@ static void proc_handle_launch_request(void)
         i32 slot = proc_find_slot_by_pid((u32)pid);
         if (slot >= 0) {
             struct process *p = &procs[(u32)slot];
+            p->el0_inbound_seq++;
             if (launch_req[uc].migrate_keep_pid)
                 p->pid = launch_req[uc].migrate_pid;
             p->parent_pid = launch_req[uc].migrate_parent_pid;
@@ -1343,6 +1466,11 @@ static bool capsule_manifest_load(struct process *p, const char *path)
 /* ---- Forward declarations ---- */
 static i32   sys_yield(void);
 static i32   sys_park(void);
+static i32   sys_sched_yield(u32 reason);
+static i32   sys_sched_get(struct proc_sched_user_state *out);
+static i32   sys_sched_set_priority(u32 pid, u32 priority_class);
+static i32   sys_sched_set_affinity(u32 pid, u32 core);
+static u64   sys_sched_preemptions(void);
 static i32   sys_exit(u32 code);
 static u32   sys_getpid(void);
 static void  sys_print(const char *msg);
@@ -1650,6 +1778,11 @@ static struct kernel_api kernel_api_tab = {
     .exit            = sys_exit,
     .getpid          = sys_getpid,
     .park            = sys_park,
+    .sched_yield     = sys_sched_yield,
+    .sched_get       = sys_sched_get,
+    .sched_set_priority = sys_sched_set_priority,
+    .sched_set_affinity = sys_sched_set_affinity,
+    .sched_preemptions = sys_sched_preemptions,
     /* Console I/O */
     .print           = sys_print,
     .putc            = sys_putc,
@@ -1917,7 +2050,7 @@ static NORETURN void proc_trampoline(void)
     __builtin_unreachable();
 }
 
-extern void proc_el0_enter(u64 entry_pc, u64 entry_sp, u64 spsr) NORETURN;
+extern void proc_el0_enter(u64 entry_pc, u64 entry_sp, u64 spsr, u64 sched_slot) NORETURN;
 
 static NORETURN void proc_el0_trampoline(void)
 {
@@ -1928,7 +2061,8 @@ static NORETURN void proc_el0_trampoline(void)
     el0_enter_sp = p->entry_sp;
     /* Pass the contract SPSR through rather than letting the asm hardcode it,
      * so proc_entry_contract_validate() and the actual eret cannot disagree. */
-    proc_el0_enter(p->entry_pc, p->entry_sp, (u64)p->entry_spsr);
+    proc_el0_enter(p->entry_pc, p->entry_sp, (u64)p->entry_spsr,
+                   p->ctx.x19_x30[2]);
     __builtin_unreachable();
 }
 
@@ -1972,6 +2106,7 @@ void proc_init_shared(void)
         procs[i].state = PROC_EMPTY;
         procs[i].pid = 0;
         procs[i].generation = 0;
+        el0_sched_reset(i, 0);
     }
     for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++)
         paged_io_poison(&paged_io_tab[i]);
@@ -2126,6 +2261,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
 
     struct process *p = &procs[slot];
     proc_bump_generation((u32)slot);
+    el0_sched_reset((u32)slot, p->generation);
     p->pid = next_pid++;
     p->parent_pid = 0;
     /* p->state stays PROC_CLAIMED (set by find_empty_slot()) through the rest
@@ -2145,6 +2281,7 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     p->mem_size = PROC_SLOT_SIZE;
     p->ticks = timer_ticks();
     p->runtime_ticks = 0;
+    p->el0_inbound_seq = 0;
     p->exit_code = 0;
     p->preemptions = 0;
     p->ipc_shm_map_refs = 0;
@@ -2300,6 +2437,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
 
     struct process *p = &procs[slot];
     proc_bump_generation((u32)slot);
+    el0_sched_reset((u32)slot, p->generation);
     p->pid = next_pid++;
     p->parent_pid = 0;
     /* p->state stays PROC_CLAIMED through setup; see the identical note in
@@ -2314,6 +2452,7 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     p->mem_size = PROC_SLOT_SIZE;
     p->ticks = timer_ticks();
     p->runtime_ticks = 0;
+    p->el0_inbound_seq = 0;
     p->exit_code = 0;
     p->preemptions = 0;
     p->ipc_shm_map_refs = 0;
@@ -2443,6 +2582,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
 
     struct process *p = &procs[slot];
     proc_bump_generation((u32)slot);
+    el0_sched_reset((u32)slot, p->generation);
     p->pid = next_pid++;
     p->parent_pid = 0;
     /* p->state stays PROC_EMPTY->(implicitly claimed by the busy-check above)
@@ -2457,6 +2597,7 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     p->mem_size = PROC_SLOT_SIZE;
     p->ticks = timer_ticks();
     p->runtime_ticks = 0;
+    p->el0_inbound_seq = 0;
     p->exit_code = 0;
     p->preemptions = 0;
     p->ipc_shm_map_refs = 0;
@@ -2499,6 +2640,8 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     p->entry_flags = proc_entry_contract_flags();
 
     simd_zero(&p->ctx, sizeof(p->ctx));
+    p->ctx.x19_x30[2] = EL0_SCHED_ALIAS_BASE + EL0_SCHED_OFFSET +
+                        (u64)(u32)slot * sizeof(struct el0_sched_slot);
     p->ctx.x19_x30[11] = (u64)(usize)proc_el0_trampoline;
     /* EL1 exception stack, deliberately NOT p->entry_sp -- see proc_kstack. */
     p->ctx.sp = proc_kstack_top((u32)slot);
@@ -2536,6 +2679,7 @@ void proc_yield(void)
     proc_account_runtime(p);
     if (p->state == PROC_RUNNING)
         p->state = PROC_READY;
+    proc_publish_control((u32)current_proc);
     proc_note_desched(2U);
     ctx_switch(&p->ctx, &scheduler_ctx);
     if (user && preempt_enabled(uc) && p->state == PROC_RUNNING)
@@ -2553,6 +2697,7 @@ NORETURN void proc_exit(u32 code)
     proc_account_runtime(p);
     p->state = PROC_DEAD;
     p->exit_code = code;
+    proc_publish_control((u32)current_proc);
 
     uart_puts("[proc] pid=");
     uart_hex(p->pid);
@@ -2695,6 +2840,7 @@ void proc_schedule(void)
             rr_cursor = chosen;
             current_proc = chosen;
             procs[chosen].state = PROC_RUNNING;
+            proc_publish_control(chosen);
             proc_diag_note_dispatch();
             procs[chosen].ticks = timer_ticks();
             principal_set_current(procs[chosen].principal_id);
@@ -3046,7 +3192,9 @@ void proc_timer_tick(u32 core, u64 tick)
         if (bp->wake_deadline_ms == 0U || now_ms < bp->wake_deadline_ms)
             continue;
         bp->wake_deadline_ms = 0U;
+        bp->el0_inbound_seq++;
         bp->state = PROC_READY;
+        proc_publish_control(i);
         DTRACE(DTRACE_CAT_SCHED, DT_SCHED_WAKE, bp->pid, i, bp->state, core);
     }
 
@@ -3081,6 +3229,7 @@ void proc_irq_maybe_preempt(struct irq_frame *frame)
     proc_account_runtime(p);
     p->state = PROC_READY;
     p->preemptions++;
+    proc_publish_control((u32)current_proc);
     sched_diag[uc].preempt_count++;
     diag_clean_word(&sched_diag[uc]);
     DTRACE(DTRACE_CAT_SCHED, DT_SCHED_PREEMPT, p->pid, uc, p->preemptions, core_id());
@@ -3613,6 +3762,7 @@ void proc_park_timeout(u32 ms) {
     proc_account_runtime(p);
     p->wake_deadline_ms = (ms != 0U) ? (timer_monotonic_ms() + (u64)ms) : 0U;
     p->state = PROC_BLOCKED;
+    proc_publish_control((u32)current_proc);
     proc_park_note(2U); /* park_block++ */
     proc_note_desched(1U);
     DTRACE(DTRACE_CAT_SCHED, DT_SCHED_PARK, p->pid, current_proc, core_id(), ms);
@@ -4903,6 +5053,53 @@ static i32 sys_park(void)
 {
     proc_park();
     return 0;
+}
+
+static i32 sys_sched_yield(u32 reason)
+{
+    proc_note_desched(reason);
+    proc_yield();
+    return 0;
+}
+
+static i32 sys_sched_get(struct proc_sched_user_state *out)
+{
+    if (!out || !ptr_valid(out, sizeof(*out)))
+        return -1;
+    u32 pid = sys_getpid();
+    for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
+        if (procs[i].pid == pid && procs[i].state != PROC_DEAD) {
+            out->pid = pid;
+            out->core = procs[i].affinity_core;
+            out->state = procs[i].state;
+            out->priority_class = procs[i].priority_class;
+            out->quantum_ms = (u32)((procs[i].quantum_ticks * 1000ULL) /
+                                    PROC_PREEMPT_TIMER_HZ);
+            out->preemptions = procs[i].preemptions;
+            out->runtime_ticks = procs[i].runtime_ticks;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static i32 sys_sched_set_priority(u32 pid, u32 priority_class)
+{
+    if (pid != sys_getpid())
+        return -1;
+    return proc_set_priority(pid, priority_class) ? 0 : -1;
+}
+
+static i32 sys_sched_set_affinity(u32 pid, u32 core)
+{
+    if (pid != sys_getpid())
+        return -1;
+    return proc_set_affinity(pid, core) ? 0 : -1;
+}
+
+static u64 sys_sched_preemptions(void)
+{
+    return proc_preemptions();
 }
 
 static i32 sys_exit(u32 code)

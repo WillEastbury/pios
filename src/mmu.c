@@ -286,6 +286,7 @@ static inline u64 user_ram_nc_attrs(void)
            PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1;
 }
 
+
 static void map_user_kernel_low(u64 *l2)
 {
     /* Mirror every privileged kernel/private-RAM block before SHARED_FIFO.

@@ -7142,6 +7142,20 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                     single && single->verified ? "verified" : "pending");
         http_append(out, &len, max, " selected=cpu");
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "picoscript caps")) {
+        http_append(out, &len, max, "PicoScript VM capabilities\n");
+        http_append(out, &len, max, " abi_hooks=0x");
+        http_append_hex32(out, &len, max, PV_HOOK_TABLE_VERSION);
+        http_append(out, &len, max, "\n core=16-opcode+systems64 local=cpu\n");
+        http_append(out, &len, max, " hooks=String Number Maths Bits Span Map Json Xml Template");
+        http_append(out, &len, max, " Storage Fifo Context Response\n");
+        http_append(out, &len, max, " kernel=FIFO:/kernel/picovm\n");
+        http_append(out, &len, max, " tensor=host_hook:0x1e0..0x1eb backend=neon/qpu/cpu\n");
+        http_append(out, &len, max, " compute=host_hook:0x370..0x37b backend=qpu/cpu async=yes\n");
+        http_append(out, &len, max, " media=host_hook:0x3a0..0x3ad backend=qpu/cpu\n");
+        http_append(out, &len, max, " bitlinear=host_hook:0x350..0x35f backend=qpu/cpu\n");
+        http_append(out, &len, max, " crypto=PIOS picocrypt backend=cpu/crypto-ext\n");
+        http_append(out, &len, max, " tls=PIOS picotls backend=cpu\n");
     } else if (http_streq(cmd, "bitnet picoscript") ||
                http_streq(cmd, "tensor bitnet")) {
         i32 argmax = -1;
@@ -15884,6 +15898,17 @@ static void ui_walfs_deck_cb(const struct walfs_dirent *entry)
  * depth/count-bounded primitives used elsewhere in the console. */
 static void ui_print_tensor_walfs_dashboard(void)
 {
+    ui_console_write("PicoScript hooks abi=0x");
+    ui_console_hex_fixed(PV_HOOK_TABLE_VERSION, 8);
+    ui_console_write(" core=systems64/local-cpu");
+    ui_console_write(" kernel=FIFO:/kernel/picovm");
+    ui_console_write(" tensor=NEON/QPU/CPU");
+    ui_console_write(" compute=QPU/CPU/Async");
+    ui_console_write(" media=QPU/CPU");
+    ui_console_write(" bitlinear=QPU/CPU");
+    ui_console_write(" crypto=PIOS-PicoCrypt");
+    ui_console_write(" tls=PIOS-PicoTLS\n");
+
     struct walfs_status_snapshot ws;
     walfs_status(&ws);
     ui_console_write("WALFS mounted=");

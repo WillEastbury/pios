@@ -761,6 +761,9 @@ void sync_exception(struct irq_frame *frame, u64 esr, u64 far) {
     u32 ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
     u64 elr = frame ? frame->elr : 0;
 
+    if (ec == EC_WFX_LOW && proc_handle_wfx(frame, esr))
+        return;
+
     if (ec == EC_SVC64 && proc_handle_svc(frame, esr))
         return;
 

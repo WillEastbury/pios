@@ -78,6 +78,36 @@ decision)
 | [026](#adr-026) | Bank unused quanta for cooperative processes | Owner | Proposed |
 | [027](#adr-027) | Guarded PicoScript accelerator enablement during boot | Owner | Accepted |
 | [028](#adr-028) | Core-0-owned asynchronous PicoScript QPU jobs | Owner | Accepted |
+| [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
+
+---
+
+<a name="adr-029"></a>
+## ADR-029 — EL0 scheduler commands over a shared SPSC ring
+
+**Date:** 2026-08-12 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Complete the documented asynchronous EL0 scheduler path
+without relying on a live device; QEMU is the validation target.
+
+**Decision.** EL0 publishes bounded `PARK`, `YIELD`, `EXIT`, and diagnostic
+commands into one per-process, Normal-NC SPSC ring in the existing IPC window.
+The EL0 process is the sole producer and its owning scheduler is the sole
+consumer. A generation is copied into every command and stale commands are
+discarded. EL0 uses the trapped `WFE` doorbell to enter the kernel; the trap
+has no operation selector, so only already-published ring commands are acted
+upon.
+
+The kernel publishes process metadata and a monotonic inbound wake sequence in
+a separate cache line. Park claims are honoured only when the observed
+sequence still matches, preserving the sticky-wake rule. Existing cross-core
+wake rings remain the mechanism for remote kernel wake delivery.
+
+**Consequences.** The common EL0 scheduler helpers no longer issue scheduler
+SVCs. The fixed ring cannot be flooded beyond its bounded depth, slot reuse is
+generation-safe, and all shared state uses the existing IPC Normal-NC mapping.
+The implementation is validated locally with the cross-build and QEMU tests;
+hardware validation is intentionally deferred while detached from the host.
 
 ---
 

@@ -73,6 +73,16 @@ struct proc_sched_core_snapshot {
     u64 soft_boosts;
 } PACKED;
 
+struct proc_sched_user_state {
+    u32 pid;
+    u32 core;
+    u32 state;
+    u32 priority_class;
+    u32 quantum_ms;
+    u32 preemptions;
+    u64 runtime_ticks;
+} PACKED;
+
 #define PROC_SOFT_EVENT_IPC_FIFO  1U
 #define PROC_SW_INT_F_BOOST       0x00000001U
 
@@ -320,6 +330,7 @@ struct process {
     struct proc_context ctx;
     u64 ticks;          /* tick count at last schedule */
     u64 runtime_ticks;  /* accumulated runtime ticks */
+    u64 el0_inbound_seq; /* kernel-owned wake sequence exposed to EL0 */
     u32 exit_code;
     u32 preemptions;
     bool capsule_enabled;
@@ -383,6 +394,11 @@ struct kernel_api {
     i32 (*exit)(u32 code);
     u32 (*getpid)(void);
     i32 (*park)(void);              /* block until woken by a soft event */
+    i32 (*sched_yield)(u32 reason); /* explicit scheduler primitive */
+    i32 (*sched_get)(struct proc_sched_user_state *out);
+    i32 (*sched_set_priority)(u32 pid, u32 priority_class);
+    i32 (*sched_set_affinity)(u32 pid, u32 core);
+    u64 (*sched_preemptions)(void);
 
     /* ---- Console I/O ---- */
     void (*print)(const char *msg);
@@ -559,6 +575,7 @@ void proc_schedule(void);          /* run scheduler loop (called from coreN_main
 u32  proc_count(void);             /* number of active processes on this core */
 bool proc_handle_fault(u64 esr, u64 elr, u64 far); /* kill faulting user proc */
 bool proc_handle_svc(struct irq_frame *frame, u64 esr);
+bool proc_handle_wfx(struct irq_frame *frame, u64 esr);
 bool proc_svc_selftest(void);
 u64  proc_svc_calls(void);
 u64  proc_svc_bad_calls(void);

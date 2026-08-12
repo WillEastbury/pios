@@ -61,6 +61,12 @@
  * cap_process_slot), independent of ctx->out's actual (larger) capacity. */
 #include "picovm.h"
 #include "pico_hooks.h"
+#include "el0_scheduler.h"
+
+#ifdef PIOS_USER_EL0
+#define el0_getpid() el0_sched_getpid()
+#define el0_wait_event() el0_sched_park()
+#endif
 
 #ifndef CAPSVC_SVC_IDX
 #define CAPSVC_SVC_IDX 0U
@@ -78,20 +84,6 @@ void *memset(void *d, int c, unsigned long n)
     for (unsigned long i = 0; i < n; i++) dd[i] = (u8)c;
     return d;
 }
-
-#ifdef PIOS_USER_EL0
-static inline u32 el0_getpid(void)
-{
-    register u64 x0 __asm__("x0");
-    __asm__ volatile("svc #1" : "=r"(x0) :: "memory");
-    return (u32)x0;
-}
-static inline void el0_wait_event(void)
-{
-    register u64 x0 __asm__("x0");
-    __asm__ volatile("svc #4" : "=r"(x0) :: "memory");
-}
-#endif
 
 static u32 cap_strlen(const char *s) { u32 n = 0; while (s && s[n]) n++; return n; }
 
@@ -430,13 +422,9 @@ static void cap_process_slot(struct capsvc_slot *slot, struct capsvc_program *pr
 
 void user_main(struct kernel_api *api)
 {
-    struct capsvc_arena *a = capsvc_arena();
-#ifdef PIOS_USER_EL0
     (void)api;
+    struct capsvc_arena *a = capsvc_arena();
     u32 pid = el0_getpid();
-#else
-    u32 pid = api->getpid();
-#endif
     a->attach[CAPSVC_SVC_IDX].pid = pid;
     a->attach[CAPSVC_SVC_IDX].svc_idx = CAPSVC_SVC_IDX;
     capsvc_clean(&a->attach[CAPSVC_SVC_IDX], CAPSVC_LINE);
@@ -470,11 +458,7 @@ void user_main(struct kernel_api *api)
             did_work = true;
         }
         if (!did_work) {
-#ifdef PIOS_USER_EL0
             el0_wait_event();   /* kernel wake path (proc_post_remote_wake) sends SEV */
-#else
-            api->park();
-#endif
         }
     }
 }

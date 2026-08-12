@@ -11,6 +11,7 @@
 
 /* Common EC values */
 #define EC_UNKNOWN      0x00
+#define EC_WFX_LOW      0x01
 #define EC_SVC64        0x15
 #define EC_IABT_LOW     0x20
 #define EC_IABT_CUR     0x21
