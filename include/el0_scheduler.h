@@ -79,11 +79,6 @@ _Static_assert(EL0_SCHED_OFFSET +
                PIOS_IPC_SHM_SIZE,
                "EL0 scheduler arena exceeds IPC shared memory");
 
-#define EL0_SCHED_GETPID 1U
-#define EL0_SCHED_REPORT 2U
-#define EL0_SCHED_EXIT 3U
-#define EL0_SCHED_PARK 4U
-
 static inline struct el0_sched_slot *el0_sched_slot(void)
 {
     u64 address;

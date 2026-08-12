@@ -33,7 +33,7 @@ void adrv_set_now_hook(u64 (*now_ms)(void)) { adrv_now_hook = now_ms; }
 void adrv_set_watchdog_hook(void (*pet)(void)) { adrv_watchdog_hook = pet; }
 void adrv_set_liveness_hook(void (*liveness)(void)) { adrv_liveness_hook = liveness; }
 
-static void adrv_name_copy(char *dst, const char *src)
+static void adrv_name_copy(volatile char *dst, const char *src)
 {
     u32 i = 0U;
     if (src) {
@@ -54,7 +54,8 @@ void adrv_init(void)
         adrv_ops[i].generation = generation + 1U;
     }
     memset(&adrv_diag_state, 0, sizeof(adrv_diag_state));
-    memset(&adrv_call_stamp, 0, sizeof(adrv_call_stamp));
+    for (u32 i = 0U; i < sizeof(adrv_call_stamp); i++)
+        ((volatile u8 *)(usize)&adrv_call_stamp)[i] = 0U;
     adrv_supervisor_overruns = 0U;
     memset(adrv_quarantined, 0, sizeof(adrv_quarantined));
     memset(adrv_worst_name, 0, sizeof(adrv_worst_name));

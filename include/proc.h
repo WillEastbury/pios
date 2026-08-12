@@ -294,7 +294,6 @@ _Static_assert((PROC_ARENA_BASE & 0x1FFFFFULL) == 0ULL,
 #define PROC_ENTRY_FLAG_DATA_RW_XN      0x00000008U
 #define PROC_ENTRY_FLAG_STACK_16_ALIGN  0x00000010U
 #define PROC_ENTRY_FLAG_API_IN_X0       0x00000020U
-#define PROC_ENTRY_FLAG_SVC_REQUIRED    0x00000040U
 /*
  * PSTATE for an EL0 process: EL0t, with D/A/F masked and **IRQs enabled**.
  *
@@ -618,7 +617,6 @@ i32  proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
 i32  proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
                             u64 linked_base, u64 physical_base,
                             u32 priority_class, u32 affinity_core);
-void proc_el0_probe_snapshot(u32 *seen, u32 *pid, u32 *spsr, u64 *arg, u64 *elr, u32 *exits);
 void proc_el0_diag_snapshot(i32 *launch_status, u32 *launch_pid, u32 *launch_slot,
                             u64 *launch_base, u32 *enter_count, u32 *enter_pid,
                             u64 *enter_pc, u64 *enter_sp, u32 *fault_pid,

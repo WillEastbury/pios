@@ -442,34 +442,19 @@ AArch64 EL1; EL1 timer access is enabled; the transition ends in `eret`.
 Secondary cores run the `SECONDARY_SETUP` macro: EL2→EL1, SCTLR, NEON, per-core
 SP and SP_EL1, `VBAR_EL1`, shared TTBR0/MAIR/TCR, MMU enable, IRQ unmask.
 
-### 7.2 EL0 and syscalls
+### 7.2 EL0 and traps
 
 EL0 entry is `proc_el0_trampoline()` → `proc_el0_enter(entry_pc, entry_sp)`.
-
-`proc_handle_svc()` implements a deliberately small SVC surface:
-
-| Syscall | Effect |
-|---|---|
-| `PROC_SVC_NOP` | No-op (liveness probe) |
-| `PROC_SVC_GETPID` | Return caller pid |
-| `PROC_SVC_EL0_PROBE` | EL0 execution proof |
-| `PROC_SVC_EXIT` | Terminate caller |
-| `PROC_SVC_PARK` | Block until woken |
-
-Anything else returns `-ENOSYS`.
-
-That surface is small **by design**: capsule request/reply runs through shared
-memory, so the hot path needs no syscall at all. The richer `kernel_api_tab`
-(queues, pipes, semaphores, tensors, IPC) is a kernel-internal API table, not an
+There is no supported EL0 SVC ABI. An unexpected EL0 SVC is counted, returns
+`-ENOSYS` only outside a running EL0 process, and terminates a running EL0
+process. The richer `kernel_api_tab` remains a kernel-internal table, not an
 EL0 SVC ABI.
 
 ### 7.3 The syscall-free scheduling contract (ADR-022/023/026)
 
-The direction is to remove that SVC surface entirely: **user code talks to the
-kernel through FIFOs and shared state, never through a call.** Three modules
-implement the logic. They are host-tested and compile into the image, but are
-**not yet wired into the live scheduler** — that is blocked on
-[#84](https://github.com/WillEastbury/pios/issues/84).
+**User code talks to the kernel through FIFOs and shared state, never through a
+call.** Three modules implement the logic. They are host-tested, compile into
+the image, and are wired into the live scheduler.
 
 **`pctl` — process → kernel** (`include/pctl.h`). A latched 64-byte control line
 per process, in its shared Normal-NC page (EL0-writable, unlike the exception

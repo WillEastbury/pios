@@ -656,8 +656,7 @@ u32 proc_entry_contract_flags(void)
            PROC_ENTRY_FLAG_CODE_RX_RO |
            PROC_ENTRY_FLAG_DATA_RW_XN |
            PROC_ENTRY_FLAG_STACK_16_ALIGN |
-           PROC_ENTRY_FLAG_API_IN_X0 |
-           PROC_ENTRY_FLAG_SVC_REQUIRED;
+           PROC_ENTRY_FLAG_API_IN_X0;
 }
 
 u32 proc_entry_contract_spsr(void)
@@ -703,18 +702,6 @@ bool proc_entry_contract_selftest(void)
     return proc_entry_contract_validate(&p);
 }
 
-#define PROC_SVC_NOP       0U
-#define PROC_SVC_GETPID    1U
-#define PROC_SVC_EL0_PROBE 2U
-#define PROC_SVC_EXIT      3U
-#define PROC_SVC_PARK      4U
-
-static volatile u32 el0_probe_seen;
-static volatile u32 el0_probe_pid;
-static volatile u32 el0_probe_spsr;
-static volatile u64 el0_probe_arg;
-static volatile u64 el0_probe_elr;
-static volatile u32 el0_probe_exits;
 static volatile i32 el0_launch_status;
 static volatile u32 el0_launch_pid;
 static volatile u32 el0_launch_slot;
@@ -744,15 +731,6 @@ u64 proc_svc_bad_calls(void)
     return svc_bad_count;
 }
 
-static u32 proc_current_pid_for_svc(void)
-{
-    if (!on_user_core() || current_proc >= MAX_PROCS_PER_CORE)
-        return 0;
-    if (procs[current_proc].state != PROC_RUNNING)
-        return 0;
-    return procs[current_proc].pid;
-}
-
 static bool proc_handle_el0_command(struct irq_frame *frame,
                                     volatile struct el0_sched_cmd *cmd,
                                     struct process *p)
@@ -774,7 +752,6 @@ static bool proc_handle_el0_command(struct irq_frame *frame,
         proc_exit((u32)cmd->arg0);
         __builtin_unreachable();
     case EL0_SCHED_OP_REPORT:
-        el0_probe_arg = cmd->arg0;
         frame->x[0] = 0;
         return true;
     default:
@@ -882,43 +859,20 @@ bool proc_handle_wfx(struct irq_frame *frame, u64 esr)
 
 static bool proc_handle_svc_inner(struct irq_frame *frame, u64 esr, bool account)
 {
-    u32 imm = (u32)(esr & 0xFFFFU);
+    (void)esr;
     if (!frame)
         return false;
     if (account)
         svc_call_count++;
-    switch (imm) {
-    case PROC_SVC_NOP:
-        frame->x[0] = 0;
-        return true;
-    case PROC_SVC_GETPID:
-        frame->x[0] = proc_current_pid_for_svc();
-        return true;
-    case PROC_SVC_EL0_PROBE:
-        if ((frame->spsr & 0xFU) == 0U)
-            el0_probe_seen++;
-        else
-            el0_probe_seen = 0xBAD00000U;
-        el0_probe_pid = proc_current_pid_for_svc();
-        el0_probe_spsr = (u32)frame->spsr;
-        el0_probe_arg = frame->x[0];
-        el0_probe_elr = frame->elr;
-        frame->x[0] = 0;
-        return true;
-    case PROC_SVC_EXIT:
-        el0_probe_exits++;
-        proc_exit((u32)frame->x[0]);
-        __builtin_unreachable();
-    case PROC_SVC_PARK:
-        proc_park();
-        frame->x[0] = 0;
-        return true;
-    default:
-        if (account)
-            svc_bad_count++;
-        frame->x[0] = (u64)-38; /* ENOSYS */
-        return true;
+    if (account)
+        svc_bad_count++;
+    if (on_user_core() && current_proc < MAX_PROCS_PER_CORE &&
+        procs[current_proc].state == PROC_RUNNING &&
+        procs[current_proc].run_at_el0) {
+        proc_exit(0xFFFF0012U);
     }
+    frame->x[0] = (u64)-38;
+    return true;
 }
 
 bool proc_handle_svc(struct irq_frame *frame, u64 esr)
@@ -930,23 +884,13 @@ bool proc_svc_selftest(void)
 {
     struct irq_frame f;
     simd_zero(&f, sizeof(f));
-    if (!proc_handle_svc_inner(&f, ((u64)EC_SVC64 << ESR_EC_SHIFT) | PROC_SVC_NOP, false))
+    if (!proc_handle_svc_inner(&f, ((u64)EC_SVC64 << ESR_EC_SHIFT), false))
         return false;
-    if (f.x[0] != 0)
+    if (f.x[0] != (u64)-38)
         return false;
     if (!proc_handle_svc_inner(&f, ((u64)EC_SVC64 << ESR_EC_SHIFT) | 0xFFFFU, false))
         return false;
     return f.x[0] == (u64)-38;
-}
-
-void proc_el0_probe_snapshot(u32 *seen, u32 *pid, u32 *spsr, u64 *arg, u64 *elr, u32 *exits)
-{
-    if (seen)  *seen  = el0_probe_seen;
-    if (pid)   *pid   = el0_probe_pid;
-    if (spsr)  *spsr  = el0_probe_spsr;
-    if (arg)   *arg   = el0_probe_arg;
-    if (elr)   *elr   = el0_probe_elr;
-    if (exits) *exits = el0_probe_exits;
 }
 
 void proc_el0_diag_snapshot(i32 *launch_status, u32 *launch_pid, u32 *launch_slot,
@@ -4162,7 +4106,6 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
     static const char copy_name[] = "bench.copy";
     struct proc_ipc_span_desc desc;
     struct proc_ipc_span_desc recv_desc;
-    struct irq_frame frame;
     u32 len = 0;
     i32 h;
     i32 hc;
@@ -4224,14 +4167,7 @@ bool proc_ipc_bench(u32 iterations, struct proc_ipc_bench_result *out)
     while (ipc_proc_fifo_recv(PRINCIPAL_ROOT, h, &recv_desc, sizeof(recv_desc), &len) == PROC_IPC_OK)
         ;
 
-    simd_zero(&frame, sizeof(frame));
-    t0 = proc_sched_counter_ticks();
-    for (u32 i = 0; i < iterations; i++) {
-        if (!proc_handle_svc_inner(&frame, ((u64)EC_SVC64 << ESR_EC_SHIFT) | PROC_SVC_GETPID, false))
-            errors++;
-    }
-    t1 = proc_sched_counter_ticks();
-    out->svc_ticks = t1 >= t0 ? t1 - t0 : 0;
+    out->svc_ticks = 0;
 
     bench_payload = 0x50494F5300000000ULL | iterations;
     desc.addr = (u64)(usize)&bench_payload;

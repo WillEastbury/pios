@@ -6426,69 +6426,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
     } else if (http_streq(cmd, "abi selftest")) {
         http_append(out, &len, max, abi_selftest() ? "ABI selftest OK\n" : "ABI selftest FAILED\n");
     } else if (http_streq(cmd, "el0") || http_streq(cmd, "el0 probe")) {
-        u32 seen = 0, pid = 0, spsr = 0, exits = 0;
-        u64 arg = 0, elr = 0;
-        proc_el0_probe_snapshot(&seen, &pid, &spsr, &arg, &elr, &exits);
-        http_append(out, &len, max, "el0 probe seen=");
-        http_append_u64(out, &len, max, seen);
-        http_append(out, &len, max, " pid=");
-        http_append_u64(out, &len, max, pid);
-        http_append(out, &len, max, " spsr=0x");
-        http_append_hex32(out, &len, max, spsr);
-        http_append(out, &len, max, " arg=0x");
-        http_append_hex64(out, &len, max, arg);
-        http_append(out, &len, max, " elr=0x");
-        http_append_hex64(out, &len, max, elr);
-        http_append(out, &len, max, " exits=");
-        http_append_u64(out, &len, max, exits);
-        i32 lst = 0; u32 lpid = 0, lslot = 0, ecnt = 0, epid = 0, fpid = 0;
-        u64 lbase = 0, epc = 0, esp = 0, fesr = 0, felr = 0, ffar = 0, fl1e = 0, fl2e = 0, fl3e = 0;
-        u64 par0w = 0, par0r = 0, par1w = 0;
-        proc_el0_diag_snapshot(&lst, &lpid, &lslot, &lbase, &ecnt, &epid,
-                               &epc, &esp, &fpid, &fesr, &felr, &ffar, &fl1e, &fl2e, &fl3e,
-                               &par0w, &par0r, &par1w);
-        http_append(out, &len, max, " launch=");
-        if (lst < 0) {
-            http_append(out, &len, max, "-");
-            http_append_u64(out, &len, max, (u32)(-lst));
-        } else {
-            http_append_u64(out, &len, max, (u32)lst);
-        }
-        http_append(out, &len, max, " lpid=");
-        http_append_u64(out, &len, max, lpid);
-        http_append(out, &len, max, " slot=");
-        http_append_u64(out, &len, max, lslot);
-        http_append(out, &len, max, " base=0x");
-        http_append_hex64(out, &len, max, lbase);
-        http_append(out, &len, max, " enter=");
-        http_append_u64(out, &len, max, ecnt);
-        http_append(out, &len, max, " epid=");
-        http_append_u64(out, &len, max, epid);
-        http_append(out, &len, max, " epc=0x");
-        http_append_hex64(out, &len, max, epc);
-        http_append(out, &len, max, " esp=0x");
-        http_append_hex64(out, &len, max, esp);
-        http_append(out, &len, max, " fpid=");
-        http_append_u64(out, &len, max, fpid);
-        http_append(out, &len, max, " fesr=0x");
-        http_append_hex64(out, &len, max, fesr);
-        http_append(out, &len, max, " felr=0x");
-        http_append_hex64(out, &len, max, felr);
-        http_append(out, &len, max, " ffar=0x");
-        http_append_hex64(out, &len, max, ffar);
-        http_append(out, &len, max, " l1e=0x");
-        http_append_hex64(out, &len, max, fl1e);
-        http_append(out, &len, max, " l2e=0x");
-        http_append_hex64(out, &len, max, fl2e);
-        http_append(out, &len, max, " l3e=0x");
-        http_append_hex64(out, &len, max, fl3e);
-        http_append(out, &len, max, " par0w=0x");
-        http_append_hex64(out, &len, max, par0w);
-        http_append(out, &len, max, " par0r=0x");
-        http_append_hex64(out, &len, max, par0r);
-        http_append(out, &len, max, " par1w=0x");
-        http_append_hex64(out, &len, max, par1w);
-        http_append(out, &len, max, "\n");
+        http_append(out, &len, max, "el0 scheduler uses pctl/swake/WFE; SVC probe retired\n");
     } else if (http_streq(cmd, "ipc bench") || http_starts_with(cmd, "ipc bench ")) {
         u32 iters = 10000;
         if (http_starts_with(cmd, "ipc bench ")) {
@@ -23645,8 +23583,6 @@ extern const u8 user_httpd_vm_start[];
 extern const u8 user_httpd_vm_end[];
 extern const u8 user_httpd_native_start[];
 extern const u8 user_httpd_native_end[];
-extern const u8 user_el0_probe_start[];
-extern const u8 user_el0_probe_end[];
 extern const u8 user_el0_pico_start[];
 extern const u8 user_el0_pico_end[];
 /* Generic capsvc capsule host (src/user_capsvc_host_payload.S). One flat
