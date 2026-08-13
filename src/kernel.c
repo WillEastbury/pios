@@ -14117,6 +14117,10 @@ static void ui_cmd_usb(u32 argc, char **argv)
         ui_console_u32_dec(st->cmd_completed);
         ui_console_write("/");
         ui_console_u32_dec(st->cmd_timeout);
+        ui_console_write(" last_cc=");
+        ui_console_u32_dec(st->last_cmd_cc);
+        ui_console_write(" last_cmd=0x");
+        ui_console_hex_fixed(st->last_cmd_type, 8);
         ui_console_write("\n");
         ui_console_write("controllers=0:");
         ui_console_u32_dec(xhci_controller_port_count(0U));

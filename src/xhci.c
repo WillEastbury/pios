@@ -372,6 +372,8 @@ static bool cmd_submit(u64 param, u32 status, u32 control, struct xhci_trb *evt)
 
         if (evt_type == TRB_CMD_COMPLETE) {
             stats.cmd_completed++;
+            stats.last_cmd_cc = cc;
+            stats.last_cmd_type = evt->control;
             fb_set_color(0x00FFAA00, 0x00000000);
             fb_printf("xHCI slot cc=%X\n", cc);
             return (cc == CC_SUCCESS);
@@ -750,6 +752,14 @@ bool xhci_port_reset(u32 port, u32 *speed) {
             uart_puts("[xhci] Port reset done PORTSC=");
             uart_hex(sc);
             uart_puts("\n");
+            for (u32 settle = 0; settle < 40U; settle++) {
+                if ((sc & PORTSC_CCS) && (sc & PORTSC_PED) &&
+                    ((sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) != 0U)
+                    break;
+                timer_delay_ms(5);
+                sc = mmio_read(pa);
+                stats.last_port_status = sc;
+            }
             sc &= ~PORTSC_RW1C_MASK;
             sc |= (PORTSC_PRC | PORTSC_CSC);
             mmio_write(pa, sc);

@@ -46,6 +46,8 @@ struct xhci_stats {
     u32 port_reset_failures;
     u32 last_port;
     u32 last_port_status;
+    u32 last_cmd_cc;
+    u32 last_cmd_type;
 };
 
 /* Controller lifecycle */
