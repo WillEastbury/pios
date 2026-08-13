@@ -98,8 +98,9 @@ DFS32 frame-size layout (`CTRLR0[20:16]`), a 200 MHz functional clock, and
 even BAUDR divisors.
 
 The driver configures SPI0 header pins on ALT0 (GPIO7-11) and SPI1 on ALT0
-(GPIO16-21). Header wiring is single-bit SPI; enhanced/quad capability is
-reported but not enabled because no IO2/IO3 header pins are available.
+(GPIO16-21). Master instances report the RP1-documented dual/quad framing
+capability; `rp1_spi_init_ex()` can select standard, dual, or quad framing.
+Physical IO2/IO3 routing remains the board/device wiring responsibility.
 
 | Function | Description |
 |----------|-------------|

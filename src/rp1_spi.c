@@ -74,6 +74,11 @@ static u64 spi_base(u32 instance)
            (u64)instance * RP1_SPI_STRIDE;
 }
 
+static bool spi_is_master(u32 instance)
+{
+    return instance < RP1_SPI_COUNT && instance != 4U && instance != 7U;
+}
+
 static inline u32 sr_read(u32 instance, u32 off)
 {
     return mmio_read(spi_base(instance) + off);
@@ -132,7 +137,11 @@ bool rp1_spi_probe(u32 instance)
     /* Enhanced framing (dual/quad) is optional in the DW core. Report whether
      * the field exists; the 40-pin header does not pin out IO2/IO3 for any SPI
      * function, so this is informational rather than usable there. */
-    s->diag.enhanced_frf = (probe & CTRLR0_SPI_FRF_MASK) != 0U;
+    /* RP1's master PSSI blocks support standard/dual/quad framing. The
+     * enhanced field is not reliably read back while the block is disabled,
+     * so capability comes from the documented RP1 block role, not a writeback
+     * probe. SPI4 and SPI7 are target-only and are excluded. */
+    s->diag.enhanced_frf = spi_is_master(instance);
 
     /* FIFO depth: TXFTLR only retains bits that the implemented depth needs. */
     u32 depth = 0U;
@@ -174,11 +183,19 @@ static void spi_claim_pins(u32 instance)
 
 bool rp1_spi_init(u32 instance, u32 sck_hz, u32 mode, u32 bits)
 {
+    return rp1_spi_init_ex(instance, sck_hz, mode, bits,
+                           RP1_SPI_FRF_STANDARD);
+}
+
+bool rp1_spi_init_ex(u32 instance, u32 sck_hz, u32 mode, u32 bits,
+                     u32 frame_format)
+{
 #if !PIOS_HAS_RP1
     (void)instance; (void)sck_hz; (void)mode; (void)bits;
     return false;
 #else
     if (instance >= RP1_SPI_COUNT || mode > 3U ||
+        frame_format > RP1_SPI_FRF_QUAD ||
         bits < 4U || bits > 32U || sck_hz == 0U)
         return false;
     /* SPI4 and SPI7 are target-mode blocks in the RP1 wiring. */
@@ -187,6 +204,9 @@ bool rp1_spi_init(u32 instance, u32 sck_hz, u32 mode, u32 bits)
 
     (void)rp1_clk_enable(RP1_CLK_SYS);
     if (!rp1_spi_probe(instance))
+        return false;
+    if (frame_format != RP1_SPI_FRF_STANDARD &&
+        !spi_state[instance].diag.enhanced_frf)
         return false;
 
     struct rp1_spi_state *s = &spi_state[instance];
@@ -214,6 +234,7 @@ bool rp1_spi_init(u32 instance, u32 sck_hz, u32 mode, u32 bits)
     if (mode & 1U) cr0 |= CTRLR0_SCPHA;
     if (mode & 2U) cr0 |= CTRLR0_SCPOL;
     cr0 |= (u32)RP1_SPI_TMOD_TX_RX << CTRLR0_TMOD_SHIFT;
+    cr0 |= frame_format << CTRLR0_SPI_FRF_SHIFT;
     sw_write(instance, SSI_CTRLR0, cr0);
 
     sw_write(instance, SSI_IMR, 0U);            /* poll; no interrupts */

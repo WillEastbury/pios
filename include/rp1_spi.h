@@ -24,6 +24,9 @@
 #define RP1_SPI_TMOD_TX_RX  0U
 #define RP1_SPI_TMOD_TX     1U
 #define RP1_SPI_TMOD_RX     2U
+#define RP1_SPI_FRF_STANDARD 0U
+#define RP1_SPI_FRF_DUAL     1U
+#define RP1_SPI_FRF_QUAD     2U
 
 struct rp1_spi_diag {
     bool present;           /* core responded to identification */
@@ -51,6 +54,8 @@ bool rp1_spi_probe(u32 instance);
  * even-only). `mode` is the usual SPI mode 0..3 (CPOL<<1 | CPHA).
  * `bits` is the frame size in bits, 4..32 (8 and 16 are the common cases). */
 bool rp1_spi_init(u32 instance, u32 sck_hz, u32 mode, u32 bits);
+bool rp1_spi_init_ex(u32 instance, u32 sck_hz, u32 mode, u32 bits,
+                     u32 frame_format);
 
 /* Full-duplex transfer of `len` frames. Either buffer may be NULL for a
  * half-duplex transfer. Frames are bytes when bits <= 8, u16 when bits <= 16.
