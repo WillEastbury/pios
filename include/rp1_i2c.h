@@ -10,6 +10,7 @@ struct rp1_i2c_diag {
 };
 
 bool rp1_i2c_init(u32 bus_hz);
+bool rp1_i2c_ready(void);
 bool rp1_i2c_write_read(u8 address, const u8 *write_data, u32 write_len,
                         u8 *read_data, u32 read_len);
 /* Probe a single 7-bit address with a zero-length-payload read. Returns true

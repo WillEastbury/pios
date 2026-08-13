@@ -76,10 +76,16 @@ bool rp1_i2c_init(u32 bus_hz)
         iw(IC_FS_SCL_LCNT, low);
         iw(IC_CON, (1U << 0) | (2U << 1) | (1U << 5));
     }
+
     iw(IC_ENABLE, 1U);
     i2c_ready = (ir(IC_ENABLE_STATUS) & 1U) != 0U;
     return i2c_ready;
 #endif
+}
+
+bool rp1_i2c_ready(void)
+{
+    return i2c_ready;
 }
 
 bool rp1_i2c_write_read(u8 address, const u8 *write_data, u32 write_len,

@@ -22142,8 +22142,11 @@ static void hdmi_dashboard_render(void)
     }
     if (hw_r < hw_end)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
-                            "USB/HID", PIOS_HAS_RP1, "RP1 ", PIOS_RP1_BAR_BASE,
-                            "xhci", PIOS_HAS_RP1 ? "xHCI + USB HID keyboard" : "not present");
+                            "USB/HID", xhci_get_stats()->init_stage >= 4U,
+                            "RP1 ", PIOS_RP1_BAR_BASE, "xhci",
+                            !PIOS_HAS_RP1 ? "not present" :
+                            (usb_kbd_available() ? "xHCI + HID ready" :
+                             "xHCI ready; no HID enumerated"));
     if (hw_r < hw_end)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "RP1 bridge", PIOS_HAS_RP1 && PIOS_HAS_PCIE, "BAR ", PIOS_RP1_BAR_BASE,
@@ -22152,18 +22155,41 @@ static void hdmi_dashboard_render(void)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "GPIO", PIOS_HAS_RP1, "RP1 ", PIOS_RP1_BAR_BASE,
                             "regs", PIOS_HAS_RP1 ? "54 GPIO / 28 header pins" : "not present");
-    if (hw_r < hw_end)
-        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
-                    "I2C / SPI", false, PIOS_HAS_RP1 ? "RP1 ctrl" : "not present",
-                    "0", PIOS_HAS_RP1 ? "HW present; driver pending" : "not present");
+    {
+        struct rp1_i2c_diag i2cd;
+        rp1_i2c_diag_snapshot(&i2cd);
+        u32 spi_present = 0U;
+        u32 spi_ready = 0U;
+        u32 spi_quad = 0U;
+        for (u32 si = 0U; si < RP1_SPI_COUNT; si++) {
+            struct rp1_spi_diag sd;
+            rp1_spi_diag_snapshot(si, &sd);
+            if (sd.present) spi_present++;
+            if (sd.ready) spi_ready++;
+            if (sd.enhanced_frf) spi_quad++;
+        }
+        if (hw_r < hw_end)
+            dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                        "I2C1", rp1_i2c_ready(), "RP1",
+                        rp1_i2c_ready() ? "ready" : "driver unavailable",
+                        "DesignWare I2C controller");
+        if (hw_r < hw_end)
+            dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                        "SPI", spi_present != 0U, "RP1",
+                        spi_ready ? "ready" :
+                        (spi_present ? "probed; not initialized" : "unavailable"),
+                        spi_present ? "9 RP1 SPI cores" : "unavailable");
+        if (hw_r < hw_end)
+            dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                        "QSPI", spi_quad != 0U, "RP1",
+                        spi_quad ? "quad capable" : "no quad capability",
+                        spi_quad ? "enhanced SPI" : "single-bit SPI only");
+        (void)i2cd;
+    }
     if (hw_r < hw_end)
         dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                     "SDIO", PIOS_HAS_SD, PIOS_HAS_SD ? "EMMC2" : "virtio/mmio",
                     "dma/buf", PIOS_HAS_SD ? "SDIO 4-bit path" : "platform block path");
-    if (hw_r < hw_end)
-        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
-                    "QSPI", false, PIOS_HAS_RP1 ? "RP1/QSPI" : "not present",
-                    "0", "HW planned; driver pending");
     if (hw_r < hw_end)
         dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                     "Framebuffer", PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB,
