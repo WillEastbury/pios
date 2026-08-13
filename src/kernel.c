@@ -24272,6 +24272,16 @@ void kernel_main(void) {
     } else {
         bp_err("[pcie] PCIe init FAILED"); bp_done(2, false); bp_done(3, false);
     }
+#elif PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    bp_log("[usb] registering storage+kbd...");
+    usb_storage_register();
+    usb_kbd_register();
+    bp_log("[usb] usb_init (QEMU PCI xHCI)...");
+    usb_ok = usb_init();
+    if (usb_ok) bp_ok("[usb] QEMU xHCI online");
+    else bp_warn("[usb] QEMU xHCI unavailable");
+    bp_done(2, true);
+    bp_done(3, true);
 #else
     bp_warn("[pcie] skipped on this platform");
     bp_done(2, true);

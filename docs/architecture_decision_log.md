@@ -79,6 +79,8 @@ decision)
 | [027](#adr-027) | Guarded PicoScript accelerator enablement during boot | Owner | Accepted |
 | [028](#adr-028) | Core-0-owned asynchronous PicoScript QPU jobs | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
+| [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
+| [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
 
 ---
 
@@ -108,6 +110,47 @@ SVCs. The fixed ring cannot be flooded beyond its bounded depth, slot reuse is
 generation-safe, and all shared state uses the existing IPC Normal-NC mapping.
 The implementation is validated locally with the cross-build and QEMU tests;
 hardware validation is intentionally deferred while detached from the host.
+
+---
+
+<a name="adr-030"></a>
+## ADR-030 — Generic xHCI core with RP1 and QEMU PCI backends
+
+**Date:** 2026-08-13 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** USB enumeration and class drivers remain transport-neutral. The
+xHCI implementation gains controller discovery and platform-specific access
+behind two backends: the existing RP1 DWC3/MMIO path on Pi 5 and PCI discovery
+of QEMU's `qemu-xhci` on the `virt` machine. QEMU PCI ECAM is mapped as device
+memory and the xHCI BAR is enabled with memory space and bus mastering.
+
+**Consequences.** QEMU can exercise the shared xHCI/USB stack with virtual USB
+devices without pretending that RP1 exists. RP1 PHY, VBUS, PCIe inbound DMA,
+and DWC3 setup remain Pi-specific and are skipped on QEMU. Future Hyper-V or
+x64 ports can provide another backend without duplicating USB class logic.
+
+---
+
+<a name="adr-031"></a>
+## ADR-031 — Pluggable auto-detected device driver backends
+
+**Date:** 2026-08-13 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** Device drivers are split into a transport-neutral core and
+pluggable hardware backends. Initialization probes available backends,
+selects exactly one compatible implementation, and fails closed when no
+backend is present. Platform-specific code is restricted to the stage-1
+jump/bring-up layer and backend registration; shared protocol, enumeration,
+buffer ownership, and class logic must not depend on a board identity.
+
+This applies incrementally to PCI/xHCI, USB class drivers, storage, network,
+display, and future peripheral drivers. The generic xHCI work on branch
+`issue-70-generic-xhci` is the first implementation of this pattern.
+
+**Consequences.** QEMU, Pi 5, Hyper-V, and future ports can provide different
+hardware backends without duplicating device protocols or class drivers.
+Every backend must publish explicit capability and DMA/attribute contracts;
+autodetection must never probe absent MMIO as if it were present.
 
 ---
 

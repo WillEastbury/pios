@@ -548,6 +548,11 @@ void mmu_init(void) {
                       * descriptor-hole bug (docs/gotchas.md). */
                      (addr >= PROC_ARENA_BASE &&
                       addr < PROC_ARENA_BASE + PROC_ARENA_SIZE);
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+        if (addr == 0x10000000UL || addr == 0x3F000000UL)
+            l2[i] = dev_block_2m(addr);
+        else
+#endif
         l2[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);
     }
     l1[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
@@ -555,6 +560,9 @@ void mmu_init(void) {
     l1[1] = ram_block_1g(0x40000000UL);
     l1[2] = ram_block_1g(0x80000000UL);
     l1[3] = ram_block_1g(0xC0000000UL);
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    l1[256] = dev_block_1g(0x4000000000ULL);
+#endif
 
     /* Peripherals: indices 64-67 (BCM2712 at 0x107C000000 = 65GB) */
     u64 dev_attr = PTE_VALID | PTE_BLOCK | PTE_AF |
@@ -703,6 +711,12 @@ void mmu_enable_caching(void) {
             continue;
         }
         u64 addr = (u64)i * L2_BLOCK_SIZE;
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+        if (addr == 0x10000000UL || addr == 0x3F000000UL) {
+            l2_table_low[i] = dev_block_2m(addr);
+            continue;
+        }
+#endif
         bool cache = (addr >= cache_lo_base && addr < cache_lo_end) ||
                      (addr >= cache_fb_base && addr < cache_fb_end);
         l2_table_low[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);

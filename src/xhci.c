@@ -18,6 +18,7 @@
 #include "rp1_gpio.h"
 #include "pcie.h"
 #include "fb.h"
+#include "pci.h"
 
 /* USB VBUS power is controlled by RP1 GPIO 38 */
 #define USB_VBUS_GPIO   38
@@ -195,6 +196,7 @@ static u32 hci_max_ports, hci_max_slots, ctx_size;
 static u32 cmd_enq, cmd_cycle;
 static u32 evt_deq, evt_cycle;
 static u32 selected_controller;
+static bool xhci_qemu_backend;
 
 static struct {
     bool pending;
@@ -210,12 +212,16 @@ static struct xhci_stats stats;
 static inline u64 dma_addr(const void *p)
 {
     u64 addr = 0ULL;
+    if (xhci_qemu_backend)
+        return p ? (u64)(usize)p : 0ULL;
     return rp1_pcie_dma_addr(p, 1ULL, &addr) ? addr : 0ULL;
 }
 
 static bool xhci_dma_layout_valid(void)
 {
     u64 addr;
+    if (xhci_qemu_backend)
+        return true;
     if (!rp1_pcie_dma_addr(dcbaa, sizeof(dcbaa), &addr) ||
         !rp1_pcie_dma_addr(cmd_ring, sizeof(cmd_ring), &addr) ||
         !rp1_pcie_dma_addr(evt_ring, sizeof(evt_ring), &addr) ||
@@ -456,22 +462,42 @@ bool xhci_init(void) {
     memset(&interrupt_xfer, 0, sizeof(interrupt_xfer));
     stats.init_stage = 1U;
 
+    xhci_qemu_backend = false;
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    if (selected_controller == 0U) {
+        struct pci_device pci_dev;
+        if (!pci_find_class(0x0C0330U, &pci_dev) ||
+            !pci_enable_device(&pci_dev)) {
+            uart_puts("[xhci] QEMU PCI xHCI not found\n");
+            return false;
+        }
+        xhci_base = pci_dev.bar0;
+        xhci_qemu_backend = true;
+    } else {
+        return false;
+    }
+#endif
+
     if (!xhci_dma_layout_valid()) {
         uart_puts("[xhci] DMA layout outside RP1 inbound window\n");
         return false;
     }
 
-    /* Enable USB VBUS power via GPIO 38 */
+    /* Enable USB VBUS power via GPIO 38 on RP1. */
+#if PIOS_PLATFORM != PIOS_PLATFORM_QEMU_VIRT
     uart_puts("[xhci] Enabling VBUS (GPIO38)...\n");
     rp1_gpio_set_function(USB_VBUS_GPIO, 5);
     rp1_gpio_set_dir_output(USB_VBUS_GPIO);
     rp1_gpio_write(USB_VBUS_GPIO, true);
     timer_delay_ms(100);  /* let VBUS stabilise and devices power up */
+#endif
 
+#if PIOS_PLATFORM != PIOS_PLATFORM_QEMU_VIRT
     xhci_base = RP1_BAR_BASE +
         (selected_controller ? XHCI_USB1_OFFSET : XHCI_USB0_OFFSET);
 
     if (!dwc3_init(xhci_base)) return false;
+#endif
     stats.init_stage = 2U;
 
     u32 caplength = xr(CAP_CAPLENGTH) & 0xFF;
@@ -603,7 +629,8 @@ bool xhci_init(void) {
     stats.init_stage = 4U;
 
     uart_puts("[xhci] Controller running");
-    /* Dump PCIe inbound BAR config (set by firmware) for DMA validation */
+    /* Dump PCIe inbound BAR config (set by firmware) for DMA validation. */
+#if PIOS_PLATFORM != PIOS_PLATFORM_QEMU_VIRT
     uart_puts(" BAR2_LO=");
     uart_hex(mmio_read(PCIE_RC_BASE + 0x4034));
     uart_puts(" BAR2_HI=");
@@ -611,11 +638,13 @@ bool xhci_init(void) {
     uart_puts(" IMAN=");
     uart_hex(mmio_read(rt_base + IR0_IMAN));
     uart_puts("\n");
+#endif
 
     /* DMA address sanity check: verify RP1 inbound BAR covers our DMA range.
      * The firmware sets BAR2 to cover system RAM. Log the config so we can
      * detect identity-vs-offset DMA mapping issues at boot. */
     {
+#if PIOS_PLATFORM != PIOS_PLATFORM_QEMU_VIRT
         u32 bar2_lo = mmio_read(PCIE_RC_BASE + 0x4034);
         u32 bar2_hi = mmio_read(PCIE_RC_BASE + 0x4038);
         u32 remap_lo = mmio_read(PCIE_RC_BASE + 0x40B4);
@@ -636,6 +665,7 @@ bool xhci_init(void) {
             uart_puts("[xhci] WARNING: DCBAA DMA addr above 4GB but BAR2_HI=0\n");
             uart_puts("[xhci] DMA may fail — check RP1_DMA_OFFSET\n");
         }
+#endif
     }
 
     /* Drain any stale events from prior operation */

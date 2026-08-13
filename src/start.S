@@ -246,6 +246,18 @@ _start:
     str     x2, [x0, #0]
 #endif
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT && PIOS_CACHE_WB_FROM_BOOT
+    /* QEMU virt PCI ECAM and the PCI MMIO32 aperture are device memory.
+     * They live inside the low 1GiB and must override the normal-RAM boot
+     * blocks before the first MMU enable. */
+    ldr     x7, =l2_table_boot
+    mov     x2, #0x401
+    mov     x5, #0x80
+    str     x2, [x7, x5, lsl #3]       /* 0x10000000 */
+    mov     x5, #0x1F8
+    str     x2, [x7, x5, lsl #3]       /* 0x3F000000 */
+#endif
+
     /* L1[1..3]: Cacheable RAM — ATTR(2) = 0x709 */
     mov     x2, #0x709
     mov     x3, #0x40000000
@@ -262,6 +274,15 @@ _start:
     /* QEMU ramfb/GOP can be placed at 0x140000000; map that 1GiB block NC. */
     mov     x2, #0x705
     mov     x5, #5
+    lsl     x3, x5, #30
+    orr     x4, x3, x2
+    lsl     x6, x5, #3
+    str     x4, [x0, x6]
+
+    /* QEMU PCI ECAM/high-MMIO lives in the 0x40_00000000 1GiB region. */
+    mov     x2, #0x401
+    movk    x2, #0x0060, lsl #48
+    mov     x5, #256
     lsl     x3, x5, #30
     orr     x4, x3, x2
     lsl     x6, x5, #3
