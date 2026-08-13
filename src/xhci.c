@@ -752,8 +752,9 @@ bool xhci_port_reset(u32 port, u32 *speed) {
             uart_puts("[xhci] Port reset done PORTSC=");
             uart_hex(sc);
             uart_puts("\n");
-            for (u32 settle = 0; settle < 40U; settle++) {
+            for (u32 settle = 0; settle < 200U; settle++) {
                 if ((sc & PORTSC_CCS) && (sc & PORTSC_PED) &&
+                    (sc & PORTSC_PLS_MASK) == PORTSC_PLS_U0 &&
                     ((sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) != 0U)
                     break;
                 timer_delay_ms(5);

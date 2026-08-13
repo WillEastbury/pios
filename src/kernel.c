@@ -24291,6 +24291,31 @@ void kernel_main(void) {
             uart_init();
             uart_puts("\n[uart] RP1 UART online\n");
             bp_ok("[uart] RP1 UART online");
+            bp_log("[i2c] RP1 I2C1 probe...");
+            if (rp1_i2c_init(100000U))
+                bp_ok("[i2c] RP1 I2C1 ready");
+            else
+                bp_warn("[i2c] RP1 I2C1 unavailable");
+            bp_log("[spi] RP1 SPI probe...");
+            u32 spi_present = 0U;
+            u32 spi_quad = 0U;
+            for (u32 spi = 0U; spi < RP1_SPI_COUNT; spi++) {
+                if (!rp1_spi_probe(spi))
+                    continue;
+                struct rp1_spi_diag sd;
+                rp1_spi_diag_snapshot(spi, &sd);
+                spi_present++;
+                if (sd.enhanced_frf)
+                    spi_quad++;
+            }
+            if (spi_present != 0U)
+                bp_ok("[spi] RP1 SPI cores present");
+            else
+                bp_warn("[spi] RP1 SPI cores unavailable");
+            if (spi_quad != 0U)
+                bp_ok("[qspi] enhanced SPI capability present");
+            else
+                bp_warn("[qspi] enhanced SPI capability unavailable");
             bp_log("[usb] registering storage+kbd...");
             usb_storage_register();
             usb_kbd_register();
