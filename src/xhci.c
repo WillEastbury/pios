@@ -717,17 +717,21 @@ u32 xhci_port_status(u32 port)
 bool xhci_port_reset(u32 port, u32 *speed) {
     u64 pa = op_base + 0x400 + (u64)port * 0x10;
     u32 sc = mmio_read(pa);
+    stats.last_port = port;
+    stats.last_port_status = sc;
 
     if (XHCI_IS_USB3_PORT(port)) {
         /* USB3: wait for link state U0 instead of port reset */
         for (u32 i = 0; i < 200; i++) {
             sc = mmio_read(pa);
+            stats.last_port_status = sc;
             if ((sc & PORTSC_PLS_MASK) == PORTSC_PLS_U0 && (sc & PORTSC_PED)) {
                 *speed = (sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
                 return true;
             }
             timer_delay_ms(5);
         }
+        stats.port_reset_failures++;
         return false;
     }
 
@@ -741,6 +745,7 @@ bool xhci_port_reset(u32 port, u32 *speed) {
     for (u32 i = 0; i < 200; i++) {
         timer_delay_ms(5);
         sc = mmio_read(pa);
+        stats.last_port_status = sc;
         if (!(sc & PORTSC_PR)) {
             uart_puts("[xhci] Port reset done PORTSC=");
             uart_hex(sc);
@@ -752,6 +757,7 @@ bool xhci_port_reset(u32 port, u32 *speed) {
             return (sc & PORTSC_CCS) && (sc & PORTSC_PED) && *speed != 0;
         }
     }
+    stats.port_reset_failures++;
     uart_puts("[xhci] Port reset timeout PORTSC=");
     uart_hex(sc);
     uart_puts("\n");

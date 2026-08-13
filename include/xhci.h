@@ -43,6 +43,9 @@ struct xhci_stats {
     u32 ep_stalls;
     u32 ep_resets;
     u32 ring_full;
+    u32 port_reset_failures;
+    u32 last_port;
+    u32 last_port_status;
 };
 
 /* Controller lifecycle */
