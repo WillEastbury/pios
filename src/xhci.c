@@ -197,6 +197,7 @@ static u32 cmd_enq, cmd_cycle;
 static u32 evt_deq, evt_cycle;
 static u32 selected_controller;
 static bool xhci_qemu_backend;
+static u32 controller_port_count[2];
 
 static struct {
     bool pending;
@@ -461,6 +462,8 @@ bool xhci_init(void) {
     memset(&stats, 0, sizeof(stats));
     memset(&interrupt_xfer, 0, sizeof(interrupt_xfer));
     stats.init_stage = 1U;
+    if (selected_controller < 2U)
+        controller_port_count[selected_controller] = 0U;
 
     xhci_qemu_backend = false;
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
@@ -507,6 +510,8 @@ bool xhci_init(void) {
 
     hci_max_slots = hcsparams1 & 0xFF;
     hci_max_ports = (hcsparams1 >> 24) & 0xFF;
+    if (selected_controller < 2U)
+        controller_port_count[selected_controller] = hci_max_ports;
     ctx_size = (hccparams1 & (1 << 2)) ? 64 : 32;
 
     /* Validate context size — must be 32 or 64 per xHCI spec */
@@ -677,6 +682,25 @@ bool xhci_init(void) {
 /* ---- Public: Port Operations ---- */
 
 u32 xhci_port_count(void) { return hci_max_ports; }
+
+u32 xhci_controller_port_count(u32 controller)
+{
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    return controller == 0U && xhci_qemu_backend ? hci_max_ports : 0U;
+#else
+    if (controller > 1U)
+        return 0U;
+    if (controller_port_count[controller] != 0U)
+        return controller_port_count[controller];
+    u64 base = RP1_BAR_BASE +
+               (controller ? XHCI_USB1_OFFSET : XHCI_USB0_OFFSET);
+    u32 cap = mmio_read(base + CAP_CAPLENGTH) & 0xFFU;
+    if (cap == 0U || cap == 0xFFU)
+        return 0U;
+    u32 hcs = mmio_read(base + cap + CAP_HCSPARAMS1);
+    return (hcs >> 24) & 0xFFU;
+#endif
+}
 
 bool xhci_port_connected(u32 port) {
     if (port >= hci_max_ports) return false;

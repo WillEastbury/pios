@@ -14104,6 +14104,11 @@ static void ui_cmd_usb(u32 argc, char **argv)
         ui_console_write("->0x");
         ui_console_hex_fixed(st->gusb3_after, 8);
         ui_console_write("\n");
+        ui_console_write("controllers=0:");
+        ui_console_u32_dec(xhci_controller_port_count(0U));
+        ui_console_write(" 1:");
+        ui_console_u32_dec(xhci_controller_port_count(1U));
+        ui_console_write("\n");
         ui_console_write("ports=");
         u32 ports = xhci_port_count();
         if (ports > 16U) ports = 16U;

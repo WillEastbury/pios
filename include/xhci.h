@@ -51,6 +51,7 @@ bool xhci_init(void);
 
 /* Port operations */
 u32  xhci_port_count(void);
+u32  xhci_controller_port_count(u32 controller);
 bool xhci_port_connected(u32 port);
 u32  xhci_port_status(u32 port);
 bool xhci_port_reset(u32 port, u32 *speed);
