@@ -61,6 +61,7 @@ static u32 num_drivers;
 
 static struct usb_device the_device;
 static bool device_valid;
+static bool controller_ready;
 
 static u8 desc_buf[512] ALIGNED(64);
 
@@ -234,12 +235,14 @@ static void probe_drivers(void) {
 
 bool usb_init(void) {
     device_valid = false;
+    controller_ready = false;
     num_drivers = num_drivers; /* preserve pre-registered drivers */
 
     for (u32 ctl = 0; ctl < 2; ctl++) {
         xhci_select_controller(ctl);
         if (!xhci_init())
             continue;
+        controller_ready = true;
 
         timer_delay_ms(300); /* Circle uses a longer root-port settle delay. */
 
@@ -280,5 +283,5 @@ bool usb_init(void) {
     }
 
     uart_puts("[usb] No USB device found\n");
-    return false;
+    return controller_ready;
 }

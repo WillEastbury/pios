@@ -14104,6 +14104,16 @@ static void ui_cmd_usb(u32 argc, char **argv)
         ui_console_write("->0x");
         ui_console_hex_fixed(st->gusb3_after, 8);
         ui_console_write("\n");
+        ui_console_write("ports=");
+        u32 ports = xhci_port_count();
+        if (ports > 16U) ports = 16U;
+        for (u32 p = 0; p < ports; p++) {
+            ui_console_write(" ");
+            ui_console_u32_dec(p);
+            ui_console_write(":");
+            ui_console_hex_fixed(xhci_port_status(p), 8);
+        }
+        ui_console_write("\n");
         ui_console_write("usage: usb status|reinit|poll\n");
         return;
     }

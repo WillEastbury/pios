@@ -683,6 +683,13 @@ bool xhci_port_connected(u32 port) {
     return (mmio_read(op_base + 0x400 + (u64)port * 0x10) & PORTSC_CCS) != 0;
 }
 
+u32 xhci_port_status(u32 port)
+{
+    if (port >= hci_max_ports)
+        return 0U;
+    return mmio_read(op_base + 0x400 + (u64)port * 0x10);
+}
+
 bool xhci_port_reset(u32 port, u32 *speed) {
     u64 pa = op_base + 0x400 + (u64)port * 0x10;
     u32 sc = mmio_read(pa);
