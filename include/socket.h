@@ -86,8 +86,11 @@ bool sock_local_port(i32 fd, u16 *port_out);
 i32 sock_send_nb(i32 fd, const void *data, u32 len);
 i32 sock_recv_nb(i32 fd, void *buf, u32 len);
 
-/* Process socket FIFO messages on Core 0 (called from net_poll) */
+/* Process socket FIFO messages on Core 0. */
 void socket_handle_fifo(u32 from_core);
+
+/* Advance bounded asynchronous socket operations from Core 0 service context. */
+void socket_service_step(void);
 
 /* Init socket subsystem on Core 0 */
 void socket_init(void);

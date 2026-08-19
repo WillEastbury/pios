@@ -47,6 +47,8 @@ struct socket_desc {
 #define SOCK_STATE_LISTEN   2
 #define SOCK_STATE_CONN     3
 #define SOCK_STATE_CLOSED   4
+#define SOCKET_PENDING_MAX  32U
+#define SOCKET_PENDING_TIMEOUT_MS 5000ULL
 
 /* Per-core socket tables (cores 2 and 3) */
 static struct socket_desc sockets[2][SOCKET_MAX];
@@ -60,6 +62,109 @@ static u32 socket_bump_generation(u32 old)
 {
     u32 g = old + 1U;
     return g ? g : 1U;
+}
+
+struct socket_pending {
+    bool used;
+    u32 from_core;
+    struct fifo_msg request;
+    tcp_conn_t conn;
+    u64 deadline_ms;
+} ALIGNED(64);
+static struct socket_pending pending[SOCKET_PENDING_MAX];
+
+static void socket_reply(u32 to_core, const struct fifo_msg *request,
+                         u32 status, u32 param, nic_iface_t iface)
+{
+    struct fifo_msg reply = {0};
+    reply.tag = request->tag;
+    reply.type = MSG_SOCK_RESULT;
+    reply.status = status;
+    reply.param = param;
+    reply.iface = iface;
+    fifo_push(CORE_NET, to_core, &reply);
+}
+
+static struct socket_pending *socket_pending_alloc(void)
+{
+    for (u32 i = 0; i < SOCKET_PENDING_MAX; i++) {
+        if (!pending[i].used) {
+            pending[i].used = true;
+            return &pending[i];
+        }
+    }
+    return NULL;
+}
+
+static bool socket_pending_start(u32 from_core, const struct fifo_msg *request,
+                                 tcp_conn_t conn)
+{
+    struct socket_pending *op = socket_pending_alloc();
+    if (!op)
+        return false;
+    op->from_core = from_core;
+    op->request = *request;
+    op->conn = conn;
+    op->deadline_ms = timer_monotonic_ms() + SOCKET_PENDING_TIMEOUT_MS;
+    return true;
+}
+
+void socket_service_step(void)
+{
+    u64 now = timer_monotonic_ms();
+    for (u32 i = 0; i < SOCKET_PENDING_MAX; i++) {
+        struct socket_pending *op = &pending[i];
+        if (!op->used)
+            continue;
+
+        bool done = false;
+        u32 status = 1U;
+        u32 param = 0U;
+        nic_iface_t iface = NIC_IFACE_ANY;
+        if (op->request.type == MSG_SOCK_CONNECT) {
+            u32 state = tcp_state(op->conn);
+            if (state == TCP_ESTABLISHED) {
+                status = 0U;
+                param = (u32)op->conn;
+                iface = tcp_iface(op->conn);
+                done = true;
+            } else if (state == TCP_CLOSED || now >= op->deadline_ms) {
+                done = true;
+            }
+        } else if (op->request.type == MSG_SOCK_ACCEPT) {
+            tcp_conn_t accepted = tcp_accept(op->conn);
+            if (accepted >= 0) {
+                status = 0U;
+                param = (u32)accepted;
+                iface = tcp_iface(accepted);
+                done = true;
+            } else if (now >= op->deadline_ms) {
+                done = true;
+            }
+        } else if (op->request.type == MSG_SOCK_RECV) {
+            u32 avail = tcp_readable(op->conn);
+            if (avail > 0) {
+                param = tcp_read(op->conn, (void *)(usize)op->request.buffer,
+                                 op->request.length);
+                status = 0U;
+                iface = tcp_iface(op->conn);
+                done = true;
+            } else {
+                u32 state = tcp_state(op->conn);
+                if (state == TCP_CLOSED || state == TCP_CLOSE_WAIT) {
+                    status = 0U;
+                    iface = tcp_iface(op->conn);
+                    done = true;
+                } else if (now >= op->deadline_ms) {
+                    done = true;
+                }
+            }
+        }
+        if (done) {
+            socket_reply(op->from_core, &op->request, status, param, iface);
+            op->used = false;
+        }
+    }
 }
 
 static void socket_poison(struct socket_desc *s)
@@ -418,27 +523,8 @@ static void socket_handle_msg(u32 from_core, const struct fifo_msg *req)
         u16 dst_port = (u16)(msg.tag & 0xFFFF);
         tcp_conn_t conn = tcp_connect_on((nic_iface_t)msg.iface,
                                          dst_ip, dst_port);
-        if (conn >= 0) {
-            /* Poll until established or failed */
-            for (u32 i = 0; i < 5000; i++) {
-                net_poll();
-                u32 st = tcp_state(conn);
-                if (st == TCP_ESTABLISHED) {
-                    reply.status = 0;
-                    reply.param = (u32)conn;
-                    reply.iface = tcp_iface(conn);
-                    fifo_push(CORE_NET, from_core, &reply);
-                    return;
-                }
-                if (st == TCP_CLOSED) break;
-                timer_delay_ms(1);
-            }
-            reply.status = 1;
-            fifo_push(CORE_NET, from_core, &reply);
-        } else {
-            reply.status = 1;
-            fifo_push(CORE_NET, from_core, &reply);
-        }
+        if (conn < 0 || !socket_pending_start(from_core, &msg, conn))
+            socket_reply(from_core, &msg, 1U, 0U, NIC_IFACE_ANY);
         break;
     }
 
@@ -454,21 +540,8 @@ static void socket_handle_msg(u32 from_core, const struct fifo_msg *req)
 
     case MSG_SOCK_ACCEPT: {
         tcp_conn_t listen_conn = (tcp_conn_t)msg.param;
-        /* Poll until a connection is accepted */
-        for (u32 i = 0; i < 30000; i++) {
-            net_poll();
-            tcp_conn_t ac = tcp_accept(listen_conn);
-            if (ac >= 0) {
-                reply.status = 0;
-                reply.param = (u32)ac;
-                reply.iface = tcp_iface(ac);
-                fifo_push(CORE_NET, from_core, &reply);
-                return;
-            }
-            timer_delay_ms(1);
-        }
-        reply.status = 1;
-        fifo_push(CORE_NET, from_core, &reply);
+        if (!socket_pending_start(from_core, &msg, listen_conn))
+            socket_reply(from_core, &msg, 1U, 0U, NIC_IFACE_ANY);
         break;
     }
 
@@ -503,29 +576,8 @@ static void socket_handle_msg(u32 from_core, const struct fifo_msg *req)
             fifo_push(CORE_NET, from_core, &reply);
             break;
         }
-        /* Poll until data available or timeout */
-        for (u32 i = 0; i < 5000; i++) {
-            net_poll();
-            u32 avail = tcp_readable(conn);
-            if (avail > 0) {
-                u32 rd = tcp_read(conn, (void *)(usize)msg.buffer, msg.length);
-                reply.param = rd;
-                reply.status = 0;
-                fifo_push(CORE_NET, from_core, &reply);
-                return;
-            }
-            u32 st = tcp_state(conn);
-            if (st == TCP_CLOSED || st == TCP_CLOSE_WAIT) {
-                reply.param = 0;
-                reply.status = 0;
-                fifo_push(CORE_NET, from_core, &reply);
-                return;
-            }
-            timer_delay_ms(1);
-        }
-        reply.param = 0;
-        reply.status = 1;
-        fifo_push(CORE_NET, from_core, &reply);
+        if (!socket_pending_start(from_core, &msg, conn))
+            socket_reply(from_core, &msg, 1U, 0U, NIC_IFACE_ANY);
         break;
     }
 
@@ -558,4 +610,5 @@ void socket_init(void) {
     for (u32 c = 0; c < 2; c++)
         for (u32 i = 0; i < SOCKET_MAX; i++)
             socket_poison(&sockets[c][i]);
+    simd_zero(pending, sizeof(pending));
 }

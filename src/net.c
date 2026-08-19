@@ -1370,6 +1370,7 @@ void net_ingress_process(nic_iface_t iface, const u8 *frame, u32 len,
 void net_service_step(void)
 {
     net_handle_fifo_request();
+    socket_service_step();
     workq_drain(4);
 }
 
