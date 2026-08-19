@@ -10,6 +10,7 @@
 
 #pragma once
 #include "types.h"
+#include "nic.h"
 
 #define TCP_MAX_CONNECTIONS 128
 #define TCP_BUF_SIZE        8192
@@ -37,7 +38,8 @@ void tcp_init(void);
 
 /* Process incoming TCP segment (called from net.c IP dispatch) */
 void tcp_input(const u8 *frame, u32 len, u32 src_ip, u32 dst_ip,
-               const u8 *payload, u32 payload_len, bool checksum_trusted);
+               const u8 *payload, u32 payload_len, bool checksum_trusted,
+               nic_iface_t ingress_iface);
 
 /* Timer tick (call once per ~100ms from net_poll or timer) */
 void tcp_tick(void);
@@ -46,6 +48,8 @@ void tcp_tick(void);
 
 /* Open an active connection (SYN_SENT) */
 tcp_conn_t tcp_connect(u32 dst_ip, u16 dst_port);
+tcp_conn_t tcp_connect_on(nic_iface_t iface, u32 dst_ip, u16 dst_port);
+nic_iface_t tcp_iface(tcp_conn_t conn);
 
 /* ---- Server API ---- */
 
@@ -106,6 +110,7 @@ typedef struct {
     u32 rx_used;
     u32 tx_used;
     u32 retries;
+    nic_iface_t iface;
 } tcp_snapshot_entry_t;
 
 /* Snapshot TCP listeners and sessions. Returns number written. */

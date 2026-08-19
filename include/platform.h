@@ -8,12 +8,47 @@
 #define PIOS_PLATFORM_HYPERV_AMD64 5
 #define PIOS_PLATFORM_PI3        6
 #define PIOS_PLATFORM_PIZERO2W   7
+#define PIOS_PLATFORM_FVP_A76_GICV2 8
 
 #ifndef PIOS_PLATFORM
 #define PIOS_PLATFORM PIOS_PLATFORM_PI5
 #endif
 
-#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+#if PIOS_PLATFORM == PIOS_PLATFORM_FVP_A76_GICV2
+/* Arm Base FVP: Cortex-A76 cluster with the GICv2-compatible legacy
+ * CPU interface. This is an architectural CPU/MMU/GIC test target, not a
+ * BCM2712/RP1 hardware model. */
+#define PIOS_PLATFORM_NAME          "fvp-a76-gicv2"
+#define PIOS_PLATFORM_CORE_COUNT    4U
+#define PIOS_PERIPH_BASE            0x1C000000UL
+#define PIOS_UART0_BASE             0x1C090000UL
+#define PIOS_MBOX_BASE              0UL
+#define PIOS_EMMC2_BASE             0UL
+#define PIOS_GENET_BASE             0UL
+#define PIOS_PCIE_RC_BASE           0UL
+#define PIOS_RP1_BAR_BASE           0UL
+#define PIOS_GIC_BASE               0x2C000000UL
+#define PIOS_GICD_BASE              0x2C040000UL
+#define PIOS_GICC_BASE              0x2C000000UL
+#define PIOS_QA7_BASE               0UL
+#define PIOS_HAS_GIC                1
+#define PIOS_HAS_RP1                0
+#define PIOS_HAS_PCIE               0
+#define PIOS_HAS_GENET              0
+#define PIOS_HAS_SD                 0
+#define PIOS_HAS_MAILBOX_FB         0
+#define PIOS_HAS_BOOTINFO_FB        0
+#define PIOS_HAS_DMA                0
+#define PIOS_HAS_PSCI_SECONDARIES   0
+#define PIOS_PSCI_USE_HVC           0
+#define PIOS_PSCI_AFF_SHIFT         0
+#define PIOS_HAS_VIRTIO_NET         0
+#define PIOS_ENABLE_NATIVE_VIDEOCORE 0
+#define PIOS_HAS_HYPERV             0
+#define PIOS_HAS_VMBUS              0
+#define PIOS_HAS_WIFI_SDIO2         0
+#define PIOS_WIFI_SDIO2_BASE        0UL
+#elif PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
 #define PIOS_PLATFORM_NAME          "qemu-virt"
 #define PIOS_PLATFORM_CORE_COUNT    4U
 #define PIOS_PERIPH_BASE            0x09000000UL

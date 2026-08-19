@@ -121,9 +121,12 @@ _start:
     mov     x0, #(1 << 31)
     msr     hcr_el2, x0
 
-    /* SCTLR_EL1: RES1 bits set (Circle's value: 0x30D00800) */
+    /* SCTLR_EL1: RES1 bits set. Clear nTWI/nTWE so EL0 WFI/WFE return
+     * through the kernel scheduler instead of sleeping as RUNNING work. */
     mov     x0, #0x0800
     movk    x0, #0x30D0, lsl #16
+    bic     x0, x0, #(1 << 16)  /* nTWI = 0: trap WFI from EL0 */
+    bic     x0, x0, #(1 << 18)  /* nTWE = 0: trap WFE from EL0 */
     msr     sctlr_el1, x0
 
     /* Return to EL1h (SP_EL1). Exception handlers use SP_EL1, so keep the
@@ -513,6 +516,8 @@ secondary_entry:
     bic     x1, x1, #(1 << 12)
     bic     x1, x1, #(1 << 1)   /* no A  (match core 0: allow unaligned Normal accesses) */
     bic     x1, x1, #(1 << 3)   /* no SA (match core 0) */
+    bic     x1, x1, #(1 << 16)  /* nTWI = 0: trap WFI from EL0 */
+    bic     x1, x1, #(1 << 18)  /* nTWE = 0: trap WFE from EL0 */
     msr     sctlr_el1, x1
     isb
     ldr     x2, =core_asm_stage
@@ -547,6 +552,8 @@ secondary_entry:
     orr     x1, x1, #(1 << 12)
     bic     x1, x1, #(1 << 1)   /* no A  (match core 0) */
     bic     x1, x1, #(1 << 3)   /* no SA (match core 0) */
+    bic     x1, x1, #(1 << 16)  /* nTWI = 0: trap WFI from EL0 */
+    bic     x1, x1, #(1 << 18)  /* nTWE = 0: trap WFE from EL0 */
     msr     sctlr_el1, x1
     isb
     ldr     x2, =core_asm_stage

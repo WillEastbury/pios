@@ -172,6 +172,8 @@ struct cyw43_diag {
      * indication path is broken but RX itself works. */
     u32 rx_probe_attempts;
     u32 rx_frames;
+    u32 data_rx_queued;
+    u32 data_rx_dropped;
     /* Times the SDIO in-band card interrupt was found asserted. Non-zero means
      * the hardware indication works and full IRQ-driven RX is achievable. */
     u32 rx_card_irqs;
@@ -203,7 +205,7 @@ struct cyw43_diag {
     u32 eapol_words[9];
     /* Headroom so adding a counter does not immediately break the cache-line
      * invariant below; shrink this when adding fields. */
-    u32 reserved[13];
+    u32 reserved[11];
 } ALIGNED(64);
 
 _Static_assert(sizeof(struct cyw43_diag) == 320U,

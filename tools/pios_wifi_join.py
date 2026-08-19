@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -17,6 +18,33 @@ def terminal_command(host: str, command: str, timeout: float) -> str:
     url = f"http://{host}/api/terminal?cmd={encoded}"
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return response.read().decode("utf-8", "replace").strip()
+
+
+def select_scan_target(scan: str, ssid: str) -> tuple[str, int] | None:
+    best: tuple[int, str, int] | None = None
+    for line in scan.splitlines():
+        fields = line.split()
+        if not fields or fields[0] != ssid:
+            continue
+        values: dict[str, str] = {}
+        for field in fields[1:]:
+            key, separator, value = field.partition("=")
+            if separator:
+                values[key] = value
+        bssid = values.get("bssid", "")
+        chanspec = values.get("cs", "")
+        rssi = values.get("rssi", "")
+        if not re.fullmatch(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}", bssid):
+            continue
+        try:
+            candidate = (int(rssi), bssid, int(chanspec, 16))
+        except ValueError:
+            continue
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    if best is None:
+        return None
+    return best[1], best[2]
 
 
 def main() -> int:
@@ -53,24 +81,29 @@ def main() -> int:
         raise SystemExit("PIOS wifi join currently requires values without spaces.")
 
     fixed_target = len(bssid) == 12 and chanspec != 0
-    if not args.no_scan and not fixed_target:
+    join_bssid = bssid
+    join_chanspec = chanspec
+    print(terminal_command(host, "wifi init", args.timeout))
+    if not args.no_scan:
         print(terminal_command(host, "wifi scan", args.timeout))
         deadline = time.monotonic() + args.timeout
         while time.monotonic() < deadline:
             time.sleep(2.0)
             scan = terminal_command(host, "wifi results", args.timeout)
-            found = any(
-                line.startswith(f"{ssid} ") for line in scan.splitlines()
-            )
-            if "WiFi scan count=" in scan and found:
+            target = select_scan_target(scan, ssid)
+            if "WiFi scan count=" in scan and target:
                 print(scan)
+                join_bssid, join_chanspec = target
+                fixed_target = True
+                print(
+                    "Using current scan target "
+                    f"{join_bssid} chanspec=0x{join_chanspec:04x}"
+                )
                 break
         else:
             raise SystemExit(f"SSID {ssid!r} not found before scan timeout")
-        # cyw43_scan_get_results() now returns data only after the driver's
-        # asynchronous completion/result state is settled. The latest-event
-        # diagnostic is not an authoritative completion latch: a late partial
-        # BSS event may legitimately overwrite event 69/status 0.
+        # Reinitialize after scanning: this refreshes the SDPCM control window
+        # before the targeted join while preserving the completed scan cache.
         print(terminal_command(host, "wifi init", args.timeout))
 
     try:
@@ -89,7 +122,11 @@ def main() -> int:
             result = terminal_command(
                 host,
                 f"wifi joinpmk {ssid} {pmk}"
-                + (f" {bssid} {chanspec:04x}" if fixed_target else ""),
+                + (
+                    f" {join_bssid} {join_chanspec:04x}"
+                    if fixed_target
+                    else ""
+                ),
                 args.timeout,
             )
         else:

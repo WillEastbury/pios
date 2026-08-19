@@ -16,6 +16,7 @@
 
 #pragma once
 #include "types.h"
+#include "nic.h"
 
 #define ETH_P_ARP       0x0806
 
@@ -50,25 +51,34 @@ struct arp_snapshot_entry {
 
 /* Init ARP subsystem (called from net_init) */
 void arp_init(u32 our_ip, u32 our_mask, const u8 *our_mac);
+void arp_set_interface(nic_iface_t iface);
+void arp_init_iface(nic_iface_t iface, u32 our_ip, u32 our_mask,
+                    const u8 *our_mac);
 
 /* Add a static entry (never expires, never overwritten) */
 void arp_add_static(u32 ip, const u8 *mac);
+void arp_add_static_iface(nic_iface_t iface, u32 ip, const u8 *mac);
 
 /* Resolve IP → MAC. Returns pointer to MAC or NULL. If NULL, an ARP
  * request is queued automatically. Caller should retry later. */
 const u8 *arp_resolve(u32 ip);
+const u8 *arp_resolve_iface(nic_iface_t iface, u32 ip);
 
 /* Process an incoming ARP frame (called from net_poll on ETH_P_ARP) */
 void arp_input(const u8 *frame, u32 len);
+void arp_input_iface(nic_iface_t iface, const u8 *frame, u32 len);
 
 /* Send gratuitous ARP announcements (call at boot) */
 void arp_announce(void);
+void arp_announce_iface(nic_iface_t iface);
 
 /* Fire a single gratuitous ARP probe (no delay) — for stall recovery testing. */
 void arp_probe(void);
+void arp_probe_iface(nic_iface_t iface);
 
 /* Age out stale entries (call periodically, e.g. once per second) */
 void arp_tick(void);
+void arp_tick_iface(nic_iface_t iface);
 
 /* Get ARP stats */
 const arp_stats_t *arp_get_stats(void);

@@ -132,13 +132,23 @@ static inline void el0_sched_publish_control(u32 state, u64 observed_seq)
     dmb_ishst();
 }
 
+/*
+ * SCTLR_EL1.nTWI traps EL0 WFI to the scheduler. Unlike WFE, WFI cannot be
+ * satisfied by a stale local event register, so an idle worker cannot resume
+ * and burn another quantum before its published AWAITING line is consumed.
+ */
+static inline void el0_sched_wait_for_scheduler(void)
+{
+    __asm__ volatile("wfi" ::: "memory");
+}
+
 static inline NORETURN void el0_sched_exit(u64 code)
 {
     el0_sched_publish_control(PCTL_STATE_EXITING, 0);
     while (!el0_sched_publish(EL0_SCHED_OP_EXIT, 0, code, 0))
-        __asm__ volatile("wfe" ::: "memory");
+        el0_sched_wait_for_scheduler();
     for (;;)
-        __asm__ volatile("wfe" ::: "memory");
+        el0_sched_wait_for_scheduler();
 }
 
 static inline void el0_sched_park(void)
@@ -146,11 +156,11 @@ static inline void el0_sched_park(void)
     struct el0_sched_slot *slot = el0_sched_slot();
     el0_sched_publish_control(PCTL_STATE_AWAITING,
                               slot->meta.inbound_seq);
-    __asm__ volatile("wfe" ::: "memory");
+    el0_sched_wait_for_scheduler();
 }
 
 static inline void el0_sched_yield(void)
 {
     el0_sched_publish_control(PCTL_STATE_YIELDED, 0);
-    __asm__ volatile("wfe" ::: "memory");
+    el0_sched_wait_for_scheduler();
 }

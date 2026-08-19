@@ -72,6 +72,13 @@ struct proc_sched_core_snapshot {
     u64 preemptions;
     u64 soft_events;
     u64 soft_boosts;
+    u64 wfx_traps;
+    u32 wfx_awaits;
+    u32 wfx_keeps;
+    u32 wfx_last_state;
+    u32 wfx_last_generation;
+    u64 wfx_last_slot_va;
+    u64 wfx_last_slot_pte;
 } PACKED;
 
 struct proc_sched_user_state {
@@ -592,6 +599,8 @@ u64  proc_svc_bad_calls(void);
 /* Preemption (user cores only) */
 #define PROC_PREEMPT_TIMER_HZ    1000U
 #define PROC_PREEMPT_QUANTUM_MS  5U
+/* Enable this core's targeted FIFO/SGI doorbell after GIC + FIFO setup. */
+void proc_fifo_doorbell_init(void);
 void proc_preempt_init(u32 timer_hz, u32 quantum_ms);
 void proc_irq_maybe_preempt(struct irq_frame *frame);
 /* Preemption-accounting half of the unified timer tick hook (see kernel.c). */

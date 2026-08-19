@@ -32,6 +32,7 @@ static u32 our_ip;
 static u32 our_gw;
 static u32 our_mask;
 static u8  our_mac[6];
+static nic_iface_t net_current_iface = NIC_IFACE_WIRED;
 
 #define UDP_SUBSCRIBER_MAX 4U
 struct udp_subscriber_slot {
@@ -84,6 +85,67 @@ static u8 tx_frame[2048] ALIGNED(64);
 
 static u8 multicast_macs[NET_MAX_MULTICAST_MACS][6];
 static u32 multicast_count;
+
+struct net_iface_state {
+    bool configured;
+    u32 ip;
+    u32 gw;
+    u32 mask;
+    u8 mac[6];
+    struct neighbor_entry neighbors[MAX_NEIGHBORS];
+    u32 neighbor_count;
+    struct net_route_entry routes[NET_ROUTE_MAX];
+    u32 route_count;
+    u8 gw_mac[6];
+    bool gw_mac_set;
+    u8 multicast_macs[NET_MAX_MULTICAST_MACS][6];
+    u32 multicast_count;
+};
+static struct net_iface_state net_ifaces[NIC_IFACE_MAX];
+static u8 resolve_mac_copy[NIC_IFACE_MAX][6];
+
+static void net_save_iface(void)
+{
+    if (net_current_iface >= NIC_IFACE_MAX)
+        return;
+    struct net_iface_state *s = &net_ifaces[net_current_iface];
+    s->configured = our_ip != 0U;
+    s->ip = our_ip;
+    s->gw = our_gw;
+    s->mask = our_mask;
+    simd_memcpy(s->mac, our_mac, 6);
+    simd_memcpy(s->neighbors, neighbors, sizeof(neighbors));
+    s->neighbor_count = neighbor_count;
+    simd_memcpy(s->routes, routes, sizeof(routes));
+    s->route_count = route_count;
+    simd_memcpy(s->gw_mac, gw_mac, 6);
+    s->gw_mac_set = gw_mac_set;
+    simd_memcpy(s->multicast_macs, multicast_macs, sizeof(multicast_macs));
+    s->multicast_count = multicast_count;
+}
+
+static bool net_load_iface(nic_iface_t iface)
+{
+    if (iface >= NIC_IFACE_MAX || !net_ifaces[iface].configured)
+        return false;
+    struct net_iface_state *s = &net_ifaces[iface];
+    net_current_iface = iface;
+    our_ip = s->ip;
+    our_gw = s->gw;
+    our_mask = s->mask;
+    simd_memcpy(our_mac, s->mac, 6);
+    simd_memcpy(neighbors, s->neighbors, sizeof(neighbors));
+    neighbor_count = s->neighbor_count;
+    simd_memcpy(routes, s->routes, sizeof(routes));
+    route_count = s->route_count;
+    simd_memcpy(gw_mac, s->gw_mac, 6);
+    gw_mac_set = s->gw_mac_set;
+    simd_memcpy(multicast_macs, s->multicast_macs, sizeof(multicast_macs));
+    multicast_count = s->multicast_count;
+    nic_set_local_ipv4_for(iface, our_ip);
+    arp_set_interface(iface);
+    return true;
+}
 
 static u16 ip_id_counter;
 
@@ -221,9 +283,14 @@ void net_firewall_install_defaults(void) {
     nic_filter_clear();
     nic_filter_set_default(false, true);
 
+    for (u32 fi = NIC_IFACE_WIRED; fi <= NIC_IFACE_WIFI; fi++) {
+        if (!net_ifaces[fi].configured)
+            continue;
+        (void)net_load_iface((nic_iface_t)fi);
     simd_zero(&rule, sizeof(rule));
     rule.direction = NIC_FILTER_DIR_IN;
     rule.action = NIC_FILTER_ALLOW;
+    rule.iface = (u8)fi;
     rule.flags = NIC_FILTER_ETHERTYPE | NIC_FILTER_IP_TO;
     rule.ethertype = ETH_P_ARP;
     rule.ip_to = our_ip;
@@ -295,6 +362,8 @@ void net_firewall_install_defaults(void) {
     rule.ip_to = our_ip;
     rule.ip_proto = IP_PROTO_ICMP;
     (void)nic_filter_add(&rule);
+    }
+    (void)net_load_iface(NIC_IFACE_WIRED);
 }
 
 /* ================================================================== */
@@ -302,6 +371,7 @@ void net_firewall_install_defaults(void) {
 /* ================================================================== */
 
 void net_add_neighbor(u32 ip, const u8 *mac) {
+    arp_set_interface(net_current_iface);
     for (u32 i = 0; i < neighbor_count; i++) {
         if (neighbors[i].ip == ip) {
             simd_memcpy(neighbors[i].mac, mac, 6);
@@ -524,7 +594,7 @@ static void handle_icmp(const u8 *frame, u32 len,
         uart_puts("\n");
     }
 #endif
-    if (!nic_send(tx_frame, frame_len)) {
+    if (!nic_send_on(net_current_iface, tx_frame, frame_len)) {
 #if NET_ICMP_DIAG_VERBOSE
         static u32 send_fail_count = 0;
         if (send_fail_count++ < 5) {
@@ -595,7 +665,7 @@ static void handle_udp(const u8 *frame, u32 len,
 /*  IP - hardened ingress validation                                   */
 /* ================================================================== */
 
-static void handle_ip(const u8 *frame, u32 len, bool checksum_trusted) {
+static void UNUSED handle_ip(const u8 *frame, u32 len, bool checksum_trusted) {
     if (unlikely(len < sizeof(struct eth_hdr) + 20)) {
         stats.drop_runt++;
         return;
@@ -668,7 +738,7 @@ static void handle_ip(const u8 *frame, u32 len, bool checksum_trusted) {
         if (ipt > 20)
             tcp_input(frame, len, ntohl(ip->src_ip), ntohl(ip->dst_ip),
                       frame + payload_off, ipt - 20,
-                      checksum_trusted);
+                      checksum_trusted, net_current_iface);
         break;
     }
     case IP_PROTO_UDP:  handle_udp(frame, len, ip, payload_off, checksum_trusted);  break;
@@ -681,6 +751,7 @@ static void handle_ip(const u8 *frame, u32 len, bool checksum_trusted) {
 /* ================================================================== */
 
 static bool resolve_mac(u32 dst_ip, const u8 **mac_out) {
+    arp_set_interface(net_current_iface);
     struct net_route_entry route;
     u32 next_hop = 0;
     egress_trace.resolve_calls++;
@@ -736,8 +807,29 @@ const u8 *net_resolve_mac(u32 dst_ip)
     return mac;
 }
 
-bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
-                  const u8 *data, u16 len) {
+const u8 *net_resolve_mac_on(nic_iface_t iface, u32 dst_ip)
+{
+    if (iface == NIC_IFACE_ANY)
+        iface = nic_default_iface();
+    if (!net_interface_configured(iface) || !nic_iface_active(iface))
+        return NULL;
+    if (iface == net_current_iface)
+        return net_resolve_mac(dst_ip);
+    nic_iface_t previous = net_current_iface;
+    net_save_iface();
+    if (!net_load_iface(iface))
+        return NULL;
+    const u8 *mac = NULL;
+    bool ok = resolve_mac(dst_ip, &mac);
+    if (ok)
+        simd_memcpy(resolve_mac_copy[iface], mac, 6);
+    net_save_iface();
+    (void)net_load_iface(previous);
+    return ok ? resolve_mac_copy[iface] : NULL;
+}
+
+static bool net_send_udp_current(u32 dst_ip, u16 src_port, u16 dst_port,
+                                 const u8 *data, u16 len) {
     egress_trace.udp_attempts++;
     egress_trace.last_udp_src_port = src_port;
     egress_trace.last_udp_dst_port = dst_port;
@@ -798,7 +890,8 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
     stats.tx_bytes += frame_len;
     stats.udp_sent++;
 
-    bool tx_csum_offload = nic_tx_checksum_offload_enabled();
+    bool tx_csum_offload =
+        nic_tx_checksum_offload_enabled_for(net_current_iface);
     if (!tx_csum_offload) {
         if (len != 0)
             simd_memcpy(tx_frame + sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr),
@@ -810,7 +903,7 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
 
     bool ok = false;
     if (len == 0) {
-        ok = nic_send(tx_frame, frame_len);
+        ok = nic_send_on(net_current_iface, tx_frame, frame_len);
         egress_trace.last_udp_ok = ok ? 1U : 0U;
         if (ok) egress_trace.udp_ok++;
         else egress_trace.udp_fail++;
@@ -820,7 +913,7 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
     if (need_pad || !tx_csum_offload) {
         simd_memcpy(tx_frame + sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr),
                     data, len);
-        ok = nic_send(tx_frame, frame_len);
+        ok = nic_send_on(net_current_iface, tx_frame, frame_len);
         egress_trace.last_udp_ok = ok ? 1U : 0U;
         if (ok) egress_trace.udp_ok++;
         else egress_trace.udp_fail++;
@@ -828,11 +921,40 @@ bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
     }
 
     u32 head_len = sizeof(struct eth_hdr) + 20 + sizeof(struct udp_hdr);
-    ok = nic_send_parts(tx_frame, head_len, data, len);
+    ok = nic_send_parts_on(net_current_iface, tx_frame, head_len, data, len);
     egress_trace.last_udp_ok = ok ? 1U : 0U;
     if (ok) egress_trace.udp_ok++;
     else egress_trace.udp_fail++;
     return ok;
+}
+
+bool net_send_udp_on(nic_iface_t iface, u32 dst_ip, u16 src_port, u16 dst_port,
+                     const u8 *data, u16 len)
+{
+    if (iface == NIC_IFACE_ANY)
+        iface = nic_default_iface();
+    if (!net_interface_configured(iface) || !nic_iface_active(iface))
+        return false;
+    if (iface == net_current_iface)
+        return net_send_udp_current(dst_ip, src_port, dst_port, data, len);
+    nic_iface_t previous = net_current_iface;
+    net_save_iface();
+    if (!net_load_iface(iface))
+        return false;
+    bool ok = net_send_udp_current(dst_ip, src_port, dst_port, data, len);
+    net_save_iface();
+    (void)net_load_iface(previous);
+    return ok;
+}
+
+bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
+                  const u8 *data, u16 len)
+{
+    /* Core-0 callbacks invoked by an ingress packet reply on that same
+     * interface. Outside ingress dispatch net_current_iface is the wired
+     * default, preserving the historical single-NIC behaviour. */
+    return net_send_udp_on(net_current_iface, dst_ip, src_port, dst_port,
+                           data, len);
 }
 
 /* ================================================================== */
@@ -888,7 +1010,7 @@ bool net_icmp_echo_send(u32 dst_ip, u16 ident, u16 seq, u8 ttl) {
     g_ping.result.rtt_ms           = 0;
     g_ping.result.reply_ttl        = 0;
 
-    bool ok = nic_send(tx_frame, frame_len);
+    bool ok = nic_send_on(net_current_iface, tx_frame, frame_len);
     if (ok) { stats.tx_packets++; stats.tx_bytes += frame_len; }
     return ok;
 }
@@ -992,16 +1114,21 @@ void net_handle_fifo_request(void) {
     n = fifo_pop_batch(CORE_NET, CORE_USER0, msgs, 16);
     for (u32 i = 0; i < n; i++) {
         struct fifo_msg msg = msgs[i];
+        simd_zero(&reply, sizeof(reply));
         if (msg.type == MSG_NET_UDP_SEND && msg.buffer && msg.length <= 1472) {
             if (!ptr_in_core_ram(CORE_USER0, msg.buffer, msg.length))
                 continue;
             u16 sp = (u16)(msg.tag >> 16);
             u16 dp = (u16)(msg.tag & 0xFFFF);
-            bool ok = net_send_udp(msg.param, sp, dp,
-                                   (const u8 *)(usize)msg.buffer, (u16)msg.length);
+            nic_iface_t iface = (msg.iface == NIC_IFACE_ANY)
+                ? nic_default_iface() : (nic_iface_t)msg.iface;
+            bool ok = net_send_udp_on(iface, msg.param, sp, dp,
+                                      (const u8 *)(usize)msg.buffer,
+                                      (u16)msg.length);
             reply.type   = MSG_NET_UDP_DONE;
             reply.status = ok ? 0 : 1;
             reply.tag    = msg.tag;
+            reply.iface  = iface;
             fifo_push(CORE_NET, CORE_USER0, &reply);
         } else if (msg.type == MSG_DNS_RESOLVE && msg.buffer && msg.length <= 256U) {
             if (!ptr_in_core_ram(CORE_USER0, msg.buffer, msg.length)) {
@@ -1016,16 +1143,21 @@ void net_handle_fifo_request(void) {
     n = fifo_pop_batch(CORE_NET, CORE_USER1, msgs, 16);
     for (u32 i = 0; i < n; i++) {
         struct fifo_msg msg = msgs[i];
+        simd_zero(&reply, sizeof(reply));
         if (msg.type == MSG_NET_UDP_SEND && msg.buffer && msg.length <= 1472) {
             if (!ptr_in_core_ram(CORE_USER1, msg.buffer, msg.length))
                 continue;
             u16 sp = (u16)(msg.tag >> 16);
             u16 dp = (u16)(msg.tag & 0xFFFF);
-            bool ok = net_send_udp(msg.param, sp, dp,
-                                   (const u8 *)(usize)msg.buffer, (u16)msg.length);
+            nic_iface_t iface = (msg.iface == NIC_IFACE_ANY)
+                ? nic_default_iface() : (nic_iface_t)msg.iface;
+            bool ok = net_send_udp_on(iface, msg.param, sp, dp,
+                                      (const u8 *)(usize)msg.buffer,
+                                      (u16)msg.length);
             reply.type   = MSG_NET_UDP_DONE;
             reply.status = ok ? 0 : 1;
             reply.tag    = msg.tag;
+            reply.iface  = iface;
             fifo_push(CORE_NET, CORE_USER1, &reply);
         } else if (msg.type == MSG_DNS_RESOLVE && msg.buffer && msg.length <= 256U) {
             if (!ptr_in_core_ram(CORE_USER1, msg.buffer, msg.length)) {
@@ -1050,75 +1182,235 @@ void net_handle_fifo_request(void) {
 /*  Poll + Init                                                        */
 /* ================================================================== */
 
-u32 net_poll(void) {
-    u32 len;
-    bool checksum_trusted;
-    u32 got = 0;
+bool net_ingress_receive(nic_iface_t iface, u8 *frame, u32 frame_max,
+                         u32 *len, bool *checksum_trusted)
+{
+    if (!frame || !len || frame_max < ETH_FRAME_MAX ||
+        !net_interface_configured(iface) || !nic_iface_active(iface))
+        return false;
+    *len = 0U;
+    if (checksum_trusted)
+        *checksum_trusted = false;
+    return nic_recv_on(iface, frame, len, checksum_trusted);
+}
 
-    stats.poll_calls++;
-    prefetch_r(rx_frame);
+static bool net_ingress_select_iface(nic_iface_t iface, nic_iface_t *previous_out)
+{
+    if (!net_interface_configured(iface) || !nic_iface_active(iface))
+        return false;
+    nic_iface_t previous = net_current_iface;
+    if (previous != iface) {
+        net_save_iface();
+        if (!net_load_iface(iface))
+            return false;
+    }
+    if (previous_out)
+        *previous_out = previous;
+    arp_set_interface(iface);
+    return true;
+}
 
-    for (u32 burst = 0; burst < NET_RX_BURST_MAX; burst++) {
-        checksum_trusted = false;
-        if (!likely(nic_recv(rx_frame, &len, &checksum_trusted)))
-            break;
+static void net_ingress_restore_iface(nic_iface_t previous)
+{
+    if (net_current_iface != previous) {
+        net_save_iface();
+        (void)net_load_iface(previous);
+    }
+}
 
-        got++;
-        stats.rx_packets++;
-        stats.rx_bytes += len;
+bool net_ingress_mac_process(nic_iface_t iface, const u8 *frame, u32 len,
+                             u16 *ethertype_out)
+{
+    nic_iface_t previous;
+    if (!frame || !net_ingress_select_iface(iface, &previous))
+        return false;
+    stats.rx_packets++;
+    stats.rx_bytes += len;
 
-        if (unlikely(len < sizeof(struct eth_hdr))) {
-            stats.drop_runt++;
-            continue;
-        }
-        if (unlikely(len > 1518)) {
-            stats.drop_oversized++;
-            continue;
-        }
-
-        struct eth_hdr *eth = (struct eth_hdr *)rx_frame;
-        if (unlikely(net_drop_arp_not_for_us(rx_frame, len))) {
-            stats.drop_not_for_us++;
-            continue;
-        }
-        if (unlikely(!net_accept_eth_dst(eth->dst))) {
-            stats.drop_not_for_us++;
-            continue;
-        }
-
-        u16 etype = ntohs(eth->ethertype);
-
-        /* Dispatch by EtherType */
-        if (likely(etype == ETH_P_IP)) {
-            handle_ip(rx_frame, len, checksum_trusted);
-            stats.rx_dispatched++;
-        } else if (etype == ETH_P_ARP) {
-            arp_input(rx_frame, len);
-            stats.rx_dispatched++;
-        } else {
-            stats.rx_unsupported++;
-        }
+    if (unlikely(len < sizeof(struct eth_hdr))) {
+        stats.drop_runt++;
+        net_ingress_restore_iface(previous);
+        return false;
+    }
+    if (unlikely(len > 1518U)) {
+        stats.drop_oversized++;
+        net_ingress_restore_iface(previous);
+        return false;
     }
 
+    const struct eth_hdr *eth = (const struct eth_hdr *)frame;
+    if (unlikely(net_drop_arp_not_for_us(frame, len))) {
+        stats.drop_not_for_us++;
+        net_ingress_restore_iface(previous);
+        return false;
+    }
+    if (unlikely(!net_accept_eth_dst(eth->dst))) {
+        stats.drop_not_for_us++;
+        net_ingress_restore_iface(previous);
+        return false;
+    }
+    u16 etype = ntohs(eth->ethertype);
+    if (etype == ETH_P_ARP) {
+        arp_input_iface(iface, frame, len);
+        stats.rx_dispatched++;
+        net_ingress_restore_iface(previous);
+        return false;
+    }
+    if (etype != ETH_P_IP) {
+        stats.rx_unsupported++;
+        net_ingress_restore_iface(previous);
+        return false;
+    }
+    if (ethertype_out)
+        *ethertype_out = etype;
+    net_ingress_restore_iface(previous);
+    return true;
+}
+
+bool net_ingress_ip_process(nic_iface_t iface, const u8 *frame, u32 len,
+                            u8 *protocol_out)
+{
+    nic_iface_t previous;
+    if (!frame || !net_ingress_select_iface(iface, &previous))
+        return false;
+    if (unlikely(len < sizeof(struct eth_hdr) + 20U)) {
+        stats.drop_runt++;
+        goto reject;
+    }
+    const struct ip_hdr *ip = (const struct ip_hdr *)(frame + sizeof(struct eth_hdr));
+    if (unlikely((ip->ver_ihl >> 4) != 4U)) {
+        stats.drop_runt++;
+        goto reject;
+    }
+    if (unlikely((ip->ver_ihl & 0x0FU) != 5U)) {
+        stats.drop_ip_options++;
+        goto reject;
+    }
+    u16 ip_total = ntohs(ip->total_len);
+    if (unlikely(ip_total < 20U || sizeof(struct eth_hdr) + ip_total > len)) {
+        stats.drop_runt++;
+        goto reject;
+    }
+    if (unlikely(simd_checksum(ip, 20) != 0U)) {
+        stats.drop_bad_cksum++;
+        goto reject;
+    }
+    u16 flags_frag = ntohs(ip->flags_frag);
+    if (unlikely((flags_frag & 0x2000U) || (flags_frag & 0x1FFFU))) {
+        stats.drop_fragment++;
+        goto reject;
+    }
+    u32 src = ntohl(ip->src_ip);
+    if (unlikely(src == 0U || src == 0xFFFFFFFFU || src == our_ip ||
+                 (src >> 24) == 127U || (src >> 28) == 0xEU)) {
+        stats.drop_bad_src++;
+        goto reject;
+    }
+    if (unlikely(ip->ttl == 0U)) {
+        stats.drop_runt++;
+        goto reject;
+    }
+    u32 dst = ntohl(ip->dst_ip);
+    if (dst != our_ip && dst != 0xFFFFFFFFU) {
+        stats.drop_not_for_us++;
+        goto reject;
+    }
+    if (protocol_out)
+        *protocol_out = ip->protocol;
+    net_ingress_restore_iface(previous);
+    return true;
+reject:
+    net_ingress_restore_iface(previous);
+    return false;
+}
+
+void net_ingress_l4_process(nic_iface_t iface, const u8 *frame, u32 len,
+                            bool checksum_trusted, u8 protocol)
+{
+    nic_iface_t previous;
+    if (!frame || !net_ingress_select_iface(iface, &previous))
+        return;
+    const struct ip_hdr *ip = (const struct ip_hdr *)(frame + sizeof(struct eth_hdr));
+    u32 payload_off = sizeof(struct eth_hdr) + 20U;
+    switch (protocol) {
+    case IP_PROTO_ICMP:
+        handle_icmp(frame, len, (struct ip_hdr *)ip, payload_off);
+        break;
+    case IP_PROTO_TCP: {
+        u16 ipt = ntohs(ip->total_len);
+        if (ipt > 20U)
+            tcp_input(frame, len, ntohl(ip->src_ip), ntohl(ip->dst_ip),
+                      frame + payload_off, ipt - 20U, checksum_trusted, iface);
+        stats.rx_dispatched++;
+        break;
+    }
+    case IP_PROTO_UDP:
+        handle_udp(frame, len, (struct ip_hdr *)ip, payload_off, checksum_trusted);
+        stats.rx_dispatched++;
+        break;
+    default:
+        stats.rx_unsupported++;
+        stats.drop_bad_proto++;
+        break;
+    }
+    net_ingress_restore_iface(previous);
+}
+
+void net_ingress_process(nic_iface_t iface, const u8 *frame, u32 len,
+                         bool checksum_trusted)
+{
+    u16 etype;
+    u8 protocol;
+    if (!net_ingress_mac_process(iface, frame, len, &etype))
+        return;
+    if (etype == ETH_P_IP && net_ingress_ip_process(iface, frame, len, &protocol))
+        net_ingress_l4_process(iface, frame, len, checksum_trusted, protocol);
+}
+
+void net_service_step(void)
+{
+    net_handle_fifo_request();
+    workq_drain(4);
+}
+
+u32 net_poll(void)
+{
+    /*
+     * Compatibility entry point for legacy synchronous console diagnostics.
+     * ADR-033 normal ingress never calls this: hardware/timer/reactor paths
+     * publish descriptors to net_dispatch instead.
+     */
+    u32 got = 0U;
+    stats.poll_calls++;
+    prefetch_r(rx_frame);
+    for (u32 fi = NIC_IFACE_WIRED; fi <= NIC_IFACE_WIFI; fi++) {
+        for (u32 burst = 0U; burst < NET_RX_BURST_MAX; burst++) {
+            u32 len = 0U;
+            bool checksum_trusted = false;
+            if (!net_ingress_receive((nic_iface_t)fi, rx_frame, sizeof(rx_frame),
+                                     &len, &checksum_trusted))
+                break;
+            net_ingress_process((nic_iface_t)fi, rx_frame, len, checksum_trusted);
+            got++;
+        }
+    }
     stats.poll_last_frames = got;
-    if (got == 0)
+    if (got == 0U)
         stats.poll_empty++;
     if (got == NET_RX_BURST_MAX)
         stats.poll_budget_hits++;
-
-    net_handle_fifo_request();
-
-    workq_drain(4);
+    net_service_step();
     return got;
 }
 
 void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
+    simd_zero(net_ifaces, sizeof(net_ifaces));
+    net_current_iface = NIC_IFACE_WIRED;
     our_ip   = ip;
     our_gw   = gateway;
     our_mask = netmask;
-    nic_set_local_ipv4(ip);
-    nic_get_mac(our_mac);
-    net_firewall_install_defaults();
+    nic_set_local_ipv4_for(NIC_IFACE_WIRED, ip);
+    nic_get_mac_for(NIC_IFACE_WIRED, our_mac);
 
     gw_mac_set = false;
     simd_zero(gw_mac, sizeof(gw_mac));
@@ -1144,7 +1436,7 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     icmp_last_tick    = 0;
 
     /* Init ARP subsystem */
-    arp_init(ip, netmask, our_mac);
+    arp_init_iface(NIC_IFACE_WIRED, ip, netmask, our_mac);
     (void)net_route_add(ip & netmask, netmask, 0, NET_ROUTE_F_CONNECTED);
     if (gateway != 0)
         (void)net_route_add(0, 0, gateway, 0);
@@ -1168,6 +1460,9 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
         arp_add_static(gateway, gateway_mac);
     }
 
+    net_save_iface();
+    net_firewall_install_defaults();
+
     uart_puts("[net] IP=");
     uart_hex(ip);
     uart_puts(" GW=");
@@ -1181,6 +1476,80 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
 
     uart_puts("[net] post-announce:\n");
     uart_puts("[net] link="); uart_hex(nic_link_up() ? 1 : 0); uart_puts("\n");
+}
+
+bool net_add_interface(nic_iface_t iface, u32 ip, u32 gateway, u32 netmask,
+                       const u8 *gateway_mac)
+{
+    if (iface != NIC_IFACE_WIRED && iface != NIC_IFACE_WIFI)
+        return false;
+    if (!nic_iface_active(iface) || ip == 0U)
+        return false;
+
+    nic_iface_t previous = net_current_iface;
+    net_save_iface();
+    net_current_iface = iface;
+    our_ip = ip;
+    our_gw = gateway;
+    our_mask = netmask;
+    nic_get_mac_for(iface, our_mac);
+    nic_set_local_ipv4_for(iface, ip);
+    simd_zero(neighbors, sizeof(neighbors));
+    simd_zero(routes, sizeof(routes));
+    simd_zero(multicast_macs, sizeof(multicast_macs));
+    neighbor_count = 0;
+    route_count = 0;
+    multicast_count = 0;
+    simd_zero(gw_mac, sizeof(gw_mac));
+    gw_mac_set = false;
+    if (gateway_mac && !mac_is_zero_6(gateway_mac)) {
+        simd_memcpy(gw_mac, gateway_mac, 6);
+        gw_mac_set = true;
+    }
+    arp_init_iface(iface, ip, netmask, our_mac);
+    (void)net_route_add(ip & netmask, netmask, 0, NET_ROUTE_F_CONNECTED);
+    if (gateway != 0U)
+        (void)net_route_add(0, 0, gateway, 0);
+    if (gateway_mac && !mac_is_zero_6(gateway_mac))
+        arp_add_static_iface(iface, gateway, gateway_mac);
+    /*
+     * Make the newly configured address visible without the blocking
+     * multi-probe boot announcement. A single gratuitous ARP is bounded and
+     * lets peers refresh their neighbor entry before the first service SYN.
+     */
+    arp_probe();
+    net_save_iface();
+    (void)net_load_iface(previous);
+    net_firewall_install_defaults();
+    return true;
+}
+
+bool net_interface_configured(nic_iface_t iface)
+{
+    return iface < NIC_IFACE_MAX && net_ifaces[iface].configured;
+}
+
+nic_iface_t net_current_interface(void)
+{
+    return net_current_iface;
+}
+
+u32 net_get_our_ip_for(nic_iface_t iface)
+{
+    return iface < NIC_IFACE_MAX ? net_ifaces[iface].ip : 0U;
+}
+
+u32 net_get_netmask_for(nic_iface_t iface)
+{
+    return iface < NIC_IFACE_MAX ? net_ifaces[iface].mask : 0U;
+}
+
+void net_get_mac_for(nic_iface_t iface, u8 *mac)
+{
+    if (mac)
+        simd_zero(mac, 6);
+    if (iface < NIC_IFACE_MAX && net_ifaces[iface].configured && mac)
+        simd_memcpy(mac, net_ifaces[iface].mac, 6);
 }
 
 void net_set_udp_callback(udp_recv_cb cb) {

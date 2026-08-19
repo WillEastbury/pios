@@ -244,7 +244,13 @@ struct proc_preempt_core {
     volatile u32 pending;
     u32 _pad0;
     u64 quantum_ticks;
-    u64 _pad[5];
+    u64 wfx_traps;
+    u32 wfx_awaits;
+    u32 wfx_keeps;
+    u32 wfx_last_state;
+    u32 wfx_last_generation;
+    u64 wfx_last_slot_va;
+    u64 wfx_last_slot_pte;
 } ALIGNED(64);
 static struct proc_preempt_core preempt_state[3];
 #define preempt_enabled(uc)       (preempt_state[(uc)].enabled)
@@ -769,9 +775,38 @@ static enum pctl_verdict proc_el0_control_verdict(u32 slot,
 {
     volatile struct pctl_line *line =
         &el0_sched_slot_kernel(slot)->control;
-    el0_sched_invalidate((volatile void *)line, sizeof(*line));
+    /*
+     * The EL0 control page is Normal-NC in both aliases. pctl_publish() has
+     * already release-published the line, and pctl_evaluate() acquires it;
+     * DC IVAC here is not only redundant but can discard the immediately
+     * preceding EL0 publication through the alias.
+     */
     return pctl_evaluate((const struct pctl_line *)(const void *)line,
                          p->generation, swake_seq(slot));
+}
+
+static enum pctl_verdict proc_el0_control_verdict_trace(u32 slot,
+                                                         const struct process *p,
+                                                         u64 el0_slot_va)
+{
+    volatile struct pctl_line *line =
+        &el0_sched_slot_kernel(slot)->control;
+    volatile struct pctl_line *identity =
+        (volatile struct pctl_line *)(usize)(PIOS_IPC_SHM_BASE +
+            EL0_SCHED_OFFSET +
+            (u64)slot * sizeof(struct el0_sched_slot) +
+            __builtin_offsetof(struct el0_sched_slot, control));
+    u32 uc = user_core_slot();
+    preempt_state[uc].wfx_last_state = line->state;
+    preempt_state[uc].wfx_last_generation = identity->state;
+    preempt_state[uc].wfx_last_slot_va = line->publish_seq;
+    u64 l1e = 0, l2e = 0, l3e = 0;
+    (void)mmu_user_pte_snapshot(core_id(), slot, el0_slot_va,
+                                &l1e, &l2e, &l3e);
+    preempt_state[uc].wfx_last_slot_pte = l3e;
+    return pctl_evaluate((const struct pctl_line *)(const void *)line,
+                         p->generation,
+                         swake_seq(slot));
 }
 
 static void proc_el0_control_clear(u32 slot, const struct process *p)
@@ -900,7 +935,14 @@ bool proc_handle_wfx(struct irq_frame *frame, u64 esr)
         struct process *p = &procs[current_proc];
         if (p->run_at_el0) {
             enum pctl_verdict verdict =
-                proc_el0_control_verdict(current_proc, p);
+                proc_el0_control_verdict_trace(current_proc, p, frame->x[21]);
+            u32 uc = user_core_slot();
+            preempt_state[uc].wfx_traps++;
+            if (verdict == PCTL_DESCHEDULE_AWAIT)
+                preempt_state[uc].wfx_awaits++;
+            else if (verdict == PCTL_KEEP_RUNNING)
+                preempt_state[uc].wfx_keeps++;
+            diag_clean_word(&preempt_state[uc]);
             if (verdict == PCTL_DESCHEDULE_AWAIT) {
                 proc_park();
                 return true;
@@ -2891,9 +2933,25 @@ void proc_schedule(void)
             struct process *sp = &procs[si];
             if (!sp->run_at_el0 || sp->owner_core != core_id())
                 continue;
-            sp->el0_inbound_seq = swake_seq(si);
-            if (sp->state == PROC_BLOCKED &&
-                proc_el0_control_verdict(si, sp) == PCTL_KEEP_RUNNING) {
+            u64 inbound_seq = swake_seq(si);
+            if (sp->el0_inbound_seq != inbound_seq) {
+                sp->el0_inbound_seq = inbound_seq;
+                proc_publish_control(si);
+            }
+            enum pctl_verdict verdict = proc_el0_control_verdict(si, sp);
+            /*
+             * A timer can preempt EL0 after it publishes AWAITING but before
+             * its WFI exception reaches this core. Honour that latched intent
+             * here, under the kernel mapping, before dispatch clears it.
+             */
+            if (sp->state == PROC_READY &&
+                verdict == PCTL_DESCHEDULE_AWAIT) {
+                sp->state = PROC_BLOCKED;
+                proc_publish_control(si);
+                DTRACE(DTRACE_CAT_SCHED, DT_SCHED_PARK, sp->pid, si,
+                       core_id(), 0);
+            } else if (sp->state == PROC_BLOCKED &&
+                       verdict == PCTL_KEEP_RUNNING) {
                 sp->state = PROC_READY;
                 proc_publish_control(si);
             }
@@ -2988,7 +3046,17 @@ void proc_schedule(void)
                 continue;
             }
             if (procs[chosen].run_at_el0)
+                /*
+                 * The process reads this metadata to form its AWAITING claim.
+                 * It must match the sequence that pctl_evaluate() will use;
+                 * otherwise every WFI trap looks like a stale wake and returns
+                 * straight to EL0, spinning through exception handling.
+                 */
+                procs[chosen].el0_inbound_seq = swake_seq(chosen);
+            if (procs[chosen].run_at_el0) {
+                proc_publish_control(chosen);
                 proc_el0_control_clear(chosen, &procs[chosen]);
+            }
             {
                 struct process *qp = &procs[chosen];
                 bool others = proc_qbank_others_runnable(chosen);
@@ -3191,7 +3259,7 @@ static void proc_sgi_wake_handler(void)
 /* Enable SGI doorbell receipt on the calling core. SGI enable/priority live in
  * banked GICD registers (intid < 32), so this MUST run on each receiving core.
  * irq_register targets the shared handler table and is idempotent. */
-static void proc_sgi_wake_setup(void)
+void proc_fifo_doorbell_init(void)
 {
     irq_register(GIC_SGI_WAKE, proc_sgi_wake_handler);
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI5
@@ -3214,6 +3282,18 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
 {
     if (!on_user_core())
         return;
+
+    /*
+     * The startup path establishes this too, but force it immediately before
+     * this core can launch EL0. A parked service must trap WFE into pctl; it
+     * must never consume a stale global event and continue as RUNNING work.
+     */
+    {
+        u64 sctlr;
+        __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+        sctlr &= ~((1ULL << 16) | (1ULL << 18)); /* nTWI/nTWE: trap EL0 WFx */
+        __asm__ volatile("msr sctlr_el1, %0\n\tisb" :: "r"(sctlr) : "memory");
+    }
 
     /* The hypervisor-hosting core dispatches a process, so its park->wake->
      * re-dispatch loop performs a per-dispatch EL2 stage-2 cage toggle
@@ -3319,7 +3399,7 @@ void proc_preempt_init(u32 timer_hz, u32 quantum_ms)
 
     /* Arm the SGI doorbell on every user core; with the GIC CPU interface now
      * up everywhere, it is delivered everywhere. */
-    proc_sgi_wake_setup();
+    proc_fifo_doorbell_init();
 
     /* Do not write per-core startup banners directly to the single UART stream:
      * cores 1-3 initialise concurrently and byte-interleave. `proc sched`,
@@ -3464,7 +3544,6 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
         if (!swake_post(core_id() & 3U, core_id() & 3U,
                         (u32)slot, SWAKE_FIFO))
             return false;
-        sev();
         return true;
     }
     /* Latch the wake STICKILY before touching state. The old code only flipped
@@ -3482,7 +3561,6 @@ bool proc_soft_event(u32 target_pid, u32 event_type, bool boost)
         diag_clean_word(&sched_diag[uc]);
     }
     proc_publish_control((u32)slot);
-    sev();
     return true;
 }
 
@@ -3624,12 +3702,12 @@ bool proc_post_remote_wake(u32 target_core, u32 pid) {
     PROC_RWAKE_SHARED->posted++;
     dsb_ishst();               /* head globally visible before the wake event */
     proc_irq_restore(daif);
+    /* The SGI is the targeted, latched doorbell. SEV remains a correctness
+     * backstop while SGI delivery is degraded: it only wakes schedulers to
+     * rescan their sequence-backed queues; it never makes EL0 runnable. */
+    if (fifo_irq_ready(target_core))
+        gic_send_sgi((u8)(1U << target_core), GIC_SGI_WAKE);
     sev();
-    /* Ring the GIC SGI doorbell: a latched interrupt reliably wakes the target
-     * core's WFE (and would wake WFI) even when cross-core SEV is missed. The
-     * handler does no work beyond a counter; the wake re-runs the scheduler loop
-     * which drains this ring. target_core is 0..3 -> CPUTargetList bit. */
-    gic_send_sgi((u8)(1U << target_core), GIC_SGI_WAKE);
     return true;
 }
 
@@ -4685,6 +4763,14 @@ u32 proc_sched_snapshot(struct proc_sched_core_snapshot *out, u32 max_entries)
         out[i].preemptions = sched_diag[i].preempt_count;
         out[i].soft_events = sched_diag[i].soft_event_count;
         out[i].soft_boosts = sched_diag[i].soft_boost_count;
+        diag_inval_bss(&preempt_state[i]);
+        out[i].wfx_traps = preempt_state[i].wfx_traps;
+        out[i].wfx_awaits = preempt_state[i].wfx_awaits;
+        out[i].wfx_keeps = preempt_state[i].wfx_keeps;
+        out[i].wfx_last_state = preempt_state[i].wfx_last_state;
+        out[i].wfx_last_generation = preempt_state[i].wfx_last_generation;
+        out[i].wfx_last_slot_va = preempt_state[i].wfx_last_slot_va;
+        out[i].wfx_last_slot_pte = preempt_state[i].wfx_last_slot_pte;
     }
     return n;
 }

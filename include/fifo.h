@@ -50,7 +50,8 @@ struct fifo_msg {
     u32 status;
     u64 tag;
     u64 timestamp;      /* cntvct_el0 at send time */
-    u64 _reserved;      /* pad to 64 bytes */
+    u32 iface;          /* NIC_IFACE_* for network/session messages */
+    u32 _reserved;      /* pad to 64 bytes */
 } ALIGNED(64);
 
 struct fifo {

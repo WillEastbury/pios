@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+#include "nic.h"
 
 /*
  * Hardened minimal network stack: IPv4 + ICMP + UDP + TCP + ARP.
@@ -138,6 +139,13 @@ typedef void (*udp_recv_cb)(u32 src_ip, u16 src_port, u16 dst_port,
 
 /* Init with static IP, gateway IP, and gateway MAC */
 void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac);
+bool net_add_interface(nic_iface_t iface, u32 ip, u32 gateway, u32 netmask,
+                       const u8 *gateway_mac);
+bool net_interface_configured(nic_iface_t iface);
+nic_iface_t net_current_interface(void);
+u32 net_get_our_ip_for(nic_iface_t iface);
+u32 net_get_netmask_for(nic_iface_t iface);
+void net_get_mac_for(nic_iface_t iface, u8 *mac);
 
 /* Restore default NIC firewall: inbound deny, outbound allow, and service allows. */
 void net_firewall_install_defaults(void);
@@ -148,18 +156,38 @@ void net_add_neighbor(u32 ip, const u8 *mac);
 /* Resolve destination IP to next-hop Ethernet MAC using route/gateway policy,
  * static neighbors, and dynamic ARP. Returns NULL while ARP is unresolved. */
 const u8 *net_resolve_mac(u32 dst_ip);
+const u8 *net_resolve_mac_on(nic_iface_t iface, u32 dst_ip);
 
 /* Join/leave an Ethernet multicast destination MAC. Frames for multicast
  * groups not in this table are dropped before protocol dispatch. */
 bool net_join_multicast_mac(const u8 *mac);
 bool net_leave_multicast_mac(const u8 *mac);
 
-/* Poll: process one incoming frame (call in tight loop on core 0) */
+/*
+ * Legacy compatibility pump. Normal network execution uses net_dispatch.c;
+ * IRQ/timer/reactor code must not call this to poll a transport.
+ */
 u32 net_poll(void);
+
+/* ADR-033 split ingress stages. The transport stage copies one received frame
+ * into an owned FIFO slot; the protocol stage validates and consumes it. */
+bool net_ingress_receive(nic_iface_t iface, u8 *frame, u32 frame_max,
+                         u32 *len, bool *checksum_trusted);
+bool net_ingress_mac_process(nic_iface_t iface, const u8 *frame, u32 len,
+                             u16 *ethertype_out);
+bool net_ingress_ip_process(nic_iface_t iface, const u8 *frame, u32 len,
+                            u8 *protocol_out);
+void net_ingress_l4_process(nic_iface_t iface, const u8 *frame, u32 len,
+                            bool checksum_trusted, u8 protocol);
+void net_ingress_process(nic_iface_t iface, const u8 *frame, u32 len,
+                         bool checksum_trusted);
+void net_service_step(void);
 
 /* Send a UDP datagram */
 bool net_send_udp(u32 dst_ip, u16 src_port, u16 dst_port,
                   const u8 *data, u16 len);
+bool net_send_udp_on(nic_iface_t iface, u32 dst_ip, u16 src_port,
+                     u16 dst_port, const u8 *data, u16 len);
 
 /* ---- ICMP echo client (ping/traceroute) -------------------------------
  * Single-outstanding-probe, core-0-only client API (mirrors net_send_udp).

@@ -195,6 +195,7 @@ static void ring_consume(struct ring_buf *r, u32 n) {
 struct tcb {
     /* Connection 4-tuple */
     u32 local_ip;
+    nic_iface_t iface;
     u32 remote_ip;
     u16 local_port;
     u16 remote_port;
@@ -246,6 +247,7 @@ struct tcb {
     struct {
         u32 remote_ip;
         u16 remote_port;
+        nic_iface_t iface;
         u32 irs;        /* client ISN */
         u32 iss;        /* our ISN (from SYN cookie) */
     } pending[LISTEN_BACKLOG];
@@ -286,15 +288,15 @@ static u32         tcb_inuse;        /* live (non-free) tcb count, diag */
 static i32         tcp_listeners[TCP_MAX_LISTENERS];
 static u32         tcp_listener_count;
 
-static inline u32 tcb_hash_key(u16 local_port, u32 remote_ip, u16 remote_port) {
+static inline u32 tcb_hash_key(u16 local_port, u32 remote_ip, u16 remote_port,
+                               nic_iface_t iface) {
     u32 h = (u32)local_port * 2654435761U;
     h ^= remote_ip * 2246822519U;
     h ^= ((u32)remote_port << 16) * 3266489917U;
+    h ^= (u32)iface * 0x9E3779B9U;
     h ^= h >> 15;
     return h & tcb_hash_mask;
 }
-static u32 tcp_local_ip;
-static u8  tcp_local_mac[6];
 static u16 tcp_ip_id;
 static tcp_diag_t tcp_diag_counts;
 
@@ -339,14 +341,16 @@ static i32 tcb_index(const struct tcb *t) {
 /* Insert an active (4-tuple-bearing) tcb into the hash. Call after the 4-tuple
  * + state are set in connect/accept. Listeners do NOT go in this hash. */
 static void tcb_hash_insert(struct tcb *t) {
-    u32 b = tcb_hash_key(t->local_port, t->remote_ip, t->remote_port);
+    u32 b = tcb_hash_key(t->local_port, t->remote_ip, t->remote_port,
+                        t->iface);
     t->hash_next = tcb_hash[b];
     tcb_hash[b] = tcb_index(t);
 }
 
 /* Remove a tcb from the hash (uses its current 4-tuple to find the bucket). */
 static void tcb_hash_remove(struct tcb *t) {
-    u32 b = tcb_hash_key(t->local_port, t->remote_ip, t->remote_port);
+    u32 b = tcb_hash_key(t->local_port, t->remote_ip, t->remote_port,
+                        t->iface);
     i32 idx = tcb_index(t);
     i32 cur = tcb_hash[b];
     i32 prev = -1;
@@ -362,13 +366,15 @@ static void tcb_hash_remove(struct tcb *t) {
     }
 }
 
-static struct tcb *tcb_find(u32 local_port, u32 remote_ip, u16 remote_port) {
-    u32 b = tcb_hash_key((u16)local_port, remote_ip, remote_port);
+static struct tcb *tcb_find(u32 local_port, u32 remote_ip, u16 remote_port,
+                            nic_iface_t iface) {
+    u32 b = tcb_hash_key((u16)local_port, remote_ip, remote_port, iface);
     for (i32 cur = tcb_hash[b]; cur >= 0; cur = tcbs[cur].hash_next) {
         struct tcb *t = &tcbs[cur];
         if (t->local_port == local_port &&
             t->remote_ip == remote_ip &&
-            t->remote_port == remote_port)
+            t->remote_port == remote_port &&
+            t->iface == iface)
             return t;
     }
     return NULL;
@@ -563,7 +569,7 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     if (data_len > 2048 - 54) return;
 
     /* Resolve destination MAC */
-    const u8 *dst_mac = net_resolve_mac(t->remote_ip);
+    const u8 *dst_mac = net_resolve_mac_on(t->iface, t->remote_ip);
     if (unlikely(!dst_mac)) {
         tcp_diag_counts.tx_no_mac++;
         return;
@@ -577,7 +583,9 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     /* Ethernet */
     struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
     simd_memcpy(eth->dst, dst_mac, 6);
-    simd_memcpy(eth->src, tcp_local_mac, 6);
+    u8 local_mac[6];
+    net_get_mac_for(t->iface, local_mac);
+    simd_memcpy(eth->src, local_mac, 6);
     eth->ethertype = htons(ETH_P_IP);
 
     /* IP */
@@ -606,7 +614,8 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
     tcp->checksum  = 0;
     tcp->urgent    = 0;
 
-    bool tx_offload_window = nic_tx_checksum_offload_enabled() && data_len > 0;
+    bool tx_offload_window = nic_tx_checksum_offload_enabled_for(t->iface) &&
+                             data_len > 0;
     bool need_pad = frame_len < MIN_FRAME;
     if (need_pad) frame_len = MIN_FRAME;
 
@@ -620,17 +629,18 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
 
     if (data_len == 0) {
         tcp_diag_counts.tx_segments++;
-        if (!nic_send(tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
+        if (!nic_send_on(t->iface, tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
         return;
     }
     if (need_pad) {
         tcp_memcpy_accel(tx_frame + TCP_OVERHEAD, data, data_len);
         tcp_diag_counts.tx_segments++;
-        if (!nic_send(tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
+        if (!nic_send_on(t->iface, tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
         return;
     }
     tcp_diag_counts.tx_segments++;
-    if (!nic_send_parts(tx_frame, TCP_OVERHEAD, data, data_len)) tcp_diag_counts.tx_send_fail++;
+    if (!nic_send_parts_on(t->iface, tx_frame, TCP_OVERHEAD, data, data_len))
+        tcp_diag_counts.tx_send_fail++;
 }
 
 static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
@@ -638,7 +648,7 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
     /* Guard against u16 overflow: max frame 2048 minus IP+TCP headers */
     if (data_len > 2048 - 54) return;
 
-    const u8 *dst_mac = net_resolve_mac(t->remote_ip);
+    const u8 *dst_mac = net_resolve_mac_on(t->iface, t->remote_ip);
     if (unlikely(!dst_mac)) {
         tcp_diag_counts.tx_no_mac++;
         return;
@@ -651,7 +661,9 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
 
     struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
     simd_memcpy(eth->dst, dst_mac, 6);
-    simd_memcpy(eth->src, tcp_local_mac, 6);
+    u8 local_mac[6];
+    net_get_mac_for(t->iface, local_mac);
+    simd_memcpy(eth->src, local_mac, 6);
     eth->ethertype = htons(ETH_P_IP);
 
     struct ip_hdr *ip = (struct ip_hdr *)(tx_frame + ETH_HDR_SIZE);
@@ -678,7 +690,8 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
     tcp->checksum  = 0;
     tcp->urgent    = 0;
 
-    bool tx_offload_window = nic_tx_checksum_offload_enabled() && data_len > 0;
+    bool tx_offload_window = nic_tx_checksum_offload_enabled_for(t->iface) &&
+                             data_len > 0;
     bool need_pad = frame_len < MIN_FRAME;
     if (need_pad) frame_len = MIN_FRAME;
 
@@ -686,7 +699,7 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
         if (!tx_offload_window)
             tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
         tcp_diag_counts.tx_segments++;
-        if (!nic_send(tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
+        if (!nic_send_on(t->iface, tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
         return;
     }
 
@@ -697,7 +710,8 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
             tcp->checksum = tcp_checksum_split(t->local_ip, t->remote_ip,
                                                tcp, TCP_HDR_SIZE, lin, data_len);
         tcp_diag_counts.tx_segments++;
-        if (!nic_send_parts(tx_frame, TCP_OVERHEAD, lin, data_len)) tcp_diag_counts.tx_send_fail++;
+        if (!nic_send_parts_on(t->iface, tx_frame, TCP_OVERHEAD, lin, data_len))
+            tcp_diag_counts.tx_send_fail++;
         return;
     }
 
@@ -705,13 +719,13 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
     if (!tx_offload_window)
         tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
     tcp_diag_counts.tx_segments++;
-    if (!nic_send(tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
+    if (!nic_send_on(t->iface, tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
 }
 
 /* Send a raw RST/ACK without a TCB (for rejecting unexpected segments) */
-static void tcp_send_rst(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port,
-                         u32 seq, u32 ack) {
-    const u8 *dst_mac = net_resolve_mac(dst_ip);
+static void tcp_send_rst(nic_iface_t iface, u32 src_ip, u32 dst_ip,
+                         u16 src_port, u16 dst_port, u32 seq, u32 ack) {
+    const u8 *dst_mac = net_resolve_mac_on(iface, dst_ip);
     if (!dst_mac) { tcp_diag_counts.tx_no_mac++; return; }
 
     u16 ip_total = IP_HDR_SIZE + TCP_HDR_SIZE;
@@ -719,7 +733,9 @@ static void tcp_send_rst(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port,
 
     struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
     simd_memcpy(eth->dst, dst_mac, 6);
-    simd_memcpy(eth->src, tcp_local_mac, 6);
+    u8 local_mac[6];
+    net_get_mac_for(iface, local_mac);
+    simd_memcpy(eth->src, local_mac, 6);
     eth->ethertype = htons(ETH_P_IP);
 
     struct ip_hdr *ip = (struct ip_hdr *)(tx_frame + ETH_HDR_SIZE);
@@ -750,14 +766,14 @@ static void tcp_send_rst(u32 src_ip, u32 dst_ip, u16 src_port, u16 dst_port,
 
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
     tcp_diag_counts.tx_segments++;
-    if (!nic_send(tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
+    if (!nic_send_on(iface, tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
 }
 
 /* Send a SYN-ACK with SYN cookie ISN (no TCB needed) */
-static void tcp_send_synack_cookie(u32 remote_ip, u16 remote_port,
+static void tcp_send_synack_cookie(nic_iface_t iface, u32 remote_ip, u16 remote_port,
                                    u16 local_port, u32 their_seq,
                                    u32 cookie_isn) {
-    const u8 *dst_mac = net_resolve_mac(remote_ip);
+    const u8 *dst_mac = net_resolve_mac_on(iface, remote_ip);
     if (!dst_mac) { tcp_diag_counts.tx_no_mac++; return; }
 
     u16 ip_total = IP_HDR_SIZE + TCP_HDR_SIZE;
@@ -765,7 +781,9 @@ static void tcp_send_synack_cookie(u32 remote_ip, u16 remote_port,
 
     struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
     simd_memcpy(eth->dst, dst_mac, 6);
-    simd_memcpy(eth->src, tcp_local_mac, 6);
+    u8 local_mac[6];
+    net_get_mac_for(iface, local_mac);
+    simd_memcpy(eth->src, local_mac, 6);
     eth->ethertype = htons(ETH_P_IP);
 
     struct ip_hdr *ip = (struct ip_hdr *)(tx_frame + ETH_HDR_SIZE);
@@ -777,7 +795,7 @@ static void tcp_send_synack_cookie(u32 remote_ip, u16 remote_port,
     ip->ttl        = 64;
     ip->protocol   = IP_PROTO_TCP;
     ip->checksum   = 0;
-    ip->src_ip     = htonl(tcp_local_ip);
+    ip->src_ip     = htonl(net_get_our_ip_for(iface));
     ip->dst_ip     = htonl(remote_ip);
     ip->checksum   = simd_checksum(ip, IP_HDR_SIZE);
 
@@ -792,11 +810,12 @@ static void tcp_send_synack_cookie(u32 remote_ip, u16 remote_port,
     tcp->checksum  = 0;
     tcp->urgent    = 0;
 
-    tcp->checksum = tcp_checksum(tcp_local_ip, remote_ip, tcp, TCP_HDR_SIZE);
+    tcp->checksum = tcp_checksum(net_get_our_ip_for(iface), remote_ip,
+                                 tcp, TCP_HDR_SIZE);
 
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
     tcp_diag_counts.tx_segments++;
-    if (nic_send(tx_frame, frame_len))
+    if (nic_send_on(iface, tx_frame, frame_len))
         tcp_diag_counts.synack_sent++;
     else {
         tcp_diag_counts.tx_send_fail++;
@@ -1121,7 +1140,12 @@ static void handle_established(struct tcb *t, u32 seg_seq, u32 seg_ack,
 }
 
 void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
-               const u8 *payload, u32 payload_len, bool checksum_trusted) {
+               const u8 *payload, u32 payload_len, bool checksum_trusted,
+               nic_iface_t ingress_iface) {
+    if ((ingress_iface != NIC_IFACE_WIRED &&
+         ingress_iface != NIC_IFACE_WIFI) ||
+        !net_interface_configured(ingress_iface))
+        return;
     if (unlikely(payload_len < TCP_HDR_SIZE)) {
         tcp_diag_counts.in_short++;
         return;
@@ -1158,7 +1182,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
     u32 data_len = payload_len - hdr_len;
 
     /* Look up existing connection */
-    struct tcb *t = tcb_find(dst_port, src_ip, src_port);
+    struct tcb *t = tcb_find(dst_port, src_ip, src_port, ingress_iface);
 
     /* ---- LISTEN handling (SYN cookies) ---- */
     if (!t) {
@@ -1168,10 +1192,10 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
             /* No matching socket — send RST */
             if (!(flags & TCP_RST)) {
                 if (flags & TCP_ACK) {
-                    tcp_send_rst(dst_ip, src_ip, dst_port, src_port,
+                    tcp_send_rst(ingress_iface, dst_ip, src_ip, dst_port, src_port,
                                  seg_ack, 0);
                 } else {
-                    tcp_send_rst(dst_ip, src_ip, dst_port, src_port,
+                    tcp_send_rst(ingress_iface, dst_ip, src_ip, dst_port, src_port,
                                  0, seg_seq + data_len +
                                  ((flags & TCP_SYN) ? 1 : 0) +
                                  ((flags & TCP_FIN) ? 1 : 0));
@@ -1184,7 +1208,8 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
             tcp_diag_counts.syn_seen++;
             /* Respond with SYN-ACK using SYN cookie ISN — no TCB allocated */
             u32 cookie = make_syn_cookie(dst_port, src_ip, src_port, seg_seq);
-            tcp_send_synack_cookie(src_ip, src_port, dst_port, seg_seq, cookie);
+            tcp_send_synack_cookie(ingress_iface, src_ip, src_port, dst_port,
+                                   seg_seq, cookie);
             return;
         }
 
@@ -1206,7 +1231,8 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
             /* Valid cookie — queue in listen backlog */
             for (u32 i = 0; i < listen->pending_count; i++) {
                 if (listen->pending[i].remote_ip == src_ip &&
-                    listen->pending[i].remote_port == src_port)
+                    listen->pending[i].remote_port == src_port &&
+                    listen->pending[i].iface == ingress_iface)
                     return;
             }
             if (listen->pending_count < LISTEN_BACKLOG) {
@@ -1214,6 +1240,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
                 u32 idx = listen->pending_count++;
                 listen->pending[idx].remote_ip   = src_ip;
                 listen->pending[idx].remote_port  = src_port;
+                listen->pending[idx].iface        = ingress_iface;
                 listen->pending[idx].irs          = their_iss;
                 listen->pending[idx].iss          = their_seq;
             } else {
@@ -1233,7 +1260,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
             if (seg_ack != t->iss + 1) {
                 tcp_diag_counts.active_bad_ack++;
                 if (!(flags & TCP_RST))
-                    tcp_send_rst(t->local_ip, t->remote_ip,
+                    tcp_send_rst(t->iface, t->local_ip, t->remote_ip,
                                  t->local_port, t->remote_port, seg_ack, 0);
                 return;
             }
@@ -1286,7 +1313,7 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
                 cc_init(t);
                 tcp_log_established(t, "passive");
             } else {
-                tcp_send_rst(t->local_ip, t->remote_ip,
+                tcp_send_rst(t->iface, t->local_ip, t->remote_ip,
                              t->local_port, t->remote_port, seg_ack, 0);
                 return;
             }
@@ -1550,8 +1577,6 @@ void tcp_init(void) {
     tcb_inuse = 0;
     tcp_listener_count = 0;
 
-    nic_get_mac(tcp_local_mac);
-    tcp_local_ip = net_get_our_ip();
 
     /* Generate SYN cookie secret from timer jitter */
     u32 t0 = (u32)tcp_now_ms();
@@ -1566,20 +1591,25 @@ void tcp_init(void) {
 #endif
 }
 
-tcp_conn_t tcp_connect(u32 dst_ip, u16 dst_port) {
+tcp_conn_t tcp_connect_on(nic_iface_t iface, u32 dst_ip, u16 dst_port) {
+    if (iface == NIC_IFACE_ANY)
+        iface = nic_default_iface();
+    if (!net_interface_configured(iface))
+        return -1;
     struct tcb *t = tcb_alloc();
     if (!t) return -1;
 
     u16 src_port = alloc_port();
 
     simd_zero(t, sizeof(struct tcb));
-    t->local_ip    = tcp_local_ip;
+    t->iface       = iface;
+    t->local_ip    = net_get_our_ip_for(t->iface);
     t->remote_ip   = dst_ip;
     t->local_port  = src_port;
     t->remote_port = dst_port;
     t->rcv_wnd     = TCP_DEFAULT_WINDOW;
 
-    t->iss     = generate_isn(tcp_local_ip, src_port, dst_ip, dst_port);
+    t->iss     = generate_isn(t->local_ip, src_port, dst_ip, dst_port);
     t->snd_una = t->iss;
     t->snd_nxt = t->iss;
 
@@ -1598,12 +1628,23 @@ tcp_conn_t tcp_connect(u32 dst_ip, u16 dst_port) {
     return tcb_index(t);
 }
 
+tcp_conn_t tcp_connect(u32 dst_ip, u16 dst_port)
+{
+    return tcp_connect_on(nic_default_iface(), dst_ip, dst_port);
+}
+
+nic_iface_t tcp_iface(tcp_conn_t conn)
+{
+    return (tcbs && tcb_valid(conn)) ? tcbs[conn].iface : NIC_IFACE_ANY;
+}
+
 tcp_conn_t tcp_listen(u16 port) {
     struct tcb *t = tcb_alloc();
     if (!t) return -1;
 
     simd_zero(t, sizeof(struct tcb));
-    t->local_ip   = tcp_local_ip;
+    t->iface      = NIC_IFACE_ANY;
+    t->local_ip   = 0;
     t->local_port = port;
     t->state      = TCP_LISTEN;
     t->rcv_wnd    = TCP_DEFAULT_WINDOW;
@@ -1624,6 +1665,7 @@ tcp_conn_t tcp_accept(tcp_conn_t listen_conn) {
     /* Pop oldest pending connection */
     u32 remote_ip   = lt->pending[0].remote_ip;
     u16 remote_port = lt->pending[0].remote_port;
+    nic_iface_t iface = lt->pending[0].iface;
     u32 irs         = lt->pending[0].irs;
     u32 iss         = lt->pending[0].iss;
 
@@ -1633,7 +1675,8 @@ tcp_conn_t tcp_accept(tcp_conn_t listen_conn) {
     lt->pending_count--;
 
     simd_zero(t, sizeof(struct tcb));
-    t->local_ip    = tcp_local_ip;
+    t->iface       = iface;
+    t->local_ip    = net_get_our_ip_for(iface);
     t->remote_ip   = remote_ip;
     t->local_port  = lt->local_port;
     t->remote_port = remote_port;
@@ -1817,6 +1860,7 @@ u32 tcp_snapshot(tcp_snapshot_entry_t *out, u32 max)
         out[n].rx_used = ring_used(&t->rx_buf);
         out[n].tx_used = ring_used(&t->tx_buf);
         out[n].retries = t->retries;
+        out[n].iface = t->iface;
         n++;
     }
     return n;

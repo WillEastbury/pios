@@ -81,6 +81,8 @@ decision)
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
+| [032](#adr-032) | Concurrent wired and WiFi network interfaces | Owner | Accepted |
+| [033](#adr-033) | FIFO/software-interrupt network execution | Owner | Accepted |
 
 ---
 
@@ -151,6 +153,48 @@ display, and future peripheral drivers. The generic xHCI work on branch
 hardware backends without duplicating device protocols or class drivers.
 Every backend must publish explicit capability and DMA/attribute contracts;
 autodetection must never probe absent MMIO as if it were present.
+
+---
+
+<a name="adr-032"></a>
+## ADR-032 — Concurrent wired and WiFi network interfaces
+
+**Date:** 2026-08-13 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** `wifi activate` adds WiFi without disabling the configured
+wired interface. Wired `.201` and WiFi `.202` remain simultaneously reachable,
+while existing single-NIC QEMU behaviour remains unchanged.
+
+**Decision.** Keep a transport-neutral dual-NIC manager with explicit backend
+identity on ingress and egress. IP/TCP/ARP/firewall paths carry that identity,
+listeners are wildcard-capable across configured local addresses, and session
+and FIFO handling rejects ambiguous or stale interface ownership. Each
+interface has independent link, MAC, address, route and neighbor state; core 0
+remains the sole reactor and owner of both hardware paths.
+
+**Consequences.** Replies follow the ingress interface, outbound client traffic
+keeps the wired default unless an explicit interface is attached, and
+unconfigured addresses or backend identities fail closed.
+
+---
+
+<a name="adr-033"></a>
+## ADR-033 — FIFO/software-interrupt network execution
+
+**Date:** 2026-08-17 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** Every network stage is event-driven. A hardware MAC/SDIO IRQ
+publishes a bounded ingress descriptor into its FIFO and raises the matching
+core-0 software interrupt. That software handler consumes the FIFO and
+publishes the next stage's descriptor, repeating until protocol/service work is
+complete. Egress follows the same software FIFO/interrupt chain; only the
+final, owned span is passed to the MAC.
+
+**Consequences.** No hardware IRQ, timer tick, maintenance pass, or reactor hot
+loop may directly call protocol work merely to poll for frames. A missing
+software-interrupt publication is a correctness failure, not a reason to add a
+polling fallback. Every queue is bounded, ownership is explicit, and every
+stage has a regression proving it does no work without its input FIFO event.
 
 ---
 

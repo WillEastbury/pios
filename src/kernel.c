@@ -78,6 +78,7 @@
 #include "workq.h"
 #include "ksvc.h"
 #include "picowal_db.h"
+#include "ppos_provider.h"
 #include "el2.h"
 #include "crypto.h"
 #include "watchdog.h"
@@ -112,6 +113,7 @@
 #include "sts_token.h"
 #include "adrv.h"
 #include "airq.h"
+#include "net_dispatch.h"
 #include "rp1_i2c.h"
 #include "rp1_spi.h"
 
@@ -466,6 +468,7 @@ static struct ota_update_state ota_update;
 static u8 *ota_stage_buf;
 static u32 ota_stage_cap;
 static bool ota_stage_ready;
+static u64 core0_io_flag_passes[8] ALIGNED(64);
 
 static void ota_update_reset_state(void)
 {
@@ -552,8 +555,6 @@ static u32 debug_tcp_len;
 static u32 debug_tcp_iac_skip;
 static i32 debug_tcp_last_term_char = -1;
 static bool debug_tcp_discard_line;
-#define CORE0_ETH_IRQ_STALL_THRESHOLD       4U     /* consecutive non-clearing quenches before poll fallback */
-#define CORE0_ETH_IRQ_FALLBACK_COOLDOWN_MS  5000ULL /* how long to stay poll-only before retrying IRQ mode */
 static volatile u64 core0_eth_irq_count;
 static volatile u32 core0_eth_irq_last_mip;
 static volatile u32 core0_eth_irq_last_macb_isr;
@@ -561,9 +562,6 @@ static volatile bool core0_eth_irq_oneshot;
 static volatile bool core0_eth_irq_deferred_quench;
 static volatile u32 core0_eth_irq_quench_passes;
 static volatile u32 core0_eth_irq_stall_streak;   /* consecutive quenches that failed to clear */
-static volatile bool core0_eth_irq_poll_fallback; /* true: IRQ line masked, relying on poll only */
-static volatile u64 core0_eth_irq_fallback_since_ms;
-static volatile u32 core0_eth_irq_fallback_count;  /* lifetime fallback engagements (diagnostic) */
 static volatile u32 core0_io_flags;
 static u32 core0_eth_source_diag[24];
 static volatile u32 core0_eth_source_diag_seq;
@@ -603,6 +601,7 @@ static void core0_eth_irq_arm_host(bool oneshot);
 static volatile u64 g_dash_snap_ticks;
 static volatile u64 g_dash_render_ticks;
 static bool core0_eth_irq_drain_and_quench(bool host_route);
+static void core0_network_service_step(void);
 static const char *tcp_state_name(u32 state);
 static const char *tcp_owner_label(u16 port);
 static bool http_request_complete(const u8 *req, u32 len);
@@ -737,7 +736,7 @@ static void debug_tcp_poll(void)
         u32 n = tcp_read(debug_client_conn, buf, sizeof(buf));
         for (u32 i = 0; i < n; i++)
             debug_tcp_feed(buf[i]);
-    } else if (st == TCP_CLOSED || st >= TCP_CLOSING) {
+    } else {
         debug_tcp_close();
     }
 }
@@ -788,7 +787,14 @@ static void http_log_event(const char *event, u32 a, u32 b)
 static void wifi_upload_progress(void)
 {
     static u32 cadence;
-    net_poll();
+    /*
+     * ADR-033: an adrv liveness hook may keep the fail-safe path observable,
+     * but it may not borrow protocol execution by polling frames.  Publish a
+     * bounded transport indication; the registered software handler owns the
+     * subsequent NIC read and protocol stages.
+     */
+    (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                         NET_DISPATCH_CAUSE_PACED);
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
     if ((++cadence & 31U) == 0U) {
         bool recovered = macb_rx_recover();
@@ -983,6 +989,10 @@ static void http_append_firewall_list(char *out, u32 *len, u32 max)
         if (r.direction == NIC_FILTER_DIR_IN) http_append(out, len, max, "in ");
         else if (r.direction == NIC_FILTER_DIR_OUT) http_append(out, len, max, "out ");
         else http_append(out, len, max, "both ");
+        http_append(out, len, max, "iface=");
+        http_append(out, len, max,
+                    r.iface == NIC_IFACE_WIRED ? "wired " :
+                    (r.iface == NIC_IFACE_WIFI ? "wifi " : "any "));
         if ((r.flags & NIC_FILTER_ETHERTYPE) && r.ethertype == ETH_P_ARP) {
             http_append(out, len, max, "arp ");
         } else if ((r.flags & NIC_FILTER_IP_PROTO) && r.ip_proto == IP_PROTO_TCP) {
@@ -3004,7 +3014,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         } else if (http_streq(topic, "mediahw")) {
             http_append(out, &len, max, "mediahw status | mediahw hevc | mediahw pisp-be\n  Watchdog-guarded read-only identity probes for dedicated BCM2712 media engines.\n");
         } else if (http_streq(topic, "wifi")) {
-            http_append(out, &len, max, "wifi status | wifi probe | wifi init | wifi scan | wifi join <ssid> <pass> | wifi disconnect\n  Explicit watchdog-guarded CYW43455/BCM2712-SDIO2 bring-up; never runs at boot.\n");
+            http_append(out, &len, max, "wifi status | wifi probe | wifi init | wifi scan | wifi join <ssid> <pass> | wifi activate | wifi disconnect\n  WiFi activation is additive: wired .201 remains live while WiFi .202 is configured.\n");
         } else if (http_streq(topic, "addr")) {
             http_append(out, &len, max, "addr <kind:pack/card[/tail]>\n  Parse and canonicalize PIOS resource addresses. Kinds: wal,tcp,udp,stream,dev,file.\n");
         } else if (http_streq(topic, "keystore")) {
@@ -3076,13 +3086,16 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         u32 n = tcp_snapshot(snap, TCP_MAX_CONNECTIONS);
         u64 rx_drop = 0, tx_drop = 0;
         nic_filter_stats(&rx_drop, &tx_drop);
-        http_append(out, &len, max, "CONN ST        LOCAL                  REMOTE                 OWNER          PEND RX TX RETRY\n");
+        http_append(out, &len, max, "CONN ST        IFACE LOCAL                  REMOTE                 OWNER          PEND RX TX RETRY\n");
         for (u32 i = 0; i < n; i++) {
             tcp_snapshot_entry_t *e = &snap[i];
             http_append_u64(out, &len, max, (u32)e->conn);
             http_append(out, &len, max, "    ");
             http_append(out, &len, max, tcp_state_name(e->state));
             http_append(out, &len, max, " ");
+            http_append(out, &len, max,
+                        e->iface == NIC_IFACE_WIRED ? "wired " :
+                        (e->iface == NIC_IFACE_WIFI ? "wifi " : "any "));
             http_append_ip4(out, &len, max, e->local_ip);
             http_append(out, &len, max, ":");
             http_append_u64(out, &len, max, e->local_port);
@@ -3472,7 +3485,17 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         sdio_diag_snapshot(&d);
         cyw43_diag_snapshot(&cd);
         http_append(out, &len, max, "wifi active=");
-        http_append_u64(out, &len, max, nic_is_wifi());
+        http_append_u64(out, &len, max, nic_wifi_active());
+        http_append(out, &len, max, " wired=");
+        http_append_u64(out, &len, max, nic_iface_active(NIC_IFACE_WIRED));
+        http_append(out, &len, max, " wired_backend=");
+        http_append(out, &len, max, nic_iface_name(NIC_IFACE_WIRED));
+        http_append(out, &len, max, " wifi_backend=");
+        http_append(out, &len, max, nic_iface_name(NIC_IFACE_WIFI));
+        http_append(out, &len, max, " wired_ip=");
+        http_append_ip4(out, &len, max, net_get_our_ip_for(NIC_IFACE_WIRED));
+        http_append(out, &len, max, " wifi_ip=");
+        http_append_ip4(out, &len, max, net_get_our_ip_for(NIC_IFACE_WIFI));
         http_append(out, &len, max, " link=");
         http_append_u64(out, &len, max, cyw43_link_state());
         http_append(out, &len, max, " sdio_attempted=");
@@ -3547,6 +3570,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, cd.rx_probe_attempts);
         http_append(out, &len, max, " rxframes=");
         http_append_u64(out, &len, max, cd.rx_frames);
+        http_append(out, &len, max, " dataq=");
+        http_append_u64(out, &len, max, cd.data_rx_queued);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, cd.data_rx_dropped);
         http_append(out, &len, max, " cardirq=");
         http_append_u64(out, &len, max, cd.rx_card_irqs);
         http_append(out, &len, max, "\nframe ch=");
@@ -3987,12 +4014,15 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
     } else if (http_streq(cmd, "wifi activate")) {
         if (!nic_activate_wifi_loaded()) {
             http_append(out, &len, max, "WiFi activate FAILED\n");
-        } else {
-            net_init(WIFI_STATIC_IP, WIFI_STATIC_GW, WIFI_STATIC_MASK, NULL);
-            dns_init(WIFI_STATIC_GW);
-            net_services_listen();
+        } else if (!net_add_interface(NIC_IFACE_WIFI, WIFI_STATIC_IP,
+                                      WIFI_STATIC_GW, WIFI_STATIC_MASK, NULL)) {
             http_append(out, &len, max,
-                        "WiFi active at 192.168.0.202/16\n");
+                        "WiFi activate FAILED; wired interface unchanged\n");
+        } else {
+            /* The existing wildcard listeners now accept on either configured
+             * local address. Do not reinitialize TCP/FIFO/session state here. */
+            http_append(out, &len, max,
+                        "WiFi active at 192.168.0.202/16; wired remains at 192.168.0.201/16\n");
         }
     } else if (http_streq(cmd, "wifi disconnect")) {
         http_append(out, &len, max,
@@ -5094,7 +5124,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
     } else if (http_streq(cmd, "proc sched")) {
         struct proc_sched_core_snapshot ps[3];
         u32 pn = proc_sched_snapshot(ps, 3);
-        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST TIMER_IRQ\n");
+        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST TIMER_IRQ WFX AWAIT KEEP ALIAS_STATE PHYS_STATE PUBLISH L3_PTE\n");
         for (u32 i = 0; i < pn; i++) {
             http_append_u64(out, &len, max, ps[i].core);
             http_append(out, &len, max, " ");
@@ -5119,7 +5149,55 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
              * have completely different root causes. */
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, timer_ticks_core(ps[i].core));
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wfx_traps);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wfx_awaits);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wfx_keeps);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wfx_last_state);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wfx_last_generation);
+            http_append(out, &len, max, " ");
+            http_append_hex64(out, &len, max, ps[i].wfx_last_slot_va);
+            http_append(out, &len, max, " ");
+            http_append_hex64(out, &len, max, ps[i].wfx_last_slot_pte);
             http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "airq stat")) {
+        struct airq_diag d;
+        airq_diag_snapshot(&d);
+        http_append(out, &len, max, "PRIO POST DISPATCH DROP MAX_DEPTH BATCH\n");
+        for (u32 p = 0; p < AIRQ_PRIO_COUNT; p++) {
+            http_append_u64(out, &len, max, p);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.posted[p]);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.dispatched[p]);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.dropped[p]);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.max_depth[p]);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.batches[p]);
+            http_append(out, &len, max, "\n");
+        }
+        http_append(out, &len, max, "passes=");
+        http_append_u64(out, &len, max, d.passes);
+        http_append(out, &len, max, " budget_exhausted=");
+        http_append_u64(out, &len, max, d.budget_exhausted);
+        http_append(out, &len, max, " quota_exhausted=");
+        http_append_u64(out, &len, max, d.quota_exhausted);
+        http_append(out, &len, max, " no_handler=");
+        http_append_u64(out, &len, max, d.no_handler);
+        http_append(out, &len, max, " sched_starved=");
+        http_append_u64(out, &len, max, d.sched_starved);
+        http_append(out, &len, max, "\n");
+        http_append(out, &len, max, "core0_flag_passes net/tcp/uart/usb/maint/dash/cpu/wifi=");
+        for (u32 bit = 0; bit < 8U; bit++) {
+            http_append_u64(out, &len, max, core0_io_flag_passes[bit]);
+            http_append(out, &len, max, bit < 7U ? "/" : "\n");
         }
     } else if (http_streq(cmd, "core status")) {
         struct core_status_entry cs[NUM_CORES];
@@ -5197,9 +5275,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
              * independent of real MAC/network activity. Interrupts stay
              * unmasked across the loop (this handler doesn't mask them), so
              * each raise is serviced synchronously by core0_eth_irq_handler
-             * before the next iteration -- the worst-case back-to-back
-             * inter-arrival gap the real IRQ-arm race and the poll-fallback
-             * backstop are meant to survive. Isolates "does pure IRQ rate
+             * before the next iteration. Isolates "does pure IRQ rate
              * alone reproduce/stress the problem" from "does it need real RX
              * ring backlog too". Bounded to 100000 to keep this HTTP request
              * from hanging indefinitely on a misbehaving build. */
@@ -5211,8 +5287,6 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             if (n > 100000U) n = 100000U;
             u64 before = core0_eth_irq_count;
             u32 stall_before = core0_eth_irq_stall_streak;
-            u32 fallback_before = core0_eth_irq_fallback_count;
-            bool poll_fallback_before = core0_eth_irq_poll_fallback;
             for (u32 i = 0; i < n; i++)
                 rp1_eth_irq_raise_test();
             http_append(out, &len, max, "rp1 eth irq storm n=");
@@ -5225,14 +5299,6 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append_u64(out, &len, max, stall_before);
             http_append(out, &len, max, " stall_streak_after=");
             http_append_u64(out, &len, max, core0_eth_irq_stall_streak);
-            http_append(out, &len, max, " poll_fallback_before=");
-            http_append(out, &len, max, poll_fallback_before ? "1" : "0");
-            http_append(out, &len, max, " poll_fallback_after=");
-            http_append(out, &len, max, core0_eth_irq_poll_fallback ? "1" : "0");
-            http_append(out, &len, max, " fallback_count_before=");
-            http_append_u64(out, &len, max, fallback_before);
-            http_append(out, &len, max, " fallback_count_after=");
-            http_append_u64(out, &len, max, core0_eth_irq_fallback_count);
             http_append(out, &len, max, "\n");
         } else if (http_streq(cmd, "rp1 irq pend-gic")) {
             u64 before = core0_eth_irq_count;
@@ -8290,7 +8356,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, ok ? "crypto selftest OK (AES-GCM + GHASH nibble table)\n"
                                        : "crypto selftest FAILED\n");
     } else if (http_streq(cmd, "arp probe")) {
-        arp_probe();
+        arp_probe_iface(NIC_IFACE_WIRED);
         const arp_stats_t *ast = arp_get_stats();
         http_append(out, &len, max, "arp probe sent requests_sent=");
         http_append_u64(out, &len, max, ast->requests_sent);
@@ -8389,10 +8455,6 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, core0_eth_irq_quench_passes);
         http_append(out, &len, max, " stall_streak=");
         http_append_u64(out, &len, max, core0_eth_irq_stall_streak);
-        http_append(out, &len, max, " fallback=");
-        http_append_u64(out, &len, max, core0_eth_irq_poll_fallback ? 1U : 0U);
-        http_append(out, &len, max, " fallback_count=");
-        http_append_u64(out, &len, max, core0_eth_irq_fallback_count);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "arp status")) {
         /* Full ARP subsystem diagnostics: reply/request rate-limit drops
@@ -11799,41 +11861,14 @@ static void admin_service_poll(struct admin_http_service *svc)
                drain_spins < 4096U) {
             drain_spins++;
             if (readable == 0) {
-                net_poll();   /* ingest more inbound frames into the TCP rx ring */
-                readable = tcp_readable(svc->client_conn);
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
-                /* Unlike the main core0 reactor (which pairs every net_poll()
-                 * with a macb_rx_recover()/macb_rx_liveness_recover() check),
-                 * this tight drain loop used to call net_poll() alone. A
-                 * genuine hardware RX overrun triggered by the sustained
-                 * burst of a bulk transfer would then sit un-recovered until
-                 * the loop exhausted its spin budget (or the connection was
-                 * abandoned) and control finally returned to the outer
-                 * reactor -- long enough that the peer's TCP stack gave up
-                 * and reset the connection. Recover inline instead, and log
-                 * enough context (drain_spins, stream progress, lifetime
-                 * recovery count) to read back on the next capture/dtrace
-                 * dump without needing to catch it live. */
-                if (readable == 0) {
-                    bool recovered = macb_rx_recover();
-                    if (!recovered)
-                        recovered = macb_rx_hole_recover();
-                    if (!recovered)
-                        recovered = macb_rx_liveness_recover(timer_monotonic_ms());
-                    if (recovered) {
-                        struct macb_diag md_post;
-                        macb_diag(&md_post);
-                        DTRACE(DTRACE_CAT_OTA, DT_OTA_RX_RECOVER, svc->stream_received,
-                               svc->stream_total, drain_spins,
-                               md_post.rx_recover + md_post.rx_live_recover);
-                        http_log_event("ota-rx-recover", svc->stream_received, drain_spins);
-                        net_poll();
-                        readable = tcp_readable(svc->client_conn);
-                    }
-                }
-#endif
-                if (readable == 0)
-                    break;    /* genuinely nothing available right now */
+                /*
+                 * Do not poll the NIC from this service hot loop.  ADR-033
+                 * makes the next RX frame publish a new transport -> protocol
+                 * -> service chain, which revisits this bounded drain with
+                 * fresh TCP data.  MAC health recovery remains the separate
+                 * maintenance responsibility; it never runs protocol work.
+                 */
+                break;
             }
             u32 want = svc->stream_total - svc->stream_received;
             if (want > readable) want = readable;
@@ -16368,6 +16403,9 @@ static void ui_firewall_print_rule(u32 i, const nic_filter_rule_t *r)
     if (r->direction == NIC_FILTER_DIR_IN) ui_console_write("in ");
     else if (r->direction == NIC_FILTER_DIR_OUT) ui_console_write("out ");
     else ui_console_write("both ");
+    ui_console_write("iface=");
+    ui_console_write(r->iface == NIC_IFACE_WIRED ? "wired " :
+                     (r->iface == NIC_IFACE_WIFI ? "wifi " : "any "));
     if (r->flags & NIC_FILTER_ETHERTYPE) {
         if (r->ethertype == ETH_P_ARP) ui_console_write("arp ");
         else if (r->ethertype == ETH_P_IP) {
@@ -20191,7 +20229,7 @@ static void ui_cmd_arp(u32 argc, char **argv)
         return;
     }
     if (argc >= 2 && ui_streq(argv[1], "probe")) {
-        arp_probe();
+        arp_probe_iface(NIC_IFACE_WIRED);
         const arp_stats_t *st = arp_get_stats();
         ui_console_write("OK: arp probe sent requests_sent=");
         ui_console_u64_dec(st->requests_sent);
@@ -22116,13 +22154,13 @@ static void hdmi_dashboard_render(void)
         bool wifi_runtime = cyw43_runtime_ready();
         u32 wifi_link = cyw43_link_state();
         const char *wifi_state = !PIOS_HAS_WIFI_SDIO2 ? "N/A" :
-                                 (nic_is_wifi() ? "ACTIVE" :
+                                 (nic_wifi_active() ? "ACTIVE" :
                                  (wifi_link == CYW_LINK_UP ? "LINKED" :
                                   (wifi_link == CYW_LINK_JOINING ? "JOINING" :
                                    (wifi_link == CYW_LINK_AUTH_FAIL ? "AUTHFAIL" :
                                     (wifi_runtime ? "READY" : "AVAILABLE")))));
         u32 wifi_color = !PIOS_HAS_WIFI_SDIO2 ? 0x00AAAAAA :
-                         (nic_is_wifi() || wifi_link == CYW_LINK_UP
+                         (nic_wifi_active() || wifi_link == CYW_LINK_UP
             ? 0x0000FF80 : (wifi_link == CYW_LINK_AUTH_FAIL
                                 ? 0x00FF4040 : 0x00FFAA00));
         const char *wifi_load = !PIOS_HAS_WIFI_SDIO2 ? "not present" :
@@ -22131,14 +22169,23 @@ static void hdmi_dashboard_render(void)
                                   (wifi_runtime ? "fw+clm" : "on-demand");
         const char *wifi_caps = !PIOS_HAS_WIFI_SDIO2
             ? "no onboard WiFi on this platform"
-            : (nic_is_wifi()
-            ? "CYW43455 SDIO2 WiFi is the active NIC"
+            : (nic_wifi_active()
+            ? "CYW43455 SDIO2 WiFi active; wired NIC remains online"
             : (wifi_runtime
                    ? "CYW43455 ready; wired fail-safe remains selected"
-                   : "CYW43455 SDIO2 driver ready; firmware init on demand; BT pending"));
+                   : "CYW43455 SDIO2 driver ready; firmware init on demand"));
         dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
-                          "WiFi/BT", wifi_state, wifi_color, wifi_load,
+                          "WiFi", wifi_state, wifi_color, wifi_load,
                           wifi_memory, wifi_caps);
+        if (hw_r < hw_end)
+            dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                              "Bluetooth",
+                              !PIOS_HAS_WIFI_SDIO2 ? "N/A" : "PENDING",
+                              !PIOS_HAS_WIFI_SDIO2 ? 0x00AAAAAA : 0x00FFAA00,
+                              !PIOS_HAS_WIFI_SDIO2 ? "not present" : "CYW43455 combo",
+                              !PIOS_HAS_WIFI_SDIO2 ? "0" : "shared SDIO2",
+                              !PIOS_HAS_WIFI_SDIO2 ? "no onboard Bluetooth on this platform" :
+                              "Bluetooth backend pending");
     }
     if (hw_r < hw_end)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
@@ -22938,69 +22985,37 @@ static void core0_io_tick_hook(u32 core, u64 tick)
      * far more than that, silently dropping bytes on overflow. */
     if ((tick & 31U) == 0 || uartflash_active)
         flags |= CORE0_IO_UART | CORE0_IO_USB;
-    /* CORE0_IO_NET is now driven PURELY by the ETH IRQ handler
-     * (core0_eth_irq_handler sets it directly) plus the deferred-quench
-     * consumer's poll-fallback backstop -- deliberately NOT forced here
-     * anymore -- ONLY on real RP1/GEM hardware, where core0_eth_irq_arm_host()
-     * actually arms that IRQ path at boot (see PIOS_HAS_RP1 && PIOS_HAS_GENET
-     * gating there). The previous unconditional 128Hz force existed only
-     * because RX IRQ delivery was previously suspected under load; that hypothesis
-     * was based on an unverified "check-then-arm" race theory that RP1SPEC.md
-     * 6.2 actually contradicts (IACK-while-still-asserted is documented to
-     * generate a fresh MSI), and the REAL bug was a software lost-wakeup race
-     * in how core0_eth_irq_deferred_quench was consumed (see the fixed
-     * clear-before-drain loop below) -- not an inherent IRQ reliability
-     * problem. Brute-force timer polling was masking that bug rather than
-     * fixing it, at the cost of never trusting/exercising the IRQ path under
-     * real load. Genuine hardware-wedge detection (RSR.BNA/OVR latch, RX
-     * silence) does NOT depend on this and still runs unconditionally on the
-     * CORE0_IO_MAINT cadence below, so a total IRQ failure (as opposed to a
-     * missed individual wake) still self-heals.
-     * On platforms without that IRQ path (e.g. QEMU's virtio-net, or any
-     * build where PIOS_HAS_RP1/PIOS_HAS_GENET is 0), nothing ever arms an RX
-     * interrupt at all -- so CORE0_IO_NET must still be forced periodically
-     * there, exactly as before, or RX is never drained. */
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
-    if ((tick & 7U) == 0) {
-        flags |= CORE0_IO_TCP;
-        /* Exception to "purely IRQ-driven": while the poll-only livelock
-         * fallback is engaged, the GIC ETH line is deliberately masked (see
-         * core0_eth_irq_drain_and_quench), so nothing else will ever set
-         * CORE0_IO_NET again -- including the cooldown-based re-arm check
-         * that lives inside that same branch and is what clears the
-         * fallback. Without this, engaging the fallback would be a
-         * permanent deadlock: masked IRQ + no periodic force = RX never
-         * drains again and the board never leaves fallback mode. Restore
-         * the fast poll cadence ONLY for the duration of this genuinely
-         * degraded window; normal healthy operation stays purely
-         * event-driven. */
-        if (core0_eth_irq_poll_fallback)
-            flags |= CORE0_IO_NET;
-    }
-#else
-    if ((tick & 7U) == 0)
-        flags |= CORE0_IO_NET | CORE0_IO_TCP;
+    /*
+     * ADR-033: timer cadence may publish a bounded SDIO transport indication,
+     * but never calls CYW43, the legacy compatibility pump, or protocol work
+     * itself.  A quiet
+     * wired link therefore cannot gate WiFi delivery, while a missing software
+     * event remains observable as a queue/interrupt failure rather than
+     * silently becoming a polling fallback.
+     */
+#if !(PIOS_HAS_RP1 && PIOS_HAS_GENET)
+    /*
+     * virtio-net exposes no wired RX IRQ in this platform build.  Its explicit
+     * 125Hz transport indication is still only a descriptor publication; the
+     * AIRQ transport handler is the sole place that may inspect its ring.
+     */
+    if ((tick & 7U) == 0U)
+        (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                             NET_DISPATCH_CAUSE_PACED);
 #endif
-    /* The CYW43455 has no wired-MAC IRQ to drive net_poll(). Once WiFi is the
-     * active backend, schedule the normal network/TCP path at the fast device
-     * cadence so SDPCM data frames reach ARP/IP/TCP instead of being consumed
-     * by the control-only WiFi poller. */
-    if (nic_is_wifi() && (tick & 7U) == 0U)
-        flags |= CORE0_IO_NET | CORE0_IO_TCP;
-    /* WiFi frame draining is deliberately independent of CORE0_IO_NET: on Pi 5
-     * that flag is set purely by the wired ETH IRQ, so a quiet wired link would
-     * otherwise stall CYW43455 event delivery (escan results, link/PSK events)
-     * for as long as no Ethernet frame arrives.
-     * The cadence is adaptive: SDIO has no host IRQ line here, so every poll
-     * costs real CMD52/CMD53 bus transactions on core 0. Run fast (~125Hz) only
-     * while a scan/association/link is actually in flight, and idle-poll
-     * (~8Hz) otherwise -- a free-running fast cadence pinned core 0 at 99%. */
     if (cyw43_poll_busy()) {
         if ((tick & 7U) == 0)
-            flags |= CORE0_IO_WIFI;
+            (void)airq_post_from(CORE_NET, AIRQ_SRC_WIFI,
+                                 NET_DISPATCH_CAUSE_PACED);
     } else if ((tick & 127U) == 0) {
-        flags |= CORE0_IO_WIFI;
+        (void)airq_post_from(CORE_NET, AIRQ_SRC_WIFI,
+                             NET_DISPATCH_CAUSE_PACED);
     }
+    /* Timer-driven TCP/application progress is an explicit service event, not
+     * a frame poll. It advances already-owned output after peer ACKs even when
+     * no new ingress descriptor is pending. */
+    if ((tick & 7U) == 0U)
+        (void)net_dispatch_publish_service();
     if ((tick % 100U) == 0)
         flags |= CORE0_IO_MAINT;
     /* Dashboard renders at 1Hz. The CPU-clock perf measurement also samples at
@@ -23015,7 +23030,6 @@ static void core0_io_tick_hook(u32 core, u64 tick)
         flags |= CORE0_IO_CPUCLK;
     if (flags) {
         core0_io_flags |= flags;
-        sev();
     }
 }
 
@@ -23041,8 +23055,6 @@ static void core0_eth_irq_handler(void)
     /* Top half: record and return. The record carries the MIP status so the
      * bottom half needs no further hardware read to know why it was woken. */
     (void)airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, core0_eth_irq_last_mip);
-    core0_io_flags |= CORE0_IO_NET | CORE0_IO_TCP;
-    sev();
 }
 
 /* Bottom half for a NIC receive interrupt. Runs in reactor context under the
@@ -23051,9 +23063,9 @@ static void core0_eth_irq_handler(void)
  * gone -- the failure this whole layering exists to prevent. */
 static void airq_eth_rx_handler(const struct airq_record *rec, void *ctx)
 {
-    (void)rec;
     (void)ctx;
-    core0_io_flags |= CORE0_IO_NET | CORE0_IO_TCP;
+    (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                         rec->arg | NET_DISPATCH_CAUSE_IRQ);
 }
 
 /* Cross-core doorbell. HIGH priority because another core is parked waiting on
@@ -23061,16 +23073,16 @@ static void airq_eth_rx_handler(const struct airq_record *rec, void *ctx)
  * not a latency detail. */
 static void airq_fifo_handler(const struct airq_record *rec, void *ctx)
 {
-    (void)rec;
     (void)ctx;
-    core0_io_flags |= CORE0_IO_TCP;
+    if (rec->target_core == CORE_NET)
+        (void)net_dispatch_publish_service();
 }
 
 static void airq_wifi_handler(const struct airq_record *rec, void *ctx)
 {
-    (void)rec;
     (void)ctx;
-    core0_io_flags |= CORE0_IO_WIFI;
+    (void)net_dispatch_publish_transport(NIC_IFACE_WIFI,
+                                         rec->arg | NET_DISPATCH_CAUSE_PACED);
 }
 
 static void airq_console_handler(const struct airq_record *rec, void *ctx)
@@ -23078,6 +23090,52 @@ static void airq_console_handler(const struct airq_record *rec, void *ctx)
     (void)rec;
     (void)ctx;
     core0_io_flags |= CORE0_IO_UART;
+}
+
+static void airq_net_transport_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_transport();
+    if (core0_eth_irq_deferred_quench) {
+        core0_eth_irq_deferred_quench = false;
+        (void)core0_eth_irq_drain_and_quench(false);
+    }
+}
+
+static void airq_net_mac_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_mac();
+}
+
+static void airq_net_ip_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_ip();
+}
+
+static void airq_net_tcp_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_tcp();
+}
+
+static void airq_net_service_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_service(core0_network_service_step);
+}
+
+static void airq_net_egress_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_egress();
 }
 
 /* Arm RP1 Ethernet RX → GIC HOST6 delivery to core 0 (the proven sequence,
@@ -23108,23 +23166,17 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
 {
     (void)host_route;
     const u32 eth_bit = 1U << RP1_INT_ETH;
-    u32 passes = 0;
-    bool clear = false;
-    /* Edge model: drain RX until the RP1 raw ETH source de-asserts (MACB has
-     * no more received frames), clearing the MACB ISR/RSR each pass. The MIP
-     * host status is non-latching in edge mode, so we no longer try to clear
-     * it; the GIC edge was already completed by EOI in irq_dispatch. */
-    for (; passes < 8U; passes++) {
-        net_poll();
-        core0_eth_irq_last_macb_isr = macb_irq_ack_rx();
-        dsb();
-        core0_eth_irq_last_mip = rp1_mip_host_status_l();
-        if ((rp1_irq_status_l() & eth_bit) == 0) {
-            clear = true;
-            break;
-        }
-    }
-    core0_eth_irq_quench_passes = passes < 8U ? passes + 1U : passes;
+    /*
+     * ADR-033 transport completion.  This no longer drains RX or invokes
+     * protocol work: the transport FIFO handler has already consumed one
+     * bounded ingress quantum.  We only acknowledge hardware and either
+     * re-arm the edge or publish another bounded transport indication.
+     */
+    core0_eth_irq_last_macb_isr = macb_irq_ack_rx();
+    dsb();
+    core0_eth_irq_last_mip = rp1_mip_host_status_l();
+    bool clear = (rp1_irq_status_l() & eth_bit) == 0U;
+    core0_eth_irq_quench_passes = 1U;
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
     {
         struct macb_diag md;
@@ -23134,54 +23186,19 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
     }
 #endif
     if (clear) {
-        /* Per RP1SPEC.md 6.2 (MSIx configuration registers): "If a peripheral
-         * interrupt is still asserted at the time the IACK register is
-         * written, a new MSIx write is generated." So a frame that completes
-         * DMA in the gap between our "raw line is low" observation and the
-         * IACK write is NOT lost -- RP1 guarantees IACK-while-asserted
-         * produces a fresh MSI. There is no check-then-arm race to close
-         * here; a single unconditional rearm after the drain loop is the
-         * documented-correct sequence. (An earlier version of this function
-         * added a bounded retry loop around this rearm based on an
-         * inferred-not-verified "edge only fires for transitions after
-         * arming" model; that model contradicts the datasheet, and the retry
-         * loop could itself exit on its last iteration without a final
-         * rearm if the line was still high -- a real regression. Removed.) */
         rp1_eth_irq_rearm();
         core0_eth_irq_stall_streak = 0;
         return true;
     }
 
-    /* Did NOT catch up within the 8-pass budget: the raw ETH interrupt
-     * source is still asserted, meaning more frames arrived faster than we
-     * could drain. Re-arming unconditionally here (the previous behaviour)
-     * risks a receive livelock under sustained overload: IRQ fires, drain
-     * falls behind, re-arm anyway, IRQ fires again almost immediately,
-     * repeat -- burning core0's time in IRQ entry/exit rather than making
-     * steady draining progress (see DT_RX_IRQ_QUENCH; live testing showed
-     * rx_owned climbing into the mid-400s while RBQP kept advancing, i.e.
-     * hardware still receiving but software never catching up). After a
-     * few consecutive non-clearing quenches, mask the IRQ line instead of
-     * re-arming and fall back to poll-only: the main reactor's net_poll()
-     * plus macb_rx_recover()/macb_rx_liveness_recover() pairing (see
-     * CORE0_IO_NET handling) is the exact same drain path either way, but
-     * without an interrupt able to re-trigger before it has finished. */
+    /*
+     * Do not self-publish a transport retry here. A level that remains
+     * asserted after its bounded quantum cannot be converted into an
+     * unbounded software-event loop: that was a core-0 hot poll which kept
+     * airq_pending() true forever. Leave it quiesced for the next explicit
+     * hardware interrupt/recovery path instead.
+     */
     core0_eth_irq_stall_streak++;
-    if (core0_eth_irq_stall_streak >= CORE0_ETH_IRQ_STALL_THRESHOLD &&
-        !core0_eth_irq_poll_fallback) {
-        core0_eth_irq_poll_fallback = true;
-        core0_eth_irq_fallback_since_ms = timer_monotonic_ms();
-        core0_eth_irq_fallback_count++;
-        gic_disable_irq(GIC_RP1_ETH_MSI);
-        DTRACE(DTRACE_CAT_REACTOR, DT_RX_IRQ_QUENCH, core0_eth_irq_count,
-               0xFFFFFFFFU /* sentinel: fallback engaged */,
-               core0_eth_irq_fallback_count, 0);
-        http_log_event("eth-irq-poll-fallback", core0_eth_irq_stall_streak,
-                       core0_eth_irq_fallback_count);
-        return false;
-    }
-    if (!core0_eth_irq_poll_fallback)
-        rp1_eth_irq_rearm();
     return false;
 }
 
@@ -23238,7 +23255,9 @@ static bool ksvc_dashboard_poll(void *ctx)
 static bool ksvc_timer_poll(void *ctx)
 {
     (void)ctx;
-    arp_tick();
+    arp_tick_iface(NIC_IFACE_WIRED);
+    if (net_interface_configured(NIC_IFACE_WIFI))
+        arp_tick_iface(NIC_IFACE_WIFI);
     tcp_tick();
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
     /* Guaranteed-cadence hardware-wedge safety net, independent of RX IRQ
@@ -23256,9 +23275,29 @@ static bool ksvc_timer_poll(void *ctx)
     return true;
 }
 
+/*
+ * Final protocol/service stage of ADR-033.  This function is entered only by
+ * AIRQ_SRC_NET_SERVICE after that handler has consumed a service descriptor;
+ * it is never selected by a timer, fallback, or reactor polling flag.
+ */
+static void core0_network_service_step(void)
+{
+    net_service_step();
+    /* Drain OTA/admin independently of the heavier :80 service so a bounded
+     * service event still preserves the management path under application
+     * load. */
+    admin_services_poll();
+    echo_tcp_poll();
+    uhttp_bridge_poll();
+    capsvc_poll();
+    picovm_kernel_fifo_poll();
+    ksvc_run(ksvc_debug_id);
+}
+
 /* Core 0: Kernel services + network */
 NORETURN void core0_main(void) {
     struct core_env *env = core_env_of(CORE_NET);
+    proc_fifo_doorbell_init();
     ui_mode = UI_MODE_NONE;  /* HDMI stays on boot diags */
     ui_selected = 0;
     ui_last_render = 0;
@@ -23305,8 +23344,8 @@ NORETURN void core0_main(void) {
     ui_console_prompt();
 
     timer_set_tick_hook(pios_tick_hook);
-    core0_io_flags = CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART |
-                     CORE0_IO_USB | CORE0_IO_MAINT | CORE0_IO_DASH | CORE0_IO_CPUCLK;
+    core0_io_flags = CORE0_IO_UART | CORE0_IO_USB | CORE0_IO_MAINT |
+                     CORE0_IO_DASH | CORE0_IO_CPUCLK;
     core0_io_sched_start_ticks = sched_counter_ticks();
 #if PIOS_HAS_BOOTINFO_FB
     bool dash_fb_ok = fb_init(1920, 1080) || fb_init(1280, 720) || fb_init(1024, 768);
@@ -23325,18 +23364,11 @@ NORETURN void core0_main(void) {
     }
 #endif
 
-    /* Auto-arm RP1 Ethernet RX → GIC HOST6 so inbound packets wake core 0 via
-     * interrupt instead of relying solely on the periodic poll. The 31 Hz NET
-     * poll is retained as a safety net until IRQ delivery is proven under load. */
+    /* Auto-arm RP1 Ethernet RX → GIC HOST6. Ingress execution is exclusively
+     * the AIRQ/FIFO pipeline; there is no periodic protocol-poll fallback. */
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
     core0_eth_irq_arm_host(false);
 #endif
-
-    /* Diagnostic-trace phase threshold: only record reactor phases that take
-     * longer than ~50us of work, so the trace ring captures the rare long
-     * (starving) phases instead of being flooded by empty 128Hz polls. */
-    u64 dt_phase_thresh;
-    { u64 f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); dt_phase_thresh = f / 20000U; }
 
     u64 stack_canary_last_check = 0;
     for (;;) {
@@ -23358,7 +23390,7 @@ NORETURN void core0_main(void) {
         }
 
         u32 flags = core0_io_take_flags();
-        if (flags == 0) {
+        if (flags == 0 && !airq_pending(CORE_NET)) {
             watchdog_hw_pet();
             core0_io_wfi_count++;
             u64 idle_start = sched_counter_ticks();
@@ -23375,6 +23407,10 @@ NORETURN void core0_main(void) {
 
         core0_io_wake_count++;
         core0_io_last_flags = flags;
+        for (u32 bit = 0; bit < 8U; bit++) {
+            if (flags & (1U << bit))
+                core0_io_flag_passes[bit]++;
+        }
         /* Core 0's reactor is itself a scheduler: account every dispatch pass
          * so its cost is attributable in the service map alongside the user
          * cores' schedulers. */
@@ -23395,102 +23431,6 @@ NORETURN void core0_main(void) {
 
         /* Scheduled asynchronous driver work (bounded, admission-controlled). */
         adrv_service();
-
-        if (flags & CORE0_IO_NET) {
-            u64 svc_start = ksvc_begin(ksvc_net_id);
-            u64 dt_t0 = sched_counter_ticks();
-            u32 got = net_poll();
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
-            /* Self-heal a latched RX-overrun stall (BNA/OVR). A burst that
-             * outran the drain leaves GEM with the ring full and RX DMA halted;
-             * without this the NIC stays wedged (rx_idx frozen) even after the
-             * load stops. Recover, then drain the freshly-restarted ring. */
-            if (macb_rx_recover())
-                got += net_poll();
-            else if (macb_rx_hole_recover())
-                got += net_poll();
-            /* Also self-heal a non-BNA/OVR RX halt (which the status check above
-             * cannot see): if the RX-liveness watchdog (activity-gated) fires,
-             * rebuild the ring and re-drain. */
-            else if (macb_rx_liveness_recover(timer_monotonic_ms()))
-                got += net_poll();
-#endif
-            /* Chain CORE0_IO_TCP directly off real MAC-layer completion
-             * (hardirq -> softirq handoff), rather than waiting for TCP's own
-             * independent periodic tick: if net_poll() actually delivered new
-             * frames this pass, the TCP-level connection/app-layer services
-             * (admin/OTA, echo, :81 bridge) have new segment data to react to
-             * right now, and the periodic tick could be up to 8 ticks away.
-             * This mirrors what core0_eth_irq_handler already does for the
-             * IRQ-driven wake path (it sets both bits together in one step);
-             * this closes the same gap for the poll/deferred-quench-driven
-             * path. TCP's own periodic tick (see core0_io_tick_hook) is still
-             * needed independently for TX-side pumping when there's pending
-             * output but no new RX to chain off of. */
-            if (got > 0)
-                core0_io_flags |= CORE0_IO_TCP;
-            dns_poll();
-            /* Consume the deferred-quench request clear-before-work, not
-             * clear-after: the old order (drain, then unconditionally clear)
-             * has a real lost-wakeup window -- core0_eth_irq_handler runs on
-             * this same core and can fire between the drain call returning
-             * and the "= false" store, setting the flag true only for it to
-             * be immediately clobbered back to false by mainline, silently
-             * dropping that request. Clearing first and looping while the
-             * flag keeps getting re-set (by a fresh IRQ arriving mid-drain)
-             * closes that window: any such IRQ causes another drain pass
-             * instead of being lost. */
-            while (core0_eth_irq_deferred_quench) {
-                core0_eth_irq_deferred_quench = false;
-                core0_eth_irq_drain_and_quench(false);
-            }
-            if (cyw43_runtime_ready() && !nic_is_wifi())
-                cyw43_poll();
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
-            /* Recovered from a poll-only livelock fallback: after a cooldown
-             * (during which this same net_poll()/macb_rx_recover() pairing
-             * above is what's been draining the ring, IRQ-free), try
-             * IRQ-driven wake again. If the overload was transient this
-             * restores lower-latency wake; if it recurs immediately the
-             * stall-streak counter will just re-trip the fallback. */
-            if (core0_eth_irq_poll_fallback &&
-                timer_monotonic_ms() - core0_eth_irq_fallback_since_ms > CORE0_ETH_IRQ_FALLBACK_COOLDOWN_MS) {
-                core0_eth_irq_poll_fallback = false;
-                core0_eth_irq_stall_streak = 0;
-                core0_eth_irq_arm_host(false);
-                http_log_event("eth-irq-poll-fallback-end", core0_eth_irq_fallback_count, 0);
-            }
-#endif
-            u64 dt_net = sched_counter_ticks() - dt_t0;
-            if (dt_net > dt_phase_thresh)
-                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_NET, dt_net, flags, 0, 0);
-            ksvc_end(ksvc_net_id, svc_start, false);
-        }
-
-        if (flags & CORE0_IO_TCP) {
-            u64 svc_start = ksvc_begin(ksvc_tcp_id);
-            /* Drain the admin services (incl. the OTA upload stream) FIRST and
-             * independently of the heavy multi-connection :80 handler, so a bulk
-             * OTA upload is never starved of core0 time by :80 load. */
-            u64 dt_a0 = sched_counter_ticks();
-            admin_services_poll();
-            u64 dt_a1 = sched_counter_ticks();
-            if (dt_a1 - dt_a0 > dt_phase_thresh)
-                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_ADMIN, dt_a1 - dt_a0, 0, 0, 0);
-            echo_tcp_poll();
-            u64 dt_echo = sched_counter_ticks() - dt_a1;
-            if (dt_echo > dt_phase_thresh)
-                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_ECHO, dt_echo, 0, 0, 0);
-            u64 dt_http0 = sched_counter_ticks();
-            uhttp_bridge_poll();   /* userland :81 request/response pump */
-            u64 dt_http = sched_counter_ticks() - dt_http0;
-            if (dt_http > dt_phase_thresh)
-                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_HTTP, dt_http, 0, 0, 0);
-            capsvc_poll();   /* generic capsule-service dispatcher (docs/net_capsule_fifo.md) */
-            picovm_kernel_fifo_poll();
-            ksvc_end(ksvc_tcp_id, svc_start, false);
-            ksvc_run(ksvc_debug_id);
-        }
 
         if (flags & (CORE0_IO_UART | CORE0_IO_USB)) {
             u64 svc_start = ksvc_begin(ksvc_ui_id);
@@ -23545,11 +23485,6 @@ NORETURN void core0_main(void) {
 
             ui_handle_keys();
             ksvc_end(ksvc_ui_id, svc_start, false);
-        }
-
-        if (flags & CORE0_IO_WIFI) {
-            if (cyw43_runtime_ready() && !nic_is_wifi())
-                cyw43_poll();
         }
 
         if (flags & CORE0_IO_MAINT) {
@@ -24376,6 +24311,37 @@ void kernel_main(void) {
     /* IPC */
     bp_log("[fifo] fifo_init_all...");
     fifo_init_all();
+    /*
+     * Bring the ADR-033 queues online before net_init().  Even bootstrap ARP
+     * announcement therefore follows the owned-span egress FIFO rather than
+     * bypassing the final MAC stage.  AIRQ is not dispatched until core0_main,
+     * after the service registry is ready.
+     */
+    airq_init();
+    airq_set_now_hook(timer_monotonic_ms);
+    net_dispatch_init();
+    (void)airq_register(AIRQ_SRC_ETH_RX, AIRQ_PRIO_CRITICAL, CORE_NET,
+                        airq_eth_rx_handler, NULL);
+    for (u32 c = 0U; c < AIRQ_CORES; c++)
+        (void)airq_register(AIRQ_SRC_FIFO_CORE(c), AIRQ_PRIO_HIGH, c,
+                            airq_fifo_handler, NULL);
+    (void)airq_register(AIRQ_SRC_WIFI, AIRQ_PRIO_NORMAL, CORE_NET,
+                        airq_wifi_handler, NULL);
+    (void)airq_register(AIRQ_SRC_CONSOLE, AIRQ_PRIO_LOW, CORE_NET,
+                        airq_console_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_TRANSPORT, AIRQ_PRIO_CRITICAL, CORE_NET,
+                        airq_net_transport_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_MAC, AIRQ_PRIO_HIGH, CORE_NET,
+                        airq_net_mac_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_IP, AIRQ_PRIO_HIGH, CORE_NET,
+                        airq_net_ip_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_TCP, AIRQ_PRIO_HIGH, CORE_NET,
+                        airq_net_tcp_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_SERVICE, AIRQ_PRIO_HIGH, CORE_NET,
+                        airq_net_service_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_EGRESS, AIRQ_PRIO_HIGH, CORE_NET,
+                        airq_net_egress_handler, NULL);
+    net_dispatch_enable();
     dtrace_init();
     coredump_init();
     bp_log("[ipc] ipc_queue_init...");
@@ -24451,6 +24417,7 @@ void kernel_main(void) {
             if (!picowal_db_init()) {
                 bp_warn("[walfs] picowal_db init FAILED — continuing");
             }
+            ppos_provider_install();
             watchdog_hw_pet();
             bp_log("[walfs] boot_policy_verify...");
             boot_policy_verify_or_seed();
@@ -24601,23 +24568,6 @@ void kernel_main(void) {
      * the very work that starves the board when it goes wrong. */
     ksvc_sched0_id = ksvc_register("sched-core0", KSVC_KIND_POLL, CORE_NET, 110);
     ksvc_fifo0_id = ksvc_register("fifo-core0", KSVC_KIND_POLL, CORE_NET, 105);
-
-    /* Software interrupt privilege levels. Hardware handlers only enqueue;
-     * these handlers run in reactor context under the dispatcher's budget. */
-    airq_init();
-    airq_set_now_hook(timer_monotonic_ms);
-    (void)airq_register(AIRQ_SRC_ETH_RX, AIRQ_PRIO_CRITICAL, CORE_NET,
-                        airq_eth_rx_handler, NULL);
-    /* One FIFO doorbell source per target core: the record must land on the
-     * core that will service it. Cores 1-3 drain theirs from airq_quantum()
-     * in their scheduler loop. */
-    for (u32 c = 0U; c < AIRQ_CORES; c++)
-        (void)airq_register(AIRQ_SRC_FIFO_CORE(c), AIRQ_PRIO_HIGH, c,
-                            airq_fifo_handler, NULL);
-    (void)airq_register(AIRQ_SRC_WIFI, AIRQ_PRIO_NORMAL, CORE_NET,
-                        airq_wifi_handler, NULL);
-    (void)airq_register(AIRQ_SRC_CONSOLE, AIRQ_PRIO_LOW, CORE_NET,
-                        airq_console_handler, NULL);
 
     /* Asynchronous driver framework: same clock, watchdog petted only on
      * proven progress, and the liveness hook that keeps the wired fail-safe

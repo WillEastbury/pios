@@ -141,6 +141,12 @@
 #define AIRQ_SRC_FIFO_CORE(n)  (2U + (n))  /* HIGH: 2..5, one per target core */
 #define AIRQ_SRC_WIFI          6U          /* NORMAL: CYW43455 SDPCM */
 #define AIRQ_SRC_CONSOLE       7U          /* LOW: UART/console input */
+#define AIRQ_SRC_NET_TRANSPORT 8U          /* CRITICAL: bounded NIC/SDIO drain */
+#define AIRQ_SRC_NET_MAC       9U          /* HIGH: Ethernet descriptor stage */
+#define AIRQ_SRC_NET_IP        10U         /* HIGH: validated IPv4 descriptor stage */
+#define AIRQ_SRC_NET_TCP       11U         /* HIGH: TCP/UDP/ICMP descriptor stage */
+#define AIRQ_SRC_NET_SERVICE   12U         /* HIGH: TCP/UDP/service stage */
+#define AIRQ_SRC_NET_EGRESS    13U         /* HIGH: final owned NIC spans */
 
 /* A queued event. Deliberately small and fixed: the top half stores one of
  * these and returns. */

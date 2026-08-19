@@ -305,6 +305,13 @@ These are not bugs to be fixed one at a time. They are the absence of an abstrac
   core without anyone deciding to. Hardware is **trigger level 0**: the top half acknowledges the
   line and posts a bounded record. Every executable privilege level sits *above* it in software,
   dispatched in scheduled context under budget. Registering work at level 0 is refused outright.
+- **Core-0 protocol work is FIFO/software-interrupt-only.** MAC/SDIO hardware IRQs and bounded
+  transport polls may only publish an immutable ingress descriptor to their FIFO, then raise the
+  matching core-0 software interrupt. The core-0 software handler dequeues that FIFO and alone
+  invokes Ethernet, ARP, IP, TCP, and service work. Timers/polls may recover hardware but must
+  never directly fire protocol processing. `core0_eth_irq_handler()`'s current direct
+  `CORE0_IO_NET` path is transitional debt: replace it with the FIFO-triggered software handler;
+  apply the same rule to IP and WiFi ingress.
 - **User cores need exactly one software interrupt: the quantum.** Not a zoo of SGI types — one
   message meaning *"drain your inbound queue, then run the scheduler with what's left."* The drain
   is capped at a fraction of the quantum, so the scheduler is guaranteed a share and a queue flood

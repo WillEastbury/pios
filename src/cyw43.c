@@ -129,6 +129,7 @@
 /* Bounded RF-neutral bus pokes issued while a scan is running. */
 #define CYW_SCAN_KICK_INTERVAL_MS 250ULL
 #define CYW_SCAN_KICKS_MAX        60U
+#define CYW_DATA_RX_QUEUE_DEPTH   CYW_POLL_BURST_FRAMES
 
 /* ── State ── */
 
@@ -148,6 +149,15 @@ static u8 cyw_eapol_frame[CYW_EAPOL_MAX] ALIGNED(64);
 static u32 cyw_eapol_len;
 static u8 cyw_m2_frame[CYW_EAPOL_MAX] ALIGNED(64);
 static u32 cyw_m2_len;
+struct cyw_data_rx_slot {
+    u32 len;
+    u8 data[CYW_MAX_FRAME];
+};
+static struct cyw_data_rx_slot
+    cyw_data_rx_queue[CYW_DATA_RX_QUEUE_DEPTH] ALIGNED(64);
+static u32 cyw_data_rx_head;
+static u32 cyw_data_rx_tail;
+static u32 cyw_data_rx_count;
 
 /* BCDC request ID counter */
 static u16 bcdc_reqid;
@@ -1004,6 +1014,7 @@ static void capture_eapol(const u8 *data, u32 len)
                 memset(seed,0,sizeof(seed));
                 wpa_host.nonce_ready=true;
             }
+
             /* The association target can be a transmitted/parent BSSID in a
              * multi-BSSID profile. The EAPOL source is the authenticator
              * address used by the four-way handshake. */
@@ -1018,6 +1029,49 @@ static void capture_eapol(const u8 *data, u32 len)
         } else if (pairwise && ack && mic)
             (void)wpa_handle_m3(frame,frame_len);
     }
+}
+
+static bool cyw_data_is_eapol(const u8 *data, u32 len)
+{
+    if (!data || len < 4U)
+        return false;
+    u32 bdc_offset = 4U + ((u32)data[3] << 2);
+    return bdc_offset <= len && len - bdc_offset >= 14U &&
+           data[bdc_offset + 12U] == 0x88U &&
+           data[bdc_offset + 13U] == 0x8EU;
+}
+
+static bool cyw_data_queue_push(const u8 *data, u32 len)
+{
+    if (!data || len > CYW_MAX_FRAME ||
+        cyw_data_rx_count == CYW_DATA_RX_QUEUE_DEPTH) {
+        cyw_diag.data_rx_dropped++;
+        return false;
+    }
+    struct cyw_data_rx_slot *slot = &cyw_data_rx_queue[cyw_data_rx_head];
+    memcpy(slot->data, data, len);
+    slot->len = len;
+    cyw_data_rx_head =
+        (cyw_data_rx_head + 1U) % CYW_DATA_RX_QUEUE_DEPTH;
+    cyw_data_rx_count++;
+    cyw_diag.data_rx_queued++;
+    return true;
+}
+
+static bool cyw_data_frame_copy(const u8 *data, u32 data_len,
+                                u8 *frame, u32 *frame_len)
+{
+    if (!data || !frame || !frame_len || data_len < 4U)
+        return false;
+    u32 bdc_offset = 4U + ((u32)data[3] << 2);
+    if (bdc_offset >= data_len)
+        return false;
+    u32 payload_len = data_len - bdc_offset;
+    if (payload_len > *frame_len)
+        payload_len = *frame_len;
+    memcpy(frame, data + bdc_offset, payload_len);
+    *frame_len = payload_len;
+    return true;
 }
 
 #define CYW_SCAN_SEC_WPA2_PSK        (1U << 0)
@@ -2291,6 +2345,11 @@ bool cyw43_init(void)
     bcdc_reqid = 1;
     bcdc_ignore_through = 0U;
     memset(bcdc_responses, 0, sizeof(bcdc_responses));
+    cyw_data_rx_head = 0U;
+    cyw_data_rx_tail = 0U;
+    cyw_data_rx_count = 0U;
+    cyw_diag.data_rx_queued = 0U;
+    cyw_diag.data_rx_dropped = 0U;
     /* Preserve the last completed scan cache across a clean firmware
      * reinitialization. Association needs fresh SDPCM credits after scanning,
      * but still needs the selected BSSID/chanspec from that scan. A new
@@ -2900,7 +2959,17 @@ void cyw43_poll(void)
             break;
 
         case SDPCM_DATA_CHANNEL:
-            capture_eapol(cyw_rx_buf, len);
+            if (cyw_data_is_eapol(cyw_rx_buf, len))
+                capture_eapol(cyw_rx_buf, len);
+            else {
+                (void)cyw_data_queue_push(cyw_rx_buf, len);
+                /*
+                 * net_poll() owns regular Ethernet delivery. Do not keep
+                 * draining SDPCM data here or a burst fills the bounded queue
+                 * before the reactor returns to the network stack.
+                 */
+                return;
+            }
             break;
 
         case SDPCM_CTL_CHANNEL:
@@ -3578,6 +3647,16 @@ bool cyw43_recv_frame(u8 *frame, u32 *len)
     u8 channel;
     u32 rlen;
 
+    if (cyw_data_rx_count != 0U) {
+        struct cyw_data_rx_slot *slot =
+            &cyw_data_rx_queue[cyw_data_rx_tail];
+        bool ok = cyw_data_frame_copy(slot->data, slot->len, frame, len);
+        cyw_data_rx_tail =
+            (cyw_data_rx_tail + 1U) % CYW_DATA_RX_QUEUE_DEPTH;
+        cyw_data_rx_count--;
+        return ok;
+    }
+
     if (!sdpcm_recv(&channel, cyw_rx_buf, &rlen))
         return false;
 
@@ -3589,18 +3668,5 @@ bool cyw43_recv_frame(u8 *frame, u32 *len)
     if (channel != SDPCM_DATA_CHANNEL)
         return false;
 
-    /* Strip BDC data header: 4 bytes + (data[3] * 4) bytes of padding */
-    if (rlen < 4)
-        return false;
-    u32 bdc_offset = 4 + ((u32)cyw_rx_buf[3] << 2);
-    if (bdc_offset >= rlen)
-        return false;
-    rlen -= bdc_offset;
-
-    if (rlen > *len)
-        rlen = *len;
-
-    memcpy(frame, cyw_rx_buf + bdc_offset, rlen);
-    *len = rlen;
-    return true;
+    return cyw_data_frame_copy(cyw_rx_buf, rlen, frame, len);
 }
