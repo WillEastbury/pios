@@ -180,6 +180,7 @@ struct airq_diag {
     u32 quota_exhausted;    /* levels that hit their per-pass quota */
     u32 no_handler;         /* records with no registered handler */
     u32 rejected_hardware;  /* attempts to execute work at level 0 */
+    u32 origin_mismatch;    /* producer claimed a different core */
     u32 sched_starved;      /* quanta that returned no scheduler budget */
     u32 low_leftover;       /* LOW records drained from leftover budget */
 } ALIGNED(64);

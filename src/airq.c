@@ -74,6 +74,27 @@ static struct airq_diag airq_diag_state ALIGNED(64);
 static u32 airq_seq;
 static u64 (*airq_now_hook)(void);
 
+static inline u64 airq_irq_save(void)
+{
+#ifdef PIOS_HOST_TYPES_SHIM
+    return 0U;
+#else
+    u64 daif;
+    __asm__ volatile("mrs %0, daif" : "=r"(daif));
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    return daif;
+#endif
+}
+
+static inline void airq_irq_restore(u64 daif)
+{
+#ifndef PIOS_HOST_TYPES_SHIM
+    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+#else
+    (void)daif;
+#endif
+}
+
 static const u32 airq_quota[AIRQ_PRIO_COUNT] = {
     0U,                     /* HARDWARE: never executed */
     AIRQ_CRITICAL_QUOTA,
@@ -171,6 +192,10 @@ bool airq_post_from(u32 origin_core, u32 source, u32 arg)
      * the scheduled world decides when the work is actually done. */
     if (origin_core >= AIRQ_CORES)
         return false;
+    if (origin_core != (core_id() & 3U)) {
+        airq_diag_state.origin_mismatch++;
+        return false;
+    }
 
     struct airq_binding *binding = airq_find(source);
     if (!binding) {
@@ -187,10 +212,18 @@ bool airq_post_from(u32 origin_core, u32 source, u32 arg)
         airq_diag_state.no_handler++;
         return false;
     }
+    /*
+     * A core can publish from both reactor and IRQ context. Mask local IRQs
+     * across reservation and publication so the self-lane remains genuinely
+     * SPSC even when an IRQ interrupts a scheduled producer. Restore the
+     * caller's exact DAIF state: this is safe when already in an IRQ.
+     */
+    u64 daif = airq_irq_save();
     if (airq_lane_depth(lane) >= AIRQ_LANE_CAPACITY) {
         /* Explicit, counted overflow. A dropped interrupt must be visible in
          * diagnostics, never silently lost. */
         airq_diag_state.dropped[priority]++;
+        airq_irq_restore(daif);
         return false;
     }
 
@@ -214,6 +247,7 @@ bool airq_post_from(u32 origin_core, u32 source, u32 arg)
     u32 depth = airq_depth_at_least(target, priority);
     if (depth > airq_diag_state.max_depth[priority])
         airq_diag_state.max_depth[priority] = depth;
+    airq_irq_restore(daif);
     return true;
 }
 
