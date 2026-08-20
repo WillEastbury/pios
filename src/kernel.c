@@ -468,6 +468,19 @@ static struct ota_update_state ota_update;
 static u8 *ota_stage_buf;
 static u32 ota_stage_cap;
 static bool ota_stage_ready;
+
+#define STATIC_UPLOAD_STAGE_MAX 1024U
+struct static_upload_state {
+    bool active;
+    bool done;
+    bool ok;
+    u32 handle;
+    u32 offset;
+    u32 total;
+    u32 len;
+    char path[256];
+} ALIGNED(64);
+static struct static_upload_state static_upload;
 static u64 core0_io_flag_passes[8] ALIGNED(64);
 static u64 core0_airq_dispatch_passes;
 static u64 core0_airq_empty_passes;
@@ -11570,53 +11583,89 @@ static bool crashdump_archive_pending(void)
     return true;
 }
 
+static u32 static_upload_step(void *ctx, u64 deadline_ms)
+{
+    (void)deadline_ms;
+    struct static_upload_state *op = (struct static_upload_state *)ctx;
+    u64 id = 0;
+    bool ok;
+    if (op->offset == 0U) {
+        if (!http_walfs_recreate_file(op->path, &id))
+            return ADRV_STEP_FAILED;
+        ok = walfs_replace(id, ota_stage_buf, op->len);
+    } else {
+        if (!http_walfs_ensure_file(op->path, &id))
+            return ADRV_STEP_FAILED;
+        ok = walfs_write(id, op->offset, ota_stage_buf, op->len);
+    }
+    return ok ? ADRV_STEP_DONE : ADRV_STEP_FAILED;
+}
+
 static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     u32 len = 0;
-    char path[256], confirm[8], tmp[16];
+    char path[256], confirm[8], tmp[16], action[16];
     u32 offset = 0, total = 0;
     u32 body_off = http_header_body_offset(req, req_len);
     u32 body_len = body_off && body_off <= req_len ? req_len - body_off : 0;
     u32 content_len = 0;
     bool has_content_len = body_off && http_content_length(req, body_off, &content_len);
-    bool ok = false;
+    bool ok = false, queued = false;
     const char *error = NULL;
-    u64 id = 0;
+    u32 completion_reason = ADRV_REASON_NONE;
 
-    path[0] = 0; confirm[0] = 0; tmp[0] = 0;
+    path[0] = 0; confirm[0] = 0; tmp[0] = 0; action[0] = 0;
     (void)http_query_value(req, req_len, "/api/admin/static-put", "path", path, sizeof(path));
     (void)http_query_value(req, req_len, "/api/admin/static-put", "confirm", confirm, sizeof(confirm));
+    (void)http_query_value(req, req_len, "/api/admin/static-put", "action", action, sizeof(action));
     if (http_query_value(req, req_len, "/api/admin/static-put", "offset", tmp, sizeof(tmp)))
         (void)http_parse_u32(tmp, &offset);
     tmp[0] = 0;
     if (http_query_value(req, req_len, "/api/admin/static-put", "total", tmp, sizeof(tmp)))
         (void)http_parse_u32(tmp, &total);
 
-    if (!http_streq(confirm, "1")) error = "requires confirm=1";
+    if (http_streq(action, "status")) {
+        if (static_upload.active &&
+            adrv_take_result(static_upload.handle, &completion_reason)) {
+            static_upload.ok = completion_reason == ADRV_REASON_DONE;
+            static_upload.active = false;
+            static_upload.done = true;
+        }
+        ok = static_upload.done && static_upload.ok;
+    } else if (!http_streq(confirm, "1")) error = "requires confirm=1";
     else if (!path[0] || !http_walfs_static_path_safe(path)) error = "bad static path";
     else if (!has_content_len || body_len != content_len) error = "incomplete body";
-    else if (body_len > WALFS_DATA_MAX) error = "chunk too large";
+    else if (body_len == 0U || body_len > STATIC_UPLOAD_STAGE_MAX) error = "chunk too large";
     else if (total != 0 && (offset > total || body_len > total - offset)) error = "chunk exceeds total";
+    else if (static_upload.active || ota_update.active) error = "previous upload still pending";
+    else if (!ota_stage_buf || ota_stage_cap < STATIC_UPLOAD_STAGE_MAX) error = "upload staging unavailable";
     else {
-        if (offset == 0) {
-            if (!http_walfs_recreate_file(path, &id)) {
-                error = "recreate failed";
-            } else {
-                ok = walfs_replace(id, req + body_off, body_len);
-                if (!ok) error = "replace failed";
-            }
+        static_upload.offset = offset;
+        static_upload.total = total;
+        static_upload.len = body_len;
+        for (u32 i = 0; i < body_len; i++)
+            ota_stage_buf[i] = req[body_off + i];
+        for (u32 i = 0; i + 1U < sizeof(static_upload.path) && path[i]; i++) {
+            static_upload.path[i] = path[i];
+            static_upload.path[i + 1U] = 0;
+        }
+        static_upload.done = false;
+        static_upload.ok = false;
+        static_upload.handle = adrv_submit("static-put", static_upload_step,
+                                           &static_upload, 4U, 5000U,
+                                           ADRV_CADENCE_IDLE);
+        if (static_upload.handle == ADRV_HANDLE_INVALID) {
+            error = "upload scheduler unavailable";
         } else {
-            if (!http_walfs_ensure_file(path, &id)) {
-                error = "create/find failed";
-            } else {
-                ok = walfs_write(id, offset, req + body_off, body_len);
-                if (!ok) error = "write failed";
-            }
+            static_upload.active = true;
+            queued = true;
+            ok = true;
         }
     }
 
     http_append(out, &len, max,
-        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{\"ok\":");
+        queued ? "HTTP/1.0 202 Accepted\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{\"ok\":"
+               : "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{\"ok\":");
     http_append(out, &len, max, ok ? "true" : "false");
     http_append(out, &len, max, ",\"path\":");
     http_append_json_string(out, &len, max, path);
@@ -11624,6 +11673,10 @@ static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, 
     http_append_u64(out, &len, max, offset);
     http_append(out, &len, max, ",\"bytes\":");
     http_append_u64(out, &len, max, body_len);
+    http_append(out, &len, max, ",\"queued\":");
+    http_append(out, &len, max, queued ? "true" : "false");
+    http_append(out, &len, max, ",\"active\":");
+    http_append(out, &len, max, static_upload.active ? "true" : "false");
     if (total) {
         http_append(out, &len, max, ",\"total\":");
         http_append_u64(out, &len, max, total);
