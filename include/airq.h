@@ -237,4 +237,14 @@ u32 airq_depth_at_least(u32 core, u32 priority);
 
 void airq_diag_snapshot(struct airq_diag *out);
 
+struct airq_lane_diag {
+    u32 producer;
+    u32 priority;
+    u32 head;
+    u32 tail;
+    u32 depth;
+};
+u32 airq_lane_diag_snapshot(u32 target, struct airq_lane_diag *out, u32 max);
+bool airq_pending_detail(u32 core, struct airq_lane_diag *out);
+
 #endif /* PIOS_AIRQ_H */

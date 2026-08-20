@@ -469,6 +469,8 @@ static u8 *ota_stage_buf;
 static u32 ota_stage_cap;
 static bool ota_stage_ready;
 static u64 core0_io_flag_passes[8] ALIGNED(64);
+static u64 core0_airq_dispatch_passes;
+static u64 core0_airq_empty_passes;
 
 static void ota_update_reset_state(void)
 {
@@ -5198,6 +5200,32 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         for (u32 bit = 0; bit < 8U; bit++) {
             http_append_u64(out, &len, max, core0_io_flag_passes[bit]);
             http_append(out, &len, max, bit < 7U ? "/" : "\n");
+        }
+        http_append(out, &len, max, "core0_airq_dispatch/empty=");
+        http_append_u64(out, &len, max, core0_airq_dispatch_passes);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, core0_airq_empty_passes);
+        http_append(out, &len, max, "\n");
+        struct airq_lane_diag lanes[AIRQ_CORES * AIRQ_QUEUED_PRIOS];
+        u32 lane_n = airq_lane_diag_snapshot(CORE_NET, lanes,
+                                             AIRQ_CORES * AIRQ_QUEUED_PRIOS);
+        http_append(out, &len, max, "core0_lanes producer/prio/head/tail/depth=");
+        if (lane_n == 0U) {
+            http_append(out, &len, max, "none\n");
+        } else {
+            for (u32 i = 0; i < lane_n; i++) {
+                if (i) http_append(out, &len, max, " ");
+                http_append_u64(out, &len, max, lanes[i].producer);
+                http_append(out, &len, max, "/");
+                http_append_u64(out, &len, max, lanes[i].priority);
+                http_append(out, &len, max, "/");
+                http_append_u64(out, &len, max, lanes[i].head);
+                http_append(out, &len, max, "/");
+                http_append_u64(out, &len, max, lanes[i].tail);
+                http_append(out, &len, max, "/");
+                http_append_u64(out, &len, max, lanes[i].depth);
+            }
+            http_append(out, &len, max, "\n");
         }
     } else if (http_streq(cmd, "core status")) {
         struct core_status_entry cs[NUM_CORES];
@@ -23423,7 +23451,10 @@ NORETURN void core0_main(void) {
          * takeover of core 0. */
         if (airq_pending(CORE_NET)) {
             u64 svc_fifo0 = ksvc_begin(ksvc_fifo0_id);
-            (void)airq_dispatch(CORE_NET, ADRV_PASS_BUDGET_MS);
+            u32 airq_done = airq_dispatch(CORE_NET, ADRV_PASS_BUDGET_MS);
+            core0_airq_dispatch_passes++;
+            if (airq_done == 0U)
+                core0_airq_empty_passes++;
             ksvc_end(ksvc_fifo0_id, svc_fifo0, false);
             flags |= core0_io_flags;
             core0_io_flags = 0;

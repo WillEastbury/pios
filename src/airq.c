@@ -39,11 +39,16 @@ struct airq_binding {
  * every CRITICAL record queued behind it.
  */
 struct airq_lane {
-    u32 head;   /* producer index */
-    u32 tail;   /* consumer index */
-    u32 pad[14];
+    volatile u32 head;   /* producer index */
+    u32 pad_head[15];    /* producer and consumer indices never share a line */
+    volatile u32 tail;   /* consumer index */
+    u32 pad_tail[15];
     struct airq_record slots[AIRQ_LANE_CAPACITY];
 } ALIGNED(64);
+_Static_assert(__builtin_offsetof(struct airq_lane, tail) == 64U,
+               "AIRQ producer head and consumer tail must own separate lines");
+_Static_assert((__builtin_offsetof(struct airq_lane, slots) & 63U) == 0U,
+               "AIRQ records must begin on their own cache line");
 
 static struct airq_lane airq_lanes[AIRQ_CORES][AIRQ_CORES][AIRQ_QUEUED_PRIOS];
 
@@ -280,6 +285,7 @@ static bool airq_drain_one(u32 core, u32 priority)
 
     struct airq_record rec = chosen->slots[chosen->tail % AIRQ_LANE_CAPACITY];
     chosen->tail++;
+    dmb_ishst();
 
     struct airq_binding *binding = airq_find(rec.source);
     if (!binding || !binding->handler) {
@@ -426,12 +432,30 @@ u32 airq_quantum(u32 core, u64 quantum_ms, u64 *sched_ms_out)
 
 bool airq_pending(u32 core)
 {
+    return airq_pending_detail(core, NULL);
+}
+
+bool airq_pending_detail(u32 core, struct airq_lane_diag *out)
+{
     if (core >= AIRQ_CORES)
         return false;
     for (u32 producer = 0U; producer < AIRQ_CORES; producer++) {
-        for (u32 p = 0U; p < AIRQ_PRIO_COUNT; p++) {
-            if (airq_lane_depth(&airq_lanes[core][producer][p]) != 0U)
+        for (u32 p = AIRQ_PRIO_CRITICAL; p < AIRQ_PRIO_COUNT; p++) {
+            struct airq_lane *lane = airq_lane_at(core, producer, p);
+            if (!lane)
+                continue;
+            u32 head = lane->head;
+            u32 tail = lane->tail;
+            if (head != tail) {
+                if (out) {
+                    out->producer = producer;
+                    out->priority = p;
+                    out->head = head;
+                    out->tail = tail;
+                    out->depth = head - tail;
+                }
                 return true;
+            }
         }
     }
     return false;
@@ -457,4 +481,28 @@ void airq_diag_snapshot(struct airq_diag *out)
     if (!out)
         return;
     *out = airq_diag_state;
+}
+
+u32 airq_lane_diag_snapshot(u32 target, struct airq_lane_diag *out, u32 max)
+{
+    if (!out || target >= AIRQ_CORES)
+        return 0U;
+    u32 n = 0U;
+    for (u32 producer = 0U; producer < AIRQ_CORES; producer++) {
+        for (u32 priority = AIRQ_PRIO_CRITICAL;
+             priority < AIRQ_PRIO_COUNT; priority++) {
+            struct airq_lane *lane = airq_lane_at(target, producer, priority);
+            if (!lane || airq_lane_depth(lane) == 0U)
+                continue;
+            if (n >= max)
+                return n;
+            out[n].producer = producer;
+            out[n].priority = priority;
+            out[n].head = lane->head;
+            out[n].tail = lane->tail;
+            out[n].depth = airq_lane_depth(lane);
+            n++;
+        }
+    }
+    return n;
 }
