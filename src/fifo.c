@@ -162,8 +162,8 @@ static inline void fifo_notify(u32 src, u32 dst) {
         fifo_store_release(&counter->sent, counter->sent + 1U);
         gic_send_sgi((u8)(1U << dst), GIC_SGI_WAKE);
     }
-    /* SEV remains the sticky correctness backstop if the platform's SGI
-     * security/group routing is not yet delivering to that secondary. */
+    /* SGI is the targeted doorbell; SEV guarantees an event-latch wake while
+     * a target's banked GIC interface is unavailable or loses delivery. */
     sev();
 }
 

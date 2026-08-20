@@ -95,7 +95,8 @@ In the tables below the **Surfaces** column marks availability:
 | **`arp probe`** | **H U** | Send a gratuitous ARP (TX-path test); reports `requests_sent`, `learned`, `conflicts`. *(Newly wired: exposes `arp_probe`.)* |
 | **`nic dump <on\|off>`** | **H U** | Toggle raw packet dump (pre-dispatch). *(Newly wired: exposes `nic_set_packet_dump`.)* |
 | **`nic counters`** | **H U** | NIC `processed` / `dropped` / `firewalled` / `rate_limited` counters. |
-| `wifi` | U | WiFi status (driver currently disabled on this board). |
+| `wifi` | H U | CYW43455 driver/link status; wired remains the fail-safe backend until explicit WiFi activation. |
+| `wifi assocreq` | H U | Read the firmware-recorded association-request IEs after a join attempt for RSN/M2 comparison. |
 
 ---
 
@@ -156,8 +157,11 @@ In the tables below the **Surfaces** column marks availability:
 | `rp1 irq arm-host6[-1]` / `arm-eth` / `raise-eth` / `clear` / `source-diag` / `pend-gic` | H | RP1 ETH IRQ arm/raise/clear/diagnose (HOST6 delivery). |
 | `pcie aer [clear]` | H | PCIe Advanced Error Reporting snapshot. |
 | `fb info` | H | Framebuffer geometry/scanout info. |
-| `qpu status` / `qpu selftest` | H U | V3D/QPU dispatch diagnostics. |
+| `qpu status` / `qpu selftest` / `qpu enable` | H U | V3D/QPU diagnostics and guarded PicoScript DotI8/MatVecI8 enablement. |
+| `qpu vm enable` / `qpu vm status` | H U | Verify PicoScript QPU VM execution 1: bounded single-block `(a+b)*c`. The QPU path is a correctness proof; CPU remains selected. |
 | `tensor status` / `tensor selftest` | H U | Tensor NEON-fallback kernels. |
+| `media selftest` / `media status` / `media bench` | H U | Verify and profile QPU grayscale XOR plus H.264-style 16×16 luma residual/restore; HEVC remains fail-closed. |
+| `media async` / `qpu async` | H U | Run the compiled PicoScript `Async.Submit/Wait/Result` QPU media overlap proof (`QPA1`). |
 | `usb status\|reinit\|poll` | U | USB/xHCI controller diagnostics. |
 
 ---

@@ -152,7 +152,7 @@ static void el2_stage2_build_table(u32 id)
     /* The capsule's IPA range is identity-mapped from its PA (see
      * el2_capsule_bind_slot: ipa_base == pa_base always), and physical RAM
      * does not universally sit below 1GB -- e.g. QEMU_VIRT's per-core RAM
-     * lives at 0x42000000+ (~1.03GB), which is already past a hardcoded
+     * lives at 0x42200000+ (~1.03GB), which is already past a hardcoded
      * L1 slot 0. Index the L1 entry that actually covers ipa_base instead
      * of assuming slot 0; el2_stage2_plan_set() guarantees the whole range
      * fits within this single 1GB-aligned L1 block before we get here. */
@@ -330,7 +330,7 @@ i32 el2_stage2_plan_set(u32 id, u64 ipa_base, u64 ipa_size, u64 pa_base, u64 fla
     /* el2_stage2_build_table() only populates a single L2 table under one
      * L1 entry -- one 1GB-aligned block of IPA space, wherever ipa_base
      * falls (physical RAM is not universally below 1GB -- e.g. QEMU_VIRT's
-     * per-core RAM sits at 0x42000000+). Reject any range that would cross
+     * per-core RAM sits at 0x42200000+). Reject any range that would cross
      * into a second 1GB-aligned L1 block, or that would index past the
      * fixed 512-entry L1 table, instead of silently building a table that
      * maps only the leading portion and leaves the remainder untranslated;

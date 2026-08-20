@@ -12,6 +12,12 @@
 
 #include "types.h"
 #include "airq.h"
+#include "adrv.h"
+#include "core.h"
+
+/* The host airq unit is linked without adrv.c; the full kernel supplies the
+ * strong implementation. Keep the standalone pure-logic test target intact. */
+extern bool adrv_supervise(u64 now_ms) __attribute__((weak));
 
 #define AIRQ_MAX_SOURCES 16U
 
@@ -33,11 +39,16 @@ struct airq_binding {
  * every CRITICAL record queued behind it.
  */
 struct airq_lane {
-    u32 head;   /* producer index */
-    u32 tail;   /* consumer index */
-    u32 pad[14];
+    volatile u32 head;   /* producer index */
+    u32 pad_head[15];    /* producer and consumer indices never share a line */
+    volatile u32 tail;   /* consumer index */
+    u32 pad_tail[15];
     struct airq_record slots[AIRQ_LANE_CAPACITY];
 } ALIGNED(64);
+_Static_assert(__builtin_offsetof(struct airq_lane, tail) == 64U,
+               "AIRQ producer head and consumer tail must own separate lines");
+_Static_assert((__builtin_offsetof(struct airq_lane, slots) & 63U) == 0U,
+               "AIRQ records must begin on their own cache line");
 
 static struct airq_lane airq_lanes[AIRQ_CORES][AIRQ_CORES][AIRQ_QUEUED_PRIOS];
 
@@ -67,6 +78,40 @@ static struct airq_binding airq_bindings[AIRQ_MAX_SOURCES];
 static struct airq_diag airq_diag_state ALIGNED(64);
 static u32 airq_seq;
 static u64 (*airq_now_hook)(void);
+
+static inline void airq_atomic_inc(u32 *value)
+{
+    (void)__atomic_fetch_add(value, 1U, __ATOMIC_RELAXED);
+}
+
+static inline void airq_atomic_max(u32 *value, u32 candidate)
+{
+    u32 observed = __atomic_load_n(value, __ATOMIC_RELAXED);
+    while (candidate > observed &&
+           !__atomic_compare_exchange_n(value, &observed, candidate, false,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+}
+
+static inline u64 airq_irq_save(void)
+{
+#ifdef PIOS_HOST_TYPES_SHIM
+    return 0U;
+#else
+    u64 daif;
+    __asm__ volatile("mrs %0, daif" : "=r"(daif));
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    return daif;
+#endif
+}
+
+static inline void airq_irq_restore(u64 daif)
+{
+#ifndef PIOS_HOST_TYPES_SHIM
+    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+#else
+    (void)daif;
+#endif
+}
 
 static const u32 airq_quota[AIRQ_PRIO_COUNT] = {
     0U,                     /* HARDWARE: never executed */
@@ -121,7 +166,7 @@ bool airq_register(u32 source, u32 priority, u32 target_core,
     /* Level 0 is a hardware trigger, not a place to execute work. Refusing
      * this is what keeps real work out of IRQ context by construction. */
     if (priority == AIRQ_PRIO_HARDWARE) {
-        airq_diag_state.rejected_hardware++;
+        airq_atomic_inc(&airq_diag_state.rejected_hardware);
         return false;
     }
     if (airq_find(source))
@@ -165,10 +210,14 @@ bool airq_post_from(u32 origin_core, u32 source, u32 arg)
      * the scheduled world decides when the work is actually done. */
     if (origin_core >= AIRQ_CORES)
         return false;
+    if (origin_core != (core_id() & 3U)) {
+        airq_atomic_inc(&airq_diag_state.origin_mismatch);
+        return false;
+    }
 
     struct airq_binding *binding = airq_find(source);
     if (!binding) {
-        airq_diag_state.no_handler++;
+        airq_atomic_inc(&airq_diag_state.no_handler);
         return false;
     }
 
@@ -178,13 +227,21 @@ bool airq_post_from(u32 origin_core, u32 source, u32 arg)
     if (!lane) {
         /* Registered at a non-queueable level (HARDWARE) or a bad core index.
          * Fail closed and count it; never fall through to an unchecked index. */
-        airq_diag_state.no_handler++;
+        airq_atomic_inc(&airq_diag_state.no_handler);
         return false;
     }
+    /*
+     * A core can publish from both reactor and IRQ context. Mask local IRQs
+     * across reservation and publication so the self-lane remains genuinely
+     * SPSC even when an IRQ interrupts a scheduled producer. Restore the
+     * caller's exact DAIF state: this is safe when already in an IRQ.
+     */
+    u64 daif = airq_irq_save();
     if (airq_lane_depth(lane) >= AIRQ_LANE_CAPACITY) {
         /* Explicit, counted overflow. A dropped interrupt must be visible in
          * diagnostics, never silently lost. */
-        airq_diag_state.dropped[priority]++;
+        airq_atomic_inc(&airq_diag_state.dropped[priority]);
+        airq_irq_restore(daif);
         return false;
     }
 
@@ -192,7 +249,7 @@ bool airq_post_from(u32 origin_core, u32 source, u32 arg)
     slot->source = source;
     slot->priority = priority;
     slot->arg = arg;
-    slot->seq = ++airq_seq;
+    slot->seq = __atomic_add_fetch(&airq_seq, 1U, __ATOMIC_RELAXED);
     slot->origin_core = origin_core;
     slot->target_core = target;
     slot->timestamp_ms = airq_now();
@@ -201,13 +258,13 @@ bool airq_post_from(u32 origin_core, u32 source, u32 arg)
     dmb_ishst();
     lane->head++;
 
-    airq_diag_state.posted[priority]++;
+    airq_atomic_inc(&airq_diag_state.posted[priority]);
     if (target != origin_core)
-        airq_diag_state.routed_cross_core++;
+        airq_atomic_inc(&airq_diag_state.routed_cross_core);
 
     u32 depth = airq_depth_at_least(target, priority);
-    if (depth > airq_diag_state.max_depth[priority])
-        airq_diag_state.max_depth[priority] = depth;
+    airq_atomic_max(&airq_diag_state.max_depth[priority], depth);
+    airq_irq_restore(daif);
     return true;
 }
 
@@ -240,15 +297,16 @@ static bool airq_drain_one(u32 core, u32 priority)
 
     struct airq_record rec = chosen->slots[chosen->tail % AIRQ_LANE_CAPACITY];
     chosen->tail++;
+    dmb_ishst();
 
     struct airq_binding *binding = airq_find(rec.source);
     if (!binding || !binding->handler) {
-        airq_diag_state.no_handler++;
+        airq_atomic_inc(&airq_diag_state.no_handler);
         return true;
     }
 
     binding->handler(&rec, binding->ctx);
-    airq_diag_state.dispatched[priority]++;
+    airq_atomic_inc(&airq_diag_state.dispatched[priority]);
     return true;
 }
 
@@ -270,7 +328,7 @@ static u32 airq_drain_batch(u32 core, u32 priority, u32 max_records)
         n++;
     }
     if (n != 0U)
-        airq_diag_state.batches[priority]++;
+        airq_atomic_inc(&airq_diag_state.batches[priority]);
     return n;
 }
 
@@ -278,7 +336,7 @@ u32 airq_dispatch(u32 core, u64 budget_ms)
 {
     if (core >= AIRQ_CORES)
         return 0U;
-    airq_diag_state.passes++;
+    airq_atomic_inc(&airq_diag_state.passes);
 
     const u64 deadline = airq_now() + budget_ms;
     u32 dispatched = 0U;
@@ -293,7 +351,7 @@ u32 airq_dispatch(u32 core, u64 budget_ms)
      * cores parked on replies must not wait indefinitely. */
     for (u32 p = AIRQ_PRIO_CRITICAL; p < AIRQ_PRIO_COUNT; p++) {
         if (budget_ms != 0ULL && airq_now() >= deadline) {
-            airq_diag_state.budget_exhausted++;
+            airq_atomic_inc(&airq_diag_state.budget_exhausted);
             return dispatched;
         }
         u32 n = airq_drain_batch(core, p, AIRQ_RESERVED_SHARE);
@@ -310,7 +368,7 @@ u32 airq_dispatch(u32 core, u64 budget_ms)
     for (u32 p = AIRQ_PRIO_CRITICAL; p <= AIRQ_PRIO_NORMAL; p++) {
         while (drained[p] < airq_quota[p]) {
             if (budget_ms != 0ULL && airq_now() >= deadline) {
-                airq_diag_state.budget_exhausted++;
+                airq_atomic_inc(&airq_diag_state.budget_exhausted);
                 return dispatched;
             }
             u32 room = airq_quota[p] - drained[p];
@@ -322,7 +380,7 @@ u32 airq_dispatch(u32 core, u64 budget_ms)
             dispatched += n;
         }
         if (drained[p] >= airq_quota[p] && airq_level_depth(core, p) != 0U)
-            airq_diag_state.quota_exhausted++;
+            airq_atomic_inc(&airq_diag_state.quota_exhausted);
     }
 
     /* Phase 3: LOW gets no batch of its own -- it is drained from whatever
@@ -335,7 +393,7 @@ u32 airq_dispatch(u32 core, u64 budget_ms)
         if (!airq_drain_one(core, AIRQ_PRIO_LOW))
             break;
         dispatched++;
-        airq_diag_state.low_leftover++;
+        airq_atomic_inc(&airq_diag_state.low_leftover);
     }
 
     return dispatched;
@@ -348,7 +406,7 @@ u32 airq_quantum(u32 core, u64 quantum_ms, u64 *sched_ms_out)
     if (core >= AIRQ_CORES || quantum_ms == 0ULL)
         return 0U;
 
-    airq_diag_state.quanta++;
+    airq_atomic_inc(&airq_diag_state.quanta);
 
     /* Cap the drain share so the scheduler is guaranteed time even under a
      * sustained queue flood. Without this cap, a saturated producer would
@@ -364,13 +422,20 @@ u32 airq_quantum(u32 core, u64 quantum_ms, u64 *sched_ms_out)
     u32 dispatched = airq_dispatch(core, drain_budget);
     const u64 spent = airq_now() - start;
 
+    /* Core 1 is outside the packet path and can observe core 0's published
+     * adrv stamp without adding work to the reactor. The stamp is in the
+     * shared kernel image mapped with the same attributes on every TTBR, and
+     * adrv_supervise() performs the acquire-side barrier before reading it. */
+    if (core == CORE_USERM && adrv_supervise)
+        (void)adrv_supervise(airq_now());
+
     /* Hand the remainder to the caller's scheduler. Even if draining somehow
      * consumed the whole quantum, the scheduler still gets a non-zero slice:
      * process progress is not negotiable. */
     u64 remaining = (spent < quantum_ms) ? (quantum_ms - spent) : 0ULL;
     if (remaining == 0ULL) {
         remaining = 1ULL;
-        airq_diag_state.sched_starved++;
+        airq_atomic_inc(&airq_diag_state.sched_starved);
     }
     if (sched_ms_out)
         *sched_ms_out = remaining;
@@ -379,12 +444,30 @@ u32 airq_quantum(u32 core, u64 quantum_ms, u64 *sched_ms_out)
 
 bool airq_pending(u32 core)
 {
+    return airq_pending_detail(core, NULL);
+}
+
+bool airq_pending_detail(u32 core, struct airq_lane_diag *out)
+{
     if (core >= AIRQ_CORES)
         return false;
     for (u32 producer = 0U; producer < AIRQ_CORES; producer++) {
-        for (u32 p = 0U; p < AIRQ_PRIO_COUNT; p++) {
-            if (airq_lane_depth(&airq_lanes[core][producer][p]) != 0U)
+        for (u32 p = AIRQ_PRIO_CRITICAL; p < AIRQ_PRIO_COUNT; p++) {
+            struct airq_lane *lane = airq_lane_at(core, producer, p);
+            if (!lane)
+                continue;
+            u32 head = lane->head;
+            u32 tail = lane->tail;
+            if (head != tail) {
+                if (out) {
+                    out->producer = producer;
+                    out->priority = p;
+                    out->head = head;
+                    out->tail = tail;
+                    out->depth = head - tail;
+                }
                 return true;
+            }
         }
     }
     return false;
@@ -409,5 +492,45 @@ void airq_diag_snapshot(struct airq_diag *out)
 {
     if (!out)
         return;
-    *out = airq_diag_state;
+    for (u32 p = 0U; p < AIRQ_PRIO_COUNT; p++) {
+        out->posted[p] = __atomic_load_n(&airq_diag_state.posted[p], __ATOMIC_RELAXED);
+        out->dispatched[p] = __atomic_load_n(&airq_diag_state.dispatched[p], __ATOMIC_RELAXED);
+        out->dropped[p] = __atomic_load_n(&airq_diag_state.dropped[p], __ATOMIC_RELAXED);
+        out->max_depth[p] = __atomic_load_n(&airq_diag_state.max_depth[p], __ATOMIC_RELAXED);
+        out->batches[p] = __atomic_load_n(&airq_diag_state.batches[p], __ATOMIC_RELAXED);
+    }
+    out->routed_cross_core = __atomic_load_n(&airq_diag_state.routed_cross_core, __ATOMIC_RELAXED);
+    out->passes = __atomic_load_n(&airq_diag_state.passes, __ATOMIC_RELAXED);
+    out->quanta = __atomic_load_n(&airq_diag_state.quanta, __ATOMIC_RELAXED);
+    out->budget_exhausted = __atomic_load_n(&airq_diag_state.budget_exhausted, __ATOMIC_RELAXED);
+    out->quota_exhausted = __atomic_load_n(&airq_diag_state.quota_exhausted, __ATOMIC_RELAXED);
+    out->no_handler = __atomic_load_n(&airq_diag_state.no_handler, __ATOMIC_RELAXED);
+    out->rejected_hardware = __atomic_load_n(&airq_diag_state.rejected_hardware, __ATOMIC_RELAXED);
+    out->origin_mismatch = __atomic_load_n(&airq_diag_state.origin_mismatch, __ATOMIC_RELAXED);
+    out->sched_starved = __atomic_load_n(&airq_diag_state.sched_starved, __ATOMIC_RELAXED);
+    out->low_leftover = __atomic_load_n(&airq_diag_state.low_leftover, __ATOMIC_RELAXED);
+}
+
+u32 airq_lane_diag_snapshot(u32 target, struct airq_lane_diag *out, u32 max)
+{
+    if (!out || target >= AIRQ_CORES)
+        return 0U;
+    u32 n = 0U;
+    for (u32 producer = 0U; producer < AIRQ_CORES; producer++) {
+        for (u32 priority = AIRQ_PRIO_CRITICAL;
+             priority < AIRQ_PRIO_COUNT; priority++) {
+            struct airq_lane *lane = airq_lane_at(target, producer, priority);
+            if (!lane || airq_lane_depth(lane) == 0U)
+                continue;
+            if (n >= max)
+                return n;
+            out[n].producer = producer;
+            out[n].priority = priority;
+            out[n].head = lane->head;
+            out[n].tail = lane->tail;
+            out[n].depth = airq_lane_depth(lane);
+            n++;
+        }
+    }
+    return n;
 }

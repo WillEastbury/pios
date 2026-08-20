@@ -124,6 +124,7 @@
 #define CYW_MAX_SCAN_RESULTS    32
 #define CYW_PASSPHRASE_MAX      64
 #define CYW_EVENT_HISTORY_CAP   16U
+#define CYW_EAPOL_MAX           512U
 
 #define CYW_BLOB_FIRMWARE       1U
 #define CYW_BLOB_NVRAM          2U
@@ -139,6 +140,8 @@ struct cyw_scan_result {
     i16 rssi;
     u16 capability;
     u32 security;
+    u8  rsn_ie_len;
+    u8  rsn_ie[66];
 };
 
 struct cyw43_diag {
@@ -164,6 +167,16 @@ struct cyw43_diag {
     u32 bcdc_pending_bytes;
     u32 bcdc_cccr_pending;
     u32 bcdc_rframe_count;
+    /* Speculative RX header probes: attempts, and frames they actually
+     * recovered. A high attempt count with a non-zero frame count means the
+     * indication path is broken but RX itself works. */
+    u32 rx_probe_attempts;
+    u32 rx_frames;
+    u32 data_rx_queued;
+    u32 data_rx_dropped;
+    /* Times the SDIO in-band card interrupt was found asserted. Non-zero means
+     * the hardware indication works and full IRQ-driven RX is achievable. */
+    u32 rx_card_irqs;
     u32 bcdc_last_channel;
     u32 bcdc_last_frame_len;
     u32 bcdc_request_id;
@@ -187,11 +200,16 @@ struct cyw43_diag {
     u32 eapol_key_info;
     u32 eapol_replay_hi;
     u32 eapol_replay_lo;
-    u32 eapol_words[11];
+    u32 eapol_m2_sent;
+    u32 eapol_m2_fail;
+    u32 eapol_words[9];
+    /* Headroom so adding a counter does not immediately break the cache-line
+     * invariant below; shrink this when adding fields. */
+    u32 reserved[11];
 } ALIGNED(64);
 
-_Static_assert(sizeof(struct cyw43_diag) == 256U,
-               "CYW43455 diagnostics must occupy four cache lines");
+_Static_assert(sizeof(struct cyw43_diag) == 320U,
+               "CYW43455 diagnostics must occupy five cache lines");
 
 struct cyw_event_record {
     u32 type;
@@ -228,6 +246,14 @@ struct cyw_join_diag {
     u8 reserved[2];
 };
 
+struct cyw_wpa_debug {
+    u32 m1_len;
+    u32 m2_len;
+    u8 snonce[32];
+    u8 m1[CYW_EAPOL_MAX];
+    u8 m2[CYW_EAPOL_MAX];
+};
+
 /* WiFi link state */
 #define CYW_LINK_DOWN           0
 #define CYW_LINK_JOINING        1
@@ -248,9 +274,13 @@ bool cyw43_poll_busy(void);
 bool cyw43_d11_state(u32 *resetctrl, u32 *ioctrl);
 bool cyw43_radio_query(u32 *radio, u32 *channel);
 bool cyw43_join_diag_query(struct cyw_join_diag *out);
+bool cyw43_assoc_req_ies(u8 *out, u32 max, u32 *out_len,
+                         u32 *req_reported, u32 *resp_reported,
+                         u32 *stage);
 bool cyw43_set_mac(const u8 mac[CYW_MAC_LEN]);
 bool cyw43_fwlog(char *out, u32 max, u32 *out_len);
 bool cyw43_take_eapol(u8 *frame, u32 *len);
+void cyw43_wpa_debug_snapshot(struct cyw_wpa_debug *out);
 typedef void (*cyw43_progress_fn)(void);
 void cyw43_set_progress_hook(cyw43_progress_fn hook);
 
@@ -272,6 +302,17 @@ bool cyw43_join(const char *ssid, u32 ssid_len,
                 const char *passphrase, u32 pass_len,
                 u32 security);
 bool cyw43_join_pmk(const char *ssid, u32 ssid_len, const u8 pmk[32]);
+bool cyw43_set_join_target(const u8 bssid[CYW_MAC_LEN], u16 chanspec);
+/* Override the RSN capability field used in both the `wpaie` iovar and the
+ * EAPOL msg 2/4 RSN IE. Used to probe whether the AP rejects M2 because the
+ * firmware placed different capabilities in the association request.
+ * `override=false` restores the default (0x0000). */
+void cyw43_set_rsn_caps(u16 caps, bool override);
+void cyw43_get_rsn_caps(u16 *caps, bool *override);
+/* Enable/disable speculative SDPCM RX header probing (default on). */
+void cyw43_set_rx_probe(bool enabled);
+bool cyw43_get_rx_probe(void);
+void cyw43_register_sdio_irq(void);
 bool cyw43_join_sae(const char *ssid, u32 ssid_len,
                     const char *password, u32 password_len);
 bool cyw43_disconnect(void);

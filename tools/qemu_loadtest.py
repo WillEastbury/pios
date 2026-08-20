@@ -131,6 +131,14 @@ def vnet_health(base: str):
         return (None, None)
 
 
+def stack_health(base: str) -> str:
+    try:
+        with urllib.request.urlopen(base + "/api/terminal?cmd=stackdiag", timeout=6) as r:
+            return r.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
 def report(name: str, stats: Stats, dips: int, base: str, min_success: float,
            require_200: bool = True) -> bool:
     total = stats.ok + stats.err
@@ -150,6 +158,10 @@ def report(name: str, stats: Stats, dips: int, base: str, min_success: float,
         ok = ok and rate >= min_success
     tag = f"{GREEN}PASS{RST}" if ok else f"{RED}FAIL{RST}"
     print(f"  [{tag}] {name}")
+    if not ok:
+        diag = stack_health(base)
+        if diag:
+            print(f"  {DIM}stackdiag after failure:\n{diag.rstrip()}{RST}")
     return ok
 
 

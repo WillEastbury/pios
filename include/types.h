@@ -48,6 +48,7 @@ static inline void isb(void)  { __asm__ volatile("isb"    ::: "memory"); }
 static inline void wfe(void)  { __asm__ volatile("wfe"); }
 static inline void wfi(void)  { __asm__ volatile("wfi"); }
 static inline void sev(void)  { __asm__ volatile("sev"); }
+static inline void sevl(void) { __asm__ volatile("sevl"); }
 
 static inline u32 core_id(void) {
     u64 mpidr;

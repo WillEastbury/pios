@@ -272,6 +272,12 @@ static void test_registration_rules(void)
           "posting an unregistered source fails closed");
     check(!airq_post_from(AIRQ_CORES, SRC_NIC, 0U),
           "posting from an invalid core fails closed");
+    check(!airq_post_from(1U, SRC_NIC, 0U),
+          "producer core must match the current core");
+    struct airq_diag d;
+    airq_diag_snapshot(&d);
+    check(d.origin_mismatch == 1U,
+          "origin mismatch is counted explicitly");
 }
 
 static void test_depth_query(void)

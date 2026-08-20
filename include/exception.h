@@ -11,6 +11,7 @@
 
 /* Common EC values */
 #define EC_UNKNOWN      0x00
+#define EC_WFX_LOW      0x01
 #define EC_SVC64        0x15
 #define EC_IABT_LOW     0x20
 #define EC_IABT_CUR     0x21
@@ -90,12 +91,33 @@ struct irq_gic_probe_snapshot {
 } PACKED;
 
 #define EXCEPTION_CRASH_RECORD_MAGIC   0x43524153U /* 'CRAS' */
-#define EXCEPTION_CRASH_RECORD_VERSION 2U
+#define EXCEPTION_CRASH_RECORD_VERSION 3U
+
+/* `kind` values. Append only: persisted records outlive the image. */
+#define EXCEPTION_CRASH_KIND_SYNC           1U
+#define EXCEPTION_CRASH_KIND_SERROR         2U
+#define EXCEPTION_CRASH_KIND_EL2_INTEGRITY  3U
+#define EXCEPTION_CRASH_KIND_EL1_INTEGRITY  4U
+#define EXCEPTION_CRASH_KIND_WATCHDOG       5U
+#define EXCEPTION_CRASH_KIND_STACK_SMASH    6U
+#define EXCEPTION_CRASH_KIND_STACK_OVERFLOW 7U
+/* A subsystem detected that it could not make progress and chose to fail
+ * loudly rather than let the hardware watchdog reset the board silently. */
+#define EXCEPTION_CRASH_KIND_STALL          8U
+
+#define EXCEPTION_CRASH_VALUES_MAX 8U
+#define EXCEPTION_CRASH_LABEL_MAX  48U
+
+/* `reason` values for EXCEPTION_CRASH_KIND_STALL, with the meaning of each
+ * `values[]` slot. Append only. */
+#define EXCEPTION_STALL_CYW_TX_CREDIT 1U
+/* values: 0 credits, 1 tx_seq, 2 tx_max, 3 fcmask, 4 channel, 5 cyw stage,
+ *         6 frames received, 7 events received */
 
 struct exception_crash_record {
     u32 magic;
     u32 version;
-    u32 kind;   /* 1 sync, 2 serror */
+    u32 kind;   /* 1 sync, 2 serror, ... see EXCEPTION_CRASH_KIND_* */
     u32 core;
     u32 current_el;
     u32 ec;
@@ -114,7 +136,23 @@ struct exception_crash_record {
     u64 ttbr0;
     u64 syndrome;
     u64 ticks;
+    /* Stall payload; zero for CPU-exception kinds. */
+    u32 reason;
+    u32 value_count;
+    u64 values[EXCEPTION_CRASH_VALUES_MAX];
+    char label[EXCEPTION_CRASH_LABEL_MAX];
+    /* Consecutive crashes without an intervening healthy run. Drives crash-loop
+     * protection: a board that panics on every boot must stop rebooting and
+     * halt on the PiSOD instead, or it becomes unrecoverable. */
+    u32 consecutive;
+    /* Set once the record has been copied into the WALFS crashdump pack, so a
+     * later boot does not archive the same crash twice. */
+    u32 archived;
 } PACKED;
+
+/* Reboot automatically for the first few consecutive crashes; halt after that
+ * so a reboot loop cannot hide the cause or wear the SD card. */
+#define EXCEPTION_CRASH_LOOP_LIMIT 3U
 
 /* Install the exception vector table */
 void exception_init(void);
@@ -138,7 +176,29 @@ void exception_crash_persist_sd(void);
 bool exception_crash_sd_read(struct exception_crash_record *out);
 void exception_crash_sd_clear(void);
 
+/* Mark the persisted record as archived into the WALFS crashdump pack. The
+ * record itself is retained so `crashlba` still works. */
+void exception_crash_mark_archived(void);
+
+/* Declare the current boot healthy: zeroes the consecutive-crash counter so
+ * crash-loop protection re-arms. Call once the system has been up long enough
+ * to be considered good. */
+void exception_crash_mark_healthy(void);
+
 NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far);
+
+/* Fail loudly, then self-heal.
+ *
+ * Captures a crash record, persists it to SD (DRAM does not survive a BCM2712
+ * reset), renders the PiSOD screen, then reboots after `reboot_delay_ms` so an
+ * unattended board recovers on its own. Use this instead of spinning until the
+ * hardware watchdog fires: a silent watchdog reset destroys all evidence of why
+ * the board stopped making progress.
+ *
+ * `values`/`value_count` carry subsystem state; see EXCEPTION_STALL_* for the
+ * per-reason slot meanings. `value_count` is clamped to
+ * EXCEPTION_CRASH_VALUES_MAX. */NORETURN void exception_pisod_reboot(const char *title, u32 kind, u32 reason,
+                                     const u64 *values, u32 value_count);
 
 /* ==================================================================
  * Stop-the-world debug freeze: a lightweight remote-inspection tool.

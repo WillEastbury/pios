@@ -1,0 +1,13 @@
+int request = Span.Make(4096, 72);
+int predictor = Span.Make(8192, 64);
+int job = Async.Submit(request, predictor);
+
+int cpuWork = 0;
+for (int i = 0; i < 1000; i = i + 1) {
+    cpuWork = cpuWork + i;
+}
+
+int completed = Async.Wait(job, 25);
+int result = Async.Result(job);
+Io.Write(result);
+print(cpuWork + completed);

@@ -49,13 +49,25 @@ static u64 l3_block0[512] ALIGNED(4096);     /* block 0 (0-2MB) split to 4KB pag
  *   user_l2_high -> L1[0x2001000000 / 1 GiB] (128) EL0 linked image + IPC alias
  * On Pi the phys region IS L1[0], so user_l2_low backs it and user_l2_phys stays
  * unused (see user_l2_install / user_l2_lookup), preserving the exact Pi L1[0]
- * table used today. */
-static u64 user_l1[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
-static u64 user_l2_low[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
-static u64 user_l2_phys[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
-static u64 user_l2_high[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
-static u64 user_l3_proc[3][MAX_PROCS_PER_CORE][2][512] ALIGNED(4096);
-static u64 user_l3_ipc[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096);
+ * table used today.
+ *
+ * These six arrays (plus user_table_valid below) are the only statics whose
+ * size scales with MAX_PROCS_PER_CORE, and doing so in the generic .bss
+ * output section is what caused issue #86: any growth of these arrays pushed
+ * the per-core kernel stacks and __heap_start upward in lockstep, eventually
+ * displacing them into CORE0_RAM_BASE (proven on QEMU: a stack-canary trip
+ * with far==CORE0_RAM_BASE at 12/16 slots). They are placed in their own
+ * explicit ".pgtbl_pool" section so the linker can size the fixed per-core
+ * stack block from the small, slot-count-independent .bss alone -- see
+ * link.ld / link_qemu_full.ld / link_2m.ld. The pool is still NOLOAD like
+ * .bss and is zeroed by the same start.S boot-time clear loops (extended
+ * with a second __pgtbl_pool_start/__pgtbl_pool_size pass). */
+static u64 user_l1[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096) SECTION(".pgtbl_pool");
+static u64 user_l2_low[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096) SECTION(".pgtbl_pool");
+static u64 user_l2_phys[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096) SECTION(".pgtbl_pool");
+static u64 user_l2_high[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096) SECTION(".pgtbl_pool");
+static u64 user_l3_proc[3][MAX_PROCS_PER_CORE][2][512] ALIGNED(4096) SECTION(".pgtbl_pool");
+static u64 user_l3_ipc[3][MAX_PROCS_PER_CORE][512] ALIGNED(4096) SECTION(".pgtbl_pool");
 
 /* 1 GiB L1 region indices backed by a process's own fine-grained L2 tables.
  * All are compile-time constants folded from the platform memory map. */
@@ -70,7 +82,7 @@ struct mmu_valid_slot {
     volatile u32 v;
     u32 _pad[15];
 } ALIGNED(64);
-static struct mmu_valid_slot user_table_valid[3][MAX_PROCS_PER_CORE];
+static struct mmu_valid_slot user_table_valid[3][MAX_PROCS_PER_CORE] SECTION(".pgtbl_pool");
 _Static_assert(sizeof(struct mmu_valid_slot) == 64,
                "user table validity slots must be one cache line");
 
@@ -273,6 +285,7 @@ static inline u64 user_ram_nc_attrs(void)
     return PTE_VALID | PTE_BLOCK | PTE_AF |
            PTE_SH_INNER | PTE_ATTR(MT_NORMAL_NC) | PTE_AP_RW_EL1;
 }
+
 
 static void map_user_kernel_low(u64 *l2)
 {
@@ -535,6 +548,11 @@ void mmu_init(void) {
                       * descriptor-hole bug (docs/gotchas.md). */
                      (addr >= PROC_ARENA_BASE &&
                       addr < PROC_ARENA_BASE + PROC_ARENA_SIZE);
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+        if (addr == 0x10000000UL || addr == 0x3F000000UL)
+            l2[i] = dev_block_2m(addr);
+        else
+#endif
         l2[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);
     }
     l1[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
@@ -542,6 +560,9 @@ void mmu_init(void) {
     l1[1] = ram_block_1g(0x40000000UL);
     l1[2] = ram_block_1g(0x80000000UL);
     l1[3] = ram_block_1g(0xC0000000UL);
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    l1[256] = dev_block_1g(0x4000000000ULL);
+#endif
 
     /* Peripherals: indices 64-67 (BCM2712 at 0x107C000000 = 65GB) */
     u64 dev_attr = PTE_VALID | PTE_BLOCK | PTE_AF |
@@ -690,6 +711,12 @@ void mmu_enable_caching(void) {
             continue;
         }
         u64 addr = (u64)i * L2_BLOCK_SIZE;
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+        if (addr == 0x10000000UL || addr == 0x3F000000UL) {
+            l2_table_low[i] = dev_block_2m(addr);
+            continue;
+        }
+#endif
         bool cache = (addr >= cache_lo_base && addr < cache_lo_end) ||
                      (addr >= cache_fb_base && addr < cache_fb_end);
         l2_table_low[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);
@@ -932,6 +959,13 @@ bool mmu_switch_to_user(u32 core, u32 slot)
     __asm__ volatile("msr ttbr0_el1, %0" :: "r"(ttbr));
     mmu_invalidate_tlb();
     return true;
+}
+
+bool mmu_user_table_ready(u32 core, u32 slot)
+{
+    if (!is_user_core(core) || slot >= MAX_PROCS_PER_CORE)
+        return false;
+    return user_table_valid[user_core_index(core)][slot].v != 0U;
 }
 
 void mmu_switch_to_kernel(void)

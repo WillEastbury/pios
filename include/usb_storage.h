@@ -10,6 +10,14 @@
 #pragma once
 #include "types.h"
 
+/*
+ * READ CAPACITY(16) is implemented but disabled until it has been exercised
+ * against a real >2 TB device. READ CAPACITY(10) remains the default path.
+ */
+#ifndef PIOS_ENABLE_SCSI_CAPACITY16
+#define PIOS_ENABLE_SCSI_CAPACITY16 0
+#endif
+
 /* Register the mass storage driver with the USB framework */
 void usb_storage_register(void);
 
@@ -21,5 +29,5 @@ u32  usb_storage_block_size(void);
 u64  usb_storage_num_blocks(void);
 
 /* Block I/O (LBA addressing, count in blocks) */
-bool usb_storage_read(u32 lba, u32 count, void *buf);
-bool usb_storage_write(u32 lba, u32 count, const void *buf);
+bool usb_storage_read(u64 lba, u32 count, void *buf);
+bool usb_storage_write(u64 lba, u32 count, const void *buf);

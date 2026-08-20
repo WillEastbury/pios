@@ -20,6 +20,23 @@
 #define PCIE_CPU_WIN_SIZE   0x00800000UL    /* 8MB window */
 #define PCIE_TARGET_ADDR    0x80000000UL    /* PCIe-side target for RP1 BAR */
 
+/* RP1 inbound DMA window: device address 0x10_00000000 maps CPU physical
+ * address 0. Only low 4 GiB CPU addresses are representable by this window.
+ * Every RP1 bus master must use this helper and fail closed on overflow. */
+#define RP1_PCIE_DMA_BASE   0x1000000000ULL
+#define RP1_PCIE_DMA_SIZE   0x100000000ULL
+
+static inline bool rp1_pcie_dma_addr(const void *ptr, u64 size, u64 *out)
+{
+    if (!ptr || !out || size == 0ULL)
+        return false;
+    u64 pa = (u64)(usize)ptr;
+    if (pa >= RP1_PCIE_DMA_SIZE || size > RP1_PCIE_DMA_SIZE - pa)
+        return false;
+    *out = RP1_PCIE_DMA_BASE + pa;
+    return true;
+}
+
 bool pcie_init(void);
 bool pcie_link_up(void);
 

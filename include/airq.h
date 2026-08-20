@@ -141,6 +141,12 @@
 #define AIRQ_SRC_FIFO_CORE(n)  (2U + (n))  /* HIGH: 2..5, one per target core */
 #define AIRQ_SRC_WIFI          6U          /* NORMAL: CYW43455 SDPCM */
 #define AIRQ_SRC_CONSOLE       7U          /* LOW: UART/console input */
+#define AIRQ_SRC_NET_TRANSPORT 8U          /* CRITICAL: bounded NIC/SDIO drain */
+#define AIRQ_SRC_NET_MAC       9U          /* HIGH: Ethernet descriptor stage */
+#define AIRQ_SRC_NET_IP        10U         /* HIGH: validated IPv4 descriptor stage */
+#define AIRQ_SRC_NET_TCP       11U         /* HIGH: TCP/UDP/ICMP descriptor stage */
+#define AIRQ_SRC_NET_SERVICE   12U         /* HIGH: TCP/UDP/service stage */
+#define AIRQ_SRC_NET_EGRESS    13U         /* HIGH: final owned NIC spans */
 
 /* A queued event. Deliberately small and fixed: the top half stores one of
  * these and returns. */
@@ -174,6 +180,7 @@ struct airq_diag {
     u32 quota_exhausted;    /* levels that hit their per-pass quota */
     u32 no_handler;         /* records with no registered handler */
     u32 rejected_hardware;  /* attempts to execute work at level 0 */
+    u32 origin_mismatch;    /* producer claimed a different core */
     u32 sched_starved;      /* quanta that returned no scheduler budget */
     u32 low_leftover;       /* LOW records drained from leftover budget */
 } ALIGNED(64);
@@ -229,5 +236,15 @@ bool airq_pending(u32 core);
 u32 airq_depth_at_least(u32 core, u32 priority);
 
 void airq_diag_snapshot(struct airq_diag *out);
+
+struct airq_lane_diag {
+    u32 producer;
+    u32 priority;
+    u32 head;
+    u32 tail;
+    u32 depth;
+};
+u32 airq_lane_diag_snapshot(u32 target, struct airq_lane_diag *out, u32 max);
+bool airq_pending_detail(u32 core, struct airq_lane_diag *out);
 
 #endif /* PIOS_AIRQ_H */

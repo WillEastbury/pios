@@ -13,14 +13,14 @@
  *
  *   1. post the request to a kernel FIFO          (plain store, no trap)
  *   2. publish AWAITING + the inbound sequence it last observed
- *   3. execute WFE                                (traps to EL1, EC=0x01)
+ *   3. execute WFI                                (traps to EL1, EC=0x01)
  *   4. ... other work runs on this core ...
  *   5. kernel posts the reply, advancing the inbound sequence
  *   6. scheduler sees the sequence moved, marks the process READY, dispatches it
  *
  * Step 3 gives up the *remainder of the quantum* rather than burning it. The
- * WFE trap is the doorbell: EL0 cannot raise an SGI, but SCTLR_EL1.nTWE is clear
- * so a WFE at EL0 traps to EL1. Unlike an SVC it carries no operation selector,
+ * WFI trap is the doorbell: EL0 cannot raise an SGI, but SCTLR_EL1.nTWI is clear
+ * so a WFI at EL0 traps to EL1. Unlike an SVC it carries no operation selector,
  * so a process can only ever stop itself -- it cannot request anything.
  *
  * ---------------------------------------------------------------------------

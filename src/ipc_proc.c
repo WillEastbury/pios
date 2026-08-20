@@ -267,7 +267,7 @@ i32 ipc_proc_fifo_send(u32 principal, i32 channel_id, const void *data, u32 len)
     copy_bytes(ch->frames[idx], data, len);
     dmb(); /* payload visible before queue metadata update */
     ch->count++;
-    sev();
+    sevl();
     return PROC_IPC_OK;
 }
 
@@ -335,7 +335,7 @@ i32 ipc_proc_fifo_send_span(u32 principal, i32 channel_id, const struct proc_ipc
     ch->lens[idx] = (u16)sizeof(*desc);
     dmb();
     ch->count++;
-    sev();
+    sevl();
     return PROC_IPC_OK;
 }
 

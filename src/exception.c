@@ -12,6 +12,7 @@
 #include "timer.h"
 #include "dtrace.h"
 #include "sd.h"
+#include "watchdog.h"
 
 /* IRQ trace via raw SD blocks.
  * We can't rely on DRAM-resident trace (Pi 5 watchdog reset clears RAM) or
@@ -32,6 +33,9 @@ static u8 irq_trace_sd_buf[SD_BLOCK_SIZE] ALIGNED(16);
  * @ LBA 2048. After a crash+reset, the `crashlba` / `coredump` command reads
  * it back to reveal where core0 faulted (elr/far/ec). */
 #define CRASH_PERSIST_LBA   24u
+/* Long enough that the PiSOD frame can be read or photographed, short enough
+ * that an unattended board recovers promptly. */
+#define PISOD_REBOOT_DELAY_MS 8000u
 static u8 crash_persist_sd_buf[SD_BLOCK_SIZE] ALIGNED(16);
 
 extern volatile u32 irq_vector_minimal_mode;
@@ -169,8 +173,35 @@ static void crash_capture(u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
     crash_record_last.ttbr0 = ttbr0;
     crash_record_last.syndrome = esr;
     crash_record_last.ticks = timer_ticks();
+    crash_record_last.reason = 0;
+    crash_record_last.value_count = 0;
+    for (u32 i = 0; i < EXCEPTION_CRASH_VALUES_MAX; i++)
+        crash_record_last.values[i] = 0;
+    for (u32 i = 0; i < EXCEPTION_CRASH_LABEL_MAX; i++)
+        crash_record_last.label[i] = 0;
     dmb_ishst();
     crash_record_valid = true;
+}
+
+/* Attach a subsystem payload to the record crash_capture() just built. */
+static void crash_capture_payload(u32 reason, const char *label,
+                                  const u64 *values, u32 value_count)
+{
+    crash_record_last.reason = reason;
+    if (value_count > EXCEPTION_CRASH_VALUES_MAX)
+        value_count = EXCEPTION_CRASH_VALUES_MAX;
+    crash_record_last.value_count = value_count;
+    for (u32 i = 0; i < value_count && values; i++)
+        crash_record_last.values[i] = values[i];
+    if (label) {
+        u32 i = 0;
+        while (i + 1U < EXCEPTION_CRASH_LABEL_MAX && label[i]) {
+            crash_record_last.label[i] = label[i];
+            i++;
+        }
+        crash_record_last.label[i] = 0;
+    }
+    dmb_ishst();
 }
 
 bool exception_crash_snapshot(struct exception_crash_record *out)
@@ -199,16 +230,34 @@ bool exception_crash_snapshot(struct exception_crash_record *out)
     out->ttbr0 = crash_record_last.ttbr0;
     out->syndrome = crash_record_last.syndrome;
     out->ticks = crash_record_last.ticks;
+    out->reason = crash_record_last.reason;
+    out->value_count = crash_record_last.value_count;
+    for (u32 i = 0; i < EXCEPTION_CRASH_VALUES_MAX; i++)
+        out->values[i] = crash_record_last.values[i];
+    for (u32 i = 0; i < EXCEPTION_CRASH_LABEL_MAX; i++)
+        out->label[i] = crash_record_last.label[i];
     return true;
 }
 
 /* Write the captured crash record to SD LBA 24 (synchronous PIO, same path as
- * irq_sd_band). Best-effort, panic-context safe: bounded, no allocation. */
+ * irq_sd_band). Best-effort, panic-context safe: bounded, no allocation.
+ * Carries forward the consecutive-crash counter so crash-loop protection can
+ * see how many panics have happened without a healthy run in between. */
 void exception_crash_persist_sd(void)
 {
     struct exception_crash_record rec;
     if (!exception_crash_snapshot(&rec))
         return;
+
+    u32 previous = 0;
+    struct exception_crash_record old;
+    if (exception_crash_sd_read(&old) &&
+        old.version == EXCEPTION_CRASH_RECORD_VERSION)
+        previous = old.consecutive;
+    rec.consecutive = previous + 1U;
+    rec.archived = 0;
+    crash_record_last.consecutive = rec.consecutive;
+
     for (u32 i = 0; i < SD_BLOCK_SIZE; i++)
         crash_persist_sd_buf[i] = 0;
     const u8 *s = (const u8 *)&rec;
@@ -241,6 +290,72 @@ void exception_crash_sd_clear(void)
     for (u32 i = 0; i < SD_BLOCK_SIZE; i++)
         crash_persist_sd_buf[i] = 0;
     (void)sd_write_block(CRASH_PERSIST_LBA, crash_persist_sd_buf);
+}
+
+/* Rewrite the persisted record with one field changed. Used by the boot-time
+ * archiver and the healthy-boot latch; both run in normal context. */
+static void crash_sd_update(bool set_archived, bool clear_consecutive)
+{
+    struct exception_crash_record rec;
+    if (!exception_crash_sd_read(&rec))
+        return;
+    if (set_archived)
+        rec.archived = 1U;
+    if (clear_consecutive)
+        rec.consecutive = 0;
+    for (u32 i = 0; i < SD_BLOCK_SIZE; i++)
+        crash_persist_sd_buf[i] = 0;
+    const u8 *s = (const u8 *)&rec;
+    for (u32 i = 0; i < sizeof(rec); i++)
+        crash_persist_sd_buf[i] = s[i];
+    (void)sd_write_block(CRASH_PERSIST_LBA, crash_persist_sd_buf);
+}
+
+void exception_crash_mark_archived(void)
+{
+    crash_sd_update(true, false);
+}
+
+void exception_crash_mark_healthy(void)
+{
+    crash_sd_update(false, true);
+}
+
+/* Common tail for every PiSOD: show the frame, then self-heal by rebooting.
+ *
+ * An appliance that halts forever on a panic is dead until someone physically
+ * power-cycles it, and a panic that reboots instantly is unreadable. So we
+ * always persist first, hold the frame long enough to be photographed, then
+ * reboot -- unless this is the Nth consecutive crash, in which case rebooting
+ * is clearly not helping and we stop so the evidence stays on screen. */
+static NORETURN void pisod_finish(void)
+{
+    u32 consecutive = crash_record_last.consecutive;
+    bool loop = consecutive >= EXCEPTION_CRASH_LOOP_LIMIT;
+
+    if (loop) {
+        uart_puts("crash loop detected; halting instead of rebooting\n");
+        fb_printf("\ncrash %u in a row: HALTING\n", consecutive);
+        fb_printf("power-cycle after collecting evidence\n");
+    } else {
+        uart_puts("crash persisted to SD; rebooting\n");
+        fb_printf("\ncrash %u persisted to SD (read: crashlba)\n", consecutive);
+        fb_printf("rebooting in %u ms...\n", PISOD_REBOOT_DELAY_MS);
+    }
+
+    fb_present();   /* force the panic frame to the scanout before we act */
+
+    if (loop) {
+        for (;;) wfi();
+    }
+
+    /* Pet the hardware watchdog across the delay so the pause itself cannot
+     * turn a diagnosed panic back into a silent watchdog reset. */
+    u64 deadline = timer_monotonic_ms() + (u64)PISOD_REBOOT_DELAY_MS;
+    while (timer_monotonic_ms() < deadline)
+        watchdog_hw_pet();
+
+    watchdog_reboot_now(crash_record_last.kind);
 }
 
 static NORETURN void pisod_halt(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
@@ -277,15 +392,56 @@ static NORETURN void pisod_halt(const char *title, u32 kind, u32 ec, u64 esr, u6
     fb_printf("far=0x%x\n", far);
     fb_printf("last crash captured in memory\n");
 
-    fb_present();   /* force the panic frame to the scanout before halting */
-
-    for (;;) wfi();
+    pisod_finish();
 }
 
 NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
 {
     pisod_halt(title, kind, ec, esr, elr, far);
 }
+
+NORETURN void exception_pisod_reboot(const char *title, u32 kind, u32 reason,
+                                     const u64 *values, u32 value_count)
+{
+    if (!panic_in_progress) {
+        panic_in_progress = true;
+        crash_capture(kind, reason, 0, 0, 0);
+        crash_capture_payload(reason, title, values, value_count);
+        /* SD, not DRAM: a BCM2712 reset clears RAM, so the record has to be on
+         * stable storage before we reboot. */
+        exception_crash_persist_sd();
+    }
+
+    if (value_count > EXCEPTION_CRASH_VALUES_MAX)
+        value_count = EXCEPTION_CRASH_VALUES_MAX;
+
+    uart_puts("\n=== PiSOD (stall) ===\n");
+    uart_puts(title);
+    uart_puts("\ncore=");
+    uart_hex(core_id());
+    uart_puts(" kind=");
+    uart_hex(kind);
+    uart_puts(" reason=");
+    uart_hex(reason);
+    uart_puts("\n");
+    for (u32 i = 0; i < value_count && values; i++) {
+        uart_puts("  v");
+        uart_hex(i);
+        uart_puts("=");
+        uart_hex(values[i]);
+        uart_puts("\n");
+    }
+    uart_puts("persisted to SD\n");
+
+    fb_clear(0x004C1966); /* deep indigo */
+    fb_set_color(0x00FFFFFF, 0x004C1966);
+    fb_printf("PIOS PiSOD\n");
+    fb_printf("%s\n\n", title);
+    fb_printf("core=%u kind=%u reason=%u\n", core_id(), kind, reason);
+    for (u32 i = 0; i < value_count && values; i++)
+        fb_printf("v%u=0x%x\n", i, values[i]);
+
+    pisod_finish();}
 
 void exception_init(void) {
     /* Install vector table */
@@ -604,6 +760,9 @@ bool irq_diag_selftest(void)
 void sync_exception(struct irq_frame *frame, u64 esr, u64 far) {
     u32 ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
     u64 elr = frame ? frame->elr : 0;
+
+    if (ec == EC_WFX_LOW && proc_handle_wfx(frame, esr))
+        return;
 
     if (ec == EC_SVC64 && proc_handle_svc(frame, esr))
         return;

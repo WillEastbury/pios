@@ -23,13 +23,15 @@ Companion documents:
 
 ## 1. Cores
 
-PIOS assigns cores statically. There is no global scheduler that moves work
-between them.
+PIOS reserves core 0 for the reactor, while cores 1-3 are scheduling
+capabilities. Processes have an eligible-core mask, an optional hard pin, and a
+last-core cache-warmth hint; ownership transfers through an atomic scheduler
+claim and destination-core page-table preparation.
 
 | Core | Constant | Role | Main loop |
 |---|---|---|---|
 | 0 | `CORE_NET` / `CORE_DISK` | Kernel: network, disk, console, services | `core0_main()` reactor (`kernel.c`) |
-| 1 | `CORE_USERM` | User management | `proc_schedule()` (`proc.c`) |
+| 1 | `CORE_USERM` | User scheduling/management | `proc_schedule()` (`proc.c`) |
 | 2 | `CORE_USER0` | User processes | `proc_schedule()` |
 | 3 | `CORE_USER1` | User processes | `proc_schedule()` |
 
@@ -45,9 +47,10 @@ and from every user core parked on a reply only core 0 can produce.
 ### 2.1 The process table
 
 `procs[MAX_PROCS_PER_CORE]` (`proc.c`) is a **single shared array**, not
-per-core. `MAX_PROCS_PER_CORE` is 6. Ownership is by field, not by table:
-`proc_schedule()` only considers entries whose `affinity_core == core_id()`,
-and only the owning core may reap or mutate them.
+per-core. `MAX_PROCS_PER_CORE` is 16. Each process has an eligible-core mask,
+an optional `pinned_core`, a `last_core` hint, and an owner claim. Only the
+owner may reap or mutate a process; dispatch claims use an ARMv8-safe
+load-exclusive/store-exclusive transition through `PROC_CLAIMED`.
 
 Per-core scheduler state is held in separate cache-line-isolated arrays indexed
 by core: `scheduler_ctx_arr`, `current_proc_arr`, `rr_cursor_arr`, `sched_diag`.
@@ -442,34 +445,19 @@ AArch64 EL1; EL1 timer access is enabled; the transition ends in `eret`.
 Secondary cores run the `SECONDARY_SETUP` macro: EL2→EL1, SCTLR, NEON, per-core
 SP and SP_EL1, `VBAR_EL1`, shared TTBR0/MAIR/TCR, MMU enable, IRQ unmask.
 
-### 7.2 EL0 and syscalls
+### 7.2 EL0 and traps
 
 EL0 entry is `proc_el0_trampoline()` → `proc_el0_enter(entry_pc, entry_sp)`.
-
-`proc_handle_svc()` implements a deliberately small SVC surface:
-
-| Syscall | Effect |
-|---|---|
-| `PROC_SVC_NOP` | No-op (liveness probe) |
-| `PROC_SVC_GETPID` | Return caller pid |
-| `PROC_SVC_EL0_PROBE` | EL0 execution proof |
-| `PROC_SVC_EXIT` | Terminate caller |
-| `PROC_SVC_PARK` | Block until woken |
-
-Anything else returns `-ENOSYS`.
-
-That surface is small **by design**: capsule request/reply runs through shared
-memory, so the hot path needs no syscall at all. The richer `kernel_api_tab`
-(queues, pipes, semaphores, tensors, IPC) is a kernel-internal API table, not an
+There is no supported EL0 SVC ABI. An unexpected EL0 SVC is counted, returns
+`-ENOSYS` only outside a running EL0 process, and terminates a running EL0
+process. The richer `kernel_api_tab` remains a kernel-internal table, not an
 EL0 SVC ABI.
 
 ### 7.3 The syscall-free scheduling contract (ADR-022/023/026)
 
-The direction is to remove that SVC surface entirely: **user code talks to the
-kernel through FIFOs and shared state, never through a call.** Three modules
-implement the logic. They are host-tested and compile into the image, but are
-**not yet wired into the live scheduler** — that is blocked on
-[#84](https://github.com/WillEastbury/pios/issues/84).
+**User code talks to the kernel through FIFOs and shared state, never through a
+call.** Three modules implement the logic. They are host-tested, compile into
+the image, and are wired into the live scheduler.
 
 **`pctl` — process → kernel** (`include/pctl.h`). A latched 64-byte control line
 per process, in its shared Normal-NC page (EL0-writable, unlike the exception

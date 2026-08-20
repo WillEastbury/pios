@@ -29,6 +29,9 @@ struct xhci_ep_info {
 
 /* Lightweight instrumentation counters */
 struct xhci_stats {
+    u32 init_stage;
+    u32 gusb3_before;
+    u32 gusb3_after;
     u32 cmd_submitted;
     u32 cmd_completed;
     u32 cmd_timeout;
@@ -40,6 +43,11 @@ struct xhci_stats {
     u32 ep_stalls;
     u32 ep_resets;
     u32 ring_full;
+    u32 port_reset_failures;
+    u32 last_port;
+    u32 last_port_status;
+    u32 last_cmd_cc;
+    u32 last_cmd_type;
 };
 
 /* Controller lifecycle */
@@ -48,7 +56,9 @@ bool xhci_init(void);
 
 /* Port operations */
 u32  xhci_port_count(void);
+u32  xhci_controller_port_count(u32 controller);
 bool xhci_port_connected(u32 port);
+u32  xhci_port_status(u32 port);
 bool xhci_port_reset(u32 port, u32 *speed);
 
 /* Device slot management */
@@ -65,6 +75,8 @@ bool xhci_stop_endpoint(u32 slot, u32 dci);
 bool xhci_control_transfer(u32 slot, u8 bmReq, u8 bReq, u16 wVal,
                             u16 wIdx, u16 wLen, void *data, u32 *actual);
 bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual);
+bool xhci_interrupt_submit(u32 slot, u8 ep_addr, void *data, u32 len);
+bool xhci_interrupt_poll(u32 *actual, bool *complete);
 
 /* Instrumentation */
 const struct xhci_stats *xhci_get_stats(void);

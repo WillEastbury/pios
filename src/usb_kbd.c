@@ -174,15 +174,25 @@ static void process_report(const u8 *report) {
 /* ---- Queue Interrupt Transfer ---- */
 
 static void queue_poll(void) {
-    if (!kbd_ready || poll_pending) return;
-    dcache_invalidate_range((u64)(usize)report_buf, sizeof(report_buf));
-    u32 actual;
     u32 xfer_len = (int_ep_maxpkt > 8) ? 8 : int_ep_maxpkt;
-    if (xhci_bulk_transfer(kbd_dev->slot, int_ep_addr, report_buf,
-                            xfer_len, &actual)) {
-        dcache_invalidate_range((u64)(usize)report_buf, sizeof(report_buf));
-        process_report(report_buf);
+    if (!kbd_ready)
+        return;
+    if (poll_pending) {
+        u32 actual = 0U;
+        bool complete = false;
+        if (!xhci_interrupt_poll(&actual, &complete)) {
+            poll_pending = false;
+            return;
+        }
+        if (!complete)
+            return;
+        poll_pending = false;
+        if (actual >= 8U)
+            process_report(report_buf);
     }
+    if (xhci_interrupt_submit(kbd_dev->slot, int_ep_addr,
+                              report_buf, xfer_len))
+        poll_pending = true;
 }
 
 /* ---- Driver Callbacks ---- */
@@ -190,6 +200,7 @@ static void queue_poll(void) {
 static bool kbd_match(struct usb_device *dev) {
     for (u32 i = 0; i < dev->num_eps; i++) {
         if (dev->eps[i].iface_class == 3 &&     /* HID */
+            dev->eps[i].iface_subclass == 1 &&  /* Boot Interface */
             dev->eps[i].iface_protocol == 1)     /* Keyboard */
             return true;
     }
@@ -204,7 +215,10 @@ static bool kbd_probe(struct usb_device *dev) {
     /* Find interrupt IN endpoint */
     for (u32 i = 0; i < dev->num_eps; i++) {
         if ((dev->eps[i].attributes & 0x03) == USB_EP_ATTR_INTR &&
-            (dev->eps[i].address & USB_DIR_IN)) {
+            (dev->eps[i].address & USB_DIR_IN) &&
+            dev->eps[i].iface_class == 3 &&
+            dev->eps[i].iface_subclass == 1 &&
+            dev->eps[i].iface_protocol == 1) {
             int_ep_addr = dev->eps[i].address;
             int_ep_maxpkt = dev->eps[i].max_packet;
             kbd_iface = dev->eps[i].iface_number;
@@ -218,11 +232,14 @@ static bool kbd_probe(struct usb_device *dev) {
     }
 
     /* SET_PROTOCOL: Boot Protocol (0) — fixed 8-byte reports */
-    usb_control_msg(dev, 0x21, HID_SET_PROTOCOL, HID_BOOT_PROTOCOL,
-                    0, kbd_iface, NULL, NULL);
+    if (!usb_control_msg(dev, 0x21, HID_SET_PROTOCOL, HID_BOOT_PROTOCOL,
+                         kbd_iface, 0, NULL, NULL))
+        return false;
 
     /* SET_IDLE: report only on change */
-    usb_control_msg(dev, 0x21, HID_SET_IDLE, 0, kbd_iface, 0, NULL, NULL);
+    if (!usb_control_msg(dev, 0x21, HID_SET_IDLE, 0,
+                         kbd_iface, 0, NULL, NULL))
+        return false;
 
     for (u32 i = 0; i < 6; i++) prev_keys[i] = 0;
     kbd_head = 0;

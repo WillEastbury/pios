@@ -115,6 +115,13 @@ TESTS_MANIFEST = {
     # sequence, and carries the end-to-end Thread.Sleep(1000) round trip driven
     # through swake + pctl with no syscall anywhere.
     "test_swake.c": ["src/swake.c", "src/pctl.c"],
+    # PPOS immutable positional page format and bounded ANY/AND/PHRASE/NEAR
+    # queries.  The test uses an in-memory authoritative document callback,
+    # so no WALFS or hardware dependencies are pulled into the host build.
+    "test_ppos.c": ["src/ppos.c"],
+    # ABI-level dual-NIC contract: distinct backend identities, preserved
+    # 64-byte FIFO messages, and interface-scoped firewall rule defaults.
+    "test_dual_nic.c": [],
 }
 
 
@@ -145,6 +152,15 @@ def main() -> int:
             total_fail += 1
             continue
         run = subprocess.run([str(exe)], capture_output=True, text=True)
+        sys.stdout.write(run.stdout)
+        if run.returncode != 0:
+            sys.stdout.write(run.stderr)
+            total_fail += 1
+
+    for test in ("test_network_dispatch.py", "test_el0_idle_contract.py",
+                 "test_bootstrap_fat_import.py"):
+        run = subprocess.run([sys.executable, str(TESTS / test)],
+                             capture_output=True, text=True)
         sys.stdout.write(run.stdout)
         if run.returncode != 0:
             sys.stdout.write(run.stderr)

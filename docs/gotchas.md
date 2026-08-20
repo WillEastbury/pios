@@ -309,20 +309,22 @@ The selftest now carries FIPS-197 Appendix B/C and NIST SP 800-38D Test Case 4.
 
 ## Network
 
-### Do not raise `TCP_BUF_SIZE`
+### `TCP_BUF_SIZE` growth moves the QEMU static image
 
-**Tried:** 8192 and 16384, to lift OTA push throughput above ~17 KB/s.
+**Symptom:** 8192 passed smoke but intermittently failed concurrent QEMU load
+with `RemoteDisconnected`.
 
-**Result:** QEMU's 29-test smoke suite still passed, but the load battery's
-parallel/bursty phases failed with `RemoteDisconnected` at **8192 already** — a
-real regression under concurrent load, confirmed by a clean 4096 re-run.
-Reverted.
+**Disproved:** virtio ring exhaustion. Enlarging both queues from 32 to 128 did
+not change the failure; `tx_drop` and `rx_starve` stayed zero.
 
-**Root cause not yet isolated.** Suspect a fixed-capacity virtio-net TX
-ring/descriptor assumption sized against the old window — *not* a `struct tcb`
-stack overflow, since the tcb is never stack-copied.
+**Root cause:** QEMU uses the static 128-entry fallback TCB table. Each TCB has
+both an RX and TX ring, so 4096 -> 8192 adds roughly 1 MiB to `.bss`. Before
+issue #86's RAM relocation this pushed the kernel/stacks/pgtbl layout through
+the old `CORE0_RAM_BASE`, producing load-sensitive corruption.
 
-**Rule:** `TCP_BUF_SIZE` stays 4096 until that ring limit is found and fixed.
+**Rule:** static buffer growth is allowed only while the QEMU linker assertion
+keeps a real margin below `CORE0_RAM_BASE`. At 8192 the image ends at
+`0x4216F000`, leaving 580 KiB before the relocated `0x42200000` boundary.
 
 ### First packet to an unresolved neighbour
 
@@ -354,6 +356,28 @@ Do not repeat these blindly; each has been tried on hardware.
 | SAE (`wifi join3`) and extended-join | Reset this firmware; quarantined |
 | Scanning after a failed join | Watchdog reboot — always `wifi init`/reboot first |
 | Replacing firmware to fix `sup_wpa` | Both 7.45.265 and 7.45.286 report `sup_wpa` unsupported; firmware version is not the issue |
+| BDC EAPOL priority 7 | Linux classifies EAPOL as 802.1D network-control; setting `bdc_buf[1]=7` changed nothing. Reverted |
+| Settling delays between `wpaie`/`wpa_auth`/`auth`/`wsec` | 10 ms gaps matching Circle's sequence changed nothing. Reverted |
+| Visible 2.4 GHz BSS versus hidden 5 GHz parent | Both multi-BSSID targets fail identically |
+| `assoc_info` / `assoc_req_ies` / `WLC_GET_PKTCNTS` during association | Firmware does not service these GETs while associating (`stage=2`, or BCME -14 with a small buffer). Cannot be used to prove whether M2 was transmitted |
+
+**EAPOL msg 2/4 and msg 4/4 must carry `key_length = 0` for RSN.** Echoing M1's
+key length is WPA-only behaviour; `wpa_supplicant_send_2_of_4()` writes zero for
+`WPA_PROTO_RSN`. Some APs silently drop a non-zero M2 key length, which is
+indistinguishable from the AP ignoring M2 entirely.
+
+**A reply frame must not reuse the received frame's Ethernet header.** M4 was
+built with `memcpy(frame, m3, 14)`, addressing the reply to ourselves with the
+AP as source. The AP never saw M4 and deauthed with reason 2 — which looked
+exactly like a rejected handshake rather than a lost reply. Replies use
+dest = received source, src = `cyw_mac`.
+
+**Do not require an explicit RX indication.** RFRAMEBC reads 0 permanently on
+this board and no HMB/CCCR frame indication ever fires, so any driver that waits
+to be told about a frame will stop receiving as soon as a next-length chain ends
+— taking TX credit, scans and events down with it. `brcmf_sdio_readframes()`
+probes speculatively and validates the SDPCM length/~length tag; PIOS now does
+the same (`wifi rxprobe`).
 
 **`escan` needs an explicit channel list.** With the default zero-channel
 request the guest AP was intermittently undiscovered; with explicit 2.4/5 GHz

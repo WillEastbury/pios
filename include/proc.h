@@ -12,6 +12,7 @@
 #include "mem_arena.h"
 #include "core_env.h"   /* PROC_ARENA_BASE/SIZE for PROC_SLOT_PHYS */
 #include "ipc_proc.h"
+#include "qbank.h"
 struct irq_frame;
 
 struct paged_io_stat {
@@ -71,6 +72,23 @@ struct proc_sched_core_snapshot {
     u64 preemptions;
     u64 soft_events;
     u64 soft_boosts;
+    u64 wfx_traps;
+    u32 wfx_awaits;
+    u32 wfx_keeps;
+    u32 wfx_last_state;
+    u32 wfx_last_generation;
+    u64 wfx_last_slot_va;
+    u64 wfx_last_slot_pte;
+} PACKED;
+
+struct proc_sched_user_state {
+    u32 pid;
+    u32 core;
+    u32 state;
+    u32 priority_class;
+    u32 quantum_ms;
+    u32 preemptions;
+    u64 runtime_ticks;
 } PACKED;
 
 #define PROC_SOFT_EVENT_IPC_FIFO  1U
@@ -207,27 +225,31 @@ struct appf_service_record {
  * Total concurrent process slots, system-wide (procs[] is shared and filtered
  * by affinity, so this is NOT per core despite the historical name).
  *
- * STILL 6 -- see issues #84 and #86. The address-space half of ADR-024 is done:
- * slots now come from the global process arena (PROC_SLOT_PHYS) instead of the
- * owning core's private RAM, so a process's memory no longer belongs to a core
- * and the old "~7 slots fit in a 16 MB region" ceiling is gone.
+ * Raised from 6 to 16 (issues #84/#86). Root cause of the #86 regression was
+ * NOT process count or hot-loop cost -- it was kernel .bss growth: mmu.c's
+ * per-slot page-table arrays ([3][MAX_PROCS_PER_CORE][512], ~28 KB per slot
+ * per user core) used to live in the generic .bss output section, which sits
+ * directly below the per-core kernel stacks and __heap_start in
+ * link.ld/link_qemu_full.ld. Growing them therefore pushed the stacks upward
+ * in lockstep, eventually displacing them into CORE0_RAM_BASE -- proven on
+ * QEMU via a stack-boundary canary trip with far==CORE0_RAM_BASE at 12/16
+ * slots. Fixed by moving those arrays (plus user_table_valid) into their own
+ * ".pgtbl_pool" linker section placed AFTER the now fixed-size stack block,
+ * so raising this constant can never again move the stacks. Both linker
+ * scripts also gained a build-time ASSERT against the relevant next-core RAM
+ * boundary so a future regression fails the link instead of silently
+ * tripping a boot-time canary. See mmu.c's comment above user_l1 and
+ * link.ld / link_qemu_full.ld / link_2m.ld for the full mechanism.
  *
- * Raising this is blocked on a measured, unexplained regression (#86), NOT on
- * address space: `ipc bench 256` fails with errors scaling with this value
- * (6 -> 0 errors, 12 -> 5, 16 -> 10) while `desc` stays 24.
- *
- * Do NOT assume it is hot-loop cost. That hypothesis was tested and DISPROVEN:
- * proc_slot_high_water now bounds every hot per-slot scan (dispatch, ready,
- * reap, and proc_timer_tick's 1 kHz deadline sweep) by slots actually in use, so
- * with three processes the scans are identical at 6 and 16 -- and the error
- * count was unchanged at exactly 10. Root cause is still open.
- *
- * The other ceiling to remember when it is raised: mmu.c's per-slot page tables
- * (user_l1, user_l2_low, user_l2_phys, user_l2_high, user_l3_proc, user_l3_ipc)
- * cost ~28 KB per slot per user core, so they need a pool rather than static
- * [3][MAX_PROCS_PER_CORE][512] arrays before this goes much higher.
+ * 16 is the process-arena ceiling (see the _Static_assert below). QEMU's
+ * whole kernel image (text+rodata+data+bss+stacks+.pgtbl_pool) must fit below
+ * CORE0_RAM_BASE (now 0x42200000 on QEMU), and the 2MB upward relocation of
+ * QEMU's private/shared RAM map would otherwise leave the 16-slot image about
+ * 444KB past the old boundary; the 2MB relocation leaves roughly 1.6MB before
+ * the new boundary. The linker keeps a 128KB minimum margin. Pi 5 has no
+ * comparable constraint, so both platforms can use the same 16-slot ceiling.
  */
-#define MAX_PROCS_PER_CORE  6
+#define MAX_PROCS_PER_CORE  16
 #define PROC_UI_KERNEL_PID 0U
 #define PROC_UI_KERNEL_PARENT_PID 0xFFFFFFFFU
 #define PROC_SLOT_SIZE      (2 * 1024 * 1024)   /* 2MB per process */
@@ -272,6 +294,8 @@ _Static_assert((PROC_ARENA_BASE & 0x1FFFFFULL) == 0ULL,
 #define PROC_PRIO_HIGH      3
 #define PROC_PRIO_REALTIME  4
 #define PROC_CAPSULE_ID_NONE 0xFFFFFFFFU
+#define PROC_CORE_NONE      0xFFFFFFFFU
+#define PROC_ELIGIBLE_USER_MASK ((1U << CORE_USERM) | (1U << CORE_USER0) | (1U << CORE_USER1))
 
 #define PROC_ENTRY_FLAG_DIRECT_KPI      0x00000001U
 #define PROC_ENTRY_FLAG_EL0_CONTRACT    0x00000002U
@@ -279,7 +303,6 @@ _Static_assert((PROC_ARENA_BASE & 0x1FFFFFULL) == 0ULL,
 #define PROC_ENTRY_FLAG_DATA_RW_XN      0x00000008U
 #define PROC_ENTRY_FLAG_STACK_16_ALIGN  0x00000010U
 #define PROC_ENTRY_FLAG_API_IN_X0       0x00000020U
-#define PROC_ENTRY_FLAG_SVC_REQUIRED    0x00000040U
 /*
  * PSTATE for an EL0 process: EL0t, with D/A/F masked and **IRQs enabled**.
  *
@@ -308,14 +331,22 @@ struct process {
     u32 state;
     u32 principal_id;
     u32 affinity_core;
+    volatile u32 owner_core;
+    u32 pinned_core;
+    u32 eligible_core_mask;
+    u32 last_core;
     u32 priority_class;
     u64 quantum_ticks;
+    u64 active_quantum_ticks;
+    u64 qbank_grant_ticks;
     u64 wake_deadline_ms; /* 0 = none; proc_park_timeout() sets this, cleared on wake */
     u8 *base;           /* 2MB slot start */
     u32 mem_size;
     struct proc_context ctx;
     u64 ticks;          /* tick count at last schedule */
     u64 runtime_ticks;  /* accumulated runtime ticks */
+    u64 el0_inbound_seq; /* kernel-owned wake sequence exposed to EL0 */
+    struct qbank quantum_bank;
     u32 exit_code;
     u32 preemptions;
     bool capsule_enabled;
@@ -379,6 +410,11 @@ struct kernel_api {
     i32 (*exit)(u32 code);
     u32 (*getpid)(void);
     i32 (*park)(void);              /* block until woken by a soft event */
+    i32 (*sched_yield)(u32 reason); /* explicit scheduler primitive */
+    i32 (*sched_get)(struct proc_sched_user_state *out);
+    i32 (*sched_set_priority)(u32 pid, u32 priority_class);
+    i32 (*sched_set_affinity)(u32 pid, u32 core);
+    u64 (*sched_preemptions)(void);
 
     /* ---- Console I/O ---- */
     void (*print)(const char *msg);
@@ -555,6 +591,7 @@ void proc_schedule(void);          /* run scheduler loop (called from coreN_main
 u32  proc_count(void);             /* number of active processes on this core */
 bool proc_handle_fault(u64 esr, u64 elr, u64 far); /* kill faulting user proc */
 bool proc_handle_svc(struct irq_frame *frame, u64 esr);
+bool proc_handle_wfx(struct irq_frame *frame, u64 esr);
 bool proc_svc_selftest(void);
 u64  proc_svc_calls(void);
 u64  proc_svc_bad_calls(void);
@@ -562,6 +599,8 @@ u64  proc_svc_bad_calls(void);
 /* Preemption (user cores only) */
 #define PROC_PREEMPT_TIMER_HZ    1000U
 #define PROC_PREEMPT_QUANTUM_MS  5U
+/* Enable this core's targeted FIFO/SGI doorbell after GIC + FIFO setup. */
+void proc_fifo_doorbell_init(void);
 void proc_preempt_init(u32 timer_hz, u32 quantum_ms);
 void proc_irq_maybe_preempt(struct irq_frame *frame);
 /* Preemption-accounting half of the unified timer tick hook (see kernel.c). */
@@ -593,7 +632,6 @@ i32  proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
 i32  proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
                             u64 linked_base, u64 physical_base,
                             u32 priority_class, u32 affinity_core);
-void proc_el0_probe_snapshot(u32 *seen, u32 *pid, u32 *spsr, u64 *arg, u64 *elr, u32 *exits);
 void proc_el0_diag_snapshot(i32 *launch_status, u32 *launch_pid, u32 *launch_slot,
                             u64 *launch_base, u32 *enter_count, u32 *enter_pid,
                             u64 *enter_pc, u64 *enter_sp, u32 *fault_pid,

@@ -145,9 +145,10 @@ coexists with static neighbor entries. Route lookup chooses a connected route
 or gateway, then resolves the next-hop MAC. Resolution failure is explicit;
 send paths do not fabricate success.
 
-`TCP_BUF_SIZE` remains 4096. Raising it to 8192 or 16384 caused reproducible
-QEMU parallel/bursty load regressions and must not be retried without first
-finding the fixed-capacity ring or descriptor constraint.
+`TCP_BUF_SIZE` is 8192. The earlier concurrent-QEMU failure was caused by the
+extra static fallback TCB storage crossing the old QEMU core-0 RAM boundary,
+not by virtio descriptor capacity. The relocated QEMU memory map and linker
+assertion now leave 580 KiB of measured margin at this size.
 
 ## NIC backends
 
@@ -232,6 +233,9 @@ Credentials belong only in ignored `tools/wifi_config.local.json`. Never print
 or commit them.
 
 ```powershell
+# Recreate the pinned official Pi5 firmware set after a machine reformat.
+python tools\fetch_wifi_firmware.py
+
 # Stream firmware, NVRAM, and CLM into the running board.
 python tools\pios_wifi_upload.py --host 192.168.0.201 --dir wifi_fw_staging
 
@@ -395,12 +399,26 @@ Firewall commands and detailed syntax are documented in `commands.md` and
 | `wifi joindiag` | Query join-related firmware state when responses are available |
 | `wifi fwlog` | Bounded CYW firmware console-ring dump |
 | `wifi joinpmk <ssid> <64-hex-pmk>` | WPA2 join using a derived PMK |
+| `wifi rsncaps <hhll\|auto>` | Override the RSN capability field in the `wpaie` iovar and the M2 RSN IE; `auto` restores `0x0000` |
+| `wifi rxprobe <on\|off>` | Speculative SDPCM RX header probing (default on); required on this board because no frame indication ever fires |
 | `wifi join <ssid> <pass>` | Firmware passphrase path; avoid exposing credentials in history |
 | `wifi join3 <ssid> <pass>` | Experimental SAE path; currently quarantined |
 | `wifi activate` | Switch active NIC and initialize `.202`; only after proven association |
 | `wifi disconnect` | Request disassociation |
 
 Prefer `tools/pios_wifi_join.py` over typing secrets into a command surface.
+
+> **Current hazard.** `wifi activate` swaps the active NIC and drops the wired
+> management path; run it only when the board can be power-cycled.
+
+The SDIO2 interrupt path is configured for BCM2712 GIC SPI 274, but live
+hardware has not yet delivered a handler hit. PIOS retains a one-second
+edge/probe fallback, so this is currently an efficiency limitation rather than
+a WiFi correctness dependency.
+
+`wifi init` performs the blob preload before touching SDIO2. Do not call
+`wifi load` or `wifi joinpmk` on a board that has not been preloaded: SDIO2
+initialization disturbs EMMC2 and the board will reset.
 
 ## Diagnostic order
 

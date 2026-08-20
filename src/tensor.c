@@ -11,6 +11,7 @@
 #include "tensor.h"
 #include "bitnet_pi5_fixture.h"
 #include "bitnet_kernel.h"
+#include "core.h"
 #include "gpu.h"
 #include "v3d.h"
 #include "v3d_matvec64_qpu.h"
@@ -19,6 +20,8 @@
 #include "mmu.h"
 #include "pico_hooks.h"
 #include "picovm.h"
+#include "qpu_async_media_fixture.h"
+#include "timer.h"
 #include "uart.h"
 #include "platform.h"
 
@@ -57,6 +60,35 @@ static u32 picovm_bitlinear_qpu_ops;
 static bool prefer_qpu_fp32_tiles;
 static bool picovm_media_qpu_ready;
 static bool picovm_h264_qpu_ready;
+static bool picovm_async_qpu_ready;
+static bool prefer_qpu_h264;
+static u32 media_h264_qpu_min_bytes;
+#define TENSOR_MEDIA_DIRECT_MAX_BYTES 4096U
+#define TENSOR_V3D_IDENTITY_BYTES     0x40000000ULL
+#define TENSOR_ASYNC_JOB_SLOTS 2U
+#define TENSOR_ASYNC_JOB_FREE 0U
+#define TENSOR_ASYNC_JOB_RUNNING 1U
+#define TENSOR_ASYNC_JOB_DONE 2U
+#define TENSOR_ASYNC_JOB_FAILED 3U
+struct tensor_async_job {
+    u32 generation;
+    u32 state;
+    u32 result_handle;
+    u32 output_ptr;
+    u32 bytes;
+    u32 kernel_id;
+    u32 qpu_output_ptr;
+    pv_ctx *ctx;
+    i32 error;
+    u64 submitted_ms;
+    u8 reserved[8];
+} ALIGNED(64);
+_Static_assert(sizeof(struct tensor_async_job) == 64U,
+               "QPU async job must own one cache line");
+static struct tensor_async_job tensor_async_jobs[TENSOR_ASYNC_JOB_SLOTS]
+    ALIGNED(64);
+static u8 tensor_async_output[TENSOR_ASYNC_JOB_SLOTS]
+                             [TENSOR_MEDIA_DIRECT_MAX_BYTES] ALIGNED(4096);
 /* Core-0-only guarded diagnostic context; never touched from scheduler cores. */
 static pv_ctx picovm_qpu_test_ctx ALIGNED(64);
 static u8 picovm_qpu_test_mem[65536] ALIGNED(64);
@@ -603,71 +635,101 @@ static bool tensor_qpu_gray_residual(const u8 *src, const u8 *pred,
     tensor_t d = {0};
     bool ok = false;
     if (!src || !pred || !dst || bytes == 0U || bytes > 4096U ||
-        (bytes & 15U) != 0U)
+        (bytes & 63U) != 0U)
         return false;
-    if (!tensor_alloc(&s, 1U, 64U, 1U) ||
-        !tensor_alloc(&p, 1U, 64U, 1U) ||
-        !tensor_alloc(&d, 1U, 64U, 1U))
+    if (!tensor_alloc(&s, 1U, bytes, 1U) ||
+        !tensor_alloc(&p, 1U, bytes, 1U) ||
+        !tensor_alloc(&d, 1U, bytes, 1U))
         goto done;
-    for (u32 off = 0; off < bytes; off += 16U) {
-        simd_zero(s.arm_ptr, 64U);
-        simd_zero(p.arm_ptr, 64U);
-        simd_zero(d.arm_ptr, 64U);
-        simd_memcpy(s.arm_ptr, src + off, 16U);
-        if (restore) {
-            u8 *neg = (u8 *)p.arm_ptr;
-            for (u32 i = 0; i < 16U; i++)
-                neg[i] = (u8)(0U - pred[off + i]);
-        } else {
-            simd_memcpy(p.arm_ptr, pred + off, 16U);
-        }
-        dcache_clean_range((u64)(usize)s.arm_ptr, 64U);
-        dcache_clean_range((u64)(usize)p.arm_ptr, 64U);
-        u32 sa = s.bus_addr & 0x3FFFFFFFU;
-        u32 pa = p.bus_addr & 0x3FFFFFFFU;
-        u32 da = d.bus_addr & 0x3FFFFFFFU;
-        u32 uniforms[6] = {
-            sa, pa, 0x7F7F7F7FU, 0x01010101U, 0x80808080U, da
-        };
-        bool tile_ok = false;
-        if (v3d_kernel_bind_builtin_qpu(V3D_KERNEL_GRAY_RESIDUAL64,
-                                        uniforms, sizeof(uniforms)) != V3D_STATUS_OK)
-            goto done;
-        for (u32 attempt = 0; attempt < 3U; attempt++) {
-            simd_memset(d.arm_ptr, 0xA5U, 64U);
-            dcache_clean_range((u64)(usize)d.arm_ptr, 64U);
-            if (v3d_dispatch_kernel(V3D_KERNEL_GRAY_RESIDUAL64, 25U) != V3D_STATUS_OK)
-                continue;
-            dcache_invalidate_range((u64)(usize)d.arm_ptr, 64U);
-            tile_ok = true;
-            for (u32 i = 0; i < 16U; i++) {
-                u8 expected = restore
-                    ? (u8)(src[off + i] + pred[off + i])
-                    : (u8)(src[off + i] - pred[off + i]);
-                if (((u8 *)d.arm_ptr)[i] != expected) {
-                    tiny_last_output_bits = ((u8 *)d.arm_ptr)[i];
-                    tiny_last_expected_bits = expected;
-                    tile_ok = false;
-                    break;
-                }
-            }
-            if (tile_ok)
+    simd_memcpy(s.arm_ptr, src, bytes);
+    simd_memcpy(p.arm_ptr, pred, bytes);
+    dcache_clean_range((u64)(usize)s.arm_ptr, bytes);
+    dcache_clean_range((u64)(usize)p.arm_ptr, bytes);
+    u32 buffers[3] = {
+        s.bus_addr & 0x3FFFFFFFU,
+        p.bus_addr & 0x3FFFFFFFU,
+        d.bus_addr & 0x3FFFFFFFU
+    };
+    v3d_kernel_id_t id = restore
+        ? V3D_KERNEL_GRAY_RESTORE64 : V3D_KERNEL_GRAY_RESIDUAL64;
+    bool verified = false;
+    if (v3d_kernel_bind_builtin_qpu_grid(id, buffers, sizeof(buffers),
+                                         bytes / 64U) != V3D_STATUS_OK)
+        goto done;
+    for (u32 attempt = 0; attempt < 3U; attempt++) {
+        simd_memset(d.arm_ptr, 0xA5U, bytes);
+        dcache_clean_range((u64)(usize)d.arm_ptr, bytes);
+        if (v3d_dispatch_kernel(id, 25U) != V3D_STATUS_OK)
+            continue;
+        dcache_invalidate_range((u64)(usize)d.arm_ptr, bytes);
+        verified = true;
+        for (u32 i = 0; i < bytes; i++) {
+            u8 expected = restore
+                ? (u8)(src[i] + pred[i])
+                : (u8)(src[i] - pred[i]);
+            if (((u8 *)d.arm_ptr)[i] != expected) {
+                tiny_last_output_bits = ((u8 *)d.arm_ptr)[i];
+                tiny_last_expected_bits = expected;
+                verified = false;
                 break;
+            }
         }
-        if (!tile_ok)
-            goto done;
-        simd_memcpy(dst + off, d.arm_ptr, 16U);
+        if (verified)
+            break;
     }
-    v3d_kernel_mark_verified(V3D_KERNEL_GRAY_RESIDUAL64, true);
+    if (!verified)
+        goto done;
+    simd_memcpy(dst, d.arm_ptr, bytes);
+    v3d_kernel_mark_verified(id, true);
     ok = true;
 
 done:
-    if (!ok)
+    if (!ok) {
         v3d_kernel_mark_verified(V3D_KERNEL_GRAY_RESIDUAL64, false);
+        v3d_kernel_mark_verified(V3D_KERNEL_GRAY_RESTORE64, false);
+    }
     tensor_free(&s);
     tensor_free(&p);
     tensor_free(&d);
     return ok;
+}
+
+static bool tensor_qpu_gray_residual_prepare(const u8 *src, const u8 *pred,
+                                             u8 *dst, u32 bytes, bool restore)
+{
+    if (!src || !pred || !dst || bytes == 0U ||
+        bytes > TENSOR_MEDIA_DIRECT_MAX_BYTES || (bytes & 63U) != 0U ||
+        (((usize)src | (usize)pred | (usize)dst) & 3U) != 0U)
+        return false;
+    u64 sa = (u64)(usize)src;
+    u64 pa = (u64)(usize)pred;
+    u64 da = (u64)(usize)dst;
+    if (sa + bytes > TENSOR_V3D_IDENTITY_BYTES ||
+        pa + bytes > TENSOR_V3D_IDENTITY_BYTES ||
+        da + bytes > TENSOR_V3D_IDENTITY_BYTES)
+        return false;
+    dcache_clean_range(sa, bytes);
+    dcache_clean_range(pa, bytes);
+    dcache_clean_range(da, bytes);
+    u32 buffers[3] = {(u32)sa, (u32)pa, (u32)da};
+    v3d_kernel_id_t id = restore
+        ? V3D_KERNEL_GRAY_RESTORE64 : V3D_KERNEL_GRAY_RESIDUAL64;
+    return v3d_kernel_bind_builtin_qpu_grid(
+               id, buffers, sizeof(buffers), bytes / 64U) == V3D_STATUS_OK;
+}
+
+static bool tensor_qpu_gray_residual_direct(const u8 *src, const u8 *pred,
+                                            u8 *dst, u32 bytes, bool restore)
+{
+    if (!tensor_qpu_gray_residual_prepare(src, pred, dst, bytes, restore))
+        return false;
+    v3d_kernel_id_t id = restore
+        ? V3D_KERNEL_GRAY_RESTORE64 : V3D_KERNEL_GRAY_RESIDUAL64;
+    if (v3d_dispatch_kernel(id, 25U) != V3D_STATUS_OK)
+        return false;
+    u64 da = (u64)(usize)dst;
+    dcache_invalidate_range(da, bytes);
+    return true;
 }
 
 bool tensor_matvec_batch_selftest(u32 rows)
@@ -807,7 +869,7 @@ static int tensor_picovm_media_hook(pv_ctx *ctx, int hook,
                    hook == PV_HOOK_MEDIA_H264RESTORE;
     if ((!xor_op && !h264_op) ||
         (xor_op && !picovm_media_qpu_ready) ||
-        (h264_op && !picovm_h264_qpu_ready))
+        (h264_op && (!picovm_h264_qpu_ready || !prefer_qpu_h264)))
         return 0;
 
     u32 xp = 0U, yp = 0U;
@@ -820,12 +882,29 @@ static int tensor_picovm_media_hook(pv_ctx *ctx, int hook,
         (u32)xn > (u32)ctx->mem_size - ctx->arena_top)
         return 0;
     u32 base = ctx->arena_top;
-    bool ok = xor_op
-        ? tensor_qpu_gray_xor(ctx->mem + xp, ctx->mem + yp,
-                              ctx->mem + base, (u32)xn)
-        : tensor_qpu_gray_residual(ctx->mem + xp, ctx->mem + yp,
-                                   ctx->mem + base, (u32)xn,
-                                   hook == PV_HOOK_MEDIA_H264RESTORE);
+    bool ok;
+    if (xor_op) {
+        ok = tensor_qpu_gray_xor(ctx->mem + xp, ctx->mem + yp,
+                                 ctx->mem + base, (u32)xn);
+    } else {
+        if ((u32)xn < media_h264_qpu_min_bytes)
+            return 0;
+        ok = true;
+        u32 done = 0U;
+        while (done < (u32)xn) {
+            u32 chunk = (u32)xn - done;
+            if (chunk > TENSOR_MEDIA_DIRECT_MAX_BYTES)
+                chunk = TENSOR_MEDIA_DIRECT_MAX_BYTES;
+            if (!tensor_qpu_gray_residual_direct(
+                    ctx->mem + xp + done, ctx->mem + yp + done,
+                    ctx->mem + base + done, chunk,
+                    hook == PV_HOOK_MEDIA_H264RESTORE)) {
+                ok = false;
+                break;
+            }
+            done += chunk;
+        }
+    }
     if (!ok)
         return 0;
     int handle = ctx->span_count++;
@@ -834,6 +913,209 @@ static int tensor_picovm_media_hook(pv_ctx *ctx, int hook,
     ctx->arena_top += (u32)xn;
     ctx->regs[rd] = handle;
     return 1;
+}
+
+static u32 tensor_async_job_handle(u32 slot,
+                                   const struct tensor_async_job *job)
+{
+    return (job->generation << 8) | (slot + 1U);
+}
+
+static struct tensor_async_job *
+tensor_async_job_lookup(pv_ctx *ctx, i32 handle)
+{
+    if (!ctx || handle <= 0)
+        return NULL;
+    u32 raw = (u32)handle;
+    u32 slot_tag = raw & 0xFFU;
+    if (slot_tag == 0U || slot_tag > TENSOR_ASYNC_JOB_SLOTS)
+        return NULL;
+    struct tensor_async_job *job = &tensor_async_jobs[slot_tag - 1U];
+    if (job->state == TENSOR_ASYNC_JOB_FREE ||
+        job->generation != (raw >> 8) || job->ctx != ctx)
+        return NULL;
+    return job;
+}
+
+static i32 tensor_async_job_poll(struct tensor_async_job *job)
+{
+    if (!job)
+        return -1;
+    if (job->state == TENSOR_ASYNC_JOB_DONE)
+        return 1;
+    if (job->state == TENSOR_ASYNC_JOB_FAILED)
+        return -1;
+    bool done = false;
+    v3d_status_t status = v3d_dispatch_poll(&done);
+    if (status == V3D_STATUS_IN_PROGRESS)
+        return 0;
+    if (status == V3D_STATUS_OK && done) {
+        dcache_invalidate_range((u64)job->qpu_output_ptr, job->bytes);
+        dsb();
+        simd_memcpy(job->ctx->mem + job->output_ptr,
+                    (const void *)(usize)job->qpu_output_ptr, job->bytes);
+        v3d_kernel_mark_verified((v3d_kernel_id_t)job->kernel_id, true);
+        job->state = TENSOR_ASYNC_JOB_DONE;
+        dmb();
+        return 1;
+    }
+    job->error = status;
+    job->state = TENSOR_ASYNC_JOB_FAILED;
+    dmb();
+    return -1;
+}
+
+static int tensor_picovm_compute_hook(pv_ctx *ctx, int hook,
+                                      int rd, int rs1, int rs2)
+{
+    if (!ctx || rd < 0 || rd >= PV_NUM_REGS ||
+        rs1 < 0 || rs1 >= PV_NUM_REGS || rs2 < 0 || rs2 >= PV_NUM_REGS)
+        return 0;
+    if (hook == PV_HOOK_ASYNC_SUBMIT) {
+        tiny_last_stage = 700;
+        if (core_id() != CORE_NET || v3d_dispatch_in_flight()) {
+            tiny_last_stage = 701;
+            ctx->regs[rd] = 0;
+            return 1;
+        }
+        u32 request_ptr = 0U, predictor_ptr = 0U;
+        i32 request_len = 0, predictor_len = 0;
+        if (!tensor_picovm_span(ctx, ctx->regs[rs1],
+                                &request_ptr, &request_len) ||
+            !tensor_picovm_span(ctx, ctx->regs[rs2],
+                                &predictor_ptr, &predictor_len) ||
+            request_len < 72 || request_len > 8 + (i32)TENSOR_MEDIA_DIRECT_MAX_BYTES) {
+            tiny_last_stage = 702;
+            return 0;
+        }
+        const u8 *request = ctx->mem + request_ptr;
+        if (request[0] != 'Q' || request[1] != 'P' ||
+            request[2] != 'A' || request[3] != '1' ||
+            (request[4] != 1U && request[4] != 2U) ||
+            request[5] != 0U || request[6] != 0U || request[7] != 0U) {
+            tiny_last_stage = 703;
+            return 0;
+        }
+        u32 bytes = (u32)request_len - 8U;
+        if ((bytes & 63U) != 0U || predictor_len != (i32)bytes ||
+            ctx->no_alloc || ctx->span_count >= PV_MAX_SPANS) {
+            tiny_last_stage = 704;
+            return 0;
+        }
+        u32 output_ptr = (ctx->arena_top + 3U) & ~3U;
+        if (output_ptr > (u32)ctx->mem_size ||
+            bytes > (u32)ctx->mem_size - output_ptr) {
+            tiny_last_stage = 705;
+            return 0;
+        }
+
+        u32 slot = TENSOR_ASYNC_JOB_SLOTS;
+        for (u32 i = 0U; i < TENSOR_ASYNC_JOB_SLOTS; i++)
+            if (tensor_async_jobs[i].state == TENSOR_ASYNC_JOB_FREE) {
+                slot = i;
+                break;
+            }
+        if (slot == TENSOR_ASYNC_JOB_SLOTS) {
+            tiny_last_stage = 706;
+            ctx->regs[rd] = 0;
+            return 1;
+        }
+
+        bool restore = request[4] == 2U;
+        u8 *qpu_output = tensor_async_output[slot];
+        if (!tensor_qpu_gray_residual_prepare(
+                request + 8U, ctx->mem + predictor_ptr,
+                qpu_output, bytes, restore)) {
+            tiny_last_stage = 707;
+            ctx->regs[rd] = 0;
+            return 1;
+        }
+        v3d_kernel_id_t id = restore
+            ? V3D_KERNEL_GRAY_RESTORE64 : V3D_KERNEL_GRAY_RESIDUAL64;
+        if (v3d_dispatch_kernel_begin(id, 25U) != V3D_STATUS_OK) {
+            tiny_last_stage = 708;
+            ctx->regs[rd] = 0;
+            return 1;
+        }
+
+        int result_handle = ctx->span_count++;
+        ctx->span_ptr[result_handle] = output_ptr;
+        ctx->span_len[result_handle] = (i32)bytes;
+        ctx->arena_top = output_ptr + bytes;
+
+        struct tensor_async_job *job = &tensor_async_jobs[slot];
+        job->generation = (job->generation + 1U) & 0x007FFFFFU;
+        if (job->generation == 0U)
+            job->generation = 1U;
+        job->result_handle = (u32)result_handle;
+        job->output_ptr = output_ptr;
+        job->bytes = bytes;
+        job->kernel_id = (u32)id;
+        job->qpu_output_ptr = (u32)(usize)qpu_output;
+        job->ctx = ctx;
+        job->error = 0;
+        job->submitted_ms = timer_monotonic_ms();
+        dmb();
+        job->state = TENSOR_ASYNC_JOB_RUNNING;
+        dmb();
+        tiny_last_stage = 709;
+        ctx->regs[rd] = (i32)tensor_async_job_handle(slot, job);
+        return 1;
+    }
+
+    if (hook == PV_HOOK_ASYNC_WAIT) {
+        struct tensor_async_job *job =
+            tensor_async_job_lookup(ctx, ctx->regs[rs1]);
+        if (!job) {
+            tiny_last_stage = 710;
+            ctx->regs[rd] = -1;
+            return 1;
+        }
+        u32 timeout_ms = ctx->regs[rs2] > 0
+            ? (u32)ctx->regs[rs2] : 0U;
+        if (timeout_ms > 25U)
+            timeout_ms = 25U;
+        u64 deadline = timer_monotonic_ms() + timeout_ms;
+        i32 state;
+        do {
+            state = tensor_async_job_poll(job);
+            if (state != 0 || timeout_ms == 0U)
+                break;
+            timer_delay_us(1U);
+        } while (timer_monotonic_ms() < deadline);
+        ctx->regs[rd] = state;
+        tiny_last_stage = state > 0 ? 712 : (state < 0 ? 713 : 711);
+        return 1;
+    }
+
+    if (hook == PV_HOOK_ASYNC_RESULT) {
+        struct tensor_async_job *job =
+            tensor_async_job_lookup(ctx, ctx->regs[rs1]);
+        if (!job) {
+            tiny_last_stage = 714;
+            ctx->regs[rd] = 0;
+            return 1;
+        }
+        i32 state = tensor_async_job_poll(job);
+        if (state == 1) {
+            ctx->regs[rd] = (i32)job->result_handle;
+            job->ctx = NULL;
+            job->state = TENSOR_ASYNC_JOB_FREE;
+            tiny_last_stage = 716;
+        } else {
+            ctx->regs[rd] = 0;
+            if (state < 0) {
+                job->ctx = NULL;
+                job->state = TENSOR_ASYNC_JOB_FREE;
+                tiny_last_stage = 717;
+            } else {
+                tiny_last_stage = 715;
+            }
+        }
+        dmb();
+        return 1;
+    }
+    return 0;
 }
 
 static int tensor_picovm_bitlinear_hook(pv_ctx *ctx, int hook,
@@ -1108,6 +1390,12 @@ bool tensor_picovm_kernel_bench(u32 reps, u64 *cpu_ns, u64 *qpu_ns)
     u64 freq = bench_freq();
     *cpu_ns = (cticks * 1000000000ULL) / freq / reps;
     *qpu_ns = (qticks * 1000000000ULL) / freq / reps;
+    dcache_invalidate_range((u64)(usize)picovm_alu_output, 64U);
+    if (picovm_alu_output[0] != 44) {
+        v3d_kernel_mark_verified(V3D_KERNEL_PICOVM_ALU, false);
+        return false;
+    }
+    v3d_kernel_mark_verified(V3D_KERNEL_PICOVM_ALU, true);
     return true;
 #endif
 }
@@ -1347,15 +1635,161 @@ bool tensor_picovm_media_selftest(void)
         }
         picovm_h264_qpu_ready = h264_ok;
     }
+    if (!picovm_h264_qpu_ready) {
+        tiny_last_stage = 411;
+        return false;
+    }
     tiny_last_stage = 499;
     tiny_last_output_bits = 0U;
     tiny_last_expected_bits = 0U;
     return true;
 }
 
+bool tensor_picovm_async_selftest(u32 *cpu_work_out)
+{
+    if (!cpu_work_out || !picovm_h264_qpu_ready ||
+        core_id() != CORE_NET)
+        return false;
+    picovm_async_qpu_ready = false;
+    tiny_last_stage = 720;
+    tiny_last_status = 0;
+    tiny_last_output_bits = 0U;
+    tiny_last_expected_bits = 68U;
+    pv_init(&picovm_qpu_test_ctx);
+    simd_zero(picovm_qpu_test_mem, sizeof(picovm_qpu_test_mem));
+    picovm_qpu_test_ctx.mem = picovm_qpu_test_mem;
+    picovm_qpu_test_ctx.mem_size = sizeof(picovm_qpu_test_mem);
+
+    u8 *request = picovm_qpu_test_mem + 4096U;
+    u8 *predictor = picovm_qpu_test_mem + 8192U;
+    request[0] = 'Q';
+    request[1] = 'P';
+    request[2] = 'A';
+    request[3] = '1';
+    request[4] = 1U;
+    for (u32 i = 5U; i < 8U; i++)
+        request[i] = 0U;
+    for (u32 i = 0U; i < 64U; i++) {
+        request[8U + i] = (u8)(i * 17U + 3U);
+        predictor[i] = (u8)(i * 9U + 11U);
+    }
+
+    (void)pv_vm_run(
+        &picovm_qpu_test_ctx, qpu_async_media_program,
+        (int)QPU_ASYNC_MEDIA_PROGRAM_WORDS);
+    if (picovm_qpu_test_ctx.fault != PV_FAULT_NONE ||
+        picovm_qpu_test_ctx.out_len != 68) {
+        tiny_last_status = picovm_qpu_test_ctx.fault;
+        tiny_last_output_bits = (u32)picovm_qpu_test_ctx.out_len;
+        return false;
+    }
+    for (u32 i = 0U; i < 64U; i++) {
+        u8 expected = (u8)(request[8U + i] - predictor[i]);
+        if (picovm_qpu_test_ctx.out[i] != expected) {
+            tiny_last_stage = 721;
+            tiny_last_output_bits = picovm_qpu_test_ctx.out[i];
+            tiny_last_expected_bits = expected;
+            return false;
+        }
+    }
+    i32 cpu_work = tensor_picovm_get_i32be(
+        picovm_qpu_test_ctx.out + 64U);
+    if (cpu_work != 499501) {
+        tiny_last_stage = 722;
+        tiny_last_output_bits = (u32)cpu_work;
+        tiny_last_expected_bits = 499501U;
+        return false;
+    }
+    *cpu_work_out = (u32)cpu_work;
+    if (v3d_dispatch_in_flight()) {
+        tiny_last_stage = 723;
+        return false;
+    }
+    tiny_last_stage = 729;
+    picovm_async_qpu_ready = true;
+    return true;
+}
+
 bool tensor_picovm_media_accel_ready(void)
 {
     return picovm_media_qpu_ready;
+}
+
+bool tensor_picovm_h264_accel_ready(void)
+{
+    return picovm_h264_qpu_ready;
+}
+
+bool tensor_picovm_async_accel_ready(void)
+{
+    return picovm_async_qpu_ready;
+}
+
+static __attribute__((noinline)) u32
+tensor_cpu_gray_roundtrip(const u8 *src, const u8 *pred,
+                          u8 *residual, u8 *restored, u32 bytes)
+{
+    u32 checksum = 0U;
+    for (u32 i = 0; i < bytes; i++)
+        residual[i] = (u8)(src[i] - pred[i]);
+    for (u32 i = 0; i < bytes; i++) {
+        restored[i] = (u8)(residual[i] + pred[i]);
+        checksum += restored[i];
+    }
+    return checksum;
+}
+
+bool tensor_picovm_media_bench(u32 reps, u64 *cpu_ns, u64 *qpu_ns)
+{
+    if (!cpu_ns || !qpu_ns || reps == 0U || reps > 32U ||
+        !picovm_h264_qpu_ready)
+        return false;
+    const u32 bytes = TENSOR_MEDIA_DIRECT_MAX_BYTES;
+    u8 *src = picovm_qpu_test_mem;
+    u8 *pred = picovm_qpu_test_mem + bytes;
+    u8 *residual = picovm_qpu_test_mem + bytes * 2U;
+    u8 *restored = picovm_qpu_test_mem + bytes * 3U;
+    for (u32 i = 0; i < bytes; i++) {
+        src[i] = (u8)(i * 17U + 3U);
+        pred[i] = (u8)(i * 9U + 11U);
+    }
+
+    volatile u32 cpu_sink = 0U;
+    u64 start = bench_now();
+    for (u32 rep = 0; rep < reps; rep++)
+        cpu_sink += tensor_cpu_gray_roundtrip(
+            src, pred, residual, restored, bytes);
+    u64 ticks = bench_now() - start;
+    *cpu_ns = ticks * 1000000000ULL / bench_freq() / reps;
+
+    volatile u32 qpu_sink = 0U;
+    start = bench_now();
+    for (u32 rep = 0; rep < reps; rep++) {
+        if (!tensor_qpu_gray_residual_direct(
+                src, pred, residual, bytes, false) ||
+            !tensor_qpu_gray_residual_direct(
+                residual, pred, restored, bytes, true))
+            return false;
+    }
+    ticks = bench_now() - start;
+    *qpu_ns = ticks * 1000000000ULL / bench_freq() / reps;
+    for (u32 i = 0; i < bytes; i++) {
+        u8 expected = (u8)(i * 17U + 3U);
+        if (restored[i] != expected)
+            return false;
+        qpu_sink += restored[i];
+    }
+    if ((cpu_sink / reps) != qpu_sink)
+        return false;
+    prefer_qpu_h264 = *qpu_ns < *cpu_ns;
+    media_h264_qpu_min_bytes =
+        prefer_qpu_h264 ? bytes : 0xFFFFFFFFU;
+    return true;
+}
+
+bool tensor_prefer_qpu_h264(void)
+{
+    return prefer_qpu_h264;
 }
 
 void tensor_status(struct tensor_status *out)
@@ -3113,6 +3547,52 @@ bool tensor_prefer_qpu_ternary(void)
     return prefer_qpu_ternary;
 }
 
+bool tensor_boot_enable_accelerators(struct tensor_boot_accel_status *out)
+{
+    if (!out)
+        return false;
+    simd_zero(out, sizeof(*out));
+    out->supported = v3d_dispatch_supported();
+    if (!out->supported)
+        return true;
+
+    out->picoscript = tensor_picovm_selftest();
+    if (out->picoscript) {
+        struct tensor_accel_profile profile;
+        out->profile = tensor_accel_profile_run(&profile);
+        u64 elapsed_ns = 0U;
+        out->bitlinear_batch = out->profile &&
+            (!prefer_qpu_ternary ||
+             tensor_picovm_bitlinear_selftest(&elapsed_ns));
+        i32 argmax = -1;
+        i32 checksum = 0;
+        u64 scalar_ns = 0U;
+        u64 neon_ns = 0U;
+        u64 qpu_kernel_ns = 0U;
+        u64 qpu_total_ns = 0U;
+        out->bitnet_program = tensor_picovm_bitnet_selftest(
+            &argmax, &checksum, &scalar_ns, &neon_ns,
+            &qpu_kernel_ns, &qpu_total_ns);
+    }
+
+    out->media = tensor_picovm_media_selftest();
+    if (out->media) {
+        out->media_profile = tensor_picovm_media_bench(
+            8U, &out->media_cpu_ns, &out->media_qpu_ns);
+        u32 cpu_work = 0U;
+        out->async_media = tensor_picovm_async_selftest(&cpu_work);
+    }
+
+    u64 vm_cpu_ns = 0U;
+    u64 vm_qpu_ns = 0U;
+    out->vm = tensor_picovm_kernel_selftest() &&
+              tensor_picovm_kernel_bench(32U, &vm_cpu_ns, &vm_qpu_ns);
+
+    return out->picoscript && out->profile && out->bitlinear_batch &&
+           out->bitnet_program && out->media && out->media_profile &&
+           out->async_media && out->vm;
+}
+
 /*
  * Time one (op, shape, backend) and return per-iteration nanoseconds (0 if the
  * backend/op is unsupported or the V3D dispatch did not run). Backends:
@@ -3421,14 +3901,23 @@ void tensor_init(void) {
     pv_tensor_hook = tensor_picovm_hook;
     pv_media_hook = tensor_picovm_media_hook;
     pv_bitlinear_hook = tensor_picovm_bitlinear_hook;
+    pv_compute_hook = tensor_picovm_compute_hook;
+    for (u32 i = 0U; i < TENSOR_ASYNC_JOB_SLOTS; i++) {
+        tensor_async_jobs[i].state = TENSOR_ASYNC_JOB_FREE;
+        tensor_async_jobs[i].ctx = NULL;
+        tensor_async_jobs[i].error = 0;
+    }
     picovm_qpu_ready = false;
     picovm_prefer_qpu_int8 = false;
     picovm_force_qpu_int8 = false;
-    prefer_qpu_ternary = true;
+    prefer_qpu_ternary = false;
     picovm_bitlinear_qpu_ops = 0U;
-    prefer_qpu_fp32_tiles = v3d_dispatch_supported();
+    prefer_qpu_fp32_tiles = false;
     picovm_media_qpu_ready = false;
     picovm_h264_qpu_ready = false;
+    picovm_async_qpu_ready = false;
+    prefer_qpu_h264 = false;
+    media_h264_qpu_min_bytes = 0xFFFFFFFFU;
 #if !PIOS_HAS_MAILBOX_FB
     for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
         v3d_kernel_disabled[i] = true;

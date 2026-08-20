@@ -5,7 +5,12 @@
  * EL0 once the process is entered via eret.
  */
 #include "types.h"
+#include "proc.h"
 #include "picovm.h"
+#include "el0_scheduler.h"
+
+#define el0_report(v) el0_sched_report(v)
+#define el0_exit(v) el0_sched_exit(v)
 
 void *memcpy(void *d, const void *s, unsigned long n)
 {
@@ -21,24 +26,9 @@ void *memset(void *d, int c, unsigned long n)
     return d;
 }
 
-static inline void el0_report(u64 v)
+void user_main(struct kernel_api *api)
 {
-    __asm__ volatile("mov x0, %0\n\t"
-                     "svc #2"
-                     :: "r"(v) : "x0", "memory");
-}
-
-static inline void el0_exit(u64 code)
-{
-    __asm__ volatile("mov x0, %0\n\t"
-                     "svc #3"
-                     :: "r"(code) : "x0", "memory");
-    for (;;) __asm__ volatile("wfe");
-}
-
-void user_main(void *ignored)
-{
-    (void)ignored;
+    (void)api;
     pv_ctx vm;
     static const u32 program[] = {
         0x41100028u, /* Math.Add(R1, R1, 40) */

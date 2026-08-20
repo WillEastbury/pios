@@ -12,7 +12,7 @@
 /* Module container (INV-23): wire format shared with pico_module.py / picovm.js. */
 #define PV_MODULE_MAGIC 0x50534331
 #define PV_MODULE_ABI_VERSION 1
-#define PV_HOOK_TABLE_VERSION 0x0DD8A3B3
+#define PV_HOOK_TABLE_VERSION 0x9C1BBBA3
 
 #define PV_HOOK_KERNEL_WAITIRQ                   0x01
 #define PV_HOOK_KERNEL_WAITSWIRQ                 0x02
@@ -337,10 +337,34 @@
 #define PV_HOOK_UI_SETVALUE                      0x192
 #define PV_HOOK_UI_SERIALIZE                     0x193
 #define PV_HOOK_STORAGE_SETSLICE                 0x1A0
+#define PV_HOOK_PARQUET_ISVALID                  0x1A0
 #define PV_HOOK_STORAGE_CARDLEN                  0x1A1
+#define PV_HOOK_PARQUET_FOOTERLENGTH             0x1A1
 #define PV_HOOK_STORAGE_READSLICE                0x1A2
 #define PV_HOOK_STORAGE_WRITESLICE               0x1A3
 #define PV_HOOK_STORAGE_ISUSERPACK               0x1A4
+#define PV_HOOK_STORAGE_PUTCARD                  0x1A5
+#define PV_HOOK_STORAGE_READEXACT                0x1A6
+#define PV_HOOK_STORAGE_DELETEEXACT              0x1A7
+#define PV_HOOK_STORAGE_EXISTS                   0x1A8
+#define PV_HOOK_STORAGE_SCANNEXT                 0x1A9
+#define PV_HOOK_STORAGE_SYNC                     0x1AA
+#define PV_HOOK_STORAGE_RECOVER                  0x1AB
+#define PV_HOOK_STORAGE_FULLTEXTUPSERT           0x1AC
+#define PV_HOOK_STORAGE_FULLTEXTDELETE           0x1AD
+#define PV_HOOK_STORAGE_FULLTEXTFIND             0x1AE
+#define PV_HOOK_STORAGE_FULLTEXTRESULT           0x1AF
+#define PV_HOOK_STORAGE_FULLTEXTFIELD            0x1B0
+#define PV_HOOK_STORAGE_FULLTEXTMODE             0x1B1
+#define PV_HOOK_STORAGE_GRAPHRELATION            0x1B2
+#define PV_HOOK_STORAGE_GRAPHWEIGHTSET           0x1B3
+#define PV_HOOK_STORAGE_GRAPHADD                 0x1B4
+#define PV_HOOK_STORAGE_GRAPHDELETE              0x1B5
+#define PV_HOOK_STORAGE_GRAPHWEIGHT              0x1B6
+#define PV_HOOK_STORAGE_GRAPHOUT                 0x1B7
+#define PV_HOOK_STORAGE_GRAPHRESULTNODE          0x1B8
+#define PV_HOOK_STORAGE_GRAPHRESULTWEIGHT        0x1B9
+#define PV_HOOK_STORAGE_GRAPHPATH                0x1BA
 #define PV_HOOK_REQ_SETSLICE                     0x1B0
 #define PV_HOOK_REQ_BODYSLICE                    0x1B1
 #define PV_HOOK_REQ_BODYLEN                      0x1B2
@@ -591,12 +615,65 @@
 #define PV_HOOK_NET_CONNECT                      0x37E
 #define PV_HOOK_NET_SENDSPAN                     0x37F
 #define PV_HOOK_NET_RECVSPAN                     0x380
+#define PV_HOOK_BITLINEAR_MATVECCATQ             0x381
+#define PV_HOOK_TENSOR_ADD                       0x382
+#define PV_HOOK_TENSOR_MUL                       0x383
+#define PV_HOOK_TENSOR_RMSNORM                   0x384
+#define PV_HOOK_TENSOR_SWIGLU                    0x385
+#define PV_HOOK_TENSOR_RELEASE                   0x386
+#define PV_HOOK_MOE_FORWARD                      0x387
+#define PV_HOOK_MOE_SELECTEDCOUNT                0x388
+#define PV_HOOK_MOE_SELECTEDEXPERT               0x389
+#define PV_HOOK_CATQ_CALIBRATETARGET             0x38A
+#define PV_HOOK_BLOCK_READY                      0x3D0
+#define PV_HOOK_BLOCK_BLOCKSIZE                  0x3D1
+#define PV_HOOK_BLOCK_SIZELOW                    0x3D2
+#define PV_HOOK_BLOCK_SIZEHIGH                   0x3D3
+#define PV_HOOK_BLOCK_SETOFFSET                  0x3D4
+#define PV_HOOK_BLOCK_READ                       0x3D5
+#define PV_HOOK_BLOCK_WRITE                      0x3D6
+#define PV_HOOK_BLOCK_SYNC                       0x3D7
+#define PV_HOOK_BLOCK_RESIZE                     0x3D8
+#define PV_HOOK_BLOCK_SETLBA                     0x3D9
+#define PV_HOOK_BLOCK_READBLOCKS                 0x3DA
+#define PV_HOOK_BLOCK_WRITEBLOCKS                0x3DB
+#define PV_HOOK_BLOCK_STATUS                     0x3DC
+#define PV_HOOK_DB_READ                          0x400
+#define PV_HOOK_DB_INSERT                        0x401
+#define PV_HOOK_DB_WRITE                         0x402
+#define PV_HOOK_DB_UPDATE                        0x403
+#define PV_HOOK_DB_DELETE                        0x404
+#define PV_HOOK_DB_PATCH                         0x405
+#define PV_HOOK_DB_SYNC                          0x406
+#define PV_HOOK_DB_RECOVER                       0x407
+#define PV_HOOK_DB_ADDINDEX                      0x408
+#define PV_HOOK_DB_REMOVEINDEX                   0x409
+#define PV_HOOK_DB_REBUILDINDEX                  0x40A
+#define PV_HOOK_DB_INDEXSTATE                    0x40B
+#define PV_HOOK_DB_RESOLVEKEY                    0x40C
+#define PV_HOOK_DB_RESOLVEPACK                   0x40D
+#define PV_HOOK_DB_SEEK                          0x40E
+#define PV_HOOK_DB_QUERY                         0x40F
+#define PV_HOOK_DB_NEXT                          0x410
+#define PV_HOOK_DB_BATCH                         0x411
+#define PV_HOOK_DB_MATERIALIZE                   0x412
+#define PV_HOOK_DB_CLOSE                         0x413
+#define PV_HOOK_DB_FROM                          0x414
+#define PV_HOOK_DB_FIELD                         0x415
+#define PV_HOOK_DB_CONST                         0x416
+#define PV_HOOK_DB_EQ                            0x417
+#define PV_HOOK_DB_WHERE                         0x420
+#define PV_HOOK_DB_SELECT                        0x421
+#define PV_HOOK_DB_ORDER                         0x422
+#define PV_HOOK_DB_LIMIT                         0x423
+#define PV_HOOK_DB_EXECUTE                       0x424
+#define PV_HOOK_DB_PLAN                          0x425
 
 /* Highest defined host-hook code. The compiler never emits a code above
  * this, so pv_default_host uses it to tell a defined-but-unbound host-
  * fillable primitive (INV-18 default: 0 / NOT_FOUND, mirroring
  * picoscript_vm.py / picovm.js) from a genuinely unknown hook id in
  * malformed bytecode, which fails closed (PV_FAULT_BAD_HOOK). */
-#define PV_HOOK_CODE_MAX 0x380
+#define PV_HOOK_CODE_MAX 0x425
 
 #endif

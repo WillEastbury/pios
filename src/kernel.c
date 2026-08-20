@@ -19,6 +19,7 @@
 #include "uart.h"
 #include "fb.h"
 #include "fifo.h"
+#include "picovm_fifo.h"
 #include "sd.h"
 #include "nic.h"
 #include "macb.h"
@@ -77,6 +78,7 @@
 #include "workq.h"
 #include "ksvc.h"
 #include "picowal_db.h"
+#include "ppos_provider.h"
 #include "el2.h"
 #include "crypto.h"
 #include "watchdog.h"
@@ -111,6 +113,9 @@
 #include "sts_token.h"
 #include "adrv.h"
 #include "airq.h"
+#include "net_dispatch.h"
+#include "rp1_i2c.h"
+#include "rp1_spi.h"
 
 /* ---- libc replacements (linked globally for compiler-generated calls) ---- */
 
@@ -463,6 +468,9 @@ static struct ota_update_state ota_update;
 static u8 *ota_stage_buf;
 static u32 ota_stage_cap;
 static bool ota_stage_ready;
+static u64 core0_io_flag_passes[8] ALIGNED(64);
+static u64 core0_airq_dispatch_passes;
+static u64 core0_airq_empty_passes;
 
 static void ota_update_reset_state(void)
 {
@@ -549,8 +557,6 @@ static u32 debug_tcp_len;
 static u32 debug_tcp_iac_skip;
 static i32 debug_tcp_last_term_char = -1;
 static bool debug_tcp_discard_line;
-#define CORE0_ETH_IRQ_STALL_THRESHOLD       4U     /* consecutive non-clearing quenches before poll fallback */
-#define CORE0_ETH_IRQ_FALLBACK_COOLDOWN_MS  5000ULL /* how long to stay poll-only before retrying IRQ mode */
 static volatile u64 core0_eth_irq_count;
 static volatile u32 core0_eth_irq_last_mip;
 static volatile u32 core0_eth_irq_last_macb_isr;
@@ -558,9 +564,6 @@ static volatile bool core0_eth_irq_oneshot;
 static volatile bool core0_eth_irq_deferred_quench;
 static volatile u32 core0_eth_irq_quench_passes;
 static volatile u32 core0_eth_irq_stall_streak;   /* consecutive quenches that failed to clear */
-static volatile bool core0_eth_irq_poll_fallback; /* true: IRQ line masked, relying on poll only */
-static volatile u64 core0_eth_irq_fallback_since_ms;
-static volatile u32 core0_eth_irq_fallback_count;  /* lifetime fallback engagements (diagnostic) */
 static volatile u32 core0_io_flags;
 static u32 core0_eth_source_diag[24];
 static volatile u32 core0_eth_source_diag_seq;
@@ -584,6 +587,14 @@ static u32 http_build_pcap_response(char *out, u32 max, const u8 *req, u32 req_l
 static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, u32 req_len);
 static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, u32 req_len);
 static void pios_bootctrl_mark_success(void);
+/* Crashdump pack: SD handoff records are archived here on the next boot. */
+#define CRASHDUMP_PACK_PATH  "/var/crash/crashdump.pack"
+#define CRASHDUMP_PACK_MAX   (64U * 1024U)
+/* Uptime after which a boot counts as healthy for crash-loop purposes. */
+#define CRASH_HEALTHY_UPTIME_MS (60U * 1000U)
+static bool http_walfs_recreate_file(const char *path, u64 *id_out);
+static bool crashdump_archive_pending(void);
+static bool crashdump_open_pack(bool recreate, u64 *id_out);
 static void core0_sched_snapshot(u64 *wake, u64 *wfi_count, u64 *idle_ticks,
                                  u64 *total_ticks, u32 *busy_permille,
                                  u32 *last_flags);
@@ -592,6 +603,7 @@ static void core0_eth_irq_arm_host(bool oneshot);
 static volatile u64 g_dash_snap_ticks;
 static volatile u64 g_dash_render_ticks;
 static bool core0_eth_irq_drain_and_quench(bool host_route);
+static void core0_network_service_step(void);
 static const char *tcp_state_name(u32 state);
 static const char *tcp_owner_label(u16 port);
 static bool http_request_complete(const u8 *req, u32 len);
@@ -726,7 +738,7 @@ static void debug_tcp_poll(void)
         u32 n = tcp_read(debug_client_conn, buf, sizeof(buf));
         for (u32 i = 0; i < n; i++)
             debug_tcp_feed(buf[i]);
-    } else if (st == TCP_CLOSED || st >= TCP_CLOSING) {
+    } else {
         debug_tcp_close();
     }
 }
@@ -777,7 +789,14 @@ static void http_log_event(const char *event, u32 a, u32 b)
 static void wifi_upload_progress(void)
 {
     static u32 cadence;
-    net_poll();
+    /*
+     * ADR-033: an adrv liveness hook may keep the fail-safe path observable,
+     * but it may not borrow protocol execution by polling frames.  Publish a
+     * bounded transport indication; the registered software handler owns the
+     * subsequent NIC read and protocol stages.
+     */
+    (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                         NET_DISPATCH_CAUSE_PACED);
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
     if ((++cadence & 31U) == 0U) {
         bool recovered = macb_rx_recover();
@@ -972,6 +991,10 @@ static void http_append_firewall_list(char *out, u32 *len, u32 max)
         if (r.direction == NIC_FILTER_DIR_IN) http_append(out, len, max, "in ");
         else if (r.direction == NIC_FILTER_DIR_OUT) http_append(out, len, max, "out ");
         else http_append(out, len, max, "both ");
+        http_append(out, len, max, "iface=");
+        http_append(out, len, max,
+                    r.iface == NIC_IFACE_WIRED ? "wired " :
+                    (r.iface == NIC_IFACE_WIFI ? "wifi " : "any "));
         if ((r.flags & NIC_FILTER_ETHERTYPE) && r.ethertype == ETH_P_ARP) {
             http_append(out, len, max, "arp ");
         } else if ((r.flags & NIC_FILTER_IP_PROTO) && r.ip_proto == IP_PROTO_TCP) {
@@ -1637,6 +1660,54 @@ static void http_append_hex64(char *out, u32 *len, u32 max, u64 v)
         s[i] = hx[(v >> ((15 - i) * 4)) & 0xF];
     s[16] = 0;
     http_append(out, len, max, s);
+}
+
+/* Render the stall payload of a crash record. Kinds other than STALL carry no
+ * payload, so this emits nothing for them. */
+static void http_append_crash_stall(char *out, u32 *len, u32 max,
+                                    const struct exception_crash_record *cr)
+{
+    if (cr->kind != EXCEPTION_CRASH_KIND_STALL)
+        return;
+    http_append(out, len, max, "stall reason=");
+    http_append_u64(out, len, max, cr->reason);
+    if (cr->label[0]) {
+        char label[EXCEPTION_CRASH_LABEL_MAX];
+        u32 i = 0;
+        while (i + 1U < sizeof(label) && cr->label[i]) {
+            char c = cr->label[i];
+            label[i] = (c >= 32 && c < 127) ? c : '?';
+            i++;
+        }
+        label[i] = 0;
+        http_append(out, len, max, " \"");
+        http_append(out, len, max, label);
+        http_append(out, len, max, "\"");
+    }
+    http_append(out, len, max, "\n");
+
+    /* Slot names are defined alongside the reason code in exception.h. */
+    static const char *const cyw_credit[EXCEPTION_CRASH_VALUES_MAX] = {
+        "credits", "tx_seq", "tx_max", "fcmask",
+        "channel", "cyw_stage", "rframe", "events"
+    };
+    u32 count = cr->value_count;
+    if (count > EXCEPTION_CRASH_VALUES_MAX)
+        count = EXCEPTION_CRASH_VALUES_MAX;
+    for (u32 i = 0; i < count; i++) {
+        const char *name =
+            (cr->reason == EXCEPTION_STALL_CYW_TX_CREDIT) ? cyw_credit[i] : NULL;
+        http_append(out, len, max, "  ");
+        if (name) {
+            http_append(out, len, max, name);
+        } else {
+            http_append(out, len, max, "v");
+            http_append_u64(out, len, max, i);
+        }
+        http_append(out, len, max, "=");
+        http_append_u64(out, len, max, cr->values[i]);
+        http_append(out, len, max, "\n");
+    }
 }
 
 static void http_append_json_metric(char *out, u32 *len, u32 max,
@@ -2945,7 +3016,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         } else if (http_streq(topic, "mediahw")) {
             http_append(out, &len, max, "mediahw status | mediahw hevc | mediahw pisp-be\n  Watchdog-guarded read-only identity probes for dedicated BCM2712 media engines.\n");
         } else if (http_streq(topic, "wifi")) {
-            http_append(out, &len, max, "wifi status | wifi probe | wifi init | wifi scan | wifi join <ssid> <pass> | wifi disconnect\n  Explicit watchdog-guarded CYW43455/BCM2712-SDIO2 bring-up; never runs at boot.\n");
+            http_append(out, &len, max, "wifi status | wifi probe | wifi init | wifi scan | wifi join <ssid> <pass> | wifi activate | wifi disconnect\n  WiFi activation is additive: wired .201 remains live while WiFi .202 is configured.\n");
         } else if (http_streq(topic, "addr")) {
             http_append(out, &len, max, "addr <kind:pack/card[/tail]>\n  Parse and canonicalize PIOS resource addresses. Kinds: wal,tcp,udp,stream,dev,file.\n");
         } else if (http_streq(topic, "keystore")) {
@@ -3017,13 +3088,16 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         u32 n = tcp_snapshot(snap, TCP_MAX_CONNECTIONS);
         u64 rx_drop = 0, tx_drop = 0;
         nic_filter_stats(&rx_drop, &tx_drop);
-        http_append(out, &len, max, "CONN ST        LOCAL                  REMOTE                 OWNER          PEND RX TX RETRY\n");
+        http_append(out, &len, max, "CONN ST        IFACE LOCAL                  REMOTE                 OWNER          PEND RX TX RETRY\n");
         for (u32 i = 0; i < n; i++) {
             tcp_snapshot_entry_t *e = &snap[i];
             http_append_u64(out, &len, max, (u32)e->conn);
             http_append(out, &len, max, "    ");
             http_append(out, &len, max, tcp_state_name(e->state));
             http_append(out, &len, max, " ");
+            http_append(out, &len, max,
+                        e->iface == NIC_IFACE_WIRED ? "wired " :
+                        (e->iface == NIC_IFACE_WIFI ? "wifi " : "any "));
             http_append_ip4(out, &len, max, e->local_ip);
             http_append(out, &len, max, ":");
             http_append_u64(out, &len, max, e->local_port);
@@ -3059,6 +3133,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, td->tx_no_mac);
         http_append(out, &len, max, " tx_fail=");
         http_append_u64(out, &len, max, td->tx_send_fail);
+        http_append(out, &len, max, " rx_ooo=");
+        http_append_u64(out, &len, max, td->rx_out_of_order);
+        http_append(out, &len, max, " rx_nospace=");
+        http_append_u64(out, &len, max, td->rx_no_space);
         http_append(out, &len, max, " arp_req=");
         http_append_u64(out, &len, max, ad ? ad->requests_sent : 0);
         http_append(out, &len, max, " arp_learn=");
@@ -3409,7 +3487,17 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         sdio_diag_snapshot(&d);
         cyw43_diag_snapshot(&cd);
         http_append(out, &len, max, "wifi active=");
-        http_append_u64(out, &len, max, nic_is_wifi());
+        http_append_u64(out, &len, max, nic_wifi_active());
+        http_append(out, &len, max, " wired=");
+        http_append_u64(out, &len, max, nic_iface_active(NIC_IFACE_WIRED));
+        http_append(out, &len, max, " wired_backend=");
+        http_append(out, &len, max, nic_iface_name(NIC_IFACE_WIRED));
+        http_append(out, &len, max, " wifi_backend=");
+        http_append(out, &len, max, nic_iface_name(NIC_IFACE_WIFI));
+        http_append(out, &len, max, " wired_ip=");
+        http_append_ip4(out, &len, max, net_get_our_ip_for(NIC_IFACE_WIRED));
+        http_append(out, &len, max, " wifi_ip=");
+        http_append_ip4(out, &len, max, net_get_our_ip_for(NIC_IFACE_WIFI));
         http_append(out, &len, max, " link=");
         http_append_u64(out, &len, max, cyw43_link_state());
         http_append(out, &len, max, " sdio_attempted=");
@@ -3480,6 +3568,16 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, cd.bcdc_cccr_pending);
         http_append(out, &len, max, " rframe=");
         http_append_u64(out, &len, max, cd.bcdc_rframe_count);
+        http_append(out, &len, max, " rxprobe=");
+        http_append_u64(out, &len, max, cd.rx_probe_attempts);
+        http_append(out, &len, max, " rxframes=");
+        http_append_u64(out, &len, max, cd.rx_frames);
+        http_append(out, &len, max, " dataq=");
+        http_append_u64(out, &len, max, cd.data_rx_queued);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, cd.data_rx_dropped);
+        http_append(out, &len, max, " cardirq=");
+        http_append_u64(out, &len, max, cd.rx_card_irqs);
         http_append(out, &len, max, "\nframe ch=");
         http_append_u64(out, &len, max, cd.bcdc_last_channel);
         http_append(out, &len, max, " len=");
@@ -3533,8 +3631,12 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, cd.eapol_replay_hi);
         http_append(out, &len, max, ":");
         http_append_hex32(out, &len, max, cd.eapol_replay_lo);
+        http_append(out, &len, max, " m2=");
+        http_append_u64(out, &len, max, cd.eapol_m2_sent);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, cd.eapol_m2_fail);
         http_append(out, &len, max, "\neapol raw=");
-        for (u32 i = 0U; i < 11U; i++)
+        for (u32 i = 0U; i < 9U; i++)
             http_append_hex32(out, &len, max, cd.eapol_words[i]);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "wifi probe")) {
@@ -3619,6 +3721,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                     }
                     http_append(out, &len, max, " ch=");
                     http_append_u64(out, &len, max, results[i].channel);
+                    http_append(out, &len, max, " cs=");
+                    http_append_hex32(out, &len, max, results[i].chanspec);
                     http_append(out, &len, max, " rssi=");
                     if (results[i].rssi < 0) {
                         http_append(out, &len, max, "-");
@@ -3630,6 +3734,16 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                     }
                     http_append(out, &len, max, " sec=");
                     http_append_hex32(out, &len, max, results[i].security);
+                    http_append(out, &len, max, " rsn=");
+                    for (u32 j=0U;j<results[i].rsn_ie_len;j++) {
+                        static const char digits[]="0123456789abcdef";
+                        char hex[3]={
+                            digits[results[i].rsn_ie[j]>>4],
+                            digits[results[i].rsn_ie[j]&0x0FU],
+                            '\0'
+                        };
+                        http_append(out,&len,max,hex);
+                    }
                     http_append(out, &len, max, "\n");
                 }
             }
@@ -3695,6 +3809,58 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append_u64(out, &len, max, cd.last_event_reason);
             http_append(out, &len, max, "\n");
         }
+    } else if (http_streq(cmd, "wifi assocreq")) {
+        static u8 ies[512];
+        u32 ies_len = 0U;
+        u32 req_reported = 0U;
+        u32 resp_reported = 0U;
+        u32 assoc_stage = 0U;
+        if (!cyw43_assoc_req_ies(ies, sizeof(ies), &ies_len,
+                                 &req_reported, &resp_reported,
+                                 &assoc_stage)) {
+            http_append(out, &len, max,
+                        "WiFi association request IEs unavailable stage=");
+            http_append_u64(out, &len, max, assoc_stage);
+            http_append(out, &len, max, " req=");
+            http_append_u64(out, &len, max, req_reported);
+            http_append(out, &len, max, " resp=");
+            http_append_u64(out, &len, max, resp_reported);
+            http_append(out, &len, max, "\n");
+        } else {
+            static const char hex[] = "0123456789abcdef";
+            http_append(out, &len, max, "assoc_req_ies len=");
+            http_append_u64(out, &len, max, ies_len);
+            http_append(out, &len, max, " hex=");
+            for (u32 i = 0U; i < ies_len; i++) {
+                char b[3] = {
+                    hex[ies[i] >> 4],
+                    hex[ies[i] & 0x0FU],
+                    0
+                };
+                http_append(out, &len, max, b);
+            }
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "wifi wpadiag")) {
+        static struct cyw_wpa_debug wd;
+        static const char hex[] = "0123456789abcdef";
+        cyw43_wpa_debug_snapshot(&wd);
+        http_append(out, &len, max, "snonce=");
+        for (u32 i=0U;i<sizeof(wd.snonce);i++) {
+            char b[3]={hex[wd.snonce[i]>>4],hex[wd.snonce[i]&15U],0};
+            http_append(out,&len,max,b);
+        }
+        http_append(out,&len,max,"\nm1=");
+        for (u32 i=0U;i<wd.m1_len;i++) {
+            char b[3]={hex[wd.m1[i]>>4],hex[wd.m1[i]&15U],0};
+            http_append(out,&len,max,b);
+        }
+        http_append(out,&len,max,"\nm2=");
+        for (u32 i=0U;i<wd.m2_len;i++) {
+            char b[3]={hex[wd.m2[i]>>4],hex[wd.m2[i]&15U],0};
+            http_append(out,&len,max,b);
+        }
+        http_append(out,&len,max,"\n");
     } else if (http_streq(cmd, "wifi fwlog")) {
         static char fwlog[2025];
         u32 fwlog_len = 0U;
@@ -3724,26 +3890,42 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                       cyw43_join_sae(argv[2], ssid_len,
                                      argv[3], pass_len);
             http_append(out, &len, max,
-                        ok ? "WiFi join OK\n" : "WiFi join FAILED\n");
+                        ok ? "WiFi join started\n" : "WiFi join FAILED\n");
         }
     } else if (http_starts_with(cmd, "wifi joinpmk ")) {
-        char *argv[5];
-        u32 argc = http_split_args(cmd, argv, 5);
+        char *argv[6];
+        u32 argc = http_split_args(cmd, argv, 6);
         u8 pmk[32];
+        u8 target_bssid[CYW_MAC_LEN];
         bool parsed = argc >= 4 && pios_strlen(argv[3]) == 64U;
         for (u32 i = 0U; parsed && i < sizeof(pmk); i++)
             parsed = pixe_parse_hex_byte_pair(argv[3] + i * 2U, &pmk[i]);
+        bool target_parsed = argc >= 6 &&
+                             pios_strlen(argv[4]) == 12U &&
+                             pios_strlen(argv[5]) == 4U;
+        for (u32 i=0U;target_parsed&&i<CYW_MAC_LEN;i++)
+            target_parsed =
+                pixe_parse_hex_byte_pair(argv[4]+i*2U,&target_bssid[i]);
+        u8 cs_hi=0U,cs_lo=0U;
+        if (target_parsed)
+            target_parsed =
+                pixe_parse_hex_byte_pair(argv[5],&cs_hi) &&
+                pixe_parse_hex_byte_pair(argv[5]+2U,&cs_lo);
         if (!parsed || !cyw43_blobs_ready()) {
             http_append(out, &len, max,
-                        "ERR: usage wifi joinpmk <ssid> <64-hex-pmk>\n");
+                        "ERR: usage wifi joinpmk <ssid> <64-hex-pmk> [bssid12 chanspec4]\n");
         } else {
             u32 ssid_len = pios_strlen(argv[2]);
             cyw43_set_progress_hook(wifi_upload_progress);
+            if (target_parsed)
+                (void)cyw43_set_join_target(target_bssid,
+                                             ((u16)cs_hi<<8)|cs_lo);
             bool ok = ssid_len <= CYW_SSID_MAX &&
                       cyw43_join_pmk(argv[2], ssid_len, pmk);
             memset(pmk, 0, sizeof(pmk));
+            memset(target_bssid,0,sizeof(target_bssid));
             http_append(out, &len, max,
-                        ok ? "WiFi join OK\n" : "WiFi join FAILED\n");
+                        ok ? "WiFi join started\n" : "WiFi join FAILED\n");
             if (!ok) {
                 wifi_append_event_history(out, &len, max);
                 static char fwlog[2025];
@@ -3773,29 +3955,76 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                       pass_len <= CYW_PASSPHRASE_MAX &&
                       cyw43_join(argv[2], ssid_len, argv[3], pass_len,
                                  WSEC_AES);
-            if (ok) {
-                u64 deadline = timer_monotonic_ms() + 20000ULL;
-                while (timer_monotonic_ms() < deadline &&
-                       cyw43_link_state() == CYW_LINK_JOINING) {
-                    cyw43_poll();
-                    wifi_upload_progress();
-                    timer_delay_ms(10U);
-                    watchdog_hw_pet();
-                }
-                ok = cyw43_is_connected();
-            }
             http_append(out, &len, max,
-                        ok ? "WiFi join OK\n" : "WiFi join FAILED\n");
+                        ok ? "WiFi join started\n" : "WiFi join FAILED\n");
         }
+    } else if (http_starts_with(cmd, "wifi rsncaps")) {
+        char *argv[3];
+        u32 argc = http_split_args(cmd, argv, 3);
+        bool bad = false;
+        if (argc >= 3) {
+            if (http_streq(argv[2], "auto")) {
+                cyw43_set_rsn_caps(0U, false);
+            } else {
+                u8 hi = 0U;
+                u8 lo = 0U;
+                if (pixe_parse_hex_byte_pair(argv[2], &hi) &&
+                    pixe_parse_hex_byte_pair(argv[2] + 2U, &lo))
+                    cyw43_set_rsn_caps((u16)(((u32)hi << 8) | lo), true);
+                else
+                    bad = true;
+            }
+        }
+        if (bad) {
+            http_append(out, &len, max,
+                        "ERR: usage wifi rsncaps <hhll|auto>\n");
+        } else {
+            u16 caps = 0U;
+            bool override = false;
+            cyw43_get_rsn_caps(&caps, &override);
+            http_append(out, &len, max, "WiFi RSN caps ");
+            http_append(out, &len, max,
+                        override ? "override=0x" : "auto=0x");
+            http_append_hex32(out, &len, max, caps);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "wifi rxprobe")) {
+        char *argv[3];
+        u32 argc = http_split_args(cmd, argv, 3);
+        if (argc >= 3)
+            cyw43_set_rx_probe(http_streq(argv[2], "on"));
+        http_append(out, &len, max, "WiFi RX header probe ");
+        http_append(out, &len, max, cyw43_get_rx_probe() ? "on\n" : "off\n");
+    } else if (http_streq(cmd, "wifi irq")) {
+        u32 status = 0U, enable = 0U, mask = 0U;
+        u32 gic_enable = 0U, gic_pending = 0U, gic_target = 0U;
+        sdio_irq_snapshot(&status, &enable, &mask,
+                          &gic_enable, &gic_pending, &gic_target);
+        http_append(out, &len, max, "SDIO irq status=");
+        http_append_hex32(out, &len, max, status);
+        http_append(out, &len, max, " signal_enable=");
+        http_append_hex32(out, &len, max, enable);
+        http_append(out, &len, max, " mask=");
+        http_append_hex32(out, &len, max, mask);
+        http_append(out, &len, max, " gic=274 enable=");
+        http_append_hex32(out, &len, max, gic_enable);
+        http_append(out, &len, max, " pending=");
+        http_append_hex32(out, &len, max, gic_pending);
+        http_append(out, &len, max, " target=");
+        http_append_hex32(out, &len, max, gic_target);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "wifi activate")) {
         if (!nic_activate_wifi_loaded()) {
             http_append(out, &len, max, "WiFi activate FAILED\n");
-        } else {
-            net_init(WIFI_STATIC_IP, WIFI_STATIC_GW, WIFI_STATIC_MASK, NULL);
-            dns_init(WIFI_STATIC_GW);
-            net_services_listen();
+        } else if (!net_add_interface(NIC_IFACE_WIFI, WIFI_STATIC_IP,
+                                      WIFI_STATIC_GW, WIFI_STATIC_MASK, NULL)) {
             http_append(out, &len, max,
-                        "WiFi active at 192.168.0.202/16\n");
+                        "WiFi activate FAILED; wired interface unchanged\n");
+        } else {
+            /* The existing wildcard listeners now accept on either configured
+             * local address. Do not reinitialize TCP/FIFO/session state here. */
+            http_append(out, &len, max,
+                        "WiFi active at 192.168.0.202/16; wired remains at 192.168.0.201/16\n");
         }
     } else if (http_streq(cmd, "wifi disconnect")) {
         http_append(out, &len, max,
@@ -3834,6 +4063,132 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max,
                     media_hw_probe_pisp_be() ? "PiSP-BE probe OK\n" :
                                                "PiSP-BE probe FAILED\n");
+    } else if (http_streq(cmd, "i2c status")) {
+        struct rp1_i2c_diag d;
+        bool ok = rp1_i2c_init(100000U);
+        rp1_i2c_diag_snapshot(&d);
+        http_append(out, &len, max, ok ? "I2C1 ready type=" :
+                                        "I2C1 unavailable type=");
+        http_append_hex32(out, &len, max, d.comp_type);
+        http_append(out, &len, max, " version=");
+        http_append_hex32(out, &len, max, d.comp_version);
+        http_append(out, &len, max, " timeouts=");
+        http_append_u64(out, &len, max, d.timeouts);
+        http_append(out, &len, max, " abort=");
+        http_append_hex32(out, &len, max, d.abort_source);
+        http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "i2c scan")) {
+        char *argv[3];
+        u32 argc = http_split_args(cmd, argv, 3);
+        u32 hz = 100000U;
+        if (argc >= 3 && http_streq(argv[2], "400"))
+            hz = 400000U;
+        if (!rp1_i2c_init(hz)) {
+            http_append(out, &len, max, "I2C1 unavailable\n");
+        } else {
+            u8 found[16];
+            u32 count = rp1_i2c_scan(found, sizeof(found));
+            http_append(out, &len, max, "I2C1 scan hz=");
+            http_append_u64(out, &len, max, hz);
+            http_append(out, &len, max, " devices=");
+            http_append_u64(out, &len, max, count);
+            http_append(out, &len, max, "\n");
+            for (u32 addr = 0x08U; addr <= 0x77U; addr++) {
+                if (found[addr >> 3] & (1U << (addr & 7U))) {
+                    http_append(out, &len, max, "  0x");
+                    http_append_hex8(out, &len, max, (u8)addr);
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        }
+    } else if (http_starts_with(cmd, "spi status")) {
+        for (u32 i = 0U; i < RP1_SPI_COUNT; i++) {
+            struct rp1_spi_diag d;
+            bool present = rp1_spi_probe(i);
+            rp1_spi_diag_snapshot(i, &d);
+            http_append(out, &len, max, "spi");
+            http_append_u64(out, &len, max, i);
+            if (!present) {
+                http_append(out, &len, max,
+                            (i == 4U || i == 7U) ? " target/absent\n"
+                                                 : " absent\n");
+                continue;
+            }
+            http_append(out, &len, max, " present version=");
+            http_append_hex32(out, &len, max, d.version);
+            http_append(out, &len, max, " fifo=");
+            http_append_u64(out, &len, max, d.fifo_depth);
+            http_append(out, &len, max, " dfs32=");
+            http_append_u64(out, &len, max, d.dfs32 ? 1U : 0U);
+            http_append(out, &len, max, " quad_capable=");
+            http_append_u64(out, &len, max, d.enhanced_frf ? 1U : 0U);
+            if (d.ready) {
+                http_append(out, &len, max, " sck=");
+                http_append_u64(out, &len, max, d.sck_hz);
+                http_append(out, &len, max, " xfers=");
+                http_append_u64(out, &len, max, d.transfers);
+                http_append(out, &len, max, " timeouts=");
+                http_append_u64(out, &len, max, d.timeouts);
+            }
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "spi init ")) {
+        char *argv[6];
+        u32 argc = http_split_args(cmd, argv, 6);
+        u32 inst = 0U, hz = 1000000U, mode = 0U, bits = 8U;
+        bool ok = argc >= 4 && http_parse_u32(argv[2], &inst) &&
+                  http_parse_u32(argv[3], &hz);
+        if (ok && argc >= 5) ok = http_parse_u32(argv[4], &mode);
+        if (ok && argc >= 6) ok = http_parse_u32(argv[5], &bits);
+        if (!ok) {
+            http_append(out, &len, max,
+                        "ERR: usage spi init <instance> <hz> [mode] [bits]\n");
+        } else if (!rp1_spi_init(inst, hz, mode, bits)) {
+            http_append(out, &len, max, "spi init FAILED\n");
+        } else {
+            struct rp1_spi_diag d;
+            rp1_spi_diag_snapshot(inst, &d);
+            http_append(out, &len, max, "spi");
+            http_append_u64(out, &len, max, inst);
+            http_append(out, &len, max, " ready sck=");
+            http_append_u64(out, &len, max, d.sck_hz);
+            http_append(out, &len, max, " baudr=");
+            http_append_u64(out, &len, max, d.baudr);
+            http_append(out, &len, max, " bits=");
+            http_append_u64(out, &len, max, bits);
+            http_append(out, &len, max, " mode=");
+            http_append_u64(out, &len, max, mode);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "spi xfer ")) {
+        char *argv[5];
+        u32 argc = http_split_args(cmd, argv, 5);
+        u32 inst = 0U, cs = 0U;
+        bool ok = argc >= 5 && http_parse_u32(argv[2], &inst) &&
+                  http_parse_u32(argv[3], &cs);
+        static u8 tx[256];
+        static u8 rx[256];
+        u32 n = 0U;
+        if (ok) {
+            const char *hex = argv[4];
+            u32 hex_len = pios_strlen(hex);
+            ok = (hex_len % 2U) == 0U && hex_len > 0U &&
+                 hex_len / 2U <= sizeof(tx);
+            for (u32 i = 0U; ok && i < hex_len / 2U; i++)
+                ok = pixe_parse_hex_byte_pair(hex + i * 2U, &tx[i]);
+            n = hex_len / 2U;
+        }
+        if (!ok) {
+            http_append(out, &len, max,
+                        "ERR: usage spi xfer <instance> <cs> <hexbytes>\n");
+        } else if (!rp1_spi_transfer(inst, cs, tx, rx, n)) {
+            http_append(out, &len, max, "spi xfer FAILED\n");
+        } else {
+            http_append(out, &len, max, "spi xfer ok rx=");
+            for (u32 i = 0U; i < n; i++)
+                http_append_hex8(out, &len, max, rx[i]);
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "rp1fw") ||
                http_streq(cmd, "rp1fw status")) {
         struct rp1_fw_diag d;
@@ -4656,6 +5011,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, td->tx_no_mac);
         http_append(out, &len, max, " txfail=");
         http_append_u64(out, &len, max, td->tx_send_fail);
+        http_append(out, &len, max, " rx_ooo=");
+        http_append_u64(out, &len, max, td->rx_out_of_order);
+        http_append(out, &len, max, " rx_nospace=");
+        http_append_u64(out, &len, max, td->rx_no_space);
         http_append(out, &len, max, " short=");
         http_append_u64(out, &len, max, td->in_short);
         http_append(out, &len, max, " badcsum=");
@@ -4767,7 +5126,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
     } else if (http_streq(cmd, "proc sched")) {
         struct proc_sched_core_snapshot ps[3];
         u32 pn = proc_sched_snapshot(ps, 3);
-        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST TIMER_IRQ\n");
+        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST TIMER_IRQ WFX AWAIT KEEP ALIAS_STATE PHYS_STATE PUBLISH L3_PTE\n");
         for (u32 i = 0; i < pn; i++) {
             http_append_u64(out, &len, max, ps[i].core);
             http_append(out, &len, max, " ");
@@ -4792,6 +5151,80 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
              * have completely different root causes. */
             http_append(out, &len, max, " ");
             http_append_u64(out, &len, max, timer_ticks_core(ps[i].core));
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wfx_traps);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wfx_awaits);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wfx_keeps);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wfx_last_state);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, ps[i].wfx_last_generation);
+            http_append(out, &len, max, " ");
+            http_append_hex64(out, &len, max, ps[i].wfx_last_slot_va);
+            http_append(out, &len, max, " ");
+            http_append_hex64(out, &len, max, ps[i].wfx_last_slot_pte);
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_streq(cmd, "airq stat")) {
+        struct airq_diag d;
+        airq_diag_snapshot(&d);
+        http_append(out, &len, max, "PRIO POST DISPATCH DROP MAX_DEPTH BATCH\n");
+        for (u32 p = 0; p < AIRQ_PRIO_COUNT; p++) {
+            http_append_u64(out, &len, max, p);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.posted[p]);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.dispatched[p]);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.dropped[p]);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.max_depth[p]);
+            http_append(out, &len, max, " ");
+            http_append_u64(out, &len, max, d.batches[p]);
+            http_append(out, &len, max, "\n");
+        }
+        http_append(out, &len, max, "passes=");
+        http_append_u64(out, &len, max, d.passes);
+        http_append(out, &len, max, " budget_exhausted=");
+        http_append_u64(out, &len, max, d.budget_exhausted);
+        http_append(out, &len, max, " quota_exhausted=");
+        http_append_u64(out, &len, max, d.quota_exhausted);
+        http_append(out, &len, max, " no_handler=");
+        http_append_u64(out, &len, max, d.no_handler);
+        http_append(out, &len, max, " sched_starved=");
+        http_append_u64(out, &len, max, d.sched_starved);
+        http_append(out, &len, max, "\n");
+        http_append(out, &len, max, "core0_flag_passes net/tcp/uart/usb/maint/dash/cpu/wifi=");
+        for (u32 bit = 0; bit < 8U; bit++) {
+            http_append_u64(out, &len, max, core0_io_flag_passes[bit]);
+            http_append(out, &len, max, bit < 7U ? "/" : "\n");
+        }
+        http_append(out, &len, max, "core0_airq_dispatch/empty=");
+        http_append_u64(out, &len, max, core0_airq_dispatch_passes);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, core0_airq_empty_passes);
+        http_append(out, &len, max, "\n");
+        struct airq_lane_diag lanes[AIRQ_CORES * AIRQ_QUEUED_PRIOS];
+        u32 lane_n = airq_lane_diag_snapshot(CORE_NET, lanes,
+                                             AIRQ_CORES * AIRQ_QUEUED_PRIOS);
+        http_append(out, &len, max, "core0_lanes producer/prio/head/tail/depth=");
+        if (lane_n == 0U) {
+            http_append(out, &len, max, "none\n");
+        } else {
+            for (u32 i = 0; i < lane_n; i++) {
+                if (i) http_append(out, &len, max, " ");
+                http_append_u64(out, &len, max, lanes[i].producer);
+                http_append(out, &len, max, "/");
+                http_append_u64(out, &len, max, lanes[i].priority);
+                http_append(out, &len, max, "/");
+                http_append_u64(out, &len, max, lanes[i].head);
+                http_append(out, &len, max, "/");
+                http_append_u64(out, &len, max, lanes[i].tail);
+                http_append(out, &len, max, "/");
+                http_append_u64(out, &len, max, lanes[i].depth);
+            }
             http_append(out, &len, max, "\n");
         }
     } else if (http_streq(cmd, "core status")) {
@@ -4870,9 +5303,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
              * independent of real MAC/network activity. Interrupts stay
              * unmasked across the loop (this handler doesn't mask them), so
              * each raise is serviced synchronously by core0_eth_irq_handler
-             * before the next iteration -- the worst-case back-to-back
-             * inter-arrival gap the real IRQ-arm race and the poll-fallback
-             * backstop are meant to survive. Isolates "does pure IRQ rate
+             * before the next iteration. Isolates "does pure IRQ rate
              * alone reproduce/stress the problem" from "does it need real RX
              * ring backlog too". Bounded to 100000 to keep this HTTP request
              * from hanging indefinitely on a misbehaving build. */
@@ -4884,8 +5315,6 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             if (n > 100000U) n = 100000U;
             u64 before = core0_eth_irq_count;
             u32 stall_before = core0_eth_irq_stall_streak;
-            u32 fallback_before = core0_eth_irq_fallback_count;
-            bool poll_fallback_before = core0_eth_irq_poll_fallback;
             for (u32 i = 0; i < n; i++)
                 rp1_eth_irq_raise_test();
             http_append(out, &len, max, "rp1 eth irq storm n=");
@@ -4898,14 +5327,6 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append_u64(out, &len, max, stall_before);
             http_append(out, &len, max, " stall_streak_after=");
             http_append_u64(out, &len, max, core0_eth_irq_stall_streak);
-            http_append(out, &len, max, " poll_fallback_before=");
-            http_append(out, &len, max, poll_fallback_before ? "1" : "0");
-            http_append(out, &len, max, " poll_fallback_after=");
-            http_append(out, &len, max, core0_eth_irq_poll_fallback ? "1" : "0");
-            http_append(out, &len, max, " fallback_count_before=");
-            http_append_u64(out, &len, max, fallback_before);
-            http_append(out, &len, max, " fallback_count_after=");
-            http_append_u64(out, &len, max, core0_eth_irq_fallback_count);
             http_append(out, &len, max, "\n");
         } else if (http_streq(cmd, "rp1 irq pend-gic")) {
             u64 before = core0_eth_irq_count;
@@ -5872,6 +6293,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, " ticks=");
             http_append_u64(out, &len, max, cr.ticks);
             http_append(out, &len, max, "\n");
+            http_append_crash_stall(out, &len, max, &cr);
         }
     } else if (http_streq(cmd, "crashlba")) {
         /* Read the SD-persisted crash record (survives the watchdog reset that
@@ -5904,10 +6326,37 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, " ticks=");
             http_append_u64(out, &len, max, cr.ticks);
             http_append(out, &len, max, "\n");
+            http_append_crash_stall(out, &len, max, &cr);
         }
     } else if (http_streq(cmd, "crashlba clear")) {
         exception_crash_sd_clear();
         http_append(out, &len, max, "crashlba cleared\n");
+    } else if (http_streq(cmd, "crashdump")) {
+        u64 id = walfs_find(CRASHDUMP_PACK_PATH);
+        if (!id) {
+            http_append(out, &len, max,
+                        "crashdump none (" CRASHDUMP_PACK_PATH " absent)\n");
+        } else {
+            struct walfs_inode ino;
+            u32 size = walfs_stat(id, &ino) ? (u32)ino.size : 0U;
+            /* Tail the pack: the newest entries matter and the response buffer
+             * is bounded. */
+            u32 room = len + 1U < max ? max - len - 1U : 0U;
+            if (room > 0U) {
+                u32 want = size < room ? size : room;
+                u64 off = size - want;
+                u32 got = walfs_read(id, off, out + len, want);
+                len += got;
+                out[len] = '\0';
+            }
+            if (size == 0U)
+                http_append(out, &len, max, "crashdump empty\n");
+        }
+    } else if (http_streq(cmd, "crashdump clear")) {
+        u64 id = 0;
+        bool ok = crashdump_open_pack(true, &id);
+        http_append(out, &len, max,
+                    ok ? "crashdump cleared\n" : "crashdump clear FAILED\n");
     } else if (http_streq(cmd, "irq selftest")) {
         http_append(out, &len, max, irq_diag_selftest() ? "IRQ selftest OK\n" : "IRQ selftest FAILED\n");
     } else if (http_starts_with(cmd, "irq cntpns step ")) {
@@ -6071,69 +6520,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
     } else if (http_streq(cmd, "abi selftest")) {
         http_append(out, &len, max, abi_selftest() ? "ABI selftest OK\n" : "ABI selftest FAILED\n");
     } else if (http_streq(cmd, "el0") || http_streq(cmd, "el0 probe")) {
-        u32 seen = 0, pid = 0, spsr = 0, exits = 0;
-        u64 arg = 0, elr = 0;
-        proc_el0_probe_snapshot(&seen, &pid, &spsr, &arg, &elr, &exits);
-        http_append(out, &len, max, "el0 probe seen=");
-        http_append_u64(out, &len, max, seen);
-        http_append(out, &len, max, " pid=");
-        http_append_u64(out, &len, max, pid);
-        http_append(out, &len, max, " spsr=0x");
-        http_append_hex32(out, &len, max, spsr);
-        http_append(out, &len, max, " arg=0x");
-        http_append_hex64(out, &len, max, arg);
-        http_append(out, &len, max, " elr=0x");
-        http_append_hex64(out, &len, max, elr);
-        http_append(out, &len, max, " exits=");
-        http_append_u64(out, &len, max, exits);
-        i32 lst = 0; u32 lpid = 0, lslot = 0, ecnt = 0, epid = 0, fpid = 0;
-        u64 lbase = 0, epc = 0, esp = 0, fesr = 0, felr = 0, ffar = 0, fl1e = 0, fl2e = 0, fl3e = 0;
-        u64 par0w = 0, par0r = 0, par1w = 0;
-        proc_el0_diag_snapshot(&lst, &lpid, &lslot, &lbase, &ecnt, &epid,
-                               &epc, &esp, &fpid, &fesr, &felr, &ffar, &fl1e, &fl2e, &fl3e,
-                               &par0w, &par0r, &par1w);
-        http_append(out, &len, max, " launch=");
-        if (lst < 0) {
-            http_append(out, &len, max, "-");
-            http_append_u64(out, &len, max, (u32)(-lst));
-        } else {
-            http_append_u64(out, &len, max, (u32)lst);
-        }
-        http_append(out, &len, max, " lpid=");
-        http_append_u64(out, &len, max, lpid);
-        http_append(out, &len, max, " slot=");
-        http_append_u64(out, &len, max, lslot);
-        http_append(out, &len, max, " base=0x");
-        http_append_hex64(out, &len, max, lbase);
-        http_append(out, &len, max, " enter=");
-        http_append_u64(out, &len, max, ecnt);
-        http_append(out, &len, max, " epid=");
-        http_append_u64(out, &len, max, epid);
-        http_append(out, &len, max, " epc=0x");
-        http_append_hex64(out, &len, max, epc);
-        http_append(out, &len, max, " esp=0x");
-        http_append_hex64(out, &len, max, esp);
-        http_append(out, &len, max, " fpid=");
-        http_append_u64(out, &len, max, fpid);
-        http_append(out, &len, max, " fesr=0x");
-        http_append_hex64(out, &len, max, fesr);
-        http_append(out, &len, max, " felr=0x");
-        http_append_hex64(out, &len, max, felr);
-        http_append(out, &len, max, " ffar=0x");
-        http_append_hex64(out, &len, max, ffar);
-        http_append(out, &len, max, " l1e=0x");
-        http_append_hex64(out, &len, max, fl1e);
-        http_append(out, &len, max, " l2e=0x");
-        http_append_hex64(out, &len, max, fl2e);
-        http_append(out, &len, max, " l3e=0x");
-        http_append_hex64(out, &len, max, fl3e);
-        http_append(out, &len, max, " par0w=0x");
-        http_append_hex64(out, &len, max, par0w);
-        http_append(out, &len, max, " par0r=0x");
-        http_append_hex64(out, &len, max, par0r);
-        http_append(out, &len, max, " par1w=0x");
-        http_append_hex64(out, &len, max, par1w);
-        http_append(out, &len, max, "\n");
+        http_append(out, &len, max, "el0 scheduler uses pctl/swake/WFE; SVC probe retired\n");
     } else if (http_streq(cmd, "ipc bench") || http_starts_with(cmd, "ipc bench ")) {
         u32 iters = 10000;
         if (http_starts_with(cmd, "ipc bench ")) {
@@ -6736,7 +7123,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, "/");
         http_append_u64(out, &len, max, d ? d->global_reapply_count : 0U);
         http_append(out, &len, max, "\n");
-    } else if (http_streq(cmd, "tensor picoscript") ||
+    } else if (http_streq(cmd, "qpu enable") ||
+               http_streq(cmd, "tensor picoscript") ||
                http_streq(cmd, "tensor picoscript selftest") ||
                http_streq(cmd, "qpu picoscript")) {
         bool ok = tensor_picovm_selftest();
@@ -6765,6 +7153,41 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             }
         }
         http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "qpu vm enable")) {
+        u64 cpu_ns = 0U;
+        u64 qpu_ns = 0U;
+        bool ok = tensor_picovm_kernel_selftest() &&
+                  tensor_picovm_kernel_bench(32U, &cpu_ns, &qpu_ns);
+        http_append(out, &len, max,
+                    ok ? "PicoVM QPU execution 1 verified"
+                       : "PicoVM QPU execution 1 FAILED");
+        http_append(out, &len, max, " cpu_ns=");
+        http_append_u64(out, &len, max, cpu_ns);
+        http_append(out, &len, max, " qpu_ns=");
+        http_append_u64(out, &len, max, qpu_ns);
+        http_append(out, &len, max, " selected=cpu\n");
+    } else if (http_streq(cmd, "qpu vm status")) {
+        const struct v3d_kernel_desc *single =
+            v3d_kernel_desc_get(V3D_KERNEL_PICOVM_ALU);
+        http_append(out, &len, max, "qpu_vm single=");
+        http_append(out, &len, max,
+                    single && single->verified ? "verified" : "pending");
+        http_append(out, &len, max, " selected=cpu");
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "picoscript caps")) {
+        http_append(out, &len, max, "PicoScript VM capabilities\n");
+        http_append(out, &len, max, " abi_hooks=0x");
+        http_append_hex32(out, &len, max, PV_HOOK_TABLE_VERSION);
+        http_append(out, &len, max, "\n core=16-opcode+systems64 local=cpu\n");
+        http_append(out, &len, max, " hooks=String Number Maths Bits Span Map Json Xml Template");
+        http_append(out, &len, max, " Storage Fifo Context Response\n");
+        http_append(out, &len, max, " kernel=FIFO:/kernel/picovm\n");
+        http_append(out, &len, max, " tensor=host_hook:0x1e0..0x1eb backend=neon/qpu/cpu\n");
+        http_append(out, &len, max, " compute=host_hook:0x370..0x37b backend=qpu/cpu async=yes\n");
+        http_append(out, &len, max, " media=host_hook:0x3a0..0x3ad backend=qpu/cpu\n");
+        http_append(out, &len, max, " bitlinear=host_hook:0x350..0x35f backend=qpu/cpu\n");
+        http_append(out, &len, max, " crypto=PIOS picocrypt backend=cpu/crypto-ext\n");
+        http_append(out, &len, max, " tls=PIOS picotls backend=cpu\n");
     } else if (http_streq(cmd, "bitnet picoscript") ||
                http_streq(cmd, "tensor bitnet")) {
         i32 argmax = -1;
@@ -6814,7 +7237,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                http_streq(cmd, "tensor media")) {
         bool ok = tensor_picovm_media_selftest();
         http_append(out, &len, max,
-                    ok ? "Media superinstructions OK: QPU grayscale XOR + CPU H264; HEVC pending"
+                    ok ? "Media superinstructions OK: QPU grayscale XOR + QPU H264 luma verified; HEVC pending"
                        : "Media superinstructions FAILED");
         http_append(out, &len, max, " stage=");
         http_append_u64(out, &len, max, (u32)tensor_tiny_last_stage());
@@ -6825,6 +7248,49 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, "\n");
         if (!ok)
             http_append_tensor_tail(out, &len, max);
+    } else if (http_streq(cmd, "media status")) {
+        http_append(out, &len, max, "media gray_xor=");
+        http_append(out, &len, max,
+                    tensor_picovm_media_accel_ready() ? "qpu" : "cpu");
+        http_append(out, &len, max, " h264_luma=");
+        http_append(out, &len, max,
+                    tensor_picovm_h264_accel_ready() ? "qpu" : "cpu");
+        http_append(out, &len, max, " h264_selected=");
+        http_append(out, &len, max,
+                    tensor_prefer_qpu_h264() ? "qpu" : "cpu");
+        http_append(out, &len, max, " async=");
+        http_append(out, &len, max,
+                    tensor_picovm_async_accel_ready() ? "qpu" : "pending");
+        http_append(out, &len, max,
+                    " hevc=unavailable pisp=pending hvs=pending\n");
+    } else if (http_streq(cmd, "media bench")) {
+        u64 cpu_ns = 0U;
+        u64 qpu_ns = 0U;
+        bool ok = tensor_picovm_media_bench(8U, &cpu_ns, &qpu_ns);
+        http_append(out, &len, max,
+                    ok ? "Media 4KiB luma residual+restore benchmark"
+                       : "Media benchmark unavailable");
+        if (ok) {
+            http_append(out, &len, max, " cpu_ns=");
+            http_append_u64(out, &len, max, cpu_ns);
+            http_append(out, &len, max, " qpu_ns=");
+            http_append_u64(out, &len, max, qpu_ns);
+            http_append(out, &len, max, " selected=");
+            http_append(out, &len, max, qpu_ns < cpu_ns ? "qpu" : "cpu");
+        }
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "media async") ||
+               http_streq(cmd, "qpu async")) {
+        u32 cpu_work = 0U;
+        bool ok = tensor_picovm_async_selftest(&cpu_work);
+        http_append(out, &len, max,
+                    ok ? "PicoScript Async QPU media OK"
+                       : "PicoScript Async QPU media FAILED");
+        http_append(out, &len, max, " cpu_work=");
+        http_append_u64(out, &len, max, cpu_work);
+        if (!ok)
+            http_append_tensor_tail(out, &len, max);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "tensor tiny noop") || http_streq(cmd, "qpu tiny noop")) {
         bool ok = tensor_tiny_noop_proof();
         http_append(out, &len, max, ok ? "Tensor tiny noop proof OK" : "Tensor tiny noop proof FAILED");
@@ -7918,7 +8384,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, ok ? "crypto selftest OK (AES-GCM + GHASH nibble table)\n"
                                        : "crypto selftest FAILED\n");
     } else if (http_streq(cmd, "arp probe")) {
-        arp_probe();
+        arp_probe_iface(NIC_IFACE_WIRED);
         const arp_stats_t *ast = arp_get_stats();
         http_append(out, &len, max, "arp probe sent requests_sent=");
         http_append_u64(out, &len, max, ast->requests_sent);
@@ -8017,10 +8483,6 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, core0_eth_irq_quench_passes);
         http_append(out, &len, max, " stall_streak=");
         http_append_u64(out, &len, max, core0_eth_irq_stall_streak);
-        http_append(out, &len, max, " fallback=");
-        http_append_u64(out, &len, max, core0_eth_irq_poll_fallback ? 1U : 0U);
-        http_append(out, &len, max, " fallback_count=");
-        http_append_u64(out, &len, max, core0_eth_irq_fallback_count);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "arp status")) {
         /* Full ARP subsystem diagnostics: reply/request rate-limit drops
@@ -10985,6 +11447,129 @@ static bool http_walfs_recreate_file(const char *path, u64 *id_out)
     return true;
 }
 
+/* ---- Crashdump pack ------------------------------------------------------
+ *
+ * The SD handoff sector (LBA 24) is a single slot: the next panic overwrites
+ * it. On each boot we copy any unarchived record into an append-only pack on
+ * WALFS so the history survives, is listable next to the rest of the
+ * filesystem, and can be pulled off the board with the normal static-file
+ * routes. */
+static bool crash_boot_marked_healthy;
+
+/* Resolve the crashdump pack, creating /var, /var/crash and the file as needed.
+ *
+ * Deliberately does not reuse http_walfs_ensure_file(): that helper confines
+ * paths to /var/www/static/, and a crash record exposes kernel addresses
+ * (elr/sp/ttbr0) that must not be reachable from the unauthenticated static
+ * file route. */
+static bool crashdump_open_pack(bool recreate, u64 *id_out)
+{
+    static const char *const dirs[] = { "/var", "/var/crash" };
+    static const char *const names[] = { "var", "crash" };
+    u64 parent = WALFS_ROOT_INODE;
+
+    if (id_out)
+        *id_out = 0;
+
+    for (u32 i = 0; i < 2U; i++) {
+        u64 id = walfs_find(dirs[i]);
+        if (!id) {
+            id = walfs_create(parent, names[i], WALFS_DIR, 0700);
+            if (!id)
+                return false;
+        } else {
+            struct walfs_inode ino;
+            if (!walfs_stat(id, &ino) || !(ino.flags & WALFS_DIR))
+                return false;
+        }
+        parent = id;
+    }
+
+    u64 id = walfs_find(CRASHDUMP_PACK_PATH);
+    if (id && recreate) {
+        if (!walfs_delete(id))
+            return false;
+        id = 0;
+    }
+    if (!id) {
+        id = walfs_create(parent, "crashdump.pack", WALFS_FILE, 0600);
+        if (!id)
+            return false;
+    }
+    if (id_out)
+        *id_out = id;
+    return true;
+}
+
+static void crashdump_append_kv(char *buf, u32 *len, u32 max,
+                                const char *key, u64 value, bool hex)
+{
+    http_append(buf, len, max, key);
+    http_append(buf, len, max, "=");
+    if (hex) {
+        http_append(buf, len, max, "0x");
+        http_append_hex64(buf, len, max, value);
+    } else {
+        http_append_u64(buf, len, max, value);
+    }
+    http_append(buf, len, max, "\n");
+}
+
+/* Copy the pending SD crash record into the WALFS pack. Safe to call on every
+ * boot: records are marked archived, so nothing is duplicated. */
+static bool crashdump_archive_pending(void)
+{
+    struct exception_crash_record cr;
+    if (!exception_crash_sd_read(&cr))
+        return false;
+    if (cr.archived)
+        return false;
+
+    static char entry[1536];
+    u32 len = 0;
+    entry[0] = 0;
+    http_append(entry, &len, sizeof(entry),
+                "---- PIOS crashdump ----\narchived_by_build=");
+    http_append(entry, &len, sizeof(entry), PIOS_BUILD_LABEL);
+    http_append(entry, &len, sizeof(entry), "\n");
+    crashdump_append_kv(entry, &len, sizeof(entry), "kind", cr.kind, false);
+    crashdump_append_kv(entry, &len, sizeof(entry), "consecutive",
+                        cr.consecutive, false);
+    crashdump_append_kv(entry, &len, sizeof(entry), "core", cr.core, false);
+    crashdump_append_kv(entry, &len, sizeof(entry), "el", cr.current_el, false);
+    crashdump_append_kv(entry, &len, sizeof(entry), "ec", cr.ec, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "esr", cr.esr, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "elr", cr.elr, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "far", cr.far, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "sp", cr.sp, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "ttbr0", cr.ttbr0, true);
+    crashdump_append_kv(entry, &len, sizeof(entry), "pid", cr.pid, false);
+    crashdump_append_kv(entry, &len, sizeof(entry), "ticks", cr.ticks, false);
+    http_append_crash_stall(entry, &len, sizeof(entry), &cr);
+    http_append(entry, &len, sizeof(entry), "\n");
+
+    u64 id = 0;
+    if (!crashdump_open_pack(false, &id) || !id)
+        return false;
+
+    struct walfs_inode ino;
+    u64 offset = 0;
+    if (walfs_stat(id, &ino))
+        offset = ino.size;
+    /* Bounded: once the pack is full, start it over rather than growing without
+     * limit on a board that keeps crashing. */
+    if (offset + len > CRASHDUMP_PACK_MAX) {
+        if (!crashdump_open_pack(true, &id) || !id)
+            return false;
+        offset = 0;
+    }
+    if (!walfs_write(id, offset, entry, len))
+        return false;
+
+    exception_crash_mark_archived();
+    return true;
+}
+
 static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     u32 len = 0;
@@ -11304,41 +11889,14 @@ static void admin_service_poll(struct admin_http_service *svc)
                drain_spins < 4096U) {
             drain_spins++;
             if (readable == 0) {
-                net_poll();   /* ingest more inbound frames into the TCP rx ring */
-                readable = tcp_readable(svc->client_conn);
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
-                /* Unlike the main core0 reactor (which pairs every net_poll()
-                 * with a macb_rx_recover()/macb_rx_liveness_recover() check),
-                 * this tight drain loop used to call net_poll() alone. A
-                 * genuine hardware RX overrun triggered by the sustained
-                 * burst of a bulk transfer would then sit un-recovered until
-                 * the loop exhausted its spin budget (or the connection was
-                 * abandoned) and control finally returned to the outer
-                 * reactor -- long enough that the peer's TCP stack gave up
-                 * and reset the connection. Recover inline instead, and log
-                 * enough context (drain_spins, stream progress, lifetime
-                 * recovery count) to read back on the next capture/dtrace
-                 * dump without needing to catch it live. */
-                if (readable == 0) {
-                    bool recovered = macb_rx_recover();
-                    if (!recovered)
-                        recovered = macb_rx_hole_recover();
-                    if (!recovered)
-                        recovered = macb_rx_liveness_recover(timer_monotonic_ms());
-                    if (recovered) {
-                        struct macb_diag md_post;
-                        macb_diag(&md_post);
-                        DTRACE(DTRACE_CAT_OTA, DT_OTA_RX_RECOVER, svc->stream_received,
-                               svc->stream_total, drain_spins,
-                               md_post.rx_recover + md_post.rx_live_recover);
-                        http_log_event("ota-rx-recover", svc->stream_received, drain_spins);
-                        net_poll();
-                        readable = tcp_readable(svc->client_conn);
-                    }
-                }
-#endif
-                if (readable == 0)
-                    break;    /* genuinely nothing available right now */
+                /*
+                 * Do not poll the NIC from this service hot loop.  ADR-033
+                 * makes the next RX frame publish a new transport -> protocol
+                 * -> service chain, which revisits this bounded drain with
+                 * fresh TCP data.  MAC health recovery remains the separate
+                 * maintenance responsibility; it never runs protocol work.
+                 */
+                break;
             }
             u32 want = svc->stream_total - svc->stream_received;
             if (want > readable) want = readable;
@@ -13598,6 +14156,50 @@ static void ui_cmd_usb(u32 argc, char **argv)
                   st->xfer_ok, st->xfer_fail, st->evt_polled,
                   st->evt_stale_drained, st->ep_resets, st->ep_stalls,
                   st->ring_full);
+        ui_console_write("USB dev=");
+        ui_console_write(dev ? "yes" : "no");
+        ui_console_write(" kbd=");
+        ui_console_write(usb_kbd_available() ? "ready" : "not-ready");
+        ui_console_write(" xhci_stage=0x");
+        ui_console_hex_fixed(st->init_stage, 8);
+        ui_console_write(" gusb3=0x");
+        ui_console_hex_fixed(st->gusb3_before, 8);
+        ui_console_write("->0x");
+        ui_console_hex_fixed(st->gusb3_after, 8);
+        ui_console_write(" reset_fail=");
+        ui_console_u32_dec(st->port_reset_failures);
+        ui_console_write(" last_port=");
+        ui_console_u32_dec(st->last_port);
+        ui_console_write(" last_status=0x");
+        ui_console_hex_fixed(st->last_port_status, 8);
+        ui_console_write(" xfer=");
+        ui_console_u32_dec(st->xfer_ok);
+        ui_console_write("/");
+        ui_console_u32_dec(st->xfer_fail);
+        ui_console_write(" cmd=");
+        ui_console_u32_dec(st->cmd_completed);
+        ui_console_write("/");
+        ui_console_u32_dec(st->cmd_timeout);
+        ui_console_write(" last_cc=");
+        ui_console_u32_dec(st->last_cmd_cc);
+        ui_console_write(" last_cmd=0x");
+        ui_console_hex_fixed(st->last_cmd_type, 8);
+        ui_console_write("\n");
+        ui_console_write("controllers=0:");
+        ui_console_u32_dec(xhci_controller_port_count(0U));
+        ui_console_write(" 1:");
+        ui_console_u32_dec(xhci_controller_port_count(1U));
+        ui_console_write("\n");
+        ui_console_write("ports=");
+        u32 ports = xhci_port_count();
+        if (ports > 16U) ports = 16U;
+        for (u32 p = 0; p < ports; p++) {
+            ui_console_write(" ");
+            ui_console_u32_dec(p);
+            ui_console_write(":");
+            ui_console_hex_fixed(xhci_port_status(p), 8);
+        }
+        ui_console_write("\n");
         ui_console_write("usage: usb status|reinit|poll\n");
         return;
     }
@@ -15330,6 +15932,17 @@ static void ui_walfs_deck_cb(const struct walfs_dirent *entry)
  * depth/count-bounded primitives used elsewhere in the console. */
 static void ui_print_tensor_walfs_dashboard(void)
 {
+    ui_console_write("PicoScript hooks abi=0x");
+    ui_console_hex_fixed(PV_HOOK_TABLE_VERSION, 8);
+    ui_console_write(" core=systems64/local-cpu");
+    ui_console_write(" kernel=FIFO:/kernel/picovm");
+    ui_console_write(" tensor=NEON/QPU/CPU");
+    ui_console_write(" compute=QPU/CPU/Async");
+    ui_console_write(" media=QPU/CPU");
+    ui_console_write(" bitlinear=QPU/CPU");
+    ui_console_write(" crypto=PIOS-PicoCrypt");
+    ui_console_write(" tls=PIOS-PicoTLS\n");
+
     struct walfs_status_snapshot ws;
     walfs_status(&ws);
     ui_console_write("WALFS mounted=");
@@ -15818,6 +16431,9 @@ static void ui_firewall_print_rule(u32 i, const nic_filter_rule_t *r)
     if (r->direction == NIC_FILTER_DIR_IN) ui_console_write("in ");
     else if (r->direction == NIC_FILTER_DIR_OUT) ui_console_write("out ");
     else ui_console_write("both ");
+    ui_console_write("iface=");
+    ui_console_write(r->iface == NIC_IFACE_WIRED ? "wired " :
+                     (r->iface == NIC_IFACE_WIFI ? "wifi " : "any "));
     if (r->flags & NIC_FILTER_ETHERTYPE) {
         if (r->ethertype == ETH_P_ARP) ui_console_write("arp ");
         else if (r->ethertype == ETH_P_IP) {
@@ -19641,7 +20257,7 @@ static void ui_cmd_arp(u32 argc, char **argv)
         return;
     }
     if (argc >= 2 && ui_streq(argv[1], "probe")) {
-        arp_probe();
+        arp_probe_iface(NIC_IFACE_WIRED);
         const arp_stats_t *st = arp_get_stats();
         ui_console_write("OK: arp probe sent requests_sent=");
         ui_console_u64_dec(st->requests_sent);
@@ -21173,6 +21789,27 @@ static void dash_hw_row(u32 row, u32 c_dev, u32 c_active, u32 c_load,
     dash_put_trunc(caps, 44U);
 }
 
+static void dash_hw_row_state(u32 row, u32 c_dev, u32 c_state, u32 c_load,
+                              u32 c_ram, u32 c_caps, const char *dev,
+                              const char *state, u32 state_color,
+                              const char *load, const char *ram,
+                              const char *caps)
+{
+    fb_set_cursor(c_dev, row);
+    fb_set_color(0x0000CCFF, 0x00000000);
+    dash_put_trunc(dev, c_state > c_dev ? c_state - c_dev - 1U : 10U);
+    fb_set_cursor(c_state, row);
+    fb_set_color(state_color, 0x00000000);
+    dash_put_trunc(state, c_load > c_state ? c_load - c_state - 1U : 8U);
+    fb_set_cursor(c_load, row);
+    fb_set_color(0x00FFFFFF, 0x00000000);
+    dash_put_trunc(load, c_ram > c_load ? c_ram - c_load - 1U : 20U);
+    fb_set_cursor(c_ram, row);
+    dash_put_trunc(ram, c_caps > c_ram ? c_caps - c_ram - 1U : 12U);
+    fb_set_cursor(c_caps, row);
+    dash_put_trunc(caps, 44U);
+}
+
 static void dash_hw_row_u64_hex(u32 row, u32 c_dev, u32 c_active, u32 c_load,
                                 u32 c_ram, u32 c_caps, const char *dev,
                                 bool active, const char *prefix, u64 addr,
@@ -21541,13 +22178,50 @@ static void hdmi_dashboard_render(void)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "NIC", PIOS_HAS_GENET && perf.nic_link_mbps != 0,
                             "MMIO ", PIOS_GENET_BASE, "rings", PIOS_HAS_GENET ? "GENET/MACB Ethernet" : "no active NIC backend");
-    if (hw_r < hw_end)
-        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
-                    "WiFi/BT", false, "not loaded", "0", "CYW/BT parked; no active driver");
+    if (hw_r < hw_end) {
+        bool wifi_runtime = cyw43_runtime_ready();
+        u32 wifi_link = cyw43_link_state();
+        const char *wifi_state = !PIOS_HAS_WIFI_SDIO2 ? "N/A" :
+                                 (nic_wifi_active() ? "ACTIVE" :
+                                 (wifi_link == CYW_LINK_UP ? "LINKED" :
+                                  (wifi_link == CYW_LINK_JOINING ? "JOINING" :
+                                   (wifi_link == CYW_LINK_AUTH_FAIL ? "AUTHFAIL" :
+                                    (wifi_runtime ? "READY" : "AVAILABLE")))));
+        u32 wifi_color = !PIOS_HAS_WIFI_SDIO2 ? 0x00AAAAAA :
+                         (nic_wifi_active() || wifi_link == CYW_LINK_UP
+            ? 0x0000FF80 : (wifi_link == CYW_LINK_AUTH_FAIL
+                                ? 0x00FF4040 : 0x00FFAA00));
+        const char *wifi_load = !PIOS_HAS_WIFI_SDIO2 ? "not present" :
+                                (wifi_runtime ? "CYW43455/SDIO2" : "driver ready");
+        const char *wifi_memory = !PIOS_HAS_WIFI_SDIO2 ? "0" :
+                                  (wifi_runtime ? "fw+clm" : "on-demand");
+        const char *wifi_caps = !PIOS_HAS_WIFI_SDIO2
+            ? "no onboard WiFi on this platform"
+            : (nic_wifi_active()
+            ? "CYW43455 SDIO2 WiFi active; wired NIC remains online"
+            : (wifi_runtime
+                   ? "CYW43455 ready; wired fail-safe remains selected"
+                   : "CYW43455 SDIO2 driver ready; firmware init on demand"));
+        dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                          "WiFi", wifi_state, wifi_color, wifi_load,
+                          wifi_memory, wifi_caps);
+        if (hw_r < hw_end)
+            dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                              "Bluetooth",
+                              !PIOS_HAS_WIFI_SDIO2 ? "N/A" : "PENDING",
+                              !PIOS_HAS_WIFI_SDIO2 ? 0x00AAAAAA : 0x00FFAA00,
+                              !PIOS_HAS_WIFI_SDIO2 ? "not present" : "CYW43455 combo",
+                              !PIOS_HAS_WIFI_SDIO2 ? "0" : "shared SDIO2",
+                              !PIOS_HAS_WIFI_SDIO2 ? "no onboard Bluetooth on this platform" :
+                              "Bluetooth backend pending");
+    }
     if (hw_r < hw_end)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
-                            "USB/HID", PIOS_HAS_RP1, "RP1 ", PIOS_RP1_BAR_BASE,
-                            "xhci", PIOS_HAS_RP1 ? "xHCI + USB HID keyboard" : "not present");
+                            "USB/HID", xhci_get_stats()->init_stage >= 4U,
+                            "RP1 ", PIOS_RP1_BAR_BASE, "xhci",
+                            !PIOS_HAS_RP1 ? "not present" :
+                            (usb_kbd_available() ? "xHCI + HID ready" :
+                             "xHCI ready; no HID enumerated"));
     if (hw_r < hw_end)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "RP1 bridge", PIOS_HAS_RP1 && PIOS_HAS_PCIE, "BAR ", PIOS_RP1_BAR_BASE,
@@ -21556,18 +22230,41 @@ static void hdmi_dashboard_render(void)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "GPIO", PIOS_HAS_RP1, "RP1 ", PIOS_RP1_BAR_BASE,
                             "regs", PIOS_HAS_RP1 ? "54 GPIO / 28 header pins" : "not present");
-    if (hw_r < hw_end)
-        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
-                    "I2C / SPI", false, PIOS_HAS_RP1 ? "RP1 ctrl" : "not present",
-                    "0", PIOS_HAS_RP1 ? "HW present; driver pending" : "not present");
+    {
+        struct rp1_i2c_diag i2cd;
+        rp1_i2c_diag_snapshot(&i2cd);
+        u32 spi_present = 0U;
+        u32 spi_ready = 0U;
+        u32 spi_quad = 0U;
+        for (u32 si = 0U; si < RP1_SPI_COUNT; si++) {
+            struct rp1_spi_diag sd;
+            rp1_spi_diag_snapshot(si, &sd);
+            if (sd.present) spi_present++;
+            if (sd.ready) spi_ready++;
+            if (sd.enhanced_frf) spi_quad++;
+        }
+        if (hw_r < hw_end)
+            dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                        "I2C1", rp1_i2c_ready(), "RP1",
+                        rp1_i2c_ready() ? "ready" : "driver unavailable",
+                        "DesignWare I2C controller");
+        if (hw_r < hw_end)
+            dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                        "SPI", spi_present != 0U, "RP1",
+                        spi_ready ? "ready" :
+                        (spi_present ? "probed; not initialized" : "unavailable"),
+                        spi_present ? "9 RP1 SPI cores" : "unavailable");
+        if (hw_r < hw_end)
+            dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                        "QSPI", spi_quad != 0U, "RP1",
+                        spi_quad ? "quad capable" : "no quad capability",
+                        spi_quad ? "enhanced SPI" : "single-bit SPI only");
+        (void)i2cd;
+    }
     if (hw_r < hw_end)
         dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                     "SDIO", PIOS_HAS_SD, PIOS_HAS_SD ? "EMMC2" : "virtio/mmio",
                     "dma/buf", PIOS_HAS_SD ? "SDIO 4-bit path" : "platform block path");
-    if (hw_r < hw_end)
-        dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
-                    "QSPI", false, PIOS_HAS_RP1 ? "RP1/QSPI" : "not present",
-                    "0", "HW planned; driver pending");
     if (hw_r < hw_end)
         dash_hw_row(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                     "Framebuffer", PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB,
@@ -21594,6 +22291,9 @@ static void hdmi_dashboard_render(void)
         const u32 t_detail_w = tns_w > (t_detail - tns_col) + 2U
                                    ? tns_w - (t_detail - tns_col) - 2U : 20U;
         bool v3d_ready = tensor_picovm_accel_ready();
+        bool v3d_hw_ready = tns.v3d_dispatch_supported &&
+                            tns.v3d_native_compute_enabled &&
+                            tns.v3d_native_mmu_ready;
         fb_set_color(0x00AAAAAA, 0x00000000);
         fb_set_cursor(t_back, tns_r);
         fb_puts("BACKEND");
@@ -21607,7 +22307,7 @@ static void hdmi_dashboard_render(void)
         fb_puts("CPU NEON");
         fb_set_color(0x00FFFFFF, 0x00000000);
         fb_set_cursor(t_state, tns_r);
-        fb_puts("ready");
+        fb_puts("enabled");
         fb_set_cursor(t_detail, tns_r);
         dash_put_trunc("FP32 add/mul/scale/dot/matmul/matvec/relu/softmax",
                        t_detail_w);
@@ -21617,37 +22317,45 @@ static void hdmi_dashboard_render(void)
         fb_puts("CPU INT");
         fb_set_color(0x00FFFFFF, 0x00000000);
         fb_set_cursor(t_state, tns_r);
-        fb_puts("ready");
+        fb_puts("enabled");
         fb_set_cursor(t_detail, tns_r);
-        dash_put_trunc("I8 dot/matvec; I32 add/mul/scale/relu/norm/rope/softmax",
+        dash_put_trunc("I8 dot/matvec NEON; I32 scalar add/mul/scale/relu/norm/rope/softmax",
                        t_detail_w);
         tns_r++;
         fb_set_color(0x0000CCFF, 0x00000000);
         fb_set_cursor(t_back, tns_r);
         fb_puts("V3D QPU");
-        fb_set_color(v3d_ready ? 0x0000FF80 : (tns.v3d_available ? 0x00FFAA00 : 0x00FF4040),
+        fb_set_color(v3d_ready ? 0x0000FF80 :
+                     (v3d_hw_ready ? 0x00FFAA00 : 0x00FF4040),
                      0x00000000);
         fb_set_cursor(t_state, tns_r);
-        fb_puts(v3d_ready ? "enabled" : (tns.v3d_dispatch_supported ? "probe" : "off"));
+        fb_puts(v3d_ready ? "verified" : (v3d_hw_ready ? "ready" : "off"));
         fb_set_color(0x00FFFFFF, 0x00000000);
         fb_set_cursor(t_detail, tns_r);
         dash_put_trunc(v3d_ready
-                           ? "PicoScript: DotI8 MatVecI8"
-                           : "QPU quarantined until PicoScript Tensor selftest  cmd: tensor picoscript",
+                           ? "PicoScript DotI8/MatVecI8 verified"
+                           : (v3d_hw_ready
+                                  ? "Native V3D 7.1 CSD ready  cmd: qpu enable"
+                                  : "V3D compute unavailable"),
                        t_detail_w);
         tns_r++;
         fb_set_color(0x00CC99FF, 0x00000000);
         fb_set_cursor(t_back, tns_r);
         fb_puts("QPU VM");
-        fb_set_color((alu_desc && alu_desc->verified) ? 0x0000FF80 : 0x00FFAA00,
+        bool alu_verified = alu_desc && alu_desc->verified;
+        fb_set_color(alu_verified ? 0x0000FF80 :
+                     (v3d_hw_ready ? 0x00FFAA00 : 0x00FF4040),
                      0x00000000);
         fb_set_cursor(t_state, tns_r);
-        fb_puts((alu_desc && alu_desc->verified) ? "enabled" : "probe");
+        fb_puts(alu_verified ? "verified" :
+                (v3d_hw_ready ? "ready" : "off"));
         fb_set_color(0x00FFFFFF, 0x00000000);
         fb_set_cursor(t_detail, tns_r);
         dash_put_trunc((alu_desc && alu_desc->verified)
-                           ? "Arithmetic block: ADD+MUL (24-bit bounded)"
-                           : "Arithmetic block pending  cmd: tensor picovm kernel",
+                           ? "ADD+MUL verified; CPU selected (QPU proof only)"
+                           : (v3d_hw_ready
+                                  ? "Bounded ADD+MUL  cmd: qpu vm enable"
+                                  : "V3D compute unavailable"),
                        t_detail_w);
         tns_r++;
         fb_set_color(0x00FFCC66, 0x00000000);
@@ -21675,7 +22383,13 @@ static void hdmi_dashboard_render(void)
         fb_puts(tensor_picovm_media_accel_ready() ? "enabled" : "CPU");
         fb_set_cursor(t_detail, tns_r);
         dash_put_trunc(tensor_picovm_media_accel_ready()
-                           ? "QPU Gray XOR codec; H264 CPU; HEVC/PiSP/HVS pending"
+                           ? (tensor_picovm_h264_accel_ready()
+                                  ? (tensor_prefer_qpu_h264()
+                                         ? "QPU Gray XOR + H264 luma selected; HEVC/PiSP/HVS pending"
+                                         : (tensor_picovm_async_accel_ready()
+                                                ? "H264 sync CPU; Async QPU ready; HEVC/PiSP/HVS pending"
+                                                : "QPU H264 verified, CPU selected; HEVC/PiSP/HVS pending"))
+                                  : "QPU Gray XOR; H264 CPU; HEVC/PiSP/HVS pending")
                            : "Gray delta + H264 residual; HEVC/PiSP/HVS pending",
                        t_detail_w);
     }
@@ -22299,63 +23013,37 @@ static void core0_io_tick_hook(u32 core, u64 tick)
      * far more than that, silently dropping bytes on overflow. */
     if ((tick & 31U) == 0 || uartflash_active)
         flags |= CORE0_IO_UART | CORE0_IO_USB;
-    /* CORE0_IO_NET is now driven PURELY by the ETH IRQ handler
-     * (core0_eth_irq_handler sets it directly) plus the deferred-quench
-     * consumer's poll-fallback backstop -- deliberately NOT forced here
-     * anymore -- ONLY on real RP1/GEM hardware, where core0_eth_irq_arm_host()
-     * actually arms that IRQ path at boot (see PIOS_HAS_RP1 && PIOS_HAS_GENET
-     * gating there). The previous unconditional 128Hz force existed only
-     * because RX IRQ delivery was previously suspected under load; that hypothesis
-     * was based on an unverified "check-then-arm" race theory that RP1SPEC.md
-     * 6.2 actually contradicts (IACK-while-still-asserted is documented to
-     * generate a fresh MSI), and the REAL bug was a software lost-wakeup race
-     * in how core0_eth_irq_deferred_quench was consumed (see the fixed
-     * clear-before-drain loop below) -- not an inherent IRQ reliability
-     * problem. Brute-force timer polling was masking that bug rather than
-     * fixing it, at the cost of never trusting/exercising the IRQ path under
-     * real load. Genuine hardware-wedge detection (RSR.BNA/OVR latch, RX
-     * silence) does NOT depend on this and still runs unconditionally on the
-     * CORE0_IO_MAINT cadence below, so a total IRQ failure (as opposed to a
-     * missed individual wake) still self-heals.
-     * On platforms without that IRQ path (e.g. QEMU's virtio-net, or any
-     * build where PIOS_HAS_RP1/PIOS_HAS_GENET is 0), nothing ever arms an RX
-     * interrupt at all -- so CORE0_IO_NET must still be forced periodically
-     * there, exactly as before, or RX is never drained. */
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
-    if ((tick & 7U) == 0) {
-        flags |= CORE0_IO_TCP;
-        /* Exception to "purely IRQ-driven": while the poll-only livelock
-         * fallback is engaged, the GIC ETH line is deliberately masked (see
-         * core0_eth_irq_drain_and_quench), so nothing else will ever set
-         * CORE0_IO_NET again -- including the cooldown-based re-arm check
-         * that lives inside that same branch and is what clears the
-         * fallback. Without this, engaging the fallback would be a
-         * permanent deadlock: masked IRQ + no periodic force = RX never
-         * drains again and the board never leaves fallback mode. Restore
-         * the fast poll cadence ONLY for the duration of this genuinely
-         * degraded window; normal healthy operation stays purely
-         * event-driven. */
-        if (core0_eth_irq_poll_fallback)
-            flags |= CORE0_IO_NET;
-    }
-#else
-    if ((tick & 7U) == 0)
-        flags |= CORE0_IO_NET | CORE0_IO_TCP;
+    /*
+     * ADR-033: timer cadence may publish a bounded SDIO transport indication,
+     * but never calls CYW43, the legacy compatibility pump, or protocol work
+     * itself.  A quiet
+     * wired link therefore cannot gate WiFi delivery, while a missing software
+     * event remains observable as a queue/interrupt failure rather than
+     * silently becoming a polling fallback.
+     */
+#if !(PIOS_HAS_RP1 && PIOS_HAS_GENET)
+    /*
+     * virtio-net exposes no wired RX IRQ in this platform build.  Its explicit
+     * 125Hz transport indication is still only a descriptor publication; the
+     * AIRQ transport handler is the sole place that may inspect its ring.
+     */
+    if ((tick & 7U) == 0U)
+        (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                             NET_DISPATCH_CAUSE_PACED);
 #endif
-    /* WiFi frame draining is deliberately independent of CORE0_IO_NET: on Pi 5
-     * that flag is set purely by the wired ETH IRQ, so a quiet wired link would
-     * otherwise stall CYW43455 event delivery (escan results, link/PSK events)
-     * for as long as no Ethernet frame arrives.
-     * The cadence is adaptive: SDIO has no host IRQ line here, so every poll
-     * costs real CMD52/CMD53 bus transactions on core 0. Run fast (~125Hz) only
-     * while a scan/association/link is actually in flight, and idle-poll
-     * (~8Hz) otherwise -- a free-running fast cadence pinned core 0 at 99%. */
     if (cyw43_poll_busy()) {
         if ((tick & 7U) == 0)
-            flags |= CORE0_IO_WIFI;
+            (void)airq_post_from(CORE_NET, AIRQ_SRC_WIFI,
+                                 NET_DISPATCH_CAUSE_PACED);
     } else if ((tick & 127U) == 0) {
-        flags |= CORE0_IO_WIFI;
+        (void)airq_post_from(CORE_NET, AIRQ_SRC_WIFI,
+                             NET_DISPATCH_CAUSE_PACED);
     }
+    /* Timer-driven TCP/application progress is an explicit service event, not
+     * a frame poll. It advances already-owned output after peer ACKs even when
+     * no new ingress descriptor is pending. */
+    if ((tick & 7U) == 0U)
+        (void)net_dispatch_publish_service();
     if ((tick % 100U) == 0)
         flags |= CORE0_IO_MAINT;
     /* Dashboard renders at 1Hz. The CPU-clock perf measurement also samples at
@@ -22370,7 +23058,6 @@ static void core0_io_tick_hook(u32 core, u64 tick)
         flags |= CORE0_IO_CPUCLK;
     if (flags) {
         core0_io_flags |= flags;
-        sev();
     }
 }
 
@@ -22396,8 +23083,6 @@ static void core0_eth_irq_handler(void)
     /* Top half: record and return. The record carries the MIP status so the
      * bottom half needs no further hardware read to know why it was woken. */
     (void)airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, core0_eth_irq_last_mip);
-    core0_io_flags |= CORE0_IO_NET | CORE0_IO_TCP;
-    sev();
 }
 
 /* Bottom half for a NIC receive interrupt. Runs in reactor context under the
@@ -22406,9 +23091,9 @@ static void core0_eth_irq_handler(void)
  * gone -- the failure this whole layering exists to prevent. */
 static void airq_eth_rx_handler(const struct airq_record *rec, void *ctx)
 {
-    (void)rec;
     (void)ctx;
-    core0_io_flags |= CORE0_IO_NET | CORE0_IO_TCP;
+    (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                         rec->arg | NET_DISPATCH_CAUSE_IRQ);
 }
 
 /* Cross-core doorbell. HIGH priority because another core is parked waiting on
@@ -22416,16 +23101,16 @@ static void airq_eth_rx_handler(const struct airq_record *rec, void *ctx)
  * not a latency detail. */
 static void airq_fifo_handler(const struct airq_record *rec, void *ctx)
 {
-    (void)rec;
     (void)ctx;
-    core0_io_flags |= CORE0_IO_TCP;
+    if (rec->target_core == CORE_NET)
+        (void)net_dispatch_publish_service();
 }
 
 static void airq_wifi_handler(const struct airq_record *rec, void *ctx)
 {
-    (void)rec;
     (void)ctx;
-    core0_io_flags |= CORE0_IO_WIFI;
+    (void)net_dispatch_publish_transport(NIC_IFACE_WIFI,
+                                         rec->arg | NET_DISPATCH_CAUSE_PACED);
 }
 
 static void airq_console_handler(const struct airq_record *rec, void *ctx)
@@ -22433,6 +23118,52 @@ static void airq_console_handler(const struct airq_record *rec, void *ctx)
     (void)rec;
     (void)ctx;
     core0_io_flags |= CORE0_IO_UART;
+}
+
+static void airq_net_transport_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_transport();
+    if (core0_eth_irq_deferred_quench) {
+        core0_eth_irq_deferred_quench = false;
+        (void)core0_eth_irq_drain_and_quench(false);
+    }
+}
+
+static void airq_net_mac_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_mac();
+}
+
+static void airq_net_ip_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_ip();
+}
+
+static void airq_net_tcp_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_tcp();
+}
+
+static void airq_net_service_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_service(core0_network_service_step);
+}
+
+static void airq_net_egress_handler(const struct airq_record *rec, void *ctx)
+{
+    (void)rec;
+    (void)ctx;
+    net_dispatch_handle_egress();
 }
 
 /* Arm RP1 Ethernet RX → GIC HOST6 delivery to core 0 (the proven sequence,
@@ -22463,23 +23194,17 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
 {
     (void)host_route;
     const u32 eth_bit = 1U << RP1_INT_ETH;
-    u32 passes = 0;
-    bool clear = false;
-    /* Edge model: drain RX until the RP1 raw ETH source de-asserts (MACB has
-     * no more received frames), clearing the MACB ISR/RSR each pass. The MIP
-     * host status is non-latching in edge mode, so we no longer try to clear
-     * it; the GIC edge was already completed by EOI in irq_dispatch. */
-    for (; passes < 8U; passes++) {
-        net_poll();
-        core0_eth_irq_last_macb_isr = macb_irq_ack_rx();
-        dsb();
-        core0_eth_irq_last_mip = rp1_mip_host_status_l();
-        if ((rp1_irq_status_l() & eth_bit) == 0) {
-            clear = true;
-            break;
-        }
-    }
-    core0_eth_irq_quench_passes = passes < 8U ? passes + 1U : passes;
+    /*
+     * ADR-033 transport completion.  This no longer drains RX or invokes
+     * protocol work: the transport FIFO handler has already consumed one
+     * bounded ingress quantum.  We only acknowledge hardware and either
+     * re-arm the edge or publish another bounded transport indication.
+     */
+    core0_eth_irq_last_macb_isr = macb_irq_ack_rx();
+    dsb();
+    core0_eth_irq_last_mip = rp1_mip_host_status_l();
+    bool clear = (rp1_irq_status_l() & eth_bit) == 0U;
+    core0_eth_irq_quench_passes = 1U;
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
     {
         struct macb_diag md;
@@ -22489,54 +23214,19 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
     }
 #endif
     if (clear) {
-        /* Per RP1SPEC.md 6.2 (MSIx configuration registers): "If a peripheral
-         * interrupt is still asserted at the time the IACK register is
-         * written, a new MSIx write is generated." So a frame that completes
-         * DMA in the gap between our "raw line is low" observation and the
-         * IACK write is NOT lost -- RP1 guarantees IACK-while-asserted
-         * produces a fresh MSI. There is no check-then-arm race to close
-         * here; a single unconditional rearm after the drain loop is the
-         * documented-correct sequence. (An earlier version of this function
-         * added a bounded retry loop around this rearm based on an
-         * inferred-not-verified "edge only fires for transitions after
-         * arming" model; that model contradicts the datasheet, and the retry
-         * loop could itself exit on its last iteration without a final
-         * rearm if the line was still high -- a real regression. Removed.) */
         rp1_eth_irq_rearm();
         core0_eth_irq_stall_streak = 0;
         return true;
     }
 
-    /* Did NOT catch up within the 8-pass budget: the raw ETH interrupt
-     * source is still asserted, meaning more frames arrived faster than we
-     * could drain. Re-arming unconditionally here (the previous behaviour)
-     * risks a receive livelock under sustained overload: IRQ fires, drain
-     * falls behind, re-arm anyway, IRQ fires again almost immediately,
-     * repeat -- burning core0's time in IRQ entry/exit rather than making
-     * steady draining progress (see DT_RX_IRQ_QUENCH; live testing showed
-     * rx_owned climbing into the mid-400s while RBQP kept advancing, i.e.
-     * hardware still receiving but software never catching up). After a
-     * few consecutive non-clearing quenches, mask the IRQ line instead of
-     * re-arming and fall back to poll-only: the main reactor's net_poll()
-     * plus macb_rx_recover()/macb_rx_liveness_recover() pairing (see
-     * CORE0_IO_NET handling) is the exact same drain path either way, but
-     * without an interrupt able to re-trigger before it has finished. */
+    /*
+     * Do not self-publish a transport retry here. A level that remains
+     * asserted after its bounded quantum cannot be converted into an
+     * unbounded software-event loop: that was a core-0 hot poll which kept
+     * airq_pending() true forever. Leave it quiesced for the next explicit
+     * hardware interrupt/recovery path instead.
+     */
     core0_eth_irq_stall_streak++;
-    if (core0_eth_irq_stall_streak >= CORE0_ETH_IRQ_STALL_THRESHOLD &&
-        !core0_eth_irq_poll_fallback) {
-        core0_eth_irq_poll_fallback = true;
-        core0_eth_irq_fallback_since_ms = timer_monotonic_ms();
-        core0_eth_irq_fallback_count++;
-        gic_disable_irq(GIC_RP1_ETH_MSI);
-        DTRACE(DTRACE_CAT_REACTOR, DT_RX_IRQ_QUENCH, core0_eth_irq_count,
-               0xFFFFFFFFU /* sentinel: fallback engaged */,
-               core0_eth_irq_fallback_count, 0);
-        http_log_event("eth-irq-poll-fallback", core0_eth_irq_stall_streak,
-                       core0_eth_irq_fallback_count);
-        return false;
-    }
-    if (!core0_eth_irq_poll_fallback)
-        rp1_eth_irq_rearm();
     return false;
 }
 
@@ -22593,7 +23283,9 @@ static bool ksvc_dashboard_poll(void *ctx)
 static bool ksvc_timer_poll(void *ctx)
 {
     (void)ctx;
-    arp_tick();
+    arp_tick_iface(NIC_IFACE_WIRED);
+    if (net_interface_configured(NIC_IFACE_WIFI))
+        arp_tick_iface(NIC_IFACE_WIFI);
     tcp_tick();
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
     /* Guaranteed-cadence hardware-wedge safety net, independent of RX IRQ
@@ -22611,9 +23303,29 @@ static bool ksvc_timer_poll(void *ctx)
     return true;
 }
 
+/*
+ * Final protocol/service stage of ADR-033.  This function is entered only by
+ * AIRQ_SRC_NET_SERVICE after that handler has consumed a service descriptor;
+ * it is never selected by a timer, fallback, or reactor polling flag.
+ */
+static void core0_network_service_step(void)
+{
+    net_service_step();
+    /* Drain OTA/admin independently of the heavier :80 service so a bounded
+     * service event still preserves the management path under application
+     * load. */
+    admin_services_poll();
+    echo_tcp_poll();
+    uhttp_bridge_poll();
+    capsvc_poll();
+    picovm_kernel_fifo_poll();
+    ksvc_run(ksvc_debug_id);
+}
+
 /* Core 0: Kernel services + network */
 NORETURN void core0_main(void) {
     struct core_env *env = core_env_of(CORE_NET);
+    proc_fifo_doorbell_init();
     ui_mode = UI_MODE_NONE;  /* HDMI stays on boot diags */
     ui_selected = 0;
     ui_last_render = 0;
@@ -22660,8 +23372,8 @@ NORETURN void core0_main(void) {
     ui_console_prompt();
 
     timer_set_tick_hook(pios_tick_hook);
-    core0_io_flags = CORE0_IO_NET | CORE0_IO_TCP | CORE0_IO_UART |
-                     CORE0_IO_USB | CORE0_IO_MAINT | CORE0_IO_DASH | CORE0_IO_CPUCLK;
+    core0_io_flags = CORE0_IO_UART | CORE0_IO_USB | CORE0_IO_MAINT |
+                     CORE0_IO_DASH | CORE0_IO_CPUCLK;
     core0_io_sched_start_ticks = sched_counter_ticks();
 #if PIOS_HAS_BOOTINFO_FB
     bool dash_fb_ok = fb_init(1920, 1080) || fb_init(1280, 720) || fb_init(1024, 768);
@@ -22680,18 +23392,11 @@ NORETURN void core0_main(void) {
     }
 #endif
 
-    /* Auto-arm RP1 Ethernet RX → GIC HOST6 so inbound packets wake core 0 via
-     * interrupt instead of relying solely on the periodic poll. The 31 Hz NET
-     * poll is retained as a safety net until IRQ delivery is proven under load. */
+    /* Auto-arm RP1 Ethernet RX → GIC HOST6. Ingress execution is exclusively
+     * the AIRQ/FIFO pipeline; there is no periodic protocol-poll fallback. */
 #if PIOS_HAS_RP1 && PIOS_HAS_GENET
     core0_eth_irq_arm_host(false);
 #endif
-
-    /* Diagnostic-trace phase threshold: only record reactor phases that take
-     * longer than ~50us of work, so the trace ring captures the rare long
-     * (starving) phases instead of being flooded by empty 128Hz polls. */
-    u64 dt_phase_thresh;
-    { u64 f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); dt_phase_thresh = f / 20000U; }
 
     u64 stack_canary_last_check = 0;
     for (;;) {
@@ -22713,7 +23418,7 @@ NORETURN void core0_main(void) {
         }
 
         u32 flags = core0_io_take_flags();
-        if (flags == 0) {
+        if (flags == 0 && !airq_pending(CORE_NET)) {
             watchdog_hw_pet();
             core0_io_wfi_count++;
             u64 idle_start = sched_counter_ticks();
@@ -22730,6 +23435,10 @@ NORETURN void core0_main(void) {
 
         core0_io_wake_count++;
         core0_io_last_flags = flags;
+        for (u32 bit = 0; bit < 8U; bit++) {
+            if (flags & (1U << bit))
+                core0_io_flag_passes[bit]++;
+        }
         /* Core 0's reactor is itself a scheduler: account every dispatch pass
          * so its cost is attributable in the service map alongside the user
          * cores' schedulers. */
@@ -22742,7 +23451,10 @@ NORETURN void core0_main(void) {
          * takeover of core 0. */
         if (airq_pending(CORE_NET)) {
             u64 svc_fifo0 = ksvc_begin(ksvc_fifo0_id);
-            (void)airq_dispatch(CORE_NET, ADRV_PASS_BUDGET_MS);
+            u32 airq_done = airq_dispatch(CORE_NET, ADRV_PASS_BUDGET_MS);
+            core0_airq_dispatch_passes++;
+            if (airq_done == 0U)
+                core0_airq_empty_passes++;
             ksvc_end(ksvc_fifo0_id, svc_fifo0, false);
             flags |= core0_io_flags;
             core0_io_flags = 0;
@@ -22750,101 +23462,6 @@ NORETURN void core0_main(void) {
 
         /* Scheduled asynchronous driver work (bounded, admission-controlled). */
         adrv_service();
-
-        if (flags & CORE0_IO_NET) {
-            u64 svc_start = ksvc_begin(ksvc_net_id);
-            u64 dt_t0 = sched_counter_ticks();
-            u32 got = net_poll();
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
-            /* Self-heal a latched RX-overrun stall (BNA/OVR). A burst that
-             * outran the drain leaves GEM with the ring full and RX DMA halted;
-             * without this the NIC stays wedged (rx_idx frozen) even after the
-             * load stops. Recover, then drain the freshly-restarted ring. */
-            if (macb_rx_recover())
-                got += net_poll();
-            else if (macb_rx_hole_recover())
-                got += net_poll();
-            /* Also self-heal a non-BNA/OVR RX halt (which the status check above
-             * cannot see): if the RX-liveness watchdog (activity-gated) fires,
-             * rebuild the ring and re-drain. */
-            else if (macb_rx_liveness_recover(timer_monotonic_ms()))
-                got += net_poll();
-#endif
-            /* Chain CORE0_IO_TCP directly off real MAC-layer completion
-             * (hardirq -> softirq handoff), rather than waiting for TCP's own
-             * independent periodic tick: if net_poll() actually delivered new
-             * frames this pass, the TCP-level connection/app-layer services
-             * (admin/OTA, echo, :81 bridge) have new segment data to react to
-             * right now, and the periodic tick could be up to 8 ticks away.
-             * This mirrors what core0_eth_irq_handler already does for the
-             * IRQ-driven wake path (it sets both bits together in one step);
-             * this closes the same gap for the poll/deferred-quench-driven
-             * path. TCP's own periodic tick (see core0_io_tick_hook) is still
-             * needed independently for TX-side pumping when there's pending
-             * output but no new RX to chain off of. */
-            if (got > 0)
-                core0_io_flags |= CORE0_IO_TCP;
-            dns_poll();
-            /* Consume the deferred-quench request clear-before-work, not
-             * clear-after: the old order (drain, then unconditionally clear)
-             * has a real lost-wakeup window -- core0_eth_irq_handler runs on
-             * this same core and can fire between the drain call returning
-             * and the "= false" store, setting the flag true only for it to
-             * be immediately clobbered back to false by mainline, silently
-             * dropping that request. Clearing first and looping while the
-             * flag keeps getting re-set (by a fresh IRQ arriving mid-drain)
-             * closes that window: any such IRQ causes another drain pass
-             * instead of being lost. */
-            while (core0_eth_irq_deferred_quench) {
-                core0_eth_irq_deferred_quench = false;
-                core0_eth_irq_drain_and_quench(false);
-            }
-            if (cyw43_runtime_ready())
-                cyw43_poll();
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
-            /* Recovered from a poll-only livelock fallback: after a cooldown
-             * (during which this same net_poll()/macb_rx_recover() pairing
-             * above is what's been draining the ring, IRQ-free), try
-             * IRQ-driven wake again. If the overload was transient this
-             * restores lower-latency wake; if it recurs immediately the
-             * stall-streak counter will just re-trip the fallback. */
-            if (core0_eth_irq_poll_fallback &&
-                timer_monotonic_ms() - core0_eth_irq_fallback_since_ms > CORE0_ETH_IRQ_FALLBACK_COOLDOWN_MS) {
-                core0_eth_irq_poll_fallback = false;
-                core0_eth_irq_stall_streak = 0;
-                core0_eth_irq_arm_host(false);
-                http_log_event("eth-irq-poll-fallback-end", core0_eth_irq_fallback_count, 0);
-            }
-#endif
-            u64 dt_net = sched_counter_ticks() - dt_t0;
-            if (dt_net > dt_phase_thresh)
-                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_NET, dt_net, flags, 0, 0);
-            ksvc_end(ksvc_net_id, svc_start, false);
-        }
-
-        if (flags & CORE0_IO_TCP) {
-            u64 svc_start = ksvc_begin(ksvc_tcp_id);
-            /* Drain the admin services (incl. the OTA upload stream) FIRST and
-             * independently of the heavy multi-connection :80 handler, so a bulk
-             * OTA upload is never starved of core0 time by :80 load. */
-            u64 dt_a0 = sched_counter_ticks();
-            admin_services_poll();
-            u64 dt_a1 = sched_counter_ticks();
-            if (dt_a1 - dt_a0 > dt_phase_thresh)
-                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_ADMIN, dt_a1 - dt_a0, 0, 0, 0);
-            echo_tcp_poll();
-            u64 dt_echo = sched_counter_ticks() - dt_a1;
-            if (dt_echo > dt_phase_thresh)
-                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_ECHO, dt_echo, 0, 0, 0);
-            u64 dt_http0 = sched_counter_ticks();
-            uhttp_bridge_poll();   /* userland :81 request/response pump */
-            u64 dt_http = sched_counter_ticks() - dt_http0;
-            if (dt_http > dt_phase_thresh)
-                DTRACE(DTRACE_CAT_REACTOR, DT_RX_PHASE_HTTP, dt_http, 0, 0, 0);
-            capsvc_poll();   /* generic capsule-service dispatcher (docs/net_capsule_fifo.md) */
-            ksvc_end(ksvc_tcp_id, svc_start, false);
-            ksvc_run(ksvc_debug_id);
-        }
 
         if (flags & (CORE0_IO_UART | CORE0_IO_USB)) {
             u64 svc_start = ksvc_begin(ksvc_ui_id);
@@ -22901,13 +23518,15 @@ NORETURN void core0_main(void) {
             ksvc_end(ksvc_ui_id, svc_start, false);
         }
 
-        if (flags & CORE0_IO_WIFI) {
-            if (cyw43_runtime_ready())
-                cyw43_poll();
-        }
-
         if (flags & CORE0_IO_MAINT) {
             ksvc_run(ksvc_timer_id);
+            /* Once we have run cleanly for a while, declare the boot healthy so
+             * crash-loop protection re-arms for the next genuine fault. */
+            if (!crash_boot_marked_healthy &&
+                timer_monotonic_ms() >= CRASH_HEALTHY_UPTIME_MS) {
+                crash_boot_marked_healthy = true;
+                exception_crash_mark_healthy();
+            }
         }
 
         if ((flags & CORE0_IO_DASH) && ui_mode == UI_MODE_NONE)
@@ -22976,6 +23595,7 @@ NORETURN void core1_main(void) {
     core_mark_online(CORE_USERM, 3);
     timer_init(PROC_PREEMPT_TIMER_HZ);
     core_mark_online(CORE_USERM, 4);
+    proc_mark_core_hosts_process(CORE_USERM);
     proc_preempt_init(PROC_PREEMPT_TIMER_HZ, PROC_PREEMPT_QUANTUM_MS);
     timer_set_tick_hook(pios_tick_hook);
     core_mark_online(CORE_USERM, 5);
@@ -22989,8 +23609,6 @@ extern const u8 user_httpd_vm_start[];
 extern const u8 user_httpd_vm_end[];
 extern const u8 user_httpd_native_start[];
 extern const u8 user_httpd_native_end[];
-extern const u8 user_el0_probe_start[];
-extern const u8 user_el0_probe_end[];
 extern const u8 user_el0_pico_start[];
 extern const u8 user_el0_pico_end[];
 /* Generic capsvc capsule host (src/user_capsvc_host_payload.S). One flat
@@ -23665,6 +24283,31 @@ void kernel_main(void) {
             uart_init();
             uart_puts("\n[uart] RP1 UART online\n");
             bp_ok("[uart] RP1 UART online");
+            bp_log("[i2c] RP1 I2C1 probe...");
+            if (rp1_i2c_init(100000U))
+                bp_ok("[i2c] RP1 I2C1 ready");
+            else
+                bp_warn("[i2c] RP1 I2C1 unavailable");
+            bp_log("[spi] RP1 SPI probe...");
+            u32 spi_present = 0U;
+            u32 spi_quad = 0U;
+            for (u32 spi = 0U; spi < RP1_SPI_COUNT; spi++) {
+                if (!rp1_spi_probe(spi))
+                    continue;
+                struct rp1_spi_diag sd;
+                rp1_spi_diag_snapshot(spi, &sd);
+                spi_present++;
+                if (sd.enhanced_frf)
+                    spi_quad++;
+            }
+            if (spi_present != 0U)
+                bp_ok("[spi] RP1 SPI cores present");
+            else
+                bp_warn("[spi] RP1 SPI cores unavailable");
+            if (spi_quad != 0U)
+                bp_ok("[qspi] enhanced SPI capability present");
+            else
+                bp_warn("[qspi] enhanced SPI capability unavailable");
             bp_log("[usb] registering storage+kbd...");
             usb_storage_register();
             usb_kbd_register();
@@ -23679,6 +24322,16 @@ void kernel_main(void) {
     } else {
         bp_err("[pcie] PCIe init FAILED"); bp_done(2, false); bp_done(3, false);
     }
+#elif PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    bp_log("[usb] registering storage+kbd...");
+    usb_storage_register();
+    usb_kbd_register();
+    bp_log("[usb] usb_init (QEMU PCI xHCI)...");
+    usb_ok = usb_init();
+    if (usb_ok) bp_ok("[usb] QEMU xHCI online");
+    else bp_warn("[usb] QEMU xHCI unavailable");
+    bp_done(2, true);
+    bp_done(3, true);
 #else
     bp_warn("[pcie] skipped on this platform");
     bp_done(2, true);
@@ -23689,6 +24342,37 @@ void kernel_main(void) {
     /* IPC */
     bp_log("[fifo] fifo_init_all...");
     fifo_init_all();
+    /*
+     * Bring the ADR-033 queues online before net_init().  Even bootstrap ARP
+     * announcement therefore follows the owned-span egress FIFO rather than
+     * bypassing the final MAC stage.  AIRQ is not dispatched until core0_main,
+     * after the service registry is ready.
+     */
+    airq_init();
+    airq_set_now_hook(timer_monotonic_ms);
+    net_dispatch_init();
+    (void)airq_register(AIRQ_SRC_ETH_RX, AIRQ_PRIO_CRITICAL, CORE_NET,
+                        airq_eth_rx_handler, NULL);
+    for (u32 c = 0U; c < AIRQ_CORES; c++)
+        (void)airq_register(AIRQ_SRC_FIFO_CORE(c), AIRQ_PRIO_HIGH, c,
+                            airq_fifo_handler, NULL);
+    (void)airq_register(AIRQ_SRC_WIFI, AIRQ_PRIO_NORMAL, CORE_NET,
+                        airq_wifi_handler, NULL);
+    (void)airq_register(AIRQ_SRC_CONSOLE, AIRQ_PRIO_LOW, CORE_NET,
+                        airq_console_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_TRANSPORT, AIRQ_PRIO_CRITICAL, CORE_NET,
+                        airq_net_transport_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_MAC, AIRQ_PRIO_HIGH, CORE_NET,
+                        airq_net_mac_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_IP, AIRQ_PRIO_HIGH, CORE_NET,
+                        airq_net_ip_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_TCP, AIRQ_PRIO_HIGH, CORE_NET,
+                        airq_net_tcp_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_SERVICE, AIRQ_PRIO_HIGH, CORE_NET,
+                        airq_net_service_handler, NULL);
+    (void)airq_register(AIRQ_SRC_NET_EGRESS, AIRQ_PRIO_HIGH, CORE_NET,
+                        airq_net_egress_handler, NULL);
+    net_dispatch_enable();
     dtrace_init();
     coredump_init();
     bp_log("[ipc] ipc_queue_init...");
@@ -23696,6 +24380,7 @@ void kernel_main(void) {
     bp_log("[ipc] ipc_stream_init...");
     ipc_stream_init();
     ipc_proc_init();
+    picovm_kernel_fifo_init();
     lease_init();   /* lease fabric (P0): descriptor-ownership pool init */
     ota_staging_init();   /* pre-allocate OTA RAM staging so uploads don't block core0 on SD */
     http_conns_init();    /* allocate the multi-connection HTTP :80 pool */
@@ -23753,12 +24438,17 @@ void kernel_main(void) {
                 uart_puts("\n");
             }
             watchdog_hw_pet();
+            bp_log("[walfs] crashdump archive...");
+            if (crashdump_archive_pending())
+                bp_warn("[crash] previous boot ended in a PiSOD — archived to "
+                        CRASHDUMP_PACK_PATH);
+            watchdog_hw_pet();
             bp_log("[walfs] principal_init...");
-            principal_init();
-            bp_log("[walfs] picowal_db_init...");
+            principal_init();            bp_log("[walfs] picowal_db_init...");
             if (!picowal_db_init()) {
                 bp_warn("[walfs] picowal_db init FAILED — continuing");
             }
+            ppos_provider_install();
             watchdog_hw_pet();
             bp_log("[walfs] boot_policy_verify...");
             boot_policy_verify_or_seed();
@@ -23881,7 +24571,16 @@ void kernel_main(void) {
                                           "[vc] native probe disabled");
     bp_log("[gpu] tensor_init...");
     tensor_init();
-    bp_ok("[gpu] tensor compute ready");
+    struct tensor_boot_accel_status accel_boot;
+    bool accel_boot_ok = tensor_boot_enable_accelerators(&accel_boot);
+    if (!accel_boot.supported) {
+        bp_ok("[gpu] tensor CPU/NEON ready; V3D unavailable");
+    } else if (accel_boot_ok) {
+        bp_ok("[gpu] PicoScript QPU superinstructions verified");
+    } else {
+        bp_warn("[gpu] QPU proof incomplete; measured CPU fallbacks retained");
+    }
+    watchdog_hw_pet();
 
     /* Core 0 environment */
     bp_log("[core] core_env_init...");
@@ -23900,23 +24599,6 @@ void kernel_main(void) {
      * the very work that starves the board when it goes wrong. */
     ksvc_sched0_id = ksvc_register("sched-core0", KSVC_KIND_POLL, CORE_NET, 110);
     ksvc_fifo0_id = ksvc_register("fifo-core0", KSVC_KIND_POLL, CORE_NET, 105);
-
-    /* Software interrupt privilege levels. Hardware handlers only enqueue;
-     * these handlers run in reactor context under the dispatcher's budget. */
-    airq_init();
-    airq_set_now_hook(timer_monotonic_ms);
-    (void)airq_register(AIRQ_SRC_ETH_RX, AIRQ_PRIO_CRITICAL, CORE_NET,
-                        airq_eth_rx_handler, NULL);
-    /* One FIFO doorbell source per target core: the record must land on the
-     * core that will service it. Cores 1-3 drain theirs from airq_quantum()
-     * in their scheduler loop. */
-    for (u32 c = 0U; c < AIRQ_CORES; c++)
-        (void)airq_register(AIRQ_SRC_FIFO_CORE(c), AIRQ_PRIO_HIGH, c,
-                            airq_fifo_handler, NULL);
-    (void)airq_register(AIRQ_SRC_WIFI, AIRQ_PRIO_NORMAL, CORE_NET,
-                        airq_wifi_handler, NULL);
-    (void)airq_register(AIRQ_SRC_CONSOLE, AIRQ_PRIO_LOW, CORE_NET,
-                        airq_console_handler, NULL);
 
     /* Asynchronous driver framework: same clock, watchdog petted only on
      * proven progress, and the liveness hook that keeps the wired fail-safe

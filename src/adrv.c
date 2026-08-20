@@ -15,7 +15,8 @@
 
 static struct adrv_op adrv_ops[ADRV_MAX_OPS];
 static struct adrv_diag adrv_diag_state ALIGNED(64);
-static struct adrv_stamp adrv_call_stamp ALIGNED(64);
+static volatile struct adrv_stamp adrv_call_stamp ALIGNED(64);
+static volatile u32 adrv_supervisor_overruns ALIGNED(64);
 static char adrv_worst_name[ADRV_NAME_MAX];
 
 /* Step functions refused re-entry after breaking their schedule. Hardware side
@@ -32,7 +33,7 @@ void adrv_set_now_hook(u64 (*now_ms)(void)) { adrv_now_hook = now_ms; }
 void adrv_set_watchdog_hook(void (*pet)(void)) { adrv_watchdog_hook = pet; }
 void adrv_set_liveness_hook(void (*liveness)(void)) { adrv_liveness_hook = liveness; }
 
-static void adrv_name_copy(char *dst, const char *src)
+static void adrv_name_copy(volatile char *dst, const char *src)
 {
     u32 i = 0U;
     if (src) {
@@ -53,7 +54,9 @@ void adrv_init(void)
         adrv_ops[i].generation = generation + 1U;
     }
     memset(&adrv_diag_state, 0, sizeof(adrv_diag_state));
-    memset(&adrv_call_stamp, 0, sizeof(adrv_call_stamp));
+    for (u32 i = 0U; i < sizeof(adrv_call_stamp); i++)
+        ((volatile u8 *)(usize)&adrv_call_stamp)[i] = 0U;
+    adrv_supervisor_overruns = 0U;
     memset(adrv_quarantined, 0, sizeof(adrv_quarantined));
     memset(adrv_worst_name, 0, sizeof(adrv_worst_name));
     adrv_call_seq = 0ULL;
@@ -345,6 +348,7 @@ void adrv_diag_snapshot(struct adrv_diag *out)
     if (!out)
         return;
     *out = adrv_diag_state;
+    out->supervisor_overruns = adrv_supervisor_overruns;
 }
 
 void adrv_stamp_snapshot(struct adrv_stamp *out)
@@ -371,7 +375,7 @@ bool adrv_supervise(u64 now_ms)
      * the corruption these invariants exist to prevent. The watchdog remains
      * the escalation path, and it is not being petted while this step stalls. */
     adrv_call_stamp.overruns_seen++;
-    adrv_diag_state.supervisor_overruns++;
+    adrv_supervisor_overruns++;
     return true;
 }
 

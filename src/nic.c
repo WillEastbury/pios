@@ -20,6 +20,7 @@
 #include "core_env.h"
 #include "platform.h"
 #include "pioscap.h"
+#include "net_dispatch.h"
 #if PIOS_HAS_WIFI_SDIO2
 #include "wifi_nic.h"
 #include "cyw43.h"
@@ -28,8 +29,11 @@
 static bool tx_checksum_offload;
 static bool rx_checksum_offload;
 static bool tso_enabled;
+static bool iface_tx_checksum_offload[NIC_IFACE_MAX];
+static bool iface_rx_checksum_offload[NIC_IFACE_MAX];
+static bool iface_tso_enabled[NIC_IFACE_MAX];
 static bool packet_dump_enabled;
-static u32 local_ipv4;
+static u32 local_ipv4[NIC_IFACE_MAX];
 static nic_packet_counters_t pkt_counts;
 
 /* ── Pluggable NIC backend registry ───────────────────────────────────────
@@ -125,10 +129,39 @@ static const struct nic_ops *const nic_backends[] = {
     &nic_backend_virtio,
 };
 
-static const struct nic_ops *g_nic;     /* active backend, or NULL */
+static const struct nic_ops *g_nic;     /* default backend, or NULL */
+static const struct nic_ops *iface_backends[NIC_IFACE_MAX];
+static bool iface_initialized[NIC_IFACE_MAX];
+
+static const struct nic_ops *nic_ops_for(nic_iface_t iface)
+{
+    if (iface >= NIC_IFACE_MAX)
+        return NULL;
+    return iface_backends[iface];
+}
 
 bool nic_active(void) { return g_nic != 0; }
 const char *nic_active_name(void) { return g_nic ? g_nic->name : "none"; }
+bool nic_iface_active(nic_iface_t iface)
+{
+    return iface < NIC_IFACE_MAX && iface_initialized[iface] &&
+           iface_backends[iface] != NULL;
+}
+
+const char *nic_iface_name(nic_iface_t iface)
+{
+    const struct nic_ops *ops = nic_ops_for(iface);
+    return ops ? ops->name : "none";
+}
+
+nic_iface_t nic_default_iface(void)
+{
+    if (nic_iface_active(NIC_IFACE_WIRED))
+        return NIC_IFACE_WIRED;
+    if (nic_iface_active(NIC_IFACE_WIFI))
+        return NIC_IFACE_WIFI;
+    return NIC_IFACE_ANY;
+}
 
 #define NIC_HDMI_TEXT_PANELS 0
 
@@ -268,7 +301,10 @@ static bool mac_is_broadcast(const u8 *p) {
 }
 
 static bool ip_is_our_debug_addr(const u8 *p) {
-    return local_ipv4 && be32(p) == local_ipv4;
+    return (local_ipv4[NIC_IFACE_WIRED] &&
+            be32(p) == local_ipv4[NIC_IFACE_WIRED]) ||
+           (local_ipv4[NIC_IFACE_WIFI] &&
+            be32(p) == local_ipv4[NIC_IFACE_WIFI]);
 }
 
 static void fb_tcp_flags(u8 flags) {
@@ -394,13 +430,16 @@ static bool filter_rule_matches(const nic_filter_rule_t *rule, const struct filt
     return true;
 }
 
-static bool nic_filter_allows(u8 direction, const u8 *frame, u32 len) {
+static bool nic_filter_allows(u8 direction, const u8 *frame, u32 len,
+                              nic_iface_t iface) {
     struct filter_packet pkt;
     filter_parse_packet(frame, len, &pkt);
 
     for (u32 i = 0; i < filter_rule_count; i++) {
         const nic_filter_rule_t *rule = &filter_rules[i];
         if (!(rule->direction & direction))
+            continue;
+        if (rule->iface != NIC_IFACE_ANY && rule->iface != iface)
             continue;
         if (!filter_rule_matches(rule, &pkt))
             continue;
@@ -562,7 +601,11 @@ static void flow_record_packet(bool tx, const u8 *frame, u32 len)
     u16 et = be16(frame + 12);
     if (et == 0x0806 && len >= 42) {
         const u8 *arp = frame + 14;
-        if (!tx && be16(arp + 6) == 1 && local_ipv4 && be32(arp + 24) == local_ipv4)
+        if (!tx && be16(arp + 6) == 1 &&
+            ((local_ipv4[NIC_IFACE_WIRED] &&
+              be32(arp + 24) == local_ipv4[NIC_IFACE_WIRED]) ||
+             (local_ipv4[NIC_IFACE_WIFI] &&
+              be32(arp + 24) == local_ipv4[NIC_IFACE_WIFI])))
             return;
         key.proto = FLOW_PROTO_ARP;
         key.subtype = be16(arp + 6);
@@ -889,8 +932,9 @@ static void nic_count_packet(bool tx, const u8 *frame, u32 len)
     nic_render_counter_panel();
 }
 
-static bool nic_drop_arp_broadcast_not_for_us(const u8 *frame, u32 len) {
-    if (!local_ipv4 || len < 42)
+static bool nic_drop_arp_broadcast_not_for_us(nic_iface_t iface,
+                                              const u8 *frame, u32 len) {
+    if (iface >= NIC_IFACE_MAX || !local_ipv4[iface] || len < 42)
         return false;
     if (!mac_is_broadcast(frame) || be16(frame + 12) != 0x0806)
         return false;
@@ -899,7 +943,7 @@ static bool nic_drop_arp_broadcast_not_for_us(const u8 *frame, u32 len) {
     if (be16(arp + 6) != 1)  /* ARP request */
         return false;
 
-    return be32(arp + 24) != local_ipv4;
+    return be32(arp + 24) != local_ipv4[iface];
 }
 
 /* Diagnostic: dump every packet to the framebuffer. The first line decodes
@@ -1031,6 +1075,9 @@ bool nic_init(void)
     tx_checksum_offload = false;
     rx_checksum_offload = false;
     tso_enabled = false;
+    simd_zero(iface_tx_checksum_offload, sizeof(iface_tx_checksum_offload));
+    simd_zero(iface_rx_checksum_offload, sizeof(iface_rx_checksum_offload));
+    simd_zero(iface_tso_enabled, sizeof(iface_tso_enabled));
     packet_dump_enabled = false;
     simd_zero(&pkt_counts, sizeof(pkt_counts));
     simd_zero(flow_table, sizeof(flow_table));
@@ -1038,12 +1085,16 @@ bool nic_init(void)
     pioscap_init();
 
     g_nic = 0;
+    simd_zero(iface_backends, sizeof(iface_backends));
+    simd_zero(iface_initialized, sizeof(iface_initialized));
     for (u32 i = 0; i < sizeof(nic_backends) / sizeof(nic_backends[0]); i++) {
         const struct nic_ops *be = nic_backends[i];
         if (!be->probe || !be->probe())
             continue;
         if (be->init && be->init()) {
             g_nic = be;
+            iface_backends[NIC_IFACE_WIRED] = be;
+            iface_initialized[NIC_IFACE_WIRED] = true;
             return true;
         }
         /* probe matched but init failed: keep trying lower-priority backends. */
@@ -1054,10 +1105,11 @@ bool nic_init(void)
 bool nic_init_wifi(void)
 {
 #if PIOS_HAS_WIFI_SDIO2
-    /* Explicit, on-demand bring-up only. Preserve the active wired backend
-     * until association succeeds and nic_activate_wifi_loaded() is called. */
+    /* Explicit, on-demand bring-up only. Preserve the active wired backend. */
     if (!nic_backend_wifi.init || !nic_backend_wifi.init())
         return false;
+    iface_backends[NIC_IFACE_WIFI] = &nic_backend_wifi;
+    iface_initialized[NIC_IFACE_WIFI] = false;
     return true;
 #else
     return false;
@@ -1070,7 +1122,8 @@ bool nic_activate_wifi_loaded(void)
     if (!cyw43_is_connected())
         return false;
     wifi_nic_adopt_loaded();
-    g_nic = &nic_backend_wifi;
+    iface_backends[NIC_IFACE_WIFI] = &nic_backend_wifi;
+    iface_initialized[NIC_IFACE_WIFI] = true;
     return true;
 #else
     return false;
@@ -1080,15 +1133,18 @@ bool nic_activate_wifi_loaded(void)
 bool nic_is_wifi(void)
 {
 #if PIOS_HAS_WIFI_SDIO2
-    return g_nic == &nic_backend_wifi;
+    return nic_iface_active(NIC_IFACE_WIFI);
 #else
     return false;
 #endif
 }
 
-bool nic_send(const u8 *frame, u32 len)
+bool nic_send_owned_on(nic_iface_t iface, const u8 *frame, u32 len)
 {
-    if (!nic_filter_allows(NIC_FILTER_DIR_OUT, frame, len)) {
+    const struct nic_ops *ops = nic_ops_for(iface);
+    if (!ops || !ops->send)
+        return false;
+    if (!nic_filter_allows(NIC_FILTER_DIR_OUT, frame, len, iface)) {
         filter_tx_dropped++;
         pkt_counts.tx_filter_drop++;
         pkt_counts.firewalled++;
@@ -1101,14 +1157,27 @@ bool nic_send(const u8 *frame, u32 len)
     if (packet_dump_enabled)
         fb_pkt_dump('T', 0x00FFFF80, frame, len);
     pioscap_tx(frame, len);
-    bool ok = (g_nic && g_nic->send) ? g_nic->send(frame, len) : false;
+    bool ok = ops->send(frame, len);
     if (ok) pkt_counts.processed++;
     else    pkt_counts.dropped++;
     nic_render_counter_panel();
     return ok;
 }
 
-bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_len)
+bool nic_send_on(nic_iface_t iface, const u8 *frame, u32 len)
+{
+    if (net_dispatch_enabled())
+        return net_dispatch_submit_egress(iface, frame, len);
+    return nic_send_owned_on(iface, frame, len);
+}
+
+bool nic_send(const u8 *frame, u32 len)
+{
+    return nic_send_on(nic_default_iface(), frame, len);
+}
+
+static bool nic_send_parts_impl(nic_iface_t iface, const void *head,
+                                u32 head_len, const void *tail, u32 tail_len)
 {
     static u8 tx_frame[2048] ALIGNED(64);
     u32 total = head_len + tail_len;
@@ -1118,31 +1187,27 @@ bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_l
         simd_memcpy(tx_frame, head, head_len);
     if (tail_len)
         simd_memcpy(tx_frame + head_len, tail, tail_len);
-    if (!nic_filter_allows(NIC_FILTER_DIR_OUT, tx_frame, total)) {
-        filter_tx_dropped++;
-        pkt_counts.tx_filter_drop++;
-        pkt_counts.firewalled++;
-        nic_render_counter_panel();
-        fb_filter_drop('T', filter_tx_dropped);
-        return false;
-    }
-    nic_record_tx_checksum_path(tx_frame, total);
-    nic_count_packet(true, tx_frame, total);
-    if (packet_dump_enabled)
-        fb_pkt_dump('T', 0x00FFFF80, tx_frame, total);
-    pioscap_tx(tx_frame, total);
-    bool ok = (g_nic && g_nic->send) ? g_nic->send(tx_frame, total) : false;
-    if (ok) pkt_counts.processed++;
-    else    pkt_counts.dropped++;
-    nic_render_counter_panel();
-    return ok;
+    return nic_send_on(iface, tx_frame, total);
 }
 
-bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
+bool nic_send_parts_on(nic_iface_t iface, const void *head, u32 head_len,
+                       const void *tail, u32 tail_len)
+{
+    return nic_send_parts_impl(iface, head, head_len, tail, tail_len);
+}
+
+bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_len)
+{
+    return nic_send_parts_impl(nic_default_iface(), head, head_len,
+                               tail, tail_len);
+}
+
+bool nic_recv_on(nic_iface_t iface, u8 *frame, u32 *len, bool *checksum_trusted)
 {
     if (checksum_trusted)
         *checksum_trusted = false;
-    if (!g_nic || !g_nic->recv) {
+    const struct nic_ops *ops = nic_ops_for(iface);
+    if (!ops || !ops->recv) {
         (void)frame;
         (void)len;
         return false;
@@ -1150,13 +1215,13 @@ bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
 
     for (u32 attempt = 0; attempt < 16; attempt++) {
         bool rx_trusted = false;
-        bool ok = g_nic->recv(frame, len, &rx_trusted);
+        bool ok = ops->recv(frame, len, &rx_trusted);
         if (!ok)
             return false;
         if (checksum_trusted)
             *checksum_trusted = rx_trusted;
 
-        if (nic_drop_arp_broadcast_not_for_us(frame, *len)) {
+        if (nic_drop_arp_broadcast_not_for_us(iface, frame, *len)) {
             filter_rx_dropped++;
             pkt_counts.rx_arp_not_us++;
             pkt_counts.dropped++;
@@ -1165,7 +1230,7 @@ bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
             continue;
         }
 
-        if (!nic_filter_allows(NIC_FILTER_DIR_IN, frame, *len)) {
+        if (!nic_filter_allows(NIC_FILTER_DIR_IN, frame, *len, iface)) {
             filter_rx_dropped++;
             pkt_counts.rx_filter_drop++;
             pkt_counts.firewalled++;
@@ -1191,12 +1256,31 @@ bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
     return false;
 }
 
+bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)
+{
+    return nic_recv_on(nic_default_iface(), frame, len, checksum_trusted);
+}
+
 void nic_get_mac(u8 *mac)
 {
     if (g_nic && g_nic->get_mac)
         g_nic->get_mac(mac);
     else if (mac)
         simd_zero(mac, 6);
+}
+
+void nic_get_mac_for(nic_iface_t iface, u8 *mac)
+{
+    const struct nic_ops *ops = nic_ops_for(iface);
+    if (ops && ops->get_mac)
+        ops->get_mac(mac);
+    else if (mac)
+        simd_zero(mac, 6);
+}
+
+bool nic_wifi_active(void)
+{
+    return nic_iface_active(NIC_IFACE_WIFI);
 }
 
 bool nic_link_up(void)
@@ -1224,9 +1308,39 @@ void nic_set_tx_checksum_offload(bool enable)
     if (g_nic && g_nic->set_tx_csum) {
         tx_checksum_offload = enable;
         g_nic->set_tx_csum(enable);
+        iface_tx_checksum_offload[nic_default_iface()] = enable;
     } else {
         tx_checksum_offload = false;
     }
+}
+
+bool nic_tx_checksum_offload_enabled_for(nic_iface_t iface)
+{
+    const struct nic_ops *ops = nic_ops_for(iface);
+    if (!ops || !ops->tx_csum_enabled)
+        return false;
+    iface_tx_checksum_offload[iface] =
+        iface_tx_checksum_offload[iface] && ops->tx_csum_enabled();
+    return iface_tx_checksum_offload[iface];
+}
+
+bool nic_rx_checksum_offload_enabled_for(nic_iface_t iface)
+{
+    const struct nic_ops *ops = nic_ops_for(iface);
+    if (!ops || !ops->rx_csum_enabled)
+        return false;
+    iface_rx_checksum_offload[iface] =
+        iface_rx_checksum_offload[iface] && ops->rx_csum_enabled();
+    return iface_rx_checksum_offload[iface];
+}
+
+bool nic_tso_enabled_for(nic_iface_t iface)
+{
+    const struct nic_ops *ops = nic_ops_for(iface);
+    if (!ops || !ops->tso_enabled)
+        return false;
+    iface_tso_enabled[iface] = ops->tso_enabled();
+    return iface_tso_enabled[iface];
 }
 
 void nic_set_rx_checksum_offload(bool enable)
@@ -1236,6 +1350,7 @@ void nic_set_rx_checksum_offload(bool enable)
     if (g_nic && g_nic->set_rx_csum) {
         rx_checksum_offload = enable;
         g_nic->set_rx_csum(enable);
+        iface_rx_checksum_offload[nic_default_iface()] = enable;
     } else {
         rx_checksum_offload = false;
     }
@@ -1274,7 +1389,13 @@ bool nic_tso_enabled(void)
 
 void nic_set_local_ipv4(u32 ip)
 {
-    local_ipv4 = ip;
+    local_ipv4[nic_default_iface()] = ip;
+}
+
+void nic_set_local_ipv4_for(nic_iface_t iface, u32 ip)
+{
+    if (iface == NIC_IFACE_WIRED || iface == NIC_IFACE_WIFI)
+        local_ipv4[iface] = ip;
 }
 
 void nic_set_packet_dump(bool enable)

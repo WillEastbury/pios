@@ -305,6 +305,13 @@ These are not bugs to be fixed one at a time. They are the absence of an abstrac
   core without anyone deciding to. Hardware is **trigger level 0**: the top half acknowledges the
   line and posts a bounded record. Every executable privilege level sits *above* it in software,
   dispatched in scheduled context under budget. Registering work at level 0 is refused outright.
+- **Core-0 protocol work is FIFO/software-interrupt-only.** MAC/SDIO hardware IRQs and bounded
+  transport polls may only publish an immutable ingress descriptor to their FIFO, then raise the
+  matching core-0 software interrupt. The core-0 software handler dequeues that FIFO and alone
+  invokes Ethernet, ARP, IP, TCP, and service work. Timers/polls may recover hardware but must
+  never directly fire protocol processing. `core0_eth_irq_handler()`'s current direct
+  `CORE0_IO_NET` path is transitional debt: replace it with the FIFO-triggered software handler;
+  apply the same rule to IP and WiFi ingress.
 - **User cores need exactly one software interrupt: the quantum.** Not a zoo of SGI types — one
   message meaning *"drain your inbound queue, then run the scheduler with what's left."* The drain
   is capped at a fraction of the quantum, so the scheduler is guaranteed a share and a queue flood
@@ -668,9 +675,10 @@ bring-up path must not do. Callers that must not block check transmit credit *be
 - PicoVM's native hook accelerates the BitNet-critical `Tensor.DotI8` and `Tensor.MatVecI8`
   operations through verified QPU float staging; i8 products/sums stay exact within the reviewed
   1024-element bound. Every other PicoScript Tensor primitive retains the pure-C fallback.
-- Acceleration remains quarantined after boot. Run `tensor picoscript`; it verifies cache
-  coherence, Add/Mul/ReLU kernels, two consecutive QPU dots, PicoVM host dispatch, and a two-row
-  MatVec before enabling. Only then does the workbench show **V3D QPU PicoScript enabled**.
+- ADR-027 now runs accelerator proofs during boot. It verifies cache coherence,
+  Add/Mul/ReLU kernels, QPU dots, PicoVM host dispatch, batched MatVec/BitLinear,
+  the compiled BitNet PicoScript fixture, Media, and QPU VM execution 1 before
+  publishing dashboard state. Failures retain deterministic CPU/NEON fallback.
 - Live Pi5 image `v20260724.235015`: guarded test passes repeatedly, kernel selftests 14/14,
   `error=0`, `rx_wedge=0`, `rx_hole_recover=0`.
 - QEMU still has no V3D. Final regression is 29/29 plus load battery PASS with the hook disabled
@@ -682,6 +690,11 @@ bring-up path must not do. Callers that must not block check transmit credit *be
   (`(7 + -3) * 11 = 44`) but Mesa lowers integer multiply to `umul24`. Measured on Pi5:
   CPU ~1 ns vs QPU ~4.42 us per block. Fine-grained interpreter replacement is not viable; only
   large, range-proven straight-line batches could amortize dispatch.
+- Follow-up batching on 2026-08-11 tested dynamically indexed SSBO grids at 16/64/256/1024
+  operations and straight-line global-memory kernels at 16/32/64 operations. Every variant
+  CSD-completed with clean cache/MMU diagnostics but performed no stores; inputs, uniforms and
+  shader addresses were verified live. The failed batch kernels were removed. Keep QPU VM
+  execution 1 as a verified single-block proof with CPU selected; do not advertise a batch path.
 - Real BitNet fixture: `examples/bitnet_pi5_wq.pc` runs token-3 embedding through layer-0 Wq from
   `RP2350B_Bitnet/bitnet-shard/artifacts/packed-tiny` using the QPU MatVec hook, then PicoScript
   ArgMax. Expected/observed: argmax 57, projection checksum 170896.
@@ -732,8 +745,13 @@ bring-up path must not do. Callers that must not block check transmit credit *be
 - Dense single-vector INT8 stays on NEON. Packed ternary batches and persistent FP32 tiles select
   QPU. QEMU remains CPU/NEON-only and passes 29/29 plus load battery.
 - Media: QPU grayscale XOR residual/restore is verified. Grayscale delta and H.264 arithmetic
-  residual/restore have deterministic CPU implementations; QPU H.264 and hardware HEVC remain
-  pending/fail-closed.
+  residual/restore have deterministic CPU implementations. Separate Mesa-generated packed-byte
+  QPU kernels now verify 64-byte H.264-style luma residual and restore, with one workgroup per
+  tile. Zero-copy profiling at the current single-dispatch limit (4 KiB) measured CPU ~0.8 us
+  versus QPU ~16.5 us, so the QPU path remains a verified proof backend while synchronous runtime
+  selection correctly stays on CPU. A slower QPU path may only be chosen for parallel CPU relief
+  through a future non-blocking `Async.*` job provider; synchronous calls cannot provide overlap.
+  Hardware HEVC remains pending/fail-closed.
 
 ---
 
@@ -1251,18 +1269,14 @@ could not advance past the missing ownership publication.
       the board rebooted and came back on the new version (uptime 47s post-reboot), proving stage0
       correctly reads the FAT package, activates raw slot A, and boots it. The RX descriptor-hole
       investigation and the persistent-stage0 bring-up are both closed.
-- [x] Baseline OTA push throughput measured 2026-07-23 (single connection, no client-side pacing
-      left in `tools\pios_ota_update.py`): 3,274,240 bytes in 192.35s (~17 KB/s), bounded by the
-      board's fixed 4 KB `TCP_BUF_SIZE` receive window (`include/tcp.h`). Tried raising
-      `TCP_BUF_SIZE` to 8192/16384 to benchmark a fix: QEMU's 29-test smoke suite still passed, but
-      the `load battery`'s `parallel`/`bursty` phases failed with `RemoteDisconnected` at **8192
-      already** (not just 16384) — a real regression under concurrent load, not a QEMU flake
-      (confirmed by a clean 4096-baseline re-run passing both smoke and load battery). Root cause
-      not yet isolated (suspect a fixed-capacity virtio-net TX ring/descriptor assumption sized
-      against the old window, not a TCP_BUF_SIZE-derived stack overflow — `struct tcb` is never
-      stack-copied). Change was reverted; `include/tcp.h` is back at `TCP_BUF_SIZE=4096`, live Pi5
-      untouched throughout. Do not blindly re-raise `TCP_BUF_SIZE` without first finding and fixing
-      the virtio-net ring-capacity limit under parallel/bursty QEMU load.
+- [x] ADR-019 / issue #91 resolved 2026-08-07. `TCP_BUF_SIZE` is now 8192.
+      The suspected virtio ring limit was disproven (32 -> 128 descriptors did
+      not affect the failure; `tx_drop=0 rx_starve=0`). QEMU's static 128-TCB
+      fallback table adds about 1 MiB of `.bss` when both rings double; before
+      the issue #86 RAM relocation that crossed the old core-0 boundary. With
+      `CORE0_RAM_BASE=0x42200000`, the image ends at `0x4216F000` (580 KiB
+      margin). Verified QEMU smoke 29/29 and five consecutive no-retry load
+      batteries.
 
 ### Next steps
 1. WiFi bring-up (CYW43455 over BCM2712 SDIO2) is the active work item — CMD5 (IO_SEND_OP_COND)

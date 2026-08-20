@@ -71,17 +71,32 @@ struct arp_entry {
 
 /* ---- State ---- */
 
-static struct arp_entry table[ARP_TABLE_SIZE];
-static u32 my_ip, my_mask;
-static u8  my_mac[6];
-static arp_stats_t arp_stats;
+struct arp_context {
+    struct arp_entry table[ARP_TABLE_SIZE];
+    u32 my_ip, my_mask;
+    u8 my_mac[6];
+    arp_stats_t stats;
+    struct lru_cache index;
+    u64 last_reply_time;
+};
 
-/* LRU index: IP → table index for O(1) lookup */
-static struct lru_cache arp_index;
-
-static u64 last_reply_time;   /* global reply rate limiter */
+static struct arp_context arp_contexts[3];
+static u32 arp_current_iface = NIC_IFACE_WIRED;
 
 static u8 arp_tx[60] ALIGNED(64);  /* min Ethernet frame */
+
+static struct arp_context *arp_current(void)
+{
+    return &arp_contexts[arp_current_iface < 3U ? arp_current_iface : 0U];
+}
+
+#define table           (arp_current()->table)
+#define my_ip           (arp_current()->my_ip)
+#define my_mask         (arp_current()->my_mask)
+#define my_mac          (arp_current()->my_mac)
+#define arp_stats       (arp_current()->stats)
+#define arp_index       (arp_current()->index)
+#define last_reply_time (arp_current()->last_reply_time)
 
 /* ---- Helpers ---- */
 
@@ -225,12 +240,19 @@ static void send_arp(u16 opcode, const u8 *target_mac, u32 target_ip) {
         uart_puts("\n");
     }
 
-    nic_send(arp_tx, 60);
+    (void)nic_send_on((nic_iface_t)arp_current_iface, arp_tx, 60);
 }
 
 /* ---- Public API ---- */
 
-void arp_init(u32 ip, u32 mask, const u8 *mac) {
+void arp_set_interface(nic_iface_t iface)
+{
+    if (iface == NIC_IFACE_WIRED || iface == NIC_IFACE_WIFI)
+        arp_current_iface = iface;
+}
+
+void arp_init_iface(nic_iface_t iface, u32 ip, u32 mask, const u8 *mac) {
+    arp_set_interface(iface);
     my_ip = ip;
     my_mask = mask;
     simd_memcpy(my_mac, mac, 6);
@@ -239,6 +261,17 @@ void arp_init(u32 ip, u32 mask, const u8 *mac) {
     simd_zero(&arp_stats, sizeof(arp_stats));
     lru_init(&arp_index, NULL, 0); /* no TTL — managed by arp_tick */
     last_reply_time = 0;
+}
+
+void arp_init(u32 ip, u32 mask, const u8 *mac)
+{
+    arp_init_iface(NIC_IFACE_WIRED, ip, mask, mac);
+}
+
+void arp_add_static_iface(nic_iface_t iface, u32 ip, const u8 *mac)
+{
+    arp_set_interface(iface);
+    arp_add_static(ip, mac);
 }
 
 void arp_add_static(u32 ip, const u8 *mac) {
@@ -253,6 +286,12 @@ void arp_add_static(u32 ip, const u8 *mac) {
     e->timestamp = now_ms();
     e->retries = 0;
     arp_index_update(ip, (u32)(e - table));
+}
+
+const u8 *arp_resolve_iface(nic_iface_t iface, u32 ip)
+{
+    arp_set_interface(iface);
+    return arp_resolve(ip);
 }
 
 const u8 *arp_resolve(u32 ip) {
@@ -285,6 +324,12 @@ const u8 *arp_resolve(u32 ip) {
     send_arp(ARP_OP_REQUEST, NULL, ip);
     arp_stats.requests_sent++;
     return NULL;
+}
+
+void arp_input_iface(nic_iface_t iface, const u8 *frame, u32 len)
+{
+    arp_set_interface(iface);
+    arp_input(frame, len);
 }
 
 void arp_input(const u8 *frame, u32 len) {
@@ -405,6 +450,12 @@ void arp_input(const u8 *frame, u32 len) {
     }
 }
 
+void arp_announce_iface(nic_iface_t iface)
+{
+    arp_set_interface(iface);
+    arp_announce();
+}
+
 void arp_announce(void) {
     u64 delay = 500;
     for (u32 i = 0; i < ARP_ANNOUNCE_COUNT; i++) {
@@ -415,11 +466,23 @@ void arp_announce(void) {
     }
 }
 
+void arp_probe_iface(nic_iface_t iface)
+{
+    arp_set_interface(iface);
+    arp_probe();
+}
+
 void arp_probe(void) {
     /* Single broadcast ARP request for our own IP. Used by the stall detector
      * to test whether the TX path can still put a frame on the wire. */
     send_arp(ARP_OP_REQUEST, NULL, my_ip);
     arp_stats.requests_sent++;
+}
+
+void arp_tick_iface(nic_iface_t iface)
+{
+    arp_set_interface(iface);
+    arp_tick();
 }
 
 void arp_tick(void) {

@@ -4,13 +4,32 @@
 #define ETH_FRAME_MAX   1518
 #define ETH_ALEN        6
 
+typedef u8 nic_iface_t;
+#define NIC_IFACE_ANY    0U
+#define NIC_IFACE_WIRED  1U
+#define NIC_IFACE_WIFI   2U
+#define NIC_IFACE_MAX    3U
+
 bool nic_init(void);
 bool nic_init_wifi(void);
 bool nic_activate_wifi_loaded(void);
 bool nic_is_wifi(void);
+bool nic_wifi_active(void);
 bool nic_send(const u8 *frame, u32 len);
 bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_len);
 bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted);
+bool nic_send_on(nic_iface_t iface, const u8 *frame, u32 len);
+bool nic_send_parts_on(nic_iface_t iface, const void *head, u32 head_len,
+                       const void *tail, u32 tail_len);
+bool nic_recv_on(nic_iface_t iface, u8 *frame, u32 *len,
+                 bool *checksum_trusted);
+/* ADR-033 final egress boundary. Only net_dispatch.c may call this after it
+ * has consumed an immutable, owned TX span from its FIFO. */
+bool nic_send_owned_on(nic_iface_t iface, const u8 *frame, u32 len);
+bool nic_iface_active(nic_iface_t iface);
+const char *nic_iface_name(nic_iface_t iface);
+nic_iface_t nic_default_iface(void);
+void nic_get_mac_for(nic_iface_t iface, u8 *mac);
 void nic_get_mac(u8 *mac);
 bool nic_link_up(void);
 u32  nic_link_mbps(void);
@@ -58,11 +77,15 @@ void nic_set_tso(bool enable);
 bool nic_tx_checksum_offload_enabled(void);
 bool nic_rx_checksum_offload_enabled(void);
 bool nic_tso_enabled(void);
+bool nic_tx_checksum_offload_enabled_for(nic_iface_t iface);
+bool nic_rx_checksum_offload_enabled_for(nic_iface_t iface);
+bool nic_tso_enabled_for(nic_iface_t iface);
 
 /* Configure our host-order IPv4 address for the earliest ARP RX filter.
  * Broadcast ARP frames whose target protocol address is not this IP are
  * dropped inside nic_recv(), before framebuffer dumps or protocol dispatch. */
 void nic_set_local_ipv4(u32 ip);
+void nic_set_local_ipv4_for(nic_iface_t iface, u32 ip);
 void nic_set_packet_dump(bool enable);
 
 typedef struct {
@@ -166,6 +189,7 @@ typedef struct {
     u16 tcp_port_from_end;
     u16 udp_port_to_end;
     u16 udp_port_from_end;
+    u8  iface;             /* NIC_IFACE_*; 0 means both */
 } nic_filter_rule_t;
 
 void nic_filter_clear(void);

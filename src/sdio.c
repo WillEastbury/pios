@@ -20,6 +20,7 @@
 #include "mmio.h"
 #include "uart.h"
 #include "timer.h"
+#include "gic.h"
 #include "fb.h"
 
 /* ── SDHCI register offsets ── */
@@ -62,6 +63,7 @@
 #define INT_DATA_DONE       (1 << 1)
 #define INT_WRITE_RDY       (1 << 4)
 #define INT_READ_RDY        (1 << 5)
+#define INT_CARD            (1 << 8)    /* SDIO in-band card interrupt */
 #define INT_ERROR_SUMMARY   (1U << 15)
 #define INT_ERROR           0xFFFF8000U  /* summary + all error bits */
 #define INT_ALL             0xFFFFFFFFU  /* clear everything */
@@ -120,6 +122,8 @@ static inline void sw16(u32 off, u16 val) { mmio_write16(BCM2712_SDIO2_BASE + of
 /* 8-bit access (host control, power control, timeout, software reset) */
 static inline u8 sr8(u32 off)           { return mmio_read8(BCM2712_SDIO2_BASE + off); }
 static inline void sw8(u32 off, u8 val) { mmio_write8(BCM2712_SDIO2_BASE + off, val); }
+static volatile bool sdio_card_irq_latched;
+static bool sdio_card_irq_level;
 
 /* SDHCI spec-accurate sub-register offsets */
 #define SDHCI_HOST_CONTROL    0x28  /* 8-bit */
@@ -1207,6 +1211,84 @@ bool sdio_enable_func_irq(u32 func)
 
     int_en |= (1 << func) | 1;  /* master interrupt enable + function */
     return sdio_cmd52_write(0, CCCR_INT_ENABLE, int_en);
+}
+
+/* SDHCI "Card Interrupt" status. REG_IRPT_MASK is left wide open by
+ * sdio_init(), so the bit latches in the status register even though
+ * REG_IRPT_EN keeps the controller from signalling the GIC. That makes this a
+ * cheap poll-side accelerator: one MMIO read tells us whether the CYW43455 is
+ * asserting DAT1, instead of issuing CMD52s to find out there is nothing to do. */
+bool sdio_card_irq_pending(void)
+{
+    return (sr16(REG_INTERRUPT) & INT_CARD) != 0U;
+}
+
+bool sdio_card_irq_edge(void)
+{
+    bool level = sdio_card_irq_pending();
+    bool edge = level && !sdio_card_irq_level;
+    sdio_card_irq_level = level;
+    return edge;
+}
+
+/* Acknowledge the latched card-interrupt status. SDHCI treats this bit as
+ * level-sensitive against DAT1, so if the card is still asserting it will come
+ * straight back -- which is the correct signal to keep draining. Without the
+ * ack a single stale assertion pins the RX backoff at zero forever. */
+void sdio_card_irq_ack(void)
+{
+    sw16(REG_INTERRUPT, (u16)INT_CARD);
+}
+
+static void sdio_gic_irq_handler(void)
+{
+    if (sdio_card_irq_pending()) {
+        sdio_card_irq_latched = true;
+        sdio_card_irq_ack();
+    }
+}
+
+void sdio_card_irq_arm(void)
+{
+#if PIOS_HAS_WIFI_SDIO2
+    /* BCM2712 WiFi SDIO2 is sdio2@1100000 in the upstream DTS, GIC SPI 274. */
+    irq_register(274U, sdio_gic_irq_handler);
+    gic_set_group1(274U);
+    gic_set_priority(274U, 0x60U);
+    gic_set_target(274U, 1U);
+    gic_clear_pending(274U);
+    gic_enable_irq(274U);
+    u16 signal = sr16(REG_IRPT_EN);
+    sw16(REG_IRPT_EN, (u16)(signal | INT_CARD));
+    sdio_card_irq_latched = false;
+    sdio_card_irq_level = false;
+#endif
+}
+
+bool sdio_card_irq_take(void)
+{
+    bool pending = sdio_card_irq_latched;
+    sdio_card_irq_latched = false;
+    return pending;
+}
+
+void sdio_irq_snapshot(u32 *status, u32 *signal_enable, u32 *mask,
+                       u32 *gic_enable, u32 *gic_pending,
+                       u32 *gic_target)
+{
+    if (status)
+        *status = sr16(REG_INTERRUPT);
+    if (signal_enable)
+        *signal_enable = sr16(REG_IRPT_EN);
+    if (mask)
+        *mask = sr16(REG_IRPT_MASK);
+    u64 gicd = gic_runtime_gicd_base();
+    if (gic_enable)
+        *gic_enable = mmio_read(gicd + 0x100U + (274U / 32U) * 4U);
+    if (gic_pending)
+        *gic_pending = mmio_read(gicd + 0x200U + (274U / 32U) * 4U);
+    if (gic_target)
+        *gic_target = mmio_read(gicd + 0x800U + (274U / 4U) * 4U);
 }
 
 bool sdio_set_bus_width_4bit(void)

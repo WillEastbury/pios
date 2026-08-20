@@ -16,6 +16,18 @@
  *   0x04B00000 - 0x04CFFFFF  DMA DISK buffers (2MB)
  *   0x04D00000 - 0x04DFFFFF  Shared process IPC SHM pool (1MB)
  *   0x05000000 - 0x05FFFFFF  HDMI double-buffer back buffer (16MB)
+ *
+ * QEMU's equivalent map is offset upward by 2MB to leave room for the larger
+ * kernel image while preserving the 0x48000000 stage0 staging window:
+ *   0x42200000 - 0x431FFFFF  Core 0 private (16MB)
+ *   0x43200000 - 0x441FFFFF  Core 1 private (16MB)
+ *   0x44200000 - 0x451FFFFF  Core 2 private (16MB)
+ *   0x45200000 - 0x461FFFFF  Core 3 private (16MB)
+ *   0x46200000 - 0x462FFFFF  Shared FIFO ring (1MB)
+ *   0x46300000 - 0x464FFFFF  DMA NET buffers (2MB)
+ *   0x46500000 - 0x466FFFFF  DMA DISK buffers (2MB)
+ *   0x46700000 - 0x467FFFFF  Shared process IPC SHM pool (1MB)
+ *   0x46A00000 - 0x479FFFFF  HDMI double-buffer back buffer (16MB)
  */
 
 #pragma once

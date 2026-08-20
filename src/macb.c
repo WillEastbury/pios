@@ -201,9 +201,6 @@ static inline void ecw(u32 off, u32 val) { mmio_write(ETH_CFG_BASE + off, val); 
 #define BUF_SIZE 2048
 
 /* ── Descriptors and buffers (64-byte aligned for DMA coherency) ── */
-/* Firmware BAR2 at PCIe 0x00 (64GB window covers 0x00-0x40).
- * But RP1 DT dma-ranges says child DMA is at 0x10. Use 0x10. */
-#define MACB_DMA_HI       0x10
 #define USE_8BYTE_DESC     0
 
 #if USE_8BYTE_DESC
@@ -259,6 +256,25 @@ static volatile struct macb_desc *const tx_ring =
     (volatile struct macb_desc *)(usize)(DMA_NET_BASE + MACB_TX_DESC_OFF);
 static volatile struct macb_desc *const dummy_desc =
     (volatile struct macb_desc *)(usize)(DMA_NET_BASE + MACB_DUMMY_DESC_OFF);
+static u64 rx_buffers_dma;
+static u64 tx_buffers_dma;
+static u64 rx_ring_dma;
+static u64 tx_ring_dma;
+static u64 dummy_desc_dma;
+
+static bool macb_dma_layout_init(void)
+{
+    return rp1_pcie_dma_addr(&rx_bufs[0][0],
+                              (u64)NUM_RX * BUF_SIZE, &rx_buffers_dma) &&
+           rp1_pcie_dma_addr(&tx_bufs[0][0],
+                              (u64)NUM_TX * BUF_SIZE, &tx_buffers_dma) &&
+           rp1_pcie_dma_addr((const void *)rx_ring,
+                              MACB_RX_RING_BYTES, &rx_ring_dma) &&
+           rp1_pcie_dma_addr((const void *)tx_ring,
+                              MACB_TX_RING_BYTES, &tx_ring_dma) &&
+           rp1_pcie_dma_addr((const void *)dummy_desc,
+                              MACB_DUMMY_DESC_BYTES, &dummy_desc_dma);
+}
 static u32 tx_idx;
 static u32 tx_tail;
 static u32 tx_inflight;
@@ -516,6 +532,11 @@ bool macb_init(void) {
     rx_csum_enabled = true;
     tso_enabled = false;
 
+    if (!macb_dma_layout_init()) {
+        uart_puts("[mac] DMA layout outside RP1 inbound window\n");
+        return false;
+    }
+
     /* ── Step 0: Enable ETH clock on RP1 ── */
     rp1_clk_enable(RP1_CLK_ETH);
 
@@ -649,7 +670,7 @@ bool macb_init(void) {
     for (u32 i = 0; i < NUM_TX; i++) {
         volatile struct macb_desc *d = &tx_ring[i];
 #if !USE_8BYTE_DESC
-        d->addr_hi = MACB_DMA_HI;
+        d->addr_hi = (u32)(tx_buffers_dma >> 32);
         d->rsvd = 0;
 #endif
         d->addr = 0;
@@ -664,9 +685,9 @@ bool macb_init(void) {
     __asm__ volatile("dsb sy" ::: "memory");
 
     /* ── TX ring base pointer (the RX engine programs RBQP/RBQPH itself) ── */
-    mw(TBQP, (u32)(usize)&tx_ring[0]);
+    mw(TBQP, (u32)tx_ring_dma);
 #if !USE_8BYTE_DESC
-    mw(TBQPH, MACB_DMA_HI);
+    mw(TBQPH, (u32)(tx_ring_dma >> 32));
 #else
     mw(TBQPH, 0);
 #endif
@@ -678,21 +699,21 @@ bool macb_init(void) {
         dummy_desc->ctrl = TX_STAT_USED;
         dummy_desc->addr = 0;
 #if !USE_8BYTE_DESC
-        dummy_desc->addr_hi = MACB_DMA_HI;
+        dummy_desc->addr_hi = (u32)(dummy_desc_dma >> 32);
         dummy_desc->rsvd = 0;
 #endif
         __asm__ volatile("dsb sy" ::: "memory");
 
         u32 dcfg6 = mr(0x0294);
         u32 queue_mask = (dcfg6 & 0xFF) | 0x01;
-        u32 dummy_lo = (u32)(usize)dummy_desc;
+        u32 dummy_lo = (u32)dummy_desc_dma;
         for (u32 q = 1; q < 8; q++) {
             if (queue_mask & (1 << q)) {
                 mw(0x0440 + ((q-1) << 2), dummy_lo);
                 mw(0x0480 + ((q-1) << 2), dummy_lo);
 #if !USE_8BYTE_DESC
-                mw(0x04C8, MACB_DMA_HI);
-                mw(0x04D4, MACB_DMA_HI);
+                mw(0x04C8, (u32)(dummy_desc_dma >> 32));
+                mw(0x04D4, (u32)(dummy_desc_dma >> 32));
 #endif
             }
         }
@@ -821,7 +842,8 @@ bool macb_init(void) {
             .buffers = &rx_bufs[0][0],
             .ring_count = NUM_RX,
             .buffer_size = BUF_SIZE,
-            .dma_high = MACB_DMA_HI,
+            .ring_dma = rx_ring_dma,
+            .buffers_dma = rx_buffers_dma,
             .trailing_bytes = (u32)MACB_RX_TRAILING_BYTES,
             .checksum_enabled = rx_csum_enabled,
         };
@@ -905,7 +927,7 @@ static void macb_tx_recover_silent(void)
     for (u32 i = 0; i < NUM_TX; i++) {
         volatile struct macb_desc *d = &tx_ring[i];
 #if !USE_8BYTE_DESC
-        d->addr_hi = MACB_DMA_HI;
+        d->addr_hi = (u32)(tx_buffers_dma >> 32);
         d->rsvd = 0;
 #endif
         d->addr = 0;
@@ -917,9 +939,9 @@ static void macb_tx_recover_silent(void)
     __asm__ volatile("dsb sy" ::: "memory");
     __asm__ volatile("dsb sy" ::: "memory");
 
-    mw(TBQP, (u32)(usize)&tx_ring[0]);
+    mw(TBQP, (u32)tx_ring_dma);
 #if !USE_8BYTE_DESC
-    mw(TBQPH, MACB_DMA_HI);
+    mw(TBQPH, (u32)(tx_ring_dma >> 32));
 #endif
     mw(NCR, (mr(NCR) & ~NCR_THALT) | NCR_TE | NCR_RE);
     __asm__ volatile("dsb sy" ::: "memory");
@@ -967,10 +989,11 @@ bool macb_send(const u8 *frame, u32 len) {
 
     /* Setup descriptor (Circle: set addr during send, then barrier, then ctrl) */
 #if !USE_8BYTE_DESC
-    tx_ring[desc_idx].addr_hi = MACB_DMA_HI;
+    tx_ring[desc_idx].addr_hi = (u32)(tx_buffers_dma >> 32);
 #endif
     __asm__ volatile("dsb sy" ::: "memory");
-    tx_ring[desc_idx].addr = (u32)(usize)&tx_bufs[desc_idx][0];
+    tx_ring[desc_idx].addr =
+        (u32)(tx_buffers_dma + (u64)desc_idx * BUF_SIZE);
     __asm__ volatile("dsb sy" ::: "memory");
 
     u32 ctrl = len & TX_STAT_LEN_MASK;

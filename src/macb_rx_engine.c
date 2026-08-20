@@ -100,7 +100,6 @@
 #define RX_CTRL_CSUM_MASK  0x3u
 #define RX_CSUM_L4         0x2u   /* trusted result must include bit value 2 */
 
-#define RX_DMA_HIGH_WORD   0x10u
 
 /* ======================================================================== */
 /* Tunable, spec-derived thresholds                                         */
@@ -157,7 +156,8 @@ struct macb_rx_state {
     u8 *buffers;
     u32 ring_count;
     u32 buffer_size;
-    u32 dma_high;
+    u64 ring_dma;
+    u64 buffers_dma;
     u32 trailing_bytes;
     bool checksum_enabled;
 
@@ -214,7 +214,7 @@ static inline volatile u32 *rx_desc(u32 i)
 
 static inline u32 rx_ring_low(void)
 {
-    return (u32)((usize)g.ring);
+    return (u32)g.ring_dma;
 }
 
 /* Exact word0 for descriptor i: low buffer address, WRAP only on the last
@@ -222,7 +222,7 @@ static inline u32 rx_ring_low(void)
  * release, so no descriptor is ever released via read-modify-write. */
 static u32 rx_expected_word0(u32 i)
 {
-    u32 addr = (u32)((usize)g.buffers + (usize)i * (usize)g.buffer_size);
+    u32 addr = (u32)(g.buffers_dma + (u64)i * (u64)g.buffer_size);
     u32 w0 = addr & RX_W0_ADDR_MASK;
     if (i == g.ring_count - 1u)
         w0 |= RX_W0_WRAP;
@@ -246,7 +246,7 @@ static void rx_release_descriptor(u32 i)
 {
     volatile u32 *d = rx_desc(i);
     d[1] = 0u;
-    d[2] = g.dma_high;
+    d[2] = (u32)(g.buffers_dma >> 32);
     d[3] = 0u;
     rx_dma_release();
     d[0] = rx_expected_word0(i);
@@ -270,7 +270,7 @@ static void rx_publish_ring(void)
     for (i = 0; i < n; i++) {
         volatile u32 *d = rx_desc(i);
         d[1] = 0u;
-        d[2] = g.dma_high;
+        d[2] = (u32)(g.buffers_dma >> 32);
         d[3] = 0u;
     }
     rx_dma_publish();
@@ -370,7 +370,7 @@ static bool rx_destructive_rebuild(void)
     rx_publish_ring();
 
     gem_wr(GEM_RBQP, rx_ring_low());
-    gem_wr(GEM_RBQPH, g.dma_high);
+    gem_wr(GEM_RBQPH, (u32)(g.ring_dma >> 32));
     rx_dma_publish();
 
     gem_wr(GEM_RSR, GEM_RSR_ALL);            /* write-one-to-clear latched bits */
@@ -398,7 +398,7 @@ bool macb_rx_engine_init(const struct macb_rx_config *config)
         return false;
     if (config->buffer_size < RX_MIN_BUFFER_SIZE)
         return false;
-    if (config->dma_high != RX_DMA_HIGH_WORD)
+    if (config->ring_dma == 0ULL || config->buffers_dma == 0ULL)
         return false;
     if (((usize)config->ring & 63u) != 0u)          /* 64-byte aligned ring     */
         return false;
@@ -413,11 +413,13 @@ bool macb_rx_engine_init(const struct macb_rx_config *config)
     if (config->ring_count > (0xFFFFFFFFu / config->buffer_size)) /* buffer span    */
         return false;
     {
-        u64 base_lo = (u64)((usize)config->buffers) & 0xFFFFFFFFull;
+        u64 base_lo = config->buffers_dma & 0xFFFFFFFFull;
         u64 span = (u64)config->ring_count * (u64)config->buffer_size;
         if (base_lo + span > 0x100000000ull)        /* word0 holds low 32 bits    */
             return false;
     }
+    if ((config->ring_dma >> 32) != (config->buffers_dma >> 32))
+        return false;
 
     /* Confirm the live descriptor mode: 64-bit addressing on, extended (6-word)
      * timestamp descriptors off. Otherwise the 4-word layout is invalid; fail. */
@@ -443,7 +445,8 @@ bool macb_rx_engine_init(const struct macb_rx_config *config)
     g.buffers = config->buffers;
     g.ring_count = config->ring_count;
     g.buffer_size = config->buffer_size;
-    g.dma_high = config->dma_high;
+    g.ring_dma = config->ring_dma;
+    g.buffers_dma = config->buffers_dma;
     g.trailing_bytes = config->trailing_bytes;
     g.checksum_enabled = config->checksum_enabled;
 
@@ -477,7 +480,7 @@ bool macb_rx_engine_init(const struct macb_rx_config *config)
 
     /* Program the queue pointer while reception is disabled. */
     gem_wr(GEM_RBQP, rx_ring_low());
-    gem_wr(GEM_RBQPH, g.dma_high);
+    gem_wr(GEM_RBQPH, (u32)(g.ring_dma >> 32));
     rx_dma_publish();
 
     /* Clear any latched status, then enable reception. */

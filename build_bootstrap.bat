@@ -35,30 +35,33 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%CC%" %USER_CFLAGS% -c src\picovm.c -o build_user\picovm.o
 if errorlevel 1 exit /b 1
+"%CC%" %USER_CFLAGS% -c src\picovm_pios_optional.c -o build_user\picovm_pios_optional.o
+if errorlevel 1 exit /b 1
+"%CC%" %USER_CFLAGS% -c src\simd.c -o build_user\simd.o
+if errorlevel 1 exit /b 1
+"%CC%" %USER_CFLAGS% -c src\sha256_hkdf.c -o build_user\sha256_hkdf.o
+if errorlevel 1 exit /b 1
+"%CC%" %USER_CFLAGS% -c src\sha512.c -o build_user\sha512.o
+if errorlevel 1 exit /b 1
+"%CC%" %USER_CFLAGS% -c src\ed25519.c -o build_user\ed25519.o
+if errorlevel 1 exit /b 1
 "%CC%" %USER_CFLAGS% -fno-gcse -DPIOS_USER_EL0 -DUHTTP_BRIDGE_INDEX=0 -c user\httpd.c -o build_user\httpd_el0.o
 if errorlevel 1 exit /b 1
-"%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_httpd.elf build_user\ustart.o build_user\httpd_el0.o build_user\picovm.o
+"%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_httpd.elf build_user\ustart.o build_user\httpd_el0.o build_user\picovm.o build_user\picovm_pios_optional.o build_user\simd.o build_user\sha256_hkdf.o build_user\sha512.o build_user\ed25519.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_httpd.elf user_httpd_vm.img
 if errorlevel 1 exit /b 1
 "%CC%" %USER_CFLAGS% -fno-gcse -DPIOS_USER_EL0 -DUHTTP_BRIDGE_INDEX=1 -c user\httpd.c -o build_user\httpd_native.o
 if errorlevel 1 exit /b 1
-"%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_httpd_native.elf build_user\ustart.o build_user\httpd_native.o build_user\picovm.o
+"%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_httpd_native.elf build_user\ustart.o build_user\httpd_native.o build_user\picovm.o build_user\picovm_pios_optional.o build_user\simd.o build_user\sha256_hkdf.o build_user\sha512.o build_user\ed25519.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_httpd_native.elf user_httpd_native.img
 if errorlevel 1 exit /b 1
 for %%f in (user_httpd_vm.img) do echo user_httpd_vm.img size: %%~zf bytes
 for %%f in (user_httpd_native.img) do echo user_httpd_native.img size: %%~zf bytes
-"%CC%" %ASFLAGS% -c user\el0_probe.S -o build_user\el0_probe.o
-if errorlevel 1 exit /b 1
-"%LD%" -T user\el0_probe.ld -nostdlib -o build_user\user_el0_probe.elf build_user\el0_probe.o
-if errorlevel 1 exit /b 1
-"%OC%" -O binary build_user\user_el0_probe.elf user_el0_probe.img
-if errorlevel 1 exit /b 1
-for %%f in (user_el0_probe.img) do echo user_el0_probe.img size: %%~zf bytes
 "%CC%" %USER_CFLAGS% -c user\el0_pico.c -o build_user\el0_pico.o
 if errorlevel 1 exit /b 1
-"%LD%" -T user\el0_pico.ld -nostdlib -o build_user\user_el0_pico.elf build_user\ustart.o build_user\el0_pico.o build_user\picovm.o
+"%LD%" -T user\el0_pico.ld -nostdlib -o build_user\user_el0_pico.elf build_user\ustart.o build_user\el0_pico.o build_user\picovm.o build_user\picovm_pios_optional.o build_user\simd.o build_user\sha256_hkdf.o build_user\sha512.o build_user\ed25519.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_el0_pico.elf user_el0_pico.img
 if errorlevel 1 exit /b 1
@@ -74,7 +77,7 @@ REM (isolated via repeated QEMU boot+HTTP tests). See the comment in
 REM user/capsvc_host.c for the full story.
 "%CC%" %USER_CFLAGS% -fno-gcse -DPIOS_USER_EL0 -DCAPSVC_SVC_IDX=0 -c user\capsvc_host.c -o build_user\capsvc_host0.o
 if errorlevel 1 exit /b 1
-"%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_capsvc_host0.elf build_user\ustart.o build_user\capsvc_host0.o build_user\picovm.o
+"%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_capsvc_host0.elf build_user\ustart.o build_user\capsvc_host0.o build_user\picovm.o build_user\picovm_pios_optional.o build_user\simd.o build_user\sha256_hkdf.o build_user\sha512.o build_user\ed25519.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_capsvc_host0.elf user_capsvc_host0.img
 if errorlevel 1 exit /b 1

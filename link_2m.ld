@@ -15,5 +15,9 @@ SECTIONS {
   . += 0x40000; __stack_top_core1 = .;
   . += 0x40000; __stack_top_core2 = .;
   . += 0x40000; __stack_top_core3 = .;
+  . = ALIGN(4096);
+  .pgtbl_pool (NOLOAD) : { __pgtbl_pool_start = .; *(.pgtbl_pool*) __pgtbl_pool_end = .; } :data
   . = ALIGN(4096); __heap_start = .;
 }
+__bss_size = (__bss_end - __bss_start) >> 3;
+__pgtbl_pool_size = (__pgtbl_pool_end - __pgtbl_pool_start) >> 3;

@@ -18,6 +18,7 @@
 #include "rp1_gpio.h"
 #include "pcie.h"
 #include "fb.h"
+#include "pci.h"
 
 /* USB VBUS power is controlled by RP1 GPIO 38 */
 #define USB_VBUS_GPIO   38
@@ -28,6 +29,7 @@
 #define DWC3_GCTL           (DWC3_GLOBALS + 0x10)
 #define DWC3_GSNPSID        (DWC3_GLOBALS + 0x20)
 #define DWC3_GUSB2PHYCFG    (DWC3_GLOBALS + 0x100)
+#define DWC3_GUSB3PIPECTL   (DWC3_GLOBALS + 0x1C0)
 
 #define GCTL_PRTCAP_MASK    (3U << 12)
 #define GCTL_PRTCAP_HOST    (1U << 12)
@@ -35,6 +37,8 @@
 #define GCTL_CORESOFTRESET  (1U << 11)
 #define GUSB2_PHYSOFTRST    (1U << 31)
 #define GUSB2_SUSPHY        (1U << 6)
+#define GUSB3_PHYSOFTRST    (1U << 31)
+#define GUSB3_SUSPHY        (1U << 17)
 
 /* ---- xHCI Capability Registers ---- */
 
@@ -192,23 +196,45 @@ static u32 hci_max_ports, hci_max_slots, ctx_size;
 static u32 cmd_enq, cmd_cycle;
 static u32 evt_deq, evt_cycle;
 static u32 selected_controller;
+static bool xhci_qemu_backend;
+static u32 controller_port_count[2];
+
+static struct {
+    bool pending;
+    u64 trb_dma;
+    void *data;
+    u32 length;
+} interrupt_xfer;
 
 /* ---- Instrumentation ---- */
 
 static struct xhci_stats stats;
 
-/*
- * RP1 DMA address translation: the xHCI controller lives inside RP1
- * which accesses system RAM via PCIe inbound translation.
- *
- * The firmware may have configured inbound windows. Try identity mapping
- * first (offset=0) since the firmware may map PCIe 0x00 → AXI 0x00.
- * The PCIe BAR2 inbound maps PCIe 0x10_00000000 → CPU 0x00_00000000.
- * So the xHCI controller (inside RP1, on PCIe) needs DMA addresses
- * with this offset added to access system RAM.
- */
-#define RP1_DMA_OFFSET  0x1000000000ULL
-static inline u64 dma_addr(const void *p) { return (u64)(usize)p + RP1_DMA_OFFSET; }
+static inline u64 dma_addr(const void *p)
+{
+    u64 addr = 0ULL;
+    if (xhci_qemu_backend)
+        return p ? (u64)(usize)p : 0ULL;
+    return rp1_pcie_dma_addr(p, 1ULL, &addr) ? addr : 0ULL;
+}
+
+static bool xhci_dma_layout_valid(void)
+{
+    u64 addr;
+    if (xhci_qemu_backend)
+        return true;
+    if (!rp1_pcie_dma_addr(dcbaa, sizeof(dcbaa), &addr) ||
+        !rp1_pcie_dma_addr(cmd_ring, sizeof(cmd_ring), &addr) ||
+        !rp1_pcie_dma_addr(evt_ring, sizeof(evt_ring), &addr) ||
+        !rp1_pcie_dma_addr(ep_rings, sizeof(ep_rings), &addr) ||
+        !rp1_pcie_dma_addr(erst, sizeof(erst), &addr) ||
+        !rp1_pcie_dma_addr(dev_ctx_buf, sizeof(dev_ctx_buf), &addr) ||
+        !rp1_pcie_dma_addr(input_ctx_buf, sizeof(input_ctx_buf), &addr) ||
+        !rp1_pcie_dma_addr(scratchpad_bufs, sizeof(scratchpad_bufs), &addr) ||
+        !rp1_pcie_dma_addr(scratchpad_array, sizeof(scratchpad_array), &addr))
+        return false;
+    return true;
+}
 
 /* DCI → ep_rings index. 0xFF = unmapped. DCI 1 = EP0 always ring 0. */
 static u8 dci_map[32];
@@ -275,21 +301,28 @@ static void UNUSED free_ep_ring(u32 ri) {
 
 /* ---- Event Ring ---- */
 
+static bool evt_try_poll(struct xhci_trb *out)
+{
+    dcache_invalidate_range((u64)(usize)&evt_ring[evt_deq],
+                            sizeof(struct xhci_trb));
+    struct xhci_trb *trb = &evt_ring[evt_deq];
+    dmb();
+    if ((trb->control & TRB_CYCLE) != (evt_cycle ? 1U : 0U))
+        return false;
+    *out = *trb;
+    stats.evt_polled++;
+    evt_deq++;
+    if (evt_deq >= RING_SIZE) { evt_deq = 0; evt_cycle ^= 1; }
+    u64 erdp = dma_addr(&evt_ring[evt_deq]);
+    rtw(IR0_ERDP_LO, (u32)erdp | (1U << 3));
+    rtw(IR0_ERDP_HI, (u32)(erdp >> 32));
+    return true;
+}
+
 static bool evt_poll(struct xhci_trb *out, u32 timeout_ms) {
     for (u32 i = 0; i < timeout_ms * 100; i++) {
-        dcache_invalidate_range((u64)(usize)&evt_ring[evt_deq], sizeof(struct xhci_trb));
-        struct xhci_trb *trb = &evt_ring[evt_deq];
-        dmb();
-        if ((trb->control & TRB_CYCLE) == (evt_cycle ? 1U : 0U)) {
-            *out = *trb;
-            stats.evt_polled++;
-            evt_deq++;
-            if (evt_deq >= RING_SIZE) { evt_deq = 0; evt_cycle ^= 1; }
-            u64 erdp = dma_addr(&evt_ring[evt_deq]);
-            rtw(IR0_ERDP_LO, (u32)erdp | (1U << 3));
-            rtw(IR0_ERDP_HI, (u32)(erdp >> 32));
+        if (evt_try_poll(out))
             return true;
-        }
         timer_delay_us(10);
     }
     return false;
@@ -339,6 +372,8 @@ static bool cmd_submit(u64 param, u32 status, u32 control, struct xhci_trb *evt)
 
         if (evt_type == TRB_CMD_COMPLETE) {
             stats.cmd_completed++;
+            stats.last_cmd_cc = cc;
+            stats.last_cmd_type = evt->control;
             fb_set_color(0x00FFAA00, 0x00000000);
             fb_printf("xHCI slot cc=%X\n", cc);
             return (cc == CC_SUCCESS);
@@ -373,20 +408,31 @@ static bool dwc3_init(u64 base) {
     mmio_write(base + DWC3_GCTL, gctl);
     timer_delay_us(100);
 
-    /* PHY soft reset. Keep the USB2 PHY out of suspend in host mode; DWC3
-     * controllers can otherwise report transaction errors on full-speed
-     * devices during Address Device. */
+    /* Reset both PHYs while the core is held in reset. Preserve RP1 firmware's
+     * electrical tuning (LFPS, elastic buffer, deemphasis and P3 quirks), but
+     * keep both PHYs out of suspend in host mode. */
     u32 phycfg = mmio_read(base + DWC3_GUSB2PHYCFG);
+    u32 pipectl = mmio_read(base + DWC3_GUSB3PIPECTL);
+    stats.gusb3_before = pipectl;
     uart_puts("[xhci] DWC3 GUSB2PHYCFG before=");
     uart_hex(phycfg);
+    uart_puts(" GUSB3PIPECTL before=");
+    uart_hex(pipectl);
     uart_puts("\n");
     phycfg &= ~GUSB2_SUSPHY;
+    pipectl &= ~GUSB3_SUSPHY;
     mmio_write(base + DWC3_GUSB2PHYCFG, phycfg | GUSB2_PHYSOFTRST);
+    mmio_write(base + DWC3_GUSB3PIPECTL, pipectl | GUSB3_PHYSOFTRST);
     timer_delay_us(100);
     mmio_write(base + DWC3_GUSB2PHYCFG, phycfg & ~(GUSB2_PHYSOFTRST | GUSB2_SUSPHY));
+    mmio_write(base + DWC3_GUSB3PIPECTL,
+               pipectl & ~(GUSB3_PHYSOFTRST | GUSB3_SUSPHY));
     timer_delay_ms(10);
     uart_puts("[xhci] DWC3 GUSB2PHYCFG after=");
     uart_hex(mmio_read(base + DWC3_GUSB2PHYCFG));
+    uart_puts(" GUSB3PIPECTL after=");
+    stats.gusb3_after = mmio_read(base + DWC3_GUSB3PIPECTL);
+    uart_hex(stats.gusb3_after);
     uart_puts("\n");
 
     /* Clear core reset, set host mode */
@@ -416,18 +462,48 @@ bool xhci_init(void) {
 
     /* Reset instrumentation counters */
     memset(&stats, 0, sizeof(stats));
+    memset(&interrupt_xfer, 0, sizeof(interrupt_xfer));
+    stats.init_stage = 1U;
+    if (selected_controller < 2U)
+        controller_port_count[selected_controller] = 0U;
 
-    /* Enable USB VBUS power via GPIO 38 */
+    xhci_qemu_backend = false;
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    if (selected_controller == 0U) {
+        struct pci_device pci_dev;
+        if (!pci_find_class(0x0C0330U, &pci_dev) ||
+            !pci_enable_device(&pci_dev)) {
+            uart_puts("[xhci] QEMU PCI xHCI not found\n");
+            return false;
+        }
+        xhci_base = pci_dev.bar0;
+        xhci_qemu_backend = true;
+    } else {
+        return false;
+    }
+#endif
+
+    if (!xhci_dma_layout_valid()) {
+        uart_puts("[xhci] DMA layout outside RP1 inbound window\n");
+        return false;
+    }
+
+    /* Enable USB VBUS power via GPIO 38 on RP1. */
+#if PIOS_PLATFORM != PIOS_PLATFORM_QEMU_VIRT
     uart_puts("[xhci] Enabling VBUS (GPIO38)...\n");
     rp1_gpio_set_function(USB_VBUS_GPIO, 5);
     rp1_gpio_set_dir_output(USB_VBUS_GPIO);
     rp1_gpio_write(USB_VBUS_GPIO, true);
     timer_delay_ms(100);  /* let VBUS stabilise and devices power up */
+#endif
 
+#if PIOS_PLATFORM != PIOS_PLATFORM_QEMU_VIRT
     xhci_base = RP1_BAR_BASE +
         (selected_controller ? XHCI_USB1_OFFSET : XHCI_USB0_OFFSET);
 
     if (!dwc3_init(xhci_base)) return false;
+#endif
+    stats.init_stage = 2U;
 
     u32 caplength = xr(CAP_CAPLENGTH) & 0xFF;
     u32 hcsparams1 = xr(CAP_HCSPARAMS1);
@@ -436,6 +512,8 @@ bool xhci_init(void) {
 
     hci_max_slots = hcsparams1 & 0xFF;
     hci_max_ports = (hcsparams1 >> 24) & 0xFF;
+    if (selected_controller < 2U)
+        controller_port_count[selected_controller] = hci_max_ports;
     ctx_size = (hccparams1 & (1 << 2)) ? 64 : 32;
 
     /* Validate context size — must be 32 or 64 per xHCI spec */
@@ -485,6 +563,7 @@ bool xhci_init(void) {
         return false;
     }
     uart_puts("[xhci] Reset OK\n");
+    stats.init_stage = 3U;
 
     /* Allow multiple device slots — cap to hw max, but at least 4 */
     {
@@ -554,9 +633,11 @@ bool xhci_init(void) {
         uart_puts("[xhci] Failed to start\n");
         return false;
     }
+    stats.init_stage = 4U;
 
     uart_puts("[xhci] Controller running");
-    /* Dump PCIe inbound BAR config (set by firmware) for DMA validation */
+    /* Dump PCIe inbound BAR config (set by firmware) for DMA validation. */
+#if PIOS_PLATFORM != PIOS_PLATFORM_QEMU_VIRT
     uart_puts(" BAR2_LO=");
     uart_hex(mmio_read(PCIE_RC_BASE + 0x4034));
     uart_puts(" BAR2_HI=");
@@ -564,11 +645,13 @@ bool xhci_init(void) {
     uart_puts(" IMAN=");
     uart_hex(mmio_read(rt_base + IR0_IMAN));
     uart_puts("\n");
+#endif
 
     /* DMA address sanity check: verify RP1 inbound BAR covers our DMA range.
      * The firmware sets BAR2 to cover system RAM. Log the config so we can
      * detect identity-vs-offset DMA mapping issues at boot. */
     {
+#if PIOS_PLATFORM != PIOS_PLATFORM_QEMU_VIRT
         u32 bar2_lo = mmio_read(PCIE_RC_BASE + 0x4034);
         u32 bar2_hi = mmio_read(PCIE_RC_BASE + 0x4038);
         u32 remap_lo = mmio_read(PCIE_RC_BASE + 0x40B4);
@@ -578,8 +661,8 @@ bool xhci_init(void) {
         uart_puts(" REMAP=");
         uart_hex(remap_hi); uart_puts(":"); uart_hex(remap_lo);
         uart_puts(" offset=");
-        uart_hex((u32)(RP1_DMA_OFFSET >> 32)); uart_puts(":");
-        uart_hex((u32)RP1_DMA_OFFSET);
+        uart_hex((u32)(RP1_PCIE_DMA_BASE >> 32)); uart_puts(":");
+        uart_hex((u32)RP1_PCIE_DMA_BASE);
         uart_puts("\n");
 
         /* Warn if DCBAA DMA address looks unusually high (above 4GB) and
@@ -589,6 +672,7 @@ bool xhci_init(void) {
             uart_puts("[xhci] WARNING: DCBAA DMA addr above 4GB but BAR2_HI=0\n");
             uart_puts("[xhci] DMA may fail — check RP1_DMA_OFFSET\n");
         }
+#endif
     }
 
     /* Drain any stale events from prior operation */
@@ -601,25 +685,55 @@ bool xhci_init(void) {
 
 u32 xhci_port_count(void) { return hci_max_ports; }
 
+u32 xhci_controller_port_count(u32 controller)
+{
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    return controller == 0U && xhci_qemu_backend ? hci_max_ports : 0U;
+#else
+    if (controller > 1U)
+        return 0U;
+    if (controller_port_count[controller] != 0U)
+        return controller_port_count[controller];
+    u64 base = RP1_BAR_BASE +
+               (controller ? XHCI_USB1_OFFSET : XHCI_USB0_OFFSET);
+    u32 cap = mmio_read(base + CAP_CAPLENGTH) & 0xFFU;
+    if (cap == 0U || cap == 0xFFU)
+        return 0U;
+    u32 hcs = mmio_read(base + cap + CAP_HCSPARAMS1);
+    return (hcs >> 24) & 0xFFU;
+#endif
+}
+
 bool xhci_port_connected(u32 port) {
     if (port >= hci_max_ports) return false;
     return (mmio_read(op_base + 0x400 + (u64)port * 0x10) & PORTSC_CCS) != 0;
 }
 
+u32 xhci_port_status(u32 port)
+{
+    if (port >= hci_max_ports)
+        return 0U;
+    return mmio_read(op_base + 0x400 + (u64)port * 0x10);
+}
+
 bool xhci_port_reset(u32 port, u32 *speed) {
     u64 pa = op_base + 0x400 + (u64)port * 0x10;
     u32 sc = mmio_read(pa);
+    stats.last_port = port;
+    stats.last_port_status = sc;
 
     if (XHCI_IS_USB3_PORT(port)) {
         /* USB3: wait for link state U0 instead of port reset */
         for (u32 i = 0; i < 200; i++) {
             sc = mmio_read(pa);
+            stats.last_port_status = sc;
             if ((sc & PORTSC_PLS_MASK) == PORTSC_PLS_U0 && (sc & PORTSC_PED)) {
                 *speed = (sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
                 return true;
             }
             timer_delay_ms(5);
         }
+        stats.port_reset_failures++;
         return false;
     }
 
@@ -633,10 +747,20 @@ bool xhci_port_reset(u32 port, u32 *speed) {
     for (u32 i = 0; i < 200; i++) {
         timer_delay_ms(5);
         sc = mmio_read(pa);
+        stats.last_port_status = sc;
         if (!(sc & PORTSC_PR)) {
             uart_puts("[xhci] Port reset done PORTSC=");
             uart_hex(sc);
             uart_puts("\n");
+            for (u32 settle = 0; settle < 200U; settle++) {
+                if ((sc & PORTSC_CCS) && (sc & PORTSC_PED) &&
+                    (sc & PORTSC_PLS_MASK) == PORTSC_PLS_U0 &&
+                    ((sc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT) != 0U)
+                    break;
+                timer_delay_ms(5);
+                sc = mmio_read(pa);
+                stats.last_port_status = sc;
+            }
             sc &= ~PORTSC_RW1C_MASK;
             sc |= (PORTSC_PRC | PORTSC_CSC);
             mmio_write(pa, sc);
@@ -644,6 +768,7 @@ bool xhci_port_reset(u32 port, u32 *speed) {
             return (sc & PORTSC_CCS) && (sc & PORTSC_PED) && *speed != 0;
         }
     }
+    stats.port_reset_failures++;
     uart_puts("[xhci] Port reset timeout PORTSC=");
     uart_hex(sc);
     uart_puts("\n");
@@ -784,10 +909,13 @@ bool xhci_control_transfer(u32 slot, u8 bmReq, u8 bReq, u16 wVal,
 
     /* Data Stage */
     if (wLen > 0 && data) {
+        u64 data_dma;
+        if (!rp1_pcie_dma_addr(data, wLen, &data_dma))
+            return false;
         u32 dc = TRB_TYPE(TRB_DATA);
         if (bmReq & 0x80) dc |= TRB_DIR_IN;
         dcache_clean_range((u64)(usize)data, wLen);
-        if (!ring_enqueue(ring, enq, cyc, dma_addr(data), wLen, dc))
+        if (!ring_enqueue(ring, enq, cyc, data_dma, wLen, dc))
             return false;
     }
 
@@ -877,10 +1005,13 @@ bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual) 
         else
             flags |= TRB_IOC;
 
-        if (!ring_enqueue(ring, enq, cyc, dma_addr(ptr), chunk, flags)) {
+        u64 data_dma;
+        if (!rp1_pcie_dma_addr(ptr, chunk, &data_dma) ||
+            !ring_enqueue(ring, enq, cyc, data_dma, chunk, flags)) {
             stats.xfer_fail++;
             return false;
         }
+
         ptr += chunk;
     }
 
@@ -899,6 +1030,73 @@ bool xhci_bulk_transfer(u32 slot, u8 ep_addr, void *data, u32 len, u32 *actual) 
     if (actual)
         *actual = len - (evt.status & 0xFFFFFF);
     stats.xfer_ok++;
+    return true;
+}
+
+bool xhci_interrupt_submit(u32 slot, u8 ep_addr, void *data, u32 len)
+{
+    if (interrupt_xfer.pending || !data || len == 0U)
+        return false;
+    u32 ep_num = ep_addr & 0x0FU;
+    u32 dir = (ep_addr & 0x80U) ? 1U : 0U;
+    if (!dir)
+        return false;
+    u32 dci = ep_num * 2U + dir;
+    u8 ri = dci_map[dci];
+    if (ri >= NUM_EP_RINGS)
+        return false;
+    u64 data_dma;
+    if (!rp1_pcie_dma_addr(data, len, &data_dma))
+        return false;
+
+    struct xhci_trb *ring = ep_rings[ri];
+    u32 *enq = &ep_enq[ri], *cyc = &ep_cyc[ri];
+    u32 trb_index = *enq;
+    if (trb_index >= RING_SIZE - 1U)
+        return false;
+    u64 trb_dma = dma_addr(&ring[trb_index]);
+    dcache_invalidate_range((u64)(usize)data, len);
+    if (!ring_enqueue(ring, enq, cyc, data_dma, len,
+                      TRB_TYPE(TRB_NORMAL) | TRB_IOC))
+        return false;
+    dcache_clean_range((u64)(usize)ring,
+                       sizeof(struct xhci_trb) * RING_SIZE);
+    dmb();
+    interrupt_xfer.pending = true;
+    interrupt_xfer.trb_dma = trb_dma;
+    interrupt_xfer.data = data;
+    interrupt_xfer.length = len;
+    ring_db(slot, dci);
+    return true;
+}
+
+bool xhci_interrupt_poll(u32 *actual, bool *complete)
+{
+    if (complete) *complete = false;
+    if (!interrupt_xfer.pending)
+        return false;
+    struct xhci_trb evt;
+    if (!evt_try_poll(&evt))
+        return true;
+    if (TRB_GET_TYPE(evt.control) != TRB_TRANSFER_EVT ||
+        evt.param != interrupt_xfer.trb_dma) {
+        stats.xfer_fail++;
+        interrupt_xfer.pending = false;
+        return false;
+    }
+    u32 cc = TRB_COMP_CODE(evt.status);
+    if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
+        stats.xfer_fail++;
+        interrupt_xfer.pending = false;
+        return false;
+    }
+    u32 done = interrupt_xfer.length - (evt.status & 0xFFFFFFU);
+    dcache_invalidate_range((u64)(usize)interrupt_xfer.data,
+                            interrupt_xfer.length);
+    interrupt_xfer.pending = false;
+    stats.xfer_ok++;
+    if (actual) *actual = done;
+    if (complete) *complete = true;
     return true;
 }
 

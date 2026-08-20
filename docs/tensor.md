@@ -112,3 +112,24 @@ Generated host-side shader tooling lives in `tools/v3d_shaders/`:
 - `vector_add.comp`, `relu.comp` — GLSL reference sources.
 - `mesa_v3d_wrap.c` — standalone Mesa V3D compiler wrapper with builtins for store/load, vector16, vector-N, scale/AXPY, matvec16, and matmul4.
 - `compile_v3d_shaders.ps1` — generates SPIR-V and, when `build/mesa_v3d_wrap.exe` exists, QPU word dumps for all builtins.
+- `qpu_dump_to_header.py` — converts audited wrapper output into checked-in QPU word and uniform-metadata headers.
+
+Media acceleration now includes separate Mesa-generated packed-byte residual and
+restore kernels. Each CSD workgroup processes one 64-byte luma tile, so a 16x16
+block uses one residual dispatch and one restore dispatch. The guarded
+`media selftest` verifies both kernels byte-for-byte before exposing them.
+`media bench` profiles a zero-copy 4 KiB in-place residual/restore round trip
+on Pi 5, the maximum single CSD dispatch for the current 64-byte/workgroup
+kernel, and sets the runtime crossover from measured results. Larger spans are
+chunked only if QPU wins at that boundary. The deterministic CPU path remains
+the fallback below that threshold. Representative
+4,194,304-MAC tensor profiles still select QPU, where dispatch amortisation
+produces a real speed-up.
+
+PicoVM QPU execution 1 remains a bounded correctness proof for
+`(a + b) * c`: the single block is bit-exact but takes about 4.4 us on QPU
+versus roughly 1-2 ns on CPU. Batch experiments using SSBO workgroup grids and
+straight-line 16/32/64-operation kernels all CSD-completed without stores despite
+verified shader, uniform and buffer addresses. Those failed kernels are not part
+of the runtime; the dashboard reports the single block as verified with CPU
+selected.

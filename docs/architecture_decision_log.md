@@ -68,7 +68,7 @@ decision)
 | [016](#adr-016) | Dedicated `CORE0_IO_WIFI` flag with adaptive cadence | Agent, **owner-ratified** | Accepted |
 | [017](#adr-017) | Per-core scheduler/FIFO service registration | Agent — **under review** | Proposed |
 | [018](#adr-018) | CPU-bound soak test required to prove ADR-014 | Owner | Accepted |
-| [019](#adr-019) | Investigate and fix the virtio-net ring limit behind `TCP_BUF_SIZE` | Owner | Accepted |
+| [019](#adr-019) | Raise `TCP_BUF_SIZE` after fixing the QEMU memory-layout limit | Owner | Implemented |
 | [020](#adr-020) | Migrate processes from EL1 to EL0 | Owner (direction), design TBD | Proposed |
 | [021](#adr-021) | Make EL0 processes actually preemptible (separate EL1 stack + `I` clear) | Agent, under ADR-012 | **Accepted — proven on Pi 5** |
 | [022](#adr-022) | EL0 talks to the kernel via FIFOs/shared state, never syscalls | Owner | Proposed |
@@ -76,6 +76,125 @@ decision)
 | [024](#adr-024) | Dynamic per-process memory allocation ([#84](https://github.com/WillEastbury/pios/issues/84)) | Owner | Proposed |
 | [025](#adr-025) | A core is a scheduling capability ([#85](https://github.com/WillEastbury/pios/issues/85)) | Owner | Proposed |
 | [026](#adr-026) | Bank unused quanta for cooperative processes | Owner | Proposed |
+| [027](#adr-027) | Guarded PicoScript accelerator enablement during boot | Owner | Accepted |
+| [028](#adr-028) | Core-0-owned asynchronous PicoScript QPU jobs | Owner | Accepted |
+| [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
+| [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
+| [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
+| [032](#adr-032) | Concurrent wired and WiFi network interfaces | Owner | Accepted |
+| [033](#adr-033) | FIFO/software-interrupt network execution | Owner | Accepted |
+
+---
+
+<a name="adr-029"></a>
+## ADR-029 — EL0 scheduler commands over a shared SPSC ring
+
+**Date:** 2026-08-12 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Complete the documented asynchronous EL0 scheduler path
+without relying on a live device; QEMU is the validation target.
+
+**Decision.** EL0 publishes bounded `PARK`, `YIELD`, `EXIT`, and diagnostic
+commands into one per-process, Normal-NC SPSC ring in the existing IPC window.
+The EL0 process is the sole producer and its owning scheduler is the sole
+consumer. A generation is copied into every command and stale commands are
+discarded. EL0 uses the trapped `WFE` doorbell to enter the kernel; the trap
+has no operation selector, so only already-published ring commands are acted
+upon.
+
+The kernel publishes process metadata and a monotonic inbound wake sequence in
+a separate cache line. Park claims are honoured only when the observed
+sequence still matches, preserving the sticky-wake rule. Existing cross-core
+wake rings remain the mechanism for remote kernel wake delivery.
+
+**Consequences.** The common EL0 scheduler helpers no longer issue scheduler
+SVCs. The fixed ring cannot be flooded beyond its bounded depth, slot reuse is
+generation-safe, and all shared state uses the existing IPC Normal-NC mapping.
+The implementation is validated locally with the cross-build and QEMU tests;
+hardware validation is intentionally deferred while detached from the host.
+
+---
+
+<a name="adr-030"></a>
+## ADR-030 — Generic xHCI core with RP1 and QEMU PCI backends
+
+**Date:** 2026-08-13 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** USB enumeration and class drivers remain transport-neutral. The
+xHCI implementation gains controller discovery and platform-specific access
+behind two backends: the existing RP1 DWC3/MMIO path on Pi 5 and PCI discovery
+of QEMU's `qemu-xhci` on the `virt` machine. QEMU PCI ECAM is mapped as device
+memory and the xHCI BAR is enabled with memory space and bus mastering.
+
+**Consequences.** QEMU can exercise the shared xHCI/USB stack with virtual USB
+devices without pretending that RP1 exists. RP1 PHY, VBUS, PCIe inbound DMA,
+and DWC3 setup remain Pi-specific and are skipped on QEMU. Future Hyper-V or
+x64 ports can provide another backend without duplicating USB class logic.
+
+---
+
+<a name="adr-031"></a>
+## ADR-031 — Pluggable auto-detected device driver backends
+
+**Date:** 2026-08-13 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** Device drivers are split into a transport-neutral core and
+pluggable hardware backends. Initialization probes available backends,
+selects exactly one compatible implementation, and fails closed when no
+backend is present. Platform-specific code is restricted to the stage-1
+jump/bring-up layer and backend registration; shared protocol, enumeration,
+buffer ownership, and class logic must not depend on a board identity.
+
+This applies incrementally to PCI/xHCI, USB class drivers, storage, network,
+display, and future peripheral drivers. The generic xHCI work on branch
+`issue-70-generic-xhci` is the first implementation of this pattern.
+
+**Consequences.** QEMU, Pi 5, Hyper-V, and future ports can provide different
+hardware backends without duplicating device protocols or class drivers.
+Every backend must publish explicit capability and DMA/attribute contracts;
+autodetection must never probe absent MMIO as if it were present.
+
+---
+
+<a name="adr-032"></a>
+## ADR-032 — Concurrent wired and WiFi network interfaces
+
+**Date:** 2026-08-13 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** `wifi activate` adds WiFi without disabling the configured
+wired interface. Wired `.201` and WiFi `.202` remain simultaneously reachable,
+while existing single-NIC QEMU behaviour remains unchanged.
+
+**Decision.** Keep a transport-neutral dual-NIC manager with explicit backend
+identity on ingress and egress. IP/TCP/ARP/firewall paths carry that identity,
+listeners are wildcard-capable across configured local addresses, and session
+and FIFO handling rejects ambiguous or stale interface ownership. Each
+interface has independent link, MAC, address, route and neighbor state; core 0
+remains the sole reactor and owner of both hardware paths.
+
+**Consequences.** Replies follow the ingress interface, outbound client traffic
+keeps the wired default unless an explicit interface is attached, and
+unconfigured addresses or backend identities fail closed.
+
+---
+
+<a name="adr-033"></a>
+## ADR-033 — FIFO/software-interrupt network execution
+
+**Date:** 2026-08-17 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** Every network stage is event-driven. A hardware MAC/SDIO IRQ
+publishes a bounded ingress descriptor into its FIFO and raises the matching
+core-0 software interrupt. That software handler consumes the FIFO and
+publishes the next stage's descriptor, repeating until protocol/service work is
+complete. Egress follows the same software FIFO/interrupt chain; only the
+final, owned span is passed to the MAC.
+
+**Consequences.** No hardware IRQ, timer tick, maintenance pass, or reactor hot
+loop may directly call protocol work merely to poll for frames. A missing
+software-interrupt publication is a correctness failure, not a reason to add a
+polling fallback. Every queue is bounded, ownership is explicit, and every
+stage has a regression proving it does no work without its input FIFO event.
 
 ---
 
@@ -431,17 +550,25 @@ advance, that capsules keep serving, and that wired health stays clean.
 ---
 
 <a name="adr-019"></a>
-## ADR-019 — Investigate and fix the virtio-net ring limit behind `TCP_BUF_SIZE`
+## ADR-019 — Raise `TCP_BUF_SIZE` after fixing the QEMU memory-layout limit
 
-**Date:** 2026-08-06 · **Decider:** Owner · **Status:** Accepted
+**Date:** 2026-08-06 · **Decider:** Owner · **Status:** Implemented
 
 **Context.** `TCP_BUF_SIZE` is pinned at 4096 because 8192 failed the QEMU load
-battery's parallel/bursty phases with `RemoteDisconnected`. Root cause was never
-isolated. It currently caps OTA push at ~17 KB/s.
+battery's parallel/bursty phases with `RemoteDisconnected`. It currently caps
+OTA push at ~17 KB/s.
 
-**Decision.** Worth scheduling: find the fixed-capacity ring/descriptor
-assumption (suspected virtio-net TX) and fix it, rather than leaving the window
-permanently pinned.
+**Finding.** The suspected virtio-net ring limit was disproven: increasing both
+queues from 32 to 128 entries did not change the failure, and `vnetdiag`
+reported `tx_drop=0 rx_starve=0`. The real limit was static memory placement.
+QEMU uses the 128-entry fallback TCB table; doubling both per-TCB rings adds
+about 1 MiB to `.bss`, which pushed the old image past `CORE0_RAM_BASE`.
+
+**Decision.** Keep the QEMU private/shared RAM map 2 MiB higher
+(`CORE0_RAM_BASE=0x42200000`) with the linker margin assertion, and raise
+`TCP_BUF_SIZE` to 8192. The resulting image ends at `0x4216F000`, leaving
+`0x91000` (580 KiB) before core 0 RAM. Verified with QEMU smoke 29/29 and five
+consecutive no-retry load batteries.
 
 ---
 
@@ -635,10 +762,10 @@ proven by the ADR-018 soak before any of the above is safe.
 
 | # | Question | Status |
 |---|---|---|
-| Q1 | Should the CYW43455 association path be migrated onto `adrv`? | **Owner asked for detail 2026-08-06** — proposal below, awaiting decision. |
+| Q1 | Should the CYW43455 association path be migrated onto `adrv`? | **Answered: after WPA2 association succeeds.** See the decision below. |
 | Q2 | Should `adrv_supervise()` run from a user core's quantum? | **Owner asked for detail 2026-08-06** — proposal below, awaiting decision. |
 | Q3 | Is a CPU-bound soak test required before ADR-014 is considered proven? | **Answered: yes.** See ADR-018. |
-| Q4 | Should `TCP_BUF_SIZE` remain 4096 permanently, or is finding the virtio-net ring limit worth scheduling? | **Answered: worth scheduling.** See ADR-019. |
+| Q4 | Should `TCP_BUF_SIZE` remain 4096 permanently, or is finding the virtio-net ring limit worth scheduling? | **Answered and implemented:** 8192 is safe after the QEMU static-memory-layout fix; the ring hypothesis was disproven. See ADR-019. |
 | Q5 | Should EL1 processes migrate to EL0 so stage-1 permissions replace the stage-2 cage? | **Direction agreed, design to be discussed.** See ADR-020. |
 | Q6 | ADR-015 lane matrix costs ~45 KB, ~9 KB of it provably dead. Trim it? | **Done — trimmed the HARDWARE level only (~9 KB).** The self-diagonal is NOT dead: `airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, …)` is core 0 → core 0 and is the hottest path in the system. My original "trim the diagonal" advice was wrong. |
 | Q7 | ADR-017 puts `ksvc` accounting inside the scheduler hot loop. Does that breach "diagnostics must not perturb scheduling"? | **Done — made lighter.** `ksvc_now_ticks()`/`ksvc_begin_at()`/`ksvc_end_at()` cut the loop from 4 counter reads + 2 divides to 2 reads + 0 divides; per-core visibility preserved. |
@@ -1094,7 +1221,76 @@ balance; and 1000 no-op yields bank nothing.
 
 ---
 
+<a name="adr-027"></a>
+## ADR-027 — Guarded PicoScript accelerator enablement during boot
+
+**Date:** 2026-08-11 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** *"lets make these accelerators work inside picoscript as
+batched superinstructions"* and *"lets run the tests and enablement on boot
+please"*.
+
+**Decision.** Keep acceleration behind PicoScript's existing coarse host hooks:
+`Tensor.MatVecI8`, `BitLinear.MatMulBitmapBatch`, and `Media.*`. Do not add
+per-operation VM bytecodes or offload scalar interpreter instructions. During
+boot, after V3D/Tensor initialisation, run the guarded PicoScript/QPU proofs,
+representative tensor profile, media proof/profile, and QPU VM proof.
+
+Only a backend that passes its proof is published as verified. Selection remains
+measurement-based: packed-ternary and representative FP32 batches may select
+QPU, while dense INT8, fine-grained VM arithmetic, and small H.264 luma
+residuals remain on CPU/NEON when faster. Any failed proof leaves the
+deterministic CPU fallback active and boot continues.
+
+Synchronous calls always choose the fastest measured backend. Choosing a slower
+QPU path to free CPU capacity uses the non-blocking `Async.*` provider defined
+by ADR-028; merely forcing a synchronous QPU call provides no parallelism.
+
+**Rationale.** This removes misleading post-boot `probe` states and makes the
+PicoScript superinstruction surface usable immediately, without weakening the
+existing fail-closed/quarantine contract. The extra boot work is bounded and
+contains no unbounded waits; the watchdog is petted only after the complete
+accelerator phase returns.
+
+---
+
+<a name="adr-028"></a>
+## ADR-028 — Core-0-owned asynchronous PicoScript QPU jobs
+
+**Date:** 2026-08-11 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** *"please do the async"* and permit QPU offload when the CPU
+has independent background work.
+
+**Decision.** Native CSD dispatch is split into bounded `begin` and `poll`
+operations; the synchronous API is a wrapper over the same state machine.
+PicoScript uses its existing `Async.Submit/Wait/Result` hooks with a bounded
+`QPA1` request (`1=residual`, `2=restore`, payload length a multiple of 64 up to
+4 KiB).
+
+V3D submission remains core-0-owned. The provider uses a fixed-capacity,
+generation-checked job table with one cache line per slot. QPU output is written
+to per-job staging, invalidated on completion, then copied into the PicoScript
+result span before publication. Invalid spans, stale handles, busy hardware,
+MMU/cache faults and timeouts fail closed.
+
+Synchronous Media still selects CPU because it is faster. Async submission is
+an explicit throughput/CPU-relief choice: the compiled PicoScript proof submits
+QPU work, executes 1,000 CPU-loop iterations, then waits and receives the
+bit-exact result. Direct non-owner submission is rejected; cross-core EL0 use
+will require a FIFO bridge to this core-0 provider.
+
+---
+
 ## Proposal for Q1 — migrate CYW43455 association onto `adrv`
+
+### Decision (owner, 2026-08-12)
+
+Defer the `adrv` migration until the current WPA2 association path has
+successfully associated. Preserve the current bounded/liveness-petted path as
+the comparison baseline while #76 diagnoses the PSK_SUP failure. Once WPA2 is
+green, migrate the join into the four-step `adrv` state machine below, retaining
+the 30-second deadline and progress-only watchdog contract.
 
 **Today.** `cyw43_join_key()` is one blocking function that owns core 0 for up
 to 30 s: it sets radio state, writes `wsec`/`wpa_auth`/PMK, issues `SET_SSID`,

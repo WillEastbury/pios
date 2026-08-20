@@ -74,6 +74,7 @@ bool mmu_user_table_build_split(u32 core, u32 slot, u64 slot_base, u64 slot_size
 bool mmu_user_table_build_split_el0(u32 core, u32 slot, u64 slot_base, u64 slot_size, u32 code_bytes);
 bool mmu_user_table_build_split_el0_at(u32 core, u32 slot, u64 va_base, u64 pa_base,
                                        u64 slot_size, u32 code_bytes);
+bool mmu_user_table_ready(u32 core, u32 slot);
 
 /* Switch active TTBR0 to a process table on core 2/3 */
 bool mmu_switch_to_user(u32 core, u32 slot);

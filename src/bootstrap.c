@@ -886,9 +886,13 @@ NORETURN void bootstrap_main(void)
     bool partition_valid = discover_kernel_partition(&root_lba);
     if (!partition_valid)
         root_lba = BOOT_FALLBACK_LBA;
-    else if (bootctrl_has_bootable_raw_slot(root_lba))
-        uart_puts("[boot] valid raw slot; FAT import skipped\n");
     else
+        /*
+         * The FAT package is the physical recovery/update authority. Its
+         * installer validates the package and skips the raw-slot write when
+         * the selected payload already matches, so a healthy raw slot must
+         * never suppress an available staged update.
+         */
         (void)stage0_apply_fat_update(root_lba);
     u32 slot_lba = partition_valid ? select_kernel_slot_lba(root_lba)
                                    : BOOT_FALLBACK_LBA;

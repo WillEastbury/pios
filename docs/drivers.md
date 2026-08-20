@@ -71,6 +71,48 @@ Software reset → set MAC address → configure DMA burst → enable RX/TX queu
 
 **Registers**: `MACB_BASE` = `0x1F00100000` (RP1 MACB, via `RP1_BAR_BASE`)
 
+## I2C — `rp1_i2c.c`
+
+**Hardware**: RP1 I2C1, a Synopsys DesignWare I2C controller at
+`RP1_BAR_BASE + 0x74000`, using GPIO2/3 with RP1 `ALT3`. Supported bus rates
+are 100 kHz and 400 kHz.
+
+| Function | Description |
+|----------|-------------|
+| `rp1_i2c_init(hz)` | Reset/configure I2C1 and claim SDA/SCL |
+| `rp1_i2c_write_read(addr, tx, tx_len, rx, rx_len)` | Combined transaction with repeated-start |
+| `rp1_i2c_probe(addr)` | Non-destructive 7-bit address probe |
+| `rp1_i2c_scan(found, 16)` | Scan non-reserved 7-bit addresses |
+| `rp1_i2c_diag_snapshot()` | Read abort, timeout and controller diagnostics |
+
+Commands: `i2c status`, `i2c scan [400]`.
+
+## SPI — `rp1_spi.c`
+
+**Hardware**: RP1 Synopsys `DW_apb_ssi` masters. SPI0 is at
+`RP1_BAR_BASE + 0x50000`; SPI1-7 follow at 0x4000 intervals and SPI8 is at
+`RP1_BAR_BASE + 0x4c000`. SPI4 and SPI7 are target-mode blocks. All nine
+instances identify as version `3430322A` (`"402*"`); master instances expose
+64-entry FIFOs and target instances 32-entry FIFOs. The RP1 core uses the
+DFS32 frame-size layout (`CTRLR0[20:16]`), a 200 MHz functional clock, and
+even BAUDR divisors.
+
+The driver configures SPI0 header pins on ALT0 (GPIO7-11) and SPI1 on ALT0
+(GPIO16-21). Master instances report the RP1-documented dual/quad framing
+capability; `rp1_spi_init_ex()` can select standard, dual, or quad framing.
+Physical IO2/IO3 routing remains the board/device wiring responsibility.
+
+| Function | Description |
+|----------|-------------|
+| `rp1_spi_probe(instance)` | Identify core, detect DFS layout and FIFO depth |
+| `rp1_spi_init(instance, hz, mode, bits)` | Configure a master, mode 0-3, 4-32 bits |
+| `rp1_spi_transfer(instance, cs, tx, rx, frames)` | Full-duplex native-CS transfer |
+| `rp1_spi_write_read()` | Command/response helper holding CS |
+| `rp1_spi_diag_snapshot()` | Read version, FIFO, divider and error counters |
+
+Commands: `spi status`, `spi init <instance> <hz> [mode] [bits]`, and
+`spi xfer <instance> <cs> <hexbytes>`.
+
 ## Framebuffer — `fb.c`
 
 **Hardware**: VideoCore VII GPU, accessed via mailbox property tags.

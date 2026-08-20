@@ -76,6 +76,18 @@ _start:
     cbnz    w2, .Lbss_loop
 .Lbss_done:
 
+    /* Clear the per-slot MMU page-table pool (.pgtbl_pool). Kept out of .bss
+     * (see link.ld / link_qemu_full.ld, issue #86) so it needs its own
+     * zeroing pass, mirroring the loop above exactly. */
+    ldr     x1, =__pgtbl_pool_start
+    ldr     w2, =__pgtbl_pool_size
+.Lpgtbl_pool_loop:
+    cbz     w2, .Lpgtbl_pool_done
+    str     xzr, [x1], #8
+    sub     w2, w2, #1
+    cbnz    w2, .Lpgtbl_pool_loop
+.Lpgtbl_pool_done:
+
     /* Init framebuffer at EL2 (proven working) */
     bl      kernel_fb_early
 
@@ -109,9 +121,12 @@ _start:
     mov     x0, #(1 << 31)
     msr     hcr_el2, x0
 
-    /* SCTLR_EL1: RES1 bits set (Circle's value: 0x30D00800) */
+    /* SCTLR_EL1: RES1 bits set. Clear nTWI/nTWE so EL0 WFI/WFE return
+     * through the kernel scheduler instead of sleeping as RUNNING work. */
     mov     x0, #0x0800
     movk    x0, #0x30D0, lsl #16
+    bic     x0, x0, #(1 << 16)  /* nTWI = 0: trap WFI from EL0 */
+    bic     x0, x0, #(1 << 18)  /* nTWE = 0: trap WFE from EL0 */
     msr     sctlr_el1, x0
 
     /* Return to EL1h (SP_EL1). Exception handlers use SP_EL1, so keep the
@@ -138,6 +153,14 @@ _start:
     sub     w2, w2, #1
     cbnz    w2, .Lstage1_bss_loop
 .Lstage1_bss_done:
+    ldr     x1, =__pgtbl_pool_start
+    ldr     w2, =__pgtbl_pool_size
+.Lstage1_pgtbl_pool_loop:
+    cbz     w2, .Lstage1_pgtbl_pool_done
+    str     xzr, [x1], #8
+    sub     w2, w2, #1
+    cbnz    w2, .Lstage1_pgtbl_pool_loop
+.Lstage1_pgtbl_pool_done:
     bl      kernel_fb_early
     b       .Lel1_entry
 
@@ -226,6 +249,18 @@ _start:
     str     x2, [x0, #0]
 #endif
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT && PIOS_CACHE_WB_FROM_BOOT
+    /* QEMU virt PCI ECAM and the PCI MMIO32 aperture are device memory.
+     * They live inside the low 1GiB and must override the normal-RAM boot
+     * blocks before the first MMU enable. */
+    ldr     x7, =l2_table_boot
+    mov     x2, #0x401
+    mov     x5, #0x80
+    str     x2, [x7, x5, lsl #3]       /* 0x10000000 */
+    mov     x5, #0x1F8
+    str     x2, [x7, x5, lsl #3]       /* 0x3F000000 */
+#endif
+
     /* L1[1..3]: Cacheable RAM — ATTR(2) = 0x709 */
     mov     x2, #0x709
     mov     x3, #0x40000000
@@ -242,6 +277,15 @@ _start:
     /* QEMU ramfb/GOP can be placed at 0x140000000; map that 1GiB block NC. */
     mov     x2, #0x705
     mov     x5, #5
+    lsl     x3, x5, #30
+    orr     x4, x3, x2
+    lsl     x6, x5, #3
+    str     x4, [x0, x6]
+
+    /* QEMU PCI ECAM/high-MMIO lives in the 0x40_00000000 1GiB region. */
+    mov     x2, #0x401
+    movk    x2, #0x0060, lsl #48
+    mov     x5, #256
     lsl     x3, x5, #30
     orr     x4, x3, x2
     lsl     x6, x5, #3
@@ -472,6 +516,8 @@ secondary_entry:
     bic     x1, x1, #(1 << 12)
     bic     x1, x1, #(1 << 1)   /* no A  (match core 0: allow unaligned Normal accesses) */
     bic     x1, x1, #(1 << 3)   /* no SA (match core 0) */
+    bic     x1, x1, #(1 << 16)  /* nTWI = 0: trap WFI from EL0 */
+    bic     x1, x1, #(1 << 18)  /* nTWE = 0: trap WFE from EL0 */
     msr     sctlr_el1, x1
     isb
     ldr     x2, =core_asm_stage
@@ -506,6 +552,8 @@ secondary_entry:
     orr     x1, x1, #(1 << 12)
     bic     x1, x1, #(1 << 1)   /* no A  (match core 0) */
     bic     x1, x1, #(1 << 3)   /* no SA (match core 0) */
+    bic     x1, x1, #(1 << 16)  /* nTWI = 0: trap WFI from EL0 */
+    bic     x1, x1, #(1 << 18)  /* nTWE = 0: trap WFE from EL0 */
     msr     sctlr_el1, x1
     isb
     ldr     x2, =core_asm_stage

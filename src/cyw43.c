@@ -25,6 +25,8 @@
 #include "uart.h"
 #include "timer.h"
 #include "fb.h"
+#include "crypto.h"
+#include "exception.h"
 
 /* ── Constants ── */
 
@@ -117,6 +119,9 @@
 
 /* Maximum frame size */
 #define CYW_MAX_FRAME           4096
+/* Must stay comfortably below the ~15 s hardware watchdog so the stall is
+ * reported by us, with diagnostics, rather than by a silent reset. */
+#define CYW_TX_CREDIT_STALL_MS  8000ULL
 #define CYW_SCAN_QUERY_BYTES    416U
 #define CYW_BCDC_GET_TIMEOUT_MS 5000ULL
 /* Bounded frames consumed per reactor poll pass. */
@@ -124,6 +129,7 @@
 /* Bounded RF-neutral bus pokes issued while a scan is running. */
 #define CYW_SCAN_KICK_INTERVAL_MS 250ULL
 #define CYW_SCAN_KICKS_MAX        60U
+#define CYW_DATA_RX_QUEUE_DEPTH   CYW_POLL_BURST_FRAMES
 
 /* ── State ── */
 
@@ -131,6 +137,7 @@ static u8 cyw_mac[CYW_MAC_LEN];
 static u32 cyw_link;
 static u8 cyw_tx_seq;
 static u8 cyw_tx_max;
+static u8 cyw_tx_fcmask;
 static u32 cyw_backplane_window;
 static bool sdpcm_frame_pending;
 static u32 sdpcm_next_len;
@@ -138,9 +145,19 @@ static u32 sdpcm_next_len;
 /* RX/TX buffers — 64-byte aligned for SDIO DMA compatibility */
 static u8 cyw_tx_buf[CYW_MAX_FRAME] ALIGNED(64);
 static u8 cyw_rx_buf[CYW_MAX_FRAME] ALIGNED(64);
-#define CYW_EAPOL_MAX 512U
 static u8 cyw_eapol_frame[CYW_EAPOL_MAX] ALIGNED(64);
 static u32 cyw_eapol_len;
+static u8 cyw_m2_frame[CYW_EAPOL_MAX] ALIGNED(64);
+static u32 cyw_m2_len;
+struct cyw_data_rx_slot {
+    u32 len;
+    u8 data[CYW_MAX_FRAME];
+};
+static struct cyw_data_rx_slot
+    cyw_data_rx_queue[CYW_DATA_RX_QUEUE_DEPTH] ALIGNED(64);
+static u32 cyw_data_rx_head;
+static u32 cyw_data_rx_tail;
+static u32 cyw_data_rx_count;
 
 /* BCDC request ID counter */
 static u16 bcdc_reqid;
@@ -165,11 +182,45 @@ static u64 scan_ready_ms;
 static bool scan_result_request_pending;
 static u16 scan_result_request_id;
 static u64 scan_result_request_deadline_ms;
+static u32 scan_result_request_attempts;
 static u32 scan_kicks_remaining;
 static u64 scan_next_kick_ms;
 static u32 join_kicks_remaining;
 static u64 join_next_kick_ms;
 static u8 scan_result_buf[CYW_SCAN_QUERY_BYTES] ALIGNED(64);
+static struct {
+    bool valid;
+    u8 bssid[CYW_MAC_LEN];
+    u16 chanspec;
+} join_target;
+
+static u16 cyw_rsn_caps;
+static bool cyw_rsn_caps_override;
+static bool cyw_rx_probe_enabled = true;
+/* Speculative-probe pacing. `armed` latches a decision across the two
+ * pending_bytes() calls that a single frame read performs. */
+static bool cyw_rx_probe_armed;
+static u32 cyw_rx_probe_backoff_ms;
+static u64 cyw_rx_probe_next_ms;
+#define CYW_RX_PROBE_BACKOFF_MAX_MS 1000U
+static u64 cyw_poll_idle_next_ms;
+static bool cyw_rx_irq_hint;
+
+struct cyw_wpa_host {
+    bool nonce_ready;
+    bool enabled;
+    bool m2_sent;
+    bool keys_installed;
+    u8 pmk[32];
+    u8 snonce[32];
+    u8 anonce[32];
+    u8 ptk[64];
+    u8 ap_mac[CYW_MAC_LEN];
+    u8 rsn_ie[66];
+    u8 rsn_ie_len;
+    u64 replay;
+};
+static struct cyw_wpa_host wpa_host;
 
 /* Discovered core addresses (from EROM scan) */
 static u32 cyw_arm_ctl;
@@ -243,7 +294,7 @@ void cyw43_event_history_snapshot(struct cyw_event_history *out)
 bool cyw43_poll_busy(void)
 {
     return scan_in_progress || scan_result_request_pending ||
-           cyw_link != CYW_LINK_DOWN;
+           cyw_link == CYW_LINK_JOINING;
 }
 
 bool cyw43_install_blob(u32 kind, const u8 *data, u32 len)
@@ -579,8 +630,319 @@ static u32 sdpcm_pending_bytes(void);
 static bool sdpcm_recv(u8 *channel, u8 *data, u32 *len);
 static void handle_event(const u8 *data, u32 len);
 static void bcdc_cache_response(const u8 *frame, u32 len);
+static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len,
+                           bool wait_response);
 static u32 load_le32(const u8 *p);
+static void store_le32(u8 *p, u32 value);
 static bool scan_store_bss(const u8 *bss, u32 record_len);
+
+struct wpa_sha1 {
+    u32 h[5];
+    u64 bytes;
+    u8 block[64];
+    u32 used;
+};
+
+static u32 wpa_rol32(u32 v, u32 n) { return (v << n) | (v >> (32U - n)); }
+
+static void wpa_sha1_block(struct wpa_sha1 *s, const u8 *p)
+{
+    u32 w[80];
+    for (u32 i = 0U; i < 16U; i++)
+        w[i] = ((u32)p[i * 4U] << 24) | ((u32)p[i * 4U + 1U] << 16) |
+               ((u32)p[i * 4U + 2U] << 8) | p[i * 4U + 3U];
+    for (u32 i = 16U; i < 80U; i++)
+        w[i] = wpa_rol32(w[i - 3U] ^ w[i - 8U] ^ w[i - 14U] ^ w[i - 16U], 1U);
+    u32 a=s->h[0], b=s->h[1], c=s->h[2], d=s->h[3], e=s->h[4];
+    for (u32 i = 0U; i < 80U; i++) {
+        u32 f, k;
+        if (i < 20U) { f = (b & c) | (~b & d); k = 0x5A827999U; }
+        else if (i < 40U) { f = b ^ c ^ d; k = 0x6ED9EBA1U; }
+        else if (i < 60U) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCU; }
+        else { f = b ^ c ^ d; k = 0xCA62C1D6U; }
+        u32 t = wpa_rol32(a, 5U) + f + e + k + w[i];
+        e=d; d=c; c=wpa_rol32(b,30U); b=a; a=t;
+    }
+    s->h[0]+=a; s->h[1]+=b; s->h[2]+=c; s->h[3]+=d; s->h[4]+=e;
+}
+
+static void wpa_sha1_init(struct wpa_sha1 *s)
+{
+    s->h[0]=0x67452301U; s->h[1]=0xEFCDAB89U; s->h[2]=0x98BADCFEU;
+    s->h[3]=0x10325476U; s->h[4]=0xC3D2E1F0U;
+    s->bytes=0U; s->used=0U;
+}
+
+static void wpa_sha1_update(struct wpa_sha1 *s, const u8 *p, u32 len)
+{
+    s->bytes += len;
+    while (len) {
+        u32 n = 64U - s->used;
+        if (n > len) n = len;
+        memcpy(s->block + s->used, p, n);
+        s->used += n; p += n; len -= n;
+        if (s->used == 64U) { wpa_sha1_block(s, s->block); s->used = 0U; }
+    }
+}
+
+static void wpa_sha1_final(struct wpa_sha1 *s, u8 out[20])
+{
+    u64 bits = s->bytes * 8ULL;
+    s->block[s->used++] = 0x80U;
+    if (s->used > 56U) {
+        while (s->used < 64U) s->block[s->used++] = 0U;
+        wpa_sha1_block(s, s->block); s->used = 0U;
+    }
+    while (s->used < 56U) s->block[s->used++] = 0U;
+    for (u32 i = 0U; i < 8U; i++)
+        s->block[56U + i] = (u8)(bits >> (56U - i * 8U));
+    wpa_sha1_block(s, s->block);
+    for (u32 i = 0U; i < 5U; i++) {
+        out[i*4U]=(u8)(s->h[i]>>24); out[i*4U+1U]=(u8)(s->h[i]>>16);
+        out[i*4U+2U]=(u8)(s->h[i]>>8); out[i*4U+3U]=(u8)s->h[i];
+    }
+}
+
+static void wpa_hmac_sha1(const u8 *key, u32 key_len,
+                          const u8 *data, u32 data_len, u8 out[20])
+{
+    u8 k[64], inner[20];
+    memset(k, 0, sizeof(k));
+    if (key_len > 64U) {
+        struct wpa_sha1 sh; wpa_sha1_init(&sh);
+        wpa_sha1_update(&sh, key, key_len); wpa_sha1_final(&sh, k);
+    } else memcpy(k, key, key_len);
+    for (u32 i=0U;i<64U;i++) k[i]^=0x36U;
+    struct wpa_sha1 sh; wpa_sha1_init(&sh);
+    wpa_sha1_update(&sh,k,64U); wpa_sha1_update(&sh,data,data_len);
+    wpa_sha1_final(&sh,inner);
+    for (u32 i=0U;i<64U;i++) k[i]^=(0x36U^0x5CU);
+    wpa_sha1_init(&sh); wpa_sha1_update(&sh,k,64U);
+    wpa_sha1_update(&sh,inner,20U); wpa_sha1_final(&sh,out);
+    memset(k,0,sizeof(k)); memset(inner,0,sizeof(inner));
+}
+
+static int wpa_bytes_cmp(const u8 *a, const u8 *b, u32 n)
+{
+    for (u32 i=0U;i<n;i++) if (a[i]!=b[i]) return a[i]<b[i]?-1:1;
+    return 0;
+}
+
+static void wpa_derive_ptk_for(const u8 authenticator[CYW_MAC_LEN],
+                               u8 out_ptk[64])
+{
+    static const u8 label[] = "Pairwise key expansion";
+    u8 data[76], input[100], mac[20];
+    const u8 *mac1 = cyw_mac, *mac2 = authenticator;
+    if (wpa_bytes_cmp(mac1,mac2,6U)>0) { const u8 *t=mac1;mac1=mac2;mac2=t; }
+    memcpy(data,mac1,6U); memcpy(data+6U,mac2,6U);
+    const u8 *n1=wpa_host.snonce,*n2=wpa_host.anonce;
+    if (wpa_bytes_cmp(n1,n2,32U)>0) { const u8 *t=n1;n1=n2;n2=t; }
+    memcpy(data+12U,n1,32U); memcpy(data+44U,n2,32U);
+    u32 off=0U; memcpy(input+off,label,sizeof(label)-1U);off+=sizeof(label)-1U;
+    input[off++]=0U; memcpy(input+off,data,sizeof(data));off+=sizeof(data);
+    for (u32 i=0U;i<4U;i++) {
+        input[off]= (u8)i;
+        wpa_hmac_sha1(wpa_host.pmk,32U,input,off+1U,mac);
+        u32 n = (64U-i*20U)>20U?20U:(64U-i*20U);
+        memcpy(out_ptk+i*20U,mac,n);
+    }
+    memset(data,0,sizeof(data)); memset(input,0,sizeof(input)); memset(mac,0,sizeof(mac));
+}
+
+static bool wpa_send_m2(const u8 *m1, u32 frame_len)
+{
+    if (frame_len < 113U || wpa_host.rsn_ie_len == 0U)
+        return false;
+    const u32 eapol = 14U, key = 18U;
+    u32 body_len = 95U + wpa_host.rsn_ie_len;
+    u32 total = 14U + 4U + body_len;
+    if (total > CYW_EAPOL_MAX)
+        return false;
+    static u8 frame[CYW_EAPOL_MAX] ALIGNED(64);
+    memset(frame,0,total);
+    memcpy(frame,m1+6U,6U); memcpy(frame+6U,cyw_mac,6U);
+    frame[12]=0x88U; frame[13]=0x8EU;
+    frame[eapol]=m1[eapol]; frame[eapol+1U]=3U;
+    frame[eapol+2U]=(u8)(body_len>>8); frame[eapol+3U]=(u8)body_len;
+    frame[key]=2U; frame[key+1U]=0x01U; frame[key+2U]=0x0AU;
+    /* RSN msg 2/4 carries key_length 0 (wpa_supplicant
+     * wpa_supplicant_send_2_of_4); echoing M1's length is a WPA-only
+     * behaviour and some APs silently drop the frame. */
+    frame[key+3U]=0U; frame[key+4U]=0U;
+    memcpy(frame+key+5U,m1+key+5U,8U);
+    memcpy(frame+key+13U,wpa_host.snonce,32U);
+    frame[key+93U]=0U; frame[key+94U]=wpa_host.rsn_ie_len;
+    memcpy(frame+key+95U,wpa_host.rsn_ie,wpa_host.rsn_ie_len);
+    u8 mic[20];
+    wpa_hmac_sha1(wpa_host.ptk,16U,frame+eapol,4U+body_len,mic);
+    memcpy(frame+key+77U,mic,16U);
+    memset(mic,0,sizeof(mic));
+    memcpy(cyw_m2_frame,frame,total);
+    cyw_m2_len=total;
+    return cyw43_send_frame(frame,total);
+}
+
+static bool wpa_mic_valid(const u8 *frame, u32 frame_len)
+{
+    if (frame_len < 113U)
+        return false;
+    u32 body_len=((u32)frame[16]<<8)|frame[17];
+    if (body_len+18U>frame_len || body_len<95U)
+        return false;
+    u8 copy[CYW_EAPOL_MAX], mac[20], wire[16];
+    u32 eapol_len=4U+body_len;
+    if (eapol_len>sizeof(copy))
+        return false;
+    memcpy(copy,frame+14U,eapol_len);
+    memcpy(wire,copy+81U,16U);
+    memset(copy+81U,0,16U);
+    wpa_hmac_sha1(wpa_host.ptk,16U,copy,eapol_len,mac);
+    u8 diff=0U;
+    for(u32 i=0U;i<16U;i++) diff|=wire[i]^mac[i];
+    memset(copy,0,sizeof(copy));memset(mac,0,sizeof(mac));memset(wire,0,sizeof(wire));
+    return diff==0U;
+}
+
+static bool wpa_aes_unwrap(const u8 *wrapped,u32 wrapped_len,u8 *plain,u32 *plain_len)
+{
+    if (!wrapped || !plain || !plain_len || wrapped_len<16U ||
+        (wrapped_len&7U)!=0U)
+        return false;
+    u32 n=wrapped_len/8U-1U;
+    if (*plain_len<n*8U)
+        return false;
+    u8 a[8],block[16],out[16];
+    memcpy(a,wrapped,8U);memcpy(plain,wrapped+8U,n*8U);
+    struct aes_key aes;
+    aes_key_expand(&aes,wpa_host.ptk+16U,128U);
+    for(i32 j=5;j>=0;j--) {
+        for(i32 i=(i32)n;i>=1;i--) {
+            u64 t=(u64)n*(u64)j+(u64)i;
+            memcpy(block,a,8U);
+            for(u32 k=0U;k<8U;k++)
+                block[7U-k]^=(u8)(t>>(k*8U));
+            memcpy(block+8U,plain+(u32)(i-1)*8U,8U);
+            aes_decrypt_block(&aes,block,out);
+            memcpy(a,out,8U);
+            memcpy(plain+(u32)(i-1)*8U,out+8U,8U);
+        }
+    }
+    static const u8 iv[8]={0xA6U,0xA6U,0xA6U,0xA6U,0xA6U,0xA6U,0xA6U,0xA6U};
+    bool ok=memcmp(a,iv,8U)==0;
+    *plain_len=ok?n*8U:0U;
+    memset(&aes,0,sizeof(aes));memset(a,0,sizeof(a));memset(block,0,sizeof(block));memset(out,0,sizeof(out));
+    return ok;
+}
+
+static bool wpa_install_key(u32 index,const u8 *key,u32 key_len,
+                            bool pairwise,const u8 *peer,u64 rsc)
+{
+    if (!key || key_len==0U || key_len>32U)
+        return false;
+    u8 params[164],*p=params;
+    memset(params,0,sizeof(params));
+#define WPA_PUT32(v) do { u32 _v=(v);p[0]=(u8)_v;p[1]=(u8)(_v>>8);p[2]=(u8)(_v>>16);p[3]=(u8)(_v>>24);p+=4; } while(0)
+#define WPA_PUT16(v) do { u16 _v=(v);p[0]=(u8)_v;p[1]=(u8)(_v>>8);p+=2; } while(0)
+    WPA_PUT32(pairwise?0U:index);
+    WPA_PUT32(key_len);
+    memcpy(p,key,key_len);p+=32U+72U;
+    WPA_PUT32(4U);                 /* CRYPTO_ALGO_AES_CCM */
+    WPA_PUT32(pairwise?0U:2U);     /* PRIMARY_KEY for GTK */
+    p+=12U;
+    WPA_PUT32(0U);                 /* IV not initialized by host */
+    WPA_PUT32((u32)(rsc>>16));
+    WPA_PUT16((u16)rsc);
+    p+=10U;
+    if(pairwise&&peer) memcpy(p,peer,CYW_MAC_LEN);
+#undef WPA_PUT32
+#undef WPA_PUT16
+    bool ok=bcdc_set_iovar("wsec_key",params,sizeof(params),false);
+    memset(params,0,sizeof(params));
+    return ok;
+}
+
+static bool wpa_find_gtk(const u8 *data,u32 len,u8 *gtk,u32 *gtk_len,u32 *key_id)
+{
+    u32 off=0U;
+    while(off+2U<=len) {
+        u32 item=data[off+1U]+2U;
+        if(item<2U||item>len-off) return false;
+        if(data[off]==0xDDU&&item>=24U&&
+           data[off+2U]==0x00U&&data[off+3U]==0x0FU&&
+           data[off+4U]==0xACU&&data[off+5U]==0x01U) {
+            u32 n=item-8U;
+            if(n>32U||*gtk_len<n) return false;
+            *key_id=data[off+6U]&3U;
+            memcpy(gtk,data+off+8U,n);*gtk_len=n;
+            return true;
+        }
+        off+=item;
+    }
+    return false;
+}
+
+static bool wpa_send_m4(const u8 *m3,u32 frame_len)
+{
+    if(frame_len<113U) return false;
+    static u8 frame[113] ALIGNED(64);
+    memset(frame,0,sizeof(frame));
+    /* Reply to the authenticator: destination is M3's source, source is us.
+     * Copying M3's first 14 bytes verbatim (the previous behaviour) addressed
+     * M4 to ourselves with the AP as source, so the AP never saw it and the
+     * handshake died after M3. */
+    memcpy(frame,m3+6U,6U);
+    memcpy(frame+6U,cyw_mac,6U);
+    frame[12]=0x88U;frame[13]=0x8EU;
+    frame[14]=m3[14];frame[15]=3U;frame[16]=0U;frame[17]=95U;
+    frame[18]=2U;frame[19]=0x03U;frame[20]=0x0AU;
+    /* RSN msg 4/4 carries key_length 0, as msg 2/4 does. */
+    frame[21]=0U;frame[22]=0U;
+    memcpy(frame+23U,m3+23U,8U);
+    u8 mac[20];
+    wpa_hmac_sha1(wpa_host.ptk,16U,frame+14U,99U,mac);
+    memcpy(frame+95U,mac,16U);memset(mac,0,sizeof(mac));
+    return cyw43_send_frame(frame,sizeof(frame));
+}
+
+static bool wpa_handle_m3(const u8 *frame,u32 frame_len)
+{
+    const u32 key=18U;
+    if(frame_len<113U||!wpa_mic_valid(frame,frame_len))
+        return false;
+    if(memcmp(frame+key+13U,wpa_host.anonce,32U)!=0)
+        return false;
+    u64 replay=((u64)frame[23]<<56)|((u64)frame[24]<<48)|
+               ((u64)frame[25]<<40)|((u64)frame[26]<<32)|
+               ((u64)frame[27]<<24)|((u64)frame[28]<<16)|
+               ((u64)frame[29]<<8)|frame[30];
+    if(replay<wpa_host.replay)
+        return false;
+    u32 kd_len=((u32)frame[key+93U]<<8)|frame[key+94U];
+    if(key+95U+kd_len>frame_len)
+        return false;
+    u8 plain[256],gtk[32];u32 plain_len=sizeof(plain),gtk_len=sizeof(gtk),key_id=0U;
+    u16 info=((u16)frame[19]<<8)|frame[20];
+    const u8 *kd=frame+key+95U;
+    if(info&0x1000U) {
+        if(kd_len>sizeof(plain)||!wpa_aes_unwrap(kd,kd_len,plain,&plain_len))
+            return false;
+        kd=plain;kd_len=plain_len;
+    }
+    if(!wpa_find_gtk(kd,kd_len,gtk,&gtk_len,&key_id))
+        return false;
+    u64 rsc=0ULL;
+    for(u32 i=0U;i<8U;i++) rsc=(rsc<<8)|frame[key+61U+i];
+    /* Send msg 4/4 before installing keys, as wpa_supplicant does: once the
+     * pairwise key is installed the firmware encrypts outbound frames, and the
+     * authenticator has not yet keyed the link for our M4. */
+    bool ok=wpa_send_m4(frame,frame_len)&&
+            wpa_install_key(0U,wpa_host.ptk+32U,16U,true,wpa_host.ap_mac,0ULL)&&
+            wpa_install_key(key_id,gtk,gtk_len,false,NULL,rsc);
+    memset(plain,0,sizeof(plain));memset(gtk,0,sizeof(gtk));
+    if(ok){wpa_host.keys_installed=true;cyw_link=CYW_LINK_UP;}
+    return ok;
+}
 
 static void capture_eapol(const u8 *data, u32 len)
 {
@@ -613,8 +975,8 @@ static void capture_eapol(const u8 *data, u32 len)
                            ((u32)frame[29] << 8) | frame[30] : 0U;
     memset(cyw_diag.eapol_words, 0, sizeof(cyw_diag.eapol_words));
     u32 words = frame_len / 4U;
-    if (words > 11U)
-        words = 11U;
+    if (words > 9U)
+        words = 9U;
     for (u32 i = 0U; i < words; i++)
         cyw_diag.eapol_words[i] = load_le32(frame + i * 4U);
     uart_puts("[cyw] EAPOL keyinfo=");
@@ -624,6 +986,92 @@ static void capture_eapol(const u8 *data, u32 len)
     uart_puts(":");
     uart_hex(cyw_diag.eapol_replay_lo);
     uart_puts("\n");
+
+    if (wpa_host.enabled && frame_len >= 113U) {
+        u16 key_info = ((u16)frame[19] << 8) | frame[20];
+        bool pairwise = (key_info & 0x0008U) != 0U;
+        bool ack = (key_info & 0x0080U) != 0U;
+        bool mic = (key_info & 0x0100U) != 0U;
+        if (pairwise && ack && !mic) {
+            memcpy(wpa_host.anonce,frame+31U,32U);
+            wpa_host.replay =
+                ((u64)frame[23]<<56)|((u64)frame[24]<<48)|
+                ((u64)frame[25]<<40)|((u64)frame[26]<<32)|
+                ((u64)frame[27]<<24)|((u64)frame[28]<<16)|
+                ((u64)frame[29]<<8)|frame[30];
+            if (!wpa_host.nonce_ready) {
+                u8 seed[28];
+                memcpy(seed,cyw_mac,6U);
+                memcpy(seed+6U,wpa_host.ap_mac,6U);
+                u64 now=timer_monotonic_ms();
+                for (u32 i=0U;i<8U;i++)
+                    seed[12U+i]=(u8)(now>>(i*8U));
+                u64 ticks=timer_ticks();
+                for (u32 i=0U;i<8U;i++)
+                    seed[20U+i]=(u8)(ticks>>(i*8U));
+                hmac_sha256(wpa_host.pmk,32U,seed,sizeof(seed),
+                            wpa_host.snonce);
+                memset(seed,0,sizeof(seed));
+                wpa_host.nonce_ready=true;
+            }
+
+            /* The association target can be a transmitted/parent BSSID in a
+             * multi-BSSID profile. The EAPOL source is the authenticator
+             * address used by the four-way handshake. */
+            memcpy(wpa_host.ap_mac,frame+6U,CYW_MAC_LEN);
+            wpa_derive_ptk_for(wpa_host.ap_mac,wpa_host.ptk);
+            if (wpa_send_m2(frame,frame_len)) {
+                wpa_host.m2_sent = true;
+                cyw_diag.eapol_m2_sent++;
+            } else {
+                cyw_diag.eapol_m2_fail++;
+            }
+        } else if (pairwise && ack && mic)
+            (void)wpa_handle_m3(frame,frame_len);
+    }
+}
+
+static bool cyw_data_is_eapol(const u8 *data, u32 len)
+{
+    if (!data || len < 4U)
+        return false;
+    u32 bdc_offset = 4U + ((u32)data[3] << 2);
+    return bdc_offset <= len && len - bdc_offset >= 14U &&
+           data[bdc_offset + 12U] == 0x88U &&
+           data[bdc_offset + 13U] == 0x8EU;
+}
+
+static bool cyw_data_queue_push(const u8 *data, u32 len)
+{
+    if (!data || len > CYW_MAX_FRAME ||
+        cyw_data_rx_count == CYW_DATA_RX_QUEUE_DEPTH) {
+        cyw_diag.data_rx_dropped++;
+        return false;
+    }
+    struct cyw_data_rx_slot *slot = &cyw_data_rx_queue[cyw_data_rx_head];
+    memcpy(slot->data, data, len);
+    slot->len = len;
+    cyw_data_rx_head =
+        (cyw_data_rx_head + 1U) % CYW_DATA_RX_QUEUE_DEPTH;
+    cyw_data_rx_count++;
+    cyw_diag.data_rx_queued++;
+    return true;
+}
+
+static bool cyw_data_frame_copy(const u8 *data, u32 data_len,
+                                u8 *frame, u32 *frame_len)
+{
+    if (!data || !frame || !frame_len || data_len < 4U)
+        return false;
+    u32 bdc_offset = 4U + ((u32)data[3] << 2);
+    if (bdc_offset >= data_len)
+        return false;
+    u32 payload_len = data_len - bdc_offset;
+    if (payload_len > *frame_len)
+        payload_len = *frame_len;
+    memcpy(frame, data + bdc_offset, payload_len);
+    *frame_len = payload_len;
+    return true;
 }
 
 #define CYW_SCAN_SEC_WPA2_PSK        (1U << 0)
@@ -657,19 +1105,39 @@ static u32 sdpcm_build_header(u8 *buf, u32 payload_len, u8 channel)
     return SDPCM_HEADER_LEN;
 }
 
+static bool sdpcm_can_send(u8 channel)
+{
+    if (channel >= 8U)
+        return false;
+    if ((u8)(cyw_tx_max - cyw_tx_seq) == 0U)
+        return false;
+    return channel != SDPCM_DATA_CHANNEL ||
+           (cyw_tx_fcmask & (u8)(1U << SDPCM_DATA_CHANNEL)) == 0U;
+}
+
 static bool sdpcm_send(u8 channel, const u8 *data, u32 len)
 {
+    if (channel >= 8U)
+        return false;
     if (len + SDPCM_HEADER_LEN > CYW_MAX_FRAME)
         return false;
 
     /* Firmware owns the transmit window. Do not publish another frame until
      * max_seq advances; drain queued responses/events to acquire credit.
-     * This loop deliberately does NOT pet the hardware watchdog: a credit
-     * stall must remain visible to the watchdog so the board reboots and
-     * self-heals rather than hanging indefinitely. Callers that must not
-     * block (reactor/association pokes) check credit before calling. */
-    u64 credit_deadline = timer_monotonic_ms() + 30000ULL;
-    while ((u8)(cyw_tx_max - cyw_tx_seq) == 0U) {
+     *
+     * This loop deliberately does NOT pet the hardware watchdog, so a stall
+     * cannot hang the board indefinitely. It must therefore give up well
+     * before the ~15 s hardware watchdog deadline: letting the watchdog win
+     * resets the board with no record of why, which is exactly the failure
+     * mode that made the CYW43455 RX regression so expensive to diagnose.
+     * On expiry we PiSOD, persist the record to SD, and reboot deliberately.
+     * Callers that must not block (reactor/association pokes) check credit
+     * before calling. */
+    u64 stall_start = timer_monotonic_ms();
+    u64 credit_deadline = stall_start + CYW_TX_CREDIT_STALL_MS;
+    while ((u8)(cyw_tx_max - cyw_tx_seq) == 0U ||
+           (channel == SDPCM_DATA_CHANNEL &&
+            (cyw_tx_fcmask & (u8)(1U << SDPCM_DATA_CHANNEL)) != 0U)) {
         if (sdpcm_pending_bytes() != 0U) {
             u8 pending_channel = 0;
             u32 pending_len = CYW_MAX_FRAME;
@@ -682,32 +1150,84 @@ static bool sdpcm_send(u8 channel, const u8 *data, u32 len)
         } else {
             timer_delay_ms(1U);
         }
-        if (timer_monotonic_ms() >= credit_deadline)
-            return false;
+        if (timer_monotonic_ms() >= credit_deadline) {
+            u64 values[8] = {
+                (u8)(cyw_tx_max - cyw_tx_seq),
+                cyw_tx_seq,
+                cyw_tx_max,
+                cyw_tx_fcmask,
+                channel,
+                cyw_diag.stage,
+                cyw_diag.bcdc_rframe_count,
+                cyw_diag.event_count,
+            };
+            exception_pisod_reboot("CYW43455 SDPCM TX credit stall",
+                                   EXCEPTION_CRASH_KIND_STALL,
+                                   EXCEPTION_STALL_CYW_TX_CREDIT,
+                                   values, 8U);
+        }
     }
 
     u32 hdr_len = sdpcm_build_header(cyw_tx_buf, len, channel);
     memcpy(cyw_tx_buf + hdr_len, data, len);
 
     u32 total = hdr_len + len;
-    /* Pad to 64-byte boundary for SDIO */
-    u32 padded = (total + 63) & ~63U;
+    /* The SDPCM FIFO requires word alignment for short transfers, not a full
+     * function-1-style 64-byte block. Writing 192 bytes for a declared
+     * 151-byte EAPOL frame left trailing bytes in the FIFO; Circle and
+     * brcmfmac round short function-2 transfers to 4 bytes. */
+    u32 padded = (total + 3U) & ~3U;
 
-    /* Zero padding to avoid leaking stale buffer contents */
-    if (padded > total)
-        memset(cyw_tx_buf + total, 0, padded - total);
-
-    /* Use block mode for transfers >512 bytes */
+    /* Use full 512-byte blocks only when the frame actually exceeds one. */
     if (padded > 512) {
         u32 nblks = (padded + SDIO_FUNC2_BLKSZ - 1) / SDIO_FUNC2_BLKSZ;
+        u32 transfer = nblks * SDIO_FUNC2_BLKSZ;
+        if (transfer > total)
+            memset(cyw_tx_buf + total, 0, transfer - total);
         return sdio_cmd53_write_blocks(SDIO_FUNC_WLAN, 0, cyw_tx_buf,
                                        SDIO_FUNC2_BLKSZ, nblks, false);
     }
+    if (padded > total)
+        memset(cyw_tx_buf + total, 0, padded - total);
     return sdio_cmd53_write(SDIO_FUNC_WLAN, 0, cyw_tx_buf, padded, false);
 }
 
 static u32 sdpcm_pending_bytes(void)
 {
+    /* A chained next-length is free information carried in the previous frame's
+     * header. Act on it without touching the bus, and never throttle it: it is
+     * how back-to-back frames are drained at full rate. */
+    if (sdpcm_next_len != 0U) {
+        cyw_diag.bcdc_pending_bytes = sdpcm_next_len;
+        return sdpcm_next_len;
+    }
+
+    /* Everything below costs real SDIO transactions, and cyw43_poll() runs on
+     * core 0 on every reactor pass. Discovering "nothing to do" was costing
+     * ~63% of core 0 whenever WiFi was initialised, connected or not, because
+     * each pass issued the RFRAMEBC pair plus a windowed backplane read.
+     *
+     * The card's in-band interrupt (SDHCI status bit 8) answers "is there
+     * anything at all?" in one MMIO read, with no bus transaction. Treat it as
+     * an accelerator only: an asserted line collapses the backoff so latency
+     * stays interrupt-like, but a quiet line still falls through to the paced
+     * probe. That ordering matters -- gating RX on the card interrupt outright
+     * would resurrect the original dead-RX bug on any board where the line does
+     * not behave. */
+    if (cyw_rx_irq_hint) {
+        cyw_rx_irq_hint = false;
+        cyw_diag.rx_card_irqs++;
+        sdio_card_irq_ack();
+        cyw_rx_probe_backoff_ms = 0U;
+        cyw_rx_probe_next_ms = 0U;
+    }
+    bool probe_due = cyw_rx_probe_armed ||
+                     timer_monotonic_ms() >= cyw_rx_probe_next_ms;
+    if (!probe_due) {
+        cyw_diag.bcdc_pending_bytes = 0U;
+        return 0U;
+    }
+
     u8 lo = 0, hi = 0;
     if (!sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_RFRAMEBC_LO, &lo) ||
         !sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_RFRAMEBC_HI, &hi))
@@ -743,15 +1263,67 @@ static u32 sdpcm_pending_bytes(void)
         count = sdpcm_next_len;
     else if (count == 0U && sdpcm_frame_pending)
         count = 64U; /* header-first read discovers the exact frame length */
+    else if (count == 0U && cyw_rx_probe_enabled) {
+        /* Speculative header probe.
+         *
+         * RFRAMEBC, the chained next-length field and the mailbox/CCCR frame
+         * indications are all indications we may simply never see: on this
+         * board RFRAMEBC reads 0 permanently and no HMB frame indication ever
+         * fires, so once a next-length chain ends the driver has no trigger
+         * left and RX stops for good (events=0, scan never completes, and TX
+         * credit -- which is only refreshed from a received SDPCM header --
+         * freezes until the send path stalls).
+         *
+         * brcmf_sdio_readframes() does not wait to be told either: it reads a
+         * header and decides from its contents whether a frame was really
+         * there. Reading an empty function-2 FIFO yields zeros, which the
+         * length/~length tag check in sdpcm_recv() rejects.
+         *
+         * The decision is latched in cyw_rx_probe_armed because callers ask
+         * twice per frame (cyw43_poll() to test, sdpcm_recv() to size the
+         * read); without the latch the second call would fall on the wrong
+         * side of the backoff deadline and abort a probe we just authorised. */
+        if (!cyw_rx_probe_armed) {
+            cyw_rx_probe_armed = true;
+            cyw_diag.rx_probe_attempts++;
+        }
+        count = 64U;
+    }
     cyw_diag.bcdc_pending_bytes = count;
     return count;
+}
+
+/* Outcome of a speculative probe. A frame means more are probably queued, so
+ * poll flat out; an empty FIFO means back off geometrically to a ceiling. This
+ * keeps a quiet link near zero cost while preserving full throughput under
+ * traffic -- an unthrottled probe pinned core 0 at ~90%. */
+static void sdpcm_probe_result(bool got_frame)
+{
+    if (got_frame) {
+        /* Frames arrive in bursts; go flat out until the FIFO runs dry. */
+        cyw_rx_probe_armed = false;
+        cyw_rx_probe_backoff_ms = 0U;
+        cyw_rx_probe_next_ms = 0U;
+        return;
+    }
+    if (!cyw_rx_probe_armed)
+        return;
+    cyw_rx_probe_armed = false;
+    cyw_rx_probe_backoff_ms = cyw_rx_probe_backoff_ms == 0U
+        ? 1U
+        : (cyw_rx_probe_backoff_ms << 1);
+    if (cyw_rx_probe_backoff_ms > CYW_RX_PROBE_BACKOFF_MAX_MS)
+        cyw_rx_probe_backoff_ms = CYW_RX_PROBE_BACKOFF_MAX_MS;
+    cyw_rx_probe_next_ms = timer_monotonic_ms() + cyw_rx_probe_backoff_ms;
 }
 
 static bool sdpcm_recv(u8 *channel, u8 *data, u32 *len)
 {
     u32 pending = sdpcm_pending_bytes();
-    if (pending < SDPCM_HEADER_LEN || pending > CYW_MAX_FRAME)
+    if (pending < SDPCM_HEADER_LEN || pending > CYW_MAX_FRAME) {
+        sdpcm_probe_result(false);
         return false;
+    }
     u32 reported = cyw_diag.bcdc_rframe_count;
     if (reported == 0U && sdpcm_next_len != 0U)
         reported = sdpcm_next_len;
@@ -760,18 +1332,27 @@ static bool sdpcm_recv(u8 *channel, u8 *data, u32 *len)
      * fails, require a fresh RFRAMEBC/interrupt indication before retrying. */
     sdpcm_frame_pending = false;
     u32 first = pending < 64U ? ((pending + 3U) & ~3U) : 64U;
-    if (!sdio_cmd53_read(SDIO_FUNC_WLAN, 0, cyw_rx_buf, first, false))
+    if (!sdio_cmd53_read(SDIO_FUNC_WLAN, 0, cyw_rx_buf, first, false)) {
+        sdpcm_probe_result(false);
         return false;
+    }
     sdpcm_next_len = 0U;
 
     /* Parse frame tag */
     u16 frame_len = (u16)cyw_rx_buf[0] | ((u16)cyw_rx_buf[1] << 8);
     u16 frame_not = (u16)cyw_rx_buf[2] | ((u16)cyw_rx_buf[3] << 8);
 
-    if (frame_len == 0 || frame_len > CYW_MAX_FRAME)
+    /* An empty function-2 FIFO reads back as zeroes, so this is also how a
+     * speculative probe learns that there was nothing to collect. */
+    if (frame_len == 0 || frame_len > CYW_MAX_FRAME) {
+        sdpcm_probe_result(false);
         return false;
-    if ((u16)(frame_len ^ frame_not) != 0xFFFF)
+    }
+    if ((u16)(frame_len ^ frame_not) != 0xFFFF) {
+        sdpcm_probe_result(false);
         return false;
+    }
+    sdpcm_probe_result(true);
     u32 rounded = (frame_len + 3U) & ~3U;
     u32 transfer_len = rounded;
     if (reported >= frame_len && reported <= CYW_MAX_FRAME)
@@ -788,7 +1369,9 @@ static bool sdpcm_recv(u8 *channel, u8 *data, u32 *len)
 
     *channel = cyw_rx_buf[5] & 0x0F;
     sdpcm_next_len = (u32)cyw_rx_buf[6] << 4;
+    cyw_tx_fcmask = cyw_rx_buf[8];
     cyw_tx_max = cyw_rx_buf[9];
+    cyw_diag.rx_frames++;
     cyw_diag.bcdc_last_channel = *channel;
     cyw_diag.bcdc_last_frame_len = frame_len;
     u8 doff = cyw_rx_buf[7];
@@ -1208,7 +1791,8 @@ static void handle_event(const u8 *data, u32 len)
 
     case CYW_E_SET_SSID:
         if (status == CYW_E_STATUS_SUCCESS) {
-            cyw_link = CYW_LINK_UP;
+            if (!wpa_host.enabled || wpa_host.keys_installed)
+                cyw_link = CYW_LINK_UP;
             uart_puts("[cyw] connected\n");
         } else {
             cyw_link = CYW_LINK_AUTH_FAIL;
@@ -1221,7 +1805,8 @@ static void handle_event(const u8 *data, u32 len)
     case CYW_E_LINK:
         if (status == CYW_E_STATUS_SUCCESS) {
             if (event_flags & 1U) {
-                cyw_link = CYW_LINK_UP;
+                if (!wpa_host.enabled || wpa_host.keys_installed)
+                    cyw_link = CYW_LINK_UP;
                 uart_puts("[cyw] link up\n");
             } else {
                 cyw_link = CYW_LINK_DOWN;
@@ -1271,6 +1856,14 @@ static u32 load_le32(const u8 *p)
            ((u32)p[2] << 16) | ((u32)p[3] << 24);
 }
 
+static void store_le32(u8 *p, u32 value)
+{
+    p[0]=(u8)value;
+    p[1]=(u8)(value>>8);
+    p[2]=(u8)(value>>16);
+    p[3]=(u8)(value>>24);
+}
+
 static bool scan_store_bss(const u8 *bss, u32 record_len)
 {
     if (!bss || record_len < 128U)
@@ -1313,6 +1906,11 @@ static bool scan_store_bss(const u8 *bss, u32 record_len)
             if (item_len + 2U > available)
                 break;
             if (ie[0] == 48U && item_len >= 8U) {
+                u32 rsn_len = item_len + 2U;
+                if (rsn_len <= sizeof(r->rsn_ie)) {
+                    memcpy(r->rsn_ie, ie, rsn_len);
+                    r->rsn_ie_len = (u8)rsn_len;
+                }
                 const u8 *p = ie + 2U;
                 u32 left = item_len;
                 if (left < 8U)
@@ -1401,38 +1999,12 @@ static bool scan_parse_legacy_results(const u8 *data, u32 len)
     return true;
 }
 
-static bool scan_fetch_legacy_results(void)
-{
-    static u8 result_buf[CYW_SCAN_QUERY_BYTES] ALIGNED(64);
-    bool parsed = false;
-    for (u32 attempt = 0U; attempt < 2U; attempt++) {
-        memset(result_buf, 0, sizeof(result_buf));
-        result_buf[0] = (u8)(sizeof(result_buf) & 0xFFU);
-        result_buf[1] = (u8)((sizeof(result_buf) >> 8) & 0xFFU);
-        result_buf[4] = 109U; /* current brcmf_bss_info_le version */
-
-        u32 response_len = sizeof(result_buf);
-        if (!bcdc_get_cmd(WLC_SCAN_RESULTS, result_buf,
-                          sizeof(result_buf), &response_len))
-            continue;
-        if (scan_parse_legacy_results(result_buf, response_len)) {
-            parsed = true;
-            break;
-        }
-    }
-    if (!parsed)
-        return false;
-
-    scan_results_pending = false;
-    uart_puts("[cyw] legacy scan n=");
-    uart_hex(scan_count);
-    uart_puts("\n");
-    return true;
-}
-
 static bool scan_result_request_start(void)
 {
     static u8 buf[BCDC_HEADER_LEN + CYW_SCAN_QUERY_BYTES] ALIGNED(64);
+    if (!sdpcm_can_send(SDPCM_CTL_CHANNEL))
+        return false;
+
     memset(scan_result_buf, 0, sizeof(scan_result_buf));
     scan_result_buf[0] = (u8)(sizeof(scan_result_buf) & 0xFFU);
     scan_result_buf[1] = (u8)((sizeof(scan_result_buf) >> 8) & 0xFFU);
@@ -1459,6 +2031,7 @@ static bool scan_result_request_start(void)
 
     scan_result_request_id = id;
     scan_result_request_pending = true;
+    scan_result_request_attempts++;
     scan_result_request_deadline_ms =
         timer_monotonic_ms() + CYW_BCDC_GET_TIMEOUT_MS;
     return true;
@@ -1469,7 +2042,11 @@ static void scan_bus_kick(void)
     /* Never block: this runs from the reactor and from the association poll
      * loop, so it must fail closed when the firmware transmit window is
      * exhausted rather than entering sdpcm_send()'s credit wait. */
-    if ((u8)(cyw_tx_max - cyw_tx_seq) == 0U)
+    /* Preserve the last advertised TX credit for the actual result request.
+     * Kicks are optional progress nudges; consuming the final credit makes
+     * result retrieval impossible if the firmware has no event to publish. */
+    if (!sdpcm_can_send(SDPCM_CTL_CHANNEL) ||
+        (u8)(cyw_tx_max - cyw_tx_seq) <= 1U)
         return;
 
     /* The firmware publishes queued SDPCM frames in response to host bus
@@ -1498,21 +2075,37 @@ static void scan_result_poll(void)
         if (bcdc_take_response(scan_result_request_id, scan_result_buf,
                                &len, &status)) {
             scan_result_request_pending = false;
-            scan_in_progress = false;
-            if (status == 0U && scan_parse_legacy_results(scan_result_buf, len))
+            if (status == 0U && scan_parse_legacy_results(scan_result_buf, len)) {
+                scan_result_request_attempts = 0U;
+                scan_in_progress = false;
                 scan_results_pending = false;
+            } else if (scan_result_request_attempts < 3U) {
+                scan_ready_ms = timer_monotonic_ms() + 250ULL;
+                scan_next_kick_ms = timer_monotonic_ms();
+            } else {
+                scan_in_progress = false;
+                scan_results_pending = false;
+            }
             return;
         }
         if (timer_monotonic_ms() >= scan_result_request_deadline_ms) {
             scan_result_request_pending = false;
-            scan_in_progress = false;
             cyw_diag.bcdc_timeouts++;
+            if (scan_result_request_attempts < 3U) {
+                scan_ready_ms = timer_monotonic_ms() + 250ULL;
+                if (scan_kicks_remaining == 0U)
+                    scan_kicks_remaining = 4U;
+                scan_next_kick_ms = timer_monotonic_ms();
+            } else {
+                scan_in_progress = false;
+                scan_results_pending = false;
+            }
         }
         return;
     }
     if (scan_in_progress && timer_monotonic_ms() >= scan_ready_ms) {
-        (void)scan_result_request_start();
-        return;
+        if (scan_result_request_start())
+            return;
     }
     /* While the scan runs, poke the bus on a bounded cadence so the firmware
      * flushes queued escan event frames to the host. */
@@ -1719,9 +2312,19 @@ static bool cyw43_backplane_init(void)
     }
 
     /* Clear pull-ups/pull-downs */
-    sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_PULLUPS, 0);
-    bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLUP, 0);
-    bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLDOWN, 0);
+    if (!sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_PULLUPS, 0) ||
+        !bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLUP, 0) ||
+        !bp_write32(CYW_CHIPCOMMON_BASE + CC_GPIOPULLDOWN, 0)) {
+        uart_puts("[cyw] GPIO pulls fail\n");
+        return false;
+    }
+
+    /* Do not write ChipControl index 1 on CYW43455. Circle's reference
+     * driver applies the bits 13:11 SDIO drive-strength write only to the
+     * older 4330/43362 parts and returns before it for 4345. On the Pi 5
+     * CYW43455, forcing 0b111 there prevents the post-firmware HT clock from
+     * becoming available (stage 23), so the safe target-specific behavior is
+     * to leave the firmware/platform pad configuration unchanged. */
 
     return true;
 }
@@ -1735,14 +2338,23 @@ bool cyw43_init(void)
     cyw_link = CYW_LINK_DOWN;
     cyw_tx_seq = 0;
     cyw_tx_max = 4U;
+    cyw_tx_fcmask = 0U;
     cyw_backplane_window = 0;
     sdpcm_frame_pending = false;
     sdpcm_next_len = 0U;
     bcdc_reqid = 1;
     bcdc_ignore_through = 0U;
     memset(bcdc_responses, 0, sizeof(bcdc_responses));
-    scan_count = 0;
-    cyw_diag.scan_result_count = 0U;
+    cyw_data_rx_head = 0U;
+    cyw_data_rx_tail = 0U;
+    cyw_data_rx_count = 0U;
+    cyw_diag.data_rx_queued = 0U;
+    cyw_diag.data_rx_dropped = 0U;
+    /* Preserve the last completed scan cache across a clean firmware
+     * reinitialization. Association needs fresh SDPCM credits after scanning,
+     * but still needs the selected BSSID/chanspec from that scan. A new
+     * cyw43_scan_start() remains the authoritative cache reset. */
+    cyw_diag.scan_result_count = scan_count;
     scan_in_progress = false;
     scan_results_pending = false;
     scan_ready_ms = 0ULL;
@@ -1756,18 +2368,22 @@ bool cyw43_init(void)
     cyw_diag.last_event_flags = 0U;
     cyw_diag.last_event_len = 0U;
     cyw_diag.event_count = 0U;
-    cyw_diag.scan_result_count = 0U;
+    cyw_diag.scan_result_count = scan_count;
     cyw_diag.last_event_reason = 0U;
     memset(cyw_diag.event_words, 0, sizeof(cyw_diag.event_words));
     event_history_reset();
     cyw_eapol_len = 0U;
+    cyw_m2_len = 0U;
     cyw_diag.eapol_frames = 0U;
     cyw_diag.eapol_len = 0U;
     cyw_diag.eapol_key_info = 0U;
     cyw_diag.eapol_replay_hi = 0U;
     cyw_diag.eapol_replay_lo = 0U;
+    cyw_diag.eapol_m2_sent = 0U;
+    cyw_diag.eapol_m2_fail = 0U;
     memset(cyw_diag.eapol_words, 0, sizeof(cyw_diag.eapol_words));
     memset(cyw_mac, 0, CYW_MAC_LEN);
+    memset(&wpa_host, 0, sizeof(wpa_host));
 
     uart_puts("[cyw] init...\n");
 
@@ -1777,6 +2393,10 @@ bool cyw43_init(void)
         uart_puts("[cyw] SDIO fail\n");
         return false;
     }
+    /* Arm the BCM2712 SDIO2 level interrupt before enabling the CYW functions.
+     * From this point onward the reactor can sleep until DAT1 signals work;
+     * the slow speculative probe remains only as a missed-IRQ safety net. */
+    cyw43_register_sdio_irq();
 
     /* Enable backplane function (func 1) */
     if (!sdio_enable_func(SDIO_FUNC_BACKPLANE)) {
@@ -2125,13 +2745,15 @@ bool cyw43_load_firmware(void)
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqHT);
     uart_puts("[cyw] CLKCSR=ReqHT done; polling HT...\n");
     bool ht_ok = false;
-    for (u32 i = 0; i < 50; i++) {
+    u32 ht_polls = 0U;
+    u64 ht_deadline = timer_monotonic_ms() + 5000ULL;
+    while (timer_monotonic_ms() < ht_deadline) {
         u8 clk = 0;
         bool rd = sdio_cmd52_read(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, &clk);
         cyw_diag.clkcsr = clk;
-        if (i < 3 || (i & 7) == 0) {
+        if (ht_polls < 3U || (ht_polls & 31U) == 0U) {
             uart_puts("[cyw] HT poll i=");
-            uart_hex(i);
+            uart_hex(ht_polls);
             uart_puts(" rd=");
             uart_hex(rd ? 1 : 0);
             uart_puts(" clk=");
@@ -2143,7 +2765,11 @@ bool cyw43_load_firmware(void)
             cyw_diag.ht_available = 1U;
             break;
         }
-        delay_cycles(5000000);
+        ht_polls++;
+        if (cyw_progress_hook)
+            cyw_progress_hook();
+        watchdog_hw_pet();
+        timer_delay_ms(10U);
     }
     if (!ht_ok) {
         cyw_diag.last_error = 23U;
@@ -2284,6 +2910,18 @@ bool cyw43_load_firmware(void)
         uart_puts("[cyw] no CLM\n");
     }
 
+    /* Use a stable locally-administered address. Leaving cyw_mac zero makes
+     * WiFi activation build ARP/Ethernet frames with an invalid source MAC if
+     * the synchronous cur_etheraddr GET is delayed or unsupported. */
+    {
+        static const u8 pios_wifi_mac[CYW_MAC_LEN] =
+            { 0x02U, 0x50U, 0x49U, 0x4FU, 0x53U, 0x01U };
+        if (!cyw43_set_mac(pios_wifi_mac)) {
+            uart_puts("[cyw] MAC set fail\n");
+            return false;
+        }
+    }
+
     uart_puts("[cyw] fw ok\n");
     cyw_diag.stage = 25U;
     return true;
@@ -2291,6 +2929,17 @@ bool cyw43_load_firmware(void)
 
 void cyw43_poll(void)
 {
+    bool active = cyw43_poll_busy();
+    u64 now = timer_monotonic_ms();
+    bool irq_edge = sdio_card_irq_take();
+    if (!active && !irq_edge && now < cyw_poll_idle_next_ms)
+        return;
+    if (!irq_edge)
+        irq_edge = sdio_card_irq_edge();
+    cyw_rx_irq_hint = irq_edge;
+    if (!active)
+        cyw_poll_idle_next_ms = now + 1000ULL;
+
     /* Drain a bounded burst rather than a single frame. An escan publishes one
      * event frame per BSS plus a completion event; consuming only one frame per
      * reactor pass throttles delivery below the firmware's publication rate and
@@ -2310,7 +2959,17 @@ void cyw43_poll(void)
             break;
 
         case SDPCM_DATA_CHANNEL:
-            capture_eapol(cyw_rx_buf, len);
+            if (cyw_data_is_eapol(cyw_rx_buf, len))
+                capture_eapol(cyw_rx_buf, len);
+            else {
+                (void)cyw_data_queue_push(cyw_rx_buf, len);
+                /*
+                 * net_poll() owns regular Ethernet delivery. Do not keep
+                 * draining SDPCM data here or a burst fills the bounded queue
+                 * before the reactor returns to the network stack.
+                 */
+                return;
+            }
             break;
 
         case SDPCM_CTL_CHANNEL:
@@ -2382,8 +3041,11 @@ bool cyw43_scan_start(void)
     scan_count = 0;
     scan_in_progress = true;
     scan_results_pending = true;
-    scan_ready_ms = timer_monotonic_ms() + 30000ULL;
+    /* Keep result retrieval inside the 15-second bounded bus-kick window so
+     * the firmware still has opportunities to publish a credit/response. */
+    scan_ready_ms = timer_monotonic_ms() + 10000ULL;
     scan_result_request_pending = false;
+    scan_result_request_attempts = 0U;
     scan_kicks_remaining = CYW_SCAN_KICKS_MAX;
     scan_next_kick_ms = timer_monotonic_ms() + CYW_SCAN_KICK_INTERVAL_MS;
 
@@ -2445,10 +3107,8 @@ bool cyw43_scan_start(void)
 
 bool cyw43_scan_get_results(struct cyw_scan_result *results, u32 *count)
 {
-    if (scan_in_progress && scan_count == 0U)
-        return false;
-    if (scan_results_pending && scan_count == 0U &&
-        !scan_fetch_legacy_results())
+    if (scan_in_progress || scan_result_request_pending ||
+        scan_results_pending)
         return false;
 
     u32 n = scan_count;
@@ -2461,10 +3121,9 @@ bool cyw43_scan_get_results(struct cyw_scan_result *results, u32 *count)
 
 bool cyw43_scan_in_progress(void)
 {
-    if (scan_in_progress && scan_results_pending &&
-        timer_monotonic_ms() >= scan_ready_ms)
-        scan_in_progress = false;
-    return scan_in_progress && scan_count == 0U;
+    scan_result_poll();
+    return scan_in_progress || scan_result_request_pending ||
+           scan_results_pending;
 }
 
 bool cyw43_radio_query(u32 *radio, u32 *channel)
@@ -2545,6 +3204,44 @@ bool cyw43_join_diag_query(struct cyw_join_diag *out)
     return out->valid != 0U;
 }
 
+bool cyw43_assoc_req_ies(u8 *out, u32 max, u32 *out_len,
+                         u32 *req_reported, u32 *resp_reported,
+                         u32 *stage)
+{
+    if (stage) *stage = 1U;
+    if (req_reported) *req_reported = 0U;
+    if (resp_reported) *resp_reported = 0U;
+    if (!out || !out_len || max == 0U || max > 512U ||
+        !cyw43_runtime_ready())
+        return false;
+    u8 info[512];
+    u32 info_len = sizeof(info);
+    if (!bcdc_get_iovar("assoc_info", info, &info_len) || info_len < 12U) {
+        if (stage) *stage = 2U;
+        return false;
+    }
+    u32 req_len = load_le32(info);
+    u32 resp_len = load_le32(info + 4U);
+    if (req_reported) *req_reported = req_len;
+    if (resp_reported) *resp_reported = resp_len;
+    if (req_len == 0U || req_len > max) {
+        if (stage) *stage = 3U;
+        return false;
+    }
+    u32 actual = max;
+    if (!bcdc_get_iovar("assoc_req_ies", out, &actual)) {
+        if (stage) *stage = 4U;
+        return false;
+    }
+    if (actual < req_len) {
+        if (stage) *stage = 5U;
+        return false;
+    }
+    *out_len = req_len;
+    if (stage) *stage = 6U;
+    return true;
+}
+
 bool cyw43_set_mac(const u8 mac[CYW_MAC_LEN])
 {
     if (!mac || (mac[0] & 1U) != 0U)
@@ -2607,6 +3304,20 @@ bool cyw43_take_eapol(u8 *frame, u32 *len)
     return true;
 }
 
+void cyw43_wpa_debug_snapshot(struct cyw_wpa_debug *out)
+{
+    if (!out)
+        return;
+    memset(out,0,sizeof(*out));
+    out->m1_len=cyw_eapol_len;
+    out->m2_len=cyw_m2_len;
+    memcpy(out->snonce,wpa_host.snonce,sizeof(out->snonce));
+    if (out->m1_len <= sizeof(out->m1))
+        memcpy(out->m1,cyw_eapol_frame,out->m1_len);
+    if (out->m2_len <= sizeof(out->m2))
+        memcpy(out->m2,cyw_m2_frame,out->m2_len);
+}
+
 static bool cyw43_join_key(const char *ssid, u32 ssid_len,
                            const u8 *key, u32 key_len, u16 key_flags,
                            u32 security, bool sae)
@@ -2616,28 +3327,77 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
     if (!key || key_len > CYW_PASSPHRASE_MAX)
         return false;
     scan_kicks_remaining = 0U;
+    struct cyw_scan_result fixed_target;
     const struct cyw_scan_result *best = NULL;
     i32 best_rssi = -32768;
-    for (u32 i = 0U; i < scan_count; i++) {
-        const struct cyw_scan_result *candidate = &scan_results[i];
-        if (candidate->ssid_len != ssid_len ||
-            memcmp(candidate->ssid, ssid, ssid_len) != 0 ||
-            candidate->rssi <= best_rssi ||
-            candidate->chanspec == 0U)
-            continue;
-        best = candidate;
-        best_rssi = candidate->rssi;
+    if (join_target.valid) {
+        for (u32 i = 0U; i < scan_count; i++) {
+            const struct cyw_scan_result *candidate = &scan_results[i];
+            if (candidate->ssid_len == ssid_len &&
+                memcmp(candidate->ssid,ssid,ssid_len) == 0 &&
+                memcmp(candidate->bssid,join_target.bssid,CYW_MAC_LEN) == 0 &&
+                candidate->chanspec == join_target.chanspec) {
+                best=candidate;
+                break;
+            }
+        }
+        if (!best) {
+            memset(&fixed_target,0,sizeof(fixed_target));
+            fixed_target.ssid_len=(u8)ssid_len;
+            memcpy(fixed_target.ssid,ssid,ssid_len);
+            memcpy(fixed_target.bssid,join_target.bssid,CYW_MAC_LEN);
+            fixed_target.chanspec=join_target.chanspec;
+            best=&fixed_target;
+        }
+        join_target.valid=false;
+    } else {
+        for (u32 i = 0U; i < scan_count; i++) {
+            const struct cyw_scan_result *candidate = &scan_results[i];
+            if (candidate->ssid_len != ssid_len ||
+                memcmp(candidate->ssid, ssid, ssid_len) != 0 ||
+                candidate->rssi <= best_rssi ||
+                candidate->chanspec == 0U)
+                continue;
+            best = candidate;
+            best_rssi = candidate->rssi;
+        }
     }
     if (!best)
         return false;
 
+    bool host_supplicant =
+        !sae && key_len == 32U && key_flags == 0U;
+    wpa_host.enabled = false;
+    wpa_host.m2_sent = false;
+
     uart_puts("[cyw] join radio\n");
     if (!cyw43_radio_enable())
         return false;
-
     cyw_link = CYW_LINK_JOINING;
 
-    /* Set security type */
+    static const u8 wpa2_ccmp_psk_rsn[] = {
+        0x30U, 0x14U,
+        0x01U, 0x00U,
+        0x00U, 0x0FU, 0xACU, 0x04U,
+        0x01U, 0x00U,
+        0x00U, 0x0FU, 0xACU, 0x04U,
+        0x01U, 0x00U,
+        0x00U, 0x0FU, 0xACU, 0x02U,
+        0x00U, 0x00U
+    };
+    static u8 rsn_buf[sizeof(wpa2_ccmp_psk_rsn)];
+    memcpy(rsn_buf, wpa2_ccmp_psk_rsn, sizeof(wpa2_ccmp_psk_rsn));
+    if (cyw_rsn_caps_override) {
+        rsn_buf[sizeof(rsn_buf)-2U] = (u8)(cyw_rsn_caps & 0xFFU);
+        rsn_buf[sizeof(rsn_buf)-1U] = (u8)(cyw_rsn_caps >> 8);
+    }
+    const u8 *rsn_ie=rsn_buf;
+    u32 rsn_ie_len=sizeof(rsn_buf);
+    if (!sae && security != WSEC_NONE &&
+        !bcdc_set_iovar("wpaie",rsn_ie,rsn_ie_len,false))
+        return false;
+
+
     u32 wsec;
     u32 wpa_auth;
     if (security == WSEC_NONE) {
@@ -2647,20 +3407,18 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
         wsec = WSEC_AES;
         wpa_auth = sae ? WPA3_AUTH_SAE_PSK : WPA2_AUTH_PSK;
     }
-    uart_puts("[cyw] join wsec\n");
-    if (!bcdc_set_cmd(WLC_SET_WSEC, &wsec, 4, false))
-        return false;
 
     /* Configure the firmware WPA supplicant. */
     if (security != WSEC_NONE && key_len > 0U) {
-        u32 supplicant = 1U;
-        uart_puts("[cyw] join supplicant\n");
-        if (!bcdc_set_iovar("sup_wpa", &supplicant,
-                            sizeof(supplicant), false))
-            return false;
-
-        timer_delay_ms(2U);
-        if (sae) {
+        if (host_supplicant) {
+            /* Match Circle's external-supplicant sequence. The transitional
+             * mode lets the firmware associate before the host completes the
+             * four-way handshake. */
+            u32 transitional = WPA2_AUTH_PSK | 0x0040U;
+            if (!bcdc_set_iovar("wpa_auth",&transitional,
+                                sizeof(transitional),false))
+                return false;
+        } else if (sae) {
             struct {
                 u16 key_len;
                 u8 key[128];
@@ -2672,6 +3430,12 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
                                 sizeof(sae_password), false))
                 return false;
         } else {
+            u32 supplicant = 1U;
+            uart_puts("[cyw] join supplicant\n");
+            if (!bcdc_set_iovar("sup_wpa", &supplicant,
+                                sizeof(supplicant), false))
+                return false;
+            timer_delay_ms(2U);
             struct {
                 u16 key_len;
                 u16 flags;
@@ -2692,29 +3456,34 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
     uart_puts("[cyw] join auth\n");
     if (!bcdc_set_cmd(WLC_SET_AUTH, &auth, sizeof(auth), false))
         return false;
+    uart_puts("[cyw] join wsec\n");
+    if (!bcdc_set_cmd(WLC_SET_WSEC, &wsec, sizeof(wsec), false))
+        return false;
     if (sae && !bcdc_set_iovar("mfp", &mfp, sizeof(mfp), false))
         return false;
-    if (!bcdc_set_cmd(WLC_SET_WPA_AUTH, &wpa_auth,
-                      sizeof(wpa_auth), false))
+    if (host_supplicant) {
+        if (!bcdc_set_iovar("wpa_auth",&wpa_auth,sizeof(wpa_auth),false))
+            return false;
+    } else if (!bcdc_set_cmd(WLC_SET_WPA_AUTH, &wpa_auth,
+                             sizeof(wpa_auth), false)) {
         return false;
+    }
 
-    /* WLC_SET_SSID takes brcmf_join_params. Supplying the scanned BSSID and
-     * chanspec avoids the firmware's malformed zero-chanspec path. */
-    struct {
-        u32 ssid_len;
-        u8  ssid[CYW_SSID_MAX];
-        u8  bssid[CYW_MAC_LEN];
-        u32 chanspec_num;
-        u16 chanspec_list[1];
-    } join_params;
-    _Static_assert(sizeof(join_params) == 52U,
-                   "Broadcom join parameters must include association data");
-    memset(&join_params, 0, sizeof(join_params));
-    join_params.ssid_len = ssid_len;
-    memcpy(join_params.ssid, ssid, ssid_len);
-    memcpy(join_params.bssid, best->bssid, CYW_MAC_LEN);
-    join_params.chanspec_num = 1U;
-    join_params.chanspec_list[0] = best->chanspec;
+    /* The firmware's targeted association interface is the 72-byte "join"
+     * iovar used by Circle, not a short WLC_SET_SSID payload. */
+    u8 join_params[72];
+    memset(join_params,0,sizeof(join_params));
+    store_le32(join_params,ssid_len);
+    memcpy(join_params+4U,ssid,ssid_len);
+    store_le32(join_params+36U,0xFFU);
+    store_le32(join_params+40U,2U);
+    store_le32(join_params+44U,120U);
+    store_le32(join_params+48U,390U);
+    store_le32(join_params+52U,0xFFFFFFFFU);
+    memcpy(join_params+56U,best->bssid,CYW_MAC_LEN);
+    store_le32(join_params+64U,1U);
+    join_params[68U]=(u8)best->chanspec;
+    join_params[69U]=(u8)(best->chanspec>>8);
 
     uart_puts("[cyw] join SSID: ");
     for (u32 i = 0; i < ssid_len; i++)
@@ -2725,37 +3494,23 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
     event_history_reset();
     join_kicks_remaining = CYW_SCAN_KICKS_MAX;
     join_next_kick_ms = timer_monotonic_ms() + CYW_SCAN_KICK_INTERVAL_MS;
-    if (!bcdc_set_cmd(WLC_SET_SSID, &join_params,
-                      sizeof(join_params), false))
+    if (!bcdc_set_iovar("join",join_params,sizeof(join_params),false))
         return false;
 
-    /* Poll for association result */
-    uart_puts("[cyw] joining...\n");
-    for (u32 i = 0; i < 3000U; i++) {  /* up to 30s */
-        if ((i & 63U) == 0U)
-            watchdog_hw_pet();
-        cyw43_poll();
-        /* This loop owns core 0 for up to 30 seconds. Without draining the
-         * wired GEM ring here it fills (896/896), latches BNA and halts RX
-         * DMA -- and because no further ETH IRQ can then be raised, the
-         * reactor's IRQ-driven recovery never runs and the wired management
-         * path is lost permanently. The progress hook pairs net_poll() with
-         * the MAC recovery checks and pets the watchdog. */
-        if (cyw_progress_hook)
-            cyw_progress_hook();
-        u32 state = cyw43_link_state();
-        if (state == CYW_LINK_UP) {
-            uart_puts("[cyw] associated!\n");
-            return true;
-        }
-        if (state == CYW_LINK_AUTH_FAIL) {
-            uart_puts("[cyw] auth failed\n");
-            return false;
-        }
-        timer_delay_ms(10U);
+    if (host_supplicant) {
+        wpa_host.nonce_ready=false;
+        memcpy(wpa_host.pmk,key,32U);
+        memcpy(wpa_host.ap_mac,best->bssid,CYW_MAC_LEN);
+        memcpy(wpa_host.rsn_ie,rsn_ie,rsn_ie_len);
+        wpa_host.rsn_ie_len=(u8)rsn_ie_len;
+        wpa_host.enabled=true;
     }
-    uart_puts("[cyw] join timeout\n");
-    return false;
+
+    /* Association is asynchronous. The core-0 reactor owns SDPCM/event
+     * draining; blocking here used to starve the wired fail-safe path and
+     * erase diagnostics in a watchdog reboot. */
+    uart_puts("[cyw] joining async\n");
+    return true;
 }
 
 bool cyw43_join(const char *ssid, u32 ssid_len,
@@ -2770,6 +3525,45 @@ bool cyw43_join_pmk(const char *ssid, u32 ssid_len, const u8 pmk[32])
 {
     return cyw43_join_key(ssid, ssid_len, pmk, 32U, 0U,
                           WSEC_AES, false);
+}
+
+bool cyw43_set_join_target(const u8 bssid[CYW_MAC_LEN], u16 chanspec)
+{
+    if (!bssid || chanspec == 0U || (bssid[0] & 1U) != 0U)
+        return false;
+    memcpy(join_target.bssid,bssid,CYW_MAC_LEN);
+    join_target.chanspec=chanspec;
+    join_target.valid=true;
+    return true;
+}
+
+void cyw43_set_rsn_caps(u16 caps, bool override)
+{
+    cyw_rsn_caps = caps;
+    cyw_rsn_caps_override = override;
+}
+
+void cyw43_get_rsn_caps(u16 *caps, bool *override)
+{
+    if (caps)
+        *caps = cyw_rsn_caps_override ? cyw_rsn_caps : 0U;
+    if (override)
+        *override = cyw_rsn_caps_override;
+}
+
+void cyw43_set_rx_probe(bool enabled)
+{
+    cyw_rx_probe_enabled = enabled;
+}
+
+bool cyw43_get_rx_probe(void)
+{
+    return cyw_rx_probe_enabled;
+}
+
+void cyw43_register_sdio_irq(void)
+{
+    sdio_card_irq_arm();
 }
 
 bool cyw43_join_sae(const char *ssid, u32 ssid_len,
@@ -2840,7 +3634,7 @@ bool cyw43_send_frame(const u8 *frame, u32 len)
 
     static u8 bdc_buf[CYW_MAX_FRAME] ALIGNED(64);
     bdc_buf[0] = 0x20;  /* BDC version 2 */
-    bdc_buf[1] = 0x00;  /* flags */
+    bdc_buf[1] = 0x00;  /* 802.1D priority */
     bdc_buf[2] = 0x00;  /* header2 */
     bdc_buf[3] = 0x00;  /* pad */
     memcpy(bdc_buf + 4, frame, len);
@@ -2853,6 +3647,16 @@ bool cyw43_recv_frame(u8 *frame, u32 *len)
     u8 channel;
     u32 rlen;
 
+    if (cyw_data_rx_count != 0U) {
+        struct cyw_data_rx_slot *slot =
+            &cyw_data_rx_queue[cyw_data_rx_tail];
+        bool ok = cyw_data_frame_copy(slot->data, slot->len, frame, len);
+        cyw_data_rx_tail =
+            (cyw_data_rx_tail + 1U) % CYW_DATA_RX_QUEUE_DEPTH;
+        cyw_data_rx_count--;
+        return ok;
+    }
+
     if (!sdpcm_recv(&channel, cyw_rx_buf, &rlen))
         return false;
 
@@ -2864,18 +3668,5 @@ bool cyw43_recv_frame(u8 *frame, u32 *len)
     if (channel != SDPCM_DATA_CHANNEL)
         return false;
 
-    /* Strip BDC data header: 4 bytes + (data[3] * 4) bytes of padding */
-    if (rlen < 4)
-        return false;
-    u32 bdc_offset = 4 + ((u32)cyw_rx_buf[3] << 2);
-    if (bdc_offset >= rlen)
-        return false;
-    rlen -= bdc_offset;
-
-    if (rlen > *len)
-        rlen = *len;
-
-    memcpy(frame, cyw_rx_buf + bdc_offset, rlen);
-    *len = rlen;
-    return true;
+    return cyw_data_frame_copy(cyw_rx_buf, rlen, frame, len);
 }

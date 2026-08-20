@@ -8,8 +8,8 @@
  *   Host sends CBW (31 bytes) → optional data phase → device sends CSW (13 bytes)
  *
  * SCSI commands used:
- *   INQUIRY (0x12), TEST_UNIT_READY (0x00), READ_CAPACITY(10) (0x25),
- *   READ(10) (0x28), WRITE(10) (0x2A)
+ *   INQUIRY (0x12), TEST_UNIT_READY (0x00), REQUEST_SENSE (0x03),
+ *   READ_CAPACITY(10/16), READ(10/16), WRITE(10/16)
  *
  * Reference: USB Mass Storage Class Bulk-Only Transport Spec 1.0
  *            SCSI Primary Commands (SPC), SCSI Block Commands (SBC)
@@ -165,6 +165,85 @@ static bool scsi_test_unit_ready(void) {
     return bbb_transfer(cmd, 6, 0x00, NULL, 0);
 }
 
+static bool scsi_request_sense(u8 *sense_key, u8 *asc, u8 *ascq) {
+    u8 cmd[6] = { 0x03, 0, 0, 0, 18, 0 };
+    if (!bbb_transfer(cmd, 6, 0x80, scsi_buf, 18))
+        return false;
+
+    dcache_invalidate_range((u64)(usize)scsi_buf, 18);
+    u8 response = scsi_buf[0] & 0x7FU;
+    if (response != 0x70U && response != 0x71U)
+        return false;
+    if (sense_key) *sense_key = scsi_buf[2] & 0x0FU;
+    if (asc) *asc = scsi_buf[12];
+    if (ascq) *ascq = scsi_buf[13];
+    return true;
+}
+
+static bool scsi_wait_ready(void) {
+    for (u32 attempt = 0; attempt < 10U; attempt++) {
+        if (scsi_test_unit_ready())
+            return true;
+
+        u8 sense_key = 0xFFU;
+        u8 asc = 0U;
+        u8 ascq = 0U;
+        if (!scsi_request_sense(&sense_key, &asc, &ascq)) {
+            uart_puts("[usb_stor] REQUEST_SENSE failed\n");
+            return false;
+        }
+
+        uart_puts("[usb_stor] Sense key=");
+        uart_hex(sense_key);
+        uart_puts(" ASC=");
+        uart_hex(asc);
+        uart_puts("/");
+        uart_hex(ascq);
+        uart_puts("\n");
+
+        if (sense_key != 0x02U && sense_key != 0x06U)
+            return false;
+        timer_delay_ms(1000U);
+    }
+    return false;
+}
+
+static u32 load_be32(const u8 *p) {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) |
+           ((u32)p[2] << 8) | (u32)p[3];
+}
+
+#if PIOS_ENABLE_SCSI_CAPACITY16
+static u64 load_be64(const u8 *p) {
+    return ((u64)load_be32(p) << 32) | load_be32(p + 4);
+}
+#endif
+
+static bool scsi_geometry_valid(u32 block_size) {
+    return block_size >= 512U && block_size <= 4096U &&
+           (block_size & (block_size - 1U)) == 0U;
+}
+
+#if PIOS_ENABLE_SCSI_CAPACITY16
+static bool scsi_read_capacity16(void) {
+    u8 cmd[16] = {
+        0x9E, 0x10, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 32, 0, 0
+    };
+    if (!bbb_transfer(cmd, 16, 0x80, scsi_buf, 32))
+        return false;
+
+    dcache_invalidate_range((u64)(usize)scsi_buf, 32);
+    u64 last_lba = load_be64(scsi_buf);
+    u32 block_size = load_be32(scsi_buf + 8);
+    if (last_lba == ~0ULL || !scsi_geometry_valid(block_size))
+        return false;
+    blk_size = block_size;
+    num_blocks = last_lba + 1ULL;
+    return true;
+}
+#endif
+
 static bool scsi_read_capacity(void) {
     u8 cmd[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     if (!bbb_transfer(cmd, 10, 0x80, scsi_buf, 8))
@@ -172,17 +251,29 @@ static bool scsi_read_capacity(void) {
 
     dcache_invalidate_range((u64)(usize)scsi_buf, 8);
 
-    u32 last_lba = ((u32)scsi_buf[0] << 24) | ((u32)scsi_buf[1] << 16) |
-                   ((u32)scsi_buf[2] << 8)  | (u32)scsi_buf[3];
-    blk_size    = ((u32)scsi_buf[4] << 24) | ((u32)scsi_buf[5] << 16) |
-                   ((u32)scsi_buf[6] << 8)  | (u32)scsi_buf[7];
-    num_blocks = (u64)last_lba + 1;
+    u32 last_lba = load_be32(scsi_buf);
+    u32 block_size = load_be32(scsi_buf + 4);
+    if (last_lba == 0xFFFFFFFFU) {
+#if PIOS_ENABLE_SCSI_CAPACITY16
+        if (!scsi_read_capacity16())
+            return false;
+#else
+        uart_puts("[usb_stor] >2TB media requires gated READ CAPACITY(16)\n");
+        return false;
+#endif
+    } else {
+        if (!scsi_geometry_valid(block_size))
+            return false;
+        blk_size = block_size;
+        num_blocks = (u64)last_lba + 1ULL;
+    }
 
-    /* Block size must be a power-of-2 between 512 and 4096 */
-    if (blk_size == 0 || blk_size > 4096 || (blk_size & (blk_size - 1)) != 0)
+    if (num_blocks == 0ULL)
         return false;
 
     uart_puts("[usb_stor] Capacity: ");
+    uart_hex((u32)(num_blocks >> 32));
+    uart_puts(":");
     uart_hex((u32)num_blocks);
     uart_puts(" blocks x ");
     uart_hex(blk_size);
@@ -235,12 +326,8 @@ static bool stor_probe(struct usb_device *dev) {
     /* SCSI init sequence */
     scsi_inquiry();
 
-    /* TEST_UNIT_READY may fail initially, retry */
-    for (u32 i = 0; i < 5; i++) {
-        if (scsi_test_unit_ready())
-            break;
-        timer_delay_ms(500);
-    }
+    if (!scsi_wait_ready())
+        return false;
 
     if (!scsi_read_capacity())
         return false;
@@ -273,24 +360,41 @@ bool usb_storage_ready(void) { return stor_ready; }
 u32  usb_storage_block_size(void) { return blk_size; }
 u64  usb_storage_num_blocks(void) { return num_blocks; }
 
-bool usb_storage_read(u32 lba, u32 count, void *buf) {
-    if (!stor_ready) return false;
+bool usb_storage_read(u64 lba, u32 count, void *buf) {
+    if (!stor_ready || !buf || count == 0U ||
+        lba >= num_blocks || (u64)count > num_blocks - lba)
+        return false;
 
     u8 *dst = (u8 *)buf;
     while (count > 0) {
         u32 n = (count > 128) ? 128 : count; /* max 128 blocks per transfer */
         u32 len = n * blk_size;
 
-        u8 cmd[10] = {
-            0x28, 0,                                    /* READ(10) */
-            (u8)(lba >> 24), (u8)(lba >> 16),
-            (u8)(lba >> 8),  (u8)lba,                   /* LBA (big-endian) */
-            0,
-            (u8)(n >> 8), (u8)n,                         /* transfer length */
-            0
-        };
+        bool use16 = lba > 0xFFFFFFFFULL ||
+                     (u64)(n - 1U) > 0xFFFFFFFFULL - lba;
+        u8 cmd[16] = {0};
+        u8 cmd_len;
+        if (use16) {
+            cmd[0] = 0x88; /* READ(16) */
+            for (u32 i = 0; i < 8U; i++)
+                cmd[2U + i] = (u8)(lba >> (56U - i * 8U));
+            cmd[10] = (u8)(n >> 24);
+            cmd[11] = (u8)(n >> 16);
+            cmd[12] = (u8)(n >> 8);
+            cmd[13] = (u8)n;
+            cmd_len = 16U;
+        } else {
+            cmd[0] = 0x28; /* READ(10) */
+            cmd[2] = (u8)(lba >> 24);
+            cmd[3] = (u8)(lba >> 16);
+            cmd[4] = (u8)(lba >> 8);
+            cmd[5] = (u8)lba;
+            cmd[7] = (u8)(n >> 8);
+            cmd[8] = (u8)n;
+            cmd_len = 10U;
+        }
 
-        if (!bbb_transfer(cmd, 10, 0x80, dst, len))
+        if (!bbb_transfer(cmd, cmd_len, 0x80, dst, len))
             return false;
 
         dcache_invalidate_range((u64)(usize)dst, len);
@@ -301,25 +405,42 @@ bool usb_storage_read(u32 lba, u32 count, void *buf) {
     return true;
 }
 
-bool usb_storage_write(u32 lba, u32 count, const void *buf) {
-    if (!stor_ready) return false;
+bool usb_storage_write(u64 lba, u32 count, const void *buf) {
+    if (!stor_ready || !buf || count == 0U ||
+        lba >= num_blocks || (u64)count > num_blocks - lba)
+        return false;
 
     const u8 *src = (const u8 *)buf;
     while (count > 0) {
         u32 n = (count > 128) ? 128 : count;
         u32 len = n * blk_size;
 
-        u8 cmd[10] = {
-            0x2A, 0,                                    /* WRITE(10) */
-            (u8)(lba >> 24), (u8)(lba >> 16),
-            (u8)(lba >> 8),  (u8)lba,
-            0,
-            (u8)(n >> 8), (u8)n,
-            0
-        };
+        bool use16 = lba > 0xFFFFFFFFULL ||
+                     (u64)(n - 1U) > 0xFFFFFFFFULL - lba;
+        u8 cmd[16] = {0};
+        u8 cmd_len;
+        if (use16) {
+            cmd[0] = 0x8A; /* WRITE(16) */
+            for (u32 i = 0; i < 8U; i++)
+                cmd[2U + i] = (u8)(lba >> (56U - i * 8U));
+            cmd[10] = (u8)(n >> 24);
+            cmd[11] = (u8)(n >> 16);
+            cmd[12] = (u8)(n >> 8);
+            cmd[13] = (u8)n;
+            cmd_len = 16U;
+        } else {
+            cmd[0] = 0x2A; /* WRITE(10) */
+            cmd[2] = (u8)(lba >> 24);
+            cmd[3] = (u8)(lba >> 16);
+            cmd[4] = (u8)(lba >> 8);
+            cmd[5] = (u8)lba;
+            cmd[7] = (u8)(n >> 8);
+            cmd[8] = (u8)n;
+            cmd_len = 10U;
+        }
 
         dcache_clean_range((u64)(usize)src, len);
-        if (!bbb_transfer(cmd, 10, 0x00, (void *)src, len))
+        if (!bbb_transfer(cmd, cmd_len, 0x00, (void *)src, len))
             return false;
 
         lba += n;

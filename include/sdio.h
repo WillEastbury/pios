@@ -163,6 +163,17 @@ bool sdio_disable_func(u32 func);
 bool sdio_enable_func_irq(u32 func);
 
 /* Bus width control */
+/* Card interrupt (SDHCI status bit 8) — the SDIO in-band interrupt the card
+ * raises on DAT1. Reading it is a single MMIO access with no bus transaction,
+ * so it is safe to consult on every reactor pass. */
+bool sdio_card_irq_pending(void);
+bool sdio_card_irq_edge(void);
+void sdio_card_irq_ack(void);
+void sdio_card_irq_arm(void);
+bool sdio_card_irq_take(void);
+void sdio_irq_snapshot(u32 *status, u32 *signal_enable, u32 *mask,
+                       u32 *gic_enable, u32 *gic_pending,
+                       u32 *gic_target);
 bool sdio_set_bus_width_4bit(void);
 
 /* Power control */

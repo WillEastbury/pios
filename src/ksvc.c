@@ -266,7 +266,7 @@ bool ksvc_send(i32 dst_id, const struct ksvc_msg *msg)
     dmb();
     e->mb_head = next;
     e->messages_sent++;
-    sev();
+    sevl();
     return true;
 }
 

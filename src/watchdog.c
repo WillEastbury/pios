@@ -144,9 +144,12 @@ void watchdog_trip(u32 core, u32 reason)
 {
     g_wdog.trip_count++;
     g_wdog.last_trip_core = core;
-    if (g_wdog.reboot_on_trip)
-        watchdog_reboot_best_effort();
-    exception_pisod("Watchdog liveness failure", 5, reason, 0, core, g_wdog.timeout_ticks);
+    /* Capture and persist before rebooting. Rebooting first (the previous
+     * behaviour) threw away the very state that explains the trip. */
+    u64 values[3] = { core, reason, g_wdog.timeout_ticks };
+    exception_pisod_reboot("Watchdog liveness failure",
+                           EXCEPTION_CRASH_KIND_WATCHDOG, reason,
+                           values, 3U);
 }
 
 NORETURN void watchdog_reboot_now(u32 reason)

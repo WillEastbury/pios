@@ -159,11 +159,11 @@ Staging is `ota_stage_buf` (highmem when available, capacity
 `pios_bootctrl_mark_pending()`. A partial or aborted stream leaves the slot
 uncommitted.
 
-Baseline push throughput: ~17 KB/s, bounded by the board's fixed 4 KB
-`TCP_BUF_SIZE` receive window.
+The original push throughput was ~17 KB/s with a 4 KB receive window.
+`TCP_BUF_SIZE` is now 8192.
 
-> `TCP_BUF_SIZE` stays 4096. Raising it has been tried and reverted — see
-> [`gotchas.md`](gotchas.md).
+> ADR-019 records the QEMU static-memory-layout fix required before the larger
+> OTA receive window was safe.
 
 ---
 
@@ -335,8 +335,12 @@ the same tick as the framebuffer-heavy render.
 
 - `PIOS WORKBENCH` — version, uptime, `WIRED IP` and `WIRELESS IP` rows
 - `HARDWARE / CAPABILITIES`
-- `PARALLEL / VECTOR ACCELERATION` — CPU FP32, CPU integer, verified PicoScript
-  QPU ops, QPU VM arithmetic, batched QPU MatVec, Media state
+- `PARALLEL / VECTOR ACCELERATION` — CPU FP32, CPU integer, native V3D 7.1 CSD
+  readiness, verified PicoScript QPU ops, QPU VM arithmetic, batched QPU MatVec,
+  Media state. ADR-027 runs the guarded proofs and representative profiles during
+  boot; the commands remain available for explicit re-verification. CPU FP32/NEON
+  and CPU integer are always enabled; the integer row combines NEON INT8
+  dot/matvec with scalar/C I32 primitives.
 - `NETWORK / PROCESS MAP` — listening ports mapped to owning pid/core/process
 - `WARNINGS / ERRORS`
 - Optional right column: `NIC / MAC RX-TX`, `DMA ENGINE`, `FIFO / LEASE ARENAS`

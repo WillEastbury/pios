@@ -57,7 +57,7 @@ bool workq_enqueue(u32 target_core, work_fn_t fn, void *ctx)
     dmb();
     q->head = next;
     irq_restore(daif);
-    sev();
+    sevl();
     return true;
 }
 
