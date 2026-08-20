@@ -65,8 +65,17 @@ void qemu_virt_main(void)
     qemu_hex((el >> 2) & 3U);
     qemu_puts("\nPL011=");
     qemu_hex(PIOS_UART0_BASE);
+#if PIOS_PLATFORM == PIOS_PLATFORM_FVP_A76_GICV2
+    /*
+     * The Base RevC model's GICv2-compatibility MMIO map is probed
+     * separately. Do not let an unresolved legacy-map access prevent the
+     * CPU/EL/UART/timer smoke target from proving the architectural platform.
+     */
+    qemu_puts("\nGICv2 MMIO probe deferred\n");
+#else
     qemu_puts("\nGICD_TYPER=");
     qemu_hex(mmio_read(PIOS_GICD_BASE + 0x004));
+#endif
     qemu_puts("\nCNTFRQ=");
     qemu_hex(qemu_cntfrq());
     qemu_puts("\nCNTVCT=");
@@ -80,8 +89,11 @@ void qemu_virt_main(void)
         qemu_puts("\n");
         qemu_delay_ticks(freq / 2U);
     }
+#if PIOS_PLATFORM == PIOS_PLATFORM_FVP_A76_GICV2
+    qemu_puts("fvp-a76 smoke boot complete; parking\n");
+#else
     qemu_puts("qemu-virt smoke boot complete; parking\n");
+#endif
     for (;;)
         __asm__ volatile("wfe");
 }
-

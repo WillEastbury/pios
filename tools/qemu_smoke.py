@@ -429,7 +429,7 @@ def main() -> int:
     net = ("user,id=n0,net=192.168.0.0/24,host=192.168.0.1,"
            "hostfwd=tcp:127.0.0.1:8088-192.168.0.201:80,"
            "hostfwd=tcp:127.0.0.1:8082-192.168.0.201:8082")
-    qargs = [QEMU, "-M", "virt", "-cpu", "cortex-a53", "-smp", "4", "-m", "1G",
+    qargs = [QEMU, "-M", "virt", "-cpu", "cortex-a76", "-smp", "4", "-m", "1G",
              "-display", "none", "-serial", f"file:{SERIAL_LOG}",
              "-kernel", args.kernel, "-netdev", net,
              "-device", "virtio-net-device,netdev=n0"]

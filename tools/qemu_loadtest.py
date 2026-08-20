@@ -215,6 +215,56 @@ def _ota_worker(host, ota_port, stop, stats):
             stats.record(False, 0.0, "ota-" + type(e).__name__)
 
 
+def _ota_fragmented(host: str, ota_port: int, image: bytes,
+                    abort_after: int | None = None) -> bool:
+    total = len(image)
+    header = (
+        f"POST /api/admin/kernel-stream?confirm=1&total={total} HTTP/1.0\r\n"
+        f"Host: {host}\r\nConnection: close\r\n"
+        f"Content-Type: application/octet-stream\r\nContent-Length: {total}\r\n\r\n"
+    ).encode()
+    with socket.create_connection((host, ota_port), timeout=20) as s:
+        s.settimeout(20)
+        wire = header + image
+        sent = 0
+        step = 1
+        while sent < len(wire):
+            end = min(sent + step, len(wire))
+            s.sendall(wire[sent:end])
+            sent = end
+            if abort_after is not None and sent >= len(header) + abort_after:
+                return True
+            step = 1 + (step % 37)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        return b'"ok":true' in response
+
+
+def prof_ota_transport(base, cfg) -> bool:
+    print(f"{YEL}ota-transport{RST} — fragmented stream, abort, then clean retry")
+    image = bytes((i * 29 + 3) & 0xFF for i in range(32 * 1024))
+    with Health(base) as h:
+        try:
+            aborted = _ota_fragmented(cfg.host, cfg.ota_port, image,
+                                      abort_after=len(image) // 3)
+            time.sleep(0.2)
+            completed = _ota_fragmented(cfg.host, cfg.ota_port, image)
+        except Exception as exc:
+            print(f"  transport exception: {type(exc).__name__}")
+            aborted = completed = False
+        dips = h.dips
+    alive = liveness(base)
+    ok = aborted and completed and alive and dips == 0
+    tag = f"{GREEN}PASS{RST}" if ok else f"{RED}FAIL{RST}"
+    print(f"  [{tag}] ota-transport abort={aborted} retry={completed} "
+          f"alive={alive} dips={dips}")
+    return ok
+
+
 # --------------------------------------------------------------------- profiles
 def prof_idle(base, cfg) -> bool:
     """Validate idle behaviour: with no load, the board must answer promptly and
@@ -382,6 +432,7 @@ PROFILES = {
     "sustained": prof_sustained,
     "bursty": prof_bursty,
     "malformed": prof_malformed,
+    "ota-transport": prof_ota_transport,
     "fallover": prof_fallover,
 }
 BATTERY = ["idle", "sequential", "parallel", "bursty", "malformed", "intermixed"]
