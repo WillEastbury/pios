@@ -471,6 +471,7 @@ static bool ota_stage_ready;
 
 #define STATIC_UPLOAD_STAGE_MAX 1024U
 struct static_upload_state {
+    bool pending;
     bool active;
     bool done;
     bool ok;
@@ -478,6 +479,7 @@ struct static_upload_state {
     u32 offset;
     u32 total;
     u32 len;
+    u64 not_before_ms;
     char path[256];
 } ALIGNED(64);
 static struct static_upload_state static_upload;
@@ -11601,6 +11603,24 @@ static u32 static_upload_step(void *ctx, u64 deadline_ms)
     return ok ? ADRV_STEP_DONE : ADRV_STEP_FAILED;
 }
 
+static void static_upload_start_if_due(void)
+{
+    if (!static_upload.pending || static_upload.active ||
+        timer_monotonic_ms() < static_upload.not_before_ms)
+        return;
+    static_upload.handle = adrv_submit("static-put", static_upload_step,
+                                       &static_upload, 4U, 5000U,
+                                       ADRV_CADENCE_IDLE);
+    if (static_upload.handle == ADRV_HANDLE_INVALID) {
+        static_upload.pending = false;
+        static_upload.done = true;
+        static_upload.ok = false;
+        return;
+    }
+    static_upload.pending = false;
+    static_upload.active = true;
+}
+
 static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     u32 len = 0;
@@ -11637,7 +11657,7 @@ static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, 
     else if (!has_content_len || body_len != content_len) error = "incomplete body";
     else if (body_len == 0U || body_len > STATIC_UPLOAD_STAGE_MAX) error = "chunk too large";
     else if (total != 0 && (offset > total || body_len > total - offset)) error = "chunk exceeds total";
-    else if (static_upload.active || ota_update.active) error = "previous upload still pending";
+    else if (static_upload.pending || static_upload.active || ota_update.active) error = "previous upload still pending";
     else if (!ota_stage_buf || ota_stage_cap < STATIC_UPLOAD_STAGE_MAX) error = "upload staging unavailable";
     else {
         static_upload.offset = offset;
@@ -11651,16 +11671,10 @@ static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, 
         }
         static_upload.done = false;
         static_upload.ok = false;
-        static_upload.handle = adrv_submit("static-put", static_upload_step,
-                                           &static_upload, 4U, 5000U,
-                                           ADRV_CADENCE_IDLE);
-        if (static_upload.handle == ADRV_HANDLE_INVALID) {
-            error = "upload scheduler unavailable";
-        } else {
-            static_upload.active = true;
-            queued = true;
-            ok = true;
-        }
+        static_upload.not_before_ms = timer_monotonic_ms() + 50U;
+        static_upload.pending = true;
+        queued = true;
+        ok = true;
     }
 
     http_append(out, &len, max,
@@ -11677,6 +11691,8 @@ static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, 
     http_append(out, &len, max, queued ? "true" : "false");
     http_append(out, &len, max, ",\"active\":");
     http_append(out, &len, max, static_upload.active ? "true" : "false");
+    http_append(out, &len, max, ",\"pending\":");
+    http_append(out, &len, max, static_upload.pending ? "true" : "false");
     if (total) {
         http_append(out, &len, max, ",\"total\":");
         http_append_u64(out, &len, max, total);
@@ -23368,6 +23384,7 @@ static void core0_network_service_step(void)
      * service event still preserves the management path under application
      * load. */
     admin_services_poll();
+    static_upload_start_if_due();
     echo_tcp_poll();
     uhttp_bridge_poll();
     capsvc_poll();
