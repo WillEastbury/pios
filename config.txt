@@ -10,3 +10,11 @@ hdmi_force_hotplug=1
 hdmi_group=1
 hdmi_mode=16
 framebuffer_depth=32
+
+[pi3]
+dtoverlay=disable-bt
+
+[pi02]
+dtoverlay=disable-bt
+
+[all]

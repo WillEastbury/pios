@@ -78,6 +78,15 @@ decision)
 | [026](#adr-026) | Bank unused quanta for cooperative processes | Owner | Proposed |
 | [027](#adr-027) | Guarded PicoScript accelerator enablement during boot | Owner | Accepted |
 | [028](#adr-028) | Core-0-owned asynchronous PicoScript QPU jobs | Owner | Accepted |
+| [034](#adr-034) | Failed in-place raw-slot expansion experiment | Owner | Reversed |
+| [035](#adr-035) | Place AIRQ atomic state in the reserved WB control page | Owner | Accepted |
+| [036](#adr-036) | Attempt stage0 framebuffer before EL/MMU transition | Owner | Reversed |
+| [037](#adr-037) | Firmware-entry allocation-only hello | Owner | Accepted |
+| [038](#adr-038) | BCM2835 SDHOST owns Pi 3/Zero 2 W removable storage | Owner | Accepted |
+| [039](#adr-039) | Stage0 framebuffer handoff and boot watchdog suppression | Owner | Accepted |
+| [040](#adr-040) | BCM2837-family Wi-Fi uses native SDIO1 | Owner | Accepted |
+| [041](#adr-041) | Automatic Wi-Fi fallback when no wired NIC exists | Owner | Accepted |
+| [042](#adr-042) | Runtime board selection and memory-capability setup | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -195,6 +204,241 @@ loop may directly call protocol work merely to poll for frames. A missing
 software-interrupt publication is a correctness failure, not a reason to add a
 polling fallback. Every queue is bounded, ownership is explicit, and every
 stage has a regression proving it does no work without its input FIFO event.
+
+---
+
+<a name="adr-034"></a>
+## ADR-034 — Failed in-place raw-slot expansion experiment
+
+**Date:** 2026-08-22 · **Decider:** Owner · **Status:** Reversed
+
+**Experiment.** The raw stage-2 slot was enlarged from the v1 payload limit
+(`0x37FE00` bytes at offset `+0x200`) to 6 MiB while retaining the v1
+boot-control sector at `+0x380000`.
+
+**Failure.** The enlarged payload necessarily crossed `+0x380000`. The payload
+write overwrote boot control; the subsequent control write overwrote the tail
+of the candidate payload. The raw slot then contained a self-corrupting
+candidate which could not boot. This is an on-disk format violation, not a
+recoverable OTA transport fault.
+
+**Rule for future expansion.** Never expand an in-place slot across a live
+control or metadata address. A new layout must use non-overlapping slot and
+control ranges, be introduced by a loader that already understands the new
+layout, and use a distinct FAT package filename so an old loader cannot import
+the new package into the old geometry. Validate the complete transition with a
+fresh-disk and seeded-old-layout migration test before hardware deployment.
+
+**Recovery.** The experiment is retained in Git stash
+`failed v2 slot layout and display recovery experiment`; the working tree was
+reverted to the v1 layout and the stable raw slot is restored by the original
+package.
+
+---
+
+<a name="adr-035"></a>
+## ADR-035 — Place AIRQ atomic state in the reserved WB control page
+
+**Date:** 2026-08-23 · **Decider:** Owner · **Status:** Accepted
+
+**Hardware evidence.** On Pi 5, AIRQ's global sequence and diagnostic counters
+were in Normal-NC kernel `.bss`. The first ARP publication then raised a
+synchronous external abort (`ESR_EL1=0x96000410`). Replacing compiler-emitted
+LSE `LDADD`/`CAS` with `LDXR`/`STXR` moved the fault to the first `LDXR`,
+proving the attribute class rather than one atomic instruction was the cause.
+
+**Decision.** Store AIRQ's 256-byte, 64-byte-aligned atomic owner record at
+`CORE0_RAM_BASE + 0x500`, inside the existing 4 KiB core-0 WB Inner-Shareable
+control reservation. The core allocator already starts after that page;
+registry spinlocks occupy only `+0x100..+0x4FF`. Every kernel TTBR maps the
+record's PA with the same WB-IS attributes, so this introduces no alias.
+
+**Rejected.** Removing atomicity would break the global publication sequence
+used to merge per-producer SPSC lanes. A lock is forbidden in IRQ/scheduler
+paths. Remapping all kernel `.bss` WB would broaden the coherency change far
+beyond the one record that requires atomic RMWs.
+
+**Consequence.** AIRQ retains one global sequence and atomic diagnostics while
+the remaining kernel `.bss` stays Normal-NC.
+
+---
+
+<a name="adr-036"></a>
+## ADR-036 — Attempt stage0 framebuffer before EL/MMU transition
+
+**Date:** 2026-08-24 · **Decider:** Owner · **Status:** Reversed
+
+**Evidence.** The original Pi 5 canary requested its mailbox framebuffer in
+the firmware-provided exception-level and translation state, then printed the
+first green screen. Commit `80c15c5` moved stage0 to EL1 before
+`bootstrap_main()`, and `a917f968` subsequently enabled the stage0 MMU before
+the framebuffer request. That ordering was required for reliable SD access but
+was never part of the proven early-display contract.
+
+**Initial decision.** Attempt framebuffer allocation in the firmware-provided
+EL/translation state, then retry after EL1/MMU setup if it failed.
+
+**Hardware result.** On a completely rebuilt SD, the pre-transition call
+prevented stage0 from reaching SD, stage2, network or UART even with a
+10,000-poll mailbox bound. The failure is therefore consistent with a
+synchronous early-MMIO/translation abort, not a recoverable mailbox timeout.
+
+**Reversal.** Stage0 now performs one bounded framebuffer attempt only after
+its proven EL1/MMU setup. It publishes CurrentEL, SCTLR and the complete
+mailbox response into an immutable Normal-NC handoff record, which stage2
+prints once RP1 UART is online. Display failure remains non-fatal so SD boot
+and headless recovery continue.
+
+---
+
+<a name="adr-037"></a>
+## ADR-037 — Firmware-entry allocation-only hello
+
+**Date:** 2026-08-24 · **Decider:** Owner · **Status:** Accepted
+
+**Direction.** The first externally visible PIOS action after firmware handoff
+must be `HELLO FROM PIOS`, before EL transition, board detection, MMU setup, SD
+or stage2.
+
+**Decision.** After selecting core 0 and installing a stack, Pi 5 stage0 issues
+the original allocation-only framebuffer property request at the
+firmware-provided EL. The helper uses a fixed BCM2712 mailbox address, a fully
+initialized 32-byte request, bounded polling and a tiny built-in glyph set. On
+success it clears only the first 96 scanlines and draws `HELLO FROM PIOS`
+directly into the returned scanout. Failure returns immediately and the normal
+EL1/MMU, diagnostic framebuffer and SD paths continue.
+
+**Rationale.** This path is deliberately independent of the later generic
+framebuffer driver and multi-platform stage0 machinery. It recreates the
+earliest proven Pi 5 canary contract while remaining bounded and non-fatal.
+
+---
+
+<a name="adr-038"></a>
+## ADR-038 — BCM2835 SDHOST owns Pi 3/Zero 2 W removable storage
+
+**Date:** 2026-08-27 · **Decider:** Owner · **Status:** Accepted
+
+**Evidence.** The common stage0 reached its framebuffer and then failed at
+ACMD41 on a Pi 3 B+. The official board device trees route GPIO48-53 and the
+removable microSD slot to BCM2835 SDHOST at `0x3F202000`; Arasan SDHCI at
+`0x3F300000`, which PIOS was driving, is routed to onboard Wi-Fi SDIO.
+
+**Decision.** Add a bounded polling SDHOST backend for Pi 3 B/B+ and Pi Zero
+2 W. Stage0 selects it after runtime board detection; their single-platform
+stage2 images select it at compile time. Arasan remains available to Wi-Fi.
+Pi 5 remains exclusively on its existing BCM2712 SDHCI backend.
+
+**Rejected.** The firmware `mmc` overlay can reroute the removable slot to
+Arasan using GPIO48-53, but it disables the separate Wi-Fi SDIO interface.
+The owner explicitly chose a new SDHOST driver so both devices retain their
+native controller ownership.
+
+**Safety.** SDHOST uses PIO only, fixed 512-byte blocks, bounded command/data
+deadlines, bounded retries, explicit FIFO occupancy checks, and the documented
+four-word FIFO thresholds required by the silicon erratum.
+
+---
+
+<a name="adr-039"></a>
+## ADR-039 — Stage0 framebuffer handoff and boot watchdog suppression
+
+**Date:** 2026-08-27 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** Stage0 publishes its validated framebuffer geometry in a
+dedicated immutable cache line before handoff. Stage2 adopts that scanout and
+prints boot milestones directly without renegotiating the framebuffer.
+
+Stage0 disables its hardware watchdog only after the selected raw payload,
+embedded manifest and trampoline validate. Stage2 suppresses hardware-watchdog
+pets throughout initialization and re-enables normal watchdog service only at
+the ready/reactor boundary. This applies consistently to Pi 5 and BCM2837.
+
+**Rationale.** A boot watchdog was repeatedly resetting slower Pi 3 bring-up
+before diagnostics could remain visible. Disabling it at a fully validated
+handoff preserves fail-closed stage0 storage validation while making stage2
+bring-up deterministic and observable.
+
+---
+
+<a name="adr-040"></a>
+## ADR-040 — BCM2837-family Wi-Fi uses native SDIO1 as an alternate network path
+
+**Date:** 2026-08-27 · **Decider:** Owner · **Status:** Accepted
+
+**Context.** Pi 3 B/B+ and Zero 2 W have no PIOS-supported GEM/MACB NIC.
+Their onboard radios are connected to the BCM2837-family legacy Arasan SDIO1
+host at `0x3F300000`, with SDIO pins on GPIO34-39. Pi 3 B/B+ `WL_ON` is
+firmware expgpio 129; Zero 2 W uses direct SoC GPIO41. The radio families
+also differ: Pi 3 B uses 43430, Pi 3 B+ uses 43455, and Zero 2 W uses 43436.
+PIOS already contains a tested CYW43455 SDPCM/BCDC FullMAC layer for Pi 5,
+but its host driver was restricted to BCM2712 SDIO2.
+
+**Decision.** Port the existing FullMAC protocol and Wi-Fi NIC adapter to the
+BCM2837 family by adding a platform-specific SDIO1 host configuration. Wi-Fi remains
+explicit/on-demand during bring-up; it must not be enabled automatically at
+boot until SDIO enumeration, firmware loading, scan, association, and the
+TCP/IP path are separately proven. Pi 5 SDIO2 behavior remains unchanged.
+
+**Consequences.** The BCM2837-family network stack can reuse the existing `nic_ops`,
+ARP/IP/TCP/UDP, and dual-interface configuration. The SDIO1 controller,
+GPIO/power sequencing, chip/firmware compatibility, and cache/bus timing
+remain independent hardware proof points. A Pi Zero 2 W port is not implied
+by this decision because its CYW43438 firmware and board wiring require a
+separate compatibility check.
+
+---
+
+<a name="adr-041"></a>
+## ADR-041 — Automatic Pi 3 Wi-Fi fallback when no wired NIC exists
+
+**Date:** 2026-08-27 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** On an explicitly identified BCM2837-family board, if `nic_init()`
+finds no wired hardware, stage2 may automatically initialize that board's
+onboard Wi-Fi backend and configure
+the Wi-Fi-only TCP/IP interface at `192.168.0.202/16`. Firmware loading is
+bounded and fail-closed; missing firmware, SDIO failure, or radio failure
+does not prevent the board from reaching the console. Association remains a
+separate operation and does not use credentials implicitly.
+
+**Rationale.** BCM2837-family boards have no PIOS-supported physical MACB/GEM NIC, so
+requiring an operator command to initialize the only available network path
+makes remote diagnostics impossible. Automatic hardware bring-up provides the
+alternate path while retaining an explicit join boundary for radio security
+and reproducibility.
+
+**Scope.** Pi 5 retains wired-first startup with explicit Wi-Fi activation.
+Pi 3 B/B+ and Zero 2 W require their matching board firmware and power
+sequence; an unidentified BCM2837 board must fail closed rather than upload
+the CYW43455 set.
+
+---
+
+<a name="adr-042"></a>
+## ADR-042 — Runtime board selection and memory-capability setup
+
+**Date:** 2026-08-28 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** The persistent stage0 loader uses ARM MIDR to identify the
+BCM2837 family versus Pi 5, then reads the firmware board-revision model for
+the BCM2837-family split. A single FAT package may carry separate Pi 5, Pi 3,
+and Zero 2 W payloads; stage0 selects platform IDs 1, 6, or 7 before writing
+the selected payload to the raw slot.
+
+Pi 5 stage-1 identity mappings reserve normal RAM descriptors through 16 GiB,
+while the runtime high-memory allocator limits use to the firmware-reported
+installed/visible RAM. This permits one image to boot 2/4/8 GiB Pi 5 boards
+without probing an unmapped address.
+
+**Rationale.** Compile-time-only BCM2837 selection caused Pi 3 and Zero 2 W
+to share incompatible Wi-Fi power, firmware, and internal-core assumptions.
+The 8 GiB Pi 5 exposed the complementary error: a valid board was probed
+beyond the page-table range.
+
+**Safety.** Unknown board models retain the BCM2837-family fallback only for
+the common boot path; board-specific Wi-Fi bring-up must reject an unsupported
+profile. Unselected payloads are never copied into the active raw slot.
 
 ---
 

@@ -3,11 +3,11 @@ set TC=C:\aarch64-none-elf\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-aarch64-no
 set CC=%TC%\aarch64-none-elf-gcc.exe
 set LD=%TC%\aarch64-none-elf-ld.exe
 set OC=%TC%\aarch64-none-elf-objcopy.exe
-set FULL_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2 -fstack-protector-strong
-set BOOT_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -DPIOS_FB_NO_DOUBLE_BUFFER -DPIOS_RUNTIME_MMIO_BOOTSTRAP=1
+set FULL_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2 -fstack-protector-strong -fno-asynchronous-unwind-tables -fno-align-functions -fno-align-jumps -fno-align-labels -fno-align-loops -DPIOS_PLATFORM=PIOS_PLATFORM_PI5
+set BOOT_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -DPIOS_FB_NO_DOUBLE_BUFFER -DPIOS_RUNTIME_MMIO_BOOTSTRAP=1 -DPIOS_FB_MBOX_POLL_LIMIT=10000U -DPIOS_PLATFORM=PIOS_PLATFORM_PI5
 set USER_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -fno-builtin
 set QEMU_STAGE2_CFLAGS=-Wall -Wextra -Wno-unused-function -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8-a -mgeneral-regs-only -Iinclude -O2 -fno-builtin -DPIOS_PLATFORM=PIOS_PLATFORM_QEMU_VIRT
-set ASFLAGS=-march=armv8.2-a+simd+crc+crypto
+set ASFLAGS=-march=armv8.2-a+simd+crc+crypto -DPIOS_PLATFORM=PIOS_PLATFORM_PI5
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyyyMMdd.HHmmss'"') do set BUILD_STAMP=%%i
 > include\build_version.h echo #pragma once
@@ -112,9 +112,10 @@ if errorlevel 1 exit /b 1
 echo Packaging Pi5 stage2 as real_kernel.img...
 REM real_kernel.img / PIOSSTG2.PKG is written WHOLE into raw slot A by stage0
 REM (write_slot_package) and by the HTTP/UART OTA tools, so the entire package
-REM must fit PIOS_STAGE2_ZONE_BYTES (0x37FE00). The Pi5 payload alone is ~3.2 MB
-REM (the embedded PicoScript IDE_HTML blob is ~1.9 MB), so a combined Pi5+QEMU
-REM package no longer fits the slot. The Pi5 FAT slot never needs the QEMU image
+REM must fit PIOS_STAGE2_ZONE_BYTES (0x37FE00). Omitting unused unwind tables
+REM and alignment padding keeps the current Pi5 payload below that hard limit.
+REM A combined Pi5+QEMU package no longer fits the slot. The Pi5 FAT slot never
+REM needs the QEMU image
 REM (qemu_smoke boots build_qemu_full\PIOS_QEMU_FULL.BIN directly and the QEMU
 REM UEFI path builds its own QEMU-only package), so package Pi5-only here.
 python tools\build_stage2_package.py --pi build_pi5_stage2\PIOS_PI5_STAGE2.BIN --out real_kernel.img
@@ -124,6 +125,11 @@ copy /Y real_kernel.img PIOSSTG2.PKG >nul
 echo Compiling bootstrap...
 "%CC%" %ASFLAGS% -c src\bootstrap_start.S -o build_boot\bootstrap_start.o
 if errorlevel 1 exit /b 1
+"%TC%\aarch64-none-elf-nm.exe" -u build_boot\bootstrap_start.o | findstr /C:"board_detect_init" >nul
+if errorlevel 1 (
+    echo ERROR: Pi stage0 was compiled without the Pi board-detection/MMU path
+    exit /b 1
+)
 "%CC%" %ASFLAGS% -c src\bootstrap_trampoline.S -o build_boot\bootstrap_trampoline.o
 if errorlevel 1 exit /b 1
 "%CC%" %BOOT_CFLAGS% -c src\bootstrap.c -o build_boot\bootstrap.o
@@ -132,11 +138,15 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%CC%" %BOOT_CFLAGS% -c src\sd.c -o build_boot\sd.o
 if errorlevel 1 exit /b 1
+"%CC%" %BOOT_CFLAGS% -c src\sdhost.c -o build_boot\sdhost.o
+if errorlevel 1 exit /b 1
+"%CC%" %BOOT_CFLAGS% -c src\sdhost_logic.c -o build_boot\sdhost_logic.o
+if errorlevel 1 exit /b 1
 "%CC%" %BOOT_CFLAGS% -c src\fb.c -o build_boot\fb.o
 if errorlevel 1 exit /b 1
 
 echo Linking bootstrap kernel8.img...
-"%LD%" -T link_bootstrap.ld -nostdlib -o bootstrap.elf build_boot\bootstrap_start.o build_boot\bootstrap_trampoline.o build_boot\bootstrap.o build_boot\board_detect.o build_boot\sd.o build_boot\fb.o
+"%LD%" -T link_bootstrap.ld -nostdlib -o bootstrap.elf build_boot\bootstrap_start.o build_boot\bootstrap_trampoline.o build_boot\bootstrap.o build_boot\board_detect.o build_boot\sd.o build_boot\sdhost.o build_boot\sdhost_logic.o build_boot\fb.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary bootstrap.elf kernel8.img
 if errorlevel 1 exit /b 1

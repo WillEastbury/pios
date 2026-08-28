@@ -11,6 +11,7 @@ FLAG_PACKAGED = 1
 PLATFORM_PI5 = 1
 PLATFORM_QEMU = 2
 PLATFORM_BCM2837_FAMILY = 6
+PLATFORM_PIZERO2W = 7
 
 FEAT_AARCH64 = 1 << 0
 FEAT_GENERIC_TIMER = 1 << 1
@@ -141,25 +142,30 @@ def entry(platform: int, name: str, payload_off: int, payload_size: int,
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build a PGS2 package containing Pi5, BCM2837-family, and/or optional QEMU payloads.")
+    ap = argparse.ArgumentParser(description="Build a PGS2 package containing Pi5, Pi3, Zero 2 W, and/or optional QEMU payloads.")
     ap.add_argument("--pi", type=pathlib.Path)
     ap.add_argument("--bcm2837", type=pathlib.Path,
-                     help="Pi3 B/B+/A+ / Pi Zero 2W payload (BCM2837(B0)/BCM2710A1, runtime-selected via MIDR_EL1 in stage0)")
+                     help="Pi3 B/B+ payload (BCM2837/BCM2837B0)")
+    ap.add_argument("--pizero2w", type=pathlib.Path,
+                    help="Pi Zero 2 W payload (BCM2710A1)")
     ap.add_argument("--qemu", type=pathlib.Path)
     ap.add_argument("--out", required=True, type=pathlib.Path)
     ap.add_argument("--compress-qemu", action="store_true")
     args = ap.parse_args()
 
-    if not args.pi and not args.bcm2837 and not args.qemu:
-        raise SystemExit("at least one of --pi, --bcm2837, or --qemu is required")
+    if not args.pi and not args.bcm2837 and not args.pizero2w and not args.qemu:
+        raise SystemExit("at least one of --pi, --bcm2837, --pizero2w, or --qemu is required")
 
     pi = args.pi.read_bytes() if args.pi else None
     bcm2837 = args.bcm2837.read_bytes() if args.bcm2837 else None
+    pizero2w = args.pizero2w.read_bytes() if args.pizero2w else None
     qemu = args.qemu.read_bytes() if args.qemu else None
     if args.pi and not pi:
         raise SystemExit("Pi payload is empty")
     if args.bcm2837 and not bcm2837:
         raise SystemExit("BCM2837-family payload is empty")
+    if args.pizero2w and not pizero2w:
+        raise SystemExit("Pi Zero 2 W payload is empty")
     if args.qemu and not qemu:
         raise SystemExit("QEMU payload is empty")
     # QEMU boots its own PIOS_QEMU_FULL.BIN directly (not via this raw-slot
@@ -168,6 +174,8 @@ def main() -> int:
         raise SystemExit(f"Pi payload too large for raw slot: {len(pi)} > {MAX_PAYLOAD}")
     if bcm2837 is not None and len(bcm2837) > MAX_PAYLOAD:
         raise SystemExit(f"BCM2837-family payload too large for raw slot: {len(bcm2837)} > {MAX_PAYLOAD}")
+    if pizero2w is not None and len(pizero2w) > MAX_PAYLOAD:
+        raise SystemExit(f"Pi Zero 2 W payload too large for raw slot: {len(pizero2w)} > {MAX_PAYLOAD}")
 
     qemu_payload = qemu
     qemu_flags = 0
@@ -183,7 +191,9 @@ def main() -> int:
 
     header_bytes = 32
     entry_bytes = 112
-    entry_count = ((1 if pi is not None else 0) + (1 if bcm2837 is not None else 0) +
+    entry_count = ((1 if pi is not None else 0) +
+                   (1 if bcm2837 is not None else 0) +
+                   (1 if pizero2w is not None else 0) +
                    (1 if qemu_payload is not None else 0))
     cursor = align_up(header_bytes + entry_count * entry_bytes)
     pi_off = cursor if pi is not None else 0
@@ -192,6 +202,9 @@ def main() -> int:
     bcm2837_off = cursor if bcm2837 is not None else 0
     if bcm2837 is not None:
         cursor = align_up(bcm2837_off + len(bcm2837))
+    pizero2w_off = cursor if pizero2w is not None else 0
+    if pizero2w is not None:
+        cursor = align_up(pizero2w_off + len(pizero2w))
     qemu_off = cursor if qemu_payload is not None else 0
     if qemu_payload is not None:
         cursor = align_up(qemu_off + len(qemu_payload))
@@ -231,6 +244,19 @@ def main() -> int:
         ))
         write_at(out, bcm2837_off, bcm2837)
         entry_index += 1
+    if pizero2w is not None:
+        write_at(out, header_bytes + entry_index * entry_bytes, entry(
+            PLATFORM_PIZERO2W,
+            "pizero2w-bcm2710a1",
+            pizero2w_off,
+            len(pizero2w),
+            PI_LOAD,
+            len(pizero2w),
+            FEAT_AARCH64 | FEAT_PI_FIRMWARE,
+            FEAT_GENERIC_TIMER | FEAT_PL011 | FEAT_SD | FEAT_MAILBOX_FB,
+        ))
+        write_at(out, pizero2w_off, pizero2w)
+        entry_index += 1
     if qemu_payload is not None:
         write_at(out, header_bytes + entry_index * entry_bytes, entry(
             PLATFORM_QEMU,
@@ -252,13 +278,14 @@ def main() -> int:
     args.out.write_bytes(out)
     pi_note = f"{len(pi)}@{pi_off}" if pi is not None else "none"
     bcm2837_note = f"{len(bcm2837)}@{bcm2837_off}" if bcm2837 is not None else "none"
+    pizero2w_note = f"{len(pizero2w)}@{pizero2w_off}" if pizero2w is not None else "none"
     if qemu_payload is not None:
         qemu_note = f"{len(qemu_payload)}:{len(qemu)}" if args.compress_qemu else str(len(qemu))
         qemu_note = f"{qemu_note}@{qemu_off}"
     else:
         qemu_note = "none"
     print(f"stage2 package: {args.out} total={len(out)} id={package_id:016x} "
-          f"pi={pi_note} bcm2837={bcm2837_note} qemu={qemu_note}")
+          f"pi={pi_note} bcm2837={bcm2837_note} pizero2w={pizero2w_note} qemu={qemu_note}")
     return 0
 
 

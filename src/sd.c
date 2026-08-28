@@ -23,6 +23,7 @@
 #include "uart.h"
 #include "fb.h"
 #include "platform.h"
+#include "sdhost.h"
 
 /* SDHCI register offsets from EMMC2_BASE */
 #define REG_ARG2            0x00
@@ -112,6 +113,7 @@
 static sd_card_t  card;
 static sd_stats_t stats;
 static inline u64 sd_now_us(void);
+static bool sdhost_active;
 
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
 #define QEMU_RAM_SD_BLOCKS 32768U  /* 16 MiB: enough for 10MiB reserved + RAM WALFS */
@@ -486,6 +488,25 @@ static inline void sd_write(u32 off, u32 val) { mmio_write(EMMC2_BASE + off, val
 static inline u32  sd_read(u32 off)           { return mmio_read(EMMC2_BASE + off); }
 #endif
 
+static bool sd_should_use_sdhost(void)
+{
+#ifdef PIOS_RUNTIME_MMIO_BOOTSTRAP
+    return g_board_family == BOARD_FAMILY_BCM2837;
+#else
+    return PIOS_PLATFORM == PIOS_PLATFORM_PI3 ||
+           PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W;
+#endif
+}
+
+static u64 sd_sdhost_base(void)
+{
+#ifdef PIOS_RUNTIME_MMIO_BOOTSTRAP
+    return g_board_bases.periph_base + 0x202000ULL;
+#else
+    return PIOS_PERIPH_BASE + 0x202000ULL;
+#endif
+}
+
 static u32 sd_mbps_x1000(u32 blocks, u64 elapsed_us)
 {
     if (blocks == 0 || elapsed_us == 0)
@@ -767,6 +788,32 @@ bool sd_init(void) {
     uart_puts("\n");
     return true;
 #else
+    if (sd_should_use_sdhost()) {
+        struct sdhost_card_info info;
+        u32 core_clock = fb_get_clock_rate_id(4U);
+        memset((void *)&stats, 0, sizeof(stats));
+        sdhost_active = false;
+        if (core_clock < 1000000U || core_clock > 1000000000U) {
+            fb_puts("  [sdh] core clock unavailable\n");
+            uart_puts("[sdh] core clock unavailable\n");
+            return false;
+        }
+        fb_puts("  [sdh] BCM2835 SDHOST...\n");
+        uart_puts("[sdh] core clock=");
+        uart_hex(core_clock);
+        uart_puts("\n");
+        if (!sdhost_init(sd_sdhost_base(), core_clock, &info)) {
+            stats.errors++;
+            return false;
+        }
+        card.type = info.type;
+        card.rca = info.rca;
+        card.capacity = info.capacity;
+        sdhost_active = true;
+        return true;
+    }
+
+    sdhost_active = false;
     fb_puts("  [sd] reset SDHCI...\n");
     uart_puts("[sd] init\n");
 
@@ -1006,6 +1053,15 @@ bool sd_read_block(u32 lba, u8 *buf) {
     return true;
 #else
     u64 start = sd_now_us();
+    if (sdhost_active) {
+        if (!buf || !sdhost_read_block(lba, buf)) {
+            stats.errors++;
+            return false;
+        }
+        stats.reads++;
+        sd_record_read_rate(1, start);
+        return true;
+    }
     for (u32 try = 0; try < SD_MAX_RETRIES; try++) {
         if (sd_read_block_inner(lba, buf)) {
             stats.reads++;
@@ -1104,6 +1160,15 @@ bool sd_write_block(u32 lba, const u8 *buf) {
     return true;
 #else
     u64 start = sd_now_us();
+    if (sdhost_active) {
+        if (!buf || !sdhost_write_block(lba, buf)) {
+            stats.errors++;
+            return false;
+        }
+        stats.writes++;
+        sd_record_write_rate(1, start);
+        return true;
+    }
     for (u32 try = 0; try < SD_MAX_RETRIES; try++) {
         if (sd_write_block_inner(lba, buf)) {
             stats.writes++;
@@ -1192,6 +1257,15 @@ bool sd_read_blocks(u32 lba, u32 count, u8 *buf) {
     if (count == 1) return sd_read_block(lba, buf);
 
     u64 start = sd_now_us();
+    if (sdhost_active) {
+        if (!sdhost_read_blocks(lba, count, buf)) {
+            stats.errors++;
+            return false;
+        }
+        stats.reads += count;
+        sd_record_read_rate(count, start);
+        return true;
+    }
     for (u32 try = 0; try < SD_MAX_RETRIES; try++) {
         if (sd_read_blocks_multi(lba, count, buf)) {
             stats.reads += count;
@@ -1284,6 +1358,15 @@ bool sd_write_blocks(u32 lba, u32 count, const u8 *buf) {
     if (count == 1) return sd_write_block(lba, buf);
 
     u64 start = sd_now_us();
+    if (sdhost_active) {
+        if (!sdhost_write_blocks(lba, count, buf)) {
+            stats.errors++;
+            return false;
+        }
+        stats.writes += count;
+        sd_record_write_rate(count, start);
+        return true;
+    }
     for (u32 try = 0; try < SD_MAX_RETRIES; try++) {
         if (sd_write_blocks_multi(lba, count, buf)) {
             stats.writes += count;

@@ -63,6 +63,15 @@ int main(void)
     expect_u32("all-zero MIDR -> BOARD_FAMILY_UNKNOWN",
                board_family_from_midr(zero_midr), BOARD_FAMILY_UNKNOWN);
 
+    expect_u32("Pi 3 Model B revision -> model 0x08",
+               board_model_from_revision(0xA02082U), BOARD_MODEL_PI3_B);
+    expect_u32("Pi 3 Model B+ revision -> model 0x0D",
+               board_model_from_revision(0xA020D3U), BOARD_MODEL_PI3_B_PLUS);
+    expect_u32("Pi Zero 2 W revision -> model 0x12",
+               board_model_from_revision(0x902120U), BOARD_MODEL_ZERO2W);
+    expect_u32("legacy revision -> unknown model",
+               board_model_from_revision(0x00000002U), BOARD_MODEL_UNKNOWN);
+
     if (failures == 0) {
         printf("OK: all board_detect MIDR decode assertions passed\n");
         return 0;

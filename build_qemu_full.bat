@@ -1,4 +1,5 @@
 @echo off
+setlocal
 set TC=C:\aarch64-none-elf\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-aarch64-none-elf\bin
 set CC=%TC%\aarch64-none-elf-gcc.exe
 set LD=%TC%\aarch64-none-elf-ld.exe
@@ -32,3 +33,4 @@ if errorlevel 1 exit /b 1
 
 for %%f in (build_qemu_full\PIOS_QEMU_FULL.BIN) do echo QEMU full payload size: %%~zf bytes
 echo QEMU FULL PAYLOAD BUILD COMPLETE
+endlocal

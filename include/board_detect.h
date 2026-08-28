@@ -36,12 +36,18 @@
 #define BOARD_FAMILY_PI5       1U   /* BCM2712, Cortex-A76 */
 #define BOARD_FAMILY_BCM2837   2U   /* BCM2837(B0)/BCM2710A1, Cortex-A53 */
 
+#define BOARD_MODEL_UNKNOWN    0U
+#define BOARD_MODEL_PI3_B      0x08U
+#define BOARD_MODEL_PI3_B_PLUS 0x0DU
+#define BOARD_MODEL_ZERO2W     0x12U
+
 #define MIDR_PARTNUM_CORTEX_A76 0xD0BU
 #define MIDR_PARTNUM_CORTEX_A53 0xD03U
 
 /* Pure decode: given a raw MIDR_EL1 value, return the board family. No MMIO,
  * no asm -- host-testable (see tests/test_board_detect.c). */
 u32 board_family_from_midr(u64 midr);
+u32 board_model_from_revision(u32 revision);
 
 /* Read MIDR_EL1 and decode it. AArch64-only (inline asm); not compiled/
  * callable on the host test build. */

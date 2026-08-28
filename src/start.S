@@ -23,6 +23,31 @@ core_asm_stage:
 #ifndef PIOS_PLATFORM_QEMU_VIRT
 #define PIOS_PLATFORM_QEMU_VIRT 2
 #endif
+#ifndef PIOS_PLATFORM_PI3
+#define PIOS_PLATFORM_PI3 6
+#endif
+#ifndef PIOS_PLATFORM_PIZERO2W
+#define PIOS_PLATFORM_PIZERO2W 7
+#endif
+
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+.equ STAGE2_BOOT_DIAG_ADDR,  0x04DFFF00
+.equ STAGE2_BOOT_DIAG_MAGIC, 0x53324244
+.macro STAGE2_BOOT_MARK value
+    ldr     x9, =STAGE2_BOOT_DIAG_ADDR
+    ldr     w10, =STAGE2_BOOT_DIAG_MAGIC
+    str     w10, [x9]
+    mov     w10, #\value
+    str     w10, [x9, #4]
+    mvn     w10, w10
+    str     w10, [x9, #8]
+    dsb     sy
+.endm
+#else
+.macro STAGE2_BOOT_MARK value
+.endm
+#endif
 
 /* GATE (reversible): canonical AArch64 cache bring-up before enabling SCTLR.C/I.
  * Set to 0 and rebuild to revert. A/B health-gated OTA backstops a bad boot.
@@ -51,6 +76,7 @@ _start:
     mrs     x0, mpidr_el1
     and     x0, x0, #0x3
     cbnz    x0, .Lpark          /* only core 0 continues */
+    STAGE2_BOOT_MARK 0x01
 
     /* Stage0 handoff enters here at EL1 with MMU/caches disabled. */
     mrs     x0, CurrentEL
@@ -75,6 +101,7 @@ _start:
     sub     w2, w2, #1
     cbnz    w2, .Lbss_loop
 .Lbss_done:
+    STAGE2_BOOT_MARK 0x02
 
     /* Clear the per-slot MMU page-table pool (.pgtbl_pool). Kept out of .bss
      * (see link.ld / link_qemu_full.ld, issue #86) so it needs its own
@@ -87,9 +114,22 @@ _start:
     sub     w2, w2, #1
     cbnz    w2, .Lpgtbl_pool_loop
 .Lpgtbl_pool_done:
+    STAGE2_BOOT_MARK 0x03
 
     /* Init framebuffer at EL2 (proven working) */
+    STAGE2_BOOT_MARK 0x04
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    mov     w0, #0x10
+    bl      early_boot_hdmi_mark
+#endif
     bl      kernel_fb_early
+    STAGE2_BOOT_MARK 0x05
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    mov     w0, #0x11
+    bl      early_boot_hdmi_mark
+#endif
 
     /* Install EL2 crash vectors so we catch any eret faults */
     adr     x0, el2_crash_vectors
@@ -153,6 +193,7 @@ _start:
     sub     w2, w2, #1
     cbnz    w2, .Lstage1_bss_loop
 .Lstage1_bss_done:
+    STAGE2_BOOT_MARK 0x02
     ldr     x1, =__pgtbl_pool_start
     ldr     w2, =__pgtbl_pool_size
 .Lstage1_pgtbl_pool_loop:
@@ -161,7 +202,20 @@ _start:
     sub     w2, w2, #1
     cbnz    w2, .Lstage1_pgtbl_pool_loop
 .Lstage1_pgtbl_pool_done:
+    STAGE2_BOOT_MARK 0x03
+    STAGE2_BOOT_MARK 0x04
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    mov     w0, #0x10
+    bl      early_boot_hdmi_mark
+#endif
     bl      kernel_fb_early
+    STAGE2_BOOT_MARK 0x05
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    mov     w0, #0x11
+    bl      early_boot_hdmi_mark
+#endif
     b       .Lel1_entry
 
 /* ── EL1 landing pad ── */
@@ -183,6 +237,12 @@ _start:
     ldr     x1, =vector_table
     msr     vbar_el1, x1
     isb
+    STAGE2_BOOT_MARK 0x06
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    mov     w0, #0x12
+    bl      early_boot_hdmi_mark
+#endif
 
     /* ── EL1 MMU setup (same page table, EL1 registers) ── */
 
@@ -261,7 +321,34 @@ _start:
     str     x2, [x7, x5, lsl #3]       /* 0x3F000000 */
 #endif
 
+#if (PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+     PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W) && PIOS_CACHE_WB_FROM_BOOT
+    /* BCM2837-family low peripherals occupy the final 16 MiB of L1[0].
+     * Override the default Normal-NC blocks before the first MMU enable. */
+    ldr     x7, =l2_table_boot
+    mov     x2, #0x401
+    movk    x2, #0x0060, lsl #48
+    mov     x5, #504
+.Lboot_l2_bcm_device:
+    lsl     x3, x5, #21
+    orr     x4, x3, x2
+    str     x4, [x7, x5, lsl #3]
+    add     x5, x5, #1
+    cmp     x5, #512
+    b.lt    .Lboot_l2_bcm_device
+#endif
+
     /* L1[1..3]: Cacheable RAM — ATTR(2) = 0x709 */
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    /* QA7 starts at 0x40000000. Match stage0's proven coarse Device map;
+     * leave L1[2]/L1[3] invalid because these boards have no RAM there. */
+    mov     x2, #0x401
+    movk    x2, #0x0060, lsl #48
+    mov     x3, #0x40000000
+    orr     x4, x3, x2
+    str     x4, [x0, #8]
+#else
     mov     x2, #0x709
     mov     x3, #0x40000000
     orr     x4, x3, x2
@@ -272,6 +359,21 @@ _start:
     ldr     x3, =0xC0000000
     orr     x4, x3, x2
     str     x4, [x0, #24]
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+    /* Pi 5 boards may contain up to 16 GiB. Keep all possible RAM
+     * identity-mapped before C can query the firmware-reported capacity;
+     * BCM2712 peripherals begin at the separate 0x10_7C... region. */
+    mov     x5, #4
+.Lboot_l1_high_ram:
+    lsl     x3, x5, #30
+    orr     x4, x3, x2
+    lsl     x6, x5, #3
+    str     x4, [x0, x6]
+    add     x5, x5, #1
+    cmp     x5, #16
+    b.lt    .Lboot_l1_high_ram
+#endif
+#endif
 
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
     /* QEMU ramfb/GOP can be placed at 0x140000000; map that 1GiB block NC. */
@@ -292,6 +394,8 @@ _start:
     str     x4, [x0, x6]
 #endif
 
+#if PIOS_PLATFORM != PIOS_PLATFORM_PI3 && \
+    PIOS_PLATFORM != PIOS_PLATFORM_PIZERO2W
     /* L1[64..67]: Device (BCM2712 peripherals at 0x10_00000000+) */
     mov     x2, #0x401
     movk    x2, #0x0060, lsl #48
@@ -315,6 +419,7 @@ _start:
     add     x5, x5, #1
     cmp     x5, #128
     b.lt    .Lrp1
+#endif
 
     dsb     sy
 
@@ -338,6 +443,12 @@ _start:
     tlbi    vmalle1
     dsb     sy
     isb
+    STAGE2_BOOT_MARK 0x07
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    mov     w0, #0x13
+    bl      early_boot_hdmi_mark
+#endif
 
 #if PIOS_CACHE_BRINGUP_FIX
     /* Canonical AArch64 bring-up: clean+invalidate ALL data/unified caches by
@@ -391,6 +502,7 @@ _start:
     dsb     sy
     isb
 #endif
+    STAGE2_BOOT_MARK 0x08
 
     /* Enable EL1 MMU + caches */
     mrs     x1, sctlr_el1
@@ -401,10 +513,22 @@ _start:
     bic     x1, x1, #(1 << 3)   /* no SA */
     msr     sctlr_el1, x1
     isb
+    STAGE2_BOOT_MARK 0x09
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    mov     w0, #0x14
+    bl      early_boot_hdmi_mark
+#endif
 
     /* ── EL1 + MMU ON — move stack and enter C ── */
     ldr     x1, =__stack_top_core0
     mov     sp, x1
+    STAGE2_BOOT_MARK 0x0A
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    mov     w0, #0x15
+    bl      early_boot_hdmi_mark
+#endif
 
     bl      kernel_main
     b       .Lhalt

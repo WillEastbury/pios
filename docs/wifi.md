@@ -1,10 +1,9 @@
-# WiFi Support: CYW43455 FullMAC via RP1 SDIO
+# WiFi Support: Broadcom FullMAC via native SDIO
 
 ## Overview
 
-PIOS supports WiFi via the Pi 5's onboard Broadcom/Cypress CYW43455
-combo chip (WiFi + Bluetooth), connected through SDIO on the RP1
-southbridge. The driver operates in **FullMAC** mode — the chip's
+PIOS supports WiFi through the board-native SDIO host. The driver operates in
+**FullMAC** mode — the chip's
 internal firmware handles 802.11 MAC, WPA2/WPA3 key exchange (EAPOL
 4-way handshake), and encryption. The host communicates using Broadcom's
 SDPCM framing protocol and BCDC control messages.
@@ -19,14 +18,13 @@ SDPCM framing protocol and BCDC control messages.
 ├──────────────┤
 │ wifi_nic.c   │  WiFi NIC backend
 ├──────────────┤
-│   cyw43.c    │  CYW43455 FullMAC driver
+│   cyw43.c    │  Broadcom FullMAC driver
 │              │  (SDPCM/BCDC protocol, scan/join/WPA2)
 ├──────────────┤
-│   sdio.c     │  RP1 SDIO host controller (SDHCI polling)
+│   sdio.c    │  Native SDIO host controller (SDHCI polling)
 ├──────────────┤
-│ RP1 GPIO/CLK │  Pin mux + clock for SDIO1
+│ GPIO/power   │  Board-specific pin mux + radio power
 ├──────────────┤
-│   PCIe       │  RP1 BAR access via outbound ATU
 └──────────────┘
 ```
 
@@ -35,23 +33,27 @@ SDPCM framing protocol and BCDC control messages.
 | File | Purpose |
 |------|---------|
 | `include/sdio.h` | SDIO host controller API + register definitions |
-| `src/sdio.c` | RP1 SDIO1 controller driver (SDHCI, polling mode) |
+| `src/sdio.c` | Native SDIO controller driver (SDHCI, polling mode) |
 | `include/cyw43.h` | CYW43455 device driver API + protocol constants |
 | `src/cyw43.c` | CYW43455 FullMAC: backplane, SDPCM, BCDC, scan/join |
 | `src/wifi_nic.c` | WiFi NIC backend implementing `nic.h` interface |
 
 ## Hardware
 
-### CYW43455 Connection
+### Board radio profiles
 
-- **Interface**: SDIO 4-bit, up to 50 MHz
-- **Controller**: RP1 SDIO1 at `RP1_BAR_BASE + 0x104000`
-- **GPIO pins** (RP1 bank 2):
-  - GPIO 34: SD1_CLK
-  - GPIO 35: SD1_CMD
-  - GPIO 36–39: SD1_DAT0–DAT3
-- **WL_REG_ON**: GPIO 40 (active HIGH, powers up the chip)
-- **Card type**: Non-removable (no card-detect needed)
+| Board | Radio family | Host | SDIO pins | WL_ON |
+|---|---|---|---|---|
+| Pi 3 Model B | BCM43430/43438 family | BCM2837 SDIO1, `0x3F300000` | GPIO34-39 | firmware expgpio 129 |
+| Pi 3 Model B+ | CYW43455 | BCM2837 SDIO1, `0x3F300000` | GPIO34-39 | firmware expgpio 129 |
+| Pi 4 Model B | CYW43455 | BCM2711 SDIO1 | board-specific | board-specific |
+| Pi Zero 2 W | CYW43436 family | BCM2710 SDIO1, `0x3F300000` | GPIO34-39 | SoC GPIO41 |
+| Pi 5 | CYW43455 | BCM2712 SDIO2, `0x1001100000` | SoC GPIO30-35 | SoC GPIO28 |
+
+The SDIO transport and FullMAC protocol are shared where compatible, but
+firmware, NVRAM, CLM data, core type, RAM layout, and power sequencing are
+not interchangeable. The current Pi 5 43455 set must not be uploaded to Pi 3
+Model B or Zero 2 W.
 
 ### SDIO Protocol
 
@@ -70,14 +72,14 @@ Standard SDHCI register layout. Key SDIO commands:
 
 ### 1. SDIO Host (`sdio.c`)
 
-Drives the RP1's Synopsys SDHCI controller:
+Drives the board's native SDHCI controller:
 - Reset + clock setup (400 kHz identification, 25 MHz transfer)
 - GPIO pin configuration (ALT0 for SD1 function)
 - WL_REG_ON power sequencing
 - CMD52/CMD53 byte and block transfers
 - 4-bit bus width upgrade after enumeration
 
-### 2. CYW43455 Device (`cyw43.c`)
+### 2. Broadcom Device (`cyw43.c`)
 
 Three SDIO functions:
 
@@ -94,7 +96,7 @@ CMD52 writes to the BAK_WIN_ADDR register, then data is moved with CMD53.
 **Firmware Upload** (Phase 2):
 1. Halt ARM core via backplane
 2. Enable SOCSRAM
-3. Write firmware blob to chip RAM at `0x198000`
+3. Write firmware blob to the chip-specific RAM location
 4. Write NVRAM to end of RAM with length token
 5. Release ARM core from reset
 6. Poll for HT clock available (firmware ready)
@@ -118,12 +120,12 @@ Implements the `nic.h` interface by delegating to `cyw43.c`:
 ### 4. NIC Selection (`nic.c`)
 
 Boot sequence tries Ethernet (MACB) first. If Ethernet init fails,
-falls back to WiFi:
+falls back to a supported WiFi backend:
 
 ```c
 nic_ok = nic_init();         /* Try Ethernet (MACB) */
 if (!nic_ok)
-    nic_ok = nic_init_wifi(); /* Fallback to WiFi (CYW43455) */
+    nic_ok = nic_init_wifi(); /* Fallback to board-native WiFi */
 ```
 
 All `nic_send()`/`nic_recv()` calls are transparently routed to the
@@ -164,10 +166,14 @@ cyw43_disconnect()
 
 ## Firmware Blobs
 
-From the `raspberrypi/firmware` repository:
+From the `RPi-Distro/firmware-nonfree` repository, using a board-matched set:
 - `brcmfmac43455-sdio.bin` — WiFi firmware (~350KB)
 - `brcmfmac43455-sdio.txt` — NVRAM configuration (~2KB)
 - `brcmfmac43455-sdio.clm_blob` — Regulatory/CLM data (~8KB)
+
+Pi 3 Model B uses the `43430` family set; Zero 2 W uses the `43436` set.
+These are staged under board-specific `/wifi/pi3b/` and `/wifi/zero2w/`
+directories by the bring-up tooling.
 
 Store on SD card at walfs paths:
 ```
@@ -179,7 +185,8 @@ Store on SD card at walfs paths:
 ## Implementation Status
 
 ### Completed
-- [x] RP1 SDIO host controller driver (polling, SDHCI)
+- [x] Native SDIO host controller selection (Pi 5 SDIO2; BCM2837 SDIO1)
+- [x] Board-specific radio power sequencing (firmware expgpio / SoC GPIO)
 - [x] SDIO card enumeration (CMD0/5/3/7)
 - [x] CMD52 (IO_RW_DIRECT) single-byte access
 - [x] CMD53 (IO_RW_EXTENDED) byte and block transfers
@@ -194,9 +201,11 @@ Store on SD card at walfs paths:
 - [x] WiFi disconnect
 - [x] Event handling (link up/down, scan results)
 - [x] NIC backend integration
-- [x] Boot sequence WiFi fallback
+- [x] Boot sequence WiFi fallback on the explicitly supported board profile
 
 ### Future Work
+- [ ] Complete BCM43430 CM3/SOCRAM and CYW43436 hardware validation on Pi 3 B and Zero 2 W
+- [ ] Runtime board-profile selection when one shared stage2 package serves multiple BCM2837 boards
 - [ ] Full firmware upload from walfs
 - [ ] CLM blob loading
 - [ ] Console commands: `wifi scan`, `wifi connect`, `wifi status`

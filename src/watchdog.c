@@ -9,7 +9,12 @@
  * = ARM_IO_BASE + 0x1200000). Pi 4 used PERIPH_BASE + 0x100000; using
  * the Pi 4 layout on Pi 5 means our writes hit dead address space, so
  * the hardware watchdog never actually counted before this fix. */
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+#define PM_BASE        (PERIPH_BASE + 0x00100000UL)
+#else
 #define PM_BASE        (PERIPH_BASE + 0x01200000UL)
+#endif
 #define PM_RSTC        (PM_BASE + 0x1CU)
 #define PM_WDOG        (PM_BASE + 0x24U)
 #define PM_PASSWORD    0x5A000000U
@@ -21,6 +26,7 @@
 
 static struct watchdog_status g_wdog;
 static u64 g_last_poll;
+static bool g_hw_suppressed;
 
 static void watchdog_psci_system_reset(void)
 {
@@ -34,11 +40,13 @@ static void watchdog_psci_system_reset(void)
 
 static NORETURN void watchdog_reboot_best_effort(void)
 {
+#if PIOS_HAS_PSCI_SECONDARIES
     dsb();
     isb();
     watchdog_psci_system_reset();
     dsb();
     isb();
+#endif
 
     /* QEMU virt has no Pi PM watchdog MMIO. If PSCI unexpectedly returns,
      * fail closed in-place instead of taking a synchronous abort at address
@@ -56,6 +64,8 @@ static NORETURN void watchdog_reboot_best_effort(void)
 
 void watchdog_hw_arm_seconds(u32 seconds)
 {
+    if (g_hw_suppressed)
+        return;
 #if !PIOS_HAS_MAILBOX_FB
     (void)seconds;
     return;
@@ -69,6 +79,11 @@ void watchdog_hw_arm_seconds(u32 seconds)
                          (mmio_read(PM_RSTC) & ~PM_RSTC_WRCFG_MASK) |
                          PM_RSTC_FULL);
 #endif
+}
+
+void watchdog_hw_set_suppressed(bool suppressed)
+{
+    g_hw_suppressed = suppressed;
 }
 
 void watchdog_hw_pet(void)

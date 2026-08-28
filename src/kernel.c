@@ -31,6 +31,7 @@
 #include "dns.h"
 #include "core.h"
 #include "core_env.h"
+#include "stage0_diag.h"
 #include "simd.h"
 #include "mmu.h"
 #include "gic.h"
@@ -77,6 +78,14 @@
 #include "ksem.h"
 #include "workq.h"
 #include "ksvc.h"
+
+#if (PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+     PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W) && __has_include("wifi_config.h")
+#include "wifi_config.h"
+#define PIOS_BCM2837_WIFI_CONFIG_PRESENT 1
+#else
+#define PIOS_BCM2837_WIFI_CONFIG_PRESENT 0
+#endif
 #include "picowal_db.h"
 #include "ppos_provider.h"
 #include "el2.h"
@@ -414,6 +423,12 @@ struct admin_http_service {
     u64 last_activity_ms;
     u64 last_ok_ms;
     u32 completions;
+    u32 diag_accepts;
+    u32 diag_complete;
+    u32 diag_built;
+    u32 diag_first_write;
+    u32 diag_close;
+    u32 diag_abort;
     /* Single-connection streaming OTA upload: the whole image arrives over ONE
      * POST body (no per-chunk connection churn that overruns the polling NIC),
      * streamed straight into the RAM staging buffer. */
@@ -801,9 +816,13 @@ static void http_log_event(const char *event, u32 a, u32 b)
     http_log_ring[slot].b = b;
 }
 
+static void bp_log(const char *msg);
+
 static void wifi_upload_progress(void)
 {
+#if PIOS_HAS_RP1 && PIOS_HAS_GENET
     static u32 cadence;
+#endif
     /*
      * ADR-033: an adrv liveness hook may keep the fail-safe path observable,
      * but it may not borrow protocol execution by polling frames.  Publish a
@@ -823,6 +842,110 @@ static void wifi_upload_progress(void)
 #endif
     watchdog_hw_pet();
 }
+
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+static void pi3_wifi_boot_progress(u32 stage)
+{
+    switch (stage) {
+    case 1U: bp_log("[wifi] preload firmware blobs..."); break;
+    case 2U: bp_log("[wifi] initialize SDIO1/chip..."); break;
+    case 3U: bp_log("[wifi] upload firmware..."); break;
+    case 4U: bp_log("[wifi] firmware ready"); break;
+    default: bp_log("[wifi] unknown init stage"); break;
+    }
+}
+#endif
+
+#if (PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+     PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W) && \
+    PIOS_BCM2837_WIFI_CONFIG_PRESENT
+enum pi3_wifi_auto_state {
+    PI3_WIFI_AUTO_IDLE = 0,
+    PI3_WIFI_AUTO_SCANNING,
+    PI3_WIFI_AUTO_JOINING,
+    PI3_WIFI_AUTO_DONE,
+    PI3_WIFI_AUTO_FAILED
+};
+
+static enum pi3_wifi_auto_state pi3_wifi_auto_state;
+static u64 pi3_wifi_auto_deadline_ms;
+static u8 pi3_wifi_auto_pmk[32] = PIOS_WIFI_CONFIG_PMK;
+
+static void pi3_wifi_auto_start(void)
+{
+    if (cyw43_scan_start()) {
+        pi3_wifi_auto_state = PI3_WIFI_AUTO_SCANNING;
+        pi3_wifi_auto_deadline_ms = timer_monotonic_ms() + 30000ULL;
+        uart_puts("[wifi] auto scan started\n");
+    } else {
+        pi3_wifi_auto_state = PI3_WIFI_AUTO_FAILED;
+        uart_puts("[wifi] auto scan failed\n");
+    }
+}
+
+static void pi3_wifi_auto_step(void)
+{
+    if (pi3_wifi_auto_state == PI3_WIFI_AUTO_SCANNING) {
+        if (timer_monotonic_ms() >= pi3_wifi_auto_deadline_ms) {
+            pi3_wifi_auto_state = PI3_WIFI_AUTO_FAILED;
+            uart_puts("[wifi] auto scan timeout\n");
+            return;
+        }
+        if (cyw43_scan_in_progress())
+            return;
+
+        struct cyw_scan_result results[CYW_MAX_SCAN_RESULTS];
+        u32 count = CYW_MAX_SCAN_RESULTS;
+        if (!cyw43_scan_get_results(results, &count)) {
+            pi3_wifi_auto_state = PI3_WIFI_AUTO_FAILED;
+            uart_puts("[wifi] auto results failed\n");
+            return;
+        }
+
+        i32 best_rssi = -32768;
+        i32 best = -1;
+        for (u32 i = 0U; i < count; i++) {
+            if (results[i].ssid_len != PIOS_WIFI_CONFIG_SSID_LEN ||
+                memcmp(results[i].ssid, PIOS_WIFI_CONFIG_SSID,
+                       PIOS_WIFI_CONFIG_SSID_LEN) != 0 ||
+                results[i].chanspec == 0U ||
+                results[i].rssi <= best_rssi)
+                continue;
+            best_rssi = results[i].rssi;
+            best = (i32)i;
+        }
+        if (best < 0) {
+            pi3_wifi_auto_state = PI3_WIFI_AUTO_FAILED;
+            uart_puts("[wifi] auto SSID not found\n");
+            return;
+        }
+        if (!cyw43_set_join_target(results[best].bssid,
+                                   results[best].chanspec) ||
+            !cyw43_join_pmk(PIOS_WIFI_CONFIG_SSID,
+                            PIOS_WIFI_CONFIG_SSID_LEN, pi3_wifi_auto_pmk)) {
+            pi3_wifi_auto_state = PI3_WIFI_AUTO_FAILED;
+            uart_puts("[wifi] auto join start failed\n");
+            return;
+        }
+        pi3_wifi_auto_state = PI3_WIFI_AUTO_JOINING;
+        pi3_wifi_auto_deadline_ms = timer_monotonic_ms() + 30000ULL;
+        uart_puts("[wifi] auto join started\n");
+        return;
+    }
+
+    if (pi3_wifi_auto_state == PI3_WIFI_AUTO_JOINING) {
+        if (cyw43_is_connected()) {
+            pi3_wifi_auto_state = PI3_WIFI_AUTO_DONE;
+            uart_puts("[wifi] auto link up\n");
+        } else if (cyw43_link_state() == CYW_LINK_AUTH_FAIL ||
+                   timer_monotonic_ms() >= pi3_wifi_auto_deadline_ms) {
+            pi3_wifi_auto_state = PI3_WIFI_AUTO_FAILED;
+            uart_puts("[wifi] auto join failed\n");
+        }
+    }
+}
+#endif
 
 static void http_trace(u32 event, u32 route, u32 a, u32 b)
 {
@@ -4328,7 +4451,14 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
     } else if (http_streq(cmd, "tls") || http_streq(cmd, "tls status")) {
         struct tls_diag_snapshot t;
         tls_diag_snapshot(&t);
-        http_append(out, &len, max, "TLS kernel=enabled crypto=arm-aese+ghash-nibble bridge=picoweb-style active=");
+        http_append(out, &len, max,
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+                    "TLS kernel=enabled crypto=software-aes+ghash-nibble bridge=picoweb-style active="
+#else
+                    "TLS kernel=enabled crypto=arm-aese+ghash-nibble bridge=picoweb-style active="
+#endif
+        );
         http_append_u64(out, &len, max, t.active);
         http_append(out, &len, max, " established=");
         http_append_u64(out, &len, max, t.established);
@@ -5220,6 +5350,19 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, core0_airq_dispatch_passes);
         http_append(out, &len, max, "/");
         http_append_u64(out, &len, max, core0_airq_empty_passes);
+        http_append(out, &len, max, "\n");
+        http_append(out, &len, max, "admin_update accept/complete/built/first_write/close/abort=");
+        http_append_u64(out, &len, max, admin_update_svc.diag_accepts);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, admin_update_svc.diag_complete);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, admin_update_svc.diag_built);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, admin_update_svc.diag_first_write);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, admin_update_svc.diag_close);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, admin_update_svc.diag_abort);
         http_append(out, &len, max, "\n");
         struct airq_lane_diag lanes[AIRQ_CORES * AIRQ_QUEUED_PRIOS];
         u32 lane_n = airq_lane_diag_snapshot(CORE_NET, lanes,
@@ -10419,9 +10562,9 @@ static u32 http_build_spa_response(char *out, u32 max)
         "<!doctype html><html><head><meta charset='utf-8'><title>PIOS Admin</title>"
         "<script>(()=>{const p=new URLSearchParams(window.location.search).get('clawpilotTheme');const t=p||(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.setAttribute('data-theme',t);})();</script>"
         "<style>:root{color-scheme:light;--cp-bg:#f7f4ef;--cp-bg-elevated:#fcfbf8;--cp-surface:#ffffff;--cp-surface-soft:#f5f5f5;--cp-border:#dedede;--cp-border-strong:#919191;--cp-text:#242424;--cp-text-muted:#5c5c5c;--cp-text-soft:#6f6f6f;--cp-accent:#b11f4b;--cp-accent-hover:#9a1a41;--cp-accent-soft:rgba(177,31,75,.08);--cp-accent-fg:#ffffff;--cp-success:#16a34a;--cp-danger:#dc2626;--cp-warning:#f59e0b;--cp-link:#0078d4;--cp-shadow:0 18px 48px rgba(0,0,0,.12);--cp-overlay:rgba(255,255,255,.8);--cp-panel:rgba(255,255,255,.86);--cp-panel-strong:rgba(255,255,255,.96);--cp-sheen:rgba(255,255,255,.55);--cp-highlight:rgba(177,31,75,.12)}html[data-theme='dark']{color-scheme:dark;--cp-bg:#3d3b3a;--cp-bg-elevated:#343231;--cp-surface:#292929;--cp-surface-soft:#2e2e2e;--cp-border:#474747;--cp-border-strong:#5f5f5f;--cp-text:#dedede;--cp-text-muted:#919191;--cp-text-soft:#b0b0b0;--cp-accent:#fd8ea1;--cp-accent-hover:#fb7b91;--cp-accent-soft:rgba(253,142,161,.14);--cp-accent-fg:#1a1a1a;--cp-success:#4ade80;--cp-danger:#f87171;--cp-warning:#fbbf24;--cp-link:#4da6ff;--cp-shadow:0 18px 48px rgba(0,0,0,.32);--cp-overlay:rgba(41,41,41,.88);--cp-panel:rgba(41,41,41,.72);--cp-panel-strong:rgba(41,41,41,.96);--cp-sheen:rgba(255,255,255,.04);--cp-highlight:rgba(253,142,161,.12)}</style>"
-        "<style>body{margin:0;background:var(--cp-bg);color:var(--cp-text);font-family:'Segoe UI',Aptos,Calibri,-apple-system,BlinkMacSystemFont,sans-serif}.wrap{padding:24px}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-end}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:16px 0}.tabs button,.bt{border:1px solid var(--cp-border);background:var(--cp-surface);color:var(--cp-text);border-radius:.625rem;padding:8px 12px}.tabs button.act,.bt.primary{background:var(--cp-accent);color:var(--cp-accent-fg);border-color:var(--cp-accent)}.tabs button:hover,.bt:hover{border-color:var(--cp-border-strong)}.tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px}.tools input{width:88px}.tools label{color:var(--cp-text-muted)}input{background:var(--cp-surface);color:var(--cp-text);border:1px solid var(--cp-border);border-radius:.625rem;padding:7px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.cd,.tile{background:var(--cp-surface);border:1px solid var(--cp-border);border-radius:16px;box-shadow:0 0 2px rgba(0,0,0,.12),0 1px 2px rgba(0,0,0,.14);padding:16px;margin:12px 0}.tile{margin:0}.muted{color:var(--cp-text-muted)}.pill{display:inline-block;border:1px solid var(--cp-border);border-radius:.625rem;padding:2px 7px;background:var(--cp-accent-soft)}a{color:var(--cp-link)}pre,code,.nt{font-family:Consolas,'Courier New',Courier,monospace}pre{white-space:pre-wrap;overflow:auto}.nt{width:100%;border-collapse:collapse;font-size:13px}.nt th,.nt td{border-bottom:1px solid var(--cp-border);padding:7px 8px;text-align:left;vertical-align:top}.nt th{color:var(--cp-text-muted);background:var(--cp-surface-soft)}.ok{color:var(--cp-success)}.warn{color:var(--cp-warning)}.bad{color:var(--cp-danger)}.term{background:var(--cp-bg-elevated);color:var(--cp-success);border:1px solid var(--cp-success);border-radius:.625rem;overflow:hidden;font-family:Consolas,'Courier New',Courier,monospace}.bar{background:var(--cp-surface-soft);padding:8px 12px;border-bottom:1px solid var(--cp-border);letter-spacing:.08em}.screen{height:420px;overflow:auto;padding:14px;white-space:pre-wrap;font-size:14px;line-height:1.35}.prompt{display:flex;gap:8px;align-items:center;border-top:1px solid var(--cp-border);background:var(--cp-surface-soft);padding:10px 12px}.prompt input{flex:1;border:0;outline:0;font-family:Consolas,'Courier New',Courier,monospace}.pico-frame{width:100%;height:70vh;border:1px solid var(--cp-border);border-radius:16px;background:var(--cp-surface)}.cursor{animation:blink 1s steps(1) infinite}@keyframes blink{50%{opacity:0}}</style></head><body><div class='wrap'><div class='top'><div><h1>PIOS Admin Console</h1><p id='sub' class='muted'>Structured tabs; manual refresh.</p></div><div class='muted'>SECOND STAGE</div></div><div class='tabs'><button class='act' data-t='overview'>Overview</button><button data-t='processes'>Processes</button><button data-t='netstat'>Netstat</button><button data-t='graphs'>Graphs</button><button data-t='system'>System</button><button data-t='users'>Users</button><button data-t='logs'>Logs</button><button data-t='walfs'>WALFS</button><button data-t='picoscript'>PicoScript</button><button data-t='firewall'>Firewall</button><button data-t='terminal'>Terminal</button><button data-t='admin'>Admin</button></div><div id='app'></div></div>");
+        "<style>body{margin:0;background:var(--cp-bg);color:var(--cp-text);font-family:'Segoe UI',Aptos,Calibri,-apple-system,BlinkMacSystemFont,sans-serif}.wrap{padding:24px}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-end}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:16px 0}.tabs button,.bt{border:1px solid var(--cp-border);background:var(--cp-surface);color:var(--cp-text);border-radius:.625rem;padding:8px 12px}.tabs button.act,.bt.primary{background:var(--cp-accent);color:var(--cp-accent-fg);border-color:var(--cp-accent)}.tabs button:hover,.bt:hover{border-color:var(--cp-border-strong)}.tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px}.tools input{width:88px}.tools label{color:var(--cp-text-muted)}input{background:var(--cp-surface);color:var(--cp-text);border:1px solid var(--cp-border);border-radius:.625rem;padding:7px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.cd,.tile{background:var(--cp-surface);border:1px solid var(--cp-border);border-radius:16px;box-shadow:0 0 2px rgba(0,0,0,.12),0 1px 2px rgba(0,0,0,.14);padding:16px;margin:12px 0}.tile{margin:0}.muted{color:var(--cp-text-muted)}.pill{display:inline-block;border:1px solid var(--cp-border);border-radius:.625rem;padding:2px 7px;background:var(--cp-accent-soft)}a{color:var(--cp-link)}pre,code,.nt{font-family:Consolas,'Courier New',Courier,monospace}pre{white-space:pre-wrap;overflow:auto}.nt{width:100%;border-collapse:collapse;font-size:13px}.nt th,.nt td{border-bottom:1px solid var(--cp-border);padding:7px 8px;text-align:left;vertical-align:top}.nt th{color:var(--cp-text-muted);background:var(--cp-surface-soft)}.ok{color:var(--cp-success)}.warn{color:var(--cp-warning)}.bad{color:var(--cp-danger)}.term{background:var(--cp-bg-elevated);color:var(--cp-success);border:1px solid var(--cp-success);border-radius:.625rem;overflow:hidden;font-family:Consolas,'Courier New',Courier,monospace}.bar{background:var(--cp-surface-soft);padding:8px 12px;border-bottom:1px solid var(--cp-border);letter-spacing:.08em}.screen{height:420px;overflow:auto;padding:14px;white-space:pre-wrap;font-size:14px;line-height:1.35}.prompt{display:flex;gap:8px;align-items:center;border-top:1px solid var(--cp-border);background:var(--cp-surface-soft);padding:10px 12px}.prompt input{flex:1;border:0;outline:0;font-family:Consolas,'Courier New',Courier,monospace}.pico-frame{width:100%;height:70vh;border:1px solid var(--cp-border);border-radius:16px;background:var(--cp-surface)}.cursor{animation:blink 1s steps(1) infinite}@keyframes blink{50%{opacity:0}}</style></head><body><div class='wrap'><div class='top'><div><h1>PIOS Admin Console</h1><p id='sub' class='muted'>Headless workbench; adjustable live refresh.</p></div><div class='muted'>SECOND STAGE</div></div><div class='tabs'><button class='act' data-t='workbench'>Workbench</button><button data-t='overview'>Overview</button><button data-t='processes'>Processes</button><button data-t='netstat'>Netstat</button><button data-t='graphs'>Graphs</button><button data-t='system'>System</button><button data-t='users'>Users</button><button data-t='logs'>Logs</button><button data-t='walfs'>WALFS</button><button data-t='picoscript'>PicoScript</button><button data-t='firewall'>Firewall</button><button data-t='terminal'>Terminal</button><button data-t='admin'>Admin</button></div><div id='app'></div></div>");
     http_append(out, &len, max,
-        "<script>let tab='overview',samples=[],hist=['PIOS remote terminal ready. Type Help for assistance!'],auto=false,ms=3000,timer=0;const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function bust(u){return u+(u.includes('?')?'&':'?')+'_='+Date.now()}async function txt(u){let r=await fetch(bust(u));return await r.text()}async function js(u){let r=await fetch(bust(u));return await r.json()}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}function tools(){return `<div class=tools><button class='bt primary' id=rf>Refresh</button><label><input id=ar type=checkbox ${auto?'checked':''}> auto-refresh</label><input id=ms type=number min=250 step=250 value='${ms}'><span class=muted>ms</span></div>`}function bind(){let r=document.getElementById('rf'),a=document.getElementById('ar'),m=document.getElementById('ms');if(r)r.onclick=draw;if(a)a.onchange=()=>{auto=a.checked;sync()};if(m)m.onchange=()=>{ms=Math.max(250,parseInt(m.value||'3000'));m.value=ms;sync()};sync()}function sync(){if(timer){clearInterval(timer);timer=0}if(auto&&tab!=='terminal')timer=setInterval(draw,ms)}function table(h,rows){let b=rows.length?rows.map(r=>'<tr>'+h.map((_,i)=>'<td>'+esc(r[i]||'')+'</td>').join('')+'</tr>').join(''):`<tr><td colspan='${h.length}' class=muted>No rows</td></tr>`;return '<table class=nt><thead><tr>'+h.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+b+'</tbody></table>'}function kv(o){return table(['Key','Value'],Object.keys(o).map(k=>[k,o[k]]))}function splitRows(t){return t.trim().split('\\n').filter(x=>x&&x[0]>='0'&&x[0]<='9').map(x=>x.trim().split(/\\s+/))}function spark(a){let m=Math.max(1,...a);return a.map(v=>String(v).padStart(4,' ')+ ' '+ '#'.repeat(Math.min(40,Math.round(v*40/m)))).join('\\n')}async function overview(){let d=await js('/api/status'),dg=d.diag||{};app.innerHTML=card('Overview',tools()+`<div class=grid><div class=tile><b>Build</b><p>${esc(d.build)}</p><span class=pill>${esc(d.version)}</span></div><div class=tile><b>Network</b><p>${esc(d.ip)}</p><p class=muted>${esc(d.mode)}</p></div><div class=tile><b>Uptime</b><p>${esc(d.uptime)} seconds</p></div><div class=tile><b>HTTP diagnostics</b>${kv(dg)}</div></div>`);bind()}async function system(){let r=await txt('/api/terminal?cmd=status'),rows=[];r.split(/\\s+/).forEach(p=>{let i=p.indexOf('=');if(i>0)rows.push([p.slice(0,i),p.slice(i+1)])});app.innerHTML=card('System',tools()+`<div class=grid><div class=tile><b>${esc((r.split('\\n')[0]||'PIOS'))}</b></div><div class=tile>${table(['Metric','Value'],rows)}</div></div><pre>${esc(r)}</pre>`);bind()}async function netstat(){let n=await js('/api/netstat');app.innerHTML=card('Netstat',tools()+table(n.cols,n.rows)+`<p class=muted>syn=${n.diag.syn} accepted=${n.diag.accepted} fw_rx_drop=${n.fw.rxDrop}</p>`);bind()}async function graphs(){let s=await js('/api/status'),n=await js('/api/netstat');samples.push([s.uptime,n.count,n.diag.syn,n.fw.rxDrop]);while(samples.length>48)samples.shift();app.innerHTML=card('Graphs',tools()+table(['uptime','conns','syn','fw_rx_drop'],samples)+`<div class=grid><div class=tile><h3>Connections</h3><pre>${esc(spark(samples.map(x=>x[1])))}</pre></div><div class=tile><h3>Firewall RX drops</h3><pre>${esc(spark(samples.map(x=>x[3])))}</pre></div></div>`);bind()}async function processes(){let r=await txt('/api/terminal?cmd=processes'),p=r.split('\\n\\nGRAPH\\n'),rows=splitRows(p[0]);app.innerHTML=card('Processes',tools()+table(['PID','PPID','Core','State','Pri','CPU','MemK','ArenaCap','ArenaUsed','ArenaHigh','Bump','SpanK','Span#','Image'],rows)+`<h3>Process graph</h3><pre>${esc(p[1]||'')}</pre>`);bind()}async function users(){let r=await txt('/api/terminal?cmd=users');app.innerHTML=card('Users',tools()+table(['ID','Flags','Name'],splitRows(r)));bind()}async function logs(){let a=await txt('/api/admin/log-stream?tail=24'),b=await txt('/api/logs');app.innerHTML=card('Logs',tools()+`<div class=grid><div class=tile><h3>Operator tail</h3><pre>${esc(a)}</pre></div><div class=tile><h3>Process logs</h3><pre>${esc(b)}</pre></div></div>`);bind()}async function walfs(){let d=await js('/api/walfs?path=/'),body='';if(d.entries)body=table(['ID','Name','Size','Flags'],d.entries.map(e=>[e.id,e.name,e.size,e.flags]));else body=kv(d);app.innerHTML=card('WALFS',tools()+body);bind()}function picoscript(){sync();app.innerHTML=card('PicoScript Editor',`<p class=muted>Full PicoScript playground/editor served from this PIOS image. <a href='/picoscript' target='_blank'>Open in new tab</a></p><iframe class=pico-frame src='/picoscript'></iframe>`)}async function firewall(){let r=await txt('/api/terminal?cmd=firewall%20list'),rows=[];r.split('\\n').forEach(l=>{let m=l.match(/^(\\d+):\\s+(\\S+)\\s+(\\S+)\\s+(.*)$/);if(m)rows.push([m[1],m[2],m[3],m[4]])});app.innerHTML=card('Firewall',tools()+`<p class=muted>${esc(r.split('\\n')[0]||'')}</p>`+table(['#','Action','Dir','Match'],rows)+`<h3>Mutation examples</h3><pre>firewall allow in tcp port 2323 src 192.168.218.9\\nfirewall deny in tcp port 80 src 192.168.218.0/24\\nfirewall reset</pre>`);bind()}function term(){sync();app.innerHTML=card('Terminal',`<div class=term><div class=bar>PIOS // SECOND STAGE LOADER // REMOTE CONSOLE</div><div class=screen id=screen></div><div class=prompt><span>ready&gt;</span><input id=cmd autocomplete=off spellcheck=false autofocus><span class=cursor>_</span></div></div>`);const sc=document.getElementById('screen'),cmd=document.getElementById('cmd');function paint(){sc.textContent=hist.join('\\n');sc.scrollTop=sc.scrollHeight}async function run(){let c=cmd.value.trim();cmd.value='';if(!c)return;if(c==='clear'){hist=[];paint();return}hist.push('ready> '+c);try{hist.push(await txt('/api/terminal?cmd='+encodeURIComponent(c)))}catch(e){hist.push('ERR '+e)}while(hist.length>160)hist.shift();paint()}cmd.onkeydown=e=>{if(e.key==='Enter')run()};paint();cmd.focus()}function admin(){app.innerHTML=card('Admin',tools()+`<div class=grid><div class=tile><b>Logs</b><p><a href='/api/admin/log-stream?tail=24'>Tail log stream</a></p></div><div class=tile><b>OTA</b><p><a href='/api/admin/kernel-update?confirm=1'>Kernel update status</a></p></div><div class=tile><b>Reboot</b><p><a href='/api/admin/reboot?confirm=1'>Queue hot reboot</a></p></div></div>`);bind()}async function draw(){sub.textContent='Loading '+tab+'...';try{if(tab==='overview')await overview();else if(tab==='system')await system();else if(tab==='netstat')await netstat();else if(tab==='graphs')await graphs();else if(tab==='processes')await processes();else if(tab==='users')await users();else if(tab==='logs')await logs();else if(tab==='walfs')await walfs();else if(tab==='picoscript')picoscript();else if(tab==='firewall')await firewall();else if(tab==='terminal')term();else if(tab==='admin')admin();else app.innerHTML=card(tab,'unknown tab')}catch(e){app.innerHTML=card('Error',`<pre>${esc(e)}</pre>`)}sub.textContent='Tab '+tab+(auto&&tab!=='terminal'?` // auto ${ms}ms`:'')}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
+        "<script>let tab='workbench',samples=[],hist=['PIOS remote terminal ready. Type Help for assistance!'],auto=localStorage.getItem('piosAuto')!=='0',ms=Math.max(1000,+(localStorage.getItem('piosMs')||3000)),timer=0,drawing=false;const app=document.getElementById('app'),sub=document.getElementById('sub');function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function bust(u){return u+(u.includes('?')?'&':'?')+'_='+Date.now()}async function txt(u){let r=await fetch(bust(u));return await r.text()}async function js(u){let r=await fetch(bust(u));return await r.json()}function termq(c){return txt('/api/terminal?cmd='+encodeURIComponent(c))}function card(t,h){return `<div class=cd><h2>${t}</h2>${h}</div>`}function tools(){return `<div class=tools><button class='bt primary' id=rf>Refresh</button><label><input id=ar type=checkbox ${auto?'checked':''}> auto-refresh</label><input id=ms type=number min=1000 step=500 value='${ms}'><span class=muted>ms</span></div>`}function bind(){let r=document.getElementById('rf'),a=document.getElementById('ar'),m=document.getElementById('ms');if(r)r.onclick=draw;if(a)a.onchange=()=>{auto=a.checked;localStorage.setItem('piosAuto',auto?'1':'0');sync()};if(m)m.onchange=()=>{ms=Math.max(1000,parseInt(m.value||'3000'));m.value=ms;localStorage.setItem('piosMs',ms);sync()};sync()}function sync(){if(timer){clearInterval(timer);timer=0}if(auto&&tab!=='terminal')timer=setInterval(draw,ms)}function table(h,rows){let b=rows.length?rows.map(r=>'<tr>'+h.map((_,i)=>'<td>'+esc(r[i]||'')+'</td>').join('')+'</tr>').join(''):`<tr><td colspan='${h.length}' class=muted>No rows</td></tr>`;return '<table class=nt><thead><tr>'+h.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>'+b+'</tbody></table>'}function kv(o){return table(['Key','Value'],Object.keys(o).map(k=>[k,o[k]]))}function splitRows(t){return t.trim().split('\\n').filter(x=>x&&x[0]>='0'&&x[0]<='9').map(x=>x.trim().split(/\\s+/))}function spark(a){let m=Math.max(1,...a);return a.map(v=>String(v).padStart(4,' ')+ ' '+ '#'.repeat(Math.min(40,Math.round(v*40/m)))).join('\\n')}function pane(t,x){return `<div class=tile><h3>${t}</h3><pre>${esc(x)}</pre></div>`}async function workbench(){let [s,ps,sv,sc,mac,nic,dma,ten,med,lease,log]=await Promise.all([js('/api/status'),termq('processes'),termq('services'),termq('proc sched'),termq('macbdiag'),termq('nic counters'),termq('dma status'),termq('tensor status'),termq('mediahw status'),termq('lease'),txt('/api/admin/log-stream?tail=24')]),p=s.perf||{},cores=[0,1,2,3].map(i=>['Core '+i,((p['cpu'+i+'_permille']||0)/10).toFixed(1)+'%']),hw=[['Board','rev 0x'+Number(p.board_revision||0).toString(16)+' model 0x'+Number(p.board_model_code||0).toString(16)],['CPU',p.cpu_clock_mhz+' MHz / '+((p.cpu_total_permille||0)/10).toFixed(1)+'% total'],['RAM',Math.round((p.ram_installed_bytes||0)/1048576)+' MiB installed; '+Math.round((p.ram_high_free_bytes||0)/1048576)+' MiB high free'],['VideoCore',p.videocore_display_ready?'display '+p.videocore_display_width+'x'+p.videocore_display_height:'display unavailable; HVS '+(p.videocore_hvs_seen?'seen':'missing')],['Wired',s.ip+' / '+(p.nic_link_mbps||0)+' Mb/s '+(p.nic_link_full_duplex?'FD':'HD')],['WALFS',p.walfs_mounted?'mounted, '+p.walfs_records+' records':'offline']];app.innerHTML=card('PIOS Workbench',tools()+`<div class=grid><div class=tile><h3>System</h3><p><b>${esc(s.version)}</b></p><p>${esc(s.ip)} · uptime ${esc(s.uptime)}s</p>${table(['CPU','Load'],cores)}</div><div class=tile><h3>Hardware / Capabilities</h3>${table(['Device','State'],hw)}</div><div class=tile><h3>Storage / Throughput</h3>${table(['Metric','Value'],[['SD read',(p.sd_read_mbps_x1000||0)/1000+' Mb/s'],['SD write',(p.sd_write_mbps_x1000||0)/1000+' Mb/s'],['NIC RX',(p.nic_rx_mbps_x1000||0)/1000+' Mb/s'],['NIC TX',(p.nic_tx_mbps_x1000||0)/1000+' Mb/s'],['RX wedge/hole',(p.nic_rx_wedge||0)+' / '+(p.nic_rx_hole_recover||0)]])}</div></div><div class=grid>${pane('Parallel / Vector Acceleration',ten+'\\n'+med)}${pane('Network / Process Map',sv+'\\n'+ps)}${pane('Scheduler / FIFO / Lease',sc+'\\n'+lease)}${pane('NIC / MAC RX-TX',mac+'\\n'+nic)}${pane('DMA Engine',dma)}${pane('Warnings / Errors',log||'none')}</div>`);bind()}async function overview(){let d=await js('/api/status'),dg=d.diag||{};app.innerHTML=card('Overview',tools()+`<div class=grid><div class=tile><b>Build</b><p>${esc(d.build)}</p><span class=pill>${esc(d.version)}</span></div><div class=tile><b>Network</b><p>${esc(d.ip)}</p><p class=muted>${esc(d.mode)}</p></div><div class=tile><b>Uptime</b><p>${esc(d.uptime)} seconds</p></div><div class=tile><b>HTTP diagnostics</b>${kv(dg)}</div></div>`);bind()}async function system(){let r=await txt('/api/terminal?cmd=status'),rows=[];r.split(/\\s+/).forEach(p=>{let i=p.indexOf('=');if(i>0)rows.push([p.slice(0,i),p.slice(i+1)])});app.innerHTML=card('System',tools()+`<div class=grid><div class=tile><b>${esc((r.split('\\n')[0]||'PIOS'))}</b></div><div class=tile>${table(['Metric','Value'],rows)}</div></div><pre>${esc(r)}</pre>`);bind()}async function netstat(){let n=await js('/api/netstat');app.innerHTML=card('Netstat',tools()+table(n.cols,n.rows)+`<p class=muted>syn=${n.diag.syn} accepted=${n.diag.accepted} fw_rx_drop=${n.fw.rxDrop}</p>`);bind()}async function graphs(){let s=await js('/api/status'),n=await js('/api/netstat');samples.push([s.uptime,n.count,n.diag.syn,n.fw.rxDrop]);while(samples.length>48)samples.shift();app.innerHTML=card('Graphs',tools()+table(['uptime','conns','syn','fw_rx_drop'],samples)+`<div class=grid><div class=tile><h3>Connections</h3><pre>${esc(spark(samples.map(x=>x[1])))}</pre></div><div class=tile><h3>Firewall RX drops</h3><pre>${esc(spark(samples.map(x=>x[3])))}</pre></div></div>`);bind()}async function processes(){let r=await txt('/api/terminal?cmd=processes'),p=r.split('\\n\\nGRAPH\\n'),rows=splitRows(p[0]);app.innerHTML=card('Processes',tools()+table(['PID','PPID','Core','State','Pri','CPU','MemK','ArenaCap','ArenaUsed','ArenaHigh','Bump','SpanK','Span#','Image'],rows)+`<h3>Process graph</h3><pre>${esc(p[1]||'')}</pre>`);bind()}async function users(){let r=await txt('/api/terminal?cmd=users');app.innerHTML=card('Users',tools()+table(['ID','Flags','Name'],splitRows(r)));bind()}async function logs(){let a=await txt('/api/admin/log-stream?tail=24'),b=await txt('/api/logs');app.innerHTML=card('Logs',tools()+`<div class=grid><div class=tile><h3>Operator tail</h3><pre>${esc(a)}</pre></div><div class=tile><h3>Process logs</h3><pre>${esc(b)}</pre></div></div>`);bind()}async function walfs(){let d=await js('/api/walfs?path=/'),body='';if(d.entries)body=table(['ID','Name','Size','Flags'],d.entries.map(e=>[e.id,e.name,e.size,e.flags]));else body=kv(d);app.innerHTML=card('WALFS',tools()+body);bind()}function picoscript(){sync();app.innerHTML=card('PicoScript Editor',`<p class=muted>Full PicoScript playground/editor served from this PIOS image. <a href='/picoscript' target='_blank'>Open in new tab</a></p><iframe class=pico-frame src='/picoscript'></iframe>`)}async function firewall(){let r=await txt('/api/terminal?cmd=firewall%20list'),rows=[];r.split('\\n').forEach(l=>{let m=l.match(/^(\\d+):\\s+(\\S+)\\s+(\\S+)\\s+(.*)$/);if(m)rows.push([m[1],m[2],m[3],m[4]])});app.innerHTML=card('Firewall',tools()+`<p class=muted>${esc(r.split('\\n')[0]||'')}</p>`+table(['#','Action','Dir','Match'],rows)+`<h3>Mutation examples</h3><pre>firewall allow in tcp port 2323 src 192.168.218.9\\nfirewall deny in tcp port 80 src 192.168.218.0/24\\nfirewall reset</pre>`);bind()}function term(){sync();app.innerHTML=card('Terminal',`<div class=term><div class=bar>PIOS // SECOND STAGE LOADER // REMOTE CONSOLE</div><div class=screen id=screen></div><div class=prompt><span>ready&gt;</span><input id=cmd autocomplete=off spellcheck=false autofocus><span class=cursor>_</span></div></div>`);const sc=document.getElementById('screen'),cmd=document.getElementById('cmd');function paint(){sc.textContent=hist.join('\\n');sc.scrollTop=sc.scrollHeight}async function run(){let c=cmd.value.trim();cmd.value='';if(!c)return;if(c==='clear'){hist=[];paint();return}hist.push('ready> '+c);try{hist.push(await txt('/api/terminal?cmd='+encodeURIComponent(c)))}catch(e){hist.push('ERR '+e)}while(hist.length>160)hist.shift();paint()}cmd.onkeydown=e=>{if(e.key==='Enter')run()};paint();cmd.focus()}function admin(){app.innerHTML=card('Admin',tools()+`<div class=grid><div class=tile><b>Logs</b><p><a href='/api/admin/log-stream?tail=24'>Tail log stream</a></p></div><div class=tile><b>OTA</b><p><a href='/api/admin/kernel-update?confirm=1'>Kernel update status</a></p></div><div class=tile><b>Reboot</b><p><a href='/api/admin/reboot?confirm=1'>Queue hot reboot</a></p></div></div>`);bind()}async function draw(){if(drawing)return;drawing=true;sub.textContent='Loading '+tab+'...';try{if(tab==='workbench')await workbench();else if(tab==='overview')await overview();else if(tab==='system')await system();else if(tab==='netstat')await netstat();else if(tab==='graphs')await graphs();else if(tab==='processes')await processes();else if(tab==='users')await users();else if(tab==='logs')await logs();else if(tab==='walfs')await walfs();else if(tab==='picoscript')picoscript();else if(tab==='firewall')await firewall();else if(tab==='terminal')term();else if(tab==='admin')admin();else app.innerHTML=card(tab,'unknown tab')}catch(e){app.innerHTML=card('Error',`<pre>${esc(e)}</pre>`)}finally{drawing=false}sub.textContent='Tab '+tab+(auto&&tab!=='terminal'?` // auto ${ms}ms`:'')}document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('act',x===b));draw()});draw()</script></body></html>");
     return len;
 }
 
@@ -11887,6 +12030,7 @@ static void admin_service_build_response(struct admin_http_service *svc)
                                                     svc->req, svc->req_len);
     http_diag.build_len = svc->resp_len;
     svc->resp_off = 0;
+    svc->diag_built++;
 }
 
 static void admin_service_poll(struct admin_http_service *svc)
@@ -11916,6 +12060,7 @@ static void admin_service_poll(struct admin_http_service *svc)
             svc->stream_total = 0;
             svc->stream_reboot = false;
             svc->last_activity_ms = now;
+            svc->diag_accepts++;
             http_log_event("admin-accept", svc->port, 0);
             http_trace(HTTP_EVT_ACCEPT, HTTP_ROUTE_UNKNOWN, svc->port, (u32)svc->client_conn);
         }
@@ -11925,8 +12070,12 @@ static void admin_service_poll(struct admin_http_service *svc)
 
     u32 st = tcp_state(svc->client_conn);
     if (st != TCP_ESTABLISHED) {
-        if (st == TCP_CLOSED || st >= TCP_CLOSING || now - svc->last_activity_ms > 1000ULL)
+        if (st == TCP_CLOSED || st >= TCP_CLOSING || now - svc->last_activity_ms > 1000ULL) {
+            svc->diag_close++;
+            if (st != TCP_CLOSED)
+                svc->diag_abort++;
             admin_service_clear_client(svc, st != TCP_CLOSED);
+        }
         return;
     }
 
@@ -12169,6 +12318,7 @@ static void admin_service_poll(struct admin_http_service *svc)
         } else if (http_request_complete(svc->req, svc->req_len) ||
                    svc->req_len >= sizeof(svc->req)) {
             http_trace(HTTP_EVT_COMPLETE, http_route_id(svc->req, svc->req_len), svc->port, svc->req_len);
+            svc->diag_complete++;
             admin_service_build_response(svc);
             svc->last_activity_ms = now;
         }
@@ -13307,15 +13457,23 @@ void early_boot_hdmi_mark(u32 code)
 {
     static bool inited;
     if (!inited) {
-        if (!fb_init(1280, 720))
+        bool attached = fb_get_phys_addr() != 0;
+        if (!attached) {
+            struct stage0_fb_handoff handoff;
+            if (stage0_fb_handoff_read(&handoff))
+                attached = fb_adopt(handoff.base, handoff.width,
+                                    handoff.height, handoff.pitch,
+                                    handoff.size);
+        }
+        if (!attached && !fb_init(1280, 720))
             return;
-        fb_clear(BOOT_BLACK);
+        if (!attached)
+            fb_clear(BOOT_BLACK);
         fb_set_color(BOOT_FG_WHITE, BOOT_BLACK);
         inited = true;
     }
-    fb_puts("EARLY ");
-    fb_putc((char)code);
-    fb_putc('\n');
+    fb_printf("EARLY %X\n", code);
+    fb_present();
 }
 
 static void boot_policy_mac(const struct boot_policy_record *r, u8 out[32])
@@ -14723,7 +14881,14 @@ static void ui_print_tls_diag(void)
 {
     struct tls_diag_snapshot t;
     tls_diag_snapshot(&t);
-    ui_console_write("TLS kernel=enabled crypto=arm-aese+ghash-nibble bridge=picoweb-style active=");
+    ui_console_write(
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+        "TLS kernel=enabled crypto=software-aes+ghash-nibble bridge=picoweb-style active="
+#else
+        "TLS kernel=enabled crypto=arm-aese+ghash-nibble bridge=picoweb-style active="
+#endif
+    );
     ui_console_u32_dec(t.active);
     ui_console_write(" established=");
     ui_console_u32_dec(t.established);
@@ -22004,18 +22169,20 @@ static void hdmi_dashboard_render(void)
     u32 screen_cols = fb_cols();
     u32 screen_rows = fb_rows();
     bool wide = screen_cols >= 180U;
-    u32 header_col = 0, header_row = 0, header_w = wide ? (screen_cols - 2U) : 78U, header_h = 6U;
+    u32 compact_w = screen_cols >= 104U ? screen_cols - 2U : 78U;
+    u32 header_col = 0, header_row = 0,
+        header_w = wide ? (screen_cols - 2U) : compact_w, header_h = 6U;
     u32 hw_col = 0U;
     u32 hw_row = header_row + header_h + 1U;
-    u32 hw_w = wide ? header_w : 78U;
+    u32 hw_w = wide ? header_w : compact_w;
     u32 hw_h = 15U;
     u32 tns_col = 0U;
     u32 tns_row = hw_row + hw_h + 1U;
-    u32 tns_w = wide ? header_w : 78U;
+    u32 tns_w = wide ? header_w : compact_w;
     u32 tns_h = 9U;     /* border + header + six accelerator feature rows */
     u32 map_col = 0U;
     u32 map_row = tns_row + tns_h + 1U;
-    u32 map_w = wide ? header_w : 78U;
+    u32 map_w = wide ? header_w : compact_w;
     u32 log_col = 0;
     u32 log_h = wide ? 11U : 12U;
     u32 log_top = screen_rows > log_h + map_row + 5U ? screen_rows - log_h - 1U :
@@ -22250,38 +22417,41 @@ static void hdmi_dashboard_render(void)
     if (hw_r < hw_end) {
         bool wifi_runtime = cyw43_runtime_ready();
         u32 wifi_link = cyw43_link_state();
-        const char *wifi_state = !PIOS_HAS_WIFI_SDIO2 ? "N/A" :
+        const char *wifi_state = !PIOS_HAS_WIFI_SDIO ? "N/A" :
                                  (nic_wifi_active() ? "ACTIVE" :
                                  (wifi_link == CYW_LINK_UP ? "LINKED" :
                                   (wifi_link == CYW_LINK_JOINING ? "JOINING" :
                                    (wifi_link == CYW_LINK_AUTH_FAIL ? "AUTHFAIL" :
                                     (wifi_runtime ? "READY" : "AVAILABLE")))));
-        u32 wifi_color = !PIOS_HAS_WIFI_SDIO2 ? 0x00AAAAAA :
+        u32 wifi_color = !PIOS_HAS_WIFI_SDIO ? 0x00AAAAAA :
                          (nic_wifi_active() || wifi_link == CYW_LINK_UP
             ? 0x0000FF80 : (wifi_link == CYW_LINK_AUTH_FAIL
                                 ? 0x00FF4040 : 0x00FFAA00));
-        const char *wifi_load = !PIOS_HAS_WIFI_SDIO2 ? "not present" :
-                                (wifi_runtime ? "CYW43455/SDIO2" : "driver ready");
-        const char *wifi_memory = !PIOS_HAS_WIFI_SDIO2 ? "0" :
+        const char *wifi_load = !PIOS_HAS_WIFI_SDIO ? "not present" :
+                                (wifi_runtime ? (PIOS_HAS_WIFI_SDIO1 ? "CYW43455/SDIO1" :
+                                                 "CYW43455/SDIO2") : "driver ready");
+        const char *wifi_memory = !PIOS_HAS_WIFI_SDIO ? "0" :
                                   (wifi_runtime ? "fw+clm" : "on-demand");
-        const char *wifi_caps = !PIOS_HAS_WIFI_SDIO2
+        const char *wifi_caps = !PIOS_HAS_WIFI_SDIO
             ? "no onboard WiFi on this platform"
             : (nic_wifi_active()
-            ? "CYW43455 SDIO2 WiFi active; wired NIC remains online"
+            ? (PIOS_HAS_WIFI_SDIO1 ? "CYW43455 SDIO1 WiFi active" :
+               "CYW43455 SDIO2 WiFi active; wired NIC remains online")
             : (wifi_runtime
-                   ? "CYW43455 ready; wired fail-safe remains selected"
-                   : "CYW43455 SDIO2 driver ready; firmware init on demand"));
+                   ? "CYW43455 ready; WiFi activation pending"
+                   : (PIOS_HAS_WIFI_SDIO1 ? "CYW43455 SDIO1 driver ready; init on demand" :
+                      "CYW43455 SDIO2 driver ready; firmware init on demand")));
         dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                           "WiFi", wifi_state, wifi_color, wifi_load,
                           wifi_memory, wifi_caps);
         if (hw_r < hw_end)
             dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                               "Bluetooth",
-                              !PIOS_HAS_WIFI_SDIO2 ? "N/A" : "PENDING",
-                              !PIOS_HAS_WIFI_SDIO2 ? 0x00AAAAAA : 0x00FFAA00,
-                              !PIOS_HAS_WIFI_SDIO2 ? "not present" : "CYW43455 combo",
-                              !PIOS_HAS_WIFI_SDIO2 ? "0" : "shared SDIO2",
-                              !PIOS_HAS_WIFI_SDIO2 ? "no onboard Bluetooth on this platform" :
+                              !PIOS_HAS_WIFI_SDIO ? "N/A" : "PENDING",
+                              !PIOS_HAS_WIFI_SDIO ? 0x00AAAAAA : 0x00FFAA00,
+                              !PIOS_HAS_WIFI_SDIO ? "not present" : "CYW43455 combo",
+                              !PIOS_HAS_WIFI_SDIO ? "0" : "shared SDIO",
+                              !PIOS_HAS_WIFI_SDIO ? "no onboard Bluetooth on this platform" :
                               "Bluetooth backend pending");
     }
     if (hw_r < hw_end)
@@ -23530,6 +23700,12 @@ NORETURN void core0_main(void) {
             core0_io_flags = 0;
         }
 
+#if (PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+     PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W) && \
+    PIOS_BCM2837_WIFI_CONFIG_PRESENT
+        pi3_wifi_auto_step();
+#endif
+
         /* Scheduled asynchronous driver work (bounded, admission-controlled). */
         adrv_service();
 
@@ -23849,16 +24025,27 @@ void kernel_fb_early(void) {
                                       " - platform framebuffer skipped\n");
     return;
 #endif
+    if (!fb_get_phys_addr()) {
+        struct stage0_fb_handoff handoff;
+        if (stage0_fb_handoff_read(&handoff))
+            (void)fb_adopt(handoff.base, handoff.width, handoff.height,
+                           handoff.pitch, handoff.size);
+    }
     /* Ramp the A76 to the firmware's max clock before anything else — bare-metal
      * Pi 5 otherwise runs at a low default, making the whole system ~10-100x
      * slower (slow FB/IPC/HTTP, high idle). */
-#if PIOS_HAS_MAILBOX_FB
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
     fb_set_arm_clock_max();
 #endif
-    if (!fb_init(1920, 1080) && !fb_init(1280, 720) && !fb_init(1024, 768))
+    if (!fb_get_phys_addr() &&
+        !fb_init(1920, 1080) && !fb_init(1280, 720) &&
+        !fb_init(1024, 768))
         return;
 
-    u64 val;
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    uart_init();
+#endif
 
     fb_set_color(0x0000FF00, 0x00000000);
     fb_puts("PIOS ");
@@ -24184,14 +24371,23 @@ void kernel_main(void) {
     /* Seed the stack-protector canary as early as possible, before any
      * deeper subsystem init runs (see stackprot.h). */
     stackprot_init();
+    watchdog_hw_disable();
+    watchdog_hw_set_suppressed(true);
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    stage2_boot_diag_mark(0x20U);
+    early_boot_hdmi_mark(0x20U);
+#endif
 
     bool usb_ok = false;
-    bool fb_ok = PIOS_HAS_BOOTINFO_FB ? false : true;  /* Pi FB is early; QEMU GOP is deferred. */
+    bool fb_ok = PIOS_HAS_BOOTINFO_FB ? false : (fb_get_phys_addr() != 0);
     bool sd_ok = false;
     bool walfs_ok = false;
     bool nic_ok = false;
-
-    watchdog_hw_arm_seconds(15);
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    bool wifi_boot_ready = false;
+#endif
 
     /* Stack, NEON, VBAR already set by start.S .Lel1_entry */
 
@@ -24214,7 +24410,9 @@ void kernel_main(void) {
 #endif
     reg_panel(at_el1);
     bp_done(0, true);                     /* Firmware handoff */
-    bp_done(1, true);                     /* VideoCore (fb from EL2) */
+    bp_done(1, fb_ok);                    /* VideoCore framebuffer */
+    if (!fb_ok)
+        bp_warn("[fb] framebuffer unavailable; continuing headless");
 #endif
 
     /* Show FB physical address — needed for MMU mapping */
@@ -24353,6 +24551,88 @@ void kernel_main(void) {
             uart_init();
             uart_puts("\n[uart] RP1 UART online\n");
             bp_ok("[uart] RP1 UART online");
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+            {
+                const struct stage0_diag *s0 =
+                    (const struct stage0_diag *)(usize)STAGE0_DIAG_ADDR;
+                dmb_ishld();
+                if (s0->magic == STAGE0_DIAG_MAGIC &&
+                    s0->version == STAGE0_DIAG_VERSION) {
+                    u32 attempts = s0->attempt_count;
+                    if (attempts > STAGE0_DIAG_ATTEMPTS)
+                        attempts = STAGE0_DIAG_ATTEMPTS;
+                    uart_puts("[stage0] fb attempts=");
+                    uart_hex(s0->attempt_count);
+                    uart_puts(" ready=");
+                    uart_hex(s0->framebuffer_ready);
+                    uart_puts(" hello=");
+                    uart_hex(s0->hello_status);
+                    uart_puts(" rsp=");
+                    uart_hex(s0->hello_response);
+                    uart_puts(" alloc=");
+                    uart_hex(s0->hello_allocation_addr);
+                    uart_puts("/");
+                    uart_hex(s0->hello_allocation_size);
+                    uart_puts("\n");
+                    for (u32 i = 0; i < attempts; i++) {
+                        const struct stage0_fb_attempt *a = &s0->attempt[i];
+                        uart_puts("[stage0] fb#");
+                        uart_hex(i + 1U);
+                        uart_puts(" EL=");
+                        uart_hex(a->current_el);
+                        uart_puts(" SCTLR1=");
+                        uart_hex(a->sctlr_el1);
+                        uart_puts(" status=");
+                        uart_hex(a->status);
+                        uart_puts(" msg=");
+                        uart_hex(a->message);
+                        uart_puts(" rsp=");
+                        uart_hex(a->response);
+                        uart_puts(" alloc=");
+                        uart_hex(a->allocation_addr);
+                        uart_puts("/");
+                        uart_hex(a->allocation_size);
+                        uart_puts(" pitch=");
+                        uart_hex(a->pitch);
+                        uart_puts("\n");
+                    }
+                } else {
+                    uart_puts("[stage0] diagnostic handoff unavailable\n");
+                }
+            }
+#endif
+            {
+                struct fb_mailbox_diag fbd;
+                u64 fb_base;
+                u32 fb_width;
+                u32 fb_height;
+                u32 fb_pitch;
+                u32 fb_size;
+                fb_mailbox_diag(&fbd);
+                fb_display_info(&fb_base, &fb_width, &fb_height,
+                                &fb_pitch, &fb_size);
+                uart_puts("[fb] mbox status=");
+                uart_hex(fbd.status);
+                uart_puts(" msg=");
+                uart_hex(fbd.message);
+                uart_puts(" rsp=");
+                uart_hex(fbd.response);
+                uart_puts(" alloc=");
+                uart_hex(fbd.allocation_addr);
+                uart_puts("/");
+                uart_hex(fbd.allocation_size);
+                uart_puts(" live=");
+                uart_hex(fb_base);
+                uart_puts(" ");
+                uart_hex(fb_width);
+                uart_puts("x");
+                uart_hex(fb_height);
+                uart_puts(" pitch=");
+                uart_hex(fb_pitch);
+                uart_puts(" size=");
+                uart_hex(fb_size);
+                uart_puts("\n");
+            }
             bp_log("[i2c] RP1 I2C1 probe...");
             if (rp1_i2c_init(100000U))
                 bp_ok("[i2c] RP1 I2C1 ready");
@@ -24404,6 +24684,13 @@ void kernel_main(void) {
     bp_done(3, true);
 #else
     bp_warn("[pcie] skipped on this platform");
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    bp_log("[uart] uart_init (platform PL011)...");
+    uart_init();
+    uart_puts("\n[uart] platform UART online\n");
+    bp_ok("[uart] platform UART online");
+#endif
     bp_done(2, true);
     bp_done(3, true);
 #endif
@@ -24579,6 +24866,21 @@ void kernel_main(void) {
     bp_active(5);
     bp_log("[nic] nic_init (probe backends)...");
     nic_ok = nic_init();
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    if (!nic_ok) {
+        bp_log("[wifi] auto init (no wired NIC)...");
+        cyw43_set_progress_hook(wifi_upload_progress);
+        wifi_nic_set_progress_hook(pi3_wifi_boot_progress);
+        wifi_boot_ready = nic_init_wifi();
+        if (wifi_boot_ready)
+            nic_ok = true;
+#if PIOS_BCM2837_WIFI_CONFIG_PRESENT
+        if (wifi_boot_ready)
+            pi3_wifi_auto_start();
+#endif
+    }
+#endif
     if (!nic_ok) {
         bp_warn("[nic] no NIC hardware detected");
         bp_done(5, true);
@@ -24595,12 +24897,29 @@ void kernel_main(void) {
     /* Init network stack — only if a NIC was activated. */
     if (nic_ok) {
         bp_log("[net] net_init (static IP)...");
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+        if (wifi_boot_ready) {
+            net_init_on(NIC_IFACE_WIFI, WIFI_STATIC_IP, WIFI_STATIC_GW,
+                        WIFI_STATIC_MASK, NULL);
+            ui_cfg_ip = WIFI_STATIC_IP;
+            ui_cfg_mask = WIFI_STATIC_MASK;
+            ui_cfg_gw = WIFI_STATIC_GW;
+            ui_cfg_dns = WIFI_STATIC_GW;
+        } else
+#endif
+        {
         net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
         /* Pin the dev host PC as a static neighbor so we never need ARP
          * resolution to talk back to it, and unsolicited replies are valid. */
         net_add_neighbor(HOST_PC_IP, HOST_PC_MAC);
         (void)net_route_add(HOST_PC_IP, 0xFFFFFFFFU, 0, NET_ROUTE_F_CONNECTED);
         uart_puts("[net] static neighbor 192.168.218.9 -> 04:bf:1b:e1:d7:78\n");
+        ui_cfg_ip = MY_IP;
+        ui_cfg_mask = MY_MASK;
+        ui_cfg_gw = MY_GW;
+        ui_cfg_dns = MY_GW;
+        }
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
         /* QEMU user-mode (SLIRP) assigns its gateway a deterministic MAC of
          * 52:55:<gateway-ipv4>. Pin it so the stack never has to ARP-resolve the
@@ -24617,10 +24936,6 @@ void kernel_main(void) {
             uart_puts("[net] QEMU SLIRP gateway MAC pinned\n");
         }
 #endif
-        ui_cfg_ip = MY_IP;
-        ui_cfg_mask = MY_MASK;
-        ui_cfg_gw = MY_GW;
-        ui_cfg_dns = MY_GW;
         ui_cfg_dhcp = false;
         dns_init(ui_cfg_dns);
         net_services_listen();
@@ -24769,6 +25084,8 @@ void kernel_main(void) {
     /* HDMI stays on boot diags */
 
     if (at_el1) {
+        watchdog_hw_set_suppressed(false);
+        watchdog_hw_pet();
         core0_main();
     } else {
         for (;;) __asm__ volatile("wfe");

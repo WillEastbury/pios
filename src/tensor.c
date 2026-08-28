@@ -3918,7 +3918,7 @@ void tensor_init(void) {
     picovm_async_qpu_ready = false;
     prefer_qpu_h264 = false;
     media_h264_qpu_min_bytes = 0xFFFFFFFFU;
-#if !PIOS_HAS_MAILBOX_FB
+#if !PIOS_HAS_V3D_71
     for (u32 i = 0; i < V3D_KERNEL_MAX; i++) {
         v3d_kernel_disabled[i] = true;
         v3d_direct_grid_disabled[i] = false;

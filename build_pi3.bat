@@ -22,8 +22,8 @@ set TC=C:\aarch64-none-elf\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-aarch64-no
 set CC=%TC%\aarch64-none-elf-gcc.exe
 set LD=%TC%\aarch64-none-elf-ld.exe
 set OC=%TC%\aarch64-none-elf-objcopy.exe
-set CFLAGS=-Wall -Wextra -Wno-unused-function -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2 -fstack-protector-strong -DPIOS_PLATFORM=PIOS_PLATFORM_PI3
-set ASFLAGS=-march=armv8.2-a+simd+crc+crypto -DPIOS_PLATFORM=PIOS_PLATFORM_PI3
+set CFLAGS=-Wall -Wextra -Wno-unused-function -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8-a+simd+crc -mno-outline-atomics -Iinclude -O2 -fstack-protector-strong -DPIOS_FB_MBOX_POLL_LIMIT=1000000U -DPIOS_PLATFORM=PIOS_PLATFORM_PI3
+set ASFLAGS=-march=armv8-a+simd+crc -DPIOS_PLATFORM=PIOS_PLATFORM_PI3
 
 if exist build_pi3 rmdir /S /Q build_pi3
 mkdir build_pi3

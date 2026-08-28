@@ -3,7 +3,7 @@
 #include "platform.h"
 
 /*
- * Raw SD block I/O via SDHCI (BCM2712 EMMC2 controller).
+ * Raw SD block I/O via BCM2712 SDHCI or BCM2835 SDHOST.
  * No filesystem. No partitions. Just LBA -> 512-byte blocks.
  *
  * Buffer contract:
@@ -54,6 +54,10 @@ const sd_stats_t *sd_get_stats(void);
 const char *sd_qemu_backend_name(void);
 bool sd_qemu_virtio_blk_ready(void);
 u32 sd_qemu_virtio_blk_diag(void);
+#elif PIOS_PLATFORM == PIOS_PLATFORM_PI3 || PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+static inline const char *sd_qemu_backend_name(void) { return "sdhost"; }
+static inline bool sd_qemu_virtio_blk_ready(void) { return false; }
+static inline u32 sd_qemu_virtio_blk_diag(void) { return 0; }
 #else
 static inline const char *sd_qemu_backend_name(void) { return "sdhci"; }
 static inline bool sd_qemu_virtio_blk_ready(void) { return false; }

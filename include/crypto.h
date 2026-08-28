@@ -1,9 +1,8 @@
 /*
  * crypto.h - Hardware-accelerated cryptographic primitives
  *
- * Uses ARMv8.2-A Crypto Extensions for AES rounds and a precomputed
- * nibble table for GHASH.
- * Already compiled with +crypto flag in CFLAGS.
+ * Uses ARM crypto extensions on Pi 5 and a scalar AES fallback on
+ * BCM2837-family targets, with a precomputed nibble table for GHASH.
  */
 
 #pragma once

@@ -231,7 +231,7 @@ enabled (`src/start.S:136-206`):
 | L1 index | VA range | Descriptor | Notes |
 |---|---|---|---|
 | 0 | `0x0`–`0x3FFF_FFFF` | table → 2 MB L2 blocks | Kernel/core RAM/back buffer WB; BSS/FIFO/DMA/IPC/high RAM NC |
-| 1-3 | `0x4000_0000`–`0xFFFF_FFFF` | `…|0x709` block | Normal Write-Back cacheable RAM |
+| 1-15 | `0x4000_0000`–`0x0000_0003_FFFF_FFFF` | `…|0x709` block | Normal Write-Back cacheable RAM on Pi 5; entries 4-15 cover up to 16 GiB |
 | 64-67 | `0x1_0000_0000`–`0x1_FFFF_FFFF` | device block | BCM2712 peripherals (`0x401 | 0x0060<<48`) |
 | 124-127 | `0x1F_0000_0000`–`0x1F_FFFF_FFFF` | device block | RP1 BAR window |
 

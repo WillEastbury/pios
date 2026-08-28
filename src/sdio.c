@@ -1,10 +1,8 @@
 /*
  * sdio.c - BCM2712 SDIO2 host controller driver
  *
- * Minimal polling SDIO host for the BCM2712 SoC's own dedicated SDIO2
- * controller (DTB compatible "brcm,bcm2712-sdhci", AXI base 0x1001100000),
- * talking to the onboard CYW43455 WiFi/BT combo chip. This is a separate
- * controller from RP1's SDIO1/MMC0/MMC1 -- RP1 is not involved in WiFi.
+ * Minimal polling SDIO host for the native WiFi SDIO controller. Pi 5 uses
+ * BCM2712 SDIO2; Pi 3/Zero 2 W use legacy BCM2837 SDIO1 at 0x3F300000.
  *
  * SDHCI-compatible register layout. Reuses the same command encoding
  * scheme as sd.c (EMMC2) but adds SDIO-specific CMD5/CMD52/CMD53.
@@ -22,6 +20,8 @@
 #include "timer.h"
 #include "gic.h"
 #include "fb.h"
+#include "mailbox.h"
+#include "exception.h"
 
 /* ── SDHCI register offsets ── */
 #define REG_ARG2            0x00
@@ -112,16 +112,25 @@ static u32 sdio_rca;
 static struct sdio_diag sdio_diag ALIGNED(64);
 static bool sdio_initialized;
 
-/* ── Register helpers — target BCM2712 SDIO2 ── */
+/* ── Register helpers ── */
 /* 32-bit access (responses, data, present state, interrupts, caps) */
-static inline u32 sr(u32 off)           { return mmio_read(BCM2712_SDIO2_BASE + off); }
-static inline void sw(u32 off, u32 val) { mmio_write(BCM2712_SDIO2_BASE + off, val); }
+#if PIOS_HAS_WIFI_SDIO
+static inline u32 sr(u32 off)           { return mmio_read(WIFI_SDIO_HOST_BASE + off); }
+static inline void sw(u32 off, u32 val) { mmio_write(WIFI_SDIO_HOST_BASE + off, val); }
 /* 16-bit access (clock control, block size/count, host control 2, transfer mode) */
-static inline u16 sr16(u32 off)           { return mmio_read16(BCM2712_SDIO2_BASE + off); }
-static inline void sw16(u32 off, u16 val) { mmio_write16(BCM2712_SDIO2_BASE + off, val); }
+static inline u16 sr16(u32 off)           { return mmio_read16(WIFI_SDIO_HOST_BASE + off); }
+static inline void sw16(u32 off, u16 val) { mmio_write16(WIFI_SDIO_HOST_BASE + off, val); }
 /* 8-bit access (host control, power control, timeout, software reset) */
-static inline u8 sr8(u32 off)           { return mmio_read8(BCM2712_SDIO2_BASE + off); }
-static inline void sw8(u32 off, u8 val) { mmio_write8(BCM2712_SDIO2_BASE + off, val); }
+static inline u8 sr8(u32 off)           { return mmio_read8(WIFI_SDIO_HOST_BASE + off); }
+static inline void sw8(u32 off, u8 val) { mmio_write8(WIFI_SDIO_HOST_BASE + off, val); }
+#else
+static inline u32 sr(u32 off) { (void)off; return 0U; }
+static inline void sw(u32 off, u32 val) { (void)off; (void)val; }
+static inline u16 sr16(u32 off) { (void)off; return 0U; }
+static inline void sw16(u32 off, u16 val) { (void)off; (void)val; }
+static inline u8 sr8(u32 off) { (void)off; return 0U; }
+static inline void sw8(u32 off, u8 val) { (void)off; (void)val; }
+#endif
 static volatile bool sdio_card_irq_latched;
 static bool sdio_card_irq_level;
 
@@ -357,6 +366,7 @@ static void bcm2712_gpio_set_pull(u32 pin, u32 mode)
 
 static void sdio_gpio_init(void)
 {
+#if PIOS_HAS_WIFI_SDIO2
     detect_soc_stepping();
 
     /* Read current FSEL for SDIO2 pins */
@@ -402,10 +412,39 @@ static void sdio_gpio_init(void)
         uart_puts(" ");
     }
     uart_puts("\n");
+#elif PIOS_HAS_WIFI_SDIO1
+    /* BCM2837 SDIO1 uses the legacy GPIO block: GPIO34-39 are ALT3
+     * (function-select value 7), with the controller's card-side pull-ups
+     * enabled during identification. */
+    static const u32 pins[] = { 34U, 35U, 36U, 37U, 38U, 39U };
+    const u32 pin_mask = 0xFCU; /* GPIO34-39 in GPIO bank 1 */
+    uart_puts("[sdio] configuring BCM2837 SDIO1 GPIO34-39\n");
+    for (u32 i = 0U; i < sizeof(pins) / sizeof(pins[0]); i++) {
+        u32 pin = pins[i];
+        u32 off = (pin / 10U) * 4U;
+        u32 shift = (pin % 10U) * 3U;
+        u32 fsel = mmio_read(PIOS_PERIPH_BASE + 0x200000UL + off);
+        fsel &= ~(7U << shift);
+        fsel |= 7U << shift; /* ALT3 = SD1_CLK/CMD/DAT[0..3] */
+        mmio_write(PIOS_PERIPH_BASE + 0x200000UL + off, fsel);
+    }
+    /* BCM2835/2837 GPIO pull sequence: select pull-up, clock it into the
+     * bank-1 pins, then return the global pull selector to disabled. */
+    mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x94U, 2U);
+    delay_cycles(150U);
+    mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x9CU, pin_mask);
+    delay_cycles(150U);
+    mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x94U, 0U);
+    mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x9CU, 0U);
+    uart_puts("[sdio] SDIO1 pins ready\n");
+#else
+    uart_puts("[sdio] no WiFi SDIO GPIO configuration\n");
+#endif
 }
 
-void sdio_power_on(void)
+bool sdio_power_on(void)
 {
+#if PIOS_HAS_WIFI_SDIO2
     /* Assert WL_REG_ON (GPIO 28) to power up CYW43455.
      * Circle: GPIO28 output HIGH + 150ms delay.
      * Uses BCM2712 SoC GPIO registers (not brcmstb-gpio base):
@@ -439,14 +478,61 @@ void sdio_power_on(void)
     uart_puts(" bit28=");
     uart_hex((data_readback >> 28) & 1);
     uart_puts("\n");
+    return true;
+#elif PIOS_HAS_WIFI_SDIO1 && PIOS_WIFI_WL_REG_ON_FIRMWARE
+    if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false)) {
+        uart_puts("[sdio] firmware WL_ON low failed\n");
+        return false;
+    }
+    delay_cycles(200000U);
+    if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, true)) {
+        uart_puts("[sdio] firmware WL_ON high failed\n");
+        return false;
+    }
+    delay_cycles(2000000U);
+    sdio_diag.wl_data = 1U;
+    sdio_diag.wl_iodir = 1U;
+    uart_puts("[sdio] firmware WL_ON GPIO129 high\n");
+    return true;
+#elif PIOS_HAS_WIFI_SDIO1
+    /* Zero 2 W WL_REG_ON is direct BCM2710 GPIO41, active high. */
+    const u32 gpio = PIOS_WIFI_WL_REG_ON_GPIO;
+    const u32 bit = 1U << (gpio - 32U);
+    const u64 base = PIOS_PERIPH_BASE + 0x200000UL;
+    u32 fsel = mmio_read(base + 0x10U); /* GPFSEL4, GPIO40-49 */
+    fsel &= ~(7U << ((gpio - 40U) * 3U));
+    fsel |= 1U << ((gpio - 40U) * 3U); /* output */
+    mmio_write(base + 0x10U, fsel);
+    mmio_write(base + 0x2CU, bit); /* GPCLR1: hold radio in reset */
+    delay_cycles(200000U);
+    mmio_write(base + 0x20U, bit); /* GPSET1: release radio reset */
+    delay_cycles(2000000U);
+    sdio_diag.wl_data = mmio_read(base + 0x38U); /* GPLEV1 */
+    sdio_diag.wl_iodir = mmio_read(base + 0x10U);
+    uart_puts("[sdio] WL_REG_ON GPIO41: level=");
+    uart_hex((sdio_diag.wl_data >> 9U) & 1U);
+    uart_puts("\n");
+    return true;
+#else
+    return false;
+#endif
 }
 
 void sdio_power_off(void)
 {
+#if PIOS_HAS_WIFI_SDIO2
     u32 bit = 1U << SDIO_WL_REG_ON_GPIO;
     u32 data = mmio_read(BCM2712_GPIO1_DATA0);
     mmio_write(BCM2712_GPIO1_DATA0, data & ~bit);
     delay_cycles(200000);
+#elif PIOS_HAS_WIFI_SDIO1 && PIOS_WIFI_WL_REG_ON_FIRMWARE
+    (void)mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false);
+    delay_cycles(200000U);
+#elif PIOS_HAS_WIFI_SDIO1
+    const u32 bit = 1U << (PIOS_WIFI_WL_REG_ON_GPIO - 32U);
+    mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x2CU, bit);
+    delay_cycles(200000U);
+#endif
 }
 
 /* ── SDIO card enumeration ── */
@@ -459,19 +545,20 @@ bool sdio_init(void)
     sdio_diag.attempted = 1U;
     sdio_diag.last_stage = 1U;
 
-#if !PIOS_HAS_WIFI_SDIO2
-    /* No BCM2712 SDIO2 controller on this platform (QEMU, Pi3/Pi Zero 2W,
-     * Hyper-V, ...) -- fail closed rather than touching MMIO at address 0. */
-    uart_puts("[sdio] no SDIO2 controller on this platform\n");
+#if !PIOS_HAS_WIFI_SDIO
+    /* No supported native WiFi SDIO controller -- fail closed rather than
+     * touching MMIO at address 0. */
+    uart_puts("[sdio] no WiFi SDIO controller on this platform\n");
     return false;
 #else
-    uart_puts("[sdio] init BCM2712 SDIO2\n");
+    uart_puts(PIOS_HAS_WIFI_SDIO1 ? "[sdio] init BCM2837 SDIO1\n" :
+                                    "[sdio] init BCM2712 SDIO2\n");
 
     /* Probe: read SDHCI capability register to verify controller is alive */
     sdio_diag.cap0 = sr(REG_CAP0);
     sdio_diag.cap1 = sr(REG_CAP1);
     uart_puts("[sdio] base=");
-    uart_hex(BCM2712_SDIO2_BASE);
+    uart_hex(WIFI_SDIO_HOST_BASE);
     uart_puts(" CAP0=");
     uart_hex(sdio_diag.cap0);
     uart_puts(" CAP1=");
@@ -482,7 +569,10 @@ bool sdio_init(void)
     sdio_gpio_init();
 
     /* Power-cycle the WiFi chip */
-    sdio_power_on();
+    if (!sdio_power_on()) {
+        uart_puts("[sdio] WiFi power-up failed\n");
+        return false;
+    }
 
     /* Probe PRESENT_STATE for card */
     u32 pstate = sr(REG_STATUS);
@@ -495,7 +585,8 @@ bool sdio_init(void)
 
     /* Program BCM2712 CFG block (MUST happen before SDHCI init)
      * Linux sdhci-brcmstb.c: sdhci_brcmstb_cfginit_2712() */
-    u64 cfg = BCM2712_SDIO2_BASE + BCM2712_SDIO2_CFG_OFFSET;
+#if PIOS_HAS_WIFI_SDIO2
+    u64 cfg = WIFI_SDIO_HOST_BASE + BCM2712_SDIO2_CFG_OFFSET;
 
     /* Force card present for non-removable WiFi chip */
     u32 ctrl = mmio_read(cfg + SDIO_CFG_CTRL);
@@ -527,6 +618,7 @@ bool sdio_init(void)
     uart_puts(" card=");
     uart_hex((pstate >> 16) & 1);
     uart_puts("\n");
+#endif
 
     /* Reset the host controller using proper 8-bit software reset register */
     uart_puts("[sdio] HC reset...\n");
@@ -724,7 +816,7 @@ bool sdio_init(void)
     sdio_diag.status = sr(REG_STATUS);
     uart_puts("[sdio] init OK\n");
     return true;
-#endif /* PIOS_HAS_WIFI_SDIO2 */
+#endif /* PIOS_HAS_WIFI_SDIO */
 }
 
 void sdio_reset_data_line(void)
@@ -1220,7 +1312,11 @@ bool sdio_enable_func_irq(u32 func)
  * asserting DAT1, instead of issuing CMD52s to find out there is nothing to do. */
 bool sdio_card_irq_pending(void)
 {
+#if !PIOS_HAS_WIFI_SDIO
+    return false;
+#else
     return (sr16(REG_INTERRUPT) & INT_CARD) != 0U;
+#endif
 }
 
 bool sdio_card_irq_edge(void)
@@ -1237,7 +1333,9 @@ bool sdio_card_irq_edge(void)
  * ack a single stale assertion pins the RX backoff at zero forever. */
 void sdio_card_irq_ack(void)
 {
+#if PIOS_HAS_WIFI_SDIO
     sw16(REG_INTERRUPT, (u16)INT_CARD);
+#endif
 }
 
 static void sdio_gic_irq_handler(void)
@@ -1276,12 +1374,19 @@ void sdio_irq_snapshot(u32 *status, u32 *signal_enable, u32 *mask,
                        u32 *gic_enable, u32 *gic_pending,
                        u32 *gic_target)
 {
+#if PIOS_HAS_WIFI_SDIO
     if (status)
         *status = sr16(REG_INTERRUPT);
     if (signal_enable)
         *signal_enable = sr16(REG_IRPT_EN);
     if (mask)
         *mask = sr16(REG_IRPT_MASK);
+#else
+    if (status) *status = 0U;
+    if (signal_enable) *signal_enable = 0U;
+    if (mask) *mask = 0U;
+#endif
+#if PIOS_HAS_WIFI_SDIO2
     u64 gicd = gic_runtime_gicd_base();
     if (gic_enable)
         *gic_enable = mmio_read(gicd + 0x100U + (274U / 32U) * 4U);
@@ -1289,6 +1394,11 @@ void sdio_irq_snapshot(u32 *status, u32 *signal_enable, u32 *mask,
         *gic_pending = mmio_read(gicd + 0x200U + (274U / 32U) * 4U);
     if (gic_target)
         *gic_target = mmio_read(gicd + 0x800U + (274U / 4U) * 4U);
+#else
+    if (gic_enable) *gic_enable = 0U;
+    if (gic_pending) *gic_pending = 0U;
+    if (gic_target) *gic_target = 0U;
+#endif
 }
 
 bool sdio_set_bus_width_4bit(void)

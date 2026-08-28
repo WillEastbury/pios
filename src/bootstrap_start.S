@@ -9,12 +9,18 @@
 #endif
 
 _start:
+    msr     daifset, #0xf
+
     mrs     x0, mpidr_el1
     and     x0, x0, #0x3
     cbnz    x0, .Lpark
 
     ldr     x1, =__stack_top_core0
     mov     sp, x1
+
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+    bl      stage0_firmware_hello
+#endif
 
     mrs     x0, CurrentEL
     lsr     x0, x0, #2

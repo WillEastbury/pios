@@ -25,11 +25,13 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%CC%" %BOOT_CFLAGS% -c src\sd.c -o build_boot\sd.o
 if errorlevel 1 exit /b 1
+"%CC%" %BOOT_CFLAGS% -c src\sdhost.c -o build_boot\sdhost.o
+if errorlevel 1 exit /b 1
 "%CC%" %BOOT_CFLAGS% -c src\fb.c -o build_boot\fb.o
 if errorlevel 1 exit /b 1
 
 echo Linking provisioner kernel8...
-"%LD%" -T link.ld -nostdlib -o provision_revert.elf build_boot\start_head.o build_boot\vectors.o build_boot\provision_revert.o build_boot\provision_revert_payload.o build_boot\sd.o build_boot\fb.o
+"%LD%" -T link.ld -nostdlib -o provision_revert.elf build_boot\start_head.o build_boot\vectors.o build_boot\provision_revert.o build_boot\provision_revert_payload.o build_boot\sd.o build_boot\sdhost.o build_boot\fb.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary provision_revert.elf provision_p0_kernel8.img
 if errorlevel 1 exit /b 1

@@ -16,6 +16,10 @@ _Static_assert(sizeof(struct kspinlock) == 64,
 #define KSPIN_SHARED_BASE  (CORE0_RAM_BASE + 0x100UL)
 #define KSPIN_SHARED_SLOTS 16U
 
+_Static_assert(KSPIN_SHARED_BASE + KSPIN_SHARED_SLOTS * 64UL <=
+               CORE0_AIRQ_ATOMIC_BASE,
+               "shared spinlocks must not overlap AIRQ atomic state");
+
 static inline struct kspinlock *kspin_shared(u32 slot)
 {
     return (struct kspinlock *)(usize)(KSPIN_SHARED_BASE +

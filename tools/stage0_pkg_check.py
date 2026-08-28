@@ -47,7 +47,7 @@ HEADER_BYTES = 32
 ENTRY_BASE_BYTES = 64                # sizeof(struct pios_stage2_manifest_entry)
 PACKAGED_ENTRY_BYTES = 96            # PIOS_STAGE2_PACKAGED_ENTRY_BYTES (V1 min)
 
-PLATFORM = {"pi5": 1, "qemu": 2, "uefi": 3, "hyperv-arm": 4, "hyperv-amd64": 5, "bcm2837": 6, "pi3": 6, "pizero2w": 6}
+PLATFORM = {"pi5": 1, "qemu": 2, "uefi": 3, "hyperv-arm": 4, "hyperv-amd64": 5, "bcm2837": 6, "pi3": 6, "pizero2w": 7}
 PI_LOAD = 0x00080000                 # BOOT_DST_ADDR / PI_LOAD
 STAGE2_ZONE_BYTES = 0x37FE00         # PIOS_STAGE2_ZONE_BYTES (3,669,504) -- per-platform raw-slot payload cap
 FAT_PACKAGE_MAX_BYTES = 16 * 1024 * 1024  # PIOS_FAT_PACKAGE_MAX_BYTES -- whole multi-platform FAT file cap

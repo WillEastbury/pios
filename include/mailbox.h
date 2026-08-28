@@ -15,6 +15,9 @@
 #define TAG_SET_PIXEL_ORDER     0x00048006
 #define TAG_ALLOCATE_BUFFER     0x00040001
 #define TAG_GET_PITCH           0x00040008
+#define TAG_SET_GPIO_STATE      0x00038041
+#define TAG_SET_GPIO_CONFIG     0x00038043
 #define TAG_END                 0x00000000
 
 bool mbox_call(u8 channel, volatile u32 *mbox_buf);
+bool mbox_set_gpio_output(u32 gpio, bool high);

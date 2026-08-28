@@ -185,6 +185,19 @@ static inline u64 dev_block_2m(u64 addr) {
            PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
 }
 
+static inline bool low_block_is_device(u64 addr)
+{
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    return addr == 0x10000000UL || addr == 0x3F000000UL;
+#elif PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+      PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    return addr >= 0x3F000000UL && addr < 0x40000000UL;
+#else
+    (void)addr;
+    return false;
+#endif
+}
+
 /* Kernel image page attributes (4KB granule), real W^X enforcement for
  * block 0 (0x0-0x1FFFFF): a 3-way split matching the R E / RW ELF PHDRS
  * split already applied to the link scripts.
@@ -210,12 +223,17 @@ static inline u64 kimg_page_attrs(u64 page, u64 code_lo, u64 rodata_hi, u64 bss_
 
 static void map_user_device_windows(u64 *l1)
 {
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    l1[1] = dev_block_1g(0x40000000UL);
+#else
     for (u32 idx = 4; idx < 8; idx++)
         l1[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
     for (u32 idx = 64; idx < 68; idx++)
         l1[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
     for (u32 idx = 124; idx < 128; idx++)
         l1[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
+#endif
 }
 
 static inline bool is_user_core(u32 core) {
@@ -548,22 +566,31 @@ void mmu_init(void) {
                       * descriptor-hole bug (docs/gotchas.md). */
                      (addr >= PROC_ARENA_BASE &&
                       addr < PROC_ARENA_BASE + PROC_ARENA_SIZE);
-#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
-        if (addr == 0x10000000UL || addr == 0x3F000000UL)
+        if (low_block_is_device(addr))
             l2[i] = dev_block_2m(addr);
         else
-#endif
-        l2[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);
+            l2[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);
     }
     l1[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    l1[1] = dev_block_1g(0x40000000UL);
+#else
     l1[1] = ram_block_1g(0x40000000UL);
     l1[2] = ram_block_1g(0x80000000UL);
     l1[3] = ram_block_1g(0xC0000000UL);
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+    for (u32 idx = 4U; idx < 16U; idx++)
+        l1[idx] = ram_block_1g((u64)idx * L1_BLOCK_SIZE);
+#endif
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
     l1[256] = dev_block_1g(0x4000000000ULL);
 #endif
+#endif
 
+#if PIOS_PLATFORM != PIOS_PLATFORM_PI3 && \
+    PIOS_PLATFORM != PIOS_PLATFORM_PIZERO2W
     /* Peripherals: indices 64-67 (BCM2712 at 0x107C000000 = 65GB) */
     u64 dev_attr = PTE_VALID | PTE_BLOCK | PTE_AF |
                    PTE_ATTR(MT_DEVICE_nGnRnE) |
@@ -574,6 +601,7 @@ void mmu_init(void) {
     /* RP1: indices 124-127 */
     for (u32 idx = 124; idx < 128; idx++)
         l1[idx] = ((u64)idx * L1_BLOCK_SIZE) | dev_attr;
+#endif
 
     __asm__ volatile("dsb sy" ::: "memory");
     __asm__ volatile("isb" ::: "memory");
@@ -711,12 +739,10 @@ void mmu_enable_caching(void) {
             continue;
         }
         u64 addr = (u64)i * L2_BLOCK_SIZE;
-#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
-        if (addr == 0x10000000UL || addr == 0x3F000000UL) {
+        if (low_block_is_device(addr)) {
             l2_table_low[i] = dev_block_2m(addr);
             continue;
         }
-#endif
         bool cache = (addr >= cache_lo_base && addr < cache_lo_end) ||
                      (addr >= cache_fb_base && addr < cache_fb_end);
         l2_table_low[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);

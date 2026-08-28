@@ -11,7 +11,7 @@
 #include "airq.h"
 #include "core.h"
 #include "platform.h"
-#if PIOS_HAS_WIFI_SDIO2
+#if PIOS_HAS_WIFI_SDIO
 #include "cyw43.h"
 #endif
 
@@ -353,7 +353,7 @@ void net_dispatch_handle_transport(void)
         handled++;
         if (!nic_iface_active((nic_iface_t)hint.iface))
             continue;
-#if PIOS_HAS_WIFI_SDIO2
+#if PIOS_HAS_WIFI_SDIO
         if (hint.iface == NIC_IFACE_WIFI && cyw43_runtime_ready())
             cyw43_poll();
 #endif

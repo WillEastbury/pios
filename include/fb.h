@@ -4,6 +4,18 @@
 /* HDMI framebuffer text console - 8x8 font, direct pixel writes */
 
 bool fb_init(u32 width, u32 height);
+bool fb_adopt(u64 base, u32 width, u32 height, u32 pitch, u32 size);
+
+struct fb_mailbox_diag {
+    u32 status;
+    u32 message;
+    u32 response;
+    u32 allocation_addr;
+    u32 allocation_size;
+    u32 pitch;
+};
+
+void fb_mailbox_diag(struct fb_mailbox_diag *out);
 void fb_clear(u32 color);
 void fb_clear_row(u32 row);
 void fb_putc(char c);

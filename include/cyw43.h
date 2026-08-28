@@ -1,10 +1,9 @@
 /*
  * cyw43.h - CYW43455 WiFi FullMAC driver
  *
- * The CYW43455 is a Broadcom/Cypress combo WiFi+BT chip on the Pi 5,
- * connected via the BCM2712 SoC's own dedicated SDIO2 controller
- * (NOT the RP1 southbridge -- see sdio.h / PIOS_WIFI_SDIO2_BASE in
- * platform.h). In FullMAC mode, the chip firmware handles 802.11 MAC
+ * The CYW43455 is a Broadcom/Cypress combo WiFi+BT chip on Pi 5 and Pi 3 B+,
+ * connected via the board's native SDIO host (SDIO2 on Pi 5, legacy SDIO1 on
+ * Pi 3; see sdio.h). In FullMAC mode, the chip firmware handles 802.11 MAC
  * and WPA2/WPA3 internally. The host communicates via Broadcom
  * SDPCM/BCDC protocol.
  *
@@ -23,6 +22,7 @@
 
 /* ── CYW43455 chip identifiers ── */
 #define CYW43455_CHIP_ID        0x4345
+#define CYW43430_CHIP_ID        0x4343
 #define CYW43455_CHIP_REV       6
 
 /* ── Silicon Backplane (AXI) core addresses ── */

@@ -20,6 +20,7 @@
 #define MBOX_FULL       0x80000000
 #define MBOX_EMPTY      0x40000000
 #define MBOX_RESPONSE   0x80000000
+#define MBOX_POLL_LIMIT 1000000U
 
 static void mbox_cache_flush(volatile u32 *buf, u32 size) {
     u64 p = (u64)(usize)buf & ~63UL;
@@ -32,6 +33,11 @@ static void mbox_cache_flush(volatile u32 *buf, u32 size) {
 }
 
 bool mbox_call(u8 channel, volatile u32 *mbox_buf) {
+#if PIOS_MBOX_BASE == 0
+    (void)channel;
+    (void)mbox_buf;
+    return false;
+#else
     u64 addr = (u64)(usize)mbox_buf;
 
     /* Ensure buffer is 16-byte aligned */
@@ -43,21 +49,52 @@ bool mbox_call(u8 channel, volatile u32 *mbox_buf) {
 
     u32 msg = (u32)(addr & 0xFFFFFFF0) | (channel & 0xF);
 
-    /* Wait for MBOX1 (write side) to be not full */
-    while (mmio_read(MBOX1_STATUS) & MBOX_FULL)
-        ;
+    /* Wait for MBOX1 (write side) to be not full. */
+    for (u32 polls = 0; polls < MBOX_POLL_LIMIT; polls++) {
+        if (!(mmio_read(MBOX1_STATUS) & MBOX_FULL))
+            goto write_ready;
+    }
+    return false;
 
+write_ready:
     /* Write message to MBOX1 */
     mmio_write(MBOX1_WRITE, msg);
 
     /* Wait for response on MBOX0 (read side) */
-    for (;;) {
-        while (mmio_read(MBOX0_STATUS) & MBOX_EMPTY)
-            ;
+    for (u32 polls = 0; polls < MBOX_POLL_LIMIT; polls++) {
+        if (mmio_read(MBOX0_STATUS) & MBOX_EMPTY)
+            continue;
         if (mmio_read(MBOX0_READ) == msg) {
             /* Invalidate cache to see VideoCore's response */
             mbox_cache_flush(mbox_buf, mbox_buf[0]);
             return (mbox_buf[1] == MBOX_RESPONSE);
         }
     }
+    return false;
+#endif
+}
+
+bool mbox_set_gpio_output(u32 gpio, bool high)
+{
+#if PIOS_MBOX_BASE == 0
+    (void)gpio;
+    (void)high;
+    return false;
+#else
+    static volatile u32 gpio_mbox[13] __attribute__((aligned(16)));
+    gpio_mbox[0] = sizeof(gpio_mbox);
+    gpio_mbox[1] = 0;
+    gpio_mbox[2] = TAG_SET_GPIO_CONFIG;
+    gpio_mbox[3] = 8;
+    gpio_mbox[4] = 8;
+    gpio_mbox[5] = gpio;
+    gpio_mbox[6] = 1; /* output */
+    gpio_mbox[7] = TAG_SET_GPIO_STATE;
+    gpio_mbox[8] = 8;
+    gpio_mbox[9] = 8;
+    gpio_mbox[10] = gpio;
+    gpio_mbox[11] = high ? 1U : 0U;
+    gpio_mbox[12] = TAG_END;
+    return mbox_call(MBOX_CH_PROP, gpio_mbox);
+#endif
 }

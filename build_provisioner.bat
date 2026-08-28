@@ -3,7 +3,7 @@ set TC=C:\aarch64-none-elf\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-aarch64-no
 set CC=%TC%\aarch64-none-elf-gcc.exe
 set LD=%TC%\aarch64-none-elf-ld.exe
 set OC=%TC%\aarch64-none-elf-objcopy.exe
-set FULL_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2 -fstack-protector-strong
+set FULL_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2 -fstack-protector-strong -fno-asynchronous-unwind-tables -fno-align-functions -fno-align-jumps -fno-align-labels -fno-align-loops
 set BOOT_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2
 set ASFLAGS=-march=armv8.2-a+simd+crc+crypto
 
@@ -22,7 +22,7 @@ mkdir build_boot
 
 echo Building full kernel payload as real_kernel.img...
 for %%f in (src\*.S) do (
-    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="provision_revert_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" (
+    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="provision_revert_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" if /I not "%%~nxf"=="qemu_boot_stage2_manifest.S" (
         echo Compiling %%~nf.S...
         "%CC%" %ASFLAGS% -c "%%f" -o "build\%%~nf.o"
         if errorlevel 1 exit /b 1
@@ -72,11 +72,13 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%CC%" %BOOT_CFLAGS% -c src\sd.c -o build_boot\sd.o
 if errorlevel 1 exit /b 1
+"%CC%" %BOOT_CFLAGS% -c src\sdhost.c -o build_boot\sdhost.o
+if errorlevel 1 exit /b 1
 "%CC%" %ASFLAGS% -c src\provision_payload.S -o build_boot\provision_payload.o
 if errorlevel 1 exit /b 1
 
 echo Linking one-off kernel8.img...
-"%LD%" -T link.ld -nostdlib -o provisioner.elf build_boot\start.o build_boot\vectors.o build_boot\bootstrap_trampoline.o build_boot\provision.o build_boot\sd.o build_boot\provision_payload.o
+"%LD%" -T link.ld -nostdlib -o provisioner.elf build_boot\start.o build_boot\vectors.o build_boot\bootstrap_trampoline.o build_boot\provision.o build_boot\sd.o build_boot\sdhost.o build_boot\provision_payload.o
 if errorlevel 1 exit /b 1
 "%OC%" -O binary provisioner.elf provisioner_kernel8.img
 if errorlevel 1 exit /b 1

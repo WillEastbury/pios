@@ -51,6 +51,8 @@ TESTS_MANIFEST = {
     # (Cortex-A76 -> Pi5, Cortex-A53 -> BCM2837-family). Pure bit-decode
     # logic, no asm/MMIO. See src/board_detect.c, include/board_detect.h.
     "test_board_detect.c": ["src/board_detect.c"],
+    "test_sdhost.c": ["src/sdhost_logic.c"],
+    "test_crypto_soft.c": ["src/crypto.c"],
     # P-256 general-point ECDH multiply (added for TLS 1.3 server-side
     # ECDHE key exchange). Pure math, no MMIO/asm deps beyond simd_memset
     # (stubbed). Vectors cross-checked against Python's `cryptography`
@@ -124,6 +126,10 @@ TESTS_MANIFEST = {
     "test_dual_nic.c": [],
 }
 
+TEST_CFLAGS = {
+    "test_crypto_soft.c": ["-DPIOS_PLATFORM=6"],
+}
+
 
 def find_clang() -> str:
     for c in ("clang", r"C:\Program Files\LLVM\bin\clang.exe"):
@@ -143,7 +149,7 @@ def main() -> int:
     total_fail = 0
     for test, srcs in TESTS_MANIFEST.items():
         exe = OUT / (pathlib.Path(test).stem + (".exe" if sys.platform == "win32" else ""))
-        cmd = [cc, *cflags, *inc, str(TESTS / test),
+        cmd = [cc, *cflags, *TEST_CFLAGS.get(test, []), *inc, str(TESTS / test),
                *[str(REPO / s) for s in srcs], "-o", str(exe)]
         build = subprocess.run(cmd, capture_output=True, text=True)
         if build.returncode != 0:

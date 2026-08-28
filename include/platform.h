@@ -14,6 +14,15 @@
 #define PIOS_PLATFORM PIOS_PLATFORM_PI5
 #endif
 
+/* The tensor/QPU backend contains V3D 7.1 code and register definitions.
+ * A firmware mailbox framebuffer alone does not imply this capability:
+ * BCM2837-family boards expose that mailbox through VideoCore IV. */
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+#define PIOS_HAS_V3D_71             1
+#else
+#define PIOS_HAS_V3D_71             0
+#endif
+
 #if PIOS_PLATFORM == PIOS_PLATFORM_FVP_A76_GICV2
 /* Arm Base FVP: Cortex-A76 cluster with the GICv2-compatible legacy
  * CPU interface. This is an architectural CPU/MMU/GIC test target, not a
@@ -144,6 +153,9 @@
 #define PIOS_HAS_VMBUS              1
 #define PIOS_HAS_WIFI_SDIO2         0
 #define PIOS_WIFI_SDIO2_BASE        0UL
+#define PIOS_HAS_WIFI_SDIO1         0
+#define PIOS_WIFI_SDIO1_BASE        0UL
+#define PIOS_WIFI_WL_REG_ON_GPIO    0U
 #elif PIOS_PLATFORM == PIOS_PLATFORM_PI3 || PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
 /* BCM2837/BCM2837B0 (Pi3 B/B+) and BCM2710A1 (Pi Zero 2 W) share the same
  * die/peripheral generation and "low peripheral" memory map -- quad
@@ -190,6 +202,20 @@
 #define PIOS_HAS_VMBUS              0
 #define PIOS_HAS_WIFI_SDIO2         0
 #define PIOS_WIFI_SDIO2_BASE        0UL
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3
+/* Pi 3 B/B+ onboard radio: legacy Arasan SDIO1 on GPIO34-39. WL_ON is
+ * firmware expgpio line 1 (property GPIO 129), not SoC GPIO43. */
+#define PIOS_HAS_WIFI_SDIO1         1
+#define PIOS_WIFI_SDIO1_BASE        0x3F300000UL
+#define PIOS_WIFI_WL_REG_ON_GPIO     129U
+#define PIOS_WIFI_WL_REG_ON_FIRMWARE 1
+#else
+/* Zero 2 W routes WL_ON to direct SoC GPIO41. */
+#define PIOS_HAS_WIFI_SDIO1         1
+#define PIOS_WIFI_SDIO1_BASE        0x3F300000UL
+#define PIOS_WIFI_WL_REG_ON_GPIO    41U
+#define PIOS_WIFI_WL_REG_ON_FIRMWARE 0
+#endif
 #else
 #define PIOS_PLATFORM_NAME          "pi5-bcm2712"
 #define PIOS_PLATFORM_CORE_COUNT    4U
@@ -224,7 +250,19 @@
  * spike/wifi/ until re-enabled (see spike/wifi/README.md). */
 #define PIOS_HAS_WIFI_SDIO2         1
 #define PIOS_WIFI_SDIO2_BASE        0x1001100000UL
+#define PIOS_HAS_WIFI_SDIO1         0
+#define PIOS_WIFI_SDIO1_BASE        0UL
+#define PIOS_WIFI_WL_REG_ON_GPIO    0U
+#define PIOS_WIFI_WL_REG_ON_FIRMWARE 0
 #endif
+
+#ifndef PIOS_HAS_WIFI_SDIO1
+#define PIOS_HAS_WIFI_SDIO1         0
+#define PIOS_WIFI_SDIO1_BASE        0UL
+#define PIOS_WIFI_WL_REG_ON_GPIO    0U
+#endif
+
+#define PIOS_HAS_WIFI_SDIO          (PIOS_HAS_WIFI_SDIO1 || PIOS_HAS_WIFI_SDIO2)
 
 #define PIOS_CORE_PRIV_SIZE         0x01000000UL
 

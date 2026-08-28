@@ -22,9 +22,14 @@
 #include "types.h"
 #include "platform.h"
 
-/* BCM2712 SDIO2 controller — the actual WiFi SDIO host, resolved from
- * platform.h (0 / PIOS_HAS_WIFI_SDIO2=0 on platforms without it). */
-#define BCM2712_SDIO2_BASE  PIOS_WIFI_SDIO2_BASE
+/* WiFi SDIO host, resolved from platform.h. */
+#if PIOS_HAS_WIFI_SDIO2
+#define WIFI_SDIO_HOST_BASE  PIOS_WIFI_SDIO2_BASE
+#elif PIOS_HAS_WIFI_SDIO1
+#define WIFI_SDIO_HOST_BASE  PIOS_WIFI_SDIO1_BASE
+#else
+#define WIFI_SDIO_HOST_BASE  0UL
+#endif
 
 /* BCM2712 SDHCI CFG block — at SDIO2 base + 0x400 (second reg range in DTB)
  * DTB: reg = <0x10 0x01100000 0x0 0x260>, <0x10 0x01100400 0x0 0x200>
@@ -177,7 +182,7 @@ void sdio_irq_snapshot(u32 *status, u32 *signal_enable, u32 *mask,
 bool sdio_set_bus_width_4bit(void);
 
 /* Power control */
-void sdio_power_on(void);
+bool sdio_power_on(void);
 void sdio_power_off(void);
 
 /* Reset DATA line (clears DAT_INHIBIT after stuck transfers) */

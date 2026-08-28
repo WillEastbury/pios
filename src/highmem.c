@@ -1,8 +1,17 @@
 #include "highmem.h"
 #include "mmu.h"
+#include "platform.h"
 
 #define HIGHMEM_BASE 0x40000000ULL
 #define HIGHMEM_LINE 64ULL
+/* The current stage-1 identity map has L1 entries only through 4 GiB.
+ * Do not probe or allocate an address above that mapping until the MMU grows
+ * explicit 36-bit high-memory tables. */
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+#define HIGHMEM_MAPPED_LIMIT 0x400000000ULL
+#else
+#define HIGHMEM_MAPPED_LIMIT 0x100000000ULL
+#endif
 
 static struct highmem_status hm;
 static u64 hm_next;
@@ -16,6 +25,9 @@ static u64 align_up_u64(u64 v, u64 a)
 
 static bool highmem_probe_line(u64 addr)
 {
+    if (addr < HIGHMEM_BASE ||
+        addr > HIGHMEM_MAPPED_LIMIT - HIGHMEM_LINE)
+        return false;
     volatile u64 *p = (volatile u64 *)(usize)addr;
     u64 old0 = p[0], old1 = p[1], old2 = p[2], old3 = p[3];
     u64 a = 0xA5A55A5AF00D0000ULL ^ addr;
@@ -65,7 +77,6 @@ static bool highmem_probe_range(u64 base, u64 limit)
 
 bool highmem_init(u64 installed_bytes, u64 arm_visible_bytes)
 {
-    (void)arm_visible_bytes;
     hm.ready = false;
     hm.probe_ok = false;
     hm.base = 0;
@@ -82,7 +93,12 @@ bool highmem_init(u64 installed_bytes, u64 arm_visible_bytes)
         return false;
 
     u64 base = HIGHMEM_BASE;
-    u64 limit = installed_bytes & ~(HIGHMEM_LINE - 1ULL);
+    u64 limit = installed_bytes;
+    if (limit > HIGHMEM_MAPPED_LIMIT)
+        limit = HIGHMEM_MAPPED_LIMIT;
+    if (arm_visible_bytes > base && arm_visible_bytes < limit)
+        limit = arm_visible_bytes;
+    limit &= ~(HIGHMEM_LINE - 1ULL);
     if (limit <= base)
         return false;
 

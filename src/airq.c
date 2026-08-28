@@ -14,6 +14,7 @@
 #include "airq.h"
 #include "adrv.h"
 #include "core.h"
+#include "core_env.h"
 
 /* The host airq unit is linked without adrv.c; the full kernel supplies the
  * strong implementation. Keep the standalone pure-logic test target intact. */
@@ -75,21 +76,94 @@ static struct airq_lane *airq_lane_at(u32 target, u32 producer, u32 priority)
 }
 
 static struct airq_binding airq_bindings[AIRQ_MAX_SOURCES];
-static struct airq_diag airq_diag_state ALIGNED(64);
-static u32 airq_seq;
 static u64 (*airq_now_hook)(void);
+
+/*
+ * Pi 5 reports an external abort for atomic RMWs against Normal-NC kernel
+ * .bss, including both LSE and exclusive-monitor instructions. Keep the
+ * cross-core sequence and diagnostics in core 0's reserved WB-IS control page;
+ * the core allocator skips this page and every kernel TTBR maps it identically.
+ */
+struct airq_atomic_state {
+    volatile u32 seq;
+    u32 seq_pad[15];
+    struct airq_diag diag;
+} ALIGNED(64);
+
+_Static_assert(__builtin_offsetof(struct airq_atomic_state, diag) == 64U,
+               "AIRQ sequence and diagnostics must own separate cache lines");
+_Static_assert(sizeof(struct airq_atomic_state) == CORE0_AIRQ_ATOMIC_SIZE,
+               "AIRQ atomic state must fit its reserved control-page range");
+_Static_assert((CORE0_AIRQ_ATOMIC_BASE & 63UL) == 0UL,
+               "AIRQ atomic state must be cache-line aligned");
+_Static_assert(CORE0_AIRQ_ATOMIC_BASE + CORE0_AIRQ_ATOMIC_SIZE <=
+               CORE0_RAM_BASE + CORE0_CONTROL_RESERVE,
+               "AIRQ atomic state must remain inside the reserved control page");
+
+#ifdef PIOS_HOST_TYPES_SHIM
+static struct airq_atomic_state airq_atomic_state_host;
+static struct airq_atomic_state *const airq_atomic_state =
+    &airq_atomic_state_host;
+#else
+static struct airq_atomic_state *const airq_atomic_state =
+    (struct airq_atomic_state *)(usize)CORE0_AIRQ_ATOMIC_BASE;
+#endif
+
+#define airq_diag_state (airq_atomic_state->diag)
+
+static inline u32 airq_atomic_add_fetch(volatile u32 *value, u32 add)
+{
+#ifdef PIOS_HOST_TYPES_SHIM
+    return __atomic_add_fetch(value, add, __ATOMIC_RELAXED);
+#else
+    u32 previous;
+    u32 next;
+    u32 failed;
+    __asm__ volatile(
+        "1: ldxr %w[previous], [%[value]]\n"
+        "add %w[next], %w[previous], %w[add]\n"
+        "stxr %w[failed], %w[next], [%[value]]\n"
+        "cbnz %w[failed], 1b\n"
+        : [previous] "=&r" (previous),
+          [next] "=&r" (next),
+          [failed] "=&r" (failed)
+        : [value] "r" (value),
+          [add] "r" (add)
+        : "cc", "memory");
+    return next;
+#endif
+}
 
 static inline void airq_atomic_inc(u32 *value)
 {
-    (void)__atomic_fetch_add(value, 1U, __ATOMIC_RELAXED);
+    (void)airq_atomic_add_fetch(value, 1U);
 }
 
 static inline void airq_atomic_max(u32 *value, u32 candidate)
 {
+#ifdef PIOS_HOST_TYPES_SHIM
     u32 observed = __atomic_load_n(value, __ATOMIC_RELAXED);
     while (candidate > observed &&
            !__atomic_compare_exchange_n(value, &observed, candidate, false,
                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+#else
+    u32 observed;
+    u32 failed;
+    __asm__ volatile(
+        "1: ldxr %w[observed], [%[value]]\n"
+        "cmp %w[candidate], %w[observed]\n"
+        "b.ls 2f\n"
+        "stxr %w[failed], %w[candidate], [%[value]]\n"
+        "cbnz %w[failed], 1b\n"
+        "b 3f\n"
+        "2: clrex\n"
+        "3:\n"
+        : [observed] "=&r" (observed),
+          [failed] "=&r" (failed)
+        : [value] "r" (value),
+          [candidate] "r" (candidate)
+        : "cc", "memory");
+#endif
 }
 
 static inline u64 airq_irq_save(void)
@@ -133,8 +207,7 @@ void airq_init(void)
 {
     memset(airq_lanes, 0, sizeof(airq_lanes));
     memset(airq_bindings, 0, sizeof(airq_bindings));
-    memset(&airq_diag_state, 0, sizeof(airq_diag_state));
-    airq_seq = 0U;
+    memset(airq_atomic_state, 0, sizeof(*airq_atomic_state));
 }
 
 void airq_set_now_hook(u64 (*now_ms)(void))
@@ -249,7 +322,7 @@ bool airq_post_from(u32 origin_core, u32 source, u32 arg)
     slot->source = source;
     slot->priority = priority;
     slot->arg = arg;
-    slot->seq = __atomic_add_fetch(&airq_seq, 1U, __ATOMIC_RELAXED);
+    slot->seq = airq_atomic_add_fetch(&airq_atomic_state->seq, 1U);
     slot->origin_core = origin_core;
     slot->target_core = target;
     slot->timestamp_ms = airq_now();

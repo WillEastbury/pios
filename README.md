@@ -64,7 +64,9 @@ For the FAT/stage0/raw second-stage/WALFS disk map, see [DISKLAYOUT.md](DISKLAYO
 
 ### Prerequisites
 
-You need an AArch64 bare-metal cross-compiler:
+You need Python 3 and an AArch64 bare-metal cross-compiler. The verified
+Windows build uses ARM GNU Toolchain **13.3.Rel1 AArch64 bare-metal** and
+does not require `make`:
 
 ```bash
 # Ubuntu/Debian
@@ -79,21 +81,62 @@ brew install --cask gcc-aarch64-embedded
 # (aarch64-none-elf variant)
 ```
 
+On Windows, the checked-in batch files expect the tools under:
+
+```text
+C:\aarch64-none-elf\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-aarch64-none-elf\bin
+```
+
+If you install the toolchain elsewhere, change `TC` in the selected batch
+file. Build from the repository root using `cmd.exe /d /c`; PowerShell can
+rewrite `-march` arguments when invoking the compiler directly.
+
 ### Build
 
 ```bash
-# With aarch64-none-elf-gcc in PATH:
-make clean && make
+# Windows: build the unified Pi 5/Pi 3/Zero 2 W package
+cmd.exe /d /c "C:\source\pios\build_multiboard.bat"
 
-# Or specify cross-compiler prefix:
-make CROSS=aarch64-linux-gnu-
+# Windows: build only the Pi 5 stage0 + stage2 package
+cmd.exe /d /c "C:\source\pios\build_bootstrap.bat"
+
+# Windows: build standalone platform payloads
+cmd.exe /d /c "C:\source\pios\build_pi3.bat"
+cmd.exe /d /c "C:\source\pios\build_pizero2w.bat"
+cmd.exe /d /c "C:\source\pios\build_qemu_full.bat"
+
+# Linux/macOS: the Makefile is a legacy direct-stage2 path and does not
+# produce the unified multi-board package. Use the platform batch scripts
+# (or port their explicit source lists and exclusions) for a release image.
 ```
 
-Outputs: `kernel8.img` (minimal stage0) and `PIOSSTG2.PKG` (stage2 package)
+The unified build produces `kernel8.img` (stage0) and `PIOSSTG2.PKG`
+containing platform entries for Pi 5/A76, Pi 3/A53, and Zero 2 W/A53.
+Platform-specific intermediate payloads are written under `build_pi3` and
+`build_pizero2w`; QEMU output is written under `build_qemu_full`.
+
+The batch files compile selected `src\*.S` and `src\*.c` files by wildcard.
+The following stage0/provisioning sources must remain excluded from stage2
+payloads so they do not introduce duplicate entry points or manifest symbols:
+
+```text
+Assembly: bootstrap_start.S bootstrap_trampoline.S provision_payload.S
+          provision_revert_payload.S qemu_virt_start.S qemu_stage2_start.S
+          qemu_stage2_manifest.S qemu_boot_stage2_manifest.S
+C source: bootstrap.c provision.c provision_revert.c qemu_virt_min.c
+          qemu_virt_walfs.c
+```
+
+The QEMU stage0-chain script also excludes `stage2_manifest.S` and compiles
+`qemu_boot_stage2_manifest.S`; other stage2 builds use `stage2_manifest.S`.
+Never compile both manifest sources into one payload. Pi 5 uses
+`-march=armv8.2-a+simd+crc+crypto`; Pi 3 and Zero 2 W use
+`-march=armv8-a+simd+crc -mno-outline-atomics` for Cortex-A53 compatibility.
 
 ### Verify
 
 ```bash
+python tests/run_host_tests.py
 aarch64-none-elf-size real_kernel.elf
 #    text     data      bss      dec      hex  filename
 # 3525084    91480  7146400 10762964   a43ad4  real_kernel.elf

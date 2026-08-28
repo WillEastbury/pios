@@ -69,6 +69,8 @@
  * cross-core control objects that require WB Inner-Shareable memory (notably
  * exclusive-access spinlocks). The bump allocator starts after this page. */
 #define CORE0_CONTROL_RESERVE  0x1000UL
+#define CORE0_AIRQ_ATOMIC_BASE (CORE0_RAM_BASE + 0x500UL)
+#define CORE0_AIRQ_ATOMIC_SIZE 0x100UL
 
 static const u64 core_ram_bases[4] = {
     CORE0_RAM_BASE, CORE1_RAM_BASE, CORE2_RAM_BASE, CORE3_RAM_BASE

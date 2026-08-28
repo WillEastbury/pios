@@ -9,8 +9,9 @@ REM define differs, which mainly changes PIOS_PLATFORM_NAME in diagnostics.
 REM
 REM Status: links a full kernel with zero missing symbols (verified).
 REM Secondary cores gracefully SKIP (PIOS_HAS_PSCI_SECONDARIES=0, same
-REM spin-table gap as Pi3 -- see the pi-zero2w-a53 todo). WiFi (CYW43438)
-REM is NOT wired up here at all yet -- separate wifi-support todo.
+REM spin-table gap as Pi3). WiFi uses the board-specific SDIO1/GPIO41
+REM profile and the CYW43436 firmware family; hardware validation remains
+REM separate from the common boot proof.
 REM
 REM Not yet hardware-validated: this build has not been tested on real
 REM Pi Zero 2 W hardware. Flash kernel8_pizero2w.img (renamed to
@@ -22,8 +23,8 @@ set TC=C:\aarch64-none-elf\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-aarch64-no
 set CC=%TC%\aarch64-none-elf-gcc.exe
 set LD=%TC%\aarch64-none-elf-ld.exe
 set OC=%TC%\aarch64-none-elf-objcopy.exe
-set CFLAGS=-Wall -Wextra -Wno-unused-function -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2 -fstack-protector-strong -DPIOS_PLATFORM=PIOS_PLATFORM_PIZERO2W
-set ASFLAGS=-march=armv8.2-a+simd+crc+crypto -DPIOS_PLATFORM=PIOS_PLATFORM_PIZERO2W
+set CFLAGS=-Wall -Wextra -Wno-unused-function -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8-a+simd+crc -mno-outline-atomics -Iinclude -O2 -fstack-protector-strong -DPIOS_FB_MBOX_POLL_LIMIT=1000000U -DPIOS_PLATFORM=PIOS_PLATFORM_PIZERO2W
+set ASFLAGS=-march=armv8-a+simd+crc -DPIOS_PLATFORM=PIOS_PLATFORM_PIZERO2W
 
 if exist build_pizero2w rmdir /S /Q build_pizero2w
 mkdir build_pizero2w
@@ -31,7 +32,7 @@ mkdir build_pizero2w
 set ERRORS=0
 
 for %%f in (src\*.S) do (
-    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="bootstrap_trampoline.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="provision_revert_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" (
+    if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="bootstrap_trampoline.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="provision_revert_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" if /I not "%%~nxf"=="qemu_boot_stage2_manifest.S" (
         echo Compiling %%~nf.S...
         "%CC%" %ASFLAGS% -c "%%f" -o "build_pizero2w\%%~nf.o"
         if errorlevel 1 (

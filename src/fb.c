@@ -276,7 +276,7 @@ static const u8 font8x8_box[][8] = {
  * (which calls this) runs. */
 #define FB_MBOX_BASE       (g_board_bases.mbox_base)
 #else
-#define FB_MBOX_BASE       0x107C013880UL
+#define FB_MBOX_BASE       PIOS_MBOX_BASE
 #endif
 #define FB_MBOX0_READ      (FB_MBOX_BASE + 0x00)
 #define FB_MBOX0_STATUS    (FB_MBOX_BASE + 0x18)
@@ -286,8 +286,18 @@ static const u8 font8x8_box[][8] = {
 #define FB_MBOX_EMPTY      0x40000000
 #define FB_MBOX_CH         8
 #define FB_MBOX_RESPONSE   0x80000000
+#ifndef PIOS_FB_MBOX_POLL_LIMIT
+#define PIOS_FB_MBOX_POLL_LIMIT 500000000U
+#endif
+#define FB_MBOX_POLL_LIMIT PIOS_FB_MBOX_POLL_LIMIT
+
+#define FB_MBOX_DIAG_NONE          0U
+#define FB_MBOX_DIAG_WRITE_TIMEOUT 1U
+#define FB_MBOX_DIAG_READ_TIMEOUT  2U
+#define FB_MBOX_DIAG_RESPONSE      3U
 
 static volatile u32 __attribute__((aligned(16))) fb_mbox[64];
+static struct fb_mailbox_diag fb_diag;
 
 static void fb_cache_flush(volatile void *addr, u32 size) {
     u64 p = (u64)addr;
@@ -300,16 +310,29 @@ static int fb_mbox_call(void) {
     fb_cache_flush(fb_mbox, sizeof(fb_mbox));
 
     u32 addr = ((u32)(u64)fb_mbox) | FB_MBOX_CH;
-    while (mmio_read(FB_MBOX1_STATUS) & FB_MBOX_FULL) {}
-    mmio_write(FB_MBOX1_WRITE, addr);
-
-    while (1) {
-        while (mmio_read(FB_MBOX0_STATUS) & FB_MBOX_EMPTY) {}
-        if (mmio_read(FB_MBOX0_READ) == addr) {
-            fb_cache_flush(fb_mbox, sizeof(fb_mbox));
-            return fb_mbox[1] == FB_MBOX_RESPONSE;
+    fb_diag.status = FB_MBOX_DIAG_NONE;
+    fb_diag.message = addr;
+    fb_diag.response = 0;
+    for (u32 polls = 0; mmio_read(FB_MBOX1_STATUS) & FB_MBOX_FULL; polls++) {
+        if (polls == FB_MBOX_POLL_LIMIT) {
+            fb_diag.status = FB_MBOX_DIAG_WRITE_TIMEOUT;
+            return false;
         }
     }
+    mmio_write(FB_MBOX1_WRITE, addr);
+
+    for (u32 polls = 0; polls < FB_MBOX_POLL_LIMIT; polls++) {
+        if (mmio_read(FB_MBOX0_STATUS) & FB_MBOX_EMPTY)
+            continue;
+        if (mmio_read(FB_MBOX0_READ) == addr) {
+            fb_cache_flush(fb_mbox, sizeof(fb_mbox));
+            fb_diag.status = FB_MBOX_DIAG_RESPONSE;
+            fb_diag.response = fb_mbox[1];
+            return fb_diag.response == FB_MBOX_RESPONSE;
+        }
+    }
+    fb_diag.status = FB_MBOX_DIAG_READ_TIMEOUT;
+    return false;
 }
 
 /* Ask the firmware for the ARM clock's maximum rate and set the ARM clock to
@@ -318,6 +341,9 @@ static int fb_mbox_call(void) {
  * system run ~10-100x slower than it should. Returns the rate the firmware
  * reports it set (Hz), or 0 on failure. */
 u32 fb_set_arm_clock_max(void) {
+#if PIOS_PLATFORM != PIOS_PLATFORM_PI5
+    return 0;
+#else
     int i = 0;
     fb_mbox[i++] = 0;            /* [0] total size */
     fb_mbox[i++] = 0;            /* [1] request */
@@ -348,6 +374,7 @@ u32 fb_set_arm_clock_max(void) {
     if (!fb_mbox_call())
         return 0;
     return fb_mbox[6];
+#endif
 }
 
 u32 fb_get_arm_clock(void) {
@@ -418,6 +445,37 @@ u32 fb_get_temperature_mc(void) {
     return fb_mbox[6];
 }
 
+bool fb_adopt(u64 base, u32 width, u32 height, u32 pitch, u32 size)
+{
+    if (!base || base > 0x3FFFFFFFULL ||
+        width == 0U || width > 4096U ||
+        height == 0U || height > 2160U ||
+        pitch < width * 4U || pitch > 32768U ||
+        size < pitch * height || base + size < base)
+        return false;
+
+    fb_ptr = (u32 *)(usize)base;
+    fb_width = width;
+    fb_height = height;
+    fb_pitch = pitch;
+    fb_size = size;
+    cursor_x = 0U;
+    cursor_y = 0U;
+    fb_inset_x = 0U;
+    fb_inset_y = 0U;
+    cols = width / 8U;
+    rows = height / 8U;
+#ifndef PIOS_FB_NO_DOUBLE_BUFFER
+    fb_back = (u32 *)(usize)FB_BACK_BASE;
+    fb_db = false;
+    fb_direct_clean = false;
+    for (u32 i = 0; i < FB_MAX_BANDS / 64U; i++)
+        fb_dirty_band[i] = 0U;
+    fb_shadow_on = false;
+#endif
+    return true;
+}
+
 bool fb_init(u32 width, u32 height) {
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
     struct pios_bootinfo *bi = (struct pios_bootinfo *)(usize)PIOS_BOOTINFO_ADDR;
@@ -466,6 +524,7 @@ bool fb_init(u32 width, u32 height) {
         (void)height;
         return true;
     }
+
     /* No UEFI GOP bootinfo (e.g. direct -kernel boot): there is no Pi mailbox
      * framebuffer on QEMU, so fail closed rather than falling through to the
      * BCM mailbox path below (which would block on absent VideoCore MMIO). */
@@ -526,6 +585,9 @@ bool fb_init(u32 width, u32 height) {
 
     u32 fb_addr  = fb_mbox[fb_idx] & 0x3FFFFFFF;
     u32 raw_size = fb_mbox[fb_idx + 1];
+    fb_diag.allocation_addr = fb_mbox[fb_idx];
+    fb_diag.allocation_size = raw_size;
+    fb_diag.pitch = fb_mbox[pitch_idx];
 
     if (!fb_addr)
         return false;
@@ -1045,6 +1107,12 @@ void fb_display_info(u64 *base, u32 *width, u32 *height, u32 *pitch, u32 *size)
     if (height) *height = fb_height;
     if (pitch) *pitch = fb_pitch;
     if (size) *size = fb_size;
+}
+
+void fb_mailbox_diag(struct fb_mailbox_diag *out)
+{
+    if (out)
+        *out = fb_diag;
 }
 
 u64 fb_last_blit_ticks(void) {

@@ -94,6 +94,19 @@ void uart_init(void) {
 
     use_rp1 = true;
 #else
+ #if PIOS_PLATFORM == PIOS_PLATFORM_PI3
+    /* Firmware normally applies this through disable-bt, but make the
+     * electrical route explicit so the standalone kernel does not depend on
+     * a particular overlay revision. GPIO14/15 ALT0 selects PL011 TX/RX. */
+    u32 fsel = mmio_read(PIOS_PERIPH_BASE + 0x200000UL + 0x04U);
+    fsel &= ~((7U << 12) | (7U << 15));
+    fsel |= (4U << 12) | (4U << 15);
+    mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x04U, fsel);
+    u32 cr = mmio_read(UART_CR);
+    cr |= (1U << 0) | (1U << 8) | (1U << 9);
+    mmio_write(UART_CR, cr);
+    mmio_write(UART_LCRH, mmio_read(UART_LCRH) | (1U << 4));
+ #endif
     use_rp1 = false;
 #endif
 }

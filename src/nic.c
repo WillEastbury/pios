@@ -21,7 +21,7 @@
 #include "platform.h"
 #include "pioscap.h"
 #include "net_dispatch.h"
-#if PIOS_HAS_WIFI_SDIO2
+#if PIOS_HAS_WIFI_SDIO
 #include "wifi_nic.h"
 #include "cyw43.h"
 #endif
@@ -94,7 +94,7 @@ static const struct nic_ops nic_backend_virtio = {
     /* no offload hooks */
 };
 
-#if PIOS_HAS_WIFI_SDIO2
+#if PIOS_HAS_WIFI_SDIO
 /* WiFi is never auto-probed at boot (firmware upload is slow and may fail
  * on real hardware that hasn't been validated yet) -- it is only activated
  * by an explicit nic_init_wifi() call, so it lives outside nic_backends[]. */
@@ -1104,12 +1104,15 @@ bool nic_init(void)
 
 bool nic_init_wifi(void)
 {
-#if PIOS_HAS_WIFI_SDIO2
+#if PIOS_HAS_WIFI_SDIO
     /* Explicit, on-demand bring-up only. Preserve the active wired backend. */
     if (!nic_backend_wifi.init || !nic_backend_wifi.init())
         return false;
     iface_backends[NIC_IFACE_WIFI] = &nic_backend_wifi;
-    iface_initialized[NIC_IFACE_WIFI] = false;
+    iface_initialized[NIC_IFACE_WIFI] =
+        PIOS_PLATFORM == PIOS_PLATFORM_PI3;
+    if (PIOS_PLATFORM == PIOS_PLATFORM_PI3)
+        g_nic = &nic_backend_wifi;
     return true;
 #else
     return false;
@@ -1118,7 +1121,7 @@ bool nic_init_wifi(void)
 
 bool nic_activate_wifi_loaded(void)
 {
-#if PIOS_HAS_WIFI_SDIO2
+#if PIOS_HAS_WIFI_SDIO
     if (!cyw43_is_connected())
         return false;
     wifi_nic_adopt_loaded();
@@ -1132,7 +1135,7 @@ bool nic_activate_wifi_loaded(void)
 
 bool nic_is_wifi(void)
 {
-#if PIOS_HAS_WIFI_SDIO2
+#if PIOS_HAS_WIFI_SDIO
     return nic_iface_active(NIC_IFACE_WIFI);
 #else
     return false;

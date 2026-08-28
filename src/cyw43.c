@@ -1,8 +1,8 @@
 /*
- * cyw43.c - CYW43455 WiFi FullMAC driver
+ * cyw43.c - Broadcom CYW43 WiFi FullMAC driver
  *
- * Broadcom/Cypress CYW43455 combo chip on Pi 5, via the BCM2712 SoC's
- * dedicated SDIO2 controller (not RP1 -- see sdio.h).
+ * Broadcom/Cypress combo chips on Pi 5 and BCM2837-family boards, via the
+ * board-native SDIO host (not RP1 -- see sdio.h).
  * FullMAC: firmware handles 802.11/WPA2, host speaks SDPCM/BCDC.
  *
  * Architecture:
@@ -27,6 +27,8 @@
 #include "fb.h"
 #include "crypto.h"
 #include "exception.h"
+#include "board_detect.h"
+#include "mailbox.h"
 
 /* ── Constants ── */
 
@@ -62,7 +64,9 @@
 
 /* SOCSRAM wrapper */
 #define SOCSRAM_BANKX_IDX       0x10
+#define SOCSRAM_BANKX_INFO      0x40
 #define SOCSRAM_BANKX_PDA       0x44
+#define SOCSRAM_COREINFO        0x00
 
 /* ARM CR4 TCM sizing registers. */
 #define ARMCR4_CAP              0x04
@@ -225,14 +229,36 @@ static struct cyw_wpa_host wpa_host;
 /* Discovered core addresses (from EROM scan) */
 static u32 cyw_arm_ctl;
 static u32 cyw_arm_regs;
+static u32 cyw_arm_core_id;
 static u32 cyw_d11_ctl;
 static u32 cyw_sram_ctl;
+static u32 cyw_sram_regs;
+static u32 cyw_sram_rev;
 static u32 cyw_sdio_regs;
 static u32 cyw_ram_base = CYW_RAM_BASE;  /* default, updated from EROM */
 static u32 cyw_ram_bytes;
+static u16 cyw_chip_id;
 static struct cyw43_diag cyw_diag ALIGNED(64);
 static struct cyw_event_history cyw_event_history ALIGNED(64);
 static cyw43_progress_fn cyw_progress_hook;
+
+static u32 cyw43_board_model(void)
+{
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3
+    static volatile u32 board_mbox[7] ALIGNED(16);
+    board_mbox[0] = sizeof(board_mbox);
+    board_mbox[1] = 0U;
+    board_mbox[2] = TAG_GET_BOARD_REV;
+    board_mbox[3] = 4U;
+    board_mbox[4] = 0U;
+    board_mbox[5] = 0U;
+    board_mbox[6] = TAG_END;
+    if (mbox_call(MBOX_CH_PROP, board_mbox) &&
+        (board_mbox[4] & 0x80000000U))
+        return board_model_from_revision(board_mbox[5]);
+#endif
+    return BOARD_MODEL_UNKNOWN;
+}
 
 /* Pre-loaded blobs (loaded before cyw43_init disturbs SD) */
 #define CYW_FW_MAX_SIZE   (700 * 1024)
@@ -567,8 +593,40 @@ static bool core_reset(u32 core_base, u32 prereset,
     return bp_read32(core_base + CORE_IOCTRL, &val);
 }
 
-static u32 cyw43_tcm_ramsize(void)
+static u32 cyw43_firmware_ramsize(void)
 {
+    if (cyw_arm_core_id == 0x82AU) {
+        u32 coreinfo = 0U;
+        if (!cyw_sram_ctl || !cyw_sram_regs || cyw_sram_rev <= 7U ||
+            cyw_sram_rev == 12U ||
+            !core_reset(cyw_sram_ctl, 0U, 0U, 0U) ||
+            !bp_read32(cyw_sram_regs + SOCSRAM_COREINFO, &coreinfo))
+            return 0U;
+        u32 banks = (coreinfo >> 4U) & 0x0FU;
+        if (banks == 0U || banks > 32U)
+            return 0U;
+        u32 bytes = 0U;
+        for (u32 idx = 0U; idx < banks; idx++) {
+            u32 info = 0U;
+            if (!bp_write32(cyw_sram_regs + SOCSRAM_BANKX_IDX, idx) ||
+                !bp_read32(cyw_sram_regs + SOCSRAM_BANKX_INFO, &info))
+                return 0U;
+            bytes += ((info & 0x3FU) + 1U) * 8192U;
+        }
+        cyw_ram_base = 0U;
+        if (cyw_chip_id == CYW43430_CHIP_ID) {
+            if (!bp_write32(cyw_sram_regs + SOCSRAM_BANKX_IDX, 3U) ||
+                !bp_write32(cyw_sram_regs + SOCSRAM_BANKX_PDA, 0U))
+                return 0U;
+        }
+        uart_puts("[cyw] SOCRAM banks=");
+        uart_hex(banks);
+        uart_puts(" bytes=");
+        uart_hex(bytes);
+        uart_puts("\n");
+        return bytes;
+    }
+
     u32 cap = 0;
     if (!cyw_arm_regs ||
         !bp_read32(cyw_arm_regs + ARMCR4_CAP, &cap))
@@ -610,6 +668,7 @@ static bool chip_identify(void)
 
     u16 id = (u16)(chip_id & 0xFFFF);
     u16 rev = (u16)((chip_id >> 16) & 0xF);
+    cyw_chip_id = id;
 
     uart_puts("[cyw] chip=");
     uart_hex(id);
@@ -617,7 +676,7 @@ static bool chip_identify(void)
     uart_hex(rev);
     uart_puts("\n");
 
-    if (id != CYW43455_CHIP_ID) {
+    if (id != CYW43455_CHIP_ID && id != CYW43430_CHIP_ID) {
         uart_puts("[cyw] bad chip ID\n");
         return false;
     }
@@ -2218,8 +2277,11 @@ static bool cyw43_backplane_init(void)
     uart_puts("\n");
 
     /* Parse EROM entries to find ARM, D11, SOCSRAM, SDIOD cores */
-    u32 arm_ctl = 0, arm_regs = 0, d11_ctl = 0, sram_ctl = 0, sdio_regs = 0;
+    u32 arm_ctl = 0, arm_regs = 0, d11_ctl = 0;
+    u32 sram_ctl = 0, sram_regs = 0, sdio_regs = 0;
     u32 coreid = 0;
+    u32 core_rev = 0;
+    u32 arm_core_id = 0;
     for (u32 i = 0; i < 512; i += 4) {
         u32 entry;
         if (!bp_read32(eromptr + i, &entry))
@@ -2231,6 +2293,7 @@ static bool cyw43_backplane_init(void)
             if (!bp_read32(eromptr + i + 4, &next)) break;
             if ((next & 0xF) == 0x1) {
                 coreid = (entry >> 8) & 0xFFF;
+                core_rev = (next >> 24) & 0xFFU;
                 uart_puts("[e] c=");
                 uart_hex(coreid);
                 i += 4;
@@ -2241,12 +2304,15 @@ static bool cyw43_backplane_init(void)
             uart_puts(is_ctl ? " W" : " M");
             uart_hex(addr);
             switch (coreid) {
-            case 0x83C: case 0x83E:  /* ARM CR4 / CA7 */
+            case 0x82A: case 0x83C: case 0x83E: case 0x847:  /* ARM CM3 / CR4 / CA7 */
                 if (is_ctl && !arm_ctl) arm_ctl = addr;
                 if (!is_ctl && !arm_regs) arm_regs = addr;
+                arm_core_id = coreid;
                 break;
             case 0x80E: case 0x135:  /* SOCSRAM / SOCRAM-es */
                 if (is_ctl && !sram_ctl) sram_ctl = addr;
+                if (!is_ctl && !sram_regs) sram_regs = addr;
+                cyw_sram_rev = core_rev;
                 break;
             case 0x812:  /* D11 */
                 if (is_ctl && !d11_ctl) d11_ctl = addr;
@@ -2276,14 +2342,17 @@ static bool cyw43_backplane_init(void)
     /* Store discovered addresses for firmware load */
     cyw_arm_ctl = arm_ctl;
     cyw_arm_regs = arm_regs;
+    cyw_arm_core_id = arm_core_id;
     cyw_d11_ctl = d11_ctl;
     cyw_sram_ctl = sram_ctl;
+    cyw_sram_regs = sram_regs;
     cyw_sdio_regs = sdio_regs;
-    /* CYW43455 TCM RAM base is chip-specific, not from EROM.
-     * Linux brcmf_chip_tcm_rambase: 0x4345 → 0x198000.
-     * Keep the #define CYW_RAM_BASE default. */
+    if (cyw_arm_core_id == 0x82AU && (!cyw_sram_ctl || !cyw_sram_regs)) {
+        uart_puts("[cyw] CM3 requires SOCRAM\n");
+        return false;
+    }
 
-    cyw_ram_bytes = cyw43_tcm_ramsize();
+    cyw_ram_bytes = cyw43_firmware_ramsize();
     if (cyw_ram_bytes == 0U || cyw_ram_bytes > 4U * 1024U * 1024U) {
         uart_puts("[cyw] invalid RAM size\n");
         return false;
@@ -2294,9 +2363,13 @@ static bool cyw43_backplane_init(void)
     uart_hex(cyw_ram_bytes);
     uart_puts("\n");
 
-    /* Match brcmf_chip_disable_arm() for CR4: leave the CPU halted. */
-    if (!core_reset(cyw_arm_ctl, SICF_CPUHALT,
-                    SICF_CPUHALT, SICF_CPUHALT)) {
+    /* Match brcmf_chip_disable_arm(): CR4 stays halted, while CM3 is
+     * disabled with its normal wrapper reset sequence. */
+    if (((cyw_arm_core_id == 0x83CU || cyw_arm_core_id == 0x83EU) &&
+         !core_reset(cyw_arm_ctl, SICF_CPUHALT,
+                     SICF_CPUHALT, SICF_CPUHALT)) ||
+        (cyw_arm_core_id != 0x83CU && cyw_arm_core_id != 0x83EU &&
+         !core_disable(cyw_arm_ctl, 0U, 0U))) {
         uart_puts("[cyw] ARM!\n");
         return false;
     }
@@ -2336,6 +2409,17 @@ bool cyw43_init(void)
     cyw_diag.stage = 1U;
     cyw_diag.last_error = 0U;
     cyw_link = CYW_LINK_DOWN;
+    cyw_arm_ctl = 0U;
+    cyw_arm_regs = 0U;
+    cyw_arm_core_id = 0U;
+    cyw_d11_ctl = 0U;
+    cyw_sram_ctl = 0U;
+    cyw_sram_regs = 0U;
+    cyw_sram_rev = 0U;
+    cyw_sdio_regs = 0U;
+    cyw_ram_base = CYW_RAM_BASE;
+    cyw_ram_bytes = 0U;
+    cyw_chip_id = 0U;
     cyw_tx_seq = 0;
     cyw_tx_max = 4U;
     cyw_tx_fcmask = 0U;
@@ -2458,10 +2542,29 @@ bool cyw43_preload_blobs(void)
         return false;
     }
 
+    const char *fw_path = "/wifi/firmware.bin";
+    const char *nv_path = "/wifi/nvram.txt";
+    const char *clm_path = "/wifi/clm.bin";
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3
+    if (cyw43_board_model() == BOARD_MODEL_PI3_B_PLUS) {
+        fw_path = "/wifi/pi3bp/firmware.bin";
+        nv_path = "/wifi/pi3bp/nvram.txt";
+        clm_path = "/wifi/pi3bp/clm.bin";
+    } else {
+        fw_path = "/wifi/pi3b/firmware.bin";
+        nv_path = "/wifi/pi3b/nvram.txt";
+        clm_path = "/wifi/pi3b/clm.bin";
+    }
+#elif PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    fw_path = "/wifi/zero2w/firmware.bin";
+    nv_path = "/wifi/zero2w/nvram.txt";
+    clm_path = "/wifi/zero2w/clm.bin";
+#endif
+
     /* Firmware */
     {
         fat32_file_t fw;
-        if (!fat32_open("/wifi/firmware.bin", &fw)) {
+        if (!fat32_open(fw_path, &fw)) {
             uart_puts("[cyw-pre] no fw\n");
             return false;
         }
@@ -2494,7 +2597,7 @@ bool cyw43_preload_blobs(void)
     /* NVRAM (optional) */
     {
         fat32_file_t nv;
-        if (fat32_open("/wifi/nvram.txt", &nv)) {
+        if (fat32_open(nv_path, &nv)) {
             if (nv.file_size <= CYW_NVRAM_MAX) {
                 nvram_buf_len = fat32_read(&nv, nvram_buf, nv.file_size);
                 uart_puts("[cyw-pre] nvram loaded ");
@@ -2508,7 +2611,7 @@ bool cyw43_preload_blobs(void)
     /* CLM (optional) */
     {
         fat32_file_t clm;
-        if (fat32_open("/wifi/clm.bin", &clm)) {
+        if (fat32_open(clm_path, &clm)) {
             if (clm.file_size <= CYW_CLM_MAX) {
                 clm_buf_len = fat32_read(&clm, clm_buf, clm.file_size);
                 uart_puts("[cyw-pre] clm loaded ");
@@ -2718,7 +2821,10 @@ bool cyw43_load_firmware(void)
 
     /* Reset ARM core to start firmware */
     uart_puts("[cyw] ARM reset out-of-halt...\n");
-    if (!core_reset(cyw_arm_ctl, SICF_CPUHALT, 0U, 0U)) {
+    if (((cyw_arm_core_id == 0x83CU || cyw_arm_core_id == 0x83EU) &&
+         !core_reset(cyw_arm_ctl, SICF_CPUHALT, 0U, 0U)) ||
+        (cyw_arm_core_id != 0x83CU && cyw_arm_core_id != 0x83EU &&
+         !core_reset(cyw_arm_ctl, 0U, 0U, 0U))) {
         cyw_diag.last_error = 22U;
         uart_puts("[cyw] ARM reset fail\n");
         return false;

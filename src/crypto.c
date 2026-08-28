@@ -1,4 +1,5 @@
 #include "crypto.h"
+#include "platform.h"
 #include "simd.h"
 
 /* ---- AES tables ---- */
@@ -131,6 +132,31 @@ static void inv_mix_columns(u8 *s) {
     }
 }
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+static void sub_bytes(u8 *s) {
+    for (u32 i = 0; i < 16; i++)
+        s[i] = aes_sbox[s[i]];
+}
+
+static void shift_rows(u8 *s) {
+    u8 t;
+    t = s[1];  s[1] = s[5];  s[5] = s[9];  s[9] = s[13]; s[13] = t;
+    t = s[2];  s[2] = s[10]; s[10] = t;     t = s[6]; s[6] = s[14]; s[14] = t;
+    t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t;
+}
+
+static void mix_columns(u8 *s) {
+    for (u32 c = 0; c < 4; c++) {
+        u32 i = c * 4U;
+        u8 a0 = s[i], a1 = s[i + 1U], a2 = s[i + 2U], a3 = s[i + 3U];
+        s[i]      = gf_xtime(a0) ^ (gf_xtime(a1) ^ a1) ^ a2 ^ a3;
+        s[i + 1U] = a0 ^ gf_xtime(a1) ^ (gf_xtime(a2) ^ a2) ^ a3;
+        s[i + 2U] = a0 ^ a1 ^ gf_xtime(a2) ^ (gf_xtime(a3) ^ a3);
+        s[i + 3U] = (gf_xtime(a0) ^ a0) ^ a1 ^ a2 ^ gf_xtime(a3);
+    }
+}
+#else
 static inline void aes_round_arm(u8 *state, const u8 *rk, bool mix_columns) {
     if (mix_columns) {
         __asm__ volatile(
@@ -153,6 +179,7 @@ static inline void aes_round_arm(u8 *state, const u8 *rk, bool mix_columns) {
             : "v0", "v1", "memory");
     }
 }
+#endif
 
 static void ghash_shift_right_one(u8 *v) {
     /* GCM's GHASH treats a 128-bit block's bit 0 (the MSB of byte[0], the
@@ -345,6 +372,19 @@ void aes_encrypt_block(const struct aes_key *ctx, const u8 *in, u8 *out) {
 
     simd_memcpy(state, in, 16);
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    add_round_key(state, &ctx->round_keys[0]);
+    for (u32 r = 1U; r < ctx->rounds; r++) {
+        sub_bytes(state);
+        shift_rows(state);
+        mix_columns(state);
+        add_round_key(state, &ctx->round_keys[r * 16U]);
+    }
+    sub_bytes(state);
+    shift_rows(state);
+    add_round_key(state, &ctx->round_keys[ctx->rounds * 16U]);
+#else
     /* ARMv8 crypto-extension AES encryption round structure. AESE's own
      * internal XOR (state XOR rk, done BEFORE SubBytes/ShiftRows) is
      * offset by one round from the textbook FIPS-197 AddRoundKey (which
@@ -370,6 +410,7 @@ void aes_encrypt_block(const struct aes_key *ctx, const u8 *in, u8 *out) {
 
     aes_round_arm(state, &ctx->round_keys[(ctx->rounds - 1U) * 16], false);
     add_round_key(state, &ctx->round_keys[ctx->rounds * 16]);
+#endif
     simd_memcpy(out, state, 16);
 }
 

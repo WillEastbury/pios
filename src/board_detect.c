@@ -15,6 +15,13 @@ u32 board_family_from_midr(u64 midr)
     return BOARD_FAMILY_UNKNOWN;
 }
 
+u32 board_model_from_revision(u32 revision)
+{
+    if ((revision & (1U << 23)) == 0U)
+        return BOARD_MODEL_UNKNOWN;
+    return (revision >> 4U) & 0xFFU;
+}
+
 #ifdef PIOS_HOST_TYPES_SHIM
 /* Host unit tests never call this (no real MIDR_EL1 to read); provide a
  * harmless stub so the file still compiles when linked into a host test

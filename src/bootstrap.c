@@ -12,8 +12,10 @@
 #include "fb.h"
 #include "walfs.h"
 #include "stage2_manifest.h"
+#include "stage0_diag.h"
 #include "board_detect.h"
 #include "platform.h"
+#include "mailbox.h"
 
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
 /* QEMU's -M virt machine has NO RAM below 0x40000000 (that range is GIC/
@@ -39,6 +41,9 @@
 #define BOOT_FALLBACK_LBA   2048U
 #define BOOT_SLOT_MAGIC     PIOS_RESERVED_HEADER_MAGIC
 #define BOOT_WDOG_SECONDS   15U
+#ifndef PIOS_STAGE0_SKIP_INITIAL_WATCHDOG
+#define PIOS_STAGE0_SKIP_INITIAL_WATCHDOG 0
+#endif
 /* PM_BASE/UART0_BASE used to be compile-time PERIPH_BASE-derived macros,
  * which only ever matched Pi5. Now resolved once at runtime from
  * g_board_bases (see board_detect_init(), called first thing in
@@ -78,6 +83,153 @@ static u8 mbr[SD_BLOCK_SIZE] ALIGNED(64);
 static u8 hdr[SD_BLOCK_SIZE] ALIGNED(64);
 static u8 bootctl[SD_BLOCK_SIZE] ALIGNED(64);
 static u8 fat_sector[SD_BLOCK_SIZE] ALIGNED(64);
+static volatile u32 stage0_board_revision_mbox[7] ALIGNED(16);
+
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+#define STAGE0_HELLO_MBOX_BASE    0x107C013880ULL
+#define STAGE0_HELLO_MBOX0_READ   (STAGE0_HELLO_MBOX_BASE + 0x00U)
+#define STAGE0_HELLO_MBOX0_STATUS (STAGE0_HELLO_MBOX_BASE + 0x18U)
+#define STAGE0_HELLO_MBOX1_WRITE  (STAGE0_HELLO_MBOX_BASE + 0x20U)
+#define STAGE0_HELLO_MBOX1_STATUS (STAGE0_HELLO_MBOX_BASE + 0x38U)
+#define STAGE0_HELLO_MBOX_FULL    0x80000000U
+#define STAGE0_HELLO_MBOX_EMPTY   0x40000000U
+#define STAGE0_HELLO_MBOX_CH      8U
+#define STAGE0_HELLO_POLL_LIMIT   10000U
+
+static volatile u32 ALIGNED(16) stage0_hello_mbox[8];
+
+static void stage0_hello_clean(const volatile void *ptr, u32 bytes)
+{
+    u64 addr = (u64)(usize)ptr;
+    for (u32 off = 0; off < bytes; off += 64U)
+        __asm__ volatile("dc civac, %0" :: "r"(addr + off));
+    dsb();
+}
+
+static bool stage0_hello_mbox_call(void)
+{
+    stage0_hello_clean(stage0_hello_mbox, sizeof(stage0_hello_mbox));
+    u32 message = (u32)(usize)stage0_hello_mbox | STAGE0_HELLO_MBOX_CH;
+    u32 polls = STAGE0_HELLO_POLL_LIMIT;
+    while ((mmio_read(STAGE0_HELLO_MBOX1_STATUS) & STAGE0_HELLO_MBOX_FULL) &&
+           polls)
+        polls--;
+    if (polls == 0U)
+        return false;
+    mmio_write(STAGE0_HELLO_MBOX1_WRITE, message);
+
+    polls = STAGE0_HELLO_POLL_LIMIT;
+    while (polls--) {
+        if (mmio_read(STAGE0_HELLO_MBOX0_STATUS) & STAGE0_HELLO_MBOX_EMPTY)
+            continue;
+        if (mmio_read(STAGE0_HELLO_MBOX0_READ) != message)
+            continue;
+        stage0_hello_clean(stage0_hello_mbox, sizeof(stage0_hello_mbox));
+        return stage0_hello_mbox[1] == 0x80000000U;
+    }
+    return false;
+}
+
+static u8 stage0_hello_glyph(char c, u32 row)
+{
+    static const u8 h[7] = {17,17,17,31,17,17,17};
+    static const u8 e[7] = {31,16,16,30,16,16,31};
+    static const u8 l[7] = {16,16,16,16,16,16,31};
+    static const u8 o[7] = {14,17,17,17,17,17,14};
+    static const u8 f[7] = {31,16,16,30,16,16,16};
+    static const u8 r[7] = {30,17,17,30,20,18,17};
+    static const u8 m[7] = {17,27,21,21,17,17,17};
+    static const u8 p[7] = {30,17,17,30,16,16,16};
+    static const u8 i[7] = {31,4,4,4,4,4,31};
+    static const u8 s[7] = {15,16,16,14,1,1,30};
+    const u8 *glyph = NULL;
+    if (c == 'H') glyph = h;
+    else if (c == 'E') glyph = e;
+    else if (c == 'L') glyph = l;
+    else if (c == 'O') glyph = o;
+    else if (c == 'F') glyph = f;
+    else if (c == 'R') glyph = r;
+    else if (c == 'M') glyph = m;
+    else if (c == 'P') glyph = p;
+    else if (c == 'I') glyph = i;
+    else if (c == 'S') glyph = s;
+    return glyph && row < 7U ? glyph[row] : 0U;
+}
+
+void stage0_firmware_hello(void)
+{
+    u64 midr;
+    __asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
+    if (((midr >> 4) & 0xFFFU) != MIDR_PARTNUM_CORTEX_A76)
+        return;
+    struct stage0_diag *handoff =
+        (struct stage0_diag *)(usize)STAGE0_DIAG_ADDR;
+    handoff->magic = STAGE0_DIAG_MAGIC;
+    handoff->version = STAGE0_DIAG_VERSION;
+    handoff->hello_attempted = 1U;
+    handoff->hello_status = 1U;
+    handoff->hello_response = 0U;
+    handoff->hello_allocation_addr = 0U;
+    handoff->hello_allocation_size = 0U;
+    dsb();
+
+    /* Allocation-only is the earliest proven Pi 5 property request: firmware
+     * chooses the configured mode, and no stage0 translation state exists yet. */
+    stage0_hello_mbox[0] = 8U * 4U;
+    stage0_hello_mbox[1] = 0U;
+    stage0_hello_mbox[2] = 0x00040001U;
+    stage0_hello_mbox[3] = 8U;
+    stage0_hello_mbox[4] = 4U;
+    stage0_hello_mbox[5] = 16U;
+    stage0_hello_mbox[6] = 0U;
+    stage0_hello_mbox[7] = 0U;
+    if (!stage0_hello_mbox_call()) {
+        handoff->hello_status = 2U;
+        handoff->hello_response = stage0_hello_mbox[1];
+        dsb();
+        return;
+    }
+
+    u32 base = stage0_hello_mbox[5] & 0x3FFFFFFFU;
+    u32 size = stage0_hello_mbox[6];
+    handoff->hello_status = 3U;
+    handoff->hello_response = stage0_hello_mbox[1];
+    handoff->hello_allocation_addr = stage0_hello_mbox[5];
+    handoff->hello_allocation_size = size;
+    dsb();
+    const u32 width = 1920U;
+    const u32 pitch = width * 4U;
+    const u32 rows = 96U;
+    if (base == 0U || size < pitch * rows)
+        return;
+
+    volatile u32 *fb = (volatile u32 *)(usize)base;
+    for (u32 y = 0; y < rows; y++)
+        for (u32 x = 0; x < width; x++)
+            fb[y * width + x] = 0x00000000U;
+
+    static const char text[] = "HELLO FROM PIOS";
+    const u32 scale = 3U;
+    u32 cursor = 32U;
+    for (u32 n = 0; text[n]; n++) {
+        for (u32 gy = 0; gy < 7U; gy++) {
+            u8 bits = stage0_hello_glyph(text[n], gy);
+            for (u32 gx = 0; gx < 5U; gx++) {
+                if ((bits & (1U << (4U - gx))) == 0U)
+                    continue;
+                for (u32 sy = 0; sy < scale; sy++)
+                    for (u32 sx = 0; sx < scale; sx++)
+                        fb[(24U + gy * scale + sy) * width +
+                           cursor + gx * scale + sx] = 0x0000FF00U;
+            }
+        }
+        cursor += 6U * scale;
+    }
+    stage0_hello_clean((const volatile void *)(usize)base, pitch * rows);
+}
+#else
+void stage0_firmware_hello(void) {}
+#endif
 
 void *memset(void *dst, int c, usize n)
 {
@@ -174,8 +326,49 @@ static u32 stage0_platform_id(void)
      * top of bootstrap_main()). Falls back to PI5 (the proven, currently
      * shipping path) if detection is somehow inconclusive, rather than an
      * undefined/zero platform id that would match no manifest entry. */
-    if (g_board_family == BOARD_FAMILY_BCM2837)
+    if (g_board_family == BOARD_FAMILY_BCM2837) {
+        /* MIDR distinguishes the BCM2837 family from Pi 5, but not Pi 3
+         * versus Zero 2 W. Use the firmware board-revision model field to
+         * select the payload whose WiFi power/core profile matches the host. */
+        u64 base = g_board_bases.mbox_base;
+        if (base != 0U) {
+            volatile u32 *m = stage0_board_revision_mbox;
+            m[0] = sizeof(stage0_board_revision_mbox);
+            m[1] = 0U;
+            m[2] = TAG_GET_BOARD_REV;
+            m[3] = 4U;
+            m[4] = 0U;
+            m[5] = 0U;
+            m[6] = TAG_END;
+            stage0_hello_clean(m, sizeof(stage0_board_revision_mbox));
+            u32 msg = ((u32)(u64)m & 0xFFFFFFF0U) | MBOX_CH_PROP;
+            bool sent = false;
+            for (u32 i = 0U; i < 10000U; i++) {
+                if (!(mmio_read(base + 0x38U) & 0x80000000U)) {
+                    mmio_write(base + 0x20U, msg);
+                    sent = true;
+                    break;
+                }
+            }
+            if (sent) {
+                for (u32 i = 0U; i < 10000U; i++) {
+                    if (mmio_read(base + 0x18U) & 0x40000000U)
+                        continue;
+                    if (mmio_read(base + 0x00U) == msg) {
+                        stage0_hello_clean(m, sizeof(stage0_board_revision_mbox));
+                        if (m[1] == 0x80000000U &&
+                            (m[4] & 0x80000000U)) {
+                            if (board_model_from_revision(m[5]) ==
+                                BOARD_MODEL_ZERO2W)
+                                return PIOS_STAGE2_PLATFORM_PIZERO2W;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         return PIOS_STAGE2_PLATFORM_BCM2837_FAMILY;
+    }
     return PIOS_STAGE2_PLATFORM_PI5;
 #endif
 }
@@ -283,6 +476,27 @@ static void stage0_watchdog_arm(u32 seconds)
 #endif
 }
 
+static void stage0_watchdog_disable(void)
+{
+#if PIOS_PLATFORM != PIOS_PLATFORM_QEMU_VIRT
+    mmio_write(PM_WDOG, PM_PASSWORD);
+    mmio_write(PM_RSTC, PM_PASSWORD |
+                         (mmio_read(PM_RSTC) & ~PM_RSTC_WRCFG_MASK));
+#endif
+}
+
+static void stage0_publish_framebuffer(void)
+{
+    u64 base;
+    u32 width;
+    u32 height;
+    u32 pitch;
+    u32 size;
+    fb_display_info(&base, &width, &height, &pitch, &size);
+    if (base && width && height && pitch && size)
+        stage0_fb_handoff_publish(base, width, height, pitch, size);
+}
+
 void uart_putc(char c)
 {
     while (mmio_read(g_board_bases.uart0_base + 0x18) & (1U << 5)) ;
@@ -305,13 +519,101 @@ void uart_hex(u64 v)
         uart_putc(hx[(v >> (u32)i) & 0xFULL]);
 }
 
+static bool stage0_fb_ready;
+static u32 stage0_fb_attempts;
+
+static void stage0_diag_putc(char c)
+{
+    /* GPIO14/15 is on RP1 on Pi 5. Stage0 does not own RP1 yet, so touching
+     * its UART before PCIe/RP1 initialization can external-abort. Pi 5 logs
+     * are carried by the Normal-NC handoff record and printed by stage2. */
+    if (g_board_family == BOARD_FAMILY_PI5)
+        return;
+    uart_putc(c);
+}
+
+static void stage0_diag_puts(const char *s)
+{
+    while (s && *s) {
+        if (*s == '\n')
+            stage0_diag_putc('\r');
+        stage0_diag_putc(*s++);
+    }
+}
+
+static void stage0_diag_hex(u64 v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    stage0_diag_puts("0x");
+    for (i32 shift = 60; shift >= 0; shift -= 4)
+        stage0_diag_putc(hex[(v >> (u32)shift) & 0xFULL]);
+}
+
 void kernel_fb_early(void)
 {
-    if (fb_init(1280, 720)) {
+    u64 current_el;
+    u64 sctlr_el1;
+    struct stage0_diag *handoff =
+        (struct stage0_diag *)(usize)STAGE0_DIAG_ADDR;
+    __asm__ volatile("mrs %0, CurrentEL" : "=r"(current_el));
+    __asm__ volatile("mrs %0, SCTLR_EL1" : "=r"(sctlr_el1));
+    if (stage0_fb_attempts == 0U &&
+        (handoff->magic != STAGE0_DIAG_MAGIC ||
+         handoff->version != STAGE0_DIAG_VERSION)) {
+        memset(handoff, 0, sizeof(*handoff));
+        handoff->magic = STAGE0_DIAG_MAGIC;
+        handoff->version = STAGE0_DIAG_VERSION;
+    }
+    u32 attempt_index = stage0_fb_attempts;
+    stage0_fb_attempts++;
+    handoff->attempt_count = stage0_fb_attempts;
+    stage0_diag_puts("[boot] fb try=");
+    stage0_diag_hex(stage0_fb_attempts);
+    stage0_diag_puts(" EL=");
+    stage0_diag_hex((current_el >> 2) & 3U);
+    stage0_diag_puts(" SCTLR1=");
+    stage0_diag_hex(sctlr_el1);
+    stage0_diag_puts("\n");
+
+    bool fb_ok = fb_init(1280, 720);
+    struct fb_mailbox_diag diag;
+    fb_mailbox_diag(&diag);
+    if (attempt_index < STAGE0_DIAG_ATTEMPTS) {
+        struct stage0_fb_attempt *attempt = &handoff->attempt[attempt_index];
+        attempt->sctlr_el1 = sctlr_el1;
+        attempt->current_el = (u32)((current_el >> 2) & 3U);
+        attempt->status = diag.status;
+        attempt->message = diag.message;
+        attempt->response = diag.response;
+        attempt->allocation_addr = diag.allocation_addr;
+        attempt->allocation_size = diag.allocation_size;
+        attempt->pitch = diag.pitch;
+    }
+    dsb();
+    if (fb_ok) {
+        stage0_fb_ready = true;
+        handoff->framebuffer_ready = 1U;
         fb_clear(0x00000000);
         fb_set_color(0x0000FF00, 0x00000000);
         fb_puts("PIOS stage0\n");
+        stage0_diag_puts("[boot] fb online\n");
+        dsb();
+        return;
     }
+
+    stage0_diag_puts("[boot] fb failed status=");
+    stage0_diag_hex(diag.status);
+    stage0_diag_puts(" msg=");
+    stage0_diag_hex(diag.message);
+    stage0_diag_puts(" rsp=");
+    stage0_diag_hex(diag.response);
+    stage0_diag_puts(" alloc=");
+    stage0_diag_hex(diag.allocation_addr);
+    stage0_diag_puts("/");
+    stage0_diag_hex(diag.allocation_size);
+    stage0_diag_puts(" pitch=");
+    stage0_diag_hex(diag.pitch);
+    stage0_diag_puts("\n");
 }
 
 void kernel_el2_crash(u64 esr, u64 elr, u64 far, u64 spsr)
@@ -870,9 +1172,13 @@ NORETURN void bootstrap_main(void)
      * deterministic, and idempotent; do so defensively so board detection
      * is never silently skipped if the asm path is ever refactored. */
     board_detect_init();
-    kernel_fb_early();
+    if (!stage0_fb_ready)
+        kernel_fb_early();
+    stage0_publish_framebuffer();
     uart_puts("[boot] PIOS bootstrap\n");
+#if !PIOS_STAGE0_SKIP_INITIAL_WATCHDOG
     stage0_watchdog_arm(BOOT_WDOG_SECONDS);
+#endif
     fb_set_color(0x0000FF00, 0x00000000);
     fb_puts("[stage0] start\n");
     if (!sd_init()) {
@@ -1002,6 +1308,7 @@ have_header:
     uart_puts(" sel.payload_bytes="); uart_hex(sel.payload_bytes);
     uart_puts(" sel.entry_offset="); uart_hex(sel.entry_offset);
     uart_puts("\n");
+    stage0_watchdog_disable();
     void (*tramp)(u64, u64, u64, u64) = (void (*)(u64, u64, u64, u64))(usize)BOOT_TRAMP_ADDR;
     tramp(BOOT_DST_ADDR, BOOT_STAGING_ADDR + sel.payload_offset, sel.payload_bytes,
           BOOT_DST_ADDR + sel.entry_offset);

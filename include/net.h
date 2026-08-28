@@ -139,6 +139,8 @@ typedef void (*udp_recv_cb)(u32 src_ip, u16 src_port, u16 dst_port,
 
 /* Init with static IP, gateway IP, and gateway MAC */
 void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac);
+void net_init_on(nic_iface_t iface, u32 ip, u32 gateway, u32 netmask,
+                 const u8 *gateway_mac);
 bool net_add_interface(nic_iface_t iface, u32 ip, u32 gateway, u32 netmask,
                        const u8 *gateway_mac);
 bool net_interface_configured(nic_iface_t iface);

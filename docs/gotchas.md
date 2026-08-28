@@ -277,7 +277,75 @@ just the loaded bytes.
 
 ---
 
+## Storage hardware
+
+### Pi 3/Zero 2 W microSD is not on Arasan SDHCI
+
+**Symptom:** multi-platform stage0 reaches `CMD8`, then fails at `ACMD41` on a
+Pi 3 B+ despite booting from that same card.
+
+**Cause:** `0x3F300000` is Arasan SDHCI and is routed to onboard Wi-Fi SDIO.
+The removable card uses BCM2835 SDHOST at `0x3F202000` on GPIO48-53. The two
+controllers have unrelated register layouts.
+
+**Rule:** Pi 3 B/B+ and Pi Zero 2 W use the SDHOST backend for removable
+storage. Do not "fix" this with the firmware `mmc` overlay unless intentionally
+giving up onboard Wi-Fi; Pi 5 continues to use BCM2712 SDHCI.
+
+### A mailbox framebuffer does not imply V3D 7.1
+
+**Symptom:** Pi 3 boot reaches `[gpu] tensor_init...` and stops after otherwise
+correctly skipping DMA, trusted entropy, and NIC initialization.
+
+**Cause:** BCM2837 has the firmware property mailbox used by the framebuffer,
+but its GPU is VideoCore IV. The PIOS tensor/QPU backend targets Pi 5's V3D 7.1;
+gating it on `PIOS_HAS_MAILBOX_FB` incorrectly entered Pi 5 GPU initialization.
+
+**Rule:** Gate V3D 7.1 tensor acceleration on `PIOS_HAS_V3D_71`. Pi 3 and Zero
+2 W retain the CPU/NEON tensor hooks without issuing GPU mailbox or V3D MMIO
+operations.
+
+### Highmem probe must stay inside the identity map
+
+**Symptom:** Pi 5 PiPLoD reports `PC=0xA4860`, opcode `0xF940001B`, during
+the cache-map phase. The register line may show `x0=0` because PiPLoD prints
+only the low 32 bits.
+
+**Cause:** `0xA4860` is `highmem_probe_line()`. On a board with 8 GiB, its
+fourth probe address is `0x1_0000_0000`, whose low word is zero, but the
+current stage-1 identity map has entries only through 4 GiB.
+
+**Rule:** Optional highmem probing and allocation must be clamped to the
+currently mapped identity range. Extending highmem beyond 4 GiB requires
+explicit stage-1 tables first.
+
+### BCM2837 Wi-Fi power control differs by board
+
+**Trap:** Pi 3 B/B+ `WL_ON` is firmware expgpio line 1 (property GPIO 129);
+it is not SoC GPIO 43. Zero 2 W uses direct SoC GPIO 41. Driving the wrong
+line leaves the radio off and makes SDIO command waits look like a hang.
+
+**Rule:** Use bounded firmware-mailbox GPIO control for Pi 3 B/B+ and direct
+GPIO41 only for Zero 2 W. The Wi-Fi chip and firmware set also differ:
+Pi 3 B uses the 43430 family, Pi 3 B+ uses 43455, and Zero 2 W uses the
+43436 family. Never upload the Pi 5 43455 blob to an unidentified BCM2837
+board.
+
+---
+
 ## Toolchain
+
+### Child `.bat` files leak build flags without `setlocal`
+
+**Failure:** `build_bootstrap.bat` called `build_qemu_full.bat`, which replaced
+the caller's `ASFLAGS` with `-DPIOS_PLATFORM=PIOS_PLATFORM_QEMU_VIRT`. The
+subsequent Pi stage0 compile therefore removed the Pi-only early framebuffer
+calls and selected the QEMU MMU table while still producing a file named
+`kernel8.img`.
+
+**Rule:** every called build batch owns a `setlocal`/`endlocal` scope. Pi build
+flags also define `PIOS_PLATFORM_PI5` explicitly, and the bootstrap build
+rejects a stage0 object that does not reference `kernel_fb_early`.
 
 ### GCC 13.3 `-fgcse` miscompile
 

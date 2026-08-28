@@ -1404,14 +1404,22 @@ u32 net_poll(void)
     return got;
 }
 
-void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
+void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac)
+{
+    net_init_on(NIC_IFACE_WIRED, ip, gateway, netmask, gateway_mac);
+}
+
+void net_init_on(nic_iface_t iface, u32 ip, u32 gateway, u32 netmask,
+                 const u8 *gateway_mac) {
+    if (iface != NIC_IFACE_WIRED && iface != NIC_IFACE_WIFI)
+        return;
     simd_zero(net_ifaces, sizeof(net_ifaces));
-    net_current_iface = NIC_IFACE_WIRED;
+    net_current_iface = iface;
     our_ip   = ip;
     our_gw   = gateway;
     our_mask = netmask;
-    nic_set_local_ipv4_for(NIC_IFACE_WIRED, ip);
-    nic_get_mac_for(NIC_IFACE_WIRED, our_mac);
+    nic_set_local_ipv4_for(iface, ip);
+    nic_get_mac_for(iface, our_mac);
 
     gw_mac_set = false;
     simd_zero(gw_mac, sizeof(gw_mac));
@@ -1437,7 +1445,7 @@ void net_init(u32 ip, u32 gateway, u32 netmask, const u8 *gateway_mac) {
     icmp_last_tick    = 0;
 
     /* Init ARP subsystem */
-    arp_init_iface(NIC_IFACE_WIRED, ip, netmask, our_mac);
+    arp_init_iface(iface, ip, netmask, our_mac);
     (void)net_route_add(ip & netmask, netmask, 0, NET_ROUTE_F_CONNECTED);
     if (gateway != 0)
         (void)net_route_add(0, 0, gateway, 0);

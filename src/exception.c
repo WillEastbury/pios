@@ -358,7 +358,22 @@ static NORETURN void pisod_finish(void)
     watchdog_reboot_now(crash_record_last.kind);
 }
 
-static NORETURN void pisod_halt(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
+static bool fault_opcode(u64 elr, u32 *opcode)
+{
+    extern char __text_start[];
+    extern char __text_end[];
+    u64 start = (u64)(usize)__text_start;
+    u64 end = (u64)(usize)__text_end;
+    if (!opcode || (elr & 3U) != 0U || elr < start ||
+        elr > end || end - elr < sizeof(u32))
+        return false;
+    *opcode = *(const u32 *)(usize)elr;
+    return true;
+}
+
+static NORETURN void pisod_halt(const char *title, u32 kind, u32 ec,
+                                u64 esr, u64 elr, u64 far,
+                                const struct irq_frame *frame)
 {
     if (!panic_in_progress) {
         panic_in_progress = true;
@@ -382,22 +397,31 @@ static NORETURN void pisod_halt(const char *title, u32 kind, u32 ec, u64 esr, u6
     uart_hex(far);
     uart_puts("\n");
 
-    fb_clear(0x004C1966); /* deep indigo */
     fb_set_color(0x00FFFFFF, 0x004C1966);
-    fb_printf("PIOS PiSOD\n");
-    fb_printf("%s\n\n", title);
-    fb_printf("core=%u ec=0x%x\n", core_id(), ec);
-    fb_printf("esr=0x%x\n", esr);
-    fb_printf("elr=0x%x\n", elr);
-    fb_printf("far=0x%x\n", far);
-    fb_printf("last crash captured in memory\n");
+    fb_clear_row(0U);
+    fb_set_cursor(0U, 0U);
+    u32 opcode = 0U;
+    bool have_opcode = fault_opcode(elr, &opcode);
+    if (frame) {
+        u64 interrupted_sp = (u64)(usize)frame + sizeof(*frame);
+        fb_printf("PiPLoD c%u ec=%x pc=%x op=%x x0=%x x1=%x x2=%x x3=%x sp=%x lr=%x",
+                  core_id(), ec, (u32)elr,
+                  have_opcode ? opcode : 0U,
+                  (u32)frame->x[0], (u32)frame->x[1],
+                  (u32)frame->x[2], (u32)frame->x[3],
+                  (u32)interrupted_sp, (u32)frame->x[30]);
+    } else {
+        fb_printf("PiPLoD %s c%u ec=%x pc=%x op=%x far=%x",
+                  title, core_id(), ec, (u32)elr,
+                  have_opcode ? opcode : 0U, (u32)far);
+    }
 
     pisod_finish();
 }
 
 NORETURN void exception_pisod(const char *title, u32 kind, u32 ec, u64 esr, u64 elr, u64 far)
 {
-    pisod_halt(title, kind, ec, esr, elr, far);
+    pisod_halt(title, kind, ec, esr, elr, far, NULL);
 }
 
 NORETURN void exception_pisod_reboot(const char *title, u32 kind, u32 reason,
@@ -433,13 +457,13 @@ NORETURN void exception_pisod_reboot(const char *title, u32 kind, u32 reason,
     }
     uart_puts("persisted to SD\n");
 
-    fb_clear(0x004C1966); /* deep indigo */
     fb_set_color(0x00FFFFFF, 0x004C1966);
-    fb_printf("PIOS PiSOD\n");
-    fb_printf("%s\n\n", title);
-    fb_printf("core=%u kind=%u reason=%u\n", core_id(), kind, reason);
-    for (u32 i = 0; i < value_count && values; i++)
-        fb_printf("v%u=0x%x\n", i, values[i]);
+    fb_clear_row(0U);
+    fb_set_cursor(0U, 0U);
+    fb_printf("PiPLoD %s core=%u kind=%u reason=%u",
+              title, core_id(), kind, reason);
+    if (value_count && values)
+        fb_printf(" v0=%X", values[0]);
 
     pisod_finish();}
 
@@ -773,7 +797,7 @@ void sync_exception(struct irq_frame *frame, u64 esr, u64 far) {
         return;
     }
 
-    pisod_halt("Synchronous exception", 1, ec, esr, elr, far);
+    pisod_halt("Synchronous exception", 1, ec, esr, elr, far, frame);
 }
 
 /* Called from vectors.S serror_handler */
@@ -782,5 +806,5 @@ void serror_exception(u64 esr) {
     __asm__ volatile("mrs %0, elr_el1" : "=r"(elr));
     __asm__ volatile("mrs %0, far_el1" : "=r"(far));
     u32 ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
-    pisod_halt("SError exception", 2, ec, esr, elr, far);
+    pisod_halt("SError exception", 2, ec, esr, elr, far, NULL);
 }

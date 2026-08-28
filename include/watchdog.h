@@ -23,5 +23,6 @@ void watchdog_hw_pet(void);
 u32  watchdog_hw_remaining_ticks(void);
 u32  watchdog_hw_rstc(void);
 void watchdog_hw_disable(void);
+void watchdog_hw_set_suppressed(bool suppressed);
 NORETURN void watchdog_reboot_now(u32 reason);
 void watchdog_status(struct watchdog_status *out);

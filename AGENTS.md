@@ -26,6 +26,63 @@ cmd.exe /d /c "C:\source\pios\build_qemu_full.bat"     # QEMU direct-boot image 
 `git checkout -- include/build_version.h` before staging, or it shows up as a
 spurious diff.
 
+### Reproducible build prerequisites
+
+The verified Windows build does not require `make`. Install Python 3 and the
+ARM GNU Toolchain **13.3.Rel1 AArch64 bare-metal** package. The batch files
+expect the compiler tools at:
+
+```text
+C:\aarch64-none-elf\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-aarch64-none-elf\bin
+```
+
+If the toolchain is installed elsewhere, update `TC` in the build batch file
+being used; do not put a different compiler first on `PATH`. Run the scripts
+from the repository root through `cmd.exe /d /c`, because PowerShell can
+rewrite `-march` arguments:
+
+```powershell
+cmd.exe /d /c "C:\source\pios\build_multiboard.bat"   # Pi 5 + Pi 3 + Zero 2 W package
+cmd.exe /d /c "C:\source\pios\build_bootstrap.bat"    # Pi 5 stage0 + stage2 package
+cmd.exe /d /c "C:\source\pios\build_pi3.bat"          # standalone Pi 3 payload
+cmd.exe /d /c "C:\source\pios\build_pizero2w.bat"     # standalone Zero 2 W payload
+cmd.exe /d /c "C:\source\pios\build_qemu_full.bat"    # direct-boot QEMU payload
+```
+
+`build_multiboard.bat` is the normal unified-image build. It invokes the
+platform builds and writes the final package to `PIOSSTG2.PKG`; generated
+`build_*` directories, images, ELF files, and packages are ignored by Git.
+The host-only regression suite needs no cross-compiler:
+
+```powershell
+python tests\run_host_tests.py
+```
+
+The wildcard stage2 builds deliberately exclude stage0/provisioning and
+platform-startup sources to prevent duplicate entry points and manifest
+symbols. Preserve these exclusions when adding another build script:
+
+```text
+Assembly: bootstrap_start.S bootstrap_trampoline.S provision_payload.S
+          provision_revert_payload.S qemu_virt_start.S qemu_stage2_start.S
+          qemu_stage2_manifest.S qemu_boot_stage2_manifest.S
+C source: bootstrap.c provision.c provision_revert.c qemu_virt_min.c
+          qemu_virt_walfs.c
+```
+
+The QEMU stage0-chain build additionally excludes `stage2_manifest.S` and
+includes `qemu_boot_stage2_manifest.S`; the Pi 5, Pi 3, Zero 2 W, and direct
+QEMU builds use `stage2_manifest.S`. Never compile both manifest sources into
+one payload. The stage0 is linked explicitly from
+`bootstrap_start.S`, `bootstrap_trampoline.S`, `bootstrap.c`,
+`board_detect.c`, `sd.c`, `sdhost.c`, `sdhost_logic.c`, and `fb.c`.
+
+Platform flags are intentional: Pi 5 uses
+`-march=armv8.2-a+simd+crc+crypto`, while Pi 3 and Zero 2 W use
+`-march=armv8-a+simd+crc -mno-outline-atomics` and the matching
+`PIOS_PLATFORM` define. Do not replace the A53 flags with Pi 5 flags; the
+resulting crypto or LSE instructions are not supported on those CPUs.
+
 ### Test
 
 ```powershell
