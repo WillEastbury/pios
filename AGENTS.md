@@ -128,6 +128,9 @@ $c=[uri]::EscapeDataString("proc sched")
 | `wifi ...` | `scan`, `status`, `fwlog`, `join` |
 
 `/api/status` is the cheap liveness/version probe used by every harness.
+`/api/diag` is the bounded read-only telemetry snapshot for HTTP/TCP pool,
+IRQ, watchdog, scheduler, framebuffer, NIC, and MACB state; query it directly
+when the browser console is suspected of overloading the service path.
 
 ### Consoles
 

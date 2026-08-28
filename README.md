@@ -60,6 +60,11 @@ For operator workflows, serial/TCP/Web consoles, OTA hot-flashing, log tailing, 
 
 For the FAT/stage0/raw second-stage/WALFS disk map, see [DISKLAYOUT.md](DISKLAYOUT.md).
 
+For a bounded machine-readable health snapshot, query `GET /api/diag`. It
+reports HTTP/TCP pool pressure, IRQ and watchdog liveness, scheduler activity,
+framebuffer geometry, NIC counters, and MACB wedge state without issuing
+hardware-mutating diagnostic commands.
+
 ## Building
 
 ### Prerequisites

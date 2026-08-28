@@ -237,6 +237,7 @@ static const u8 HOST_PC_MAC[6] = { 0x04, 0xBF, 0x1B, 0xE1, 0xD7, 0x78 };
 #define HTTP_ROUTE_STATIC_PUT 14U
 #define HTTP_ROUTE_CAPSULE    15U
 #define HTTP_ROUTE_PCAP       16U
+#define HTTP_ROUTE_DIAG       17U
 
 #define HTTP_ERR_NONE         0U
 #define HTTP_ERR_RESP_TIMEOUT 1U
@@ -285,6 +286,7 @@ static const char *http_route_name(u32 route)
     case HTTP_ROUTE_STATIC_PUT: return "static-put";
     case HTTP_ROUTE_CAPSULE: return "capsule";
     case HTTP_ROUTE_PCAP: return "pcap";
+    case HTTP_ROUTE_DIAG: return "diag";
     default: return "?";
     }
 }
@@ -1529,6 +1531,8 @@ static u32 http_route_id(const u8 *req, u32 len)
         return HTTP_ROUTE_ACME;
     if (http_request_path_is(req, len, "/api/status"))
         return HTTP_ROUTE_STATUS;
+    if (http_request_path_is(req, len, "/api/diag"))
+        return HTTP_ROUTE_DIAG;
     if (http_request_path_is(req, len, "/api/netstat"))
         return HTTP_ROUTE_NETSTAT;
     if (http_request_path_prefix_token(req, len, "/static/", token, sizeof(token)))
@@ -2214,6 +2218,14 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     (void)req;
     (void)req_len;
     u32 len = 0;
+    u32 http_inuse = 0;
+    for (u32 i = 0; i < http_conn_count; i++) {
+        if (http_conns[i].client_conn >= 0)
+            http_inuse++;
+    }
+    u32 tcp_capacity = 0, tcp_inuse = 0, tcp_listeners = 0;
+    tcp_table_stats(&tcp_capacity, &tcp_inuse, &tcp_listeners);
+    const tcp_diag_t *tdiag = tcp_diag();
     http_trace(HTTP_EVT_STATUS_ENTER, HTTP_ROUTE_STATUS, req_len, max);
 
     http_append(out, &len, max,
@@ -2242,6 +2254,13 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
     http_append_json_metric(out, &len, max, "off", http_resp_off, true);
     http_append_json_metric(out, &len, max, "body", http_diag.body_off, true);
     http_append_json_metric(out, &len, max, "clen", http_diag.content_len, true);
+    http_append_json_metric(out, &len, max, "http_pool", http_conn_count, true);
+    http_append_json_metric(out, &len, max, "http_inuse", http_inuse, true);
+    http_append_json_metric(out, &len, max, "tcp_capacity", tcp_capacity, true);
+    http_append_json_metric(out, &len, max, "tcp_inuse", tcp_inuse, true);
+    http_append_json_metric(out, &len, max, "tcp_listeners", tcp_listeners, true);
+    http_append_json_metric(out, &len, max, "tcp_pending_full",
+                            tdiag ? tdiag->pending_full : 0, true);
     struct perf_counter_snapshot perf;
     perf_counter_snapshot(&perf);
     const struct videocore_probe *vc = videocore_probe_get();
@@ -2379,6 +2398,11 @@ static u32 http_build_status_json(char *out, u32 max, const u8 *req, u32 req_len
         boot_success_marked_by_health = true;
     }
     return len;
+}
+
+static u32 http_build_diag_json(char *out, u32 max)
+{
+    return http_build_status_json(out, max, NULL, 0);
 }
 
 static void http_append_json_ip4(char *out, u32 *len, u32 max, u32 ip)
@@ -4788,17 +4812,25 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, ":");
         http_append_hex32(out, &len, max, (u32)cpuactlr);
         http_append(out, &len, max, "\n");
-    } else if (http_streq(cmd, "lease")) {
-        /* P0: prove the lease fabric (lifecycle, poison, MMU grant/revoke,
-         * zero-copy handle, copy-once, TLS-direct-write) runs live. */
-        bool ok = lease_selftest();
-        http_append(out, &len, max, ok ? "lease selftest PASS\n" : "lease selftest FAIL\n");
+    } else if (http_streq(cmd, "lease") || http_streq(cmd, "lease status")) {
+        /* Status is read-only. The full self-test resets the lease registry
+         * and is reserved for an explicit operator command below. */
         struct lease_stats st;
         lease_get_stats(&st);
-        http_append(out, &len, max, "lease pool slots=");
+        http_append(out, &len, max, "lease status slots=");
         http_append_u64(out, &len, max, st.slots_total);
         http_append(out, &len, max, " live=");
         http_append_u64(out, &len, max, st.slots_live);
+        http_append(out, &len, max, " arenas=");
+        http_append_u64(out, &len, max, st.arenas);
+        http_append(out, &len, max, " acquires=");
+        http_append_u64(out, &len, max, st.acquires);
+        http_append(out, &len, max, " releases=");
+        http_append_u64(out, &len, max, st.releases);
+        http_append(out, &len, max, " copies=");
+        http_append_u64(out, &len, max, st.copies);
+        http_append(out, &len, max, " transfers=");
+        http_append_u64(out, &len, max, st.transfers);
         http_append(out, &len, max, " rejects mmu=");
         http_append_u64(out, &len, max, st.mmu_rejects);
         http_append(out, &len, max, " stale=");
@@ -4806,6 +4838,11 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " state=");
         http_append_u64(out, &len, max, st.state_rejects);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "lease selftest")) {
+        /* P0: prove the lease fabric (lifecycle, poison, MMU grant/revoke,
+         * zero-copy handle, copy-once, TLS-direct-write) on demand. */
+        bool ok = lease_selftest();
+        http_append(out, &len, max, ok ? "lease selftest PASS\n" : "lease selftest FAIL\n");
     } else if (http_streq(cmd, "rxholedump")) {
 #if !PIOS_HAS_GENET
         http_append(out, &len, max,
@@ -10979,6 +11016,12 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
 
     if (route == HTTP_ROUTE_STATUS) {
         len = http_build_status_json(out, max, req, req_len);
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
+        return len;
+    }
+    if (route == HTTP_ROUTE_DIAG) {
+        len = http_build_diag_json(out, max);
         http_diag.build_len = len;
         http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
         return len;

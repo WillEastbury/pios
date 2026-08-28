@@ -73,6 +73,13 @@ static bool dma_channel_allowed(u32 ch)
 }
 
 void dma_init(void) {
+#if !PIOS_HAS_DMA
+    dma_hw_memcpy_enabled = false;
+    dma_direct_mode = false;
+    dma_cbaddr_shifted = false;
+    dma_last_error = DMA_ERR_NONE;
+    return;
+#else
     dma_hw_memcpy_enabled = false;
     dma_direct_mode = false;
     dma_cbaddr_shifted = false;
@@ -94,6 +101,7 @@ void dma_init(void) {
     dsb();
 
     uart_puts("[dma] 6 channels initialised\n");
+#endif
 }
 
 static void dma_dump_channel(u32 ch, const char *tag)
@@ -123,6 +131,10 @@ void dma_diag_snapshot(struct dma_diag_snapshot *out)
 {
     if (!out)
         return;
+#if !PIOS_HAS_DMA
+    simd_zero(out, sizeof(*out));
+    return;
+#else
     out->hw_memcpy_enabled = dma_hw_memcpy_enabled;
     out->direct_mode = dma_direct_mode;
     out->cbaddr_shifted = dma_cbaddr_shifted;
@@ -144,10 +156,14 @@ void dma_diag_snapshot(struct dma_diag_snapshot *out)
         out->channel[ch].len = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_LEN)) : 0;
         out->channel[ch].debug = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_DEBUG)) : 0;
     }
+#endif
 }
 
 bool dma_selftest(void)
 {
+#if !PIOS_HAS_DMA
+    return false;
+#else
     dma_selftest_runs++;
     dma_hw_memcpy_enabled = false;
     dma_last_error = DMA_ERR_NONE;
@@ -178,6 +194,7 @@ bool dma_selftest(void)
     dma_hw_memcpy_enabled = false;
     uart_puts("[dma] selftest failed both cbaddr modes\n");
     return false;
+#endif
 }
 
 static bool dma_selftest_mode(u32 mode)
