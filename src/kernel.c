@@ -25084,6 +25084,20 @@ void kernel_main(void) {
     /* HDMI stays on boot diags */
 
     if (at_el1) {
+        /*
+         * Stage0 uses a deliberately small 1280x720 framebuffer so the
+         * pre-MMU boot path stays bounded. It is only a handoff surface;
+         * the workbench needs the normal 1920x1080 allocation so its border
+         * and right-hand wedge diagnostics fit. Recreate the mailbox
+         * framebuffer now that EL1/MMU and the full kernel are ready.
+         */
+#if PIOS_HAS_MAILBOX_FB
+        bool dashboard_fb_ok =
+            fb_init(1920U, 1080U) || fb_init(1280U, 720U) ||
+            fb_init(1024U, 768U);
+        uart_puts(dashboard_fb_ok ? "[fb] dashboard framebuffer online\n" :
+                                   "[fb] dashboard framebuffer unavailable; keeping handoff\n");
+#endif
         watchdog_hw_set_suppressed(false);
         watchdog_hw_pet();
         core0_main();
