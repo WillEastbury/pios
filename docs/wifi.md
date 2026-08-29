@@ -197,7 +197,7 @@ Store on SD card at walfs paths:
 - [x] SDPCM framing (TX/RX)
 - [x] BCDC control message protocol
 - [x] WiFi scan (escan)
-- [x] WiFi join with WPA2-PSK
+- [ ] WPA2-PSK association across Pi 3 B+, Pi 5, and Zero 2 W
 - [x] WiFi disconnect
 - [x] Event handling (link up/down, scan results)
 - [x] NIC backend integration
@@ -205,7 +205,6 @@ Store on SD card at walfs paths:
 
 ### Future Work
 - [ ] Complete BCM43430 CM3/SOCRAM and CYW43436 hardware validation on Pi 3 B and Zero 2 W
-- [ ] Runtime board-profile selection when one shared stage2 package serves multiple BCM2837 boards
 - [ ] Full firmware upload from walfs
 - [ ] CLM blob loading
 - [ ] Console commands: `wifi scan`, `wifi connect`, `wifi status`

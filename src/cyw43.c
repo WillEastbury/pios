@@ -3575,21 +3575,24 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
         return false;
     }
 
-    /* The firmware's targeted association interface is the 72-byte "join"
-     * iovar used by Circle, not a short WLC_SET_SSID payload. */
-    u8 join_params[72];
-    memset(join_params,0,sizeof(join_params));
-    store_le32(join_params,ssid_len);
-    memcpy(join_params+4U,ssid,ssid_len);
-    store_le32(join_params+36U,0xFFU);
-    store_le32(join_params+40U,2U);
-    store_le32(join_params+44U,120U);
-    store_le32(join_params+48U,390U);
-    store_le32(join_params+52U,0xFFFFFFFFU);
-    memcpy(join_params+56U,best->bssid,CYW_MAC_LEN);
-    store_le32(join_params+64U,1U);
-    join_params[68U]=(u8)best->chanspec;
-    join_params[69U]=(u8)(best->chanspec>>8);
+    /* WLC_SET_SSID takes brcmf_join_params. Supplying the scanned BSSID and
+     * chanspec avoids the firmware's malformed zero-chanspec path on all
+     * supported CYW43 board profiles. */
+    struct {
+        u32 ssid_len;
+        u8  ssid[CYW_SSID_MAX];
+        u8  bssid[CYW_MAC_LEN];
+        u32 chanspec_num;
+        u16 chanspec_list[1];
+    } join_params;
+    _Static_assert(sizeof(join_params) == 52U,
+                   "Broadcom join parameters must include association data");
+    memset(&join_params, 0, sizeof(join_params));
+    join_params.ssid_len = ssid_len;
+    memcpy(join_params.ssid, ssid, ssid_len);
+    memcpy(join_params.bssid, best->bssid, CYW_MAC_LEN);
+    join_params.chanspec_num = 1U;
+    join_params.chanspec_list[0] = best->chanspec;
 
     uart_puts("[cyw] join SSID: ");
     for (u32 i = 0; i < ssid_len; i++)
@@ -3600,7 +3603,8 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
     event_history_reset();
     join_kicks_remaining = CYW_SCAN_KICKS_MAX;
     join_next_kick_ms = timer_monotonic_ms() + CYW_SCAN_KICK_INTERVAL_MS;
-    if (!bcdc_set_iovar("join",join_params,sizeof(join_params),false))
+    if (!bcdc_set_cmd(WLC_SET_SSID, &join_params,
+                      sizeof(join_params), false))
         return false;
 
     if (host_supplicant) {
