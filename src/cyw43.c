@@ -226,6 +226,20 @@ struct cyw_wpa_host {
 };
 static struct cyw_wpa_host wpa_host;
 
+static void wpa_attempt_reset(void)
+{
+    memset(&wpa_host, 0, sizeof(wpa_host));
+    cyw_eapol_len = 0U;
+    cyw_m2_len = 0U;
+}
+
+static bool cyw_join_fail(void)
+{
+    cyw_link = CYW_LINK_AUTH_FAIL;
+    join_kicks_remaining = 0U;
+    return false;
+}
+
 /* Discovered core addresses (from EROM scan) */
 static u32 cyw_arm_ctl;
 static u32 cyw_arm_regs;
@@ -899,23 +913,25 @@ static bool wpa_install_key(u32 index,const u8 *key,u32 key_len,
 {
     if (!key || key_len==0U || key_len>32U)
         return false;
-    u8 params[164],*p=params;
+    /*
+     * brcmf_wsec_key_le has a 64-byte data field and 18 u32 pad words
+     * before algo. The previous 164-byte hand-built buffer placed algo 32
+     * bytes too early, so the firmware read zero/garbage for the key
+     * metadata after M3.
+     */
+    u8 params[196];
     memset(params,0,sizeof(params));
-#define WPA_PUT32(v) do { u32 _v=(v);p[0]=(u8)_v;p[1]=(u8)(_v>>8);p[2]=(u8)(_v>>16);p[3]=(u8)(_v>>24);p+=4; } while(0)
-#define WPA_PUT16(v) do { u16 _v=(v);p[0]=(u8)_v;p[1]=(u8)(_v>>8);p+=2; } while(0)
-    WPA_PUT32(pairwise?0U:index);
-    WPA_PUT32(key_len);
-    memcpy(p,key,key_len);p+=32U+72U;
-    WPA_PUT32(4U);                 /* CRYPTO_ALGO_AES_CCM */
-    WPA_PUT32(pairwise?0U:2U);     /* PRIMARY_KEY for GTK */
-    p+=12U;
-    WPA_PUT32(0U);                 /* IV not initialized by host */
-    WPA_PUT32((u32)(rsc>>16));
-    WPA_PUT16((u16)rsc);
-    p+=10U;
-    if(pairwise&&peer) memcpy(p,peer,CYW_MAC_LEN);
-#undef WPA_PUT32
-#undef WPA_PUT16
+    store_le32(params + 0U, pairwise ? 0U : index);
+    store_le32(params + 4U, key_len);
+    memcpy(params + 8U, key, key_len);
+    store_le32(params + 144U, 4U);             /* CRYPTO_ALGO_AES_CCM */
+    store_le32(params + 148U, pairwise ? 0U : 2U); /* PRIMARY_KEY for GTK */
+    store_le32(params + 164U, 0U);             /* IV not initialized */
+    store_le32(params + 172U, (u32)(rsc >> 16));
+    params[176U] = (u8)rsc;
+    params[177U] = (u8)(rsc >> 8);
+    if (pairwise && peer)
+        memcpy(params + 188U, peer, CYW_MAC_LEN);
     bool ok=bcdc_set_iovar("wsec_key",params,sizeof(params),false);
     memset(params,0,sizeof(params));
     return ok;
@@ -1832,6 +1848,12 @@ static void handle_event(const u8 *data, u32 len)
         ((u8 *)cyw_diag.event_words)[i] = data[i];
 
     switch (event_type) {
+    case CYW_E_JOIN:
+        if (status != CYW_E_STATUS_SUCCESS &&
+            cyw_link == CYW_LINK_JOINING)
+            cyw_link = CYW_LINK_AUTH_FAIL;
+        break;
+
     case CYW_E_AUTH:
         if (status != CYW_E_STATUS_SUCCESS)
             cyw_link = CYW_LINK_AUTH_FAIL;
@@ -1874,11 +1896,16 @@ static void handle_event(const u8 *data, u32 len)
         }
         break;
 
-    case CYW_E_DISASSOC_IND:
+    case CYW_E_DEAUTH:
     case CYW_E_DEAUTH_IND:
-        cyw_link = CYW_LINK_DOWN;
+    case CYW_E_DISASSOC:
+    case CYW_E_DISASSOC_IND:
+        cyw_link = cyw_link == CYW_LINK_JOINING ?
+                   CYW_LINK_AUTH_FAIL : CYW_LINK_DOWN;
         uart_puts("[cyw] discon ev=");
         uart_hex(event_type);
+        uart_puts(" reason=");
+        uart_hex(reason);
         uart_puts(")\n");
         break;
 
@@ -3432,6 +3459,14 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
         return false;
     if (!key || key_len > CYW_PASSPHRASE_MAX)
         return false;
+    if (cyw_link == CYW_LINK_JOINING ||
+        scan_in_progress || scan_results_pending ||
+        scan_result_request_pending) {
+        uart_puts("[cyw] join rejected: scan or join still active\n");
+        return false;
+    }
+    wpa_attempt_reset();
+    cyw_link = CYW_LINK_DOWN;
     scan_kicks_remaining = 0U;
     struct cyw_scan_result fixed_target;
     const struct cyw_scan_result *best = NULL;
@@ -3473,8 +3508,6 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
 
     bool host_supplicant =
         !sae && key_len == 32U && key_flags == 0U;
-    wpa_host.enabled = false;
-    wpa_host.m2_sent = false;
 
     uart_puts("[cyw] join radio\n");
     if (!cyw43_radio_enable())
@@ -3501,7 +3534,7 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
     u32 rsn_ie_len=sizeof(rsn_buf);
     if (!sae && security != WSEC_NONE &&
         !bcdc_set_iovar("wpaie",rsn_ie,rsn_ie_len,false))
-        return false;
+        return cyw_join_fail();
 
 
     u32 wsec;
@@ -3523,7 +3556,7 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
             u32 transitional = WPA2_AUTH_PSK | 0x0040U;
             if (!bcdc_set_iovar("wpa_auth",&transitional,
                                 sizeof(transitional),false))
-                return false;
+                return cyw_join_fail();
         } else if (sae) {
             struct {
                 u16 key_len;
@@ -3534,13 +3567,13 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
             memcpy(sae_password.key, key, key_len);
             if (!bcdc_set_iovar("sae_password", &sae_password,
                                 sizeof(sae_password), false))
-                return false;
+                return cyw_join_fail();
         } else {
             u32 supplicant = 1U;
             uart_puts("[cyw] join supplicant\n");
             if (!bcdc_set_iovar("sup_wpa", &supplicant,
                                 sizeof(supplicant), false))
-                return false;
+                return cyw_join_fail();
             timer_delay_ms(2U);
             struct {
                 u16 key_len;
@@ -3553,7 +3586,7 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
             memcpy(wsec_pmk.key, key, key_len);
             if (!bcdc_set_cmd(WLC_SET_WSEC_PMK, &wsec_pmk,
                               sizeof(wsec_pmk), false))
-                return false;
+                return cyw_join_fail();
         }
     }
 
@@ -3561,18 +3594,18 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
     u32 mfp = security == WSEC_NONE ? 0U : 1U;
     uart_puts("[cyw] join auth\n");
     if (!bcdc_set_cmd(WLC_SET_AUTH, &auth, sizeof(auth), false))
-        return false;
+        return cyw_join_fail();
     uart_puts("[cyw] join wsec\n");
     if (!bcdc_set_cmd(WLC_SET_WSEC, &wsec, sizeof(wsec), false))
-        return false;
+        return cyw_join_fail();
     if (sae && !bcdc_set_iovar("mfp", &mfp, sizeof(mfp), false))
-        return false;
+        return cyw_join_fail();
     if (host_supplicant) {
         if (!bcdc_set_iovar("wpa_auth",&wpa_auth,sizeof(wpa_auth),false))
-            return false;
+            return cyw_join_fail();
     } else if (!bcdc_set_cmd(WLC_SET_WPA_AUTH, &wpa_auth,
                              sizeof(wpa_auth), false)) {
-        return false;
+        return cyw_join_fail();
     }
 
     /* WLC_SET_SSID takes brcmf_join_params. Supplying the scanned BSSID and
@@ -3603,10 +3636,6 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
     event_history_reset();
     join_kicks_remaining = CYW_SCAN_KICKS_MAX;
     join_next_kick_ms = timer_monotonic_ms() + CYW_SCAN_KICK_INTERVAL_MS;
-    if (!bcdc_set_cmd(WLC_SET_SSID, &join_params,
-                      sizeof(join_params), false))
-        return false;
-
     if (host_supplicant) {
         wpa_host.nonce_ready=false;
         memcpy(wpa_host.pmk,key,32U);
@@ -3615,6 +3644,9 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
         wpa_host.rsn_ie_len=(u8)rsn_ie_len;
         wpa_host.enabled=true;
     }
+    if (!bcdc_set_cmd(WLC_SET_SSID, &join_params,
+                      sizeof(join_params), false))
+        return cyw_join_fail();
 
     /* Association is asynchronous. The core-0 reactor owns SDPCM/event
      * draining; blocking here used to starve the wired fail-safe path and

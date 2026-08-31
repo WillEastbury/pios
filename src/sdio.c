@@ -181,6 +181,23 @@ static bool sdio_wait_data(void)
     return !(sr(REG_STATUS) & SR_DAT_INHIBIT);
 }
 
+static bool sdio_reset_cmd_line(void)
+{
+    sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD);
+    u32 timeout = 100000U;
+    while (timeout != 0U && (sr8(SDHCI_SOFTWARE_RESET) &
+                             SDHCI_RESET_CMD) != 0U) {
+        timeout--;
+        delay_cycles(10U);
+    }
+    sw(REG_INTERRUPT, INT_ALL);
+    if ((sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_CMD) != 0U) {
+        uart_puts("[sdio] CMD reset timeout\n");
+        return false;
+    }
+    return true;
+}
+
 static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
 {
     if (!sdio_wait_cmd())
@@ -459,12 +476,12 @@ bool sdio_power_on(void)
     /* Drive low (reset) */
     u32 data = mmio_read(BCM2712_GPIO1_DATA0);
     mmio_write(BCM2712_GPIO1_DATA0, data & ~bit);
-    delay_cycles(200000);
+    timer_delay_ms(20U);
 
     /* Drive high (power on) */
     data = mmio_read(BCM2712_GPIO1_DATA0);
     mmio_write(BCM2712_GPIO1_DATA0, data | bit);
-    delay_cycles(2000000);  /* 150ms+ startup delay */
+    timer_delay_ms(150U);
     
     /* Verify GPIO state */
     u32 data_readback = mmio_read(BCM2712_GPIO1_DATA0);
@@ -484,12 +501,12 @@ bool sdio_power_on(void)
         uart_puts("[sdio] firmware WL_ON low failed\n");
         return false;
     }
-    delay_cycles(200000U);
+    timer_delay_ms(20U);
     if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, true)) {
         uart_puts("[sdio] firmware WL_ON high failed\n");
         return false;
     }
-    delay_cycles(2000000U);
+    timer_delay_ms(150U);
     sdio_diag.wl_data = 1U;
     sdio_diag.wl_iodir = 1U;
     uart_puts("[sdio] firmware WL_ON GPIO129 high\n");
@@ -504,9 +521,9 @@ bool sdio_power_on(void)
     fsel |= 1U << ((gpio - 40U) * 3U); /* output */
     mmio_write(base + 0x10U, fsel);
     mmio_write(base + 0x2CU, bit); /* GPCLR1: hold radio in reset */
-    delay_cycles(200000U);
+    timer_delay_ms(20U);
     mmio_write(base + 0x20U, bit); /* GPSET1: release radio reset */
-    delay_cycles(2000000U);
+    timer_delay_ms(150U);
     sdio_diag.wl_data = mmio_read(base + 0x38U); /* GPLEV1 */
     sdio_diag.wl_iodir = mmio_read(base + 0x10U);
     uart_puts("[sdio] WL_REG_ON GPIO41: level=");
@@ -524,14 +541,14 @@ void sdio_power_off(void)
     u32 bit = 1U << SDIO_WL_REG_ON_GPIO;
     u32 data = mmio_read(BCM2712_GPIO1_DATA0);
     mmio_write(BCM2712_GPIO1_DATA0, data & ~bit);
-    delay_cycles(200000);
+    timer_delay_ms(20U);
 #elif PIOS_HAS_WIFI_SDIO1 && PIOS_WIFI_WL_REG_ON_FIRMWARE
     (void)mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false);
-    delay_cycles(200000U);
+    timer_delay_ms(20U);
 #elif PIOS_HAS_WIFI_SDIO1
     const u32 bit = 1U << (PIOS_WIFI_WL_REG_ON_GPIO - 32U);
     mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x2CU, bit);
-    delay_cycles(200000U);
+    timer_delay_ms(20U);
 #endif
 }
 
@@ -660,7 +677,7 @@ bool sdio_init(void)
     uart_hex((sr(REG_STATUS) >> 16) & 1);
     uart_puts("\n");
 
-    delay_cycles(200000);  /* 20ms settle */
+    timer_delay_ms(20U);
 
     /* CMD0: GO_IDLE_STATE */
     sdio_send_cmd(SDIO_CMD0, 0, NULL);
@@ -694,9 +711,9 @@ bool sdio_init(void)
         /* Send CMD5 directly — tolerate errors on first attempts */
         if (!sdio_wait_cmd()) {
             uart_puts("[sdio] CMD5 wait_cmd fail\n");
-            sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD);
-            while (sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_CMD) delay_cycles(10);
-            delay_cycles(100000);
+            if (!sdio_reset_cmd_line())
+                return false;
+            timer_delay_ms(10U);
             continue;
         }
         
@@ -734,9 +751,9 @@ bool sdio_init(void)
         
         sw(REG_INTERRUPT, 0xFFFFFFFF);
         /* Reset CMD line on error — proper 8-bit write + poll */
-        sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD);
-        while (sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_CMD) delay_cycles(10);
-        delay_cycles(2000000);
+        if (!sdio_reset_cmd_line())
+            return false;
+        timer_delay_ms(100U);
     }
     
     if (!cmd5_ok) {
@@ -763,7 +780,7 @@ bool sdio_init(void)
             uart_puts("[sdio] CMD5 retry fail\n");
             return false;
         }
-        delay_cycles(1000000);  /* 100ms between retries (Circle: tsleep 100) */
+        timer_delay_ms(100U);
     } while (!(resp[0] & (1U << 31)) && timeout--);
 
     if (!timeout) {
