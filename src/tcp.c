@@ -5,7 +5,7 @@
  * Reno congestion control, RFC 5961 RST hardening, retransmit with
  * exponential backoff, fast retransmit on 3 dup ACKs.
  *
- * Max 8 simultaneous connections. Runs on Core 0 alongside net_poll().
+ * Runs on Core 0 from ADR-033 FIFO/AIRQ network events.
  *
  * References: RFC 793, RFC 5681, RFC 5961, RFC 6528
  */
@@ -48,6 +48,8 @@ extern u32 net_get_our_ip(void);
 #define MAX_RETRIES         8
 
 #define LISTEN_BACKLOG      64
+#define TCP_SYN_PAYLOAD_SLOTS 64U
+#define TCP_SYN_PAYLOAD_INVALID 0xFFFFU
 #define TCP_DMA_COPY_THRESHOLD 256U
 #define TCP_UART_DIAG_VERBOSE 0
 
@@ -193,6 +195,8 @@ static void ring_consume(struct ring_buf *r, u32 n) {
 /* ================================================================== */
 
 struct tcb {
+    u32 generation;
+
     /* Connection 4-tuple */
     u32 local_ip;
     nic_iface_t iface;
@@ -250,6 +254,8 @@ struct tcb {
         nic_iface_t iface;
         u32 irs;        /* client ISN */
         u32 iss;        /* our ISN (from SYN cookie) */
+        u16 data_slot;  /* bounded payload pool slot, or INVALID */
+        u16 data_len;
     } pending[LISTEN_BACKLOG];
 
     /* Intrusive links for the O(1) connection table (see below). */
@@ -276,6 +282,8 @@ struct tcb {
                                       * .bss is NOLOAD so this costs ZERO binary
                                       * size — only runtime RAM. */
 #define TCP_MAX_LISTENERS   32U
+_Static_assert(TCP_TABLE_TARGET <= TCP_CONN_INDEX_MASK + 1U,
+               "tcp_conn_t index field is too small for the live TCB table");
 
 static struct tcb  tcbs_fallback[TCP_TABLE_FALLBACK];
 static i32         hash_fallback[256];
@@ -287,6 +295,16 @@ static i32         tcb_free_head = -1;
 static u32         tcb_inuse;        /* live (non-free) tcb count, diag */
 static i32         tcp_listeners[TCP_MAX_LISTENERS];
 static u32         tcp_listener_count;
+
+struct tcp_syn_payload_slot {
+    u32 used;
+    u8 _control_pad[60];
+    u8 data[TCP_MSS];
+    u8 _stride_pad[12];
+} ALIGNED(64);
+static struct tcp_syn_payload_slot tcp_syn_payloads[TCP_SYN_PAYLOAD_SLOTS];
+_Static_assert(sizeof(struct tcp_syn_payload_slot) == 1536U,
+               "SYN payload slots must have cache-line stride");
 
 static inline u32 tcb_hash_key(u16 local_port, u32 remote_ip, u16 remote_port,
                                nic_iface_t iface) {
@@ -329,6 +347,38 @@ static u8 tx_frame[1600] ALIGNED(64);
 
 static u32 min32(u32 a, u32 b) { return a < b ? a : b; }
 
+static u16 tcp_syn_payload_alloc(const u8 *data, u32 len)
+{
+    if (!data || len == 0U || len > TCP_MSS)
+        return TCP_SYN_PAYLOAD_INVALID;
+    for (u32 i = 0; i < TCP_SYN_PAYLOAD_SLOTS; i++) {
+        if (tcp_syn_payloads[i].used)
+            continue;
+        tcp_syn_payloads[i].used = true;
+        tcp_memcpy_accel(tcp_syn_payloads[i].data, data, len);
+        return (u16)i;
+    }
+    return TCP_SYN_PAYLOAD_INVALID;
+}
+
+static void tcp_syn_payload_free(u16 slot)
+{
+    if (slot >= TCP_SYN_PAYLOAD_SLOTS)
+        return;
+    simd_zero(tcp_syn_payloads[slot].data,
+              sizeof(tcp_syn_payloads[slot].data));
+    tcp_syn_payloads[slot].used = false;
+}
+
+static void tcp_listener_pending_clear(struct tcb *t)
+{
+    if (!t || t->state != TCP_LISTEN)
+        return;
+    for (u32 i = 0; i < t->pending_count; i++)
+        tcp_syn_payload_free(t->pending[i].data_slot);
+    t->pending_count = 0U;
+}
+
 /* Sequence number comparison: a < b in modular arithmetic */
 static bool seq_lt(u32 a, u32 b)  { return (i32)(a - b) < 0; }
 static bool seq_le(u32 a, u32 b)  { return (i32)(a - b) <= 0; }
@@ -336,6 +386,17 @@ static bool seq_gt(u32 a, u32 b)  { return (i32)(a - b) > 0; }
 
 static i32 tcb_index(const struct tcb *t) {
     return (i32)(t - tcbs);
+}
+
+static u32 tcb_bump_generation(u32 generation)
+{
+    generation = (generation + 1U) & TCP_CONN_GENERATION_MASK;
+    return generation ? generation : 1U;
+}
+
+static tcp_conn_t tcb_handle(const struct tcb *t)
+{
+    return tcp_conn_make((u32)tcb_index(t), t->generation);
 }
 
 /* Insert an active (4-tuple-bearing) tcb into the hash. Call after the 4-tuple
@@ -409,13 +470,26 @@ static struct tcb *tcb_alloc(void) {
     i32 idx = tcb_free_head;
     struct tcb *t = &tcbs[idx];
     tcb_free_head = t->free_next;
+    u32 generation = t->generation;
+    simd_zero(t, sizeof(*t));
+    t->generation = generation ? generation : 1U;
+    t->hash_next = -1;
     t->free_next = -1;
     tcb_inuse++;
     return t;
 }
 
-static bool tcb_valid(tcp_conn_t c) {
-    return c >= 0 && (u32)c < tcb_capacity && tcbs[c].state != TCP_CLOSED;
+static struct tcb *tcb_from_handle(tcp_conn_t conn)
+{
+    u32 slot = 0;
+    u32 generation = 0;
+    if (!tcbs || !tcp_conn_decode(conn, &slot, &generation) ||
+        slot >= tcb_capacity)
+        return NULL;
+    struct tcb *t = &tcbs[slot];
+    if (t->state == TCP_CLOSED || t->generation != generation)
+        return NULL;
+    return t;
 }
 
 #if TCP_UART_DIAG_VERBOSE
@@ -722,15 +796,18 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
     if (!nic_send_on(t->iface, tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
 }
 
-/* Send a raw RST/ACK without a TCB (for rejecting unexpected segments) */
-static void tcp_send_rst(nic_iface_t iface, u32 src_ip, u32 dst_ip,
-                         u16 src_port, u16 dst_port, u32 seq, u32 ack) {
+static bool tcp_send_control(nic_iface_t iface, u32 src_ip, u32 dst_ip,
+                             u16 src_port, u16 dst_port, u32 seq, u32 ack,
+                             u8 flags, u16 window)
+{
     const u8 *dst_mac = net_resolve_mac_on(iface, dst_ip);
-    if (!dst_mac) { tcp_diag_counts.tx_no_mac++; return; }
+    if (!dst_mac) {
+        tcp_diag_counts.tx_no_mac++;
+        return false;
+    }
 
     u16 ip_total = IP_HDR_SIZE + TCP_HDR_SIZE;
     u32 frame_len = ETH_HDR_SIZE + ip_total;
-
     struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
     simd_memcpy(eth->dst, dst_mac, 6);
     u8 local_mac[6];
@@ -757,68 +834,49 @@ static void tcp_send_rst(nic_iface_t iface, u32 src_ip, u32 dst_ip,
     tcp->seq       = htonl(seq);
     tcp->ack       = htonl(ack);
     tcp->data_off  = (TCP_HDR_SIZE / 4) << 4;
-    tcp->flags     = TCP_RST | TCP_ACK;
-    tcp->window    = 0;
+    tcp->flags     = flags;
+    tcp->window    = htons(window);
     tcp->checksum  = 0;
     tcp->urgent    = 0;
-
     tcp->checksum = tcp_checksum(src_ip, dst_ip, tcp, TCP_HDR_SIZE);
 
     if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
     tcp_diag_counts.tx_segments++;
-    if (!nic_send_on(iface, tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
+    bool sent = nic_send_on(iface, tx_frame, frame_len);
+    if (!sent)
+        tcp_diag_counts.tx_send_fail++;
+    return sent;
+}
+
+/* Send a raw RST/ACK without a TCB (for rejecting unexpected segments) */
+static void tcp_send_rst(nic_iface_t iface, u32 src_ip, u32 dst_ip,
+                         u16 src_port, u16 dst_port, u32 seq, u32 ack) {
+    (void)tcp_send_control(iface, src_ip, dst_ip, src_port, dst_port,
+                           seq, ack, TCP_RST | TCP_ACK, 0U);
+}
+
+/* Acknowledge a SYN-cookie completion before a TCB exists. ack is either the
+ * first post-SYN sequence (payload was not retained, forcing retransmission)
+ * or the byte after a payload copied into the bounded pending pool. */
+static void tcp_send_cookie_ack(nic_iface_t iface, u32 remote_ip,
+                                u16 remote_port, u16 local_port,
+                                u32 cookie_isn, u32 ack)
+{
+    u32 local_ip = net_get_our_ip_for(iface);
+    (void)tcp_send_control(iface, local_ip, remote_ip, local_port,
+                           remote_port, cookie_isn + 1U, ack, TCP_ACK,
+                           TCP_DEFAULT_WINDOW);
 }
 
 /* Send a SYN-ACK with SYN cookie ISN (no TCB needed) */
 static void tcp_send_synack_cookie(nic_iface_t iface, u32 remote_ip, u16 remote_port,
                                    u16 local_port, u32 their_seq,
                                    u32 cookie_isn) {
-    const u8 *dst_mac = net_resolve_mac_on(iface, remote_ip);
-    if (!dst_mac) { tcp_diag_counts.tx_no_mac++; return; }
-
-    u16 ip_total = IP_HDR_SIZE + TCP_HDR_SIZE;
-    u32 frame_len = ETH_HDR_SIZE + ip_total;
-
-    struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
-    simd_memcpy(eth->dst, dst_mac, 6);
-    u8 local_mac[6];
-    net_get_mac_for(iface, local_mac);
-    simd_memcpy(eth->src, local_mac, 6);
-    eth->ethertype = htons(ETH_P_IP);
-
-    struct ip_hdr *ip = (struct ip_hdr *)(tx_frame + ETH_HDR_SIZE);
-    ip->ver_ihl    = 0x45;
-    ip->tos        = 0;
-    ip->total_len  = htons(ip_total);
-    ip->id         = htons(tcp_ip_id++);
-    ip->flags_frag = htons(0x4000);
-    ip->ttl        = 64;
-    ip->protocol   = IP_PROTO_TCP;
-    ip->checksum   = 0;
-    ip->src_ip     = htonl(net_get_our_ip_for(iface));
-    ip->dst_ip     = htonl(remote_ip);
-    ip->checksum   = simd_checksum(ip, IP_HDR_SIZE);
-
-    struct tcp_hdr *tcp = (struct tcp_hdr *)(tx_frame + ETH_HDR_SIZE + IP_HDR_SIZE);
-    tcp->src_port  = htons(local_port);
-    tcp->dst_port  = htons(remote_port);
-    tcp->seq       = htonl(cookie_isn);
-    tcp->ack       = htonl(their_seq + 1);
-    tcp->data_off  = (TCP_HDR_SIZE / 4) << 4;
-    tcp->flags     = TCP_SYN | TCP_ACK;
-    tcp->window    = htons(TCP_DEFAULT_WINDOW);
-    tcp->checksum  = 0;
-    tcp->urgent    = 0;
-
-    tcp->checksum = tcp_checksum(net_get_our_ip_for(iface), remote_ip,
-                                 tcp, TCP_HDR_SIZE);
-
-    if (frame_len < MIN_FRAME) frame_len = MIN_FRAME;
-    tcp_diag_counts.tx_segments++;
-    if (nic_send_on(iface, tx_frame, frame_len))
+    if (tcp_send_control(iface, net_get_our_ip_for(iface), remote_ip,
+                         local_port, remote_port, cookie_isn, their_seq + 1U,
+                         TCP_SYN | TCP_ACK, TCP_DEFAULT_WINDOW))
         tcp_diag_counts.synack_sent++;
     else {
-        tcp_diag_counts.tx_send_fail++;
 #if TCP_UART_DIAG_VERBOSE
         uart_puts("[tcp] SYNACK nic_send failed\n");
 #endif
@@ -1005,11 +1063,15 @@ static void tcb_reset(struct tcb *t) {
     if (st == TCP_CLOSED)
         return;   /* already free — never double-link onto the free list */
     i32 idx = tcb_index(t);
-    if (st == TCP_LISTEN)
+    if (st == TCP_LISTEN) {
+        tcp_listener_pending_clear(t);
         tcp_listener_unregister(idx);
-    else
+    } else {
         tcb_hash_remove(t);   /* active conn: unlink from the 4-tuple hash */
+    }
+    u32 generation = tcb_bump_generation(t->generation);
     simd_zero(t, sizeof(struct tcb));   /* state -> TCP_CLOSED (0) */
+    t->generation = generation;
     t->hash_next = -1;
     t->free_next = tcb_free_head;
     tcb_free_head = idx;
@@ -1232,8 +1294,17 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
             for (u32 i = 0; i < listen->pending_count; i++) {
                 if (listen->pending[i].remote_ip == src_ip &&
                     listen->pending[i].remote_port == src_port &&
-                    listen->pending[i].iface == ingress_iface)
+                    listen->pending[i].iface == ingress_iface) {
+                    u32 ack = seg_seq;
+                    if (seg_seq == listen->pending[i].irs + 1U &&
+                        listen->pending[i].data_slot != TCP_SYN_PAYLOAD_INVALID &&
+                        listen->pending[i].data_len == data_len)
+                        ack += data_len;
+                    if (data_len > 0U)
+                        tcp_send_cookie_ack(ingress_iface, src_ip, src_port,
+                                            dst_port, their_seq, ack);
                     return;
+                }
             }
             if (listen->pending_count < LISTEN_BACKLOG) {
                 tcp_diag_counts.pending_queued++;
@@ -1243,8 +1314,21 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
                 listen->pending[idx].iface        = ingress_iface;
                 listen->pending[idx].irs          = their_iss;
                 listen->pending[idx].iss          = their_seq;
+                listen->pending[idx].data_slot =
+                    tcp_syn_payload_alloc(seg_data, data_len);
+                listen->pending[idx].data_len =
+                    (listen->pending[idx].data_slot !=
+                     TCP_SYN_PAYLOAD_INVALID) ? (u16)data_len : 0U;
+                if (data_len > 0U) {
+                    u32 ack = seg_seq + listen->pending[idx].data_len;
+                    tcp_send_cookie_ack(ingress_iface, src_ip, src_port,
+                                        dst_port, their_seq, ack);
+                }
             } else {
                 tcp_diag_counts.pending_full++;
+                if (data_len > 0U)
+                    tcp_send_cookie_ack(ingress_iface, src_ip, src_port,
+                                        dst_port, their_seq, seg_seq);
             }
             return;
         }
@@ -1569,6 +1653,7 @@ void tcp_init(void) {
      * Other tcb fields stay garbage until tcb_alloc's caller simd_zero()s the
      * slot, so we avoid zeroing the whole (up to ~134MB) highmem table. */
     for (u32 i = 0; i < cap; i++) {
+        table[i].generation = 1U;
         table[i].state     = TCP_CLOSED;
         table[i].hash_next = -1;
         table[i].free_next = (i + 1U < cap) ? (i32)(i + 1U) : -1;
@@ -1576,6 +1661,7 @@ void tcp_init(void) {
     tcb_free_head = 0;
     tcb_inuse = 0;
     tcp_listener_count = 0;
+    simd_zero(tcp_syn_payloads, sizeof(tcp_syn_payloads));
 
 
     /* Generate SYN cookie secret from timer jitter */
@@ -1601,7 +1687,6 @@ tcp_conn_t tcp_connect_on(nic_iface_t iface, u32 dst_ip, u16 dst_port) {
 
     u16 src_port = alloc_port();
 
-    simd_zero(t, sizeof(struct tcb));
     t->iface       = iface;
     t->local_ip    = net_get_our_ip_for(t->iface);
     t->remote_ip   = dst_ip;
@@ -1625,7 +1710,7 @@ tcp_conn_t tcp_connect_on(nic_iface_t iface, u32 dst_ip, u16 dst_port) {
     t->snd_nxt = t->iss + 1;
     tcp_arm_rto(t);
 
-    return tcb_index(t);
+    return tcb_handle(t);
 }
 
 tcp_conn_t tcp_connect(u32 dst_ip, u16 dst_port)
@@ -1635,14 +1720,14 @@ tcp_conn_t tcp_connect(u32 dst_ip, u16 dst_port)
 
 nic_iface_t tcp_iface(tcp_conn_t conn)
 {
-    return (tcbs && tcb_valid(conn)) ? tcbs[conn].iface : NIC_IFACE_ANY;
+    struct tcb *t = tcb_from_handle(conn);
+    return t ? t->iface : NIC_IFACE_ANY;
 }
 
 tcp_conn_t tcp_listen(u16 port) {
     struct tcb *t = tcb_alloc();
     if (!t) return -1;
 
-    simd_zero(t, sizeof(struct tcb));
     t->iface      = NIC_IFACE_ANY;
     t->local_ip   = 0;
     t->local_port = port;
@@ -1650,12 +1735,12 @@ tcp_conn_t tcp_listen(u16 port) {
     t->rcv_wnd    = TCP_DEFAULT_WINDOW;
 
     tcp_listener_register(tcb_index(t));
-    return tcb_index(t);
+    return tcb_handle(t);
 }
 
 tcp_conn_t tcp_accept(tcp_conn_t listen_conn) {
-    if (!tcb_valid(listen_conn)) return -1;
-    struct tcb *lt = &tcbs[listen_conn];
+    struct tcb *lt = tcb_from_handle(listen_conn);
+    if (!lt) return -1;
     if (lt->state != TCP_LISTEN || lt->pending_count == 0) return -1;
 
     /* Do not consume backlog entries if no TCB is available yet. */
@@ -1668,13 +1753,14 @@ tcp_conn_t tcp_accept(tcp_conn_t listen_conn) {
     nic_iface_t iface = lt->pending[0].iface;
     u32 irs         = lt->pending[0].irs;
     u32 iss         = lt->pending[0].iss;
+    u16 data_slot   = lt->pending[0].data_slot;
+    u16 data_len    = lt->pending[0].data_len;
 
     /* Shift backlog */
     for (u32 i = 1; i < lt->pending_count; i++)
         lt->pending[i - 1] = lt->pending[i];
     lt->pending_count--;
 
-    simd_zero(t, sizeof(struct tcb));
     t->iface       = iface;
     t->local_ip    = net_get_our_ip_for(iface);
     t->remote_ip   = remote_ip;
@@ -1694,14 +1780,22 @@ tcp_conn_t tcp_accept(tcp_conn_t listen_conn) {
 
     t->state = TCP_ESTABLISHED;
     tcb_hash_insert(t);
+    if (data_slot != TCP_SYN_PAYLOAD_INVALID && data_len > 0U) {
+        u32 written = ring_write(&t->rx_buf,
+                                 tcp_syn_payloads[data_slot].data, data_len);
+        t->rcv_nxt += written;
+        t->rcv_wnd = ring_free(&t->rx_buf);
+    }
+    tcp_syn_payload_free(data_slot);
+    tcp_send_ack(t);
     tcp_diag_counts.accepted++;
     tcp_log_established(t, "accepted");
-    return tcb_index(t);
+    return tcb_handle(t);
 }
 
 u32 tcp_write(tcp_conn_t conn, const void *data, u32 len) {
-    if (!tcb_valid(conn)) return 0;
-    struct tcb *t = &tcbs[conn];
+    struct tcb *t = tcb_from_handle(conn);
+    if (!t) return 0;
     if (t->state != TCP_ESTABLISHED && t->state != TCP_CLOSE_WAIT) return 0;
 
     u32 written = ring_write(&t->tx_buf, data, len);
@@ -1716,8 +1810,8 @@ u32 tcp_write(tcp_conn_t conn, const void *data, u32 len) {
  * nothing to drain — so nothing re-triggers the ACK. A caller stalled waiting
  * for more inbound data can call this to keep the window advertised. */
 void tcp_advertise_window(tcp_conn_t conn) {
-    if (!tcb_valid(conn)) return;
-    struct tcb *t = &tcbs[conn];
+    struct tcb *t = tcb_from_handle(conn);
+    if (!t) return;
     if (t->state != TCP_ESTABLISHED) return;
     u32 old_wnd = t->rcv_wnd;
     t->rcv_wnd = ring_free(&t->rx_buf);
@@ -1726,8 +1820,8 @@ void tcp_advertise_window(tcp_conn_t conn) {
 }
 
 u32 tcp_read(tcp_conn_t conn, void *data, u32 len) {
-    if (!tcb_valid(conn)) return 0;
-    struct tcb *t = &tcbs[conn];
+    struct tcb *t = tcb_from_handle(conn);
+    if (!t) return 0;
     u32 old_wnd = t->rcv_wnd;
     u32 n = ring_read(&t->rx_buf, data, len);
     t->rcv_wnd = ring_free(&t->rx_buf);
@@ -1747,9 +1841,17 @@ u32 tcp_read(tcp_conn_t conn, void *data, u32 len) {
     return n;
 }
 
+u32 tcp_peek(tcp_conn_t conn, u32 offset, void *data, u32 len)
+{
+    struct tcb *t = tcb_from_handle(conn);
+    if (!t || !data)
+        return 0;
+    return ring_peek_at(&t->rx_buf, offset, data, len);
+}
+
 void tcp_close(tcp_conn_t conn) {
-    if (!tcb_valid(conn)) return;
-    struct tcb *t = &tcbs[conn];
+    struct tcb *t = tcb_from_handle(conn);
+    if (!t) return;
 
     switch (t->state) {
     case TCP_LISTEN:
@@ -1778,9 +1880,9 @@ void tcp_close(tcp_conn_t conn) {
 
 void tcp_abort(tcp_conn_t conn)
 {
-    if (conn < 0 || (u32)conn >= tcb_capacity)
-        return;
-    tcb_reset(&tcbs[conn]);
+    struct tcb *t = tcb_from_handle(conn);
+    if (t)
+        tcb_reset(t);
 }
 
 void tcp_purge_port(u16 local_port)
@@ -1792,7 +1894,7 @@ void tcp_purge_port(u16 local_port)
         if (t->local_port != local_port)
             continue;
         if (t->state == TCP_LISTEN) {
-            t->pending_count = 0;
+            tcp_listener_pending_clear(t);
         } else {
             tcb_reset(t);
         }
@@ -1800,31 +1902,33 @@ void tcp_purge_port(u16 local_port)
 }
 
 u32 tcp_state(tcp_conn_t conn) {
-    if (conn < 0 || (u32)conn >= tcb_capacity)
-        return TCP_CLOSED;
-    return tcbs[conn].state;
+    struct tcb *t = tcb_from_handle(conn);
+    return t ? t->state : TCP_CLOSED;
 }
 
 u32 tcp_readable(tcp_conn_t conn) {
-    if (!tcb_valid(conn)) return 0;
+    struct tcb *t = tcb_from_handle(conn);
+    if (!t) return 0;
     dmb();
-    u32 n = ring_used(&tcbs[conn].rx_buf);
+    u32 n = ring_used(&t->rx_buf);
     dmb();
     return n;
 }
 
 u32 tcp_writable(tcp_conn_t conn) {
-    if (!tcb_valid(conn)) return 0;
+    struct tcb *t = tcb_from_handle(conn);
+    if (!t) return 0;
     dmb();
-    u32 n = ring_free(&tcbs[conn].tx_buf);
+    u32 n = ring_free(&t->tx_buf);
     dmb();
     return n;
 }
 
 u32 tcp_tx_pending(tcp_conn_t conn) {
-    if (!tcb_valid(conn)) return 0;
+    struct tcb *t = tcb_from_handle(conn);
+    if (!t) return 0;
     dmb();
-    u32 n = ring_used(&tcbs[conn].tx_buf);
+    u32 n = ring_used(&t->tx_buf);
     dmb();
     return n;
 }
@@ -1850,7 +1954,7 @@ u32 tcp_snapshot(tcp_snapshot_entry_t *out, u32 max)
         if (t->state == TCP_CLOSED)
             continue;
         dmb();
-        out[n].conn = (i32)i;
+        out[n].conn = tcb_handle(t);
         out[n].state = t->state;
         out[n].local_ip = t->local_ip;
         out[n].remote_ip = t->remote_ip;

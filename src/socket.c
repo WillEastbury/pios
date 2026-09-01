@@ -21,6 +21,8 @@
 #include "uart.h"
 #include "simd.h"
 #include "timer.h"
+#include "mmu.h"
+#include "proc_buffer.h"
 
 /* ---- Socket Descriptor ---- */
 
@@ -70,6 +72,7 @@ struct socket_pending {
     struct fifo_msg request;
     tcp_conn_t conn;
     u64 deadline_ms;
+    struct proc_buffer_ref buffer_ref;
 } ALIGNED(64);
 static struct socket_pending pending[SOCKET_PENDING_MAX];
 
@@ -97,7 +100,8 @@ static struct socket_pending *socket_pending_alloc(void)
 }
 
 static bool socket_pending_start(u32 from_core, const struct fifo_msg *request,
-                                 tcp_conn_t conn)
+                                 tcp_conn_t conn,
+                                 const struct proc_buffer_ref *buffer_ref)
 {
     struct socket_pending *op = socket_pending_alloc();
     if (!op)
@@ -106,6 +110,10 @@ static bool socket_pending_start(u32 from_core, const struct fifo_msg *request,
     op->request = *request;
     op->conn = conn;
     op->deadline_ms = timer_monotonic_ms() + SOCKET_PENDING_TIMEOUT_MS;
+    if (buffer_ref)
+        op->buffer_ref = *buffer_ref;
+    else
+        simd_zero(&op->buffer_ref, sizeof(op->buffer_ref));
     return true;
 }
 
@@ -142,21 +150,32 @@ void socket_service_step(void)
                 done = true;
             }
         } else if (op->request.type == MSG_SOCK_RECV) {
-            u32 avail = tcp_readable(op->conn);
-            if (avail > 0) {
-                param = tcp_read(op->conn, (void *)(usize)op->request.buffer,
-                                 op->request.length);
-                status = 0U;
-                iface = tcp_iface(op->conn);
+            if (!proc_buffer_ref_validate(op->from_core, op->request.buffer,
+                                          op->request.length,
+                                          &op->buffer_ref)) {
                 done = true;
             } else {
-                u32 state = tcp_state(op->conn);
-                if (state == TCP_CLOSED || state == TCP_CLOSE_WAIT) {
+                u32 avail = tcp_readable(op->conn);
+                if (avail > 0) {
+                    dcache_invalidate_range(op->request.buffer,
+                                            op->request.length);
+                    param = tcp_read(op->conn,
+                                     (void *)(usize)op->request.buffer,
+                                     op->request.length);
+                    if (param > 0U)
+                        dcache_clean_range(op->request.buffer, param);
                     status = 0U;
                     iface = tcp_iface(op->conn);
                     done = true;
-                } else if (now >= op->deadline_ms) {
-                    done = true;
+                } else {
+                    u32 state = tcp_state(op->conn);
+                    if (state == TCP_CLOSED || state == TCP_CLOSE_WAIT) {
+                        status = 0U;
+                        iface = tcp_iface(op->conn);
+                        done = true;
+                    } else if (now >= op->deadline_ms) {
+                        done = true;
+                    }
                 }
             }
         }
@@ -245,6 +264,7 @@ i32 sock_bind(i32 fd, const struct sockaddr_in *addr) {
     if (!s) return SOCK_ERR;
 
     s->local = *addr;
+    s->iface = addr->iface;
     s->state = SOCK_STATE_BOUND;
 
     /* Notify Core 0 for UDP port registration */
@@ -254,6 +274,7 @@ i32 sock_bind(i32 fd, const struct sockaddr_in *addr) {
         msg.param = addr->ip;
         msg.tag = addr->port;
         msg.length = fd;
+        msg.iface = addr->iface;
         send_to_net(&msg);
     }
     return SOCK_OK;
@@ -264,6 +285,7 @@ i32 sock_connect(i32 fd, const struct sockaddr_in *addr) {
     if (!s) return SOCK_ERR;
 
     s->remote = *addr;
+    s->iface = addr->iface;
 
     if (s->type == SOCK_DGRAM) {
         s->state = SOCK_STATE_CONN;
@@ -276,7 +298,7 @@ i32 sock_connect(i32 fd, const struct sockaddr_in *addr) {
     msg.param = addr->ip;
     msg.tag = ((u64)s->local.port << 16) | addr->port;
     msg.length = fd;
-    msg.iface = NIC_IFACE_WIRED;
+    msg.iface = s->iface;
     send_to_net(&msg);
 
     /* Wait for result */
@@ -366,6 +388,7 @@ i32 sock_send(i32 fd, const void *data, u32 len) {
     msg.iface = s->iface;
     msg.buffer = (u64)(usize)data;
     msg.length = len;
+    dcache_clean_range(msg.buffer, msg.length);
     send_to_net(&msg);
 
     struct fifo_msg reply;
@@ -390,10 +413,15 @@ i32 sock_recv(i32 fd, void *buf, u32 len) {
     msg.iface = s->iface;
     msg.buffer = (u64)(usize)buf;
     msg.length = len;
+    dcache_clean_range(msg.buffer, msg.length);
     send_to_net(&msg);
 
     struct fifo_msg reply;
     wait_reply(&reply);
+    if (reply.status == 0U && reply.param > 0U) {
+        u32 received = reply.param < len ? reply.param : len;
+        dcache_invalidate_range(msg.buffer, received);
+    }
 
     return (i32)reply.param; /* bytes read */
 }
@@ -408,13 +436,27 @@ i32 sock_sendto(i32 fd, const void *data, u32 len, const struct sockaddr_in *des
     msg.buffer = (u64)(usize)data;
     msg.length = len;
     msg.tag = ((u64)s->local.port << 16) | dest->port;
-    msg.iface = NIC_IFACE_WIRED;
+    msg.iface = (dest->iface != NIC_IFACE_ANY) ? dest->iface : s->iface;
+    dcache_clean_range(msg.buffer, msg.length);
     send_to_net(&msg);
 
     struct fifo_msg reply;
     wait_reply(&reply);
 
     return (reply.status == 0) ? (i32)len : SOCK_ERR;
+}
+
+static bool socket_udp_msg_matches(const struct socket_desc *s,
+                                   const struct fifo_msg *msg)
+{
+    if (!s || !msg || msg->type != MSG_NET_UDP_RECV || !msg->buffer)
+        return false;
+    u16 dst_port = (u16)(msg->tag & 0xFFFFU);
+    u32 dst_ip = msg->_reserved;
+    nic_iface_t iface = (nic_iface_t)msg->iface;
+    return dst_port == s->local.port &&
+           (s->local.ip == 0U || s->local.ip == dst_ip) &&
+           (s->iface == NIC_IFACE_ANY || s->iface == iface);
 }
 
 i32 sock_recvfrom(i32 fd, void *buf, u32 len, struct sockaddr_in *src) {
@@ -426,7 +468,7 @@ i32 sock_recvfrom(i32 fd, void *buf, u32 len, struct sockaddr_in *src) {
     while (!recv_from_net(&msg))
         wfe();
 
-    if (msg.type != MSG_NET_UDP_RECV || !msg.buffer)
+    if (!socket_udp_msg_matches(s, &msg))
         return SOCK_ERR;
 
     u32 copy = (msg.length < len) ? msg.length : len;
@@ -435,7 +477,8 @@ i32 sock_recvfrom(i32 fd, void *buf, u32 len, struct sockaddr_in *src) {
 
     if (src) {
         src->ip = msg.param;
-        src->port = (u16)(msg.tag & 0xFFFF);
+        src->port = (u16)(msg.tag >> 16);
+        src->iface = (nic_iface_t)msg.iface;
     }
 
     return (i32)copy;
@@ -497,7 +540,7 @@ i32 sock_recv_nb(i32 fd, void *buf, u32 len) {
         return SOCK_EAGAIN;
 
     /* Process the received message */
-    if (s->type == SOCK_DGRAM && msg.type == MSG_NET_UDP_RECV) {
+    if (s->type == SOCK_DGRAM && socket_udp_msg_matches(s, &msg)) {
         u32 copy = (msg.length < len) ? msg.length : len;
         simd_memcpy(buf, (void *)(usize)msg.buffer, copy);
         return (i32)copy;
@@ -510,7 +553,7 @@ i32 sock_recv_nb(i32 fd, void *buf, u32 len) {
 /*  Core 0 side: process socket FIFO requests from user cores          */
 /* ================================================================== */
 
-static void socket_handle_msg(u32 from_core, const struct fifo_msg *req)
+void socket_handle_message(u32 from_core, const struct fifo_msg *req)
 {
     struct fifo_msg msg = *req;
     struct fifo_msg reply = {0};
@@ -523,7 +566,7 @@ static void socket_handle_msg(u32 from_core, const struct fifo_msg *req)
         u16 dst_port = (u16)(msg.tag & 0xFFFF);
         tcp_conn_t conn = tcp_connect_on((nic_iface_t)msg.iface,
                                          dst_ip, dst_port);
-        if (conn < 0 || !socket_pending_start(from_core, &msg, conn))
+        if (conn < 0 || !socket_pending_start(from_core, &msg, conn, NULL))
             socket_reply(from_core, &msg, 1U, 0U, NIC_IFACE_ANY);
         break;
     }
@@ -540,17 +583,21 @@ static void socket_handle_msg(u32 from_core, const struct fifo_msg *req)
 
     case MSG_SOCK_ACCEPT: {
         tcp_conn_t listen_conn = (tcp_conn_t)msg.param;
-        if (!socket_pending_start(from_core, &msg, listen_conn))
+        if (!socket_pending_start(from_core, &msg, listen_conn, NULL))
             socket_reply(from_core, &msg, 1U, 0U, NIC_IFACE_ANY);
         break;
     }
 
     case MSG_SOCK_SEND: {
-        if (!ptr_in_core_ram(from_core, msg.buffer, msg.length)) {
+        struct proc_buffer_ref buffer_ref;
+        if (!msg.buffer ||
+            !proc_buffer_ref_acquire(from_core, msg.buffer, msg.length,
+                                     &buffer_ref)) {
             reply.status = 1;
             fifo_push(CORE_NET, from_core, &reply);
             break;
         }
+        dcache_invalidate_range(msg.buffer, msg.length);
         tcp_conn_t conn = (tcp_conn_t)msg.param;
         if (msg.iface != tcp_iface(conn)) {
             reply.status = 1;
@@ -565,7 +612,10 @@ static void socket_handle_msg(u32 from_core, const struct fifo_msg *req)
     }
 
     case MSG_SOCK_RECV: {
-        if (!ptr_in_core_ram(from_core, msg.buffer, msg.length)) {
+        struct proc_buffer_ref buffer_ref;
+        if (!msg.buffer ||
+            !proc_buffer_ref_acquire(from_core, msg.buffer, msg.length,
+                                     &buffer_ref)) {
             reply.status = 1;
             fifo_push(CORE_NET, from_core, &reply);
             break;
@@ -576,7 +626,7 @@ static void socket_handle_msg(u32 from_core, const struct fifo_msg *req)
             fifo_push(CORE_NET, from_core, &reply);
             break;
         }
-        if (!socket_pending_start(from_core, &msg, conn))
+        if (!socket_pending_start(from_core, &msg, conn, &buffer_ref))
             socket_reply(from_core, &msg, 1U, 0U, NIC_IFACE_ANY);
         break;
     }
@@ -603,7 +653,7 @@ void socket_handle_fifo(u32 from_core) {
     struct fifo_msg msgs[16];
     u32 n = fifo_pop_batch(CORE_NET, from_core, msgs, 16);
     for (u32 i = 0; i < n; i++)
-        socket_handle_msg(from_core, &msgs[i]);
+        socket_handle_message(from_core, &msgs[i]);
 }
 
 void socket_init(void) {

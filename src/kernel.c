@@ -13077,7 +13077,9 @@ static void ui_service_tick(void);
 static void ui_render_scheduler(void);
 static void ui_scheduler_feed_char(i32 c);
 static void disk_handle_request(u32 from_core);
-static void ui_db_udp_cb(u32 src_ip, u16 src_port, u16 dst_port, const u8 *data, u16 len);
+static void ui_db_udp_cb(nic_iface_t iface, u32 dst_ip,
+                         u32 src_ip, u16 src_port, u16 dst_port,
+                         const u8 *data, u16 len);
 static bool ui_env_get(const char *key, const char **val_out);
 static void ui_env_set(const char *key, const char *val, bool persistent);
 static bool ui_env_save(void);
@@ -17871,7 +17873,9 @@ static void ui_cmd_rm(const char *path)
     ui_console_write("OK: removed\n");
 }
 
-static void ui_stream_udp_cb(u32 src_ip, u16 src_port, u16 dst_port UNUSED, const u8 *data, u16 len)
+static void ui_stream_udp_cb(nic_iface_t iface UNUSED, u32 dst_ip UNUSED,
+                             u32 src_ip, u16 src_port, u16 dst_port UNUSED,
+                             const u8 *data, u16 len)
 {
     if (!ui_stream_udp.waiting || !data) return;
     if (len > sizeof(ui_stream_udp.data)) len = sizeof(ui_stream_udp.data);
@@ -17916,7 +17920,9 @@ static void ui_be32_write(u8 *p, u32 v)
     p[3] = (u8)v;
 }
 
-static void ui_db_udp_cb(u32 src_ip, u16 src_port, u16 dst_port, const u8 *data, u16 len)
+static void ui_db_udp_cb(nic_iface_t iface UNUSED, u32 dst_ip UNUSED,
+                         u32 src_ip, u16 src_port, u16 dst_port,
+                         const u8 *data, u16 len)
 {
     if (!data || len < 12 || dst_port != PICOWAL_KV_UDP_PORT)
         return;
@@ -17937,12 +17943,12 @@ static void ui_db_udp_cb(u32 src_ip, u16 src_port, u16 dst_port, const u8 *data,
 
     if (ver != UI_DB_UDP_VER) {
         out[0] = 2; /* bad request/version */
-        net_send_udp(src_ip, PICOWAL_KV_UDP_PORT, src_port, out, out_len);
+        net_send_udp_on(iface, src_ip, PICOWAL_KV_UDP_PORT, src_port, out, out_len);
         return;
     }
     if (card > PICOWAL_CARD_MAX || rec > PICOWAL_RECORD_MAX) {
         out[0] = 2;
-        net_send_udp(src_ip, PICOWAL_KV_UDP_PORT, src_port, out, out_len);
+        net_send_udp_on(iface, src_ip, PICOWAL_KV_UDP_PORT, src_port, out, out_len);
         return;
     }
 
@@ -17982,7 +17988,7 @@ static void ui_db_udp_cb(u32 src_ip, u16 src_port, u16 dst_port, const u8 *data,
         out[0] = 2;
     }
 
-    net_send_udp(src_ip, PICOWAL_KV_UDP_PORT, src_port, out, out_len);
+    net_send_udp_on(iface, src_ip, PICOWAL_KV_UDP_PORT, src_port, out, out_len);
 }
 
 static bool ui_env_key_eq(const char *a, const char *b)

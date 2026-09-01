@@ -24,7 +24,8 @@
 #define MSG_NET_UDP_SEND    10  /* param=dst_ip, buffer=payload, length=payload_len,
                                    tag = (src_port << 16) | dst_port */
 #define MSG_NET_UDP_RECV    11  /* param=src_ip, buffer=payload, length=payload_len,
-                                   tag = (src_port << 16) | dst_port */
+                                   tag=(src_port << 16)|dst_port, iface=ingress,
+                                   _reserved=destination IPv4 address */
 #define MSG_NET_UDP_DONE    12  /* status=0 ok, status=1 no neighbor */
 #define MSG_NET_STATS       13  /* buffer=pointer to net_stats_t */
 #define MSG_NET_LINK_UP     14

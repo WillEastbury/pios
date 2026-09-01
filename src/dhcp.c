@@ -264,8 +264,11 @@ static bool parse_dhcp_options(const u8 *opts, u32 opts_len, struct dhcp_parsed 
 
 /* ---- UDP callback for DHCP responses ---- */
 
-static void dhcp_udp_handler(u32 src_ip, u16 src_port, u16 dst_port,
-                              const u8 *data, u16 len) {
+static void dhcp_udp_handler(nic_iface_t iface, u32 dst_ip,
+                             u32 src_ip, u16 src_port, u16 dst_port,
+                             const u8 *data, u16 len) {
+    (void)iface;
+    (void)dst_ip;
     (void)src_ip;
     (void)src_port;
     if (dst_port != DHCP_CLIENT_PORT) return;

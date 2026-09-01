@@ -3,6 +3,7 @@
 #include "core.h"
 #include "walfs.h"
 #include "simd.h"
+#include "mmu.h"
 
 #define PICOWAL_BASE_DIR "/var/picowal"
 
@@ -63,10 +64,25 @@ static u32 u32_to_dec(char *out, u32 v)
 static bool fs_request(struct fifo_msg *msg, struct fifo_msg *reply)
 {
     if (!msg || !reply) return false;
+    if (msg->buffer && msg->length != 0U) {
+        if (msg->type == MSG_FS_FIND || msg->type == MSG_FS_CREATE ||
+            msg->type == MSG_FS_MKDIR || msg->type == MSG_FS_DELETE ||
+            msg->type == MSG_FS_WRITE || msg->type == MSG_FS_READ ||
+            msg->type == MSG_FS_READDIR)
+            dcache_clean_range(msg->buffer, msg->length);
+    }
     if (!fifo_push(core_id(), CORE_DISK, msg))
         return false;
     while (!fifo_pop(core_id(), CORE_DISK, reply))
         wfe();
+    if (msg->type == MSG_FS_READ && reply->status == 0U &&
+        reply->length > 0U && reply->length <= msg->length)
+        dcache_invalidate_range(msg->buffer, reply->length);
+    if (msg->type == MSG_FS_READDIR && reply->status == 0U &&
+        reply->param <= msg->tag)
+        dcache_invalidate_range(
+            msg->buffer,
+            reply->param * (u32)sizeof(struct picowal_readdir_wire));
     return true;
 }
 

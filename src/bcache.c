@@ -155,8 +155,15 @@ static bcache_entry_t *evict(void)
         return NULL;
 
     if (victim->flags & FLAG_DIRTY) {
-        writeback(victim);
-        stats.dirty_count--;
+        /*
+         * A dirty victim remains the authority until its writeback succeeds.
+         * Recycling it after an I/O error silently loses the only copy of the
+         * block and makes the cache report a clean state.
+         */
+        if (!writeback(victim))
+            return NULL;
+        if (stats.dirty_count > 0U)
+            stats.dirty_count--;
     }
 
     hash_remove(victim->lba);
@@ -356,8 +363,8 @@ void bcache_invalidate(u32 lba)
     if (e->flags & FLAG_PINNED)
         return;
 
-    if (e->flags & FLAG_DIRTY)
-        writeback(e);
+    if ((e->flags & FLAG_DIRTY) && !writeback(e))
+        return;
 
     hash_remove(e->lba);
     e->flags = 0;
@@ -371,8 +378,8 @@ void bcache_invalidate_all(void)
         if (!(e->flags & FLAG_VALID))
             continue;
 
-        if (e->flags & FLAG_DIRTY)
-            writeback(e);
+        if ((e->flags & FLAG_DIRTY) && !writeback(e))
+            continue;
 
         if (!(e->flags & FLAG_PINNED)) {
             hash_remove(e->lba);

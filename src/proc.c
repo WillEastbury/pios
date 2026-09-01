@@ -35,6 +35,7 @@
 #include "el0_scheduler.h"
 #include "swake.h"
 #include "adrv.h"
+#include "kspin.h"
 
 #define PROC_OWNER_LOCKED 0x80000000U
 
@@ -182,7 +183,7 @@ static inline u64 proc_kstack_top(u32 s)
  *
  * Monotonic and never decreases: a freed slot stays within the scanned range,
  * which keeps it safe -- a stale high water costs a few empty iterations, never a
- * missed process. Written under g_slot_alloc_lock alongside the claim it
+ * missed process. Written under proc_slot_alloc_lock() alongside the claim it
  * describes.
  */
 static volatile u32 proc_slot_high_water;
@@ -1164,9 +1165,27 @@ static bool ptr_valid_cstr(const char *s, u32 max_len)
 /* Send a FIFO request to the disk core and block until reply */
 static void fs_request(struct fifo_msg *msg, struct fifo_msg *reply)
 {
+    if (msg->buffer && msg->length != 0U) {
+        if (msg->type == MSG_FS_CREATE || msg->type == MSG_FS_MKDIR ||
+        msg->type == MSG_FS_DELETE || msg->type == MSG_FS_FIND ||
+        msg->type == MSG_FS_WRITE || msg->type == MSG_FS_READ ||
+        msg->type == MSG_FS_READDIR)
+        dcache_clean_range(msg->buffer, msg->length);
+    }
     fifo_push(core_id(), CORE_DISK, msg);
     while (!fifo_pop(core_id(), CORE_DISK, reply))
         wfe();
+    if (msg->type == MSG_FS_READ && reply->status == 0U &&
+        reply->length > 0U && reply->length <= msg->length)
+        dcache_invalidate_range(msg->buffer, reply->length);
+    if (msg->type == MSG_FS_READDIR && reply->status == 0U)
+        dcache_invalidate_range(msg->buffer, msg->length);
+    if (msg->type == MSG_FS_STAT && reply->status == 0U) {
+        if (msg->length == sizeof(struct walfs_inode))
+            dcache_invalidate_range(msg->buffer, sizeof(struct walfs_inode));
+        else if (msg->tag)
+            dcache_invalidate_range(msg->tag, sizeof(struct walfs_inode));
+    }
 }
 
 /* OWASP A01: capability gate — check before privileged operations */
@@ -2096,8 +2115,18 @@ static u8 *slot_base(u32 slot)
  * both rare, bounded events, not a per-tick occurrence. The critical
  * section itself is a fixed MAX_PROCS_PER_CORE-element scan plus one write,
  * with no I/O or nested locking, so the spin is short and bounded even
- * though it executes inside the scheduler loop's call tree. */
-static volatile u8 g_slot_alloc_lock;
+ * though it executes inside the scheduler loop's call tree.
+ *
+ * Slot 4 is a complete cache line in core 0's WB-IS control page. Slots 0-2
+ * belong to the IPC registries and slot 3 to the lease registry. Keeping the
+ * allocator lock here prevents both false sharing in .bss and exclusive-access
+ * faults against Pi 5's Normal-NC kernel .bss. */
+#define PROC_SLOT_ALLOC_LOCK_SLOT 4U
+
+static inline struct kspinlock *proc_slot_alloc_lock(void)
+{
+    return kspin_shared(PROC_SLOT_ALLOC_LOCK_SLOT);
+}
 
 static i32 find_empty_slot(void)
 {
@@ -2124,14 +2153,13 @@ static i32 find_empty_slot(void)
         return -1;
 
     /* Acquire: simple test-and-set spinlock. Reached from proc_schedule()'s
-     * call tree (see the note on g_slot_alloc_lock's declaration above), but
+     * call tree (see the note on proc_slot_alloc_lock() above), but
      * only actually taken on the rare/bounded "free slot exists and a launch
      * is pending" path, with a fixed MAX_PROCS_PER_CORE-element critical
      * section and no I/O -- not the kind of unbounded/blocking lock the
      * "no locks in scheduler" invariant is meant to rule out. */
-    while (__atomic_test_and_set(&g_slot_alloc_lock, __ATOMIC_ACQUIRE)) {
-        __asm__ volatile("yield");
-    }
+    struct kspinlock *slot_lock = proc_slot_alloc_lock();
+    kspin_lock(slot_lock);
 
     /* Second check (locked, authoritative): re-scan under the lock -- the
      * unlocked peek above could be stale by now -- and claim the chosen
@@ -2144,7 +2172,7 @@ static i32 find_empty_slot(void)
             empty[n++] = i;
 
     if (n == 0) {
-        __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+        kspin_unlock(slot_lock);
         return -1; /* raced away between the two checks */
     }
 
@@ -2169,7 +2197,7 @@ static i32 find_empty_slot(void)
     i32 chosen = (i32)empty[pick];
     procs[chosen].state = PROC_CLAIMED;
     proc_slot_note_used((u32)chosen);
-    __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+    kspin_unlock(slot_lock);
     return chosen;
 }
 
@@ -2239,6 +2267,7 @@ void proc_init_shared(void)
 {
     if (initialized)
         return;
+    kspin_init(proc_slot_alloc_lock());
     swake_reset();
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
         procs[i].state = PROC_EMPTY;
@@ -2554,14 +2583,14 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
      * specific slot rather than a random pick from the free pool, but it's
      * still a slot find_empty_slot() could independently pick for an
      * unrelated process on another core -- close that TOCTOU window too. */
-    while (__atomic_test_and_set(&g_slot_alloc_lock, __ATOMIC_ACQUIRE)) {
-        __asm__ volatile("yield");
-    }
+    struct kspinlock *slot_lock = proc_slot_alloc_lock();
+    kspin_lock(slot_lock);
     bool busy = (procs[required_slot].state != PROC_EMPTY);
-    if (!busy)
+    if (!busy) {
         procs[required_slot].state = PROC_CLAIMED;
         proc_slot_note_used(required_slot);
-    __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+    }
+    kspin_unlock(slot_lock);
     if (busy) {
         uart_puts("[proc] mem-exec: required slot busy\n");
         return -1;
@@ -3878,6 +3907,69 @@ static inline void diag_inval_bss(volatile void *p) {
     (void)p;
     __asm__ volatile("dmb sy" ::: "memory");
 #endif
+}
+
+static bool proc_buffer_range_in_slot(u32 slot, u64 ptr, u32 len)
+{
+    if (slot >= MAX_PROCS_PER_CORE)
+        return false;
+    u64 base = PROC_SLOT_PHYS(slot);
+    u64 end = ptr + (u64)len;
+    return ptr >= base && end >= ptr && end <= base + PROC_SLOT_SIZE;
+}
+
+static void proc_buffer_ref_refresh(volatile void *p, u64 len)
+{
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+    dcache_invalidate_range((u64)(usize)p, len);
+#else
+    (void)p;
+    (void)len;
+    dmb_ish();
+#endif
+}
+
+bool proc_buffer_ref_acquire(u32 core, u64 ptr, u32 len,
+                             struct proc_buffer_ref *out)
+{
+    if (!out || core < CORE_USERM || core > CORE_USER1)
+        return false;
+
+    proc_buffer_ref_refresh(&current_proc_arr[core],
+                            sizeof(current_proc_arr[core]));
+    u32 slot = current_proc_arr[core].v;
+    if (!proc_buffer_range_in_slot(slot, ptr, len))
+        return false;
+
+    proc_buffer_ref_refresh(&procs[slot], 64U);
+    struct process *p = &procs[slot];
+    u32 generation = p->generation;
+    if (p->owner_core != core || p->state != PROC_RUNNING)
+        return false;
+
+    dmb_ish();
+    if (current_proc_arr[core].v != slot || p->generation != generation ||
+        p->owner_core != core || p->state != PROC_RUNNING)
+        return false;
+
+    out->slot = slot;
+    out->generation = generation;
+    return true;
+}
+
+bool proc_buffer_ref_validate(u32 core, u64 ptr, u32 len,
+                              const struct proc_buffer_ref *ref)
+{
+    if (!ref || core < CORE_USERM || core > CORE_USER1 ||
+        !proc_buffer_range_in_slot(ref->slot, ptr, len))
+        return false;
+
+    proc_buffer_ref_refresh(&procs[ref->slot], 64U);
+    const struct process *p = &procs[ref->slot];
+    return p->generation == ref->generation &&
+           p->owner_core == core &&
+           (p->state == PROC_READY || p->state == PROC_RUNNING ||
+            p->state == PROC_BLOCKED);
 }
 
 u32 proc_sgi_wake_count(u32 core)

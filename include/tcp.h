@@ -32,6 +32,35 @@
 
 /* Opaque connection handle */
 typedef i32 tcp_conn_t;
+#define TCP_CONN_INVALID       ((tcp_conn_t)-1)
+#define TCP_CONN_INDEX_BITS    14U
+#define TCP_CONN_INDEX_MASK    ((1U << TCP_CONN_INDEX_BITS) - 1U)
+#define TCP_CONN_GENERATION_MASK 0x1FFFFU
+
+static inline tcp_conn_t tcp_conn_make(u32 slot, u32 generation)
+{
+    if (slot > TCP_CONN_INDEX_MASK)
+        return TCP_CONN_INVALID;
+    generation &= TCP_CONN_GENERATION_MASK;
+    if (generation == 0U)
+        return TCP_CONN_INVALID;
+    return (tcp_conn_t)((generation << TCP_CONN_INDEX_BITS) | slot);
+}
+
+static inline bool tcp_conn_decode(tcp_conn_t conn, u32 *slot, u32 *generation)
+{
+    if (conn < 0)
+        return false;
+    u32 raw = (u32)conn;
+    u32 gen = (raw >> TCP_CONN_INDEX_BITS) & TCP_CONN_GENERATION_MASK;
+    if (gen == 0U)
+        return false;
+    if (slot)
+        *slot = raw & TCP_CONN_INDEX_MASK;
+    if (generation)
+        *generation = gen;
+    return true;
+}
 
 /* Init TCP subsystem */
 void tcp_init(void);
@@ -66,6 +95,9 @@ u32 tcp_write(tcp_conn_t conn, const void *data, u32 len);
 
 /* Read data from receive buffer. Returns bytes read. */
 u32 tcp_read(tcp_conn_t conn, void *data, u32 len);
+
+/* Inspect receive data without consuming it. */
+u32 tcp_peek(tcp_conn_t conn, u32 offset, void *data, u32 len);
 
 /* Re-advertise our receive window via an ACK (self-heals a lost window-update
  * during a stalled bulk inbound transfer). No-op unless ESTABLISHED. */

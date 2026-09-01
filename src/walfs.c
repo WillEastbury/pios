@@ -20,12 +20,26 @@
 #include "lru.h"
 #include "principal.h"
 #include "fb.h"
+#include "proc_buffer.h"
+#include "mmu.h"
 
 typedef char walfs_super_must_be_one_block[(sizeof(struct walfs_super) == SD_BLOCK_SIZE) ? 1 : -1];
 
 #define WAL_START  SD_BLOCK_SIZE
 #define WAL_REC_MIN  sizeof(struct wal_record)
 #define WAL_REC_MAX  (WALFS_DATA_MAX + 256)
+#define WALFS_FIFO_PATH_MAX 256U
+
+static bool walfs_fifo_cstr_valid(const char *s, u32 len)
+{
+    if (!s || len == 0U || len > WALFS_FIFO_PATH_MAX)
+        return false;
+    for (u32 i = 0; i < len; i++) {
+        if (s[i] == 0)
+            return i != 0U;
+    }
+    return false;
+}
 
 /* ---- Partition offset ---- */
 
@@ -1371,10 +1385,12 @@ bool walfs_compact(void)
 
 /* ---- FIFO handler for Core 1 ---- */
 
-void walfs_handle_fifo(u32 from_core)
+void walfs_handle_message(u32 from_core, const struct fifo_msg *request)
 {
     struct fifo_msg msg;
-    if (!fifo_pop(CORE_DISK, from_core, &msg)) return;
+    if (!request)
+        return;
+    msg = *request;
 
     struct fifo_msg reply;
     memset(&reply, 0, sizeof(reply));
@@ -1392,7 +1408,18 @@ void walfs_handle_fifo(u32 from_core)
             reply.status = 1;
             break;
         }
-        if (!msg.buffer) {
+        struct proc_buffer_ref buffer_ref;
+        if (!msg.buffer || msg.length == 0U ||
+            msg.length > WALFS_FIFO_PATH_MAX ||
+            !proc_buffer_ref_acquire(from_core, msg.buffer, msg.length,
+                                     &buffer_ref)) {
+            reply.type = MSG_FS_ERROR;
+            reply.status = 1;
+            break;
+        }
+        dcache_invalidate_range(msg.buffer, msg.length);
+        if (!walfs_fifo_cstr_valid((const char *)(usize)msg.buffer,
+                                   msg.length)) {
             reply.type = MSG_FS_ERROR;
             reply.status = 1;
             break;
@@ -1423,11 +1450,16 @@ void walfs_handle_fifo(u32 from_core)
             reply.status = 1;
             break;
         }
-        if (!msg.buffer || msg.param == 0) {
+        struct proc_buffer_ref buffer_ref;
+        if (!msg.buffer || msg.param == 0 ||
+            msg.length > WALFS_DATA_MAX ||
+            !proc_buffer_ref_acquire(from_core, msg.buffer, msg.length,
+                                     &buffer_ref)) {
             reply.type = MSG_FS_ERROR;
             reply.status = 1;
             break;
         }
+        dcache_invalidate_range(msg.buffer, msg.length);
         bool ok = walfs_write((u64)msg.param, msg.tag,
                               (const void *)(usize)msg.buffer, msg.length);
         reply.type = ok ? MSG_FS_DONE : MSG_FS_ERROR;
@@ -1436,13 +1468,20 @@ void walfs_handle_fifo(u32 from_core)
         break;
     }
     case MSG_FS_READ: {
-        if (!msg.buffer || msg.param == 0) {
+        struct proc_buffer_ref buffer_ref;
+        if (!msg.buffer || msg.param == 0 ||
+            msg.length > WALFS_DATA_MAX ||
+            !proc_buffer_ref_acquire(from_core, msg.buffer, msg.length,
+                                     &buffer_ref)) {
             reply.type = MSG_FS_ERROR;
             reply.status = 1;
             break;
         }
+        dcache_invalidate_range(msg.buffer, msg.length);
         u32 n = walfs_read((u64)msg.param, msg.tag,
                            (void *)(usize)msg.buffer, msg.length);
+        if (n > 0U)
+            dcache_clean_range(msg.buffer, n);
         reply.type   = MSG_FS_DONE;
         reply.status = 0;
         reply.length = n;
@@ -1455,8 +1494,25 @@ void walfs_handle_fifo(u32 from_core)
             break;
         }
         u64 inode_id = msg.tag;
-        if (msg.buffer)
+        if (msg.buffer) {
+            struct proc_buffer_ref buffer_ref;
+            if (msg.length == 0U ||
+                msg.length > WALFS_FIFO_PATH_MAX ||
+                !proc_buffer_ref_acquire(from_core, msg.buffer, msg.length,
+                                         &buffer_ref)) {
+                reply.type = MSG_FS_ERROR;
+                reply.status = 1;
+                break;
+            }
+            dcache_invalidate_range(msg.buffer, msg.length);
+            if (!walfs_fifo_cstr_valid((const char *)(usize)msg.buffer,
+                                       msg.length)) {
+                reply.type = MSG_FS_ERROR;
+                reply.status = 1;
+                break;
+            }
             inode_id = walfs_find((const char *)(usize)msg.buffer);
+        }
         bool ok = inode_id && walfs_delete(inode_id);
         reply.type = ok ? MSG_FS_DONE : MSG_FS_ERROR;
         reply.status = ok ? 0 : 1;
@@ -1465,23 +1521,60 @@ void walfs_handle_fifo(u32 from_core)
     case MSG_FS_STAT: {
         bool ok = false;
         if (msg.buffer && msg.length == sizeof(struct walfs_inode)) {
+            struct proc_buffer_ref buffer_ref;
+            if (!proc_buffer_ref_acquire(from_core, msg.buffer,
+                                         sizeof(struct walfs_inode),
+                                         &buffer_ref)) {
+                reply.type = MSG_FS_ERROR;
+                reply.status = 1;
+                break;
+            }
+            dcache_invalidate_range(msg.buffer, sizeof(struct walfs_inode));
             ok = walfs_stat(msg.tag, (struct walfs_inode *)(usize)msg.buffer);
+            if (ok)
+                dcache_clean_range(msg.buffer, sizeof(struct walfs_inode));
         } else if (msg.buffer && msg.tag) {
-            u64 inode_id = walfs_find((const char *)(usize)msg.buffer);
-            if (inode_id)
-                ok = walfs_stat(inode_id, (struct walfs_inode *)(usize)msg.tag);
+            struct proc_buffer_ref path_ref;
+            struct proc_buffer_ref out_ref;
+            if (msg.length == 0U || msg.length > WALFS_FIFO_PATH_MAX ||
+                !proc_buffer_ref_acquire(from_core, msg.buffer, msg.length,
+                                         &path_ref) ||
+                !proc_buffer_ref_acquire(from_core, msg.tag,
+                                         sizeof(struct walfs_inode), &out_ref)) {
+                reply.type = MSG_FS_ERROR;
+                reply.status = 1;
+                break;
+            }
+            dcache_invalidate_range(msg.buffer, msg.length);
+            dcache_invalidate_range(msg.tag, sizeof(struct walfs_inode));
+            if (walfs_fifo_cstr_valid((const char *)(usize)msg.buffer,
+                                       msg.length)) {
+                u64 inode_id = walfs_find((const char *)(usize)msg.buffer);
+                if (inode_id)
+                    ok = walfs_stat(inode_id,
+                                    (struct walfs_inode *)(usize)msg.tag);
+            }
+            if (ok)
+                dcache_clean_range(msg.tag, sizeof(struct walfs_inode));
         }
         reply.type = ok ? MSG_FS_DONE : MSG_FS_ERROR;
         reply.status = ok ? 0 : 1;
         break;
     }
     case MSG_FS_FIND: {
-        if (!msg.buffer) {
+        struct proc_buffer_ref buffer_ref;
+        if (!msg.buffer || msg.length == 0U ||
+            msg.length > WALFS_FIFO_PATH_MAX ||
+            !proc_buffer_ref_acquire(from_core, msg.buffer, msg.length,
+                                     &buffer_ref)) {
             reply.type = MSG_FS_ERROR;
             reply.status = 1;
             break;
         }
-        u64 id = walfs_find((const char *)(usize)msg.buffer);
+        dcache_invalidate_range(msg.buffer, msg.length);
+        u64 id = walfs_fifo_cstr_valid((const char *)(usize)msg.buffer,
+                                        msg.length)
+            ? walfs_find((const char *)(usize)msg.buffer) : 0;
         reply.type = id ? MSG_FS_DONE : MSG_FS_ERROR;
         reply.status = id ? 0 : 1;
         reply.param = (u32)id;
@@ -1500,19 +1593,31 @@ void walfs_handle_fifo(u32 from_core)
         break;
     }
     case MSG_FS_READDIR:
-        if (!msg.buffer || msg.param == 0 || msg.tag == 0) {
+        {
+        struct proc_buffer_ref buffer_ref;
+        u32 max_entries = (u32)msg.tag;
+        if (!msg.buffer || msg.param == 0 || max_entries == 0U ||
+            max_entries > 0xFFFFFFFFU / (u32)sizeof(struct readdir_entry_wire) ||
+            msg.length != max_entries * (u32)sizeof(struct readdir_entry_wire) ||
+            !proc_buffer_ref_acquire(from_core, msg.buffer, msg.length,
+                                     &buffer_ref)) {
             reply.type = MSG_FS_ERROR;
             reply.status = 1;
             break;
         }
+        dcache_invalidate_range(msg.buffer, msg.length);
         readdir_ctx.out = (struct readdir_entry_wire *)(usize)msg.buffer;
-        readdir_ctx.max = (u32)msg.tag;
+        readdir_ctx.max = max_entries;
         readdir_ctx.count = 0;
         walfs_readdir((u64)msg.param, readdir_fill_cb);
+        if (readdir_ctx.count != 0U)
+            dcache_clean_range(msg.buffer,
+                               readdir_ctx.count * (u32)sizeof(struct readdir_entry_wire));
         reply.type = MSG_FS_DONE;
         reply.status = 0;
         reply.param = readdir_ctx.count;
         break;
+        }
     default:
         reply.type = MSG_FS_ERROR;
         reply.status = 1;
@@ -1520,6 +1625,13 @@ void walfs_handle_fifo(u32 from_core)
     }
 
     fifo_push(CORE_DISK, from_core, &reply);
+}
+
+void walfs_handle_fifo(u32 from_core)
+{
+    struct fifo_msg msg;
+    if (fifo_pop(CORE_DISK, from_core, &msg))
+        walfs_handle_message(from_core, &msg);
 }
 
 bool walfs_verify(struct walfs_health *out)
