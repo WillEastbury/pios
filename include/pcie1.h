@@ -13,6 +13,7 @@
  */
 #pragma once
 #include "types.h"
+#include "platform.h"
 
 #define PCIE1_VID_INTEL     0x8086U
 #define PCIE1_DID_B50       0xE212U   /* Arc Pro B50 / Battlemage BMG-G21 */
@@ -313,6 +314,35 @@ static inline bool pcie1_cpu_win_overlaps(u64 a_base, u64 a_size,
     if (a_end < a_base || b_end < b_base)
         return true;
     return a_base < b_end && b_base < a_end;
+}
+
+/* pcie1 inbound DMA (#141): 2 MiB NC arena only.
+ * PCIe 0x10_00000000 + off -> CPU PIOS_DMA_PCIE1_BASE + off.
+ * Rejects kernel, FIFO, DMA_NET/DISK, IPC, FB, process arena. */
+#define PCIE1_DMA_PCIE_BASE     0x1000000000ULL
+#define PCIE1_BAR2_SIZE_ENC     6U   /* ilog2(2 MiB) - 15 */
+
+static inline bool pcie1_dma_addr_in(u64 pa, u64 n, u64 arena, u64 arena_sz,
+                                     u64 pcie_base, u64 *out)
+{
+    if (!out || n == 0ULL || arena_sz == 0ULL)
+        return false;
+    if (pa < arena)
+        return false;
+    if (pa >= arena + arena_sz)
+        return false;
+    if (n > arena_sz - (pa - arena))
+        return false;
+    *out = pcie_base + (pa - arena);
+    return true;
+}
+
+static inline bool pcie1_dma_addr(const void *ptr, u64 n, u64 *out)
+{
+    if (!ptr)
+        return false;
+    return pcie1_dma_addr_in((u64)(usize)ptr, n, PIOS_DMA_PCIE1_BASE,
+                             PIOS_DMA_PCIE1_SIZE, PCIE1_DMA_PCIE_BASE, out);
 }
 
 bool pcie1_init(void);

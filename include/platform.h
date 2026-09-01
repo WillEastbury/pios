@@ -356,6 +356,7 @@
 #define PIOS_DMA_NET_BASE           0x46300000UL
 #define PIOS_DMA_DISK_BASE          0x46500000UL
 #define PIOS_IPC_SHM_BASE           0x46700000UL
+#define PIOS_DMA_PCIE1_BASE         0x46800000UL
 #define PIOS_FB_BACK_BASE           0x46A00000UL
 #else
 #define PIOS_CORE0_RAM_BASE         0x00800000UL
@@ -366,6 +367,7 @@
 #define PIOS_DMA_NET_BASE           0x04900000UL
 #define PIOS_DMA_DISK_BASE          0x04B00000UL
 #define PIOS_IPC_SHM_BASE           0x04D00000UL
+#define PIOS_DMA_PCIE1_BASE         0x04E00000UL
 #define PIOS_FB_BACK_BASE           0x05000000UL
 #endif
 
@@ -373,6 +375,7 @@
 #define PIOS_DMA_NET_SIZE           0x00200000UL
 #define PIOS_DMA_DISK_SIZE          0x00200000UL
 #define PIOS_IPC_SHM_SIZE           0x00100000UL
+#define PIOS_DMA_PCIE1_SIZE         0x00200000UL
 #define PIOS_FB_BACK_SIZE           0x01000000UL
 
 /*

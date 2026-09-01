@@ -73,6 +73,37 @@ int main(void)
                 !pcie1_cpu_win_overlaps(0x1800000000ULL, 0x300000000ULL,
                                         0x1F00000000ULL, 0x00800000ULL));
 
+    {
+        u64 out = 0xdeadULL;
+        u64 arena = PIOS_DMA_PCIE1_BASE;
+        u64 asz = PIOS_DMA_PCIE1_SIZE;
+        u64 pcie = PCIE1_DMA_PCIE_BASE;
+        expect_true("dma in arena",
+                    pcie1_dma_addr_in(arena, 64, arena, asz, pcie, &out) &&
+                    out == pcie);
+        expect_true("dma at arena end-1",
+                    pcie1_dma_addr_in(arena + asz - 1, 1, arena, asz, pcie, &out) &&
+                    out == pcie + asz - 1);
+        expect_true("dma past arena fails",
+                    !pcie1_dma_addr_in(arena + asz, 1, arena, asz, pcie, &out));
+        expect_true("dma before arena fails",
+                    !pcie1_dma_addr_in(arena - 1, 1, arena, asz, pcie, &out));
+        expect_true("dma overflow size fails",
+                    !pcie1_dma_addr_in(arena + asz - 8, 16, arena, asz, pcie, &out));
+        expect_true("dma kernel image fails",
+                    !pcie1_dma_addr_in(0x80000ULL, 64, arena, asz, pcie, &out));
+        expect_true("dma FIFO fails",
+                    !pcie1_dma_addr_in(PIOS_SHARED_FIFO_BASE, 64, arena, asz, pcie, &out));
+        expect_true("dma DMA_NET fails",
+                    !pcie1_dma_addr_in(PIOS_DMA_NET_BASE, 64, arena, asz, pcie, &out));
+        expect_true("dma process arena fails",
+                    !pcie1_dma_addr_in(PIOS_PROC_ARENA_BASE, 64, arena, asz, pcie, &out));
+        expect_true("dma null fails", !pcie1_dma_addr(NULL, 64, &out));
+        expect_true("wrapper matches arena",
+                    pcie1_dma_addr((const void *)(usize)arena, 16, &out) &&
+                    out == pcie);
+    }
+
     expect_u32("no pcie1",
                lzero_classify(false, false, false, 0, 0), LZERO_NO_PCIE1);
     expect_u32("no link",

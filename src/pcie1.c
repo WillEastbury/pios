@@ -8,6 +8,7 @@
  *   - RC base 0x1000110000 (not 0x1000120000)
  *   - reset id 43 (pcie2 is 44)
  *   - 32 MiB Device ATU at 0x1B00000000 (BAR0 MMIO; not LMEM, not RP1)
+ *   - 2 MiB inbound NC arena only (#141); not 64 GiB -> PA 0
  *   - no BAR1 MIP0
  *   - MSI INTID 255/256 left masked (no handler yet)
  *
@@ -18,6 +19,7 @@
 #include "platform.h"
 #include "mmio.h"
 #include "uart.h"
+#include "timer.h"
 
 #if PIOS_HAS_PCIE1
 
@@ -31,6 +33,21 @@ _Static_assert(PIOS_PCIE1_CPU_WIN_SIZE == 0x02000000UL,
                "pcie1 ATU is 32 MiB for BAR0 MMIO; LMEM stays unmapped");
 _Static_assert(PIOS_PCIE1_RESET_ID != 44U,
                "pcie1 must not assert pcie2/RP1 reset id 44");
+_Static_assert(PIOS_DMA_PCIE1_SIZE == 0x00200000UL,
+               "pcie1 inbound arena is 2 MiB");
+_Static_assert(PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE == PIOS_FB_BACK_BASE,
+               "pcie1 DMA arena sits in the NC hole before FB_BACK");
+_Static_assert(PIOS_IPC_SHM_BASE + PIOS_IPC_SHM_SIZE == PIOS_DMA_PCIE1_BASE,
+               "pcie1 DMA arena follows IPC");
+_Static_assert((PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE) <= PIOS_DMA_NET_BASE ||
+               PIOS_DMA_PCIE1_BASE >= (PIOS_DMA_NET_BASE + PIOS_DMA_NET_SIZE),
+               "pcie1 DMA arena must not overlap DMA_NET");
+_Static_assert((PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE) <= PIOS_DMA_DISK_BASE ||
+               PIOS_DMA_PCIE1_BASE >= (PIOS_DMA_DISK_BASE + PIOS_DMA_DISK_SIZE),
+               "pcie1 DMA arena must not overlap DMA_DISK");
+_Static_assert((PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE) <= PIOS_PROC_ARENA_BASE ||
+               PIOS_DMA_PCIE1_BASE >= (PIOS_PROC_ARENA_BASE + PIOS_PROC_ARENA_SIZE),
+               "pcie1 DMA arena must not overlap process arena");
 
 #define PCIE1_RC_BASE               PIOS_PCIE1_RC_BASE
 
@@ -113,6 +130,49 @@ static void perst_set(bool assert)
     else
         tmp |= CTRL_PERSTB;
     pw(MISC_PCIE_CTRL, tmp);
+    dmb();
+}
+
+/* #144: nop-spin is not a deadline. Poll link with the generic timer. */
+static bool wait_link_ms(u32 budget_ms)
+{
+    u64 t0 = timer_monotonic_ms();
+    if (pcie1_link_up())
+        return true;
+    while (timer_monotonic_ms() - t0 < (u64)budget_ms) {
+        timer_delay_ms(1);
+        if (pcie1_link_up())
+            return true;
+    }
+    return pcie1_link_up();
+}
+
+static bool rc_alive(void)
+{
+    u32 id = pr(0);
+    return id != 0U && id != 0xFFFFFFFFU;
+}
+
+static void program_inbound_arena(void)
+{
+    u32 tmp;
+    /* 2 MiB at PCIe 0x10_00000000 -> CPU DMA_PCIE1. Not 64 GiB -> PA 0. */
+    pw(MISC_RC_BAR2_CONFIG_LO, PCIE1_BAR2_SIZE_ENC);
+    pw(MISC_RC_BAR2_CONFIG_HI, (u32)(PCIE1_DMA_PCIE_BASE >> 32));
+    dmb();
+    pw(MISC_UBUS_BAR2_CONFIG_REMAP, (u32)PIOS_DMA_PCIE1_BASE | 1U);
+    pw(MISC_UBUS_BAR2_CONFIG_REMAP_HI, (u32)(PIOS_DMA_PCIE1_BASE >> 32));
+    dmb();
+    pw(MISC_RC_BAR3_CONFIG_LO, 0);
+    pw(MISC_RC_BAR3_CONFIG_HI, 0);
+    pw(MISC_UBUS_BAR3_CONFIG_REMAP, 0);
+    pw(MISC_UBUS_BAR3_CONFIG_REMAP_HI, 0);
+    dmb();
+    tmp = pr(MISC_MISC_CTRL);
+    tmp &= ~(0x1FU << 27);
+    tmp |= (PCIE1_BAR2_SIZE_ENC << 27);
+    pw(MISC_MISC_CTRL, tmp);
+    dmb();
 }
 
 static void set_outbound_win(u64 cpu_addr, u64 pcie_addr, u64 size)
@@ -282,13 +342,26 @@ bool pcie1_init(void)
     /* RESCAL is shared with pcie2/RP1 and already ran in pcie_init().
      * Do not re-assert it while the RP1 link is live. */
     bridge_reset_brcm(true);
-    delay_cycles(100000);
+    timer_delay_ms(1);
     bridge_reset_brcm(false);
+
+    /* #144: first RC MMIO. If firmware did not enable pciex1 the load may
+     * still hang the fabric — skip long waits when the ID is already dead. */
+    if (!rc_alive()) {
+        g_inited = true;
+        publish_link("rc absent (need dtparam=pciex1)");
+        uart_puts("[pcie1] RC ID absent; skip (dtparam=pciex1)\n");
+        return false;
+    }
 
     tmp = pr(HARD_DEBUG);
     tmp &= ~SERDES_IDDQ;
     pw(HARD_DEBUG, tmp);
-    delay_cycles(200000);
+    dmb();
+    timer_delay_ms(1);
+
+    perst_set(true);
+    timer_delay_ms(20);
 
     tmp = pr(MISC_MISC_CTRL);
     tmp |= MCTRL_SCB_ACCESS_EN;
@@ -300,28 +373,7 @@ bool pcie1_init(void)
     pw(MISC_MISC_CTRL, tmp);
     dmb();
 
-    /* Inbound BAR2: 64 GiB at PCIe 0x10 -> CPU 0. This is the endpoint's
-     * DMA window into system RAM (Linux pcie1 dma-ranges), not GPU LMEM. */
-    pw(MISC_RC_BAR2_CONFIG_LO, 0x15);
-    pw(MISC_RC_BAR2_CONFIG_HI, 0x10);
-    dmb();
-    tmp = pr(MISC_UBUS_BAR2_CONFIG_REMAP);
-    tmp |= 1;
-    pw(MISC_UBUS_BAR2_CONFIG_REMAP, tmp);
-    pw(MISC_UBUS_BAR2_CONFIG_REMAP_HI, 0x00);
-    dmb();
-
-    pw(MISC_RC_BAR3_CONFIG_LO, 0);
-    pw(MISC_RC_BAR3_CONFIG_HI, 0);
-    pw(MISC_UBUS_BAR3_CONFIG_REMAP, 0);
-    pw(MISC_UBUS_BAR3_CONFIG_REMAP_HI, 0);
-    dmb();
-
-    tmp = pr(MISC_MISC_CTRL);
-    tmp &= ~(0x1FU << 27);
-    tmp |= (21U << 27);
-    pw(MISC_MISC_CTRL, tmp);
-    dmb();
+    program_inbound_arena();
 
     tmp = pr(MISC_UBUS_CTRL);
     tmp |= UBUS_REPLY_ERR_DIS | UBUS_REPLY_DECERR_DIS;
@@ -345,16 +397,11 @@ bool pcie1_init(void)
     dmb();
 
     cap_set_gen2();
+    dmb();
 
     perst_set(false);
-    delay_cycles(100000000);
-
-    for (i = 0; i < 200; i++) {
-        if (pcie1_link_up())
-            break;
-        delay_cycles(5000000);
-    }
-    g_link_up = pcie1_link_up();
+    /* #144: 200 ms deadline, 1 ms polls. Do not pet the watchdog. */
+    g_link_up = wait_link_ms(200);
     if (!g_link_up) {
         g_inited = true;
         publish_snap("no link (dtparam=pciex1 + powered FFC riser?)");

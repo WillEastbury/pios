@@ -316,11 +316,14 @@ multi-gigabyte Device window that is not yet a programmed ATU. Finding
 `8086:E212` is also not LevelZero.
 
 **Rule:** pcie1 is a second BCM2712 RC (`0x1000110000`, reset 43, 32 MiB
-Device ATU at `0x1B00000000` for BAR0 only). Never map ReBAR LMEM to
-“have a heap”. MSI 255/256 stay masked until a handler exists. Firmware
-needs `dtparam=pciex1`. The FFC is 5 V / 1 A; GPU 12 V comes from the
-powered riser. `lzero map` is opt-in and fail-closed if BAR0 > ATU.
-Dashboard LevelZero stays red until gate E. See ADR-045/046 / issue #137.
+Device ATU at `0x1B00000000` for BAR0 only). Inbound DMA is a **2 MiB NC
+arena** (`PIOS_DMA_PCIE1_BASE`), never 64 GiB → PA 0 (#141). Never map
+ReBAR LMEM to “have a heap”. MSI 255/256 stay masked until a handler
+exists. Firmware needs `dtparam=pciex1`; if the RC ID reads
+`0xFFFFFFFF`, skip without a multi-second spin (#144). The FFC is 5 V /
+1 A; GPU 12 V comes from the powered riser. `lzero map` is opt-in and
+fail-closed if BAR0 > ATU. Dashboard LevelZero stays red until gate E.
+See ADR-045/046 / issue #137.
 
 ### Highmem probe must stay inside the identity map
 

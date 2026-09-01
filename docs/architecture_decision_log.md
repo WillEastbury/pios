@@ -555,6 +555,10 @@ the FFC to Arc Pro B50; any compute-class function is a candidate.
   (32 MiB at `0x1B00000000`) if it fits. Memory decode on, Bus Master off.
   If BAR0 > ATU, stay blocked (`bar0>atu`); do not steal RP1 or grow into
   the 12 GiB prefetch window.
+- **Inbound DMA (#141)** — pcie1 RC BAR2 is **2 MiB** at PCIe
+  `0x10_00000000` remapped to `PIOS_DMA_PCIE1_BASE` (NC hole before
+  `FB_BACK`), not 64 GiB → PA 0. `pcie1_dma_addr()` fail-closes anything
+  outside that arena.
 - **D** — GuC firmware from WALFS, adrv-chunked. Not implemented until C
   is proven live. MSI still masked.
 - **E** — host-compiled ZEBIN known-answer vs NEON. Only E may set

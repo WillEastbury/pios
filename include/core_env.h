@@ -15,6 +15,7 @@
  *   0x04900000 - 0x04AFFFFF  DMA NET buffers (2MB)
  *   0x04B00000 - 0x04CFFFFF  DMA DISK buffers (2MB)
  *   0x04D00000 - 0x04DFFFFF  Shared process IPC SHM pool (1MB)
+ *   0x04E00000 - 0x04FFFFFF  DMA PCIE1 inbound arena (2MB, NC; #141)
  *   0x05000000 - 0x05FFFFFF  HDMI double-buffer back buffer (16MB)
  *
  * QEMU's equivalent map is offset upward by 2MB to leave room for the larger
@@ -27,6 +28,7 @@
  *   0x46300000 - 0x464FFFFF  DMA NET buffers (2MB)
  *   0x46500000 - 0x466FFFFF  DMA DISK buffers (2MB)
  *   0x46700000 - 0x467FFFFF  Shared process IPC SHM pool (1MB)
+ *   0x46800000 - 0x469FFFFF  DMA PCIE1 inbound arena (2MB, unused on QEMU)
  *   0x46A00000 - 0x479FFFFF  HDMI double-buffer back buffer (16MB)
  */
 
@@ -49,6 +51,9 @@
 
 #define DMA_DISK_BASE       PIOS_DMA_DISK_BASE
 #define DMA_DISK_SIZE       PIOS_DMA_DISK_SIZE
+
+#define DMA_PCIE1_BASE      PIOS_DMA_PCIE1_BASE
+#define DMA_PCIE1_SIZE      PIOS_DMA_PCIE1_SIZE
 
 #define IPC_SHM_BASE        PIOS_IPC_SHM_BASE
 #define IPC_SHM_SIZE        PIOS_IPC_SHM_SIZE

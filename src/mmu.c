@@ -686,7 +686,7 @@ void mmu_init(void) {
  *                   rings/buffers here but already do dcache clean/invalidate;
  *                   caching these is Phase 2b, gated on per-driver review)
  *   blocks 4-35   0x00800000-0x047FFFFF  per-core private RAM        -> WB IS
- *   blocks 36-39  0x04800000-0x04FFFFFF  FIFO/DMA_NET/DMA_DISK/IPC   -> NC
+ *   blocks 36-39  0x04800000-0x04FFFFFF  FIFO/DMA_NET/DISK/IPC/PCIE1 -> NC
  *   blocks 40-47  0x05000000-0x05FFFFFF  HDMI back buffer           -> WB IS
  *   blocks 48-511 0x06000000-0x3FFFFFFF  high RAM + VideoCore scanout-> NC
  *
