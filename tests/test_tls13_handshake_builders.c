@@ -9,6 +9,7 @@
  * code.
  */
 #include "tls13_handshake.h"
+#include "tls13_record.h"
 #include "tls13_keysched.h"
 #include "crypto.h"
 #include <stdio.h>
@@ -81,12 +82,17 @@ int main(void) {
 
     /* ---- EncryptedExtensions ----------------------------------------- */
     u8 ee[16];
-    u32 ee_len = tls13_build_encrypted_extensions(ee, sizeof(ee));
-    CHECK(ee_len == 6U, "EncryptedExtensions total length == 6 (4-byte header + 2-byte empty list)");
-    if (ee_len == 6U) {
+    u32 ee_len = tls13_build_encrypted_extensions_with_limit(
+        TLS13_MAX_INNER_PLAINTEXT, ee, sizeof(ee));
+    CHECK(ee_len == 12U, "EncryptedExtensions carries record_size_limit");
+    if (ee_len == 12U) {
         CHECK(ee[0] == TLS13_HS_ENCRYPTED_EXTENSIONS, "EncryptedExtensions msg_type == 8");
-        CHECK(ee[1] == 0 && ee[2] == 0 && ee[3] == 2, "EncryptedExtensions body_len == 2");
-        CHECK(ee[4] == 0 && ee[5] == 0, "EncryptedExtensions extensions list is empty");
+        CHECK(ee[1] == 0 && ee[2] == 0 && ee[3] == 8, "EncryptedExtensions body_len == 8");
+        CHECK(ee[4] == 0 && ee[5] == 6, "EncryptedExtensions extension list length == 6");
+        CHECK(ee[6] == 0 && ee[7] == 0x1C &&
+              ee[8] == 0 && ee[9] == 2 &&
+              ee[10] == 0x10 && ee[11] == 0,
+              "EncryptedExtensions record_size_limit == 4096");
     }
 
     /* ---- Certificate --------------------------------------------------*/

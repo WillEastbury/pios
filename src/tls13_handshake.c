@@ -1,4 +1,5 @@
 #include "tls13_handshake.h"
+#include "tls13_record.h"
 #include "simd.h"
 #include "ecdsa.h"
 
@@ -54,6 +55,14 @@ static bool cur_u16(struct cursor *c, u16 *out)
     return true;
 }
 
+static bool cur_u24(struct cursor *c, u32 *out)
+{
+    const u8 *p = cur_take(c, 3);
+    if (!p) return false;
+    *out = ((u32)p[0] << 16) | ((u32)p[1] << 8) | (u32)p[2];
+    return true;
+}
+
 /* A "vector" per RFC 8446/TLS presentation language: a length prefix of
  * `len_bytes` (1, 2, or 3) followed by that many bytes of payload. Opens
  * a sub-cursor scoped exactly to the vector's payload -- a sub-parser
@@ -71,6 +80,8 @@ static bool cur_open_vector(struct cursor *c, u32 len_bytes, struct cursor *sub)
         u16 v16;
         if (!cur_u16(c, &v16)) return false;
         vlen = v16;
+    } else if (len_bytes == 3) {
+        if (!cur_u24(c, &vlen)) return false;
     } else {
         return false;
     }
@@ -213,9 +224,29 @@ u32 tls13_build_server_hello(const u8 *session_id, u32 session_id_len,
 
 u32 tls13_build_encrypted_extensions(u8 *out, u32 out_cap)
 {
-    static const u8 empty_extensions[2] = { 0x00, 0x00 }; /* extensions<0..2^16-1> length=0 */
-    return wrap_handshake_message(TLS13_HS_ENCRYPTED_EXTENSIONS, empty_extensions,
-                                  sizeof(empty_extensions), out, out_cap);
+    static const u8 extensions[] = { 0x00, 0x00 };
+    return wrap_handshake_message(TLS13_HS_ENCRYPTED_EXTENSIONS, extensions,
+                                  sizeof(extensions), out, out_cap);
+}
+
+u32 tls13_build_encrypted_extensions_with_limit(u16 record_size_limit,
+                                                u8 *out, u32 out_cap)
+{
+    if (record_size_limit < 64U ||
+        record_size_limit > TLS13_RECORD_SIZE_LIMIT_MAX)
+        return 0U;
+    u8 extensions[8];
+    extensions[0] = 0x00;
+    extensions[1] = 0x06;
+    extensions[2] = 0x00;
+    extensions[3] = 0x1c;
+    extensions[4] = 0x00;
+    extensions[5] = 0x02;
+    extensions[6] = (u8)(record_size_limit >> 8);
+    extensions[7] = (u8)record_size_limit;
+    return wrap_handshake_message(TLS13_HS_ENCRYPTED_EXTENSIONS,
+                                  extensions, sizeof(extensions),
+                                  out, out_cap);
 }
 
 u32 tls13_build_certificate(const u8 *cert_der, u32 cert_der_len, u8 *out, u32 out_cap)
@@ -382,6 +413,20 @@ static bool parse_server_name(struct cursor *ext, struct tls13_client_hello *out
     return list.ok;
 }
 
+static bool parse_record_size_limit(struct cursor *ext,
+                                    struct tls13_client_hello *out)
+{
+    u16 limit;
+    if (out->has_record_size_limit ||
+        cur_remaining(ext) != 2U ||
+        !cur_u16(ext, &limit) ||
+        limit < 64U || limit > TLS13_RECORD_SIZE_LIMIT_MAX)
+        return false;
+    out->has_record_size_limit = true;
+    out->record_size_limit = limit;
+    return true;
+}
+
 bool tls13_parse_client_hello(const u8 *body, u32 body_len, struct tls13_client_hello *out)
 {
     if (!body || !out) return false;
@@ -461,6 +506,9 @@ bool tls13_parse_client_hello(const u8 *body, u32 body_len, struct tls13_client_
             case 0x0000U: /* server_name (SNI) */
                 ok = parse_server_name(&ext, out);
                 break;
+            case 0x001cU: /* record_size_limit (RFC 8449) */
+                ok = parse_record_size_limit(&ext, out);
+                break;
             default:
                 /* RFC 8446: unrecognized extensions MUST be ignored. */
                 break;
@@ -471,4 +519,219 @@ bool tls13_parse_client_hello(const u8 *body, u32 body_len, struct tls13_client_
     }
 
     return c.ok && cur_remaining(&c) == 0;
+}
+
+u32 tls13_build_client_hello(const u8 *server_name, u32 server_name_len,
+                             const u8 client_random[32],
+                             const u8 session_id[32],
+                             const u8 ephemeral_public[65],
+                             u8 *out, u32 out_cap)
+{
+    if (!client_random || !session_id || !ephemeral_public || !out)
+        return 0;
+    if (server_name_len > TLS13_CH_SNI_MAX - 1U ||
+        (server_name_len && !server_name) ||
+        ephemeral_public[0] != 0x04U)
+        return 0;
+
+    u8 body[512];
+    struct writer w;
+    wr_init(&w, body, sizeof(body));
+    wr_u16(&w, 0x0303U);
+    wr_put(&w, client_random, 32U);
+    wr_u8(&w, 32U);
+    wr_put(&w, session_id, 32U);
+    wr_u16(&w, 2U);
+    wr_u16(&w, TLS13_CIPHER_AES_128_GCM_SHA256);
+    wr_u8(&w, 1U);
+    wr_u8(&w, 0U);
+
+    u8 extensions[384];
+    struct writer ew;
+    wr_init(&ew, extensions, sizeof(extensions));
+
+    if (server_name_len) {
+        wr_u16(&ew, 0x0000U);
+        wr_u16(&ew, (u16)(server_name_len + 5U));
+        wr_u16(&ew, (u16)(server_name_len + 3U));
+        wr_u8(&ew, 0U);
+        wr_u16(&ew, (u16)server_name_len);
+        wr_put(&ew, server_name, server_name_len);
+    }
+
+    wr_u16(&ew, 0x002bU);
+    wr_u16(&ew, 3U);
+    wr_u8(&ew, 2U);
+    wr_u16(&ew, TLS13_VERSION_1_3);
+
+    wr_u16(&ew, 0x000aU);
+    wr_u16(&ew, 4U);
+    wr_u16(&ew, 2U);
+    wr_u16(&ew, TLS13_GROUP_SECP256R1);
+
+    wr_u16(&ew, 0x000dU);
+    wr_u16(&ew, 4U);
+    wr_u16(&ew, 2U);
+    wr_u16(&ew, TLS13_SIGALG_ECDSA_SECP256R1_SHA256);
+
+    wr_u16(&ew, 0x0033U);
+    wr_u16(&ew, 71U);
+    wr_u16(&ew, 69U);
+    wr_u16(&ew, TLS13_GROUP_SECP256R1);
+    wr_u16(&ew, 65U);
+    wr_put(&ew, ephemeral_public, 65U);
+
+    /* Bound peer TLSCiphertext records to the receive buffer this
+     * implementation provisions. The limit is large enough for the maximum
+     * supported plaintext plus the TLS 1.3 authentication overhead. */
+    wr_u16(&ew, 0x001cU); /* record_size_limit (RFC 8449) */
+    wr_u16(&ew, 2U);
+    wr_u16(&ew, TLS13_MAX_INNER_PLAINTEXT);
+
+    if (!ew.ok) return 0;
+    wr_u16(&w, (u16)ew.len);
+    wr_put(&w, extensions, ew.len);
+    if (!w.ok) return 0;
+    return wrap_handshake_message(TLS13_HS_CLIENT_HELLO, body, w.len,
+                                  out, out_cap);
+}
+
+bool tls13_parse_server_hello(const u8 *body, u32 body_len,
+                              struct tls13_server_hello *out)
+{
+    if (!body || !out) return false;
+    simd_zero(out, sizeof(*out));
+    struct cursor c;
+    cur_init(&c, body, body_len);
+
+    u16 legacy_version;
+    if (!cur_u16(&c, &legacy_version) || legacy_version != 0x0303U)
+        return false;
+    if (!cur_take(&c, 32U)) return false;
+
+    u8 sid_len;
+    if (!cur_u8(&c, &sid_len) || sid_len > TLS13_CH_MAX_SESSION_ID)
+        return false;
+    const u8 *sid = cur_take(&c, sid_len);
+    if (!sid) return false;
+    if (sid_len) simd_memcpy(out->legacy_session_id, sid, sid_len);
+    out->legacy_session_id_len = sid_len;
+
+    if (!cur_u16(&c, &out->cipher_suite)) return false;
+    u8 compression;
+    if (!cur_u8(&c, &compression) || compression != 0U) return false;
+
+    struct cursor exts;
+    if (!cur_open_vector(&c, 2U, &exts)) return false;
+    while (cur_remaining(&exts) > 0) {
+        u16 type;
+        struct cursor ext;
+        if (!cur_u16(&exts, &type) ||
+            !cur_open_vector(&exts, 2U, &ext))
+            return false;
+        if (type == 0x002bU) {
+            u16 version;
+            if (!cur_u16(&ext, &version) || cur_remaining(&ext) != 0U)
+                return false;
+            out->selects_tls13 = version == TLS13_VERSION_1_3;
+        } else if (type == 0x0033U) {
+            u16 group;
+            u16 key_len;
+            if (!cur_u16(&ext, &group) || !cur_u16(&ext, &key_len))
+                return false;
+            const u8 *key = cur_take(&ext, key_len);
+            if (!key || cur_remaining(&ext) != 0U) return false;
+            if (group == TLS13_GROUP_SECP256R1 && key_len == 65U &&
+                key[0] == 0x04U) {
+                out->has_p256_key_share = true;
+                simd_memcpy(out->p256_key_share, key, 65U);
+            }
+        }
+    }
+    return c.ok && cur_remaining(&c) == 0U &&
+           out->selects_tls13 && out->has_p256_key_share;
+}
+
+bool tls13_parse_encrypted_extensions_limit(const u8 *body, u32 body_len,
+                                            u16 *record_size_limit)
+{
+    if (!body) return false;
+    if (record_size_limit) *record_size_limit = 0U;
+    struct cursor c;
+    struct cursor exts;
+    cur_init(&c, body, body_len);
+    if (!cur_open_vector(&c, 2U, &exts)) return false;
+    while (cur_remaining(&exts) > 0U) {
+        u16 type;
+        struct cursor ext;
+        if (!cur_u16(&exts, &type) ||
+            !cur_open_vector(&exts, 2U, &ext))
+            return false;
+        if (type == 0x001cU) {
+            u16 limit;
+            if ((record_size_limit && *record_size_limit != 0U) ||
+                cur_remaining(&ext) != 2U ||
+                !cur_u16(&ext, &limit) ||
+                limit < 64U || limit > TLS13_RECORD_SIZE_LIMIT_MAX)
+                return false;
+            if (record_size_limit) *record_size_limit = limit;
+            if (cur_remaining(&ext) != 0U)
+                return false;
+        }
+    }
+    return c.ok && cur_remaining(&c) == 0U;
+}
+
+bool tls13_parse_encrypted_extensions(const u8 *body, u32 body_len)
+{
+    return tls13_parse_encrypted_extensions_limit(body, body_len, NULL);
+}
+
+bool tls13_parse_certificate_leaf(const u8 *body, u32 body_len,
+                                  const u8 **cert_der, u32 *cert_der_len)
+{
+    if (!body || !cert_der || !cert_der_len) return false;
+    struct cursor c;
+    cur_init(&c, body, body_len);
+    struct cursor context;
+    if (!cur_open_vector(&c, 1U, &context)) return false;
+    if (context.len != 0U) return false;
+    struct cursor list;
+    if (!cur_open_vector(&c, 3U, &list) || cur_remaining(&list) == 0U)
+        return false;
+
+    bool have_leaf = false;
+    while (cur_remaining(&list) > 0U) {
+        struct cursor cert;
+        struct cursor extensions;
+        if (!cur_open_vector(&list, 3U, &cert) ||
+            cur_remaining(&cert) == 0U ||
+            !cur_open_vector(&list, 2U, &extensions))
+            return false;
+        if (!have_leaf) {
+            *cert_der = cert.p;
+            *cert_der_len = cert.len;
+            have_leaf = true;
+        }
+    }
+    return have_leaf && c.ok && cur_remaining(&c) == 0U;
+}
+
+bool tls13_parse_certificate_verify(const u8 *body, u32 body_len,
+                                    u16 *signature_scheme,
+                                    const u8 **signature_der,
+                                    u32 *signature_der_len)
+{
+    if (!body || !signature_scheme || !signature_der ||
+        !signature_der_len)
+        return false;
+    struct cursor c;
+    cur_init(&c, body, body_len);
+    if (!cur_u16(&c, signature_scheme)) return false;
+    struct cursor sig;
+    if (!cur_open_vector(&c, 2U, &sig) || sig.len == 0U)
+        return false;
+    *signature_der = sig.p;
+    *signature_der_len = sig.len;
+    return c.ok && cur_remaining(&c) == 0U;
 }

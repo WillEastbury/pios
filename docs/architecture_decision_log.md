@@ -91,6 +91,7 @@ decision)
 | [044](#adr-044) | GENET and WiFi ingress are IRQ → FIFO only | Owner | Accepted |
 | [045](#adr-045) | Pi 5 pcie1 FFC is a second RC; LevelZero stays fail-closed | Owner | Accepted |
 | [046](#adr-046) | LevelZero B→E path: compute-class, BAR0 only, no LMEM | Owner | Accepted |
+| [047](#adr-047) | Event-driven real TLS 1.3 client and server I/O | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -561,6 +562,46 @@ the FFC to Arc Pro B50; any compute-class function is a candidate.
 
 **Rejected.** Auto-mapping BAR0 at boot. Mapping ReBAR LMEM to “have a
 heap”. `clCreateProgramWithSource` / IGC on the board. Porting xe/i915.
+
+---
+
+<a name="adr-047"></a>
+## ADR-047 — Event-driven real TLS 1.3 client and server I/O
+
+**Date:** 2026-09-01 · **Decider:** Owner · **Status:** Accepted
+
+**Context.** The existing TLS client uses a private CHLO/SHLO protocol and
+waits by calling `net_poll()` from blocking read/write loops. The real TLS 1.3
+server has the same blocking I/O shape. This violates ADR-002 and ADR-033:
+core 0 must not borrow unbounded protocol work or hide a missed network event
+behind a polling loop.
+
+**Decision.** Replace both roles with a real RFC 8446 TLS 1.3 state machine
+using the existing P-256, HKDF, SHA-256, and AES-GCM primitives. Each
+connection owns persistent handshake and record cursors in the fixed TLS
+connection table. `start`, `handshake_step`, `read`, and `write` operations
+consume only currently available TCP bytes or emit bounded output and return
+`PENDING`, `DONE`, or `ERROR`; they never call `net_poll()`, sleep, allocate,
+or wait for a buffer to fill.
+
+TLS progress is driven by the existing TCP/AIRQ/service continuation path.
+Every in-flight connection has a bounded deadline and explicit cancellation
+or failure transition. Core 0 remains the sole TLS owner, and all certificate,
+key-schedule, record, and application-data ownership stays inside the existing
+kernel TLS boundary from ADR-006.
+
+The compatibility blocking APIs are not used by normal runtime services. Any
+diagnostic-only compatibility wrapper must be explicitly named and remain
+behind the `net_poll()` diagnostic allowlist.
+
+**Rejected.** Keeping the fake handshake and merely renaming `net_poll()`;
+disabling `tls_connect()` while leaving existing HTTPS callers; or moving TLS
+to another core, which would weaken the core-0 ownership and fail-safe model.
+
+**Validation.** Host tests cover fragmented handshake messages, partial TCP
+writes, record backpressure, timeout/cancel paths, stale handles, close
+notification, record-size negotiation, and the absence of normal-runtime
+`net_poll()` callers. QEMU exercises the shared kernel regression path.
 
 ---
 

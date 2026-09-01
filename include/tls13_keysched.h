@@ -14,6 +14,8 @@
  *   server RX (handshake) = client_hs_traffic_secret
  *   server TX (application) = server_ap_traffic_secret
  *   server RX (application) = client_ap_traffic_secret
+ *   client TX (handshake/application) = client_*_traffic_secret
+ *   client RX (handshake/application) = server_*_traffic_secret
  */
 
 #define TLS13_HASH_LEN     32U   /* SHA-256 output length */

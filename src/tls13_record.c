@@ -32,9 +32,12 @@ u32 tls13_record_seal(struct tls13_record_dir *dir, u8 content_type,
                      u8 *out, u32 out_cap)
 {
     if (!dir || !out || (plain_len && !plain)) return 0;
+    if (dir->seq == ~0ULL) return 0;
+    if (plain_len > TLS13_MAX_INNER_PLAINTEXT - 1U ||
+        pad_len > TLS13_MAX_INNER_PLAINTEXT - 1U - plain_len)
+        return 0;
 
     u32 inner_len = plain_len + pad_len + 1U;
-    if (inner_len > TLS13_MAX_INNER_PLAINTEXT) return 0;
 
     u32 cipher_len = inner_len + TLS13_TAG_LEN;
     if (out_cap < TLS13_RECORD_HDR_LEN + cipher_len) return 0;
@@ -65,6 +68,7 @@ bool tls13_record_open(struct tls13_record_dir *dir, const u8 *in, u32 record_le
                        u8 *content_type, u8 *out, u32 out_cap, u32 *out_len)
 {
     if (!dir || !in || !content_type || !out || !out_len) return false;
+    if (dir->seq == ~0ULL) return false;
     if (record_len < TLS13_RECORD_HDR_LEN + TLS13_TAG_LEN + 1U) return false;
 
     u32 cipher_len = ((u32)in[3] << 8) | (u32)in[4];
@@ -162,4 +166,3 @@ bool tls13_record_selftest(void)
 
     return true;
 }
-
