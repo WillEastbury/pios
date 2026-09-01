@@ -369,6 +369,8 @@ static u32 stage0_platform_id(void)
         }
         return PIOS_STAGE2_PLATFORM_BCM2837_FAMILY;
     }
+    if (g_board_family == BOARD_FAMILY_PI4)
+        return PIOS_STAGE2_PLATFORM_PI4;
     return PIOS_STAGE2_PLATFORM_PI5;
 #endif
 }
@@ -1001,6 +1003,62 @@ static bool bootctrl_activate_slot_a(u32 root_lba)
     return bootctrl_write(root_lba, bootctl);
 }
 
+static void stage0_install_shared(const u8 *image, u32 image_len)
+{
+    if (!image || image_len < sizeof(struct pios_stage2_manifest_header))
+        return;
+    for (u32 off = 0; off + sizeof(struct pios_stage2_manifest_header) <= image_len; off += 8U) {
+        const u8 *h = image + off;
+        if (read_le32(h) != PIOS_STAGE2_MANIFEST_MAGIC)
+            continue;
+        u16 ver = read_le16(h + 4);
+        u16 header_bytes = read_le16(h + 6);
+        u16 entry_count = read_le16(h + 8);
+        u16 entry_bytes = read_le16(h + 10);
+        u32 flags = read_le32(h + 12);
+        if (ver != PIOS_STAGE2_MANIFEST_VERSION ||
+            !(flags & PIOS_STAGE2_MANIFEST_FLAG_PACKAGED) ||
+            entry_bytes < PIOS_STAGE2_PACKAGED_ENTRY_BYTES ||
+            entry_count == 0 || entry_count > 16U)
+            continue;
+        for (u32 i = 0; i < entry_count; i++) {
+            const u8 *e = h + header_bytes + i * (u32)entry_bytes;
+            if (read_le32(e) != PIOS_STAGE2_PLATFORM_SHARED)
+                continue;
+            u64 payload_off = read_le64(e + 64);
+            u64 payload_size = read_le64(e + 72);
+            if (payload_size == 0 || payload_size > PIOS_SHARED_ASSET_SIZE ||
+                payload_off > image_len ||
+                payload_size > image_len - payload_off)
+                return;
+            memcpy((void *)(usize)PIOS_SHARED_ASSET_BASE,
+                   image + (u32)payload_off, (usize)payload_size);
+            uart_puts("[boot] shared assets ");
+            uart_hex((u32)payload_size);
+            uart_puts(" @");
+            uart_hex((u32)PIOS_SHARED_ASSET_BASE);
+            uart_puts("\n");
+            return;
+        }
+        return;
+    }
+}
+
+static bool stage0_load_shared_from_fat(void)
+{
+    struct fat32_ro fs;
+    u32 first_cluster = 0;
+    u32 file_size = 0;
+    u8 *staging = (u8 *)(usize)BOOT_STAGING_ADDR;
+    if (!fat32_mount(&fs) ||
+        !fat32_find_stage2(&fs, &first_cluster, &file_size))
+        return false;
+    if (!fat32_load_file(&fs, first_cluster, file_size, staging))
+        return false;
+    stage0_install_shared(staging, file_size);
+    return true;
+}
+
 static bool stage0_apply_fat_update(u32 root_lba)
 {
     struct fat32_ro fs;
@@ -1200,6 +1258,7 @@ NORETURN void bootstrap_main(void)
          * never suppress an available staged update.
          */
         (void)stage0_apply_fat_update(root_lba);
+        (void)stage0_load_shared_from_fat();
     u32 slot_lba = partition_valid ? select_kernel_slot_lba(root_lba)
                                    : BOOT_FALLBACK_LBA;
     fb_set_color(0x0000CCFF, 0x00000000);

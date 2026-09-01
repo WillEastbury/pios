@@ -12,6 +12,9 @@ typedef u8 nic_iface_t;
 
 bool nic_init(void);
 bool nic_init_wifi(void);
+/* Bind a named loadable nic_ops backend (e.g. "wifi-cyw43455") to an iface.
+ * Boot-probed wired NICs use nic_init(); slow/optional devices use this. */
+bool nic_load(const char *name, nic_iface_t iface);
 bool nic_activate_wifi_loaded(void);
 bool nic_is_wifi(void);
 bool nic_wifi_active(void);
@@ -37,11 +40,11 @@ bool nic_link_full_duplex(void);
 
 /* Pluggable NIC backend abstraction.
  *
- * Each hardware backend (Cadence MACB on Pi5, virtio-net on QEMU, future
- * CYW43 WiFi, ...) exposes a nic_ops vtable. nic_init() probes the registered
- * backends in priority order and activates the first whose hardware is
- * detected, so the network stack is brought up against whatever NIC is
- * present rather than a compile-time-fixed driver.
+ * Each hardware backend (Cadence MACB on Pi 5, Broadcom GENET on Pi 4,
+ * virtio-net on QEMU, CYW43 WiFi) exposes a nic_ops vtable. TCP/IP/UDP/sockets
+ * sit above this and never name a board. nic_init() probes boot-time wired
+ * backends; nic_load() binds optional/slow backends (WiFi firmware upload)
+ * onto NIC_IFACE_WIFI without replacing the wired path.
  *
  * probe() must be non-destructive and safe to call on a platform where the
  * device is absent (it may not touch unmapped MMIO). Offload hooks are

@@ -13,15 +13,17 @@
  * smaller surface and CAN be made genuinely runtime-multi-platform: read the
  * ARM MIDR_EL1 register (a CPU identification register, not an MMIO
  * peripheral -- safe to read before any board-specific address is known) to
- * distinguish Cortex-A76 (Pi5) from Cortex-A53 (BCM2837-family: Pi3 B/B+/A+,
- * Pi Zero 2 W), then select the matching peripheral base addresses and the
- * matching payload entry from the multi-platform PIOSSTG2.PKG (see
- * include/stage2_manifest.h). One bootstrap kernel8.img can then boot
- * correctly regardless of which of these boards it's inserted into.
+ * distinguish Cortex-A76 (Pi5), Cortex-A72 (Pi4 / BCM2711), and Cortex-A53
+ * (BCM2837-family: Pi3 B/B+/A+, Pi Zero 2 W), then select the matching
+ * peripheral base addresses and the matching payload entry from the
+ * multi-platform PIOSSTG2.PKG (see include/stage2_manifest.h). One
+ * bootstrap kernel8.img can then boot correctly regardless of which of
+ * these boards it's inserted into.
  *
  * MIDR_EL1 PartNum values (bits [15:4]), cross-checked against the Linux
  * kernel's arch/arm64/include/asm/cputype.h:
  *   Cortex-A76: 0xD0B
+ *   Cortex-A72: 0xD08
  *   Cortex-A53: 0xD03
  */
 #pragma once
@@ -31,17 +33,21 @@
  * (which also covers QEMU/UEFI/Hyper-V -- targets stage0 never runs on,
  * since QEMU boots its own binary directly and UEFI/Hyper-V have their own
  * boot paths). Only the two real, physical, SD-booted board families that
- * can plausibly share one stage0 image are represented here. */
+ * can plausibly share one stage0 image are represented here (Pi 5, Pi 4,
+ * BCM2837-family). */
 #define BOARD_FAMILY_UNKNOWN   0U
 #define BOARD_FAMILY_PI5       1U   /* BCM2712, Cortex-A76 */
 #define BOARD_FAMILY_BCM2837   2U   /* BCM2837(B0)/BCM2710A1, Cortex-A53 */
+#define BOARD_FAMILY_PI4       3U   /* BCM2711, Cortex-A72 */
 
 #define BOARD_MODEL_UNKNOWN    0U
 #define BOARD_MODEL_PI3_B      0x08U
 #define BOARD_MODEL_PI3_B_PLUS 0x0DU
+#define BOARD_MODEL_PI4_B      0x11U
 #define BOARD_MODEL_ZERO2W     0x12U
 
 #define MIDR_PARTNUM_CORTEX_A76 0xD0BU
+#define MIDR_PARTNUM_CORTEX_A72 0xD08U
 #define MIDR_PARTNUM_CORTEX_A53 0xD03U
 
 /* Pure decode: given a raw MIDR_EL1 value, return the board family. No MMIO,

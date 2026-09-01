@@ -1,16 +1,17 @@
 /*
- * nic.c - Active NIC backend for Raspberry Pi 5
+ * nic.c - Modular NIC backends, shared TCP/IP/UDP/socket stack.
  *
- * Pi 5 wired networking is provided by the BCM2712 SoC's own GEM/MACB
- * Ethernet MAC (see macb.c / PIOS_GENET_BASE). WiFi (CYW43455 via the
- * BCM2712 SoC's dedicated SDIO2 controller, see cyw43.c/sdio.c) is a
- * second, explicitly-triggered backend: nic_init_wifi() brings it up and
- * activates it as g_nic only when called (e.g. from the console "wifi"
- * command), it is never auto-probed by nic_init() at boot.
+ * Wired probe order is compile-time capability, not board nicknames:
+ *   Pi 5  — Cadence MACB on RP1 (PIOS_HAS_MACB)
+ *   Pi 4  — Broadcom GENET v5 on BCM2711 (PIOS_HAS_GENET)
+ *   QEMU  — virtio-net
+ * WiFi is the same nic_ops vtable, loaded on demand (nic_load / nic_init_wifi)
+ * so CYW43455 SDIO1/SDIO2 hosts do not own core 0 at boot. TCP/IP is shared.
  */
 
 #include "nic.h"
 #include "macb.h"
+#include "genet.h"
 #include "virtio_net.h"
 #include "tcp.h"
 #include "socket.h"
@@ -37,18 +38,45 @@ static u32 local_ipv4[NIC_IFACE_MAX];
 static nic_packet_counters_t pkt_counts;
 
 /* ── Pluggable NIC backend registry ───────────────────────────────────────
- * Backends are probed in array order; the first whose hardware is detected
- * is activated. macb (Pi5 wired GEM) takes priority over virtio-net (QEMU),
- * which takes priority over any future software/wireless backend. Symbols for
- * every backend exist in all builds (the inactive ones link to stubs), so the
- * table needs no per-platform #if. */
+ * nic_boot_backends[] is probed in order; first probe+init wins WIRED.
+ * nic_loadable_backends[] is bound by name (nic_load). MACB and GENET
+ * never share an image: PIOS_HAS_MACB (Pi 5) vs PIOS_HAS_GENET (Pi 4). */
 
 static bool macb_backend_probe(void)
 {
-    /* The MACB/GEM register window is only mapped on platforms that have it;
-     * gate on the platform capability so we never touch unmapped MMIO. */
-    return PIOS_HAS_GENET ? true : false;
+    /* Cadence GEM on RP1 — Pi 5 only. PIOS_HAS_GENET is BCM SoC GENET (Pi 4). */
+    return PIOS_HAS_MACB ? true : false;
 }
+
+#if PIOS_HAS_GENET
+static bool genet_backend_probe(void)
+{
+    return PIOS_GENET_BASE != 0UL;
+}
+
+static u32 genet_backend_link_mbps(void)
+{
+    return genet_link_mbps();
+}
+
+static const struct nic_ops nic_backend_genet = {
+    .name        = "genet",
+    .probe       = genet_backend_probe,
+    .init        = genet_init,
+    .send        = genet_send,
+    .recv        = genet_recv,
+    .get_mac     = genet_get_mac,
+    .link_up     = genet_link_up,
+    .link_mbps   = genet_backend_link_mbps,
+    .full_duplex = genet_link_full_duplex,
+    .set_tx_csum = genet_set_tx_checksum_offload,
+    .set_rx_csum = genet_set_rx_checksum_offload,
+    .set_tso     = genet_set_tso,
+    .tx_csum_enabled = genet_tx_checksum_offload_enabled,
+    .rx_csum_enabled = genet_rx_checksum_offload_enabled,
+    .tso_enabled = genet_tso_enabled,
+};
+#endif
 
 static bool virtio_backend_recv(u8 *frame, u32 *len, bool *checksum_trusted)
 {
@@ -95,9 +123,11 @@ static const struct nic_ops nic_backend_virtio = {
 };
 
 #if PIOS_HAS_WIFI_SDIO
-/* WiFi is never auto-probed at boot (firmware upload is slow and may fail
- * on real hardware that hasn't been validated yet) -- it is only activated
- * by an explicit nic_init_wifi() call, so it lives outside nic_backends[]. */
+static bool wifi_backend_probe(void)
+{
+    return true; /* compiled in only when PIOS_HAS_WIFI_SDIO */
+}
+
 static bool wifi_backend_recv(u8 *frame, u32 *len, bool *checksum_trusted)
 {
     if (checksum_trusted)
@@ -112,7 +142,7 @@ static u32 wifi_backend_link_mbps(void)
 
 static const struct nic_ops nic_backend_wifi = {
     .name        = "wifi-cyw43455",
-    .probe       = NULL,   /* never auto-probed; see nic_init_wifi() */
+    .probe       = wifi_backend_probe,
     .init        = wifi_nic_init,
     .send        = wifi_nic_send,
     .recv        = wifi_backend_recv,
@@ -124,9 +154,22 @@ static const struct nic_ops nic_backend_wifi = {
 };
 #endif
 
-static const struct nic_ops *const nic_backends[] = {
+/* Boot-probed wired backends. First probe+init wins NIC_IFACE_WIRED. */
+static const struct nic_ops *const nic_boot_backends[] = {
     &nic_backend_macb,
+#if PIOS_HAS_GENET
+    &nic_backend_genet,
+#endif
     &nic_backend_virtio,
+};
+
+/* Optional/slow backends. Never auto-probed; nic_load() binds them by name.
+ * NULL-terminated so the table can be empty on boards with no loadable NIC. */
+static const struct nic_ops *const nic_loadable_backends[] = {
+#if PIOS_HAS_WIFI_SDIO
+    &nic_backend_wifi,
+#endif
+    0
 };
 
 static const struct nic_ops *g_nic;     /* default backend, or NULL */
@@ -1087,8 +1130,8 @@ bool nic_init(void)
     g_nic = 0;
     simd_zero(iface_backends, sizeof(iface_backends));
     simd_zero(iface_initialized, sizeof(iface_initialized));
-    for (u32 i = 0; i < sizeof(nic_backends) / sizeof(nic_backends[0]); i++) {
-        const struct nic_ops *be = nic_backends[i];
+    for (u32 i = 0; i < sizeof(nic_boot_backends) / sizeof(nic_boot_backends[0]); i++) {
+        const struct nic_ops *be = nic_boot_backends[i];
         if (!be->probe || !be->probe())
             continue;
         if (be->init && be->init()) {
@@ -1102,21 +1145,50 @@ bool nic_init(void)
     return false;
 }
 
+static bool nic_name_eq(const char *a, const char *b)
+{
+    if (!a || !b)
+        return false;
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+bool nic_load(const char *name, nic_iface_t iface)
+{
+    const struct nic_ops *be;
+    u32 i;
+
+    if (!name || iface == NIC_IFACE_ANY || iface >= NIC_IFACE_MAX)
+        return false;
+    if (iface_backends[iface] && nic_name_eq(iface_backends[iface]->name, name))
+        return true;
+    for (i = 0; (be = nic_loadable_backends[i]) != 0; i++) {
+        if (!nic_name_eq(be->name, name))
+            continue;
+        if (be->probe && !be->probe())
+            return false;
+        if (be->init && !be->init())
+            return false;
+        iface_backends[iface] = be;
+        return true;
+    }
+    return false;
+}
+
 bool nic_init_wifi(void)
 {
-#if PIOS_HAS_WIFI_SDIO
-    /* Explicit, on-demand bring-up only. Preserve the active wired backend. */
-    if (!nic_backend_wifi.init || !nic_backend_wifi.init())
+    /* Explicit, on-demand bring-up. Preserve the active wired backend. */
+    if (!nic_load("wifi-cyw43455", NIC_IFACE_WIFI))
         return false;
-    iface_backends[NIC_IFACE_WIFI] = &nic_backend_wifi;
-    iface_initialized[NIC_IFACE_WIFI] =
-        PIOS_PLATFORM == PIOS_PLATFORM_PI3;
-    if (PIOS_PLATFORM == PIOS_PLATFORM_PI3)
-        g_nic = &nic_backend_wifi;
+    /* ADR-041: boards with no wired NIC make WiFi the default iface. */
+    if (!nic_iface_active(NIC_IFACE_WIRED)) {
+        iface_initialized[NIC_IFACE_WIFI] = true;
+        g_nic = iface_backends[NIC_IFACE_WIFI];
+    }
     return true;
-#else
-    return false;
-#endif
 }
 
 bool nic_activate_wifi_loaded(void)

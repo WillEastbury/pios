@@ -9,6 +9,7 @@
 #define PIOS_PLATFORM_PI3        6
 #define PIOS_PLATFORM_PIZERO2W   7
 #define PIOS_PLATFORM_FVP_A76_GICV2 8
+#define PIOS_PLATFORM_PI4        9
 
 #ifndef PIOS_PLATFORM
 #define PIOS_PLATFORM PIOS_PLATFORM_PI5
@@ -156,6 +157,48 @@
 #define PIOS_HAS_WIFI_SDIO1         0
 #define PIOS_WIFI_SDIO1_BASE        0UL
 #define PIOS_WIFI_WL_REG_ON_GPIO    0U
+#elif PIOS_PLATFORM == PIOS_PLATFORM_PI4
+/* BCM2711 (Pi 4 B): quad Cortex-A72, GENET v5 on-SoC, GIC-400, no RP1.
+ * 64-bit firmware uses the "low peripheral" map: SoC window at 0xFE000000,
+ * GENET at 0xFD580000, GIC in the ARM-local window at 0xFF84xxxx.
+ * The top 64 MiB of the first 4 GiB (0xFC000000-0xFFFFFFFF) is a peripheral
+ * hole and must never be mapped Normal. PSCI CPU_ON uses Aff0 (shift 0). */
+#define PIOS_PLATFORM_NAME          "pi4-bcm2711"
+#define PIOS_PLATFORM_CORE_COUNT    4U
+#define PIOS_PERIPH_BASE            0xFE000000UL
+#define PIOS_UART0_BASE             0xFE201000UL
+#define PIOS_MBOX_BASE              0xFE00B880UL
+#define PIOS_EMMC2_BASE             0xFE340000UL
+#define PIOS_GENET_BASE             0xFD580000UL
+#define PIOS_PCIE_RC_BASE           0UL
+#define PIOS_RP1_BAR_BASE           0UL
+#define PIOS_GIC_BASE               0xFF840000UL
+#define PIOS_GICD_BASE              0xFF841000UL
+#define PIOS_GICC_BASE              0xFF842000UL
+#define PIOS_QA7_BASE               0UL
+#define PIOS_HAS_GIC                1
+#define PIOS_HAS_RP1                0
+#define PIOS_HAS_PCIE               0
+#define PIOS_HAS_GENET              1
+#define PIOS_HAS_SD                 1
+#define PIOS_HAS_MAILBOX_FB         1
+#define PIOS_HAS_BOOTINFO_FB        0
+#define PIOS_HAS_DMA                0
+#define PIOS_HAS_PSCI_SECONDARIES   1
+#define PIOS_PSCI_USE_HVC           0
+#define PIOS_PSCI_AFF_SHIFT         0
+#define PIOS_HAS_VIRTIO_NET         0
+#define PIOS_ENABLE_NATIVE_VIDEOCORE 0
+#define PIOS_HAS_HYPERV             0
+#define PIOS_HAS_VMBUS              0
+#define PIOS_HAS_WIFI_SDIO2         0
+#define PIOS_WIFI_SDIO2_BASE        0UL
+/* CYW43455 on Arasan SDIO1 (same pinmux as Pi 3, low-peripheral map).
+ * Wired path is GENET; WiFi is a loadable nic_ops backend, not boot-probed. */
+#define PIOS_HAS_WIFI_SDIO1         1
+#define PIOS_WIFI_SDIO1_BASE        0xFE300000UL
+#define PIOS_WIFI_WL_REG_ON_GPIO     129U
+#define PIOS_WIFI_WL_REG_ON_FIRMWARE 1
 #elif PIOS_PLATFORM == PIOS_PLATFORM_PI3 || PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
 /* BCM2837/BCM2837B0 (Pi3 B/B+) and BCM2710A1 (Pi Zero 2 W) share the same
  * die/peripheral generation and "low peripheral" memory map -- quad
@@ -223,7 +266,7 @@
 #define PIOS_UART0_BASE             (PIOS_PERIPH_BASE + 0x201000UL)
 #define PIOS_MBOX_BASE              (PIOS_PERIPH_BASE + 0x013880UL)
 #define PIOS_EMMC2_BASE             0x1000FFF000UL
-#define PIOS_GENET_BASE             0x107D580000UL
+#define PIOS_GENET_BASE             0UL
 #define PIOS_PCIE_RC_BASE           0x1000120000UL
 #define PIOS_RP1_BAR_BASE           0x1F00000000UL
 #define PIOS_GIC_BASE               0x107FFF8000UL
@@ -233,7 +276,7 @@
 #define PIOS_HAS_GIC                1
 #define PIOS_HAS_RP1                1
 #define PIOS_HAS_PCIE               1
-#define PIOS_HAS_GENET              1
+#define PIOS_HAS_GENET              0
 #define PIOS_HAS_SD                 1
 #define PIOS_HAS_MAILBOX_FB         1
 #define PIOS_HAS_BOOTINFO_FB        0
@@ -263,6 +306,8 @@
 #endif
 
 #define PIOS_HAS_WIFI_SDIO          (PIOS_HAS_WIFI_SDIO1 || PIOS_HAS_WIFI_SDIO2)
+/* Cadence GEM on RP1 — Pi 5 only. Broadcom GENET is PIOS_HAS_GENET (Pi 4). */
+#define PIOS_HAS_MACB               PIOS_HAS_RP1
 
 #define PIOS_CORE_PRIV_SIZE         0x01000000UL
 
@@ -293,6 +338,27 @@
 #define PIOS_DMA_DISK_SIZE          0x00200000UL
 #define PIOS_IPC_SHM_SIZE           0x00100000UL
 #define PIOS_FB_BACK_SIZE           0x01000000UL
+
+/*
+ * Shared asset window (PicoScript IDE HTML/JS, etc.). One copy lives in
+ * PIOSSTG2.PKG as platform_id SHARED; stage0 copies it here so every
+ * kernel payload can omit the ~2 MiB blob. Must sit outside kernel, FIFO,
+ * DMA, FB_BACK, and the stage0 staging/trampoline windows.
+ */
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+#define PIOS_SHARED_ASSET_BASE      0x47A00000UL
+#else
+#define PIOS_SHARED_ASSET_BASE      0x06000000UL
+#endif
+#define PIOS_SHARED_ASSET_SIZE      0x00400000UL
+
+#ifndef PIOS_EMBED_IDE_ASSETS
+#if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
+#define PIOS_EMBED_IDE_ASSETS       1
+#else
+#define PIOS_EMBED_IDE_ASSETS       0
+#endif
+#endif
 
 /*
  * Global process arena (ADR-024 / issue #84).

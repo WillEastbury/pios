@@ -87,6 +87,7 @@ decision)
 | [040](#adr-040) | BCM2837-family Wi-Fi uses native SDIO1 | Owner | Accepted |
 | [041](#adr-041) | Automatic Wi-Fi fallback when no wired NIC exists | Owner | Accepted |
 | [042](#adr-042) | Runtime board selection and memory-capability setup | Owner | Accepted |
+| [043](#adr-043) | Pi 4 GENET + loadable nic_ops (MACB stays Pi 5) | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -439,6 +440,40 @@ beyond the page-table range.
 **Safety.** Unknown board models retain the BCM2837-family fallback only for
 the common boot path; board-specific Wi-Fi bring-up must reject an unsupported
 profile. Unselected payloads are never copied into the active raw slot.
+
+---
+
+<a name="adr-043"></a>
+## ADR-043 — Pi 4 GENET + loadable nic_ops (MACB stays Pi 5)
+
+**Date:** 2026-09-01 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Cortex-A72 / BCM2711 is a first-class target. Wired
+Ethernet on Pi 4 is SoC GENET v5. Pi 5 stays on Cadence MACB via RP1. TCP/IP
+is one shared stack. WiFi is the same `nic_ops` vtable, loaded on demand.
+
+**Decision.**
+
+- `PIOS_PLATFORM_PI4` (9). MIDR PartNum `0xD08` → `BOARD_FAMILY_PI4`. Stage0
+  selects package id 9. Stage2 is compile-time Pi 4 (`-march=armv8-a+simd+crc+crypto
+  -mno-outline-atomics`).
+- `PIOS_HAS_GENET` means Broadcom GENET on BCM2711 only. `PIOS_HAS_MACB`
+  (`PIOS_HAS_RP1`) means Cadence GEM on RP1. Pi 5 no longer sets `PIOS_HAS_GENET`.
+- `nic_init()` probes wired backends (`macb`, `genet`, `virtio-net`).
+  `nic_load(name, iface)` binds optional backends. WiFi is
+  `nic_load("wifi-cyw43455", NIC_IFACE_WIFI)` — never boot-probed, because
+  firmware upload must not own core 0.
+- PicoScript IDE blobs live once in the package as platform_id SHARED (16)
+  and are copied by stage0 to `PIOS_SHARED_ASSET_BASE`. Kernel payloads omit
+  `src/ide_assets.c`.
+
+**Rejected.** Using GENET on Pi 5. Treating `PIOS_HAS_GENET` as “has Ethernet”.
+A second TCP/IP stack for Pi 4. Auto-probing WiFi at `nic_init()`.
+
+**Consequences.** `macbdiag` / RX-hole recovery stay Pi 5-only. Pi 4 wired
+path is polling GENET until a GENET IRQ is wired. Pi 4/Pi 5 keep `.201` as
+the fail-safe wired address; WiFi is additive (ADR-032). Live Pi 4 boot is
+not yet proven.
 
 ---
 

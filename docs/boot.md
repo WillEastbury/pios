@@ -6,9 +6,11 @@ boot chain, multi-platform board detection (§2.0), the `start.S` low-level
 bring-up, the `kernel_main()` init order, secondary-core start, and the
 health-gated A/B success/rollback model.
 
-Related: [disk_layout.md](disk_layout.md) (on-disk slot/control structures,
+Related: [platforms.md](platforms.md) (Pi 5 / Pi 3 / Zero 2 W / QEMU),
+[disk_layout.md](disk_layout.md) (on-disk slot/control structures,
 including the FAT-package size model), [mmu.md](mmu.md) (page tables),
-[architecture.md](architecture.md) (core assignment & memory map),
+[architecture.md](architecture.md) (entry point),
+[architecture_system.md](architecture_system.md) (kernel model),
 [deployment.md](deployment.md) (SD prep / OTA), `include/board_detect.h`
 (runtime CPU/board detection).
 
@@ -26,7 +28,7 @@ Real kernel  (real_kernel.img / kernel8_pi3.img / kernel8_pizero2w.img —
    │  EL2→EL1, BSS, early FB, MMU on, subsystem init, start cores 1-3
    ▼
 core0_main()  IRQ-driven network + disk + console reactor  (never returns)
-cores 1-3     per-core cooperative process schedulers
+cores 1-3     per-core preemptive process schedulers
 ```
 
 ---
@@ -317,7 +319,7 @@ regime (`kernel.c:13294-13300`).
 - `daifclr #2`, then `bl coreN_main` (`src/start.S:344-349`).
 
 Each secondary's C entry (`core1_main`/`core2_main`/`core3_main`) runs a
-**per-core cooperative scheduler**:
+**per-core preemptive scheduler**:
 
 ```c
 core_env_init(CORE_USERx);
@@ -368,15 +370,16 @@ begin/chunk/commit protocol that stages a candidate.
   bytes (`src/vectors.S:195-220`). IRQ entries save context and call
   `irq_dispatch()`; sync entries call `sync_exception()`; see
   [drivers.md](drivers.md#exception--irq-glue).
-- `ctx_switch.S` performs cooperative context switches by saving/restoring the
-  callee-saved set `x19-x30` plus `sp` (`src/ctx_switch.S:11-29`), matching
-  `struct proc_context` (`include/proc.h:213-217`).
+- `ctx_switch.S` saves/restores the callee-saved set `x19-x30` plus `sp`
+  (`src/ctx_switch.S:11-29`), matching `struct proc_context`. The same
+  helper is used for voluntary switches and for preemption from IRQ
+  context after EOI (ADR-013).
 
 ## Quick reference — boot-time constants
 
 | Constant | Value | Where |
 |---|---|---|
-| Kernel load address | `0x80000` | `config.txt`, `link_bootstrap.ld` |
+| Kernel load address | `0x80000` (Pi); `0x40080000` (QEMU) | `config.txt` / `link_bootstrap.ld` / `link_bootstrap_qemu.ld` |
 | Stage0 watchdog | `15 s` | `bootstrap.c:20` |
 | Stage-2 staging RAM | `0x08000000` | `bootstrap.c:15` |
 | Boot trampoline | `0x07FFF000` | `bootstrap.c:17` |

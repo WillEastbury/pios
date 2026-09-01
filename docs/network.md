@@ -2,8 +2,8 @@
 
 This is the authoritative map for the current PIOS network stack, NIC
 backends, WiFi bring-up, counters, dashboard meters, and operator commands.
-Older `networking.md` and `wifi.md` describe earlier implementations and should
-not be used as the source of truth.
+Older `networking.md` and `wifi.md` are stubs pointing here. Per-board NIC
+and SDIO hosts are in [platforms.md](platforms.md).
 
 Active Pi 5 WPA association diagnosis is tracked in
 [GitHub issue #76](https://github.com/WillEastbury/pios/issues/76).
@@ -31,19 +31,23 @@ NIC boundary        |  nic.c
   validation, firewall, packet classification, counters, offload policy
                     |
 Backend abstraction |  struct nic_ops
-  Pi 5 wired: macb.c/macb_rx_engine.c (Cadence GEM)
-  QEMU:       virtio_net.c
-  Pi 5 WiFi: wifi_nic.c -> cyw43.c -> sdio.c
+  Pi 5 wired:     macb.c/macb_rx_engine.c (Cadence GEM)
+  Pi 5 WiFi:      wifi_nic.c -> cyw43.c -> sdio.c (SDIO2)
+  Pi 3 / Zero 2 W: wifi_nic.c -> cyw43.c -> sdio.c (SDIO1)
+  QEMU:           virtio_net.c
                     |
 Hardware
-  RP1 Ethernet via PCIe
-  BCM2712 SDIO2 -> CYW43455
+  RP1 Ethernet via PCIe (Pi 5)
+  BCM2712 SDIO2 -> CYW43455 (Pi 5)
+  BCM2837 Arasan SDIO1 -> 43430/43455/43436 (Pi 3 / Zero 2 W)
   virtio-mmio in QEMU
 ```
 
-The active IP stack sees one `nic_ops` backend at a time. WiFi initialization
-is additive: loading CYW43455 firmware does not replace the wired backend.
-`wifi activate` performs the explicit backend switch only after association.
+The active IP stack sees one `nic_ops` backend at a time. On Pi 5, WiFi
+initialization is additive: loading firmware does not replace the wired
+backend; `wifi activate` switches only after association. BCM2837-family
+boards have no GEM, so stage2 may auto-init Wi-Fi as the only path
+(ADR-041). QEMU is virtio-net only. See [platforms.md](platforms.md).
 
 ## Core ownership and communication
 
@@ -467,7 +471,8 @@ For WiFi, do not debug WPA before proving:
 - `boot_storage.md` - two-stage boot, A/B OTA, WALFS, users, logging and
   perf/monitoring.
 - `gotchas.md` - failed attempts, reverted changes and non-obvious traps.
-- `architecture.md` - core assignment, memory map and boot architecture.
+- `platforms.md` - Pi 5 / Pi 3 / Zero 2 W / QEMU NIC and SDIO hosts.
+- `architecture.md` - entry point to kernel vs platform docs.
 - `kernel_dma_irq.md` - DMA, IRQ and core-0 reactor behavior.
 - `ipc.md` - FIFO ownership, publication and wake contracts.
 - `net_capsule_fifo.md` - capsule service dispatch architecture.

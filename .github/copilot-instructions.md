@@ -23,11 +23,19 @@ aarch64-none-elf-nm --print-size --size-sort --reverse-sort kernel8.elf
 
 On Windows without `make`, compile each `.S` and `.c` file individually then link with `aarch64-none-elf-ld -T link.ld -nostdlib -o kernel8.elf build/*.o`, then `aarch64-none-elf-objcopy -O binary kernel8.elf kernel8.img`.
 
-There are no tests or linters. Verification is: **it compiles with zero errors and zero warnings** (the `-Wall -Wextra` flags are strict).
+Host-testable logic has `python tests/run_host_tests.py`. QEMU regression is
+`python tools/qemu_smoke.py`. Hardware verification is: **it compiles with
+zero errors and zero warnings** (`-Wall -Wextra` are strict) and the live
+selftest / smoke battery still passes.
 
 ## Architecture
 
-This is a **bare-metal OS** for the Raspberry Pi 5 (BCM2712 / Cortex-A76). No Linux, no libc, no POSIX. Every line runs directly on hardware.
+This is a **bare-metal OS**. No Linux, no libc, no POSIX. It runs on
+Raspberry Pi 5 (BCM2712 / Cortex-A76), Pi 3 B/B+ and Pi Zero 2 W
+(BCM2837-family / Cortex-A53), and QEMU `virt`. Kernel contracts are the
+same on every target; hardware is a compile-time capability set
+(`PIOS_PLATFORM`). Read `docs/platforms.md` before assuming RP1, GIC, GEM,
+or a Pi 5 memory map.
 
 ### Hardware Debugging Strategy
 
@@ -121,14 +129,17 @@ Use these as scan/review rules for FIFO, wake-ring, scheduler, descriptor, IPC, 
 
 | Core | Role | Hot loop | Source |
 |------|------|----------|--------|
-| 0 | Kernel / network / disk | IRQ-driven `net_poll()` + services + console | `kernel.c:core0_main()` |
-| 1 | User management | Scheduler + SGI FIFO doorbell | `kernel.c:core1_main()` |
-| 2 | User | Cooperative application scheduler | `kernel.c:core2_main()` |
-| 3 | User | Cooperative application scheduler | `kernel.c:core3_main()` |
+| 0 | Kernel / network / disk | IRQ-driven reactor (`net_poll()` + services + console) | `kernel.c:core0_main()` |
+| 1 | User management | Preemptive scheduler + FIFO doorbell | `kernel.c:core1_main()` |
+| 2 | User | Preemptive application scheduler | `kernel.c:core2_main()` |
+| 3 | User | Preemptive application scheduler | `kernel.c:core3_main()` |
 
 Cores communicate through lock-free SPSC FIFOs (`fifo.h`) and explicit scheduler wake records. Each successful FIFO publication/batch uses a targeted SGI on IRQ-ready cores and SEV fallback on process-hosting cores whose GIC interface remains disabled.
 
 ### Memory Map
+
+Raspberry Pi physical layout (Pi 5 / Pi 3 / Zero 2 W). QEMU `virt` has no
+RAM below `0x40000000` — see `docs/platforms.md`.
 
 ```
 0x00080000          Kernel image (loaded by GPU firmware)
@@ -140,8 +151,11 @@ Cores communicate through lock-free SPSC FIFOs (`fifo.h`) and explicit scheduler
 0x04900000 +2MB     DMA NET buffers
 0x04B00000 +2MB     DMA DISK buffers
 0x04D00000 +1MB     Shared process IPC SHM pool
-0x107C000000        BCM2712 peripherals (device memory)
-0x1F00000000        RP1 southbridge (PCIe BAR, device memory)
+0x10000000 +32MB    Process arena (ADR-024)
+0x107C000000        BCM2712 peripherals (Pi 5; device memory)
+0x1F00000000        RP1 southbridge (Pi 5; device memory)
+0x3F000000          BCM2837 low peripherals (Pi 3 / Zero 2 W)
+0x40000000          QA7 ARM-local (Pi 3 / Zero 2 W; no GIC)
 ```
 
 All addresses are physical. The MMU is identity-mapped (VA == PA). Cacheability is region-specific; do not assume "RAM == WB". Kernel `.bss`, page tables, shared FIFO/DMA/IPC windows, and other control metadata may be Normal NC even when nearby private RAM is WB.
@@ -160,20 +174,20 @@ Violations create stale or incoherent metadata that looks like scheduler ghosts.
 
 ### Boot Sequence
 
-`_start` (start.S) → `el2_to_el1` (vectors.S) → SCTLR safe baseline → NEON enable → SP + SP_EL1 → VBAR_EL1 → BSS clear → `kernel_main` (kernel.c) → init all subsystems → MMU on → GIC → timer → launch cores 1-3 → core 0 enters poll loop.
+`_start` (start.S) → `el2_to_el1` (vectors.S) → SCTLR safe baseline → NEON enable → SP + SP_EL1 → VBAR_EL1 → BSS clear → `kernel_main` (kernel.c) → init all subsystems → MMU on → interrupt controller (GIC on Pi 5/QEMU, QA7 on BCM2837) → timer → launch cores 1-3 where the platform supports it → core 0 enters poll loop.
 
-Secondary cores get: EL2→EL1, SCTLR, NEON, per-core SP + SP_EL1, VBAR_EL1, shared TTBR0/MAIR/TCR, MMU enable, IRQ unmask — all in the `SECONDARY_SETUP` macro in `start.S`.
+Secondary cores get: EL2→EL1, SCTLR, NEON, per-core SP + SP_EL1, VBAR_EL1, shared TTBR0/MAIR/TCR, MMU enable, IRQ unmask — all in the `SECONDARY_SETUP` macro in `start.S`. BCM2837-family stage2 currently documents `PIOS_HAS_PSCI_SECONDARIES=0`.
 
 ### Hardware Drivers
 
-Each driver is one `.c` + one `.h`. They talk directly to MMIO registers via `mmio_read()`/`mmio_write()` from `mmio.h`. Key peripheral base addresses are in `mmio.h`.
+Each driver is one `.c` + one `.h`. They talk directly to MMIO registers via `mmio_read()`/`mmio_write()` from `mmio.h`. Bases come from `platform.h` / `board_detect.h`, not a single Pi 5 map. See `docs/platforms.md`.
 
-- **UART** (`uart.c`) — PL011 on BCM2712 directly (not RP1). Pre-configured by firmware.
-- **SD** (`sd.c`) — SDHCI EMMC2 controller. Raw LBA block access, no filesystem.
-- **GENET** (`genet.c`) — Ethernet MAC with MDIO PHY. DMA descriptor rings, polling mode.
-- **Framebuffer** (`fb.c`) — VideoCore mailbox to allocate framebuffer, then direct pixel writes.
-- **DMA** (`dma.c`) — BCM2712 scatter-gather DMA engine, 6 channels.
-- **GIC** (`gic.c`) — GIC-400 distributor + CPU interface.
+- **UART** (`uart.c`) — PL011; Pi 5 uses the SoC UART early then RP1 UART0; BCM2837 uses `0x3F201000`; QEMU uses `0x09000000`.
+- **SD** (`sd.c` / `sdhost.c`) — Pi 5: BCM2712 SDHCI EMMC2. Pi 3 / Zero 2 W: SDHOST at `0x3F202000` (Arasan is Wi-Fi). QEMU: virtio-blk.
+- **NIC** (`macb.c`, `wifi_nic.c`, `virtio_net.c`) — Pi 5 GEM via RP1; BCM2837 Wi-Fi SDIO1; QEMU virtio-net. `genet.c` is not the live Pi 5 path.
+- **Framebuffer** (`fb.c`) — VideoCore mailbox on Raspberry boards; ramfb/bootinfo on QEMU.
+- **DMA** (`dma.c`) — BCM2712 scatter-gather (Pi 5).
+- **IRQ** (`gic.c` / `irqc_legacy.c`) — GIC-400 on Pi 5 and QEMU; QA7 local controller on BCM2837 (no GIC).
 - **MMU** (`mmu.c`) — Page tables, SCTLR/TTBR0/MAIR/TCR setup, cache ops.
 
 ### Network Stack Security + Performance Model
@@ -182,7 +196,9 @@ The network stack (`net.c`) is hardened with strict ingress validation (drop fas
 
 Methodology for network/runtime changes:
 - Keep hot paths cache-friendly and branch-light.
-- Prefer ARMv8.2-A hardware acceleration (NEON, CRC32, DMA, validated NIC assists) when behavior is explicit.
+- Prefer hardware acceleration the **current** `PIOS_PLATFORM` actually has
+  (NEON/CRC on all AArch64 targets; AES/SHA crypto and LSE only on Pi 5
+  ARMv8.2-A). Never emit Pi 5 opcodes into an A53 image.
 - Maintain behavior-safe fallbacks and avoid hidden “success-shaped” paths.
 
 ## Conventions
@@ -222,46 +238,22 @@ Inter-core communication uses `struct fifo_msg` (64 bytes). When adding new mess
 The stage0 loader is ~27 KiB and the stage2 OS image is ~3.45 MiB (~2.28 MiB of that is the
 embedded PicoScript IDE web assets in `src/ide_assets.c`); see `docs/size.md`. Keep strings short (prefixes: `[mac]`, `[wal]`, `[bt]`, `[cyw]`, `[fat]`, `[sdio]`, etc). No unused code. `-O2` optimization. If a function is only called once, the compiler will inline it — don't fight this.
 
-### WiFi — CYW43455 via BCM2712 SDIO2 (WIP)
+### WiFi
 
-**Status:** SDIO2 controller confirmed alive, CMD5 fails (chip not responding).
+Wi-Fi is board-specific. Do not treat the Pi 5 SDIO2 path as universal.
+See `docs/platforms.md` and `docs/network.md`.
 
-**Critical hardware finding (2026-04-14):** The Pi 5's CYW43455 WiFi chip is connected to the **BCM2712 SoC's SDIO2** controller, NOT RP1. This was discovered by parsing the DTB (`bcm2712-rpi-5-b.dtb`).
+| Board | Host | Radio | Bring-up |
+|---|---|---|---|
+| Pi 5 | BCM2712 SDIO2 `0x1001100000` (not RP1) | CYW43455 | Wired-first; `wifi activate` after association |
+| Pi 3 B/B+ | Arasan SDIO1 `0x3F300000` | 43430 / 43455 | Auto-init as only NIC (ADR-041); join stays explicit |
+| Zero 2 W | Arasan SDIO1 `0x3F300000`, `WL_ON` GPIO41 | 43436 | Same as Pi 3 family, matching firmware required |
+| QEMU | none | — | virtio-net only |
 
-**Address map:**
-| What | Address | Notes |
-|------|---------|-------|
-| BCM2712 SDIO2 (WiFi) | `0x1001100000` | DTB: `/axi/mmc@1100000`, compat: `brcm,bcm2712-sdhci` |
-| BCM2712 EMMC2 (SD card) | `0x1000FFF000` | DTB: `/soc@107c000000/mmc@fff000` |
-| RP1 MMC0 | `RP1_BAR + 0x180000` | NOT WiFi — separate RP1 controller |
-| RP1 MMC1 | `RP1_BAR + 0x184000` | NOT WiFi — separate RP1 controller |
-| BCM2712 SoC pinctrl | `0x107D504100` | DTB: `sdio2_30_pins` for SDIO2 GPIO 30-35 |
-| BCM2712 SoC GPIO | `0x107D517C00` | `brcmstb-gpio` — different register layout from RP1 |
-| WL_REG_ON | firmware regulator | DTB: `wl-on-reg` / `ywl-on-regulator` — may need mailbox |
+Pi 5 scan/SDIO2 bring-up is complete (escan, firmware upload, adaptive
+`CORE0_IO_WIFI` cadence). Remaining work is WPA2 association, not CMD5.
+Association must not block core 0: a join loop that skips
+`wifi_upload_progress()` wedges the wired GEM ring (`BNA`).
 
-**What works:**
-- SDIO2 controller responds: CAP0=`0x55EEC832`, CAP1=`0x8000A527`
-- HC reset, 3.3V power, 400kHz clock all succeed
-- STATUS=`0x000F0000` (CMD/DAT lines idle — correct)
-
-**What doesn't work yet:**
-- CMD5 (IO_SEND_OP_COND) fails — CYW43455 not responding
-- Likely cause: WL_REG_ON not toggling correctly. The `brcmstb-gpio` controller at `0x107D517C00` has a different register layout than standard ARM GPIO. May need to use VideoCore mailbox to toggle the `wl-on-reg` regulator instead.
-- SoC pinctrl at `0x107D504100` — FSEL register layout for `bcm2712c0-pinctrl` needs verification. The firmware may already configure SDIO2 pins via DTB `sdio2_30_pins`.
-
-**Next steps:**
-1. Investigate `brcmstb-gpio` register layout (Linux `drivers/gpio/gpio-brcmstb.c`)
-2. Try VideoCore mailbox to control `wl-on-reg` (SET_GPIO_STATE or equivalent)
-3. Verify SDIO2 pin muxing is correct (firmware may handle this)
-4. Add CMD5 error detail logging (read interrupt status register for specific error bits)
-5. If CMD5 returns CRC error, that's actually normal for first probe — retry with error masking
-
-**Architecture (FullMAC):** CYW43455 firmware handles 802.11/WPA2. Host speaks SDPCM/BCDC protocol. Files: `sdio.c` (SDHCI host), `cyw43.c` (chip driver + protocol), `wifi_nic.c` (NIC backend), `fat32.c` (reads firmware from boot partition).
-
-**Firmware blobs** (on SD `/wifi/` folder):
-- `firmware.bin` — cyfmac43455-sdio-standard.bin (595KB)
-- `nvram.txt` — brcmfmac43455-sdio.txt (2KB)
-- `clm.bin` — cyfmac43455-sdio.clm_blob (2.6KB)
-Source: `RPi-Distro/firmware-nonfree` GitHub repo.
-
-**DO NOT** modify `pcie.c`, `macb.c`, `uart.c`, `fb.c`, `net.c` for WiFi work — these are stable boot-critical drivers. The cloud agent previously broke boot by "cleaning up" RESCAL calibration, DMA scroll, and HDMI mirror code. WiFi code is additive only.
+**DO NOT** modify `pcie.c`, `macb.c`, `uart.c`, `fb.c`, `net.c` for WiFi
+work — these are stable boot-critical drivers. WiFi code is additive only.

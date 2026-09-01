@@ -1,8 +1,12 @@
-# PIOS — Pi 5 Bare Metal Microkernel
+# PIOS — Bare Metal Microkernel
 
-A bare-metal operating system for the Raspberry Pi 5 (BCM2712 / Cortex-A76).
-No Linux. No libc. 4 dedicated CPU cores. A 27 KiB stage0 loader plus a ~3.5 MiB stage2 OS image
-(drivers + network/TLS stack + WALFS/picowal DB + web application stack + PicoScript VM).
+A bare-metal operating system for **Raspberry Pi 5**, **Pi 3 B/B+**, **Pi Zero 2 W**,
+and **QEMU `virt`**. No Linux. No libc. Four dedicated CPU cores. A ~27 KiB
+multi-platform stage0 loader plus a ~3.5 MiB stage2 OS image (drivers +
+network/TLS stack + WALFS/picowal DB + web application stack + PicoScript VM).
+
+Platform matrix, memory maps, and QEMU boot paths:
+[docs/platforms.md](docs/platforms.md).
 
 ## What is this?
 
@@ -14,20 +18,15 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 │                     PIOS Microkernel                        │
 ├──────────┬──────────┬──────────┬───────────────────────────┤
 │  Core 0  │  Core 1  │  Core 2  │         Core 3            │
-│KERNEL+NET│  USER    │  USER    │         USER              │
-│ +DISK svc│ (USERM)  │ (USER0)  │        (USER1)            │
+│ reactor  │  USER    │  USER    │         USER              │
+│ net/disk │ preempt  │ preempt  │        preempt            │
 ├──────────┴──────────┴──────────┴───────────────────────────┤
 │           Inter-Core FIFO (SPSC, lock-free)                │
-├──────────┬──────────┬──────────────────────────────────────┤
-│ Cadence  │  SDHCI   │  VideoCore Mailbox / Framebuffer    │
-│ GEM/MACB │  SD Card │  HDMI Text Console / QPU Tensor     │
-│ (via RP1)│ (EMMC2)  │                                      │
-├──────────┴──────────┴──────────────────────────────────────┤
-│  DMA Engine │ GIC-400 │ MMU (identity) │ ARM Timer        │
-├─────────────┴─────────┴───────────────┴───────────────────┤
-│  PCIe RC → RP1 Southbridge (UART, GPIO, USB/xHCI, NIC)    │
 ├────────────────────────────────────────────────────────────┤
-│                BCM2712 Hardware (Pi 5)                      │
+│  Backends (compile-time PIOS_PLATFORM)                     │
+│  Pi 5:     GEM/RP1 + SDHCI EMMC2 + SDIO2 Wi-Fi + GIC       │
+│  Pi 3/Z2W: SDHOST + SDIO1 Wi-Fi + QA7 (no GIC, no GEM)     │
+│  QEMU:     virtio-net + virtio-blk + GIC + ramfb           │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,6 +54,11 @@ Every byte of RAM, every CPU cycle, and every hardware register is under your di
 | **PCIe + RP1 Southbridge** | PCIe root complex init; RP1 GPIO, clock, UART, and USB xHCI. |
 | **USB xHCI + HID Keyboard** | USB host via xHCI on RP1; HID keyboard and mass storage class drivers. |
 | **EL2 Capsule + Stage-2 Groundwork** | Capsule descriptors plus HVC-managed stage-2 planning/enabling metadata (VMID/IPA policy scaffolding); user apps (including console apps) default to capsule binding, with optional shared capsule groups, virtual fs roots, and capsule-local shared memory via IPC SHM. |
+
+Hardware rows above that name GEM, RP1, GIC-400, V3D, or BCM2712 DMA are
+**Pi 5**. Pi 3 / Zero 2 W use QA7 interrupts, SDHOST for the SD card, and
+onboard Wi-Fi as the NIC. QEMU uses virtio-net/blk, GIC, and ramfb. See
+[docs/platforms.md](docs/platforms.md).
 
 For operator workflows, serial/TCP/Web consoles, OTA hot-flashing, log tailing, remote reboot, and firewall commands, see [CONSOLE.md](CONSOLE.md).
 

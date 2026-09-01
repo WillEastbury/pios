@@ -1,26 +1,40 @@
 # Deployment Guide
 
+PIOS boots on **Pi 5, Pi 3 B/B+, Pi Zero 2 W**, and **QEMU `virt`**. The
+same FAT `kernel8.img` stage0 selects the matching payload from
+`PIOSSTG2.PKG`. Platform matrix: [platforms.md](platforms.md).
+
+The steps below are the Pi 5 SD card path. Pi 3 / Zero 2 W use the same
+card layout with their own firmware (`start.elf` / board DTB, not
+`start4.elf`) and the unified package. QEMU does not use an SD card —
+see the QEMU section in [platforms.md](platforms.md).
+
 ## Requirements
 
-### Hardware
-- Raspberry Pi 5 (any RAM variant: 4GB or 8GB)
+### Hardware (Pi 5 live board)
+- Raspberry Pi 5 (2/4/8 GB — stage0 maps RAM from firmware-reported size)
 - MicroSD card (any size ≥ 64MB)
 - USB-to-serial adapter (FTDI FT232R, CP2102, or similar — 3.3V logic)
 - HDMI monitor + cable (for boot diagnostics)
-- Ethernet cable + switch/router (for network features)
+- Ethernet cable + switch/router (wired `.201` management path)
 - 5V USB-C power supply (Pi 5 official PSU recommended)
 
+Pi 3 B/B+ and Zero 2 W need their matching board firmware and Wi-Fi
+blobs; they have no PIOS GEM NIC (ADR-041).
+
 ### Software
-- AArch64 cross-compiler: `aarch64-none-elf-gcc` or `aarch64-linux-gnu-gcc`
+- AArch64 cross-compiler: `aarch64-none-elf-gcc` (Windows verified path pins
+  ARM GNU Toolchain 13.3.Rel1; see `AGENTS.md`)
 - Serial terminal: PuTTY, minicom, screen, or picocom
 
 ## Build
 
+On Windows, do **not** use `make`. From the repo root:
+
 ```bash
-git clone https://github.com/WillEastbury/pios.git
-cd pios
-make CROSS=aarch64-none-elf-
-# Outputs: kernel8.img + PIOSSTG2.PKG
+cmd.exe /d /c "build_multiboard.bat"   # kernel8.img + Pi 5/Pi 3/Zero 2 W package
+cmd.exe /d /c "build_bootstrap.bat"    # Pi 5 only
+cmd.exe /d /c "build_qemu_full.bat"    # QEMU direct-boot
 ```
 
 ## Prepare SD Card

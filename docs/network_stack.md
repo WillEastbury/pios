@@ -17,23 +17,29 @@ Checked against the code. Companion documents:
 Services      HTTP :80, HTTPS :443, debug :2323, admin/OTA :8080-:8082
               uhttp bridges :82/:83, capsvc services (e.g. :8090)
                     |
-Transport     tcp.c, UDP callbacks
+Transport     tcp.c, UDP callbacks          (shared, board-agnostic)
                     |
-Network       net.c, arp.c, dns.c   (IPv4, ICMP, routes, neighbours)
+Network       net.c, arp.c, dns.c           (shared IPv4 / ICMP / routes)
                     |
 NIC boundary  nic.c   validation, firewall, classification, counters, offload
                     |
-Backends      struct nic_ops
-              Pi 5 wired: macb.c + macb_rx_engine.c   (Cadence GEM via RP1/PCIe)
-              QEMU:       virtio_net.c
-              Pi 5 WiFi:  wifi_nic.c -> cyw43.c -> sdio.c
+Backends      struct nic_ops  (boot-probed wired, or nic_load by name)
+              Pi 5 wired:      macb.c + macb_rx_engine.c   (Cadence GEM via RP1)
+              Pi 4 wired:      genet.c                     (BCM2711 GENET v5)
+              WiFi (loadable): wifi_nic.c -> cyw43.c -> sdio.c
+                               Pi 5 SDIO2 · Pi 4/Pi 3/Zero 2 W SDIO1
+              QEMU:            virtio_net.c
                     |
-Hardware      RP1 Ethernet (PCIe) | BCM2712 SDIO2 -> CYW43455 | virtio-mmio
+Hardware      RP1 GEM | BCM2711 GENET | SDIO CYW43455 | virtio-mmio
 ```
 
-Exactly **one** `nic_ops` backend is active at a time. WiFi initialisation is
-additive: loading CYW43455 firmware does not replace the wired backend.
-`wifi activate` performs the explicit switch, and only after association.
+TCP/IP/UDP/sockets never name a board. `nic_init()` probes **wired** backends
+(`macb`, `genet`, `virtio-net`). WiFi is the same vtable, bound with
+`nic_load("wifi-cyw43455", NIC_IFACE_WIFI)` so firmware upload does not own
+core 0 at boot. On Pi 4 and Pi 5 the wired iface stays default; `wifi activate`
+adds `.202` after association (ADR-032). BCM2837-family boards have no wired
+MAC, so stage2 may auto-init Wi-Fi as the only path (ADR-041). See
+[`platforms.md`](platforms.md) and ADR-043.
 
 Core 0 owns all of this. Other cores reach it through FIFO messages and capsule
 bridges, never by touching NIC, route or TCP state directly.
@@ -60,9 +66,10 @@ from the descriptor checksum status and trusts it only when the checked mask
 matches the expected L4 value. virtio-net and WiFi report
 `checksum_trusted = false`.
 
-`nic_init_wifi()` brings WiFi up; `nic_activate_wifi_loaded()` switches the
-active backend only once WiFi is loaded and associated; `nic_active_name()`
-reports the current backend or `"none"`.
+`nic_init_wifi()` is `nic_load("wifi-cyw43455", NIC_IFACE_WIFI)`.
+`nic_activate_wifi_loaded()` marks the WiFi iface active after association
+without replacing the wired backend. `nic_active_name()` reports the default
+backend or `"none"`.
 
 ---
 

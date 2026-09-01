@@ -4,6 +4,11 @@
 
 Each driver is a single `.c` / `.h` pair. All talk directly to MMIO registers via `mmio_read()`/`mmio_write()`. No abstraction layers, no HAL.
 
+Drivers are **platform-gated**. Pi 5 has RP1/GEM/GIC/SDHCI EMMC2/SDIO2; Pi 3
+and Zero 2 W have QA7 + SDHOST + SDIO1 and no GEM; QEMU has virtio-net/blk
+and ramfb. See [platforms.md](platforms.md) before assuming a Pi 5 register
+block exists.
+
 ## UART — `uart.c` / `rp1_uart.c`
 
 **Hardware**: PL011 on the RP1 southbridge (UART0 at `RP1_BAR_BASE + 0x30000`), exposed on GPIO14/15 (header pins 8/10). The BCM2712 on-SoC PL011 (`UART0_BASE`) is used only for very early pre-PCIe output when firmware has `enable_rp1_uart=1`; after `pcie_init()`/`rp1_init()` the RP1 UART takes over.

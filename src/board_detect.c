@@ -10,6 +10,8 @@ u32 board_family_from_midr(u64 midr)
     u32 partnum = (u32)((midr >> 4) & 0xFFFU);
     if (partnum == MIDR_PARTNUM_CORTEX_A76)
         return BOARD_FAMILY_PI5;
+    if (partnum == MIDR_PARTNUM_CORTEX_A72)
+        return BOARD_FAMILY_PI4;
     if (partnum == MIDR_PARTNUM_CORTEX_A53)
         return BOARD_FAMILY_BCM2837;
     return BOARD_FAMILY_UNKNOWN;
@@ -51,6 +53,14 @@ void board_runtime_bases_for(u32 family, struct board_runtime_bases *out)
         out->emmc_base   = 0x3F000000ULL + 0x300000ULL;
         out->pm_base     = 0x3F000000ULL + 0x00100000ULL;
         out->qa7_base    = 0x40000000ULL;
+    } else if (family == BOARD_FAMILY_PI4) {
+        /* BCM2711 low-peripheral map (arm_64bit firmware). */
+        out->periph_base = 0xFE000000ULL;
+        out->uart0_base  = 0xFE201000ULL;
+        out->mbox_base   = 0xFE00B880ULL;
+        out->emmc_base   = 0xFE340000ULL;
+        out->pm_base     = 0xFE100000ULL;
+        out->qa7_base    = 0ULL;
     } else {
         /* Default/fallback: Pi5 (BCM2712). Also used for BOARD_FAMILY_UNKNOWN
          * -- fail toward the most hardware-validated, proven path rather

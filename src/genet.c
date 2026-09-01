@@ -1,15 +1,18 @@
 /*
- * genet.c - Minimal GENET v5 Ethernet MAC driver for BCM2712 (Pi 5)
+ * genet.c - Minimal GENET v5 Ethernet MAC driver for BCM2711 (Pi 4)
  * Single default queue (ring 16), polling mode, basic PHY autoneg.
+ * Pi 5 uses RP1 MACB, not this SoC block.
  */
 
 #include "genet.h"
+#include "platform.h"
 #include "mmio.h"
 #include "uart.h"
 #include "simd.h"
 #include "fb.h"
 #include "timer.h"
 #include "mailbox.h"
+#include "mmu.h"
 
 /* ---- Register offsets from GENET_BASE ---- */
 
@@ -120,7 +123,7 @@
 #define BMSR_LSTATUS        (1 << 2)
 #define BMSR_ANEGCOMPLETE   (1 << 5)
 
-#define PHY_ADDR            1   /* Default PHY address on Pi 5 */
+#define PHY_ADDR            1   /* BCM54213PE on Pi 4; same default as Circle */
 
 /* ---- Static data ---- */
 
@@ -276,6 +279,8 @@ static void init_rx_ring(void) {
     gw(RDMA_RING16 + DMA_READ_PTR,      0);
     gw(RDMA_RING16 + DMA_PROD_INDEX,    0);
     gw(RDMA_RING16 + DMA_CONS_INDEX,    0);
+    dcache_clean_range((u64)(usize)rx_ring, sizeof(rx_ring));
+    dcache_clean_range((u64)(usize)rx_bufs, sizeof(rx_bufs));
 }
 
 static void init_tx_ring(void) {
@@ -300,11 +305,17 @@ static void init_tx_ring(void) {
     gw(TDMA_RING16 + DMA_READ_PTR,      0);
     gw(TDMA_RING16 + DMA_PROD_INDEX,    0);
     gw(TDMA_RING16 + DMA_CONS_INDEX,    0);
+    dcache_clean_range((u64)(usize)tx_ring, sizeof(tx_ring));
+    dcache_clean_range((u64)(usize)tx_bufs, sizeof(tx_bufs));
 }
 
 /* ---- Public API ---- */
 
 bool genet_init(void) {
+#if !PIOS_HAS_GENET || (PIOS_GENET_BASE == 0)
+    uart_puts("[genet] not present on this platform\n");
+    return false;
+#else
     uart_puts("[genet] Init GENET v5...\n");
     tx_csum_offload = false;
     rx_csum_offload = false;
@@ -441,6 +452,7 @@ bool genet_init(void) {
     uart_puts("\n");
 
     return true;
+#endif
 }
 
 bool genet_send(const u8 *frame, u32 len) {
@@ -460,6 +472,7 @@ bool genet_send(const u8 *frame, u32 len) {
     prefetch_r(frame);
     prefetch_w(tx_bufs[idx]);
     simd_memcpy(tx_bufs[idx], frame, len);
+    dcache_clean_range((u64)(usize)tx_bufs[idx], len);
     dsb();
 
     /* Set descriptor */
@@ -469,6 +482,7 @@ bool genet_send(const u8 *frame, u32 len) {
         tx_ring[idx].length_status |= DESC_TX_DO_CSUM;
     if (idx == NUM_DESC - 1)
         tx_ring[idx].length_status |= DESC_WRAP;
+    dcache_clean_range((u64)(usize)&tx_ring[idx], sizeof(tx_ring[idx]));
     dsb();
 
     /* Advance producer index to trigger DMA */
@@ -499,6 +513,7 @@ bool genet_send_parts(const void *head, u32 head_len, const void *tail, u32 tail
     simd_memcpy(tx_bufs[idx], head, head_len);
     if (tail_len > 0)
         simd_memcpy(tx_bufs[idx] + head_len, tail, tail_len);
+    dcache_clean_range((u64)(usize)tx_bufs[idx], len);
     dsb();
 
     tx_ring[idx].length_status =
@@ -516,12 +531,14 @@ bool genet_send_parts(const void *head, u32 head_len, const void *tail, u32 tail
 
 bool genet_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
     u32 idx = rx_index % NUM_DESC;
+    dcache_invalidate_range((u64)(usize)&rx_ring[idx], sizeof(rx_ring[idx]));
     u32 ls = rx_ring[idx].length_status;
     const struct genet_status64 *st;
 
     if (ls & DESC_OWN)
         return false;   /* DMA still owns this descriptor */
 
+    dcache_invalidate_range((u64)(usize)rx_bufs[idx], BUF_SIZE);
     st = (const struct genet_status64 *)&rx_bufs[idx][0];
     u32 pkt_len = (st->length_status >> DESC_LEN_SHIFT) & 0xFFFF;
     u32 max_payload = BUF_SIZE - sizeof(struct genet_status64);
@@ -563,7 +580,21 @@ void genet_get_mac(u8 *mac) {
 }
 
 bool genet_link_up(void) {
+#if !PIOS_HAS_GENET || (PIOS_GENET_BASE == 0)
+    return false;
+#else
     return (mdio_read(PHY_ADDR, MII_BMSR) & BMSR_LSTATUS) != 0;
+#endif
+}
+
+u32 genet_link_mbps(void)
+{
+    return genet_link_up() ? 1000U : 0U;
+}
+
+bool genet_link_full_duplex(void)
+{
+    return genet_link_up();
 }
 
 void genet_set_tx_checksum_offload(bool enable) {

@@ -14,8 +14,8 @@ pios/
 ├── config.txt         # VideoCore boot configuration
 ├── Makefile           # Build rules
 ├── .github/           # Copilot instructions
-├── docs/              # Architecture and API documentation
-└── STATUS.md          # Feature status and roadmap
+├── docs/              # Architecture and API documentation (start at docs/platforms.md)
+└── STATUS.md          # Retired pointer — not a live feature matrix
 ```
 
 ---
@@ -202,7 +202,7 @@ pios/
 ## Process Management & IPC
 
 ### `src/proc.c` — Process Scheduler (~230KB source, ~68KB in image)
-- **Role:** Per-core cooperative scheduler, process lifecycle, syscall dispatch
+- **Role:** Per-core preemptive scheduler, process lifecycle, EL0 park/yield path
 - **Features:** Priority levels (lazy→realtime), affinity, process states, filesystem syscalls, tensor syscalls
 - **API:** `proc_create()`, `proc_kill()`, `proc_schedule()`, `proc_syscall()`
 - **Interactions:** Uses FIFO for cross-core requests, WALFS for filesystem, tensor.c for compute

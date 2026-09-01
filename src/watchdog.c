@@ -10,7 +10,8 @@
  * the Pi 4 layout on Pi 5 means our writes hit dead address space, so
  * the hardware watchdog never actually counted before this fix. */
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
-    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PI4
 #define PM_BASE        (PERIPH_BASE + 0x00100000UL)
 #else
 #define PM_BASE        (PERIPH_BASE + 0x01200000UL)

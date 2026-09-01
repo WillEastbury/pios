@@ -14,7 +14,7 @@
 
 #include "ide_assets.h"
 
-const u8 IDE_HTML[] =
+const u8 IDE_HTML_EMBED[] =
     "<!DOCTYPE html>\r\n"
     "<html lang=\"en\">\r\n"
     "<head>\r\n"
@@ -26236,9 +26236,9 @@ const u8 IDE_HTML[] =
     "</body>\r\n"
     "</html>"
 ;
-const u32 IDE_HTML_LEN = (u32)(sizeof(IDE_HTML) - 1);
+const u32 IDE_HTML_EMBED_LEN = (u32)(sizeof(IDE_HTML_EMBED) - 1);
 
-const u8 IDE_PICOWAL_HTML[] =
+const u8 IDE_PICOWAL_HTML_EMBED[] =
     "<!DOCTYPE html>\n"
     "<!-- ide_picowal_workspace.html -- the PIOS PicoWAL workspace, embedded into the\n"
     "     vendored PicoScript WebIDE portal at /picoscript/picowal.html and opened\n"
@@ -26501,9 +26501,9 @@ const u8 IDE_PICOWAL_HTML[] =
     "</body>\n"
     "</html>\n"
 ;
-const u32 IDE_PICOWAL_HTML_LEN = (u32)(sizeof(IDE_PICOWAL_HTML) - 1);
+const u32 IDE_PICOWAL_HTML_EMBED_LEN = (u32)(sizeof(IDE_PICOWAL_HTML_EMBED) - 1);
 
-const u8 IDE_PICO_HOOKS_JS[] =
+const u8 IDE_PICO_HOOKS_JS_EMBED[] =
     "// AUTO-GENERATED from picoscript_lang.py -- do not edit by hand.\r\n"
     "(function (root) {\r\n"
     "  var H = {\r\n"
@@ -27173,9 +27173,9 @@ const u8 IDE_PICO_HOOKS_JS[] =
     "  else { root.PV_HOOKS = H; }\r\n"
     "})(typeof globalThis !== \"undefined\" \? globalThis : this);\r\n"
 ;
-const u32 IDE_PICO_HOOKS_JS_LEN = (u32)(sizeof(IDE_PICO_HOOKS_JS) - 1);
+const u32 IDE_PICO_HOOKS_JS_EMBED_LEN = (u32)(sizeof(IDE_PICO_HOOKS_JS_EMBED) - 1);
 
-const u8 IDE_BAREMETAL_BINARY_JS[] =
+const u8 IDE_BAREMETAL_BINARY_JS_EMBED[] =
     "/* istanbul ignore next */\r\n"
     "var BareMetal = (typeof BareMetal !== 'undefined') \? BareMetal : {};\r\n"
     "BareMetal.Binary = (() => {\r\n"
@@ -27663,5 +27663,5 @@ const u8 IDE_BAREMETAL_BINARY_JS[] =
     "\r\n"
     "if (typeof module !== 'undefined' && module.exports) module.exports = BareMetal.Binary;\r\n"
 ;
-const u32 IDE_BAREMETAL_BINARY_JS_LEN = (u32)(sizeof(IDE_BAREMETAL_BINARY_JS) - 1);
+const u32 IDE_BAREMETAL_BINARY_JS_EMBED_LEN = (u32)(sizeof(IDE_BAREMETAL_BINARY_JS_EMBED) - 1);
 

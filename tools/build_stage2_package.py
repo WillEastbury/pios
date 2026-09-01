@@ -12,6 +12,8 @@ PLATFORM_PI5 = 1
 PLATFORM_QEMU = 2
 PLATFORM_BCM2837_FAMILY = 6
 PLATFORM_PIZERO2W = 7
+PLATFORM_PI4 = 9
+PLATFORM_SHARED = 16
 
 FEAT_AARCH64 = 1 << 0
 FEAT_GENERIC_TIMER = 1 << 1
@@ -148,17 +150,23 @@ def main() -> int:
                      help="Pi3 B/B+ payload (BCM2837/BCM2837B0)")
     ap.add_argument("--pizero2w", type=pathlib.Path,
                     help="Pi Zero 2 W payload (BCM2710A1)")
+    ap.add_argument("--pi4", type=pathlib.Path,
+                    help="Pi 4 B payload (BCM2711 / GENET)")
+    ap.add_argument("--shared", type=pathlib.Path,
+                    help="Shared asset pack (IDE HTML/JS), one copy for all kernels")
     ap.add_argument("--qemu", type=pathlib.Path)
     ap.add_argument("--out", required=True, type=pathlib.Path)
     ap.add_argument("--compress-qemu", action="store_true")
     args = ap.parse_args()
 
-    if not args.pi and not args.bcm2837 and not args.pizero2w and not args.qemu:
-        raise SystemExit("at least one of --pi, --bcm2837, --pizero2w, or --qemu is required")
+    if not args.pi and not args.bcm2837 and not args.pizero2w and not args.pi4 and not args.qemu:
+        raise SystemExit("at least one kernel payload is required")
 
     pi = args.pi.read_bytes() if args.pi else None
     bcm2837 = args.bcm2837.read_bytes() if args.bcm2837 else None
     pizero2w = args.pizero2w.read_bytes() if args.pizero2w else None
+    pi4 = args.pi4.read_bytes() if args.pi4 else None
+    shared = args.shared.read_bytes() if args.shared else None
     qemu = args.qemu.read_bytes() if args.qemu else None
     if args.pi and not pi:
         raise SystemExit("Pi payload is empty")
@@ -166,6 +174,10 @@ def main() -> int:
         raise SystemExit("BCM2837-family payload is empty")
     if args.pizero2w and not pizero2w:
         raise SystemExit("Pi Zero 2 W payload is empty")
+    if args.pi4 and not pi4:
+        raise SystemExit("Pi 4 payload is empty")
+    if args.shared and not shared:
+        raise SystemExit("shared asset pack is empty")
     if args.qemu and not qemu:
         raise SystemExit("QEMU payload is empty")
     # QEMU boots its own PIOS_QEMU_FULL.BIN directly (not via this raw-slot
@@ -176,6 +188,10 @@ def main() -> int:
         raise SystemExit(f"BCM2837-family payload too large for raw slot: {len(bcm2837)} > {MAX_PAYLOAD}")
     if pizero2w is not None and len(pizero2w) > MAX_PAYLOAD:
         raise SystemExit(f"Pi Zero 2 W payload too large for raw slot: {len(pizero2w)} > {MAX_PAYLOAD}")
+    if pi4 is not None and len(pi4) > MAX_PAYLOAD:
+        raise SystemExit(f"Pi 4 payload too large for raw slot: {len(pi4)} > {MAX_PAYLOAD}")
+    if shared is not None and len(shared) > MAX_PAYLOAD:
+        raise SystemExit(f"shared asset pack too large: {len(shared)} > {MAX_PAYLOAD}")
 
     qemu_payload = qemu
     qemu_flags = 0
@@ -194,6 +210,8 @@ def main() -> int:
     entry_count = ((1 if pi is not None else 0) +
                    (1 if bcm2837 is not None else 0) +
                    (1 if pizero2w is not None else 0) +
+                   (1 if pi4 is not None else 0) +
+                   (1 if shared is not None else 0) +
                    (1 if qemu_payload is not None else 0))
     cursor = align_up(header_bytes + entry_count * entry_bytes)
     pi_off = cursor if pi is not None else 0
@@ -205,6 +223,12 @@ def main() -> int:
     pizero2w_off = cursor if pizero2w is not None else 0
     if pizero2w is not None:
         cursor = align_up(pizero2w_off + len(pizero2w))
+    pi4_off = cursor if pi4 is not None else 0
+    if pi4 is not None:
+        cursor = align_up(pi4_off + len(pi4))
+    shared_off = cursor if shared is not None else 0
+    if shared is not None:
+        cursor = align_up(shared_off + len(shared))
     qemu_off = cursor if qemu_payload is not None else 0
     if qemu_payload is not None:
         cursor = align_up(qemu_off + len(qemu_payload))
@@ -227,7 +251,7 @@ def main() -> int:
             len(pi),
             FEAT_AARCH64 | FEAT_PI_FIRMWARE,
             FEAT_GENERIC_TIMER | FEAT_GICV2 | FEAT_PL011 | FEAT_RP1 |
-            FEAT_PCIE | FEAT_SD | FEAT_GENET | FEAT_MAILBOX_FB,
+            FEAT_PCIE | FEAT_SD | FEAT_MAILBOX_FB,
         ))
         write_at(out, pi_off, pi)
         entry_index += 1
@@ -257,6 +281,33 @@ def main() -> int:
         ))
         write_at(out, pizero2w_off, pizero2w)
         entry_index += 1
+    if pi4 is not None:
+        write_at(out, header_bytes + entry_index * entry_bytes, entry(
+            PLATFORM_PI4,
+            "pi4-bcm2711",
+            pi4_off,
+            len(pi4),
+            PI_LOAD,
+            len(pi4),
+            FEAT_AARCH64 | FEAT_PI_FIRMWARE,
+            FEAT_GENERIC_TIMER | FEAT_GICV2 | FEAT_PL011 | FEAT_SD |
+            FEAT_GENET | FEAT_MAILBOX_FB,
+        ))
+        write_at(out, pi4_off, pi4)
+        entry_index += 1
+    if shared is not None:
+        write_at(out, header_bytes + entry_index * entry_bytes, entry(
+            PLATFORM_SHARED,
+            "shared-assets",
+            shared_off,
+            len(shared),
+            0,
+            len(shared),
+            FEAT_AARCH64,
+            0,
+        ))
+        write_at(out, shared_off, shared)
+        entry_index += 1
     if qemu_payload is not None:
         write_at(out, header_bytes + entry_index * entry_bytes, entry(
             PLATFORM_QEMU,
@@ -279,13 +330,16 @@ def main() -> int:
     pi_note = f"{len(pi)}@{pi_off}" if pi is not None else "none"
     bcm2837_note = f"{len(bcm2837)}@{bcm2837_off}" if bcm2837 is not None else "none"
     pizero2w_note = f"{len(pizero2w)}@{pizero2w_off}" if pizero2w is not None else "none"
+    pi4_note = f"{len(pi4)}@{pi4_off}" if pi4 is not None else "none"
+    shared_note = f"{len(shared)}@{shared_off}" if shared is not None else "none"
     if qemu_payload is not None:
         qemu_note = f"{len(qemu_payload)}:{len(qemu)}" if args.compress_qemu else str(len(qemu))
         qemu_note = f"{qemu_note}@{qemu_off}"
     else:
         qemu_note = "none"
     print(f"stage2 package: {args.out} total={len(out)} id={package_id:016x} "
-          f"pi={pi_note} bcm2837={bcm2837_note} pizero2w={pizero2w_note} qemu={qemu_note}")
+          f"pi={pi_note} bcm2837={bcm2837_note} pizero2w={pizero2w_note} "
+          f"pi4={pi4_note} shared={shared_note} qemu={qemu_note}")
     return 0
 
 

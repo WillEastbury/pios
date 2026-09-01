@@ -19,25 +19,45 @@
 #define PIOS_IDE_ASSETS_H
 
 #include "types.h"
+#include "platform.h"
 
-/* Upstream PicoScript WebIDE portal (../picoscript/docs/index.html) with
- * tools/ide_server_bridge.js injected before </body>. */
-extern const u8  IDE_HTML[];
-extern const u32 IDE_HTML_LEN;
+#define PIOS_ASSET_PACK_MAGIC       0x53414950U /* 'PIAS' */
+#define PIOS_ASSET_PACK_VERSION     1U
+#define PIOS_ASSET_IDE_HTML         1U
+#define PIOS_ASSET_IDE_PICOWAL      2U
+#define PIOS_ASSET_IDE_HOOKS        3U
+#define PIOS_ASSET_IDE_BAREMETAL    4U
+
+/* Bound at boot from the shared package blob (or compiled-in QEMU fallback). */
+extern const u8 *IDE_HTML;
+extern u32 IDE_HTML_LEN;
 
 /* PIOS PicoWAL workspace page (tools/ide_picowal_workspace.html), opened from
  * the portal's PicoWAL tab in a same-origin iframe. */
-extern const u8  IDE_PICOWAL_HTML[];
-extern const u32 IDE_PICOWAL_HTML_LEN;
+extern const u8 *IDE_PICOWAL_HTML;
+extern u32 IDE_PICOWAL_HTML_LEN;
 
 /* Standalone host-hook table (../picoscript/vm/pico_hooks.js) for backward
  * compatibility / hook-namespace verification. */
-extern const u8  IDE_PICO_HOOKS_JS[];
-extern const u32 IDE_PICO_HOOKS_JS_LEN;
+extern const u8 *IDE_PICO_HOOKS_JS;
+extern u32 IDE_PICO_HOOKS_JS_LEN;
 
 /* BSO1 codec (../baremetaljstools/src/BareMetal.Binary.js), used by the
  * workspace's Fast Serial (BSO1) panel. */
-extern const u8  IDE_BAREMETAL_BINARY_JS[];
-extern const u32 IDE_BAREMETAL_BINARY_JS_LEN;
+extern const u8 *IDE_BAREMETAL_BINARY_JS;
+extern u32 IDE_BAREMETAL_BINARY_JS_LEN;
+
+void ide_assets_bind(void);
+
+#if PIOS_EMBED_IDE_ASSETS
+extern const u8 IDE_HTML_EMBED[];
+extern const u32 IDE_HTML_EMBED_LEN;
+extern const u8 IDE_PICOWAL_HTML_EMBED[];
+extern const u32 IDE_PICOWAL_HTML_EMBED_LEN;
+extern const u8 IDE_PICO_HOOKS_JS_EMBED[];
+extern const u32 IDE_PICO_HOOKS_JS_EMBED_LEN;
+extern const u8 IDE_BAREMETAL_BINARY_JS_EMBED[];
+extern const u32 IDE_BAREMETAL_BINARY_JS_EMBED_LEN;
+#endif
 
 #endif /* PIOS_IDE_ASSETS_H */

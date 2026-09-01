@@ -822,7 +822,7 @@ static void bp_log(const char *msg);
 
 static void wifi_upload_progress(void)
 {
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+#if PIOS_HAS_MACB
     static u32 cadence;
 #endif
     /*
@@ -833,7 +833,7 @@ static void wifi_upload_progress(void)
      */
     (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
                                          NET_DISPATCH_CAUSE_PACED);
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+#if PIOS_HAS_MACB
     if ((++cadence & 31U) == 0U) {
         bool recovered = macb_rx_recover();
         if (!recovered)
@@ -2169,7 +2169,7 @@ static void perf_counter_snapshot(struct perf_counter_snapshot *p)
     p->nic_tx_mbps_x1000 = rate_nic_tx;
     p->nic_rx_peak_mbps_x1000 = peak_nic_rx;
     p->nic_tx_peak_mbps_x1000 = peak_nic_tx;
-#if PIOS_HAS_GENET
+#if PIOS_HAS_MACB
     {
         struct macb_diag md;
         macb_diag(&md);
@@ -4844,7 +4844,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         bool ok = lease_selftest();
         http_append(out, &len, max, ok ? "lease selftest PASS\n" : "lease selftest FAIL\n");
     } else if (http_streq(cmd, "rxholedump")) {
-#if !PIOS_HAS_GENET
+#if !PIOS_HAS_MACB
         http_append(out, &len, max,
             "rxholedump unavailable: macb/GEM not active on this platform\n");
 #else
@@ -4929,7 +4929,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         /* P1 live wedge diagnosis: poll this while ramping load. If rx_owned
          * climbs to 32 the RX ring is full (overrun); if rx_recv/tx_send stop
          * climbing the MAC engine has stalled; RSR/TSR carry overrun/HRESP. */
-#if !PIOS_HAS_GENET
+#if !PIOS_HAS_MACB
         /* macb is not the active NIC on this platform (e.g. QEMU uses
          * virtio-net), so macb_init() never ran — its RX ring pointer/size are
          * uninitialised and scanning them would wedge core 0. Fail closed and
@@ -8626,7 +8626,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         const net_stats_t *ns = net_get_stats();
         nic_packet_counters(&nc);
 
-#if PIOS_HAS_GENET
+#if PIOS_HAS_MACB
         struct macb_diag md;
         macb_diag(&md);
         http_append(out, &len, max, "MAC  rx_recv=");
@@ -11287,6 +11287,15 @@ static u32 http_build_picoscript_asset_response(char *out, u32 max,
                                                 const char *content_type)
 {
     u32 len = 0;
+    if (!body || body_len == 0U) {
+        http_append(out, &len, max,
+                    "HTTP/1.0 503 Service Unavailable\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: 20\r\n"
+                    "Connection: close\r\n\r\n"
+                    "IDE assets missing\n");
+        return len;
+    }
     http_static_body = body;
     http_static_len = body_len;
     http_static_off = 0;
@@ -22455,8 +22464,10 @@ static void hdmi_dashboard_render(void)
                             "SDHCI/SDIO + WALFS");
     if (hw_r < hw_end)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
-                            "NIC", PIOS_HAS_GENET && perf.nic_link_mbps != 0,
-                            "MMIO ", PIOS_GENET_BASE, "rings", PIOS_HAS_GENET ? "GENET/MACB Ethernet" : "no active NIC backend");
+                            "NIC", nic_iface_active(NIC_IFACE_WIRED) && perf.nic_link_mbps != 0,
+                            "MMIO ", PIOS_HAS_MACB ? PIOS_RP1_BAR_BASE : PIOS_GENET_BASE,
+                            "rings", nic_iface_active(NIC_IFACE_WIRED) ?
+                            nic_iface_name(NIC_IFACE_WIRED) : "no active NIC backend");
     if (hw_r < hw_end) {
         bool wifi_runtime = cyw43_runtime_ready();
         u32 wifi_link = cyw43_link_state();
@@ -23303,7 +23314,7 @@ static void core0_io_tick_hook(u32 core, u64 tick)
      * event remains observable as a queue/interrupt failure rather than
      * silently becoming a polling fallback.
      */
-#if !(PIOS_HAS_RP1 && PIOS_HAS_GENET)
+#if !PIOS_HAS_MACB
     /*
      * virtio-net exposes no wired RX IRQ in this platform build.  Its explicit
      * 125Hz transport indication is still only a descriptor publication; the
@@ -23487,7 +23498,7 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
     core0_eth_irq_last_mip = rp1_mip_host_status_l();
     bool clear = (rp1_irq_status_l() & eth_bit) == 0U;
     core0_eth_irq_quench_passes = 1U;
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+#if PIOS_HAS_MACB
     {
         struct macb_diag md;
         macb_diag(&md);
@@ -23569,7 +23580,7 @@ static bool ksvc_timer_poll(void *ctx)
     if (net_interface_configured(NIC_IFACE_WIFI))
         arp_tick_iface(NIC_IFACE_WIFI);
     tcp_tick();
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+#if PIOS_HAS_MACB
     /* Guaranteed-cadence hardware-wedge safety net, independent of RX IRQ
      * activity. CORE0_IO_NET (which also runs these two checks inline) is now
      * purely event-driven off the ETH IRQ handler -- if the IRQ path ever
@@ -23677,7 +23688,7 @@ NORETURN void core0_main(void) {
 
     /* Auto-arm RP1 Ethernet RX → GIC HOST6. Ingress execution is exclusively
      * the AIRQ/FIFO pipeline; there is no periodic protocol-poll fallback. */
-#if PIOS_HAS_RP1 && PIOS_HAS_GENET
+#if PIOS_HAS_MACB
     core0_eth_irq_arm_host(false);
 #endif
 
@@ -24414,6 +24425,7 @@ void kernel_main(void) {
     /* Seed the stack-protector canary as early as possible, before any
      * deeper subsystem init runs (see stackprot.h). */
     stackprot_init();
+    ide_assets_bind();
     watchdog_hw_disable();
     watchdog_hw_set_suppressed(true);
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
@@ -24905,7 +24917,7 @@ void kernel_main(void) {
     }
     watchdog_hw_pet();
 
-    /* ── Phase 5: NIC (runtime backend probe: macb / virtio-net / ...) ── */
+    /* ── Phase 5: NIC (boot-probe macb/genet/virtio; WiFi is nic_load) ── */
     bp_active(5);
     bp_log("[nic] nic_init (probe backends)...");
     nic_ok = nic_init();

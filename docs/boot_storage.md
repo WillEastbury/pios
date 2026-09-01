@@ -4,6 +4,7 @@ How PIOS boots and updates itself, how the disk is laid out, how WALFS works,
 and how identity, logging and telemetry are implemented.
 
 Checked against the code. Companion documents:
+[`platforms.md`](platforms.md) (Pi 5 / Pi 3 / Zero 2 W / QEMU boot addresses),
 [`architecture_system.md`](architecture_system.md),
 [`network_stack.md`](network_stack.md), [`network.md`](network.md),
 [`gotchas.md`](gotchas.md).

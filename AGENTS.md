@@ -291,6 +291,8 @@ process cannot move while its memory lives inside the owning core's 16 MB region
 
 - [`docs/architecture_decision_log.md`](docs/architecture_decision_log.md) — **every significant
   architectural decision, who made it, and what was rejected.** Read before proposing a change.
+- [`docs/platforms.md`](docs/platforms.md) — Pi 5, Pi 3 B/B+, Zero 2 W, and QEMU `virt`;
+  stage0 vs stage2; IRQ/NIC/SD/Wi-Fi differences; do not assume BCM2712+RP1.
 - [`docs/architecture_system.md`](docs/architecture_system.md) — cores, scheduling and quanta,
   mandatory preemption, the software-interrupt privilege model and per-core quantum, FIFOs, IPC,
   EL levels, memory isolation, processes and capsules.

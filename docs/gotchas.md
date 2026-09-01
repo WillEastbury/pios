@@ -470,3 +470,14 @@ explained its apparent "disappearance".
 - **QEMU trampoline ordering differs from silicon.** TCG treats a write to a page
   it has translated code from as self-modifying code and invalidates the softTLB
   mid-copy. QEMU disables the MMU *before* the copy; real hardware copies first.
+- **QEMU must not use runtime MIDR detection.** `-cpu cortex-a53` reports the
+  same PartNum (`0xD03`) as BCM2837. Guessing Pi 3 fills `g_board_bases` with
+  real Broadcom UART/mailbox addresses and hangs with zero output. QEMU builds
+  populate bases from `platform.h` constants.
+- **Do not put Pi 5 `-march=armv8.2-a+simd+crc+crypto` on A53 images.** Pi 3
+  and Zero 2 W need `-march=armv8-a+simd+crc -mno-outline-atomics`. Crypto/LSE
+  opcodes trap on those CPUs.
+- **BCM2837 SD card is SDHOST, not Arasan.** Driving `0x3F300000` for the
+  microSD slot talks to the Wi-Fi SDIO host; the removable slot is SDHOST at
+  `0x3F202000` (ADR-038). The firmware `mmc` overlay can reroute the slot onto
+  Arasan, but that disables Wi-Fi.

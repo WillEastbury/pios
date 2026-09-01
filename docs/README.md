@@ -1,16 +1,25 @@
 # PIOS System Documentation
 
+Start here: **[platforms.md](platforms.md)** (which boards and QEMU) then
+**[architecture_system.md](architecture_system.md)** (the kernel model).
+`architecture.md` is a short index, not a second architecture.
+
 ## Contents
 
 | Document | Description |
 |----------|-------------|
-| [architecture.md](architecture.md) | Hardware platform, core assignment, memory map, boot sequence |
+| [platforms.md](platforms.md) | **Boards and QEMU**: Pi 5, Pi 3 B/B+, Zero 2 W, QEMU `virt`; stage0 vs stage2; hardware matrix |
+| [architecture.md](architecture.md) | Entry point: kernel contracts vs platform capabilities |
+| [architecture_system.md](architecture_system.md) | Authoritative kernel model: cores, preemption, `airq`/`adrv`, FIFOs, isolation |
+| [architecture_decision_log.md](architecture_decision_log.md) | Every significant architectural decision |
+| [gotchas.md](gotchas.md) | Failed attempts, reverted changes, and traps |
 | [boot.md](boot.md) | Boot sequence: two-stage A/B chain, `start.S` bring-up, `kernel_main` init order, health-gated rollback |
 | [disk_layout.md](disk_layout.md) | Disk layout & on-disk structures: partition map, A/B raw slots, boot-control, OTA protocol, WALFS/keystore/principal records |
 | [drivers.md](drivers.md) | Hardware driver reference — registers, init sequences, APIs |
 | [network.md](network.md) | Authoritative network layering, core-0 communication, NIC/WiFi bring-up, meters, counters, and operator runbook |
-| [networking.md](networking.md) | Historical network stack notes; superseded by `network.md` |
-| [wifi.md](wifi.md) | Historical WiFi design notes; superseded by `network.md` and current continuation notes |
+| [network_stack.md](network_stack.md) | NIC/IP/TCP/TLS implementation |
+| [networking.md](networking.md) | Stub — superseded by `network.md` |
+| [wifi.md](wifi.md) | Stub — superseded by `network.md` and `platforms.md` |
 | [ipc.md](ipc.md) | Inter-core FIFO messaging protocol and message types |
 | [net_capsule_fifo.md](net_capsule_fifo.md) | Design draft: moving admin/web/TCP servers out of the kernel into FIFO/SWIRQ-woken user capsules, plus idle-core early-wake scheduling |
 | [api.md](api.md) | Full kernel API surface: userland kernel program interface (KPI) + kernel subsystem APIs |

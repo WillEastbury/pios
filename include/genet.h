@@ -2,7 +2,8 @@
 #include "types.h"
 
 /*
- * GENET v5 Ethernet MAC driver for BCM2712 (Pi 5).
+ * GENET v5 Ethernet MAC driver for BCM2711 (Pi 4).
+ * Pi 5 wired Ethernet is Cadence MACB on RP1, not this block.
  * Minimal: single TX/RX queue, polling, basic PHY init.
  */
 
@@ -15,6 +16,8 @@ bool genet_send_parts(const void *head, u32 head_len, const void *tail, u32 tail
 bool genet_recv(u8 *frame, u32 *len, bool *checksum_trusted);
 void genet_get_mac(u8 *mac);
 bool genet_link_up(void);
+u32  genet_link_mbps(void);
+bool genet_link_full_duplex(void);
 
 /* Safe feature-gated hooks for checksum/TSO offload plumbing. */
 void genet_set_tx_checksum_offload(bool enable);

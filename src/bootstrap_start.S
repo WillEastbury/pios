@@ -94,6 +94,8 @@ _start:
     b.eq    .Lb_pi5_table
     cmp     w0, #2                      /* BOARD_FAMILY_BCM2837 */
     b.eq    .Lb_bcm2837_table
+    cmp     w0, #3                      /* BOARD_FAMILY_PI4     */
+    b.eq    .Lb_pi4_table
     /* BOARD_FAMILY_UNKNOWN (0) or anything else: neither peripheral map is
      * known to be safe. Fail closed rather than guess -- an unrecognized
      * core here means genuinely unanticipated hardware, and silently
@@ -163,6 +165,30 @@ _start:
     cmp     x5, #128
     b.lt    .Lb_rp1
 
+    b       .Lb_mmu_enable
+
+    /* ── BCM2711 (Pi 4): UART/mailbox/EMMC2 live at 0xFE00_0000 and GENET
+     * at 0xFD58_0000, in the top of the first 4 GiB. Stage0 only needs
+     * kernel/staging in L1[0] and Device access to that hole, so L1[3]
+     * is a single 1 GiB Device block. Stage2 splits L1[3] so 0xC0000000-
+     * 0xFBFFFFFF stays RAM. */
+.Lb_pi4_table:
+    ldr     x0, =l1_table
+    mov     x1, #512
+.Lb_zero_l1_pi4:
+    str     xzr, [x0], #8
+    subs    x1, x1, #1
+    b.ne    .Lb_zero_l1_pi4
+
+    ldr     x0, =l1_table
+    mov     x2, #0x705                 /* ATTR(1) = Normal-NC             */
+    str     x2, [x0, #0]               /* L1[0]: first 1 GiB Normal-NC    */
+
+    mov     x2, #0x401                 /* Device-nGnRnE, ATTR(0)          */
+    movk    x2, #0x0060, lsl #48
+    ldr     x3, =0xC0000000
+    orr     x4, x3, x2
+    str     x4, [x0, #24]              /* L1[3]: 0xC0000000-0xFFFFFFFF Device */
     b       .Lb_mmu_enable
 
     /* ── BCM2837-family (Pi3 B/B+/A+, Pi Zero 2 W): peripherals fall inside

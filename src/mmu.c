@@ -33,6 +33,9 @@ u64 l2_table_boot[512] ALIGNED(4096);  /* start.S low-1GB split; never edited li
 static u64 l1_table_cached[512] ALIGNED(4096); /* BBM-safe target: fresh root for cache enable */
 static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
 static u64 l3_block0[512] ALIGNED(4096);     /* block 0 (0-2MB) split to 4KB pages */
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI4
+static u64 l2_table_pi4_high[512] ALIGNED(4096); /* L1[3]: RAM then 0xFC000000 Device */
+#endif
 
 /* Per-process user tables for user cores. Process slots are 1MiB-misaligned,
  * so each 2MiB slot can straddle two L2 entries and needs two L3 tables.
@@ -226,6 +229,8 @@ static void map_user_device_windows(u64 *l1)
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
     PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
     l1[1] = dev_block_1g(0x40000000UL);
+#elif PIOS_PLATFORM == PIOS_PLATFORM_PI4
+    (void)l1;
 #else
     for (u32 idx = 4; idx < 8; idx++)
         l1[idx] = dev_block_1g((u64)idx * L1_BLOCK_SIZE);
@@ -576,6 +581,19 @@ void mmu_init(void) {
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
     PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
     l1[1] = dev_block_1g(0x40000000UL);
+#elif PIOS_PLATFORM == PIOS_PLATFORM_PI4
+    l1[1] = ram_block_1g(0x40000000UL);
+    l1[2] = ram_block_1g(0x80000000UL);
+    /* L1[3] 0xC0000000-0xFFFFFFFF: RAM until 0xFC000000, then Device. */
+    {
+        u32 i;
+        for (i = 0; i < 480U; i++)
+            l2_table_pi4_high[i] = ram_block_2m(0xC0000000UL + (u64)i * L2_BLOCK_SIZE);
+        for (; i < 512U; i++)
+            l2_table_pi4_high[i] = dev_block_2m(0xC0000000UL + (u64)i * L2_BLOCK_SIZE);
+        dcache_clean_range((u64)(usize)l2_table_pi4_high, sizeof(l2_table_pi4_high));
+        l1[3] = (u64)(usize)l2_table_pi4_high | PTE_VALID | PTE_TABLE;
+    }
 #else
     l1[1] = ram_block_1g(0x40000000UL);
     l1[2] = ram_block_1g(0x80000000UL);
@@ -590,7 +608,8 @@ void mmu_init(void) {
 #endif
 
 #if PIOS_PLATFORM != PIOS_PLATFORM_PI3 && \
-    PIOS_PLATFORM != PIOS_PLATFORM_PIZERO2W
+    PIOS_PLATFORM != PIOS_PLATFORM_PIZERO2W && \
+    PIOS_PLATFORM != PIOS_PLATFORM_PI4
     /* Peripherals: indices 64-67 (BCM2712 at 0x107C000000 = 65GB) */
     u64 dev_attr = PTE_VALID | PTE_BLOCK | PTE_AF |
                    PTE_ATTR(MT_DEVICE_nGnRnE) |

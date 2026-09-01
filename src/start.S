@@ -29,6 +29,9 @@ core_asm_stage:
 #ifndef PIOS_PLATFORM_PIZERO2W
 #define PIOS_PLATFORM_PIZERO2W 7
 #endif
+#ifndef PIOS_PLATFORM_PI4
+#define PIOS_PLATFORM_PI4 9
+#endif
 
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
     PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
@@ -348,6 +351,21 @@ _start:
     mov     x3, #0x40000000
     orr     x4, x3, x2
     str     x4, [x0, #8]
+#elif PIOS_PLATFORM == PIOS_PLATFORM_PI4
+    /* 0xC0000000-0xFFFFFFFF contains the BCM2711 peripheral hole. Map the
+     * whole 1 GiB Device until mmu_init() installs the RAM/Device L2 split. */
+    mov     x2, #0x709
+    mov     x3, #0x40000000
+    orr     x4, x3, x2
+    str     x4, [x0, #8]
+    ldr     x3, =0x80000000
+    orr     x4, x3, x2
+    str     x4, [x0, #16]
+    mov     x2, #0x401
+    movk    x2, #0x0060, lsl #48
+    ldr     x3, =0xC0000000
+    orr     x4, x3, x2
+    str     x4, [x0, #24]
 #else
     mov     x2, #0x709
     mov     x3, #0x40000000
@@ -395,7 +413,8 @@ _start:
 #endif
 
 #if PIOS_PLATFORM != PIOS_PLATFORM_PI3 && \
-    PIOS_PLATFORM != PIOS_PLATFORM_PIZERO2W
+    PIOS_PLATFORM != PIOS_PLATFORM_PIZERO2W && \
+    PIOS_PLATFORM != PIOS_PLATFORM_PI4
     /* L1[64..67]: Device (BCM2712 peripherals at 0x10_00000000+) */
     mov     x2, #0x401
     movk    x2, #0x0060, lsl #48

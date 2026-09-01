@@ -93,7 +93,7 @@ for %%f in (src\*.S) do (
     )
 )
 for %%f in (src\*.c) do (
-    if /I not "%%~nxf"=="bootstrap.c" if /I not "%%~nxf"=="provision.c" if /I not "%%~nxf"=="provision_revert.c" if /I not "%%~nxf"=="qemu_virt_min.c" if /I not "%%~nxf"=="qemu_virt_walfs.c" (
+    if /I not "%%~nxf"=="bootstrap.c" if /I not "%%~nxf"=="provision.c" if /I not "%%~nxf"=="provision_revert.c" if /I not "%%~nxf"=="qemu_virt_min.c" if /I not "%%~nxf"=="qemu_virt_walfs.c" if /I not "%%~nxf"=="ide_assets.c" (
         echo Compiling %%~nf.c...
         "%CC%" %FULL_CFLAGS% -c "%%f" -o "build\%%~nf.o"
         if errorlevel 1 exit /b 1
@@ -118,7 +118,9 @@ REM A combined Pi5+QEMU package no longer fits the slot. The Pi5 FAT slot never
 REM needs the QEMU image
 REM (qemu_smoke boots build_qemu_full\PIOS_QEMU_FULL.BIN directly and the QEMU
 REM UEFI path builds its own QEMU-only package), so package Pi5-only here.
-python tools\build_stage2_package.py --pi build_pi5_stage2\PIOS_PI5_STAGE2.BIN --out real_kernel.img
+python tools\pack_ide_assets.py
+if errorlevel 1 exit /b 1
+python tools\build_stage2_package.py --pi build_pi5_stage2\PIOS_PI5_STAGE2.BIN --shared assets\pios_shared_assets.bin --out real_kernel.img
 if errorlevel 1 exit /b 1
 copy /Y real_kernel.img PIOSSTG2.PKG >nul
 

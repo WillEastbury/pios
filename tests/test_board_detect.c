@@ -47,11 +47,13 @@ int main(void)
     expect_u32("Cortex-A76 (different variant/rev) -> BOARD_FAMILY_PI5",
                board_family_from_midr(a76_other_variant), BOARD_FAMILY_PI5);
 
-    /* An unrecognized core (e.g. Cortex-A72, partnum 0xD08) must fail closed
-     * to UNKNOWN, not silently alias to either known family. */
-    u64 a72_midr = make_midr(0x41, 0x0, 0xF, 0xD08, 0x0);
-    expect_u32("Cortex-A72 (unrecognized) -> BOARD_FAMILY_UNKNOWN",
-               board_family_from_midr(a72_midr), BOARD_FAMILY_UNKNOWN);
+    u64 a72_midr = make_midr(0x41, 0x0, 0xF, MIDR_PARTNUM_CORTEX_A72, 0x0);
+    expect_u32("Cortex-A72 -> BOARD_FAMILY_PI4",
+               board_family_from_midr(a72_midr), BOARD_FAMILY_PI4);
+
+    u64 a57_midr = make_midr(0x41, 0x0, 0xF, 0xD07, 0x0);
+    expect_u32("Cortex-A57 (unrecognized) -> BOARD_FAMILY_UNKNOWN",
+               board_family_from_midr(a57_midr), BOARD_FAMILY_UNKNOWN);
 
     /* Implementer byte must not leak into the partnum comparison (e.g. a
      * non-ARM implementer with a coincidentally-matching low 12 bits should
@@ -67,6 +69,8 @@ int main(void)
                board_model_from_revision(0xA02082U), BOARD_MODEL_PI3_B);
     expect_u32("Pi 3 Model B+ revision -> model 0x0D",
                board_model_from_revision(0xA020D3U), BOARD_MODEL_PI3_B_PLUS);
+    expect_u32("Pi 4 Model B revision -> model 0x11",
+               board_model_from_revision(0xA03111U), BOARD_MODEL_PI4_B);
     expect_u32("Pi Zero 2 W revision -> model 0x12",
                board_model_from_revision(0x902120U), BOARD_MODEL_ZERO2W);
     expect_u32("legacy revision -> unknown model",

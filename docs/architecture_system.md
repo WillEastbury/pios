@@ -7,8 +7,15 @@ and how user processes and PicoScript capsules execute.
 This document is checked against the code. Where behaviour is surprising, the
 reason is given. Where something is scaffolded but inactive, it says so.
 
+The kernel model is **platform-independent**. Raspberry Pi 5, Pi 3 B/B+,
+Pi Zero 2 W, and QEMU `virt` all run this reactor / FIFO / preemption
+design. Board-specific IRQs, NICs, storage, and memory maps are in
+[`platforms.md`](platforms.md).
+
 Companion documents:
 
+- [`platforms.md`](platforms.md) — Pi 5, Pi 3, Zero 2 W, QEMU; stage0 vs
+  stage2; hardware matrix and memory maps.
 - [`architecture_decision_log.md`](architecture_decision_log.md) — significant
   architectural decisions, who made them, and what was rejected.
 - [`boot_storage.md`](boot_storage.md) — two-stage boot, OTA, WALFS, users,
@@ -512,7 +519,9 @@ a busy core 0 is not punished.
 
 ### 8.1 Map
 
-Identity mapped, VA == PA.
+Identity mapped, VA == PA. The map below is the **Raspberry Pi** physical
+layout (Pi 5 / Pi 3 / Zero 2 W). QEMU `virt` has no RAM below
+`0x40000000` and uses a different arena; see [`platforms.md`](platforms.md).
 
 ```text
 0x00080000          Kernel image
