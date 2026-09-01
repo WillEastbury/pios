@@ -23,6 +23,7 @@
 #include "sd.h"
 #include "nic.h"
 #include "macb.h"
+#include "genet.h"
 #include "pioscap.h"
 #include "net.h"
 #include "arp.h"
@@ -636,6 +637,7 @@ static volatile u64 g_dash_snap_ticks;
 static volatile u64 g_dash_render_ticks;
 static bool core0_eth_irq_drain_and_quench(bool host_route);
 static void core0_network_service_step(void);
+static void core0_net_dispatch_yield(void);
 static const char *tcp_state_name(u32 state);
 static const char *tcp_owner_label(u16 port);
 static bool http_request_complete(const u8 *req, u32 len);
@@ -826,13 +828,9 @@ static void wifi_upload_progress(void)
     static u32 cadence;
 #endif
     /*
-     * ADR-033: an adrv liveness hook may keep the fail-safe path observable,
-     * but it may not borrow protocol execution by polling frames.  Publish a
-     * bounded transport indication; the registered software handler owns the
-     * subsequent NIC read and protocol stages.
+     * ADR-033: liveness may recover MAC hardware but must not publish
+     * protocol work. Ingress is IRQ → FIFO only.
      */
-    (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
-                                         NET_DISPATCH_CAUSE_PACED);
 #if PIOS_HAS_MACB
     if ((++cadence & 31U) == 0U) {
         bool recovered = macb_rx_recover();
@@ -3096,7 +3094,7 @@ static bool net_icmp_echo_send_retry(u32 dst_ip, u16 ident, u16 seq, u8 ttl, u32
             return true;
         if (timer_monotonic_ms() >= deadline)
             return false;
-        net_poll();
+        net_dispatch_yield();
         timer_delay_us(2000);
     }
 }
@@ -3117,7 +3115,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
             "Examples: status | ps | services | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
-            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | picocompress selftest | picoweb selftest\n"
+            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | picocompress selftest | picoweb selftest\n"
             "Client tools: arp | route | ping <ip-or-cached-host> [count] | traceroute <ip-or-cached-host> [max_hops] | dnslookup <hostname>\n"
             "Command help: help status | help netstat | help firewall | help reboot | help peek | help walfs | help db | help cachestats\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
@@ -3443,7 +3441,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                 bool got = false;
                 u64 deadline = timer_monotonic_ms() + 1000;
                 while (timer_monotonic_ms() < deadline) {
-                    net_poll();
+                    net_dispatch_yield();
                     if (net_icmp_echo_poll_result(&r)) { got = true; break; }
                     timer_delay_us(200);
                 }
@@ -3514,7 +3512,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                 bool got = false;
                 u64 deadline = timer_monotonic_ms() + 1000;
                 while (timer_monotonic_ms() < deadline) {
-                    net_poll();
+                    net_dispatch_yield();
                     if (net_icmp_echo_poll_result(&r)) { got = true; break; }
                     timer_delay_us(200);
                 }
@@ -8592,6 +8590,12 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         bool on = http_streq(cmd, "nic dump on");
         nic_set_packet_dump(on);
         http_append(out, &len, max, on ? "nic packet dump ENABLED\n" : "nic packet dump disabled\n");
+    } else if (http_streq(cmd, "net pump")) {
+        /* Issue #94: explicit diagnostic NIC pump. Not used by services. */
+        u32 got = net_poll();
+        http_append(out, &len, max, "net pump frames=");
+        http_append_u64(out, &len, max, got);
+        http_append(out, &len, max, " (diagnostic only)\n");
     } else if (http_streq(cmd, "nic counters")) {
         nic_packet_counters_t c;
         nic_packet_counters(&c);
@@ -18095,7 +18099,7 @@ static u32 ui_read_tty_line(char *out, u32 out_max, const char *prompt)
         i32 c = usb_kbd_try_getc();
         if (c < 0) c = uart_try_getc();
         if (c < 0) {
-            net_poll();
+            net_dispatch_yield();
             timer_delay_ms(1);
             continue;
         }
@@ -18481,7 +18485,7 @@ static void ui_cmd_edit(const char *path)
                 }
             }
         }
-        net_poll();
+        net_dispatch_yield();
         workq_drain(2);
         timer_delay_ms(1);
     }
@@ -18538,7 +18542,7 @@ static void http_append_sanitized_bytes(char *out, u32 *len, u32 max, const u8 *
 static bool ui_tcp_wait_established(tcp_conn_t c, u32 timeout_ms)
 {
     for (u32 t = 0; t < timeout_ms; t++) {
-        net_poll();
+        net_dispatch_yield();
         u32 st = tcp_state(c);
         if (st == TCP_ESTABLISHED) return true;
         if (st == TCP_CLOSED) return false;
@@ -18560,7 +18564,7 @@ static bool ui_tcp_write_all(tcp_conn_t c, const u8 *data, u32 len, u32 timeout_
             idle++;
             timer_delay_ms(1);
         }
-        net_poll();
+        net_dispatch_yield();
     }
     return off == len;
 }
@@ -18628,7 +18632,7 @@ static bool ui_http_fetch(bool use_tls, u32 dst_ip, u16 port,
     u32 nout = 0;
     u32 idle = 0;
     while (idle < timeout_ms && nout < out_max) {
-        net_poll();
+        net_dispatch_yield();
         u32 avail = tcp_readable(c);
         if (avail > 0) {
             u32 want = out_max - nout;
@@ -18769,7 +18773,7 @@ static void ui_cmd_stream(u32 argc, char **argv)
             return;
         }
         for (u32 t = 0; t < timeout_ms; t++) {
-            net_poll();
+            net_dispatch_yield();
             if (ui_stream_udp.ready) break;
             timer_delay_ms(1);
         }
@@ -18794,7 +18798,7 @@ static void ui_cmd_stream(u32 argc, char **argv)
     }
     bool up = false;
     for (u32 t = 0; t < timeout_ms; t++) {
-        net_poll();
+        net_dispatch_yield();
         u32 st = tcp_state(c);
         if (st == TCP_ESTABLISHED) { up = true; break; }
         if (st == TCP_CLOSED) break;
@@ -18808,15 +18812,15 @@ static void ui_cmd_stream(u32 argc, char **argv)
     u32 off = 0;
     while (off < in_len) {
         u32 n = tcp_write(c, in_buf + off, in_len - off);
-        if (n == 0) { net_poll(); timer_delay_ms(1); continue; }
+        if (n == 0) { net_dispatch_yield(); timer_delay_ms(1); continue; }
         off += n;
-        net_poll();
+        net_dispatch_yield();
     }
     u8 out[UI_STREAM_OUT_MAX];
     u32 out_len = 0;
     u32 idle = 0;
     while (idle < 200 && out_len < sizeof(out)) {
-        net_poll();
+        net_dispatch_yield();
         u32 avail = tcp_readable(c);
         if (avail > 0) {
             u32 want = (u32)((sizeof(out) - out_len) < avail ? (sizeof(out) - out_len) : avail);
@@ -23313,31 +23317,15 @@ static void core0_io_tick_hook(u32 core, u64 tick)
     if ((tick & 31U) == 0 || uartflash_active)
         flags |= CORE0_IO_UART | CORE0_IO_USB;
     /*
-     * ADR-033: timer cadence may publish a bounded SDIO transport indication,
-     * but never calls CYW43, the legacy compatibility pump, or protocol work
-     * itself.  A quiet
-     * wired link therefore cannot gate WiFi delivery, while a missing software
-     * event remains observable as a queue/interrupt failure rather than
-     * silently becoming a polling fallback.
+     * ADR-033 / ADR-044: MACB, GENET, and WiFi ingress are IRQ → FIFO only.
+     * A timer must not substitute for a missing device interrupt except on
+     * virtio-net, which has no RX IRQ in this QEMU build.
      */
-#if !PIOS_HAS_MACB
-    /*
-     * virtio-net exposes no wired RX IRQ in this platform build.  Its explicit
-     * 125Hz transport indication is still only a descriptor publication; the
-     * AIRQ transport handler is the sole place that may inspect its ring.
-     */
+#if PIOS_HAS_VIRTIO_NET
     if ((tick & 7U) == 0U)
         (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
                                              NET_DISPATCH_CAUSE_PACED);
 #endif
-    if (cyw43_poll_busy()) {
-        if ((tick & 7U) == 0)
-            (void)airq_post_from(CORE_NET, AIRQ_SRC_WIFI,
-                                 NET_DISPATCH_CAUSE_PACED);
-    } else if ((tick & 127U) == 0) {
-        (void)airq_post_from(CORE_NET, AIRQ_SRC_WIFI,
-                             NET_DISPATCH_CAUSE_PACED);
-    }
     /* Timer-driven TCP/application progress is an explicit service event, not
      * a frame poll. It advances already-owned output after peer ACKs even when
      * no new ingress descriptor is pending. */
@@ -23384,10 +23372,35 @@ static void core0_eth_irq_handler(void)
     (void)airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, core0_eth_irq_last_mip);
 }
 
+#if PIOS_GENET_IRQ
+static void core0_genet_irq_handler(void)
+{
+    genet_irq_mask_rx();
+    (void)genet_irq_ack();
+    (void)airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, NET_DISPATCH_CAUSE_IRQ);
+}
+
+static void core0_genet_irq_arm(void)
+{
+    irq_register(PIOS_GENET_IRQ, core0_genet_irq_handler);
+    gic_set_group1(PIOS_GENET_IRQ);
+    gic_set_priority(PIOS_GENET_IRQ, 0x40);
+    gic_set_target(PIOS_GENET_IRQ, 1);
+    gic_clear_pending(PIOS_GENET_IRQ);
+    gic_enable_irq(PIOS_GENET_IRQ);
+}
+#endif
+
 /* Bottom half for a NIC receive interrupt. Runs in reactor context under the
  * dispatcher's budget, never in IRQ context. CRITICAL priority: if this is
  * starved the GEM RX ring fills, BNA latches, and the wired fail-safe path is
  * gone -- the failure this whole layering exists to prevent. */
+static void core0_net_dispatch_yield(void)
+{
+    /* Issue #94: waiters may drain posted AIRQ work, never the NIC. */
+    (void)airq_dispatch(CORE_NET, 2U);
+}
+
 static void airq_eth_rx_handler(const struct airq_record *rec, void *ctx)
 {
     (void)ctx;
@@ -23409,7 +23422,7 @@ static void airq_wifi_handler(const struct airq_record *rec, void *ctx)
 {
     (void)ctx;
     (void)net_dispatch_publish_transport(NIC_IFACE_WIFI,
-                                         rec->arg | NET_DISPATCH_CAUSE_PACED);
+                                         rec->arg ? rec->arg : NET_DISPATCH_CAUSE_IRQ);
 }
 
 static void airq_console_handler(const struct airq_record *rec, void *ctx)
@@ -23428,6 +23441,12 @@ static void airq_net_transport_handler(const struct airq_record *rec, void *ctx)
         core0_eth_irq_deferred_quench = false;
         (void)core0_eth_irq_drain_and_quench(false);
     }
+#if PIOS_HAS_GENET
+    genet_irq_unmask_rx();
+#endif
+#if PIOS_HAS_WIFI_SDIO
+    sdio_card_irq_unmask();
+#endif
 }
 
 static void airq_net_mac_handler(const struct airq_record *rec, void *ctx)
@@ -23696,6 +23715,9 @@ NORETURN void core0_main(void) {
      * the AIRQ/FIFO pipeline; there is no periodic protocol-poll fallback. */
 #if PIOS_HAS_MACB
     core0_eth_irq_arm_host(false);
+#endif
+#if PIOS_GENET_IRQ
+    core0_genet_irq_arm();
 #endif
 
     u64 stack_canary_last_check = 0;
@@ -24768,6 +24790,7 @@ void kernel_main(void) {
      */
     airq_init();
     airq_set_now_hook(timer_monotonic_ms);
+    net_set_dispatch_yield(core0_net_dispatch_yield);
     net_dispatch_init();
     (void)airq_register(AIRQ_SRC_ETH_RX, AIRQ_PRIO_CRITICAL, CORE_NET,
                         airq_eth_rx_handler, NULL);

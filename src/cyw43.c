@@ -3097,7 +3097,7 @@ void cyw43_poll(void)
             else {
                 (void)cyw_data_queue_push(cyw_rx_buf, len);
                 /*
-                 * net_poll() owns regular Ethernet delivery. Do not keep
+                 * net_dispatch owns regular Ethernet delivery. Do not keep
                  * draining SDPCM data here or a burst fills the bounded queue
                  * before the reactor returns to the network stack.
                  */

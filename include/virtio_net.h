@@ -7,7 +7,7 @@
  *
  * Provides the same poll-driven, non-blocking RX/TX contract that net.c /
  * nic.c expect from a hardware MAC, so the full kernel network stack
- * (net_poll -> nic_recv, tcp_output -> nic_send) runs unchanged under QEMU.
+ * (net_dispatch transport -> nic_recv, egress FIFO -> nic_send) under QEMU.
  *
  * Single-producer/single-consumer split virtqueues, driven entirely by
  * polling on core 0 (no MSI/IRQ) to mirror the Pi5 GENET/MACB polling model.

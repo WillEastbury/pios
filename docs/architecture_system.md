@@ -158,7 +158,7 @@ Core 0 does not run `proc_schedule()`. It runs an event-driven reactor keyed on
 
 | Flag | Meaning |
 |---|---|
-| `CORE0_IO_NET` | Drain NIC + `net_poll()` + MAC recovery |
+| `CORE0_IO_NET` | (retired) NIC drain is IRQ → AIRQ → FIFO |
 | `CORE0_IO_TCP` | TCP timers, service pumps, bridges |
 | `CORE0_IO_UART` | UART/console input |
 | `CORE0_IO_USB` | USB polling |

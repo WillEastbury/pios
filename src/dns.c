@@ -471,7 +471,7 @@ bool dns_resolve(const char *hostname, u32 *ip_out) {
         /* Poll for response */
         u64 deadline = timer_monotonic_ms() + QUERY_TIMEOUT;
         while (timer_monotonic_ms() < deadline) {
-            net_poll();
+            net_dispatch_yield();
             if (got_response) {
                 *ip_out = resp_ip;
                 cache_insert(hash, resp_ip, resp_ttl);

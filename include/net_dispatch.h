@@ -21,7 +21,7 @@
 #define NET_DISPATCH_RX_CAPACITY   4U
 #define NET_DISPATCH_TX_CAPACITY   8U
 
-/* A paced SDIO probe and a MAC IRQ are both bounded transport indications. */
+/* A MAC/SDIO IRQ is a bounded transport indication. PACED is virtio-only. */
 #define NET_DISPATCH_CAUSE_IRQ     (1U << 0)
 #define NET_DISPATCH_CAUSE_PACED   (1U << 1)
 #define NET_DISPATCH_CAUSE_RECHECK (1U << 2)

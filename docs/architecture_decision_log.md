@@ -88,6 +88,7 @@ decision)
 | [041](#adr-041) | Automatic Wi-Fi fallback when no wired NIC exists | Owner | Accepted |
 | [042](#adr-042) | Runtime board selection and memory-capability setup | Owner | Accepted |
 | [043](#adr-043) | Pi 4 GENET + loadable nic_ops (MACB stays Pi 5) | Owner | Accepted |
+| [044](#adr-044) | GENET and WiFi ingress are IRQ → FIFO only | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -470,10 +471,38 @@ is one shared stack. WiFi is the same `nic_ops` vtable, loaded on demand.
 **Rejected.** Using GENET on Pi 5. Treating `PIOS_HAS_GENET` as “has Ethernet”.
 A second TCP/IP stack for Pi 4. Auto-probing WiFi at `nic_init()`.
 
-**Consequences.** `macbdiag` / RX-hole recovery stay Pi 5-only. Pi 4 wired
-path is polling GENET until a GENET IRQ is wired. Pi 4/Pi 5 keep `.201` as
-the fail-safe wired address; WiFi is additive (ADR-032). Live Pi 4 boot is
-not yet proven.
+**Consequences.** `macbdiag` / RX-hole recovery stay Pi 5-only. Pi 4/Pi 5 keep
+`.201` as the fail-safe wired address; WiFi is additive (ADR-032). Live Pi 4
+boot is not yet proven. GENET and WiFi ingress are IRQ → FIFO (ADR-044).
+
+---
+
+<a name="adr-044"></a>
+## ADR-044 — GENET and WiFi ingress are IRQ → FIFO only
+
+**Date:** 2026-09-01 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** MACB is already interrupt-driven. GENET was written as a
+poller. Make GENET and the WiFi MAC the same as MACB: hardware IRQ top half
+acks/masks, then AIRQ + net_dispatch FIFO. No protocol poll.
+
+**Decision.**
+
+- Pi 4 GENET unmasks `UMAC_IRQ_RXDMA_DONE` and takes GIC SPI 157 (INTID 189).
+  Top half masks + clears INTRL2 and posts `AIRQ_SRC_ETH_RX`. Drain is the
+  existing transport FIFO.
+- WiFi DAT1/SDHCI card interrupt posts `AIRQ_SRC_WIFI` with `CAUSE_IRQ`.
+  Pi 5 uses GIC SPI 274 (INTID 306); Pi 4 Arasan uses GIC SPI 126 (INTID 158).
+  Top half masks the level line; the transport bottom half unmasks after drain.
+- Timer cadence must not publish WiFi or GENET transport. The only remaining
+  paced wired indication is virtio-net on QEMU, which has no RX IRQ here.
+- BCM2837-family boards have no GIC and `irqc_legacy` does not yet route GPU
+  peripheral IRQs, so WiFi there has a host interrupt with no delivery path
+  until that controller is wired. Fail closed rather than keep a poll fallback.
+
+**Rejected.** Keeping a 125 Hz `CAUSE_PACED` poll for GENET or CYW43455 as a
+"until IRQ is proven" backstop. A quiet timer cannot be told apart from a
+dead interrupt, which is how WiFi RX was previously starved.
 
 ---
 

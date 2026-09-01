@@ -90,7 +90,7 @@ static bool tcp_write_all(tcp_conn_t tcp, const u8 *buf, u32 len) {
             off += n;
             continue;
         }
-        net_poll();
+        net_dispatch_yield();
         timer_delay_ms(1);
         if ((timer_ticks() - start) > TLS_IO_TIMEOUT)
             return false;
@@ -108,7 +108,7 @@ static bool tcp_read_all(tcp_conn_t tcp, u8 *buf, u32 len) {
             off += n;
             continue;
         }
-        net_poll();
+        net_dispatch_yield();
         timer_delay_ms(1);
         if ((timer_ticks() - start) > TLS_IO_TIMEOUT)
             return false;

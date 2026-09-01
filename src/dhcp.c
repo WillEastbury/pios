@@ -401,7 +401,7 @@ bool dhcp_start(u32 timeout_ms) {
             return true;
 
         dhcp_poll();
-        net_poll();
+        net_dispatch_yield();
         timer_delay_ms(10);
     }
 

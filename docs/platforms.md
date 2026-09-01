@@ -83,10 +83,12 @@ into one payload.
 | V3D 7.1 | yes | no | no | no |
 | Mailbox | yes | yes | yes | `PIOS_MBOX_BASE=0` — never call `mbox_call()` |
 
-**Network (ADR-043).** One TCP/IP stack. Wired `nic_ops`: MACB on Pi 5, GENET
-on Pi 4, virtio on QEMU. WiFi is `nic_load("wifi-cyw43455")`, never boot-probed.
-Pi 4 and Pi 5 stay wired-first (`.201`); `wifi activate` adds `.202`. BCM2837
-boards have no wired MAC, so stage2 may auto-init Wi-Fi (ADR-041).
+**Network (ADR-043 / ADR-044).** One TCP/IP stack. Wired `nic_ops`: MACB on
+Pi 5 (RP1 IRQ), GENET on Pi 4 (GIC SPI 157), virtio on QEMU (paced; no RX
+IRQ). WiFi is `nic_load("wifi-cyw43455")` and DAT1/SDHCI IRQ → FIFO on GIC
+hosts. BCM2837 has no GIC; GPU SDIO IRQ is not routed yet. Pi 4 and Pi 5 stay
+wired-first (`.201`); `wifi activate` adds `.202`. BCM2837 boards have no
+wired MAC, so stage2 may auto-init Wi-Fi (ADR-041).
 
 **MMU trap.** BCM2837 UART/SD/QA7 sit **inside** the low 4 GiB, so stage0
 cannot reuse the Pi 5 1 GiB Normal-NC L1[0]. Unknown MIDR fails closed rather

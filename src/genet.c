@@ -90,6 +90,18 @@
 #define RDMA_RING_CFG       (RDMA_BASE + 0xA04)
 #define TDMA_RING_CFG       (TDMA_BASE + 0xA04)
 
+/* INTRL2_0 — Linux bcmgenet.h. IRQ top half acks; protocol stays in FIFO. */
+#define INTRL2_0_STAT       0x0200
+#define INTRL2_0_SET        0x0204
+#define INTRL2_0_CLEAR      0x0208
+#define INTRL2_0_MASK_STAT  0x020C
+#define INTRL2_0_MASK_SET   0x0210
+#define INTRL2_0_MASK_CLR   0x0214
+#define INTRL2_1_CLEAR      0x0248
+#define INTRL2_1_MASK_SET   0x0250
+#define UMAC_IRQ_RXDMA_DONE (1U << 13)
+#define UMAC_IRQ_TXDMA_DONE (1U << 16)
+
 /* Descriptor length_status bits */
 #define DESC_OWN            (1 << 15)
 #define DESC_EOP            (1 << 14)
@@ -395,11 +407,11 @@ bool genet_init(void) {
     gw(RBUF_CTRL, gr(RBUF_CTRL) | (1 << 1));  /* RBUF_ALIGN_2B */
     gw(RBUF_TBUF_SIZE_CTRL, 1);
 
-    /* Mask all interrupts (polling mode) */
-    gw(0x0210, 0xFFFFFFFF);  /* INTRL2_0 MASK_SET */
-    gw(0x0208, 0xFFFFFFFF);  /* INTRL2_0 CLEAR */
-    gw(0x0250, 0xFFFFFFFF);  /* INTRL2_1 MASK_SET */
-    gw(0x0248, 0xFFFFFFFF);  /* INTRL2_1 CLEAR */
+    /* Start masked; genet_irq_enable() unmasks RXDMA_DONE after DMA is up. */
+    gw(INTRL2_0_MASK_SET, 0xFFFFFFFF);
+    gw(INTRL2_0_CLEAR, 0xFFFFFFFF);
+    gw(INTRL2_1_MASK_SET, 0xFFFFFFFF);
+    gw(INTRL2_1_CLEAR, 0xFFFFFFFF);
 
     /* Phase D: Set MAC address */
     gw(UMAC_MAC0, (mac_addr[0] << 24) | (mac_addr[1] << 16) |
@@ -451,6 +463,7 @@ bool genet_init(void) {
     }
     uart_puts("\n");
 
+    genet_irq_enable();
     return true;
 #endif
 }
@@ -595,6 +608,40 @@ u32 genet_link_mbps(void)
 bool genet_link_full_duplex(void)
 {
     return genet_link_up();
+}
+
+void genet_irq_mask_rx(void)
+{
+#if PIOS_HAS_GENET && (PIOS_GENET_BASE != 0)
+    gw(INTRL2_0_MASK_SET, UMAC_IRQ_RXDMA_DONE);
+#endif
+}
+
+u32 genet_irq_ack(void)
+{
+#if PIOS_HAS_GENET && (PIOS_GENET_BASE != 0)
+    u32 stat = gr(INTRL2_0_STAT) & ~gr(INTRL2_0_MASK_STAT);
+    gw(INTRL2_0_CLEAR, stat);
+    return stat;
+#else
+    return 0U;
+#endif
+}
+
+void genet_irq_unmask_rx(void)
+{
+#if PIOS_HAS_GENET && (PIOS_GENET_BASE != 0)
+    gw(INTRL2_0_MASK_CLR, UMAC_IRQ_RXDMA_DONE);
+#endif
+}
+
+void genet_irq_enable(void)
+{
+#if PIOS_HAS_GENET && (PIOS_GENET_BASE != 0)
+    gw(INTRL2_0_CLEAR, 0xFFFFFFFF);
+    gw(INTRL2_0_MASK_CLR, UMAC_IRQ_RXDMA_DONE);
+    uart_puts("[genet] RXDMA_DONE unmasked\n");
+#endif
 }
 
 void genet_set_tx_checksum_offload(bool enable) {

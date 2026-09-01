@@ -22,6 +22,9 @@
 #include "fb.h"
 #include "mailbox.h"
 #include "exception.h"
+#include "airq.h"
+#include "core.h"
+#include "net_dispatch.h"
 
 /* ── SDHCI register offsets ── */
 #define REG_ARG2            0x00
@@ -1355,28 +1358,52 @@ void sdio_card_irq_ack(void)
 #endif
 }
 
+void sdio_card_irq_mask(void)
+{
+#if PIOS_HAS_WIFI_SDIO
+    u16 signal = sr16(REG_IRPT_EN);
+    sw16(REG_IRPT_EN, (u16)(signal & ~(u16)INT_CARD));
+#endif
+}
+
+void sdio_card_irq_unmask(void)
+{
+#if PIOS_HAS_WIFI_SDIO
+    u16 signal = sr16(REG_IRPT_EN);
+    sw16(REG_IRPT_EN, (u16)(signal | INT_CARD));
+#endif
+}
+
 static void sdio_gic_irq_handler(void)
 {
+    /* Top half: mask the level line, ack, post. Drain is FIFO/AIRQ only. */
+    sdio_card_irq_mask();
     if (sdio_card_irq_pending()) {
         sdio_card_irq_latched = true;
         sdio_card_irq_ack();
     }
+    (void)airq_post_from(CORE_NET, AIRQ_SRC_WIFI, NET_DISPATCH_CAUSE_IRQ);
 }
 
 void sdio_card_irq_arm(void)
 {
-#if PIOS_HAS_WIFI_SDIO2
-    /* BCM2712 WiFi SDIO2 is sdio2@1100000 in the upstream DTS, GIC SPI 274. */
-    irq_register(274U, sdio_gic_irq_handler);
-    gic_set_group1(274U);
-    gic_set_priority(274U, 0x60U);
-    gic_set_target(274U, 1U);
-    gic_clear_pending(274U);
-    gic_enable_irq(274U);
-    u16 signal = sr16(REG_IRPT_EN);
-    sw16(REG_IRPT_EN, (u16)(signal | INT_CARD));
+#if PIOS_HAS_WIFI_SDIO
     sdio_card_irq_latched = false;
     sdio_card_irq_level = false;
+    sdio_card_irq_unmask();
+#if PIOS_WIFI_SDIO_IRQ != 0
+    irq_register(PIOS_WIFI_SDIO_IRQ, sdio_gic_irq_handler);
+    gic_set_group1(PIOS_WIFI_SDIO_IRQ);
+    gic_set_priority(PIOS_WIFI_SDIO_IRQ, 0x60U);
+    gic_set_target(PIOS_WIFI_SDIO_IRQ, 1U);
+    gic_clear_pending(PIOS_WIFI_SDIO_IRQ);
+    gic_enable_irq(PIOS_WIFI_SDIO_IRQ);
+    uart_puts("[sdio] card IRQ armed intid=");
+    uart_hex(PIOS_WIFI_SDIO_IRQ);
+    uart_puts("\n");
+#else
+    uart_puts("[sdio] card IRQ: no host INTID on this platform\n");
+#endif
 #endif
 }
 

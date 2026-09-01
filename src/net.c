@@ -72,7 +72,7 @@ static u64 icmp_min_interval;
 
 static u8 rx_frame[2048] ALIGNED(64);
 static u8 tx_frame[2048] ALIGNED(64);
-/* Drain up to a full RX ring (NUM_RX=32) per net_poll call. The MACB RX ring
+/* Drain up to a full RX ring (NUM_RX=32) per transport burst. The MACB RX ring
  * is 32 descriptors deep; draining only 1 frame/poll (the old value) could not
  * keep pace with bursty load, so the ring backed up (observed rx_owned->21/32)
  * and frames waited seconds before being processed -> multi-second ICMP/HTTP
@@ -1030,7 +1030,7 @@ bool net_icmp_echo_poll_result(struct net_ping_result *out) {
 
 /* ================================================================== */
 /*  DNS FIFO integration - user cores must never call dns_resolve() or */
-/*  net_poll() directly: dns.c/net.c/macb.c state is owned exclusively */
+/*  net_poll()/dns_resolve() directly: dns.c/net.c/macb.c state is owned exclusively */
 /*  by Core 0. A user core that touched it directly would race Core 0  */
 /*  on the same non-coherent NIC descriptor rings/registers. Route     */
 /*  resolves through a small pending queue drained on Core 0.          */
@@ -1369,12 +1369,25 @@ void net_service_step(void)
     workq_drain(4);
 }
 
+static net_dispatch_yield_fn g_dispatch_yield;
+
+void net_set_dispatch_yield(net_dispatch_yield_fn fn)
+{
+    g_dispatch_yield = fn;
+}
+
+void net_dispatch_yield(void)
+{
+    if (g_dispatch_yield)
+        g_dispatch_yield();
+}
+
 u32 net_poll(void)
 {
     /*
-     * Compatibility entry point for legacy synchronous console diagnostics.
-     * ADR-033 normal ingress never calls this: hardware/timer/reactor paths
-     * publish descriptors to net_dispatch instead.
+     * Diagnostic pump only (`net pump`). ADR-033 / issue #94: normal
+     * ingress never calls this. Hardware/timer paths publish descriptors
+     * to net_dispatch instead.
      */
     u32 got = 0U;
     stats.poll_calls++;

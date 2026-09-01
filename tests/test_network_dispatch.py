@@ -40,7 +40,8 @@ assert "net_poll(" not in tick
 assert "cyw43_poll(" not in tick
 assert "CORE0_IO_NET" not in tick
 assert "CORE0_IO_WIFI" not in tick
-assert "airq_post_from(CORE_NET, AIRQ_SRC_WIFI" in tick
+assert "AIRQ_SRC_WIFI" not in tick
+assert "NIC_IFACE_WIFI" not in tick
 
 quench = body_after("static bool core0_eth_irq_drain_and_quench(bool host_route)\n{")
 assert "net_poll(" not in quench
@@ -110,5 +111,36 @@ assert "nic_send_owned_on" in nic
 assert "core0_eth_irq_poll_fallback" not in kernel
 assert "CORE0_ETH_IRQ_STALL_THRESHOLD" not in kernel
 assert "CORE0_ETH_IRQ_FALLBACK_COOLDOWN_MS" not in kernel
+
+# Issue #94: net_poll() is diagnostic-only. Runtime .c files must not call it.
+src_dir = Path(__file__).resolve().parent.parent / "src"
+allowed_net_poll = {"net.c"}  # definition of the diagnostic pump
+for path in sorted(src_dir.glob("*.c")):
+    text = path.read_text(encoding="utf-8", errors="replace")
+    runtime_calls = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("/*") or stripped.startswith("*") or stripped.startswith("//"):
+            continue
+        if "u32 net_poll(void)" in line:
+            continue
+        if "net_poll(" not in line:
+            continue
+        runtime_calls.append(lineno)
+    if path.name in allowed_net_poll:
+        assert not runtime_calls, path.name
+        continue
+    if path.name == "kernel.c":
+        pump = body_after("} else if (http_streq(cmd, \"net pump\")) {\n")
+        assert "net_poll(" in pump
+        assert "net_dispatch_yield(" in kernel
+        # The only remaining call is the diagnostic `net pump` command.
+        assert len(runtime_calls) == 1, runtime_calls
+        continue
+    assert not runtime_calls, "%s still calls net_poll() at %s" % (path.name, runtime_calls)
+
+assert "net_dispatch_yield(" in (src_dir / "dhcp.c").read_text(encoding="utf-8")
+assert "net_dispatch_yield(" in (src_dir / "dns.c").read_text(encoding="utf-8")
+assert "net_dispatch_yield(" in (src_dir / "tls.c").read_text(encoding="utf-8")
 
 print("network dispatch: ADR-033 MAC/IP/TCP FIFO ingress and owned-span egress")

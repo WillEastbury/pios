@@ -64,7 +64,7 @@ void arp_add_static_iface(nic_iface_t iface, u32 ip, const u8 *mac);
 const u8 *arp_resolve(u32 ip);
 const u8 *arp_resolve_iface(nic_iface_t iface, u32 ip);
 
-/* Process an incoming ARP frame (called from net_poll on ETH_P_ARP) */
+/* Process an incoming ARP frame (MAC stage, ETH_P_ARP) */
 void arp_input(const u8 *frame, u32 len);
 void arp_input_iface(nic_iface_t iface, const u8 *frame, u32 len);
 

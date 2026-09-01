@@ -309,6 +309,25 @@
 /* Cadence GEM on RP1 — Pi 5 only. Broadcom GENET is PIOS_HAS_GENET (Pi 4). */
 #define PIOS_HAS_MACB               PIOS_HAS_RP1
 
+/* GIC INTIDs (SPI + 32). Zero means no host IRQ is wired (BCM2837 QA7
+ * does not yet route GPU/SDIO peripherals). */
+#ifndef PIOS_GENET_IRQ
+#if PIOS_HAS_GENET
+#define PIOS_GENET_IRQ              189U   /* GIC_SPI 157 */
+#else
+#define PIOS_GENET_IRQ              0U
+#endif
+#endif
+#ifndef PIOS_WIFI_SDIO_IRQ
+#if PIOS_HAS_WIFI_SDIO2
+#define PIOS_WIFI_SDIO_IRQ          306U   /* GIC_SPI 274 */
+#elif PIOS_HAS_WIFI_SDIO1 && PIOS_HAS_GIC
+#define PIOS_WIFI_SDIO_IRQ          158U   /* GIC_SPI 126, Arasan @ 0xFE300000 */
+#else
+#define PIOS_WIFI_SDIO_IRQ          0U
+#endif
+#endif
+
 #define PIOS_CORE_PRIV_SIZE         0x01000000UL
 
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT

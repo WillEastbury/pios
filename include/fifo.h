@@ -33,7 +33,7 @@
 #define MSG_DNS_RESOLVE      16  /* buffer=hostname cstring ptr (sender core RAM),
                                     length=strlen+1, tag=request id (echoed back).
                                     Core 0 owns dns.c state; never call dns_resolve()
-                                    or net_poll() directly from a user core. */
+                                    or net_poll() / dns_resolve() from a user core. */
 #define MSG_DNS_RESOLVE_DONE 17  /* status=0 ok/1 fail/2 busy(retry), param=host-order
                                     IPv4 result, tag=echoed request id */
 

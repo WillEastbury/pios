@@ -70,7 +70,7 @@ void tcp_input(const u8 *frame, u32 len, u32 src_ip, u32 dst_ip,
                const u8 *payload, u32 payload_len, bool checksum_trusted,
                nic_iface_t ingress_iface);
 
-/* Timer tick (call once per ~100ms from net_poll or timer) */
+/* Timer tick (call once per ~100ms from the service FIFO stage or timer) */
 void tcp_tick(void);
 
 /* ---- Client API ---- */

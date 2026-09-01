@@ -25,7 +25,7 @@ NIC boundary  nic.c   validation, firewall, classification, counters, offload
                     |
 Backends      struct nic_ops  (boot-probed wired, or nic_load by name)
               Pi 5 wired:      macb.c + macb_rx_engine.c   (Cadence GEM via RP1)
-              Pi 4 wired:      genet.c                     (BCM2711 GENET v5)
+              Pi 4 wired:      genet.c  (BCM2711 GENET v5, GIC RX IRQ → FIFO)
               WiFi (loadable): wifi_nic.c -> cyw43.c -> sdio.c
                                Pi 5 SDIO2 · Pi 4/Pi 3/Zero 2 W SDIO1
               QEMU:            virtio_net.c
@@ -38,8 +38,9 @@ TCP/IP/UDP/sockets never name a board. `nic_init()` probes **wired** backends
 `nic_load("wifi-cyw43455", NIC_IFACE_WIFI)` so firmware upload does not own
 core 0 at boot. On Pi 4 and Pi 5 the wired iface stays default; `wifi activate`
 adds `.202` after association (ADR-032). BCM2837-family boards have no wired
-MAC, so stage2 may auto-init Wi-Fi as the only path (ADR-041). See
-[`platforms.md`](platforms.md) and ADR-043.
+MAC, so stage2 may auto-init Wi-Fi as the only path (ADR-041). MACB, GENET, and
+WiFi ingress are IRQ → FIFO (ADR-044); only QEMU virtio-net still uses a paced
+transport indication. See [`platforms.md`](platforms.md) and ADR-043.
 
 Core 0 owns all of this. Other cores reach it through FIFO messages and capsule
 bridges, never by touching NIC, route or TCP state directly.
@@ -144,7 +145,9 @@ virtqueues — no `DMA_NET` ring and no GEM-specific recovery.
 
 ### 4.1 net.c
 
-`net_poll()` drains a bounded burst — `NET_RX_BURST_MAX` 896 — and never treats
+Ingress is FIFO/AIRQ (ADR-033 / issue #94). `net_poll()` is a diagnostic pump
+(`net pump`) and must not be called from services. The transport stage drains a
+bounded burst — `NET_RX_BURST_MAX` 896 — and never treats
 an empty ring as an error. Malformed input is rejected **before** protocol side
 effects, and each major drop reason has a counter.
 

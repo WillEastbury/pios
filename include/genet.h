@@ -4,7 +4,8 @@
 /*
  * GENET v5 Ethernet MAC driver for BCM2711 (Pi 4).
  * Pi 5 wired Ethernet is Cadence MACB on RP1, not this block.
- * Minimal: single TX/RX queue, polling, basic PHY init.
+ * Minimal: single TX/RX queue, GIC RX interrupt, basic PHY init.
+ * Protocol work is FIFO-only (ADR-033); the IRQ top half only acks.
  */
 
 #define ETH_FRAME_MAX   1518
@@ -26,3 +27,9 @@ void genet_set_tso(bool enable);
 bool genet_tx_checksum_offload_enabled(void);
 bool genet_rx_checksum_offload_enabled(void);
 bool genet_tso_enabled(void);
+
+/* IRQ top-half helpers. Mask, ack INTRL2, post AIRQ; unmask after drain. */
+void genet_irq_mask_rx(void);
+u32  genet_irq_ack(void);
+void genet_irq_unmask_rx(void);
+void genet_irq_enable(void);

@@ -167,8 +167,17 @@ bool net_join_multicast_mac(const u8 *mac);
 bool net_leave_multicast_mac(const u8 *mac);
 
 /*
- * Legacy compatibility pump. Normal network execution uses net_dispatch.c;
- * IRQ/timer/reactor code must not call this to poll a transport.
+ * Yield to already-posted AIRQ/FIFO network work. Does not read a NIC.
+ * Blocking helpers (console ping, TLS I/O, DHCP wait) must call this
+ * instead of net_poll() so missed IRQs stay observable (issue #94).
+ */
+typedef void (*net_dispatch_yield_fn)(void);
+void net_set_dispatch_yield(net_dispatch_yield_fn fn);
+void net_dispatch_yield(void);
+
+/*
+ * Diagnostic-only NIC pump. Unreachable from normal service execution.
+ * The terminal command `net pump` is the only runtime caller.
  */
 u32 net_poll(void);
 
@@ -194,7 +203,7 @@ bool net_send_udp_on(nic_iface_t iface, u32 dst_ip, u16 src_port,
 
 /* ---- ICMP echo client (ping/traceroute) -------------------------------
  * Single-outstanding-probe, core-0-only client API (mirrors net_send_udp).
- * Caller sends one probe, then polls net_poll() +
+ * Caller sends one probe, then yields via net_dispatch_yield() and reads
  * net_icmp_echo_poll_result() in a bounded loop. */
 struct net_ping_result {
     bool got_reply;         /* true: genuine echo reply from dst_ip */

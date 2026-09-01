@@ -175,6 +175,8 @@ bool sdio_card_irq_pending(void);
 bool sdio_card_irq_edge(void);
 void sdio_card_irq_ack(void);
 void sdio_card_irq_arm(void);
+void sdio_card_irq_mask(void);
+void sdio_card_irq_unmask(void);
 bool sdio_card_irq_take(void);
 void sdio_irq_snapshot(u32 *status, u32 *signal_enable, u32 *mask,
                        u32 *gic_enable, u32 *gic_pending,

@@ -39,7 +39,7 @@ typedef struct {
 /* Start DHCP on the current interface. Blocks until BOUND or timeout. */
 bool dhcp_start(u32 timeout_ms);
 
-/* Poll DHCP state machine (call from net_poll or timer). */
+/* Poll DHCP state machine (timer / command wait; does not drain a NIC). */
 void dhcp_poll(void);
 
 /* Get current lease info (NULL if not bound) */
