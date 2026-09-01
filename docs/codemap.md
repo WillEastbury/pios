@@ -295,9 +295,18 @@ pios/
 - **API:** `dma_init()`, `dma_memcpy()`, `dma_zero()`
 - **Known issue:** 32-bit address truncation (#61)
 
-### `src/pcie.c` — PCIe Root Complex
-- **Role:** BCM2712 PCIe RC — RESCAL calibration, SerDes, bridge reset, ATU, BAR2
+### `src/pcie.c` — PCIe2 Root Complex (RP1)
+- **Role:** BCM2712 pcie2 RC — RESCAL calibration, SerDes, bridge reset, ATU, BAR2
 - **API:** `pcie_init()` — brings up PCIe link to RP1
+
+### `src/pcie1.c` — PCIe1 Root Complex (FFC / HAT)
+- **Role:** BCM2712 pcie1 RC, separate from RP1. 32 MiB Device ATU at `0x1B00000000` (BAR0, not LMEM).
+- **API:** `pcie1_init()`, `pcie1_status()`, bounded config enum. MSI masked.
+- **See:** ADR-045, issue #137
+
+### `src/lzero.c` — Intel LevelZero tensor backend (fail-closed)
+- **Role:** B→E path: compute-class pick, BAR size probe, optional BAR0 map.
+- **API:** `lzero_probe()`, `lzero_probe_bars()`, `lzero_map_bar0()`, `lzero_status()`
 
 ### `src/rp1.c` — RP1 Southbridge
 - **Role:** Enumerate RP1 via PCIe, map BAR1, read chip ID

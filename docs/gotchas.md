@@ -305,6 +305,23 @@ gating it on `PIOS_HAS_MAILBOX_FB` incorrectly entered Pi 5 GPU initialization.
 2 W retain the CPU/NEON tensor hooks without issuing GPU mailbox or V3D MMIO
 operations.
 
+### pcie1 is not pcie2 and must not steal the RP1 window
+
+**Trap:** reuse `PCIE_RC_BASE` / reset id 44 / the 8 MiB ATU at
+`0x1F00000000` for the FFC HAT, or map the Linux 12 GiB prefetch range at
+`0x1800000000` so the B50's 16 GiB LMEM is "just there".
+
+**Result:** RP1 (UART, GEM, xHCI) dies, or the first MMU enable maps a
+multi-gigabyte Device window that is not yet a programmed ATU. Finding
+`8086:E212` is also not LevelZero.
+
+**Rule:** pcie1 is a second BCM2712 RC (`0x1000110000`, reset 43, 32 MiB
+Device ATU at `0x1B00000000` for BAR0 only). Never map ReBAR LMEM to
+“have a heap”. MSI 255/256 stay masked until a handler exists. Firmware
+needs `dtparam=pciex1`. The FFC is 5 V / 1 A; GPU 12 V comes from the
+powered riser. `lzero map` is opt-in and fail-closed if BAR0 > ATU.
+Dashboard LevelZero stays red until gate E. See ADR-045/046 / issue #137.
+
 ### Highmem probe must stay inside the identity map
 
 **Symptom:** Pi 5 PiPLoD reports `PC=0xA4860`, opcode `0xF940001B`, during

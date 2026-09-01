@@ -55,6 +55,8 @@
 #include "capsvc.h"
 #include "pix.h"
 #include "pcie.h"
+#include "pcie1.h"
+#include "lzero.h"
 #include "rp1.h"
 #include "rp1_adc.h"
 #include "rp1_dma.h"
@@ -3115,7 +3117,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
             "Examples: status | ps | services | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
-            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | picocompress selftest | picoweb selftest\n"
+            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | pcie1 | lzero | picocompress selftest | picoweb selftest\n"
             "Client tools: arp | route | ping <ip-or-cached-host> [count] | traceroute <ip-or-cached-host> [max_hops] | dnslookup <hostname>\n"
             "Command help: help status | help netstat | help firewall | help reboot | help peek | help walfs | help db | help cachestats\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
@@ -3201,6 +3203,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, "abi status | abi selftest\n  Show kernel/user ABI transition stage, ksvc foundations, and pending EL0/SVC work.\n");
         } else if (http_streq(topic, "qpu") || http_streq(topic, "tensor")) {
             http_append(out, &len, max, "qpu status | tensor selftest\n  Show V3D/QPU tensor dispatch diagnostics and verify safe NEON fallback kernels.\n");
+        } else if (http_streq(topic, "pcie1") || http_streq(topic, "lzero")) {
+            http_append(out, &len, max,
+                "pcie1 | pcie1 scan | lzero | lzero probe | lzero path | lzero map\n"
+                "  Pi 5 FFC/HAT root. Enum any device/switch. LevelZero B→E path; MSI masked.\n");
         } else if (http_streq(topic, "walfs") || http_streq(topic, "disk")) {
             http_append(out, &len, max, "walfs verify | walfs compact | walfs status | walfs format confirm\n  Verify WAL metadata/record-chain integrity, compact the WAL (non-destructive), or status.\n");
         } else if (http_streq(topic, "db")) {
@@ -6304,6 +6310,112 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " ");
         http_append_hex32(out, &len, max, a.hdr3);
         http_append(out, &len, max, clear ? " cleared\n" : "\n");
+    } else if (http_streq(cmd, "pcie1") || http_streq(cmd, "pcie1 status") ||
+               http_streq(cmd, "pcie1 scan")) {
+        struct pcie1_status p1;
+        struct lzero_status lz;
+        if (http_streq(cmd, "pcie1 scan"))
+            pcie1_rescan();
+        pcie1_status(&p1);
+        lzero_status(&lz);
+        http_append(out, &len, max, "pcie1 present=");
+        http_append_u64(out, &len, max, p1.present ? 1U : 0U);
+        http_append(out, &len, max, " inited=");
+        http_append_u64(out, &len, max, p1.inited ? 1U : 0U);
+        http_append(out, &len, max, " link=");
+        http_append_u64(out, &len, max, p1.link_up ? 1U : 0U);
+        http_append(out, &len, max, " sts=");
+        http_append_hex32(out, &len, max, p1.rc_status);
+        http_append(out, &len, max, " gen=");
+        http_append_u64(out, &len, max, p1.link_speed);
+        http_append(out, &len, max, " x");
+        http_append_u64(out, &len, max, p1.link_width);
+        http_append(out, &len, max, " eps=");
+        http_append_u64(out, &len, max, p1.ep_count);
+        http_append(out, &len, max, " b50=");
+        http_append_u64(out, &len, max, p1.b50_found ? 1U : 0U);
+        http_append(out, &len, max, " lzero=");
+        http_append(out, &len, max, lzero_state_name(lz.state));
+        http_append(out, &len, max, " fail=");
+        http_append(out, &len, max, p1.fail_reason ? p1.fail_reason : "-");
+        http_append(out, &len, max, "\n");
+        if (http_streq(cmd, "pcie1 scan") || p1.ep_count != 0) {
+            for (u32 i = 0; i < p1.ep_count; i++) {
+                const struct pcie1_ep *e = &p1.eps[i];
+                char caps[48];
+                pcie1_fmt_caps(caps, sizeof(caps), e);
+                http_append(out, &len, max, "  ");
+                http_append(out, &len, max, pcie1_hdr_kind(e->hdr_type));
+                http_append(out, &len, max, " ");
+                http_append_u64(out, &len, max, e->bus);
+                http_append(out, &len, max, ":");
+                http_append_u64(out, &len, max, e->dev);
+                http_append(out, &len, max, ".");
+                http_append_u64(out, &len, max, e->func);
+                http_append(out, &len, max, " id=");
+                http_append_hex32(out, &len, max,
+                    ((u32)e->device << 16) | e->vendor);
+                http_append(out, &len, max, " class=");
+                http_append_hex32(out, &len, max,
+                    ((u32)e->base_class << 16) | ((u32)e->subclass << 8) |
+                    e->prog_if);
+                http_append(out, &len, max, " ");
+                http_append(out, &len, max, caps);
+                http_append(out, &len, max, "\n");
+            }
+            if (p1.scan_truncated)
+                http_append(out, &len, max, "  (truncated)\n");
+        }
+    } else if (http_streq(cmd, "lzero") || http_streq(cmd, "lzero status") ||
+               http_streq(cmd, "lzero probe") || http_streq(cmd, "lzero path") ||
+               http_streq(cmd, "lzero map")) {
+        struct lzero_status lz;
+        if (http_streq(cmd, "lzero probe")) {
+            pcie1_rescan();
+            lzero_probe();
+        } else if (http_streq(cmd, "lzero map")) {
+            if (!lzero_map_bar0())
+                http_append(out, &len, max, "lzero map refused (need B bars + BAR0<=ATU)\n");
+        }
+        lzero_status(&lz);
+        http_append(out, &len, max, "lzero state=");
+        http_append(out, &len, max, lzero_state_name(lz.state));
+        http_append(out, &len, max, " gate=");
+        http_append(out, &len, max, lzero_gate_name(lz.gate));
+        http_append(out, &len, max, " block=");
+        http_append(out, &len, max, lzero_block_name(lz.block));
+        http_append(out, &len, max, " gpu=");
+        http_append_u64(out, &len, max, lz.gpu_found ? 1U : 0U);
+        http_append(out, &len, max, " b50=");
+        http_append_u64(out, &len, max, lz.b50_found ? 1U : 0U);
+        http_append(out, &len, max, " ");
+        http_append_u64(out, &len, max, lz.gpu_bus);
+        http_append(out, &len, max, ":");
+        http_append_u64(out, &len, max, lz.gpu_dev);
+        http_append(out, &len, max, ".");
+        http_append_u64(out, &len, max, lz.gpu_func);
+        http_append(out, &len, max, " id=");
+        http_append_hex32(out, &len, max,
+                          ((u32)lz.device_id << 16) | lz.vendor_id);
+        http_append(out, &len, max, " class=");
+        http_append_hex32(out, &len, max,
+                          ((u32)lz.gpu_class << 8) | lz.gpu_sub);
+        http_append(out, &len, max, " bar0=");
+        http_append_u64(out, &len, max, lz.bar0_size);
+        http_append(out, &len, max, " lmem=");
+        http_append_u64(out, &len, max, lz.lmem_size);
+        http_append(out, &len, max, " atu=");
+        http_append_u64(out, &len, max, lz.atu_size);
+        http_append(out, &len, max, " fit=");
+        http_append_u64(out, &len, max, lz.bar0_fits_atu ? 1U : 0U);
+        http_append(out, &len, max, " mapped=");
+        http_append_u64(out, &len, max, lz.bar0_mapped ? 1U : 0U);
+        http_append(out, &len, max, "\n  next=");
+        http_append(out, &len, max, lz.next ? lz.next : "-");
+        http_append(out, &len, max, "\n  path B compute -> C BAR0 map -> D GuC -> E proof\n");
+        http_append(out, &len, max, "  caps=");
+        http_append(out, &len, max, LZERO_DASH_CAPS);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "ksvc") || http_streq(cmd, "ksvc status")) {
         struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
         u32 kn = ksvc_snapshot(ks, KSVC_MAX_SERVICES);
@@ -20477,6 +20589,9 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "qpu") || ui_streq(topic, "tensor")) {
         ui_console_write("qpu status\n  Show V3D/QPU tensor dispatch diagnostics.\n");
         ui_console_write("tensor selftest\n  Verify safe NEON fallback tensor kernels.\n");
+    } else if (ui_streq(topic, "pcie1") || ui_streq(topic, "lzero")) {
+        ui_console_write("pcie1 | pcie1 scan\n  Pi 5 FFC/HAT root. Enumerates any switch/device on the connector.\n");
+        ui_console_write("lzero | lzero probe | lzero path | lzero map\n  B compute-class + BAR sizes; C BAR0 map; D/E firmware/proof still blocked.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -22237,11 +22352,11 @@ static void hdmi_dashboard_render(void)
     u32 hw_col = 0U;
     u32 hw_row = header_row + header_h + 1U;
     u32 hw_w = wide ? header_w : compact_w;
-    u32 hw_h = 15U;
+    u32 hw_h = 16U + PCIE1_DASH_MAX;
     u32 tns_col = 0U;
     u32 tns_row = hw_row + hw_h + 1U;
     u32 tns_w = wide ? header_w : compact_w;
-    u32 tns_h = 9U;     /* border + header + six accelerator feature rows */
+    u32 tns_h = 10U;    /* border + header + seven accelerator feature rows */
     u32 map_col = 0U;
     u32 map_row = tns_row + tns_h + 1U;
     u32 map_w = wide ? header_w : compact_w;
@@ -22529,6 +22644,72 @@ static void hdmi_dashboard_render(void)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "RP1 bridge", PIOS_HAS_RP1 && PIOS_HAS_PCIE, "BAR ", PIOS_RP1_BAR_BASE,
                             "regs", PIOS_HAS_RP1 ? "PCIe southbridge, MIP IRQs" : "not present");
+    if (hw_r < hw_end) {
+        struct pcie1_status p1;
+        pcie1_status(&p1);
+        u32 p1col = !p1.present ? 0x00AAAAAAU :
+                    (p1.link_up ? 0x0000FF80U : 0x00FF4040U);
+        char p1caps[48];
+        const char *p1sum;
+        if (!p1.present) {
+            p1sum = "pcie1 is Pi 5 only";
+        } else if (!p1.link_up) {
+            p1sum = p1.fail_reason ? p1.fail_reason : "no FFC link";
+        } else {
+            u32 pn = 0;
+            const char *s = "FFC ";
+            while (*s && pn + 1U < sizeof(p1caps))
+                p1caps[pn++] = *s++;
+            if (p1.ep_count >= 10U && pn + 1U < sizeof(p1caps))
+                p1caps[pn++] = (char)('0' + (p1.ep_count / 10U));
+            if (pn + 1U < sizeof(p1caps))
+                p1caps[pn++] = (char)('0' + (p1.ep_count % 10U));
+            s = p1.ep_count == 1U ? " func" : " funcs";
+            while (*s && pn + 1U < sizeof(p1caps))
+                p1caps[pn++] = *s++;
+            if (p1.ep_count > PCIE1_DASH_MAX) {
+                s = " (+more)";
+                while (*s && pn + 1U < sizeof(p1caps))
+                    p1caps[pn++] = *s++;
+            }
+            s = "; any device/switch";
+            while (*s && pn + 1U < sizeof(p1caps))
+                p1caps[pn++] = *s++;
+            p1caps[pn] = 0;
+            p1sum = p1caps;
+        }
+        dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
+                          "PCIe1 FFC",
+                          !p1.present ? "N/A" : (p1.link_up ? "LINK" : "DOWN"),
+                          p1col,
+                          p1.present ? "RC 0x1000110000" : "not present",
+                          p1.link_up ? "32M ATU" : "0",
+                          p1sum);
+        if (p1.link_up) {
+            u32 shown = p1.ep_count;
+            if (shown > PCIE1_DASH_MAX)
+                shown = PCIE1_DASH_MAX;
+            for (u32 ei = 0; ei < shown && hw_r < hw_end; ei++) {
+                const struct pcie1_ep *e = &p1.eps[ei];
+                char bdf[16], id[12], caps[48];
+                const char *vn = pcie1_vendor_name(e->vendor);
+                pcie1_fmt_bdf(bdf, sizeof(bdf), e->bus, e->dev, e->func);
+                pcie1_fmt_id(id, sizeof(id), e->vendor, e->device);
+                pcie1_fmt_caps(caps, sizeof(caps), e);
+                dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load,
+                                  hw_ram, hw_caps, bdf,
+                                  pcie1_hdr_kind(e->hdr_type),
+                                  0x0000FF80U, id,
+                                  vn ? vn : pcie1_hdr_kind(e->hdr_type),
+                                  caps);
+            }
+            if (p1.ep_count == 0 && hw_r < hw_end)
+                dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram,
+                                  hw_caps, "p1 empty", "NONE", 0x00FFAA00U,
+                                  "link up", "0",
+                                  "no functions on FFC (switch/endpoint)");
+        }
+    }
     if (hw_r < hw_end)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                             "GPIO", PIOS_HAS_RP1, "RP1 ", PIOS_RP1_BAR_BASE,
@@ -22695,6 +22876,20 @@ static void hdmi_dashboard_render(void)
                                   : "QPU Gray XOR; H264 CPU; HEVC/PiSP/HVS pending")
                            : "Gray delta + H264 residual; HEVC/PiSP/HVS pending",
                        t_detail_w);
+        tns_r++;
+        {
+            struct lzero_status lz;
+            lzero_status(&lz);
+            fb_set_color(0x00FF4040, 0x00000000);
+            fb_set_cursor(t_back, tns_r);
+            fb_puts(LZERO_DASH_BACKEND);
+            fb_set_color(lzero_dash_color(lz.state), 0x00000000);
+            fb_set_cursor(t_state, tns_r);
+            fb_puts(lzero_dash_state_of(&lz));
+            fb_set_color(0x00FFFFFF, 0x00000000);
+            fb_set_cursor(t_detail, tns_r);
+            dash_put_trunc(LZERO_DASH_CAPS, t_detail_w);
+        }
     }
 
     dash_clear_body(map_col, map_row, map_w, map_h);
@@ -24634,6 +24829,19 @@ void kernel_main(void) {
             uart_init();
             uart_puts("\n[uart] RP1 UART online\n");
             bp_ok("[uart] RP1 UART online");
+            bp_log("[pcie1] FFC RC (pcie1, not RP1)...");
+            if (pcie1_init())
+                bp_ok("[pcie1] FFC link up");
+            else
+                bp_warn("[pcie1] no FFC link (dtparam=pciex1 + powered riser)");
+            lzero_probe();
+            {
+                struct lzero_status lz;
+                lzero_status(&lz);
+                uart_puts("[lzero] ");
+                uart_puts(lzero_state_name(lz.state));
+                uart_puts(" (red until verified)\n");
+            }
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI5
             {
                 const struct stage0_diag *s0 =
@@ -24777,6 +24985,7 @@ void kernel_main(void) {
     bp_done(2, true);
     bp_done(3, true);
 #endif
+    lzero_probe();
     watchdog_hw_pet();
 
     /* IPC */

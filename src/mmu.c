@@ -17,6 +17,7 @@
  *   0x1_07C00000 - 0x1_07FFFFFF  4MB  BCM2712 ARM peripherals
  *   0x1_08000000 - 0x1_09FFFFFF  32MB GIC-400
  *   0x1_F0000000 - 0x1_F0FFFFFF  16MB RP1 BAR0 (via PCIe)
+ *   0x1_B0000000 - 0x1_B1FFFFFF  pcie1 FFC 32 MiB Device ATU (BAR0, not LMEM)
  */
 
 #include "mmu.h"
@@ -620,6 +621,12 @@ void mmu_init(void) {
     /* RP1: indices 124-127 */
     for (u32 idx = 124; idx < 128; idx++)
         l1[idx] = ((u64)idx * L1_BLOCK_SIZE) | dev_attr;
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+    /* pcie1 FFC outbound window at 0x1B00000000 (L1[108]). One 1 GiB
+     * Device block covers the 32 MiB ATU. Do not map the 12 GiB prefetch
+     * range at 0x1800000000 — that is GPU LMEM territory. */
+    l1[108] = ((u64)108U * L1_BLOCK_SIZE) | dev_attr;
+#endif
 #endif
 
     __asm__ volatile("dsb sy" ::: "memory");

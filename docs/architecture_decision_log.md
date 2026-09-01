@@ -89,6 +89,8 @@ decision)
 | [042](#adr-042) | Runtime board selection and memory-capability setup | Owner | Accepted |
 | [043](#adr-043) | Pi 4 GENET + loadable nic_ops (MACB stays Pi 5) | Owner | Accepted |
 | [044](#adr-044) | GENET and WiFi ingress are IRQ → FIFO only | Owner | Accepted |
+| [045](#adr-045) | Pi 5 pcie1 FFC is a second RC; LevelZero stays fail-closed | Owner | Accepted |
+| [046](#adr-046) | LevelZero B→E path: compute-class, BAR0 only, no LMEM | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -503,6 +505,62 @@ acks/masks, then AIRQ + net_dispatch FIFO. No protocol poll.
 **Rejected.** Keeping a 125 Hz `CAUSE_PACED` poll for GENET or CYW43455 as a
 "until IRQ is proven" backstop. A quiet timer cannot be told apart from a
 dead interrupt, which is how WiFi RX was previously starved.
+
+---
+
+<a name="adr-045"></a>
+## ADR-045 — Pi 5 pcie1 FFC is a second RC; LevelZero stays fail-closed
+
+**Date:** 2026-09-01 · **Decider:** Owner · **Status:** Accepted
+([#137](https://github.com/WillEastbury/pios/issues/137))
+
+**Owner direction.** Start Intel Arc Pro B50 work at the FFC connector, not
+the GPU. Dashboard shows `Tensor PCIe GPU External -> Intel LevelZero
+Acceleration` in red until a verified proof exists.
+
+**Decision.**
+
+- `pcie2` @ `0x1000120000` remains RP1 (`src/pcie.c`). `pcie1` @
+  `0x1000110000` is a separate BCM2712 root complex (`src/pcie1.c`), reset
+  id 43, 8 MiB Device ATU at `0x1B00000000`. It must not steal the RP1
+  window at `0x1F00000000` or assert reset id 44.
+- Milestone A is link-up + bounded config enum. MSI INTID 255/256 stay
+  masked. Firmware still needs `dtparam=pciex1`. A 70 W GPU takes 12 V from
+  the powered riser; the FFC is 5 V / 1 A only.
+- Do not map the 12 GiB prefetch / 16 GiB LMEM window. Do not poll the GPU
+  from the core-0 tick. Do not port i915/xe.
+- `lzero` classifies pcie1 enumeration. Finding `8086:E212` is `B50_SEEN`,
+  still red. `VERIFIED` is not produced by classify.
+
+**Rejected.** Treating pcie1 as an alias of pcie2. Mapping GPU LMEM first.
+Enabling pcie1 MSI before a handler exists.
+
+---
+
+<a name="adr-046"></a>
+## ADR-046 — LevelZero B→E path: compute-class, BAR0 only, no LMEM
+
+**Date:** 2026-09-01 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Start gate B and create a path to E. Do not restrict
+the FFC to Arc Pro B50; any compute-class function is a candidate.
+
+**Decision.**
+
+- **B** — pick PCI class `03:00` / `03:02` / `12:00` (or DID `8086:E212`)
+  from the pcie1 snapshot. Size-probe BARs in config space and restore.
+  LMEM size is recorded, never mapped.
+- **C** — `lzero map` programs **BAR0 only** into the pcie1 Device ATU
+  (32 MiB at `0x1B00000000`) if it fits. Memory decode on, Bus Master off.
+  If BAR0 > ATU, stay blocked (`bar0>atu`); do not steal RP1 or grow into
+  the 12 GiB prefetch window.
+- **D** — GuC firmware from WALFS, adrv-chunked. Not implemented until C
+  is proven live. MSI still masked.
+- **E** — host-compiled ZEBIN known-answer vs NEON. Only E may set
+  `LZERO_VERIFIED`. QPU word arrays are not L0 modules.
+
+**Rejected.** Auto-mapping BAR0 at boot. Mapping ReBAR LMEM to “have a
+heap”. `clCreateProgramWithSource` / IGC on the board. Porting xe/i915.
 
 ---
 

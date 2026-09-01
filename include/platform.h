@@ -268,6 +268,13 @@
 #define PIOS_EMMC2_BASE             0x1000FFF000UL
 #define PIOS_GENET_BASE             0UL
 #define PIOS_PCIE_RC_BASE           0x1000120000UL
+#define PIOS_HAS_PCIE1              1
+#define PIOS_PCIE1_RC_BASE          0x1000110000UL
+#define PIOS_PCIE1_CPU_WIN_BASE     0x1B00000000UL
+#define PIOS_PCIE1_CPU_WIN_SIZE     0x02000000UL /* 32 MiB Device; BAR0 only, not LMEM */
+#define PIOS_PCIE1_IRQ              255U   /* GIC_SPI 223, still masked */
+#define PIOS_PCIE1_MSI_IRQ          256U   /* GIC_SPI 224, still masked */
+#define PIOS_PCIE1_RESET_ID         43U    /* pcie2/RP1 is 44 — do not reuse */
 #define PIOS_RP1_BAR_BASE           0x1F00000000UL
 #define PIOS_GIC_BASE               0x107FFF8000UL
 #define PIOS_GICD_BASE              0x107FFF9000UL
@@ -303,6 +310,16 @@
 #define PIOS_HAS_WIFI_SDIO1         0
 #define PIOS_WIFI_SDIO1_BASE        0UL
 #define PIOS_WIFI_WL_REG_ON_GPIO    0U
+#endif
+
+#ifndef PIOS_HAS_PCIE1
+#define PIOS_HAS_PCIE1              0
+#define PIOS_PCIE1_RC_BASE          0UL
+#define PIOS_PCIE1_CPU_WIN_BASE     0UL
+#define PIOS_PCIE1_CPU_WIN_SIZE     0UL
+#define PIOS_PCIE1_IRQ              0U
+#define PIOS_PCIE1_MSI_IRQ          0U
+#define PIOS_PCIE1_RESET_ID         0U
 #endif
 
 #define PIOS_HAS_WIFI_SDIO          (PIOS_HAS_WIFI_SDIO1 || PIOS_HAS_WIFI_SDIO2)

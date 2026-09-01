@@ -131,6 +131,10 @@ TESTS_MANIFEST = {
     # tcp_conn_t encodes both slot and generation; stale handles for a reused
     # TCB must remain distinguishable and fail closed.
     "test_tcp_handle.c": [],
+    # pcie1 FFC / LevelZero fail-closed classify (no MMIO). Pins B50 id,
+    # BAR size, RP1 window non-overlap, and that finding a GPU is not a
+    # verified LevelZero proof.
+    "test_pcie1.c": [],
 }
 
 TEST_CFLAGS = {
