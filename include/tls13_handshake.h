@@ -4,7 +4,7 @@
 
 /*
  * tls13_handshake.h - TLS 1.3 (RFC 8446 Section 4) handshake message
- * parsing/construction for the SERVER role. Pure logic (no MMIO/asm,
+ * parsing/construction for the client and server roles. Pure logic (no MMIO/asm,
  * no network I/O) -- host-testable, see tests/test_tls13_clienthello.c.
  *
  * Every parse function is strict and bounds-checked (per this repo's
@@ -31,6 +31,7 @@
 #define TLS13_CH_MAX_SIGALGS      32U
 #define TLS13_CH_MAX_GROUPS       16U
 #define TLS13_CH_SNI_MAX          128U
+#define TLS13_RECORD_SIZE_LIMIT_MAX 16385U
 
 /* Parsed, validated fields this server actually needs from a ClientHello.
  * Everything else (padding, unknown extensions, PSK/early-data, etc.) is
@@ -62,6 +63,18 @@ struct tls13_client_hello {
     bool has_sni;
     char sni[TLS13_CH_SNI_MAX];
     u32  sni_len;
+
+    bool has_record_size_limit;
+    u16 record_size_limit;
+};
+
+struct tls13_server_hello {
+    u8  legacy_session_id[TLS13_CH_MAX_SESSION_ID];
+    u32 legacy_session_id_len;
+    u16 cipher_suite;
+    bool selects_tls13;
+    bool has_p256_key_share;
+    u8 p256_key_share[65];
 };
 
 /* Parses a ClientHello handshake message BODY (i.e. NOT including the
@@ -73,6 +86,37 @@ struct tls13_client_hello {
  * key_share, etc.) -- callers check *out's fields for that after a
  * successful parse. */
 bool tls13_parse_client_hello(const u8 *body, u32 body_len, struct tls13_client_hello *out);
+
+/* Builds the minimal PIOS ClientHello: TLS_AES_128_GCM_SHA256,
+ * secp256r1, ECDSA-P256-SHA256, one P-256 key share, and optional SNI.
+ * client_random/session_id/ephemeral_public are caller-owned entropy. */
+u32 tls13_build_client_hello(const u8 *server_name, u32 server_name_len,
+                             const u8 client_random[32],
+                             const u8 session_id[32],
+                             const u8 ephemeral_public[65],
+                             u8 *out, u32 out_cap);
+
+/* Parses a ServerHello BODY and retains only parameters needed by the
+ * minimal PIOS client. HelloRetryRequest and non-P256 shares fail closed. */
+bool tls13_parse_server_hello(const u8 *body, u32 body_len,
+                              struct tls13_server_hello *out);
+
+/* EncryptedExtensions BODY parser. Unknown extensions are skipped, but
+ * the vector must be structurally complete. */
+bool tls13_parse_encrypted_extensions(const u8 *body, u32 body_len);
+bool tls13_parse_encrypted_extensions_limit(const u8 *body, u32 body_len,
+                                            u16 *record_size_limit);
+
+/* Returns the first leaf certificate DER span from a Certificate BODY. */
+bool tls13_parse_certificate_leaf(const u8 *body, u32 body_len,
+                                  const u8 **cert_der, u32 *cert_der_len);
+
+/* Parses an ECDSA-P256 CertificateVerify BODY. Signature bytes point into
+ * body and remain caller-owned. */
+bool tls13_parse_certificate_verify(const u8 *body, u32 body_len,
+                                    u16 *signature_scheme,
+                                    const u8 **signature_der,
+                                    u32 *signature_der_len);
 
 /* Reads a 4-byte handshake message header (1-byte msg_type, 3-byte
  * big-endian length) from `buf` (buf_len bytes available). On success,
@@ -122,9 +166,11 @@ u32 tls13_build_server_hello(const u8 *session_id, u32 session_id_len,
                              const u8 server_random[32],
                              u8 *out, u32 out_cap);
 
-/* EncryptedExtensions with an empty extensions list -- sufficient for a
- * minimal server that doesn't negotiate ALPN or other optional features. */
+/* EncryptedExtensions with no optional extensions. */
 u32 tls13_build_encrypted_extensions(u8 *out, u32 out_cap);
+/* EncryptedExtensions with the RFC 8449 limit requested by the peer. */
+u32 tls13_build_encrypted_extensions_with_limit(u16 record_size_limit,
+                                                u8 *out, u32 out_cap);
 
 /* Certificate: empty certificate_request_context, one CertificateEntry
  * (the leaf DER certificate, no extensions) -- this server only ever

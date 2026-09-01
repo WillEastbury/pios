@@ -141,6 +141,6 @@ for path in sorted(src_dir.glob("*.c")):
 
 assert "net_dispatch_yield(" in (src_dir / "dhcp.c").read_text(encoding="utf-8")
 assert "net_dispatch_yield(" in (src_dir / "dns.c").read_text(encoding="utf-8")
-assert "net_dispatch_yield(" in (src_dir / "tls.c").read_text(encoding="utf-8")
+assert "net_poll(" not in (src_dir / "tls.c").read_text(encoding="utf-8")
 
 print("network dispatch: ADR-033 MAC/IP/TCP FIFO ingress and owned-span egress")

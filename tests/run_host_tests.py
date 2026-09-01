@@ -83,6 +83,18 @@ TESTS_MANIFEST = {
     # src/tls13_handshake.c.
     "test_tls13_handshake_builders.c": ["src/tls13_handshake.c", "src/sha256_hkdf.c",
                                         "src/p256.c", "src/ecdsa.c"],
+    # ADR-044 event-driven RFC 8446 client/server transport state and
+    # generation-safe public TLS handles.
+    "test_tls_event.c": ["src/picotlsserver.c", "src/tls13_client.c",
+                         "src/tls13_verify.c", "src/tls13_handshake.c",
+                         "src/tls13_keysched.c", "src/tls13_record.c",
+                         "src/sha256_hkdf.c", "src/p256.c", "src/ecdsa.c",
+                         "src/crypto.c"],
+    "test_tls_api.c": ["src/tls.c", "src/picotlsserver.c",
+                       "src/tls13_client.c", "src/tls13_verify.c",
+                       "src/tls13_handshake.c", "src/tls13_keysched.c",
+                       "src/tls13_record.c", "src/sha256_hkdf.c",
+                       "src/p256.c", "src/ecdsa.c", "src/crypto.c"],
     # Asynchronous driver framework (src/adrv.c). Pure logic: time, watchdog
     # and liveness are injected hooks, so the contracts can be pinned with a
     # deterministic fake clock. These tests exist because the CYW43455
@@ -140,6 +152,8 @@ TESTS_MANIFEST = {
 TEST_CFLAGS = {
     "test_crypto_soft.c": ["-DPIOS_PLATFORM=6"],
     "test_airq_concurrency.c": ["-DPIOS_HOST_CORE_ID_FN", "-pthread"],
+    "test_tls_event.c": ["-DPIOS_PLATFORM=6"],
+    "test_tls_api.c": ["-DPIOS_PLATFORM=6"],
 }
 
 
@@ -182,7 +196,8 @@ def main() -> int:
                  "test_issue_116_allocator_lock.py",
                  "test_issue_115_socket_recv.py",
                  "test_issue_111_walfs_fifo.py",
-                 "test_issue_112_bcache.py"):
+                 "test_issue_112_bcache.py",
+                 "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)
         sys.stdout.write(run.stdout)

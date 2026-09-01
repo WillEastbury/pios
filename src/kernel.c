@@ -316,6 +316,8 @@ static u8 https_tls_req_buf[3072];   /* >= STS_TOKEN_MAX + request header overhe
 static u32 https_tls_req_len;
 static bool https_tls_accepted;
 static bool https_tls_response_sent;
+static bool https_tls_write_pending;
+static bool https_tls_close_pending;
 static bool https_tls_route_pending;
 static u64 https_tls_route_token;
 static u8 https_tls_route_response[CAPSVC_SLOT_DATA_MAX];
@@ -788,6 +790,8 @@ static void net_services_listen(void)
     https_tls_req_len = 0;
     https_tls_accepted = false;
     https_tls_response_sent = false;
+    https_tls_write_pending = false;
+    https_tls_close_pending = false;
     https_tls_route_pending = false;
     https_tls_route_token = 0;
     https_tls_route_pending = false;
@@ -12596,10 +12600,27 @@ static void http_render_diag(void)
     fb_puts("'                              ");
 }
 
+static i32 https_tls_write_response(const void *data, u32 len)
+{
+    struct tls_result result = tls_write_step(
+        https_tls_conn,
+        https_tls_write_pending ? NULL : data,
+        https_tls_write_pending ? 0U : len);
+    if (result.status == TLS_STEP_ERROR)
+        return -1;
+    if (result.status == TLS_STEP_PENDING) {
+        https_tls_write_pending = true;
+        if (result.bytes != 0U)
+            https_tls_last_activity_ms = timer_monotonic_ms();
+        return 0;
+    }
+    https_tls_write_pending = false;
+    return (i32)result.bytes;
+}
+
 /* HTTP/TLS poll — called from core0 service loop */
 static void echo_tcp_poll(void) {
-    /* Kernel TLS test server on port 443. This uses PIOS's kernel TLS-style
-     * record wrapper, not a browser-compatible X.509 TLS endpoint yet. */
+    /* Kernel RFC 8446 TLS server on port 443. */
     if (https_tls_tcp_conn < 0 && https_tls_listen_conn >= 0) {
         https_tls_tcp_conn = tcp_accept(https_tls_listen_conn);
         if (https_tls_tcp_conn >= 0) {
@@ -12607,6 +12628,9 @@ static void echo_tcp_poll(void) {
             https_tls_req_len = 0;
             https_tls_accepted = false;
             https_tls_response_sent = false;
+            https_tls_write_pending = false;
+            https_tls_close_pending = false;
+            https_tls_route_pending = false;
             https_tls_last_activity_ms = timer_monotonic_ms();
             http_log_event("tls443-accept", HTTPS_TLS_TCP_PORT, (u32)https_tls_tcp_conn);
         }
@@ -12622,20 +12646,67 @@ static void echo_tcp_poll(void) {
             https_tls_conn = -1;
         } else if (st == TCP_ESTABLISHED) {
             if (!https_tls_accepted) {
-                if (tcp_readable(https_tls_tcp_conn) > 0) {
-                    https_tls_conn = tls_accept(https_tls_tcp_conn);
-                    if (https_tls_conn < 0) {
+                if (https_tls_conn < 0)
+                    https_tls_conn = tls_server_start(
+                        https_tls_tcp_conn,
+                        https_tls_last_activity_ms + 5000ULL);
+                if (https_tls_conn < 0) {
+                    http_log_event("tls443-alloc-fail",
+                                   HTTPS_TLS_TCP_PORT,
+                                   (u32)https_tls_tcp_conn);
+                    tcp_close(https_tls_tcp_conn);
+                    https_tls_tcp_conn = -1;
+                } else {
+                    struct tls_result hs = tls_handshake_step(
+                        https_tls_conn, timer_monotonic_ms());
+                    if (hs.status == TLS_STEP_ERROR) {
                         http_log_event("tls443-handshake-fail", HTTPS_TLS_TCP_PORT, (u32)https_tls_tcp_conn);
-                        tcp_close(https_tls_tcp_conn);
+                        tls_cancel(https_tls_conn, true);
                         https_tls_tcp_conn = -1;
-                    } else {
+                        https_tls_conn = -1;
+                    } else if (hs.status == TLS_STEP_DONE) {
                         https_tls_accepted = true;
                         https_tls_last_activity_ms = timer_monotonic_ms();
                         http_log_event("tls443-handshake-ok", HTTPS_TLS_TCP_PORT, (u32)https_tls_conn);
+                    } else if ((timer_monotonic_ms() -
+                                https_tls_last_activity_ms) > 5000ULL) {
+                        tls_cancel(https_tls_conn, true);
+                        https_tls_tcp_conn = -1;
+                        https_tls_conn = -1;
                     }
-                } else if ((timer_monotonic_ms() - https_tls_last_activity_ms) > 5000ULL) {
-                    tcp_close(https_tls_tcp_conn);
+                }
+            } else if (https_tls_write_pending) {
+                i32 wn = https_tls_write_response(NULL, 0U);
+                if (wn > 0) {
+                    https_tls_response_sent = true;
+                    https_tls_close_pending = true;
+                    https_tls_last_activity_ms = timer_monotonic_ms();
+                    https_tls_route_pending = false;
+                } else if (wn < 0) {
+                    tls_close(https_tls_conn);
                     https_tls_tcp_conn = -1;
+                    https_tls_conn = -1;
+                }
+                if (https_tls_write_pending &&
+                    timer_monotonic_ms() - https_tls_last_activity_ms >
+                        5000ULL) {
+                    tls_cancel(https_tls_conn, true);
+                    https_tls_tcp_conn = -1;
+                    https_tls_conn = -1;
+                    https_tls_write_pending = false;
+                }
+            } else if (https_tls_close_pending) {
+                struct tls_result close_result =
+                    tls_close_step(https_tls_conn);
+                if (close_result.status != TLS_STEP_PENDING ||
+                    timer_monotonic_ms() - https_tls_last_activity_ms >
+                        5000ULL) {
+                    if (close_result.status != TLS_STEP_DONE)
+                        tls_cancel(https_tls_conn, true);
+                    https_tls_tcp_conn = -1;
+                    https_tls_conn = -1;
+                    https_tls_close_pending = false;
+                    https_tls_route_pending = false;
                 }
             } else if (https_tls_route_pending) {
                 u32 response_len = 0;
@@ -12643,15 +12714,22 @@ static void echo_tcp_poll(void) {
                     https_tls_route_token, https_tls_route_response,
                     sizeof(https_tls_route_response), &response_len);
                 if (route_status > 0) {
-                    i32 wn = tls_write(https_tls_conn,
-                                       https_tls_route_response, response_len);
-                    http_log_event(wn > 0 ? "tls443-route-response" :
-                                            "tls443-route-write-fail",
-                                   HTTPS_TLS_TCP_PORT, (u32)wn);
-                    tls_close(https_tls_conn);
-                    https_tls_tcp_conn = -1;
-                    https_tls_conn = -1;
-                    https_tls_route_pending = false;
+                    i32 wn = https_tls_write_response(
+                        https_tls_route_response, response_len);
+                    if (wn > 0) {
+                        http_log_event("tls443-route-response",
+                                       HTTPS_TLS_TCP_PORT, (u32)wn);
+                        https_tls_close_pending = true;
+                        https_tls_route_pending = false;
+                        https_tls_last_activity_ms = timer_monotonic_ms();
+                    } else if (wn < 0) {
+                        http_log_event("tls443-route-write-fail",
+                                       HTTPS_TLS_TCP_PORT, (u32)wn);
+                        tls_close(https_tls_conn);
+                        https_tls_tcp_conn = -1;
+                        https_tls_conn = -1;
+                        https_tls_route_pending = false;
+                    }
                 } else if (route_status < 0 ||
                            timer_monotonic_ms() - https_tls_last_activity_ms >
                                5000ULL) {
@@ -12661,12 +12739,18 @@ static void echo_tcp_poll(void) {
                         "HTTP/1.0 504 Gateway Timeout\r\n"
                         "Content-Length: 0\r\n"
                         "Connection: close\r\n\r\n";
-                    (void)tls_write(https_tls_conn, unavailable,
-                                    sizeof(unavailable) - 1U);
-                    tls_close(https_tls_conn);
-                    https_tls_tcp_conn = -1;
-                    https_tls_conn = -1;
-                    https_tls_route_pending = false;
+                    i32 wn = https_tls_write_response(
+                        unavailable, sizeof(unavailable) - 1U);
+                    if (wn < 0) {
+                        tls_close(https_tls_conn);
+                        https_tls_tcp_conn = -1;
+                        https_tls_conn = -1;
+                        https_tls_route_pending = false;
+                    } else if (wn > 0) {
+                        https_tls_close_pending = true;
+                        https_tls_route_pending = false;
+                        https_tls_last_activity_ms = timer_monotonic_ms();
+                    }
                 }
             } else if (!https_tls_response_sent) {
                 /* Accumulate the (possibly multi-segment, POST-bodied) request
@@ -12714,7 +12798,7 @@ static void echo_tcp_poll(void) {
                             "Content-Type: application/json\r\n"
                             "Connection: close\r\n\r\n"
                             "{\"ok\":false,\"error\":\"request_too_large\"}\n";
-                        wn = tls_write(https_tls_conn, toobig, sizeof(toobig) - 1);
+                        wn = https_tls_write_response(toobig, sizeof(toobig) - 1);
                     } else if (http_request_path_prefix_token(https_tls_req_buf,
                                    https_tls_req_len, "/api/sts", sts_tail, sizeof(sts_tail))) {
                         u32 rlen = http_build_sts_response(https_resp, sizeof(https_resp),
@@ -12729,9 +12813,9 @@ static void echo_tcp_poll(void) {
                                 "Content-Type: application/json\r\n"
                                 "Connection: close\r\n\r\n"
                                 "{\"ok\":false,\"error\":\"response_too_large\"}\n";
-                            wn = tls_write(https_tls_conn, too_big, sizeof(too_big) - 1);
+                            wn = https_tls_write_response(too_big, sizeof(too_big) - 1);
                         } else {
-                            wn = tls_write(https_tls_conn, https_resp, rlen);
+                            wn = https_tls_write_response(https_resp, rlen);
                         }
                     } else {
                         char host[CAPSVC_HOST_MAX];
@@ -12757,8 +12841,8 @@ static void echo_tcp_poll(void) {
                                     "HTTP/1.0 503 Service Unavailable\r\n"
                                     "Content-Length: 0\r\n"
                                     "Connection: close\r\n\r\n";
-                                wn = tls_write(https_tls_conn, busy,
-                                               sizeof(busy) - 1U);
+                                wn = https_tls_write_response(
+                                    busy, sizeof(busy) - 1U);
                             }
                         } else {
                             static const char resp[] =
@@ -12767,24 +12851,23 @@ static void echo_tcp_poll(void) {
                                 "Content-Length: 20\r\n"
                                 "Connection: close\r\n\r\n"
                                 "PIOS kernel TLS 443\n";
-                            wn = tls_write(https_tls_conn, resp,
-                                           sizeof(resp) - 1);
+                            wn = https_tls_write_response(
+                                resp, sizeof(resp) - 1);
                         }
                     }
                     if (deferred) {
                         /* The capsule owns the request slot until it publishes
                          * a generation-matched reply. */
+                    } else if (wn == 0 && https_tls_write_pending) {
+                        /* TLS retained the sealed record for a later flush. */
                     } else if (wn > 0) {
                         https_tls_response_sent = true;
                         https_tls_last_activity_ms = timer_monotonic_ms();
                         http_log_event("tls443-response", HTTPS_TLS_TCP_PORT, (u32)wn);
-                        tls_close(https_tls_conn);
-                        https_tls_tcp_conn = -1;
-                        https_tls_conn = -1;
+                        https_tls_close_pending = true;
                     } else {
-                        /* tls_write cannot partially queue a record, so a
-                         * non-positive result is terminal: reset the sole
-                         * connection immediately instead of retrying forever. */
+                        /* A pending result retains the sealed record; only a
+                         * terminal error resets the connection. */
                         http_log_event("tls443-write-fail", HTTPS_TLS_TCP_PORT, (u32)wn);
                         tls_close(https_tls_conn);
                         https_tls_tcp_conn = -1;
@@ -18681,6 +18764,122 @@ static bool ui_tcp_write_all(tcp_conn_t c, const u8 *data, u32 len, u32 timeout_
     return off == len;
 }
 
+static bool ui_tls_exchange(tcp_conn_t tcp, const char *host,
+                            const u8 *request, u32 request_len,
+                            u8 *response, u32 response_max,
+                            u32 timeout_ms, u32 *response_len)
+{
+    u32 host_len = 0U;
+    while (host[host_len] && host_len < TLS_CLIENT_SERVER_NAME_MAX)
+        host_len++;
+    if (host[host_len] != 0U)
+        return false;
+
+    struct tls_client_start_config config = {
+        .server_name = (const u8 *)host,
+        .server_name_len = host_len,
+        .pinned_p256_public_key = NULL,
+        .deadline_ms = timer_monotonic_ms() + timeout_ms,
+    };
+    tls_conn_t tls = tls_client_start(tcp, &config);
+    if (tls < 0)
+        return false;
+
+    u64 deadline = config.deadline_ms;
+    for (;;) {
+        struct tls_result step =
+            tls_handshake_step(tls, timer_monotonic_ms());
+        if (step.status == TLS_STEP_DONE)
+            break;
+        if (step.status == TLS_STEP_ERROR ||
+            timer_monotonic_ms() >= deadline) {
+            tls_cancel(tls, true);
+            return false;
+        }
+        net_dispatch_yield();
+        timer_delay_ms(1U);
+    }
+
+    bool first_write = true;
+    for (;;) {
+        struct tls_result step = tls_write_step(
+            tls, first_write ? request : NULL,
+            first_write ? request_len : 0U);
+        if (step.status == TLS_STEP_DONE)
+            break;
+        if (step.status == TLS_STEP_ERROR ||
+            timer_monotonic_ms() >= deadline) {
+            tls_cancel(tls, true);
+            return false;
+        }
+        first_write = false;
+        net_dispatch_yield();
+        timer_delay_ms(1U);
+    }
+
+    u32 received = 0U;
+    bool orderly_eof = false;
+    while (received < response_max) {
+        if (timer_monotonic_ms() >= deadline)
+            break;
+        struct tls_result step = tls_read_step(
+            tls, response + received, response_max - received);
+        if (step.status == TLS_STEP_DONE) {
+            received += step.bytes;
+            if (step.bytes == 0U && tls_peer_closed(tls)) {
+                orderly_eof = true;
+                break;
+            }
+        } else if (step.status == TLS_STEP_ERROR) {
+            tls_cancel(tls, true);
+            return false;
+        }
+        net_dispatch_yield();
+        timer_delay_ms(1U);
+    }
+
+    if (!orderly_eof && received == response_max) {
+        u8 extra;
+        while (timer_monotonic_ms() < deadline) {
+            struct tls_result step = tls_read_step(tls, &extra, 1U);
+            if (step.status == TLS_STEP_DONE) {
+                if (step.bytes == 0U && tls_peer_closed(tls)) {
+                    orderly_eof = true;
+                    break;
+                }
+                tls_cancel(tls, true);
+                return false;
+            }
+            if (step.status == TLS_STEP_ERROR) {
+                tls_cancel(tls, true);
+                return false;
+            }
+            net_dispatch_yield();
+            timer_delay_ms(1U);
+        }
+    }
+    if (!orderly_eof) {
+        tls_cancel(tls, true);
+        return false;
+    }
+
+    for (u32 attempts = 0U; attempts < timeout_ms; attempts++) {
+        struct tls_result close_result = tls_close_step(tls);
+        if (close_result.status == TLS_STEP_DONE)
+            break;
+        if (close_result.status == TLS_STEP_ERROR ||
+            timer_monotonic_ms() >= deadline) {
+            tls_cancel(tls, true);
+            break;
+        }
+        net_dispatch_yield();
+        timer_delay_ms(1U);
+    }
+    if (response_len)
+        *response_len = received;
+    return true;
+}
+
 static bool ui_http_fetch(bool use_tls, u32 dst_ip, u16 port,
                           const char *host, const char *path,
                           u32 timeout_ms, u8 *out, u32 out_max,
@@ -18714,24 +18913,14 @@ static bool ui_http_fetch(bool use_tls, u32 dst_ip, u16 port,
     }
 
     if (use_tls) {
-        tls_conn_t tc = tls_connect(c);
-        if (tc < 0) {
+        u32 received = 0U;
+        if (!ui_tls_exchange(c, host, (const u8 *)req, req_len,
+                             out, out_max, timeout_ms, &received)) {
             tcp_close(c);
             if (err) *err = "tls handshake failed";
             return false;
         }
-        if (tls_write(tc, req, req_len) < 0) {
-            tls_close(tc);
-            if (err) *err = "tls write failed";
-            return false;
-        }
-        i32 n = tls_read(tc, out, out_max);
-        tls_close(tc);
-        if (n < 0) {
-            if (err) *err = "tls read failed";
-            return false;
-        }
-        if (out_len) *out_len = (u32)n;
+        if (out_len) *out_len = received;
         return true;
     }
 

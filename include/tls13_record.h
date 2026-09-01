@@ -11,7 +11,7 @@
  * assigned to TX vs RX (see tls13_keysched.h's direction-assignment doc
  * comment).
  *
- * This server only ever negotiates TLS_AES_128_GCM_SHA256, so the AEAD
+ * PIOS only negotiates TLS_AES_128_GCM_SHA256, so the AEAD
  * is always AES-128-GCM (crypto.h's existing aes_gcm_encrypt/decrypt).
  */
 
@@ -22,7 +22,7 @@
 
 #define TLS13_TAG_LEN        16U
 #define TLS13_RECORD_HDR_LEN 5U
-/* This server intentionally supports a much smaller max fragment than TLS's
+/* PIOS intentionally supports a much smaller max fragment than TLS's
  * spec-permitted 16384 bytes (RFC 8446 Section 5.1): its own ClientHello/
  * Certificate/CertificateVerify/Finished messages and HTTP response bodies
  * are all well under a few KB, and capping this bounds every scratch
