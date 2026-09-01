@@ -9,6 +9,7 @@
 
 #pragma once
 #include "types.h"
+#include "nic.h"
 
 /* Address family */
 #define AF_INET         2
@@ -34,6 +35,7 @@
 struct sockaddr_in {
     u32 ip;
     u16 port;
+    nic_iface_t iface; /* NIC_IFACE_ANY selects/defaults as appropriate */
 };
 
 /* FIFO message types for socket operations */
@@ -88,6 +90,11 @@ i32 sock_recv_nb(i32 fd, void *buf, u32 len);
 
 /* Process socket FIFO messages on Core 0. */
 void socket_handle_fifo(u32 from_core);
+/* Handle one already-dequeued socket request. Core 0's FIFO demultiplexer owns
+ * dequeueing so socket, network, and filesystem requests cannot consume each
+ * other's messages. */
+struct fifo_msg;
+void socket_handle_message(u32 from_core, const struct fifo_msg *request);
 
 /* Advance bounded asynchronous socket operations from Core 0 service context. */
 void socket_service_step(void);

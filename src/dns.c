@@ -277,8 +277,9 @@ static void parse_response(const u8 *data, u16 len) {
 
 static udp_recv_cb prev_callback;
 
-static void dns_udp_handler(u32 src_ip, u16 src_port, u16 dst_port,
-                             const u8 *data, u16 len) {
+static void dns_udp_handler(nic_iface_t iface, u32 dst_ip,
+                            u32 src_ip, u16 src_port, u16 dst_port,
+                            const u8 *data, u16 len) {
     async_status.rx_total++;
     async_status.last_rx_src_ip = src_ip;
     async_status.last_rx_src_port = src_port;
@@ -289,7 +290,7 @@ static void dns_udp_handler(u32 src_ip, u16 src_port, u16 dst_port,
     if (src_ip != dns_server || src_port != DNS_PORT) {
         async_status.rx_ignored++;
         if (prev_callback)
-            prev_callback(src_ip, src_port, dst_port, data, len);
+            prev_callback(iface, dst_ip, src_ip, src_port, dst_port, data, len);
         return;
     }
 

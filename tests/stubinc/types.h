@@ -52,4 +52,9 @@ static inline void dsb_ish(void) {}
 static inline void dsb_ishst(void) {}
 static inline void sev(void) {}
 static inline void wfe(void) {}
+#ifdef PIOS_HOST_CORE_ID_FN
+u32 pios_host_core_id(void);
+static inline u32 core_id(void) { return pios_host_core_id(); }
+#else
 static inline u32  core_id(void) { return 0; }
+#endif

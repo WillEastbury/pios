@@ -11,6 +11,7 @@
 #include "pipe.h"
 #include "mem_arena.h"
 #include "core_env.h"   /* PROC_ARENA_BASE/SIZE for PROC_SLOT_PHYS */
+#include "proc_buffer.h"
 #include "ipc_proc.h"
 #include "qbank.h"
 struct irq_frame;

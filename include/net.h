@@ -134,7 +134,8 @@ struct net_egress_snapshot {
 void net_egress_snapshot(struct net_egress_snapshot *out);
 
 /* UDP receive callback */
-typedef void (*udp_recv_cb)(u32 src_ip, u16 src_port, u16 dst_port,
+typedef void (*udp_recv_cb)(nic_iface_t iface, u32 dst_ip,
+                            u32 src_ip, u16 src_port, u16 dst_port,
                             const u8 *data, u16 len);
 
 /* Init with static IP, gateway IP, and gateway MAC */
@@ -193,8 +194,8 @@ bool net_send_udp_on(nic_iface_t iface, u32 dst_ip, u16 src_port,
 
 /* ---- ICMP echo client (ping/traceroute) -------------------------------
  * Single-outstanding-probe, core-0-only client API (mirrors net_send_udp).
- * Caller sends one probe, then polls net_poll() + net_icmp_echo_poll_result()
- * in a bounded loop (same pattern as ui_http_fetch()) until a reply/timeout. */
+ * Caller sends one probe, then polls net_poll() +
+ * net_icmp_echo_poll_result() in a bounded loop. */
 struct net_ping_result {
     bool got_reply;         /* true: genuine echo reply from dst_ip */
     bool got_ttl_exceeded;  /* true: ICMP Time Exceeded from an intermediate hop */

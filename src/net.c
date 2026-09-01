@@ -9,6 +9,8 @@
 #include "arp.h"
 #include "tcp.h"
 #include "socket.h"
+#include "walfs.h"
+#include "proc_buffer.h"
 #include "tls.h"
 #include "nic.h"
 #include "simd.h"
@@ -21,6 +23,7 @@
 #include "fb.h"
 #include "pcie.h"
 #include "mmio.h"
+#include "mmu.h"
 #include "macb.h"
 #include "dns.h"
 
@@ -644,8 +647,10 @@ static void handle_udp(const u8 *frame, u32 len,
 
     stats.udp_recv++;
 
+    nic_iface_t ingress_iface = net_current_iface;
+    u32 dst_ip = ntohl(ip->dst_ip);
     if (udp_callback) {
-        udp_callback(ntohl(ip->src_ip),
+        udp_callback(ingress_iface, dst_ip, ntohl(ip->src_ip),
                      ntohs(udp->src_port),
                      ntohs(udp->dst_port),
                      data, data_len);
@@ -653,7 +658,7 @@ static void handle_udp(const u8 *frame, u32 len,
     for (u32 i = 0; i < UDP_SUBSCRIBER_MAX; i++) {
         udp_recv_cb cb = udp_subscribers[i].cb;
         if (cb) {
-            cb(ntohl(ip->src_ip),
+            cb(ingress_iface, dst_ip, ntohl(ip->src_ip),
                ntohs(udp->src_port),
                ntohs(udp->dst_port),
                data, data_len);
@@ -1044,7 +1049,7 @@ static u32  dns_fifo_active_core;
 static u64  dns_fifo_active_tag;
 
 static void dns_fifo_reply(u32 requester_core, u64 tag, u32 status, u32 ip) {
-    struct fifo_msg reply;
+    struct fifo_msg reply = {0};
     reply.type   = MSG_DNS_RESOLVE_DONE;
     reply.status = status;
     reply.param  = ip;
@@ -1108,72 +1113,61 @@ static void dns_fifo_poll(void) {
 
 void net_handle_fifo_request(void) {
     struct fifo_msg msgs[16];
-    struct fifo_msg reply;
-    u32 n;
-
-    n = fifo_pop_batch(CORE_NET, CORE_USER0, msgs, 16);
-    for (u32 i = 0; i < n; i++) {
-        struct fifo_msg msg = msgs[i];
-        simd_zero(&reply, sizeof(reply));
-        if (msg.type == MSG_NET_UDP_SEND && msg.buffer && msg.length <= 1472) {
-            if (!ptr_in_core_ram(CORE_USER0, msg.buffer, msg.length))
-                continue;
-            u16 sp = (u16)(msg.tag >> 16);
-            u16 dp = (u16)(msg.tag & 0xFFFF);
-            nic_iface_t iface = (msg.iface == NIC_IFACE_ANY)
-                ? nic_default_iface() : (nic_iface_t)msg.iface;
-            bool ok = net_send_udp_on(iface, msg.param, sp, dp,
-                                      (const u8 *)(usize)msg.buffer,
-                                      (u16)msg.length);
-            reply.type   = MSG_NET_UDP_DONE;
-            reply.status = ok ? 0 : 1;
-            reply.tag    = msg.tag;
-            reply.iface  = iface;
-            fifo_push(CORE_NET, CORE_USER0, &reply);
-        } else if (msg.type == MSG_DNS_RESOLVE && msg.buffer && msg.length <= 256U) {
-            if (!ptr_in_core_ram(CORE_USER0, msg.buffer, msg.length)) {
-                dns_fifo_reply(CORE_USER0, msg.tag, 1U, 0U);
-                continue;
+    for (u32 requester = CORE_USERM; requester <= CORE_USER1; requester++) {
+        u32 n = fifo_pop_batch(CORE_NET, requester, msgs, 16);
+        for (u32 i = 0; i < n; i++) {
+            struct fifo_msg msg = msgs[i];
+            if (msg.type == MSG_NET_UDP_SEND) {
+                struct fifo_msg reply;
+                simd_zero(&reply, sizeof(reply));
+                nic_iface_t iface = (msg.iface == NIC_IFACE_ANY)
+                    ? nic_default_iface() : (nic_iface_t)msg.iface;
+                struct proc_buffer_ref buffer_ref;
+                bool valid = msg.buffer != 0U && msg.length <= 1472U &&
+                    proc_buffer_ref_acquire(requester, msg.buffer,
+                                             msg.length, &buffer_ref);
+                bool ok = false;
+                if (valid) {
+                    dcache_invalidate_range(msg.buffer, msg.length);
+                    u16 sp = (u16)(msg.tag >> 16);
+                    u16 dp = (u16)(msg.tag & 0xFFFFU);
+                    ok = net_send_udp_on(iface, msg.param, sp, dp,
+                                         (const u8 *)(usize)msg.buffer,
+                                         (u16)msg.length);
+                }
+                reply.type = MSG_NET_UDP_DONE;
+                reply.status = ok ? 0U : 1U;
+                reply.tag = msg.tag;
+                reply.iface = iface;
+                (void)fifo_push(CORE_NET, requester, &reply);
+            } else if (msg.type == MSG_DNS_RESOLVE) {
+                struct proc_buffer_ref buffer_ref;
+                bool valid = msg.buffer != 0U && msg.length > 0U &&
+                    msg.length <= 256U &&
+                    proc_buffer_ref_acquire(requester, msg.buffer,
+                                             msg.length, &buffer_ref);
+                if (!valid) {
+                    dns_fifo_reply(requester, msg.tag, 1U, 0U);
+                } else {
+                    dcache_invalidate_range(msg.buffer, msg.length);
+                    dns_fifo_enqueue(requester, msg.tag,
+                                     (const u8 *)(usize)msg.buffer,
+                                     msg.length);
+                }
+            } else if ((msg.type >= MSG_SOCK_BIND &&
+                        msg.type <= MSG_SOCK_RESULT) ||
+                       msg.type == MSG_SOCK_STATUS) {
+                socket_handle_message(requester, &msg);
+            } else if ((msg.type >= MSG_FS_CREATE &&
+                        msg.type <= MSG_FS_SYNC) ||
+                       msg.type == MSG_FS_READDIR ||
+                       msg.type == MSG_FS_READ ||
+                       msg.type == MSG_FS_STAT ||
+                       msg.type == MSG_FS_FIND) {
+                walfs_handle_message(requester, &msg);
             }
-            dns_fifo_enqueue(CORE_USER0, msg.tag,
-                             (const u8 *)(usize)msg.buffer, msg.length);
         }
     }
-
-    n = fifo_pop_batch(CORE_NET, CORE_USER1, msgs, 16);
-    for (u32 i = 0; i < n; i++) {
-        struct fifo_msg msg = msgs[i];
-        simd_zero(&reply, sizeof(reply));
-        if (msg.type == MSG_NET_UDP_SEND && msg.buffer && msg.length <= 1472) {
-            if (!ptr_in_core_ram(CORE_USER1, msg.buffer, msg.length))
-                continue;
-            u16 sp = (u16)(msg.tag >> 16);
-            u16 dp = (u16)(msg.tag & 0xFFFF);
-            nic_iface_t iface = (msg.iface == NIC_IFACE_ANY)
-                ? nic_default_iface() : (nic_iface_t)msg.iface;
-            bool ok = net_send_udp_on(iface, msg.param, sp, dp,
-                                      (const u8 *)(usize)msg.buffer,
-                                      (u16)msg.length);
-            reply.type   = MSG_NET_UDP_DONE;
-            reply.status = ok ? 0 : 1;
-            reply.tag    = msg.tag;
-            reply.iface  = iface;
-            fifo_push(CORE_NET, CORE_USER1, &reply);
-        } else if (msg.type == MSG_DNS_RESOLVE && msg.buffer && msg.length <= 256U) {
-            if (!ptr_in_core_ram(CORE_USER1, msg.buffer, msg.length)) {
-                dns_fifo_reply(CORE_USER1, msg.tag, 1U, 0U);
-                continue;
-            }
-            dns_fifo_enqueue(CORE_USER1, msg.tag,
-                             (const u8 *)(usize)msg.buffer, msg.length);
-        }
-    }
-
-    /* Drain socket-layer FIFO requests in small bursts per poll pass. */
-    for (u32 i = 0; i < NET_FIFO_BURST_MAX; i++)
-        socket_handle_fifo(CORE_USER0);
-    for (u32 i = 0; i < NET_FIFO_BURST_MAX; i++)
-        socket_handle_fifo(CORE_USER1);
 
     dns_fifo_poll();
 }
@@ -1371,6 +1365,7 @@ void net_service_step(void)
 {
     net_handle_fifo_request();
     socket_service_step();
+    dns_poll();
     workq_drain(4);
 }
 

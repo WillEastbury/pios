@@ -88,7 +88,7 @@
                                    multi-block SD flush done by http_write_kernel_slot_range()
                                    (OTA commit / uartflash commit both funnel through it).
                                    Since CORE_DISK == CORE_NET == 0, this entire duration is
-                                   time net_poll()/TCP/UART do NOT run -- a direct measurement
+                                   time AIRQ network dispatch/TCP/UART do NOT run
                                    of network-reactor starvation caused by disk I/O sharing
                                    core 0. a0=bytes_written a1=dur_ticks a2=slot_offset a3=0 */
 /* REACTOR (core 0 service loop) */

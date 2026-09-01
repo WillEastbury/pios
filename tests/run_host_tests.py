@@ -99,6 +99,10 @@ TESTS_MANIFEST = {
     # takeover of the core, and that strict priority never starves the
     # cross-core FIFO doorbell that user cores are parked on.
     "test_airq.c": ["src/airq.c"],
+    # Issue #96: four simultaneous producer cores target one priority/core.
+    # Per-origin lanes remain SPSC while sequence allocation and shared
+    # diagnostics must not lose or duplicate updates.
+    "test_airq_concurrency.c": ["src/airq.c"],
     # EL0 -> EL1 process control line (src/pctl.c). The trap-free channel that
     # replaces the PARK/EXIT syscalls: async/await over queues with the
     # scheduler as executor. Pins the sticky-wake rule -- a reply landing
@@ -124,10 +128,14 @@ TESTS_MANIFEST = {
     # ABI-level dual-NIC contract: distinct backend identities, preserved
     # 64-byte FIFO messages, and interface-scoped firewall rule defaults.
     "test_dual_nic.c": [],
+    # tcp_conn_t encodes both slot and generation; stale handles for a reused
+    # TCB must remain distinguishable and fail closed.
+    "test_tcp_handle.c": [],
 }
 
 TEST_CFLAGS = {
     "test_crypto_soft.c": ["-DPIOS_PLATFORM=6"],
+    "test_airq_concurrency.c": ["-DPIOS_HOST_CORE_ID_FN", "-pthread"],
 }
 
 
@@ -163,8 +171,14 @@ def main() -> int:
             sys.stdout.write(run.stderr)
             total_fail += 1
 
-    for test in ("test_network_dispatch.py", "test_el0_idle_contract.py",
-                 "test_bootstrap_fat_import.py"):
+    for test in ("test_network_dispatch.py", "test_net_fifo_contract.py",
+                 "test_udp_iface_contract.py", "test_tcp_syn_cookie_contract.py",
+                 "test_tcp_generation_contract.py",
+                 "test_el0_idle_contract.py",                  "test_bootstrap_fat_import.py",
+                 "test_issue_116_allocator_lock.py",
+                 "test_issue_115_socket_recv.py",
+                 "test_issue_111_walfs_fifo.py",
+                 "test_issue_112_bcache.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)
         sys.stdout.write(run.stdout)
