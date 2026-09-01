@@ -2097,7 +2097,13 @@ static u8 *slot_base(u32 slot)
  * section itself is a fixed MAX_PROCS_PER_CORE-element scan plus one write,
  * with no I/O or nested locking, so the spin is short and bounded even
  * though it executes inside the scheduler loop's call tree. */
-static volatile u8 g_slot_alloc_lock;
+struct proc_slot_alloc_lock {
+    volatile u8 value;
+    u8 _pad[63];
+} ALIGNED(64);
+_Static_assert(sizeof(struct proc_slot_alloc_lock) == 64U,
+               "slot allocator lock must occupy one cache line");
+static struct proc_slot_alloc_lock g_slot_alloc_lock;
 
 static i32 find_empty_slot(void)
 {
@@ -2129,7 +2135,7 @@ static i32 find_empty_slot(void)
      * is pending" path, with a fixed MAX_PROCS_PER_CORE-element critical
      * section and no I/O -- not the kind of unbounded/blocking lock the
      * "no locks in scheduler" invariant is meant to rule out. */
-    while (__atomic_test_and_set(&g_slot_alloc_lock, __ATOMIC_ACQUIRE)) {
+    while (__atomic_test_and_set(&g_slot_alloc_lock.value, __ATOMIC_ACQUIRE)) {
         __asm__ volatile("yield");
     }
 
@@ -2144,7 +2150,7 @@ static i32 find_empty_slot(void)
             empty[n++] = i;
 
     if (n == 0) {
-        __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+        __atomic_clear(&g_slot_alloc_lock.value, __ATOMIC_RELEASE);
         return -1; /* raced away between the two checks */
     }
 
@@ -2169,7 +2175,7 @@ static i32 find_empty_slot(void)
     i32 chosen = (i32)empty[pick];
     procs[chosen].state = PROC_CLAIMED;
     proc_slot_note_used((u32)chosen);
-    __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+    __atomic_clear(&g_slot_alloc_lock.value, __ATOMIC_RELEASE);
     return chosen;
 }
 
@@ -2554,14 +2560,14 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
      * specific slot rather than a random pick from the free pool, but it's
      * still a slot find_empty_slot() could independently pick for an
      * unrelated process on another core -- close that TOCTOU window too. */
-    while (__atomic_test_and_set(&g_slot_alloc_lock, __ATOMIC_ACQUIRE)) {
+    while (__atomic_test_and_set(&g_slot_alloc_lock.value, __ATOMIC_ACQUIRE)) {
         __asm__ volatile("yield");
     }
     bool busy = (procs[required_slot].state != PROC_EMPTY);
     if (!busy)
         procs[required_slot].state = PROC_CLAIMED;
         proc_slot_note_used(required_slot);
-    __atomic_clear(&g_slot_alloc_lock, __ATOMIC_RELEASE);
+    __atomic_clear(&g_slot_alloc_lock.value, __ATOMIC_RELEASE);
     if (busy) {
         uart_puts("[proc] mem-exec: required slot busy\n");
         return -1;
