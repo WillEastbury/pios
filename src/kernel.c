@@ -24071,15 +24071,15 @@ NORETURN void core0_main(void) {
 
     fb_set_color(0x00FFAA00, 0x00000000);
 #if PIOS_HAS_DMA
-    fb_puts("[dma] late memcpy selftest...\n");
-    uart_puts("[dma] late memcpy selftest...\n");
-    if (dma_selftest()) {
-        fb_puts("[dma] late memcpy selftest OK\n");
-        uart_puts("[dma] late memcpy selftest OK\n");
-    } else {
-        fb_puts("[dma] late memcpy selftest FAILED (using NEON fallback)\n");
-        uart_puts("[dma] late memcpy selftest FAILED (using NEON fallback)\n");
-    }
+    /*
+     * Hardware DMA probing is an explicit diagnostic operation, not boot
+     * work. A failing controller can hold core 0 in MMIO/spin waits long
+     * enough to trip the watchdog before the reactor is alive. Keep the
+     * engine disabled and use the proven NEON fallback until an operator
+     * runs `dma selftest` under the guarded harness.
+     */
+    fb_puts("[dma] hardware selftest deferred; NEON fallback\n");
+    uart_puts("[dma] hardware selftest deferred; NEON fallback\n");
 #else
     fb_puts("[dma] late memcpy selftest skipped on this platform\n");
     uart_puts("[dma] late memcpy selftest skipped on this platform\n");
