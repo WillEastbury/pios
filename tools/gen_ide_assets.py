@@ -105,12 +105,13 @@ def c_escape_bytes(data: bytes) -> str:
 
 
 def emit_asset(name: str, data: bytes) -> str:
+    symbol = name + "_EMBED"
     body = c_escape_bytes(data)
     indented = textwrap.indent(body, "    ")
     return (
         "const u8 %s[] =\n%s\n;\n"
         "const u32 %s_LEN = (u32)(sizeof(%s) - 1);\n\n"
-        % (name, indented, name, name)
+        % (symbol, indented, symbol, symbol)
     )
 
 

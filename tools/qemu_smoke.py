@@ -133,7 +133,7 @@ class Smoke:
             code, body = get("/picoscript/config")
             self.check("picoscript config JSON",
                        code == 200 and '"capsule_prefix":"/api/capsule"' in body
-                       and "0x9C1BBBA3" in body,
+                       and "0xE55B3B70" in body,
                        body.strip()[:80])
         except Exception as e:
             self.check("picoscript config JSON", False, str(e))

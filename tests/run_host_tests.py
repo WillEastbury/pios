@@ -206,6 +206,7 @@ def main() -> int:
                  "test_issue_142_pcie1_dma_cache.py",
                  "test_issue_147_pcie1_msi_mask.py",
                  "test_issue_137_pcie1_host_contract.py",
+                 "test_picoscript_datagram_contract.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)
