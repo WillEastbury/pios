@@ -18,6 +18,7 @@
 #include "pcie1.h"
 #include "platform.h"
 #include "mmio.h"
+#include "mmu.h"
 #include "uart.h"
 #include "timer.h"
 
@@ -223,6 +224,35 @@ bool pcie1_enable_memory_path(u32 target_bus)
         cmd = (cmd | PCI_CMD_MEM) & ~PCI_CMD_MASTER;
         pcie1_cfg_write(e->bus, e->dev, e->func, PCI_REG_CMD, cmd);
     }
+    return true;
+}
+
+bool pcie1_dma_prepare_to_device(const void *ptr, u64 len, u64 *pci_addr)
+{
+    if (!pcie1_dma_addr(ptr, len, pci_addr))
+        return false;
+    dcache_clean_range((u64)(usize)ptr, len);
+    dsb();
+    return true;
+}
+
+bool pcie1_dma_prepare_from_device(void *ptr, u64 len, u64 *pci_addr)
+{
+    if (!pcie1_dma_addr(ptr, len, pci_addr))
+        return false;
+    dcache_invalidate_range((u64)(usize)ptr, len);
+    dsb();
+    return true;
+}
+
+bool pcie1_dma_complete_from_device(void *ptr, u64 len)
+{
+    u64 pci_addr;
+    if (!pcie1_dma_addr(ptr, len, &pci_addr))
+        return false;
+    (void)pci_addr;
+    dcache_invalidate_range((u64)(usize)ptr, len);
+    dsb();
     return true;
 }
 
@@ -686,6 +716,21 @@ bool pcie1_set_outbound_window(u64 size)
 bool pcie1_enable_memory_path(u32 target_bus)
 {
     (void)target_bus;
+    return false;
+}
+bool pcie1_dma_prepare_to_device(const void *ptr, u64 len, u64 *pci_addr)
+{
+    (void)ptr; (void)len; (void)pci_addr;
+    return false;
+}
+bool pcie1_dma_prepare_from_device(void *ptr, u64 len, u64 *pci_addr)
+{
+    (void)ptr; (void)len; (void)pci_addr;
+    return false;
+}
+bool pcie1_dma_complete_from_device(void *ptr, u64 len)
+{
+    (void)ptr; (void)len;
     return false;
 }
 void pcie1_aer_init(void) {}
