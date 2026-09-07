@@ -193,6 +193,21 @@ int main(void)
     }
 
     {
+        struct pcie1_ep vga, gpu, b50, list[2];
+        pcie1_fill_ep(&vga, 1, 0, 0, 0x12345678U, 0x03000000U, 0, 0);
+        pcie1_fill_ep(&gpu, 1, 1, 0, 0x12345678U, 0x03020000U, 0, 0);
+        pcie1_fill_ep(&b50, 1, 2, 0, 0xE2128086U, 0x03000000U, 0, 0);
+        list[0] = vga;
+        list[1] = gpu;
+        expect_true("prefer 3D over VGA",
+                    lzero_pick_compute(list, 2) == &list[1]);
+        list[0] = gpu;
+        list[1] = b50;
+        expect_true("prefer B50 over generic 3D",
+                    lzero_pick_compute(list, 2) == &list[1]);
+    }
+
+    {
         struct lzero_facts f = {0};
         expect_u32("no gpu stays at A", lzero_gate_from_facts(&f), LZERO_GATE_A);
         f.gpu_seen = true;

@@ -202,6 +202,7 @@ def main() -> int:
                  "test_irq_fifo_intids.py",
                  "test_issue_143_pcie1_bus_master.py",
                  "test_issue_146_pcie1_aer.py",
+                 "test_issue_145_pcie1_enum_map.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)

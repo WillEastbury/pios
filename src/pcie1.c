@@ -80,6 +80,7 @@ _Static_assert((PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE) <= PIOS_PROC_ARENA_BA
 #define RC_CFG_PRIV1_ID_VAL3        0x043C
 #define PCI_REG_CMD                 0x04
 #define PCI_REG_BUS_NUM             0x18
+#define PCI_REG_MEM_BASE_LIMIT      0x20
 #define PCI_REG_CAP_PTR             0x34
 #define PCIE1_AER_UNCORR_ERR       0x04
 #define PCIE1_AER_UNCORR_MASK      0x08
@@ -118,6 +119,7 @@ static bool g_link_up;
 static const char *g_fail = "not inited";
 static struct pcie1_status g_snap;
 static u32 pcie1_aer_offset_rc;
+static u32 pcie1_next_bridge_bus;
 
 static void bridge_reset_brcm(bool assert)
 {
@@ -194,6 +196,34 @@ static void set_outbound_win(u64 cpu_addr, u64 pcie_addr, u64 size)
        ((u32)(limit_mb & 0xFFF) << 20) | ((u32)(cpu_mb & 0xFFF) << 4));
     pw(MISC_CPU_2_PCIE_WIN0_BH, (u32)(cpu_mb >> 12));
     pw(MISC_CPU_2_PCIE_WIN0_LH, (u32)(limit_mb >> 12));
+    dmb();
+}
+
+bool pcie1_set_outbound_window(u64 size)
+{
+    if (!g_link_up || size < 0x00100000ULL ||
+        size > PIOS_PCIE1_CPU_WIN_SIZE ||
+        (size & (size - 1ULL)) != 0ULL)
+        return false;
+    set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, 0, size);
+    dsb();
+    return true;
+}
+
+bool pcie1_enable_memory_path(u32 target_bus)
+{
+    if (!g_link_up)
+        return false;
+    for (u32 i = 0; i < g_snap.ep_count; i++) {
+        const struct pcie1_ep *e = &g_snap.eps[i];
+        if (!pcie1_is_bridge(e->hdr_type) ||
+            target_bus < e->sec_bus || target_bus > e->sub_bus)
+            continue;
+        u32 cmd = pcie1_cfg_read(e->bus, e->dev, e->func, PCI_REG_CMD);
+        cmd = (cmd | PCI_CMD_MEM) & ~PCI_CMD_MASTER;
+        pcie1_cfg_write(e->bus, e->dev, e->func, PCI_REG_CMD, cmd);
+    }
+    return true;
 }
 
 static void cap_set_gen2(void)
@@ -260,6 +290,25 @@ bool pcie1_link_up(void)
     return (st & STATUS_DL_ACTIVE) && (st & STATUS_PHYLINKUP);
 }
 
+static void program_bridge(u32 bus, u32 dev, u32 func, struct pcie1_ep *e)
+{
+    u32 secondary;
+    u32 bus_numbers;
+    if (!e || !pcie1_is_bridge(e->hdr_type) ||
+        pcie1_next_bridge_bus > PCIE1_SCAN_BUS_HI)
+        return;
+    secondary = pcie1_next_bridge_bus++;
+    bus_numbers = (bus & 0xFFU) | (secondary << 8) |
+                  ((PCIE1_SCAN_BUS_HI & 0xFFU) << 16);
+    pcie1_cfg_write(bus, dev, func, PCI_REG_BUS_NUM, bus_numbers);
+    /* Keep a broad 32-bit memory window; endpoint BAR0 mapping narrows the
+     * root ATU before Memory Space is enabled on the selected function. */
+    pcie1_cfg_write(bus, dev, func, PCI_REG_MEM_BASE_LIMIT, 0xFFF00000U);
+    dmb();
+    e->sec_bus = (u8)secondary;
+    e->sub_bus = (u8)PCIE1_SCAN_BUS_HI;
+}
+
 static void record_function(struct pcie1_status *s, u32 bus, u32 dev, u32 func)
 {
     u32 cfg0, cfg8, cfgc, cfg18;
@@ -281,6 +330,7 @@ static void record_function(struct pcie1_status *s, u32 bus, u32 dev, u32 func)
         cmd &= ~(PCI_CMD_MEM | PCI_CMD_MASTER);
         pcie1_cfg_write(bus, dev, func, PCI_REG_CMD, cmd);
     }
+    program_bridge(bus, dev, func, e);
     if (s->ep_count == 0) {
         s->first_vendor = e->vendor;
         s->first_device = e->device;
@@ -302,6 +352,7 @@ static void scan_endpoints(struct pcie1_status *s)
     s->b50_vendor = 0;
     s->b50_device = 0;
     s->scan_truncated = false;
+    pcie1_next_bridge_bus = PCIE1_SCAN_BUS_LO + 1U;
     for (u32 bus = PCIE1_SCAN_BUS_LO; bus <= PCIE1_SCAN_BUS_HI; bus++) {
         for (u32 dev = 0; dev <= PCIE1_SCAN_DEV_HI; dev++) {
             u32 cfg0 = pcie1_cfg_read(bus, dev, 0, 0);
@@ -368,14 +419,17 @@ bool pcie1_init(void)
         return false;
     }
 
+    /* Assert PERST before touching link configuration so a warm endpoint
+     * cannot train from stale LTSSM state. */
+    perst_set(true);
+    dsb();
+    timer_delay_ms(20);
+
     tmp = pr(HARD_DEBUG);
     tmp &= ~SERDES_IDDQ;
     pw(HARD_DEBUG, tmp);
     dmb();
     timer_delay_ms(1);
-
-    perst_set(true);
-    timer_delay_ms(20);
 
     tmp = pr(MISC_MISC_CTRL);
     tmp |= MCTRL_SCB_ACCESS_EN;
@@ -400,6 +454,7 @@ bool pcie1_init(void)
     tmp &= ~0xFFFFFF;
     tmp |= 0x060400;
     pw(RC_CFG_PRIV1_ID_VAL3, tmp);
+    dmb();
 
     /* Device ATU: CPU 0x1B00000000, 32 MiB, PCIe 0. BAR0 only. Not RP1. */
     set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, 0x00000000UL,
@@ -413,7 +468,9 @@ bool pcie1_init(void)
     cap_set_gen2();
     dmb();
 
+    dsb();
     perst_set(false);
+    dsb();
     /* #144: 200 ms deadline, 1 ms polls. Do not pet the watchdog. */
     g_link_up = wait_link_ms(200);
     if (!g_link_up) {
@@ -621,6 +678,16 @@ void pcie1_status(struct pcie1_status *out)
 }
 
 void pcie1_rescan(void) {}
+bool pcie1_set_outbound_window(u64 size)
+{
+    (void)size;
+    return false;
+}
+bool pcie1_enable_memory_path(u32 target_bus)
+{
+    (void)target_bus;
+    return false;
+}
 void pcie1_aer_init(void) {}
 void pcie1_aer_dump(const char *tag) { (void)tag; }
 void pcie1_aer_snapshot(struct pcie1_aer_snapshot *out, bool clear)

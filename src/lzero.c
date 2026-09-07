@@ -54,15 +54,19 @@ static u64 probe_bar_size(u32 bus, u32 dev, u32 fn, u32 off, bool *is64, bool *p
     if (is64) *is64 = sixty;
     if (pref) *pref = (orig_lo & 8U) != 0U;
 
-    pcie1_cfg_write(bus, dev, fn, off, 0xFFFFFFFFU);
-    mask_lo = pcie1_cfg_read(bus, dev, fn, off);
-    pcie1_cfg_write(bus, dev, fn, off, orig_lo);
     mask_hi = 0;
     if (sixty) {
         orig_hi = pcie1_cfg_read(bus, dev, fn, off + 4U);
+        pcie1_cfg_write(bus, dev, fn, off, 0xFFFFFFFFU);
         pcie1_cfg_write(bus, dev, fn, off + 4U, 0xFFFFFFFFU);
+        mask_lo = pcie1_cfg_read(bus, dev, fn, off);
         mask_hi = pcie1_cfg_read(bus, dev, fn, off + 4U);
         pcie1_cfg_write(bus, dev, fn, off + 4U, orig_hi);
+        pcie1_cfg_write(bus, dev, fn, off, orig_lo);
+    } else {
+        pcie1_cfg_write(bus, dev, fn, off, 0xFFFFFFFFU);
+        mask_lo = pcie1_cfg_read(bus, dev, fn, off);
+        pcie1_cfg_write(bus, dev, fn, off, orig_lo);
     }
     return pcie1_bar_size_from_mask(mask_lo, mask_hi, sixty);
 }
@@ -100,7 +104,9 @@ bool lzero_probe_bars(void)
     g_lzero.lmem_size = lmem;
     g_lzero.atu_size = PIOS_PCIE1_CPU_WIN_SIZE;
     g_lzero.bars_probed = true;
-    g_lzero.bar0_fits_atu = (bar0 != 0ULL && bar0 <= PIOS_PCIE1_CPU_WIN_SIZE);
+    g_lzero.bar0_fits_atu =
+        (bar0 >= 0x00100000ULL && bar0 <= PIOS_PCIE1_CPU_WIN_SIZE &&
+         (bar0 & (bar0 - 1ULL)) == 0ULL);
     g_lzero.bar0_mapped = false;
     publish_gate();
     return true;
@@ -112,6 +118,10 @@ bool lzero_map_bar0(void)
     if (!g_lzero.gpu_found || !g_lzero.bars_probed)
         return false;
     if (!g_lzero.bar0_fits_atu || g_lzero.bar0_size == 0ULL)
+        return false;
+    if (!pcie1_set_outbound_window(g_lzero.bar0_size))
+        return false;
+    if (!pcie1_enable_memory_path(g_lzero.gpu_bus))
         return false;
 
     bus = g_lzero.gpu_bus;
@@ -129,6 +139,7 @@ bool lzero_map_bar0(void)
         cmd = (cmd | PCI_CMD_MEM) & ~PCI_CMD_MASTER;
         pcie1_cfg_write(bus, dev, fn, PCI_REG_CMD, cmd);
     }
+    g_lzero.atu_size = g_lzero.bar0_size;
     g_lzero.bar0_mapped = true;
     publish_gate();
     return true;
