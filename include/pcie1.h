@@ -60,6 +60,16 @@ struct pcie1_status {
     struct pcie1_ep eps[PCIE1_SCAN_MAX];
 };
 
+struct pcie1_aer_snapshot {
+    u32 aer_offset;
+    u32 uncorr;
+    u32 corr;
+    u32 hdr0;
+    u32 hdr1;
+    u32 hdr2;
+    u32 hdr3;
+} PACKED;
+
 /* Pure logic — host-tested. */
 
 static inline bool pcie1_is_b50(u16 vendor, u16 device)
@@ -349,5 +359,8 @@ bool pcie1_init(void);
 bool pcie1_link_up(void);
 void pcie1_status(struct pcie1_status *out);
 void pcie1_rescan(void);
+void pcie1_aer_init(void);
+void pcie1_aer_dump(const char *tag);
+void pcie1_aer_snapshot(struct pcie1_aer_snapshot *out, bool clear);
 u32  pcie1_cfg_read(u32 bus, u32 dev, u32 func, u32 reg);
 void pcie1_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val);

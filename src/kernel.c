@@ -3121,7 +3121,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
             "Examples: status | ps | services | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
-            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | pcie1 | lzero | picocompress selftest | picoweb selftest\n"
+            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | pcie1 | pcie1 aer | lzero | picocompress selftest | picoweb selftest\n"
             "Client tools: arp | route | ping <ip-or-cached-host> [count] | traceroute <ip-or-cached-host> [max_hops] | dnslookup <hostname>\n"
             "Command help: help status | help netstat | help firewall | help reboot | help peek | help walfs | help db | help cachestats\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
@@ -3209,7 +3209,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, "qpu status | tensor selftest\n  Show V3D/QPU tensor dispatch diagnostics and verify safe NEON fallback kernels.\n");
         } else if (http_streq(topic, "pcie1") || http_streq(topic, "lzero")) {
             http_append(out, &len, max,
-                "pcie1 | pcie1 scan | lzero | lzero probe | lzero path | lzero map\n"
+                "pcie1 | pcie1 scan | pcie1 aer [clear] | lzero | lzero probe | lzero path | lzero map\n"
                 "  Pi 5 FFC/HAT root. Enum any device/switch. LevelZero B→E path; MSI masked.\n");
         } else if (http_streq(topic, "walfs") || http_streq(topic, "disk")) {
             http_append(out, &len, max, "walfs verify | walfs compact | walfs status | walfs format confirm\n  Verify WAL metadata/record-chain integrity, compact the WAL (non-destructive), or status.\n");
@@ -6300,6 +6300,26 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         bool clear = http_streq(cmd, "pcie aer clear");
         pcie_aer_snapshot(&a, clear);
         http_append(out, &len, max, "pcie aer off=");
+        http_append_hex32(out, &len, max, a.aer_offset);
+        http_append(out, &len, max, " uncorr=");
+        http_append_hex32(out, &len, max, a.uncorr);
+        http_append(out, &len, max, " corr=");
+        http_append_hex32(out, &len, max, a.corr);
+        http_append(out, &len, max, " hdr=");
+        http_append_hex32(out, &len, max, a.hdr0);
+        http_append(out, &len, max, " ");
+        http_append_hex32(out, &len, max, a.hdr1);
+        http_append(out, &len, max, " ");
+        http_append_hex32(out, &len, max, a.hdr2);
+        http_append(out, &len, max, " ");
+        http_append_hex32(out, &len, max, a.hdr3);
+        http_append(out, &len, max, clear ? " cleared\n" : "\n");
+    } else if (http_streq(cmd, "pcie1 aer") ||
+               http_streq(cmd, "pcie1 aer clear")) {
+        struct pcie1_aer_snapshot a;
+        bool clear = http_streq(cmd, "pcie1 aer clear");
+        pcie1_aer_snapshot(&a, clear);
+        http_append(out, &len, max, "pcie1 aer off=");
         http_append_hex32(out, &len, max, a.aer_offset);
         http_append(out, &len, max, " uncorr=");
         http_append_hex32(out, &len, max, a.uncorr);

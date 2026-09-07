@@ -81,6 +81,14 @@ _Static_assert((PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE) <= PIOS_PROC_ARENA_BA
 #define PCI_REG_CMD                 0x04
 #define PCI_REG_BUS_NUM             0x18
 #define PCI_REG_CAP_PTR             0x34
+#define PCIE1_AER_UNCORR_ERR       0x04
+#define PCIE1_AER_UNCORR_MASK      0x08
+#define PCIE1_AER_CORR_ERR         0x10
+#define PCIE1_AER_CORR_MASK        0x14
+#define PCIE1_AER_HDR_LOG0         0x1C
+#define PCIE1_AER_HDR_LOG1         0x20
+#define PCIE1_AER_HDR_LOG2         0x24
+#define PCIE1_AER_HDR_LOG3         0x28
 
 #define STATUS_DL_ACTIVE            (1U << 5)
 #define STATUS_PHYLINKUP            (1U << 4)
@@ -109,6 +117,7 @@ static bool g_inited;
 static bool g_link_up;
 static const char *g_fail = "not inited";
 static struct pcie1_status g_snap;
+static u32 pcie1_aer_offset_rc;
 
 static void bridge_reset_brcm(bool assert)
 {
@@ -423,6 +432,7 @@ bool pcie1_init(void)
     pw(PCI_REG_CMD, tmp);
     dmb();
 
+    pcie1_aer_init();
     g_inited = true;
     publish_snap("ok");
     uart_puts("[pcie1] link up x");
@@ -454,6 +464,111 @@ bool pcie1_init(void)
     }
     uart_puts("[pcie1] MSI INTID 255/256 masked (no handler yet)\n");
     return true;
+}
+
+static u32 pcie1_find_aer_cap(u32 bus, u32 dev, u32 fn)
+{
+    u32 off = 0x100U;
+    for (u32 i = 0; i < 48U && off >= 0x100U; i++) {
+        u32 hdr = pcie1_cfg_read(bus, dev, fn, off);
+        if ((hdr & 0xFFFFU) == 0x0001U)
+            return off;
+        off = (hdr >> 20) & 0xFFCU;
+        if (off == 0U)
+            break;
+    }
+    return 0U;
+}
+
+void pcie1_aer_init(void)
+{
+    pcie1_aer_offset_rc = pcie1_find_aer_cap(0, 0, 0);
+    if (!pcie1_aer_offset_rc) {
+        uart_puts("[pcie1] no AER\n");
+        return;
+    }
+    uart_puts("[pcie1] AER @RC=");
+    uart_hex(pcie1_aer_offset_rc);
+    uart_puts("\n");
+    pcie1_cfg_write(0, 0, 0, pcie1_aer_offset_rc + PCIE1_AER_UNCORR_ERR,
+                    0xFFFFFFFFU);
+    pcie1_cfg_write(0, 0, 0, pcie1_aer_offset_rc + PCIE1_AER_CORR_ERR,
+                    0xFFFFFFFFU);
+    pcie1_cfg_write(0, 0, 0, pcie1_aer_offset_rc + PCIE1_AER_UNCORR_MASK, 0U);
+    pcie1_cfg_write(0, 0, 0, pcie1_aer_offset_rc + PCIE1_AER_CORR_MASK, 0U);
+}
+
+void pcie1_aer_dump(const char *tag)
+{
+    u32 uncorr, corr;
+    if (!pcie1_aer_offset_rc)
+        return;
+    uncorr = pcie1_cfg_read(0, 0, 0,
+                            pcie1_aer_offset_rc + PCIE1_AER_UNCORR_ERR);
+    corr = pcie1_cfg_read(0, 0, 0,
+                          pcie1_aer_offset_rc + PCIE1_AER_CORR_ERR);
+    uart_puts("[pcie1-aer] ");
+    uart_puts(tag ? tag : "snapshot");
+    uart_puts(" uncorr=");
+    uart_hex(uncorr);
+    uart_puts(" corr=");
+    uart_hex(corr);
+    if (uncorr || corr) {
+        uart_puts("\n[pcie1-aer] HDR: ");
+        uart_hex(pcie1_cfg_read(0, 0, 0,
+                                pcie1_aer_offset_rc + PCIE1_AER_HDR_LOG0));
+        uart_puts(" ");
+        uart_hex(pcie1_cfg_read(0, 0, 0,
+                                pcie1_aer_offset_rc + PCIE1_AER_HDR_LOG1));
+        uart_puts(" ");
+        uart_hex(pcie1_cfg_read(0, 0, 0,
+                                pcie1_aer_offset_rc + PCIE1_AER_HDR_LOG2));
+        uart_puts(" ");
+        uart_hex(pcie1_cfg_read(0, 0, 0,
+                                pcie1_aer_offset_rc + PCIE1_AER_HDR_LOG3));
+        pcie1_cfg_write(0, 0, 0,
+                        pcie1_aer_offset_rc + PCIE1_AER_UNCORR_ERR,
+                        0xFFFFFFFFU);
+        pcie1_cfg_write(0, 0, 0,
+                        pcie1_aer_offset_rc + PCIE1_AER_CORR_ERR,
+                        0xFFFFFFFFU);
+    }
+    uart_puts("\n");
+}
+
+void pcie1_aer_snapshot(struct pcie1_aer_snapshot *out, bool clear)
+{
+    if (!out)
+        return;
+    out->aer_offset = pcie1_aer_offset_rc;
+    out->uncorr = 0;
+    out->corr = 0;
+    out->hdr0 = 0;
+    out->hdr1 = 0;
+    out->hdr2 = 0;
+    out->hdr3 = 0;
+    if (!pcie1_aer_offset_rc)
+        return;
+    out->uncorr = pcie1_cfg_read(0, 0, 0,
+                                 pcie1_aer_offset_rc + PCIE1_AER_UNCORR_ERR);
+    out->corr = pcie1_cfg_read(0, 0, 0,
+                               pcie1_aer_offset_rc + PCIE1_AER_CORR_ERR);
+    out->hdr0 = pcie1_cfg_read(0, 0, 0,
+                               pcie1_aer_offset_rc + PCIE1_AER_HDR_LOG0);
+    out->hdr1 = pcie1_cfg_read(0, 0, 0,
+                               pcie1_aer_offset_rc + PCIE1_AER_HDR_LOG1);
+    out->hdr2 = pcie1_cfg_read(0, 0, 0,
+                               pcie1_aer_offset_rc + PCIE1_AER_HDR_LOG2);
+    out->hdr3 = pcie1_cfg_read(0, 0, 0,
+                               pcie1_aer_offset_rc + PCIE1_AER_HDR_LOG3);
+    if (clear) {
+        pcie1_cfg_write(0, 0, 0,
+                        pcie1_aer_offset_rc + PCIE1_AER_UNCORR_ERR,
+                        0xFFFFFFFFU);
+        pcie1_cfg_write(0, 0, 0,
+                        pcie1_aer_offset_rc + PCIE1_AER_CORR_ERR,
+                        0xFFFFFFFFU);
+    }
 }
 
 void pcie1_status(struct pcie1_status *out)
@@ -506,5 +621,13 @@ void pcie1_status(struct pcie1_status *out)
 }
 
 void pcie1_rescan(void) {}
+void pcie1_aer_init(void) {}
+void pcie1_aer_dump(const char *tag) { (void)tag; }
+void pcie1_aer_snapshot(struct pcie1_aer_snapshot *out, bool clear)
+{
+    (void)clear;
+    if (out)
+        *out = (struct pcie1_aer_snapshot){0};
+}
 
 #endif
