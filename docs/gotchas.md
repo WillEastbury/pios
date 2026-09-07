@@ -484,9 +484,10 @@ explained its apparent "disappearance".
 - **Editors can silently convert line endings.** A single small edit rewrote
   `src/exception.c` as CRLF and produced a 1249-line phantom diff for a 9-line
   change. Check `git ls-files --eol` when a diff looks disproportionate.
-- **QEMU needs two virtio-blk devices.** `qemu_blk_probe()` requires at least two
-  virtio-mmio devices reporting BLK before it will use virtio-blk; otherwise it
-  silently falls back to a 16 MiB RAM disk with no error.
+- **QEMU virtio-blk probe accepts one or more devices.** `qemu_blk_probe()`
+  uses the first discovered virtio-mmio BLK device and falls back to the 16 MiB
+  RAM disk only when no usable virtio-blk device is present. The diagnostic
+  reports the discovered count and selected device.
 - **QEMU trampoline ordering differs from silicon.** TCG treats a write to a page
   it has translated code from as self-modifying code and invalidates the softTLB
   mid-copy. QEMU disables the MMU *before* the copy; real hardware copies first.

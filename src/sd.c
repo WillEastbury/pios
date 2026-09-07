@@ -309,10 +309,15 @@ static bool qemu_blk_probe(void)
                 selected = base;
         }
     }
-    if (blocks < 2 || selected == 0)
+    if (blocks == 0U || selected == 0U) {
+        uart_puts("[sd] qemu-blk: no virtio-blk devices; using RAM disk\n");
         return false;
+    }
     qemu_blk_base = selected;
     qemu_blk_diag = blocks;
+    uart_puts("[sd] qemu-blk: discovered ");
+    uart_hex(blocks);
+    uart_puts(" virtio-blk device(s), using device 0\n");
     return true;
 }
 

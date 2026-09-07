@@ -76,7 +76,7 @@ into one payload.
 | Secondaries | PSCI Aff0 shift 8 | PSCI Aff0 shift 0 | `PIOS_HAS_PSCI_SECONDARIES=0` | PSCI HVC |
 | Wired NIC | Cadence MACB via RP1 | Broadcom GENET v5 `0xFD580000` | none in PIOS | virtio-net |
 | Wi-Fi host | BCM2712 SDIO2 | Arasan SDIO1 `0xFE300000` (loadable) | Arasan SDIO1 at `0x3F300000` | none |
-| SD / disk | BCM2712 SDHCI EMMC2 | EMMC2 `0xFE340000` | **SDHOST** at `0x3F202000` (ADR-038) | virtio-blk (needs **two** devices) |
+| SD / disk | BCM2712 SDHCI EMMC2 | EMMC2 `0xFE340000` | **SDHOST** at `0x3F202000` (ADR-038) | virtio-blk (one or more devices) |
 | Radio | CYW43455 | CYW43455 | Pi 3 B: 43430 · B+: 43455 · Zero 2 W: 43436 | — |
 | `WL_ON` | Pi 5 SDIO2 path | firmware expgpio 129 | Pi 3: firmware expgpio 129 · Zero 2 W: SoC GPIO41 | — |
 | Framebuffer | VideoCore mailbox | VideoCore mailbox | VideoCore IV mailbox | ramfb via `PIOS_BOOTINFO` |
@@ -161,14 +161,15 @@ QEMU-specific rules (also in [`gotchas.md`](gotchas.md)):
 2. **Trampoline disables MMU before the self-overwrite copy.** QEMU TCG treats
    a write to a translated code page as SMC and invalidates the softTLB
    mid-copy. Pi silicon copies first, then disables MMU.
-3. **Attach two virtio-blk devices.** `qemu_blk_probe()` otherwise falls back
-   silently to the 16 MiB RAM disk.
+3. **Attach at least one virtio-blk device.** `qemu_blk_probe()` uses the first
+   discovered BLK device and falls back to the 16 MiB RAM disk only when none
+   is present.
 4. **Keystore LBA 0 is valid** on the QEMU RAM-fallback WALFS;
    `KEYSTORE_LBA_INVALID` is `0xFFFFFFFF`, not zero.
 5. **No mailbox.** `board_serial()` / `mbox_call()` must stay
    `PIOS_HAS_MAILBOX_FB`-gated.
 
-Manual stage0-chain launch (two virtio-blk devices required):
+Manual stage0-chain launch (one virtio-blk device is sufficient):
 
 ```text
 qemu-system-aarch64 -M virt -cpu cortex-a53 -smp 4 -m 1G -display none
