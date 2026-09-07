@@ -197,6 +197,7 @@ def main() -> int:
                  "test_issue_115_socket_recv.py",
                  "test_issue_111_walfs_fifo.py",
                  "test_issue_112_bcache.py",
+                 "test_qemu_blk_probe.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)
