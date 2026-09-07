@@ -147,6 +147,7 @@ TESTS_MANIFEST = {
     # BAR size, RP1 window non-overlap, and that finding a GPU is not a
     # verified LevelZero proof.
     "test_pcie1.c": [],
+    "test_usb_descriptor.c": ["src/usb_descriptor.c"],
 }
 
 TEST_CFLAGS = {

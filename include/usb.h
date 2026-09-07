@@ -13,6 +13,7 @@
 
 #define USB_MAX_DRIVERS     4
 #define USB_MAX_ENDPOINTS   8
+#define USB_MAX_CONFIG_DESC 1024
 
 #define USB_DIR_IN          0x80
 #define USB_DIR_OUT         0x00
@@ -54,6 +55,10 @@ struct usb_driver {
     bool (*probe)(struct usb_device *dev);
     void (*disconnect)(struct usb_device *dev);
 };
+
+/* Parse one bounded configuration descriptor blob without touching hardware. */
+bool usb_parse_config_descriptors(const u8 *buf, u32 len,
+                                  struct usb_device *dev);
 
 /* Driver registration (call before usb_init) */
 void usb_register_driver(struct usb_driver *drv);

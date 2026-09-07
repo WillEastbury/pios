@@ -18,8 +18,6 @@
 
 #define DESC_DEVICE         1
 #define DESC_CONFIG         2
-#define DESC_INTERFACE      4
-#define DESC_ENDPOINT       5
 
 /* ---- USB Descriptor Structures ---- */
 
@@ -29,27 +27,6 @@ struct usb_dev_desc {
     u8  bDeviceClass, bDeviceSubClass, bDeviceProtocol, bMaxPacketSize0;
     u16 idVendor, idProduct, bcdDevice;
     u8  iManufacturer, iProduct, iSerialNumber, bNumConfigurations;
-} PACKED;
-
-struct usb_cfg_desc {
-    u8  bLength, bDescriptorType;
-    u16 wTotalLength;
-    u8  bNumInterfaces, bConfigurationValue, iConfiguration;
-    u8  bmAttributes, bMaxPower;
-} PACKED;
-
-struct usb_iface_desc {
-    u8  bLength, bDescriptorType;
-    u8  bInterfaceNumber, bAlternateSetting, bNumEndpoints;
-    u8  bInterfaceClass, bInterfaceSubClass, bInterfaceProtocol;
-    u8  iInterface;
-} PACKED;
-
-struct usb_ep_desc {
-    u8  bLength, bDescriptorType;
-    u8  bEndpointAddress, bmAttributes;
-    u16 wMaxPacketSize;
-    u8  bInterval;
 } PACKED;
 
 /* ---- Driver Registry ---- */
@@ -63,7 +40,7 @@ static struct usb_device the_device;
 static bool device_valid;
 static bool controller_ready;
 
-static u8 desc_buf[512] ALIGNED(64);
+static u8 desc_buf[USB_MAX_CONFIG_DESC] ALIGNED(64);
 
 /* ---- Driver Registration ---- */
 
@@ -145,46 +122,29 @@ static bool enumerate_device(u32 port, u32 speed) {
     uart_hex(dd->idProduct);
     uart_puts("\n");
 
-    /* GET_DESCRIPTOR: Configuration (full) */
+    /* Read the header first so wTotalLength is an authority, not a guess. */
     if (!xhci_control_transfer(dev->slot, USB_DIR_IN, 0x06,
-                                (DESC_CONFIG << 8), 0, sizeof(desc_buf),
-                                desc_buf, &got)) {
-        uart_puts("[usb] GET_DESCRIPTOR(config) failed\n");
+                                (DESC_CONFIG << 8), 0, 9,
+                                desc_buf, &got) || got < 9U) {
+        uart_puts("[usb] GET_DESCRIPTOR(config header) failed\n");
         return false;
     }
 
-    struct usb_cfg_desc *cfg = (struct usb_cfg_desc *)desc_buf;
-    dev->config_value = cfg->bConfigurationValue;
-    dev->num_interfaces = cfg->bNumInterfaces;
+    u32 total = (u32)desc_buf[2] | ((u32)desc_buf[3] << 8);
+    if (total < 9U || total > sizeof(desc_buf)) {
+        uart_puts("[usb] Configuration descriptor length rejected\n");
+        return false;
+    }
 
-    /* Parse descriptors: collect endpoints with interface context */
-    u8 cur_iface = 0, cur_class = 0, cur_sub = 0, cur_proto = 0;
-    u32 off = 0;
-    while (off + 2 <= got && dev->num_eps < USB_MAX_ENDPOINTS) {
-        u8 len = desc_buf[off];
-        u8 type = desc_buf[off + 1];
-        if (len < 2 || off + len > got) break; /* bounds check */
-
-        if (type == DESC_INTERFACE && len >= 9 && off + 9 <= got) {
-            struct usb_iface_desc *id = (struct usb_iface_desc *)(desc_buf + off);
-            cur_iface = id->bInterfaceNumber;
-            cur_class = id->bInterfaceClass;
-            cur_sub = id->bInterfaceSubClass;
-            cur_proto = id->bInterfaceProtocol;
-        } else if (type == DESC_ENDPOINT && len >= 7 && off + 7 <= got) {
-            struct usb_ep_desc *ep = (struct usb_ep_desc *)(desc_buf + off);
-            u32 idx = dev->num_eps;
-            dev->eps[idx].address = ep->bEndpointAddress;
-            dev->eps[idx].attributes = ep->bmAttributes;
-            dev->eps[idx].max_packet = ep->wMaxPacketSize & 0x7FF;
-            dev->eps[idx].interval = ep->bInterval;
-            dev->eps[idx].iface_number = cur_iface;
-            dev->eps[idx].iface_class = cur_class;
-            dev->eps[idx].iface_subclass = cur_sub;
-            dev->eps[idx].iface_protocol = cur_proto;
-            dev->num_eps++;
-        }
-        off += len;
+    if (!xhci_control_transfer(dev->slot, USB_DIR_IN, 0x06,
+                                (DESC_CONFIG << 8), 0, (u16)total,
+                                desc_buf, &got) || got < total) {
+        uart_puts("[usb] GET_DESCRIPTOR(config) failed\n");
+        return false;
+    }
+    if (!usb_parse_config_descriptors(desc_buf, total, dev)) {
+        uart_puts("[usb] Configuration descriptors rejected\n");
+        return false;
     }
 
     /* SET_CONFIGURATION */
