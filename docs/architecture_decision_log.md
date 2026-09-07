@@ -266,6 +266,29 @@ beyond the one record that requires atomic RMWs.
 **Consequence.** AIRQ retains one global sequence and atomic diagnostics while
 the remaining kernel `.bss` stays Normal-NC.
 
+**Scheduler follow-up (2026-09-07, owner-authorized repair).** The Pi 5 saved a
+core-1 `ESR=0x96000410` at `LDAXR` on `procs[].owner_core`; user-core timer
+counters stopped while core 0 continued serving management. Apply the same
+WB-only atomic invariant to generation-tagged, cache-line-isolated scheduler
+ownership tokens. Allocate them once before SMP from already-WB core-0 RAM,
+past the linked image; verify WB/Inner-Shareable attributes before first use.
+Do not use another fixed slice of the first control page: the current Pi link
+places the fallback TCP array across that address. Core-0 bump allocation must
+skip the whole linked image as well as its control reservation.
+
+The process table stays NC, kernel/user TTBRs keep matching attributes, and no
+allocation occurs in the scheduler. The owner permitted justified scheduling
+policy changes; this repair does not require one. Claims reject a token already
+being claimed, and generation participates in CAS so a stale claimant cannot
+restore ownership over a reused slot.
+
+The same acceptance pass found that a trapped EL0 WFI returned to its own
+instruction because `proc_handle_wfx()` did not advance `ELR_EL1`. That produced
+hundreds of thousands of WFx traps, repeated timer preemption and 504s while the
+worker never rechecked its queue. The WFx handler now advances the A64 PC by four
+bytes before applying pctl. This is independent of cache coherency but amplified
+the apparent cross-core scheduler failure.
+
 ---
 
 <a name="adr-036"></a>
@@ -1531,6 +1554,15 @@ has capacity, else the least-loaded eligible core.
   the same slot.
 - Per-core page tables are indexed `[uc][slot]`; a migrated process needs a valid
   table on its new core (build-on-demand, or make tables per-process).
+
+**Implementation guard (2026-09-07).** This ADR remains Proposed. The launcher
+must not make processes eligible on all user cores before the message-passing
+migration handoff above is implemented. Doing so exposed NC `state`/`ctx`
+directly to competing schedulers: a wake could move a service between cores
+without publishing a complete immutable migration descriptor. Until ADR-025 is
+accepted and implemented end-to-end, new processes are pinned to their launch
+core under accepted ADR-001. Explicit `proc_set_affinity()` remains the only
+migration surface and uses the existing target-core launch request.
 
 ---
 

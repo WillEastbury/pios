@@ -52,7 +52,7 @@ acquire = function_body(
 )
 assert "current_proc_arr[core].v" in acquire
 assert "proc_buffer_range_in_slot(slot, ptr, len)" in acquire
-assert "p->owner_core != core" in acquire
+assert "proc_owner_core(p) != core" in acquire
 assert "p->state != PROC_RUNNING" in acquire
 
 revalidate = function_body(
@@ -60,6 +60,6 @@ revalidate = function_body(
     "bool proc_buffer_ref_validate(u32 core, u64 ptr, u32 len,",
 )
 assert "p->generation == ref->generation" in revalidate
-assert "p->owner_core == core" in revalidate
+assert "proc_owner_core(p) == core" in revalidate
 
 print("issue #115: recv authorizes slot+generation, maintains WB cache, and replies on rejection")

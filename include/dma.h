@@ -14,8 +14,9 @@
 #define DMA_BASE            0x1000010000UL
 #define DMA_CHAN_STRIDE      0x100
 
-/* DMA Channel count — using channels 0-5 (full channels, not lite) */
+/* Legacy-register BCM2712 channels 0-5, not the DMA40 block at +0x600. */
 #define DMA_NUM_CHANNELS     6
+#define DMA_MAX_CB_BYTES     65532U /* LITE channels: 16-bit length, whole words */
 
 /* Control Block (CB) — 32 bytes, must be 32-byte aligned */
 struct dma_cb {
@@ -23,7 +24,7 @@ struct dma_cb {
     u32 src_addr;       /* Source address (low 32 bits) */
     u32 dst_addr;       /* Destination address (low 32 bits) */
     u32 xfer_len;       /* Transfer length in bytes */
-    u32 stride;         /* 2D stride */
+    u32 stride;         /* BCM2712 source [39:32] | destination [39:32] << 8 */
     u32 next_cb;        /* Next CB address (0 = end of chain) */
     u32 _pad[2];        /* Pad to 32 bytes */
 } ALIGNED(32);
@@ -50,7 +51,12 @@ struct dma_diag_snapshot {
     u32 last_mismatch_off;
     u32 last_got;
     u32 last_expected;
-    u32 enable_reg;
+    u32 channel_mask;
+    u32 hw_copies;
+    u32 hw_zeroes;
+    u32 last_cs;
+    u32 last_debug;
+    u32 last_cbaddr;
     struct dma_channel_diag channel[DMA_NUM_CHANNELS];
 } PACKED;
 
@@ -71,6 +77,7 @@ struct dma_diag_snapshot {
 #define DMA_CS_ACTIVE        (1 << 0)
 #define DMA_CS_END           (1 << 1)
 #define DMA_CS_INT           (1 << 2)
+#define DMA_CS_WAITING_WRITES (1 << 6)
 #define DMA_CS_ERROR         (1 << 8)
 #define DMA_CS_RESET         (1 << 31)
 #define DMA_CS_ABORT         (1 << 30)
@@ -95,12 +102,17 @@ struct dma_diag_snapshot {
 #define DMA_CHAN_SPARE       5
 #define DMA_CHAN_MASK        ((1U << 0) | (1U << 2) | (1U << 4) | (1U << 5))
 
+/* BCM2712 CB pointers are always PA >> 5; there is no direct/raw mode. */
+bool dma_cb_encode(struct dma_cb *cb, u64 src, u64 dst, u32 len,
+                   bool source_increment, u64 next);
+
 /* Init the DMA engine */
 void dma_init(void);
 bool dma_selftest(void);
 void dma_diag_snapshot(struct dma_diag_snapshot *out);
 
-/* Simple one-shot memcpy via DMA (blocks until complete) */
+/* Core 0 owns hardware. Other cores use synchronous CPU copies/fills. */
+/* Simple memcpy via bounded DMA quanta (blocks until complete). */
 bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len);
 
 /* Async: start a DMA transfer (returns immediately) */

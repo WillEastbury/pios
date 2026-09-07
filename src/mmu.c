@@ -1095,6 +1095,42 @@ bool mmu_user_pte_snapshot(u32 core, u32 slot, u64 va, u64 *l1e, u64 *l2e, u64 *
     } else if (l3base == (u64)(usize)user_l3_proc[uc][slot][1]) {
         if (l3e) *l3e = user_l3_proc[uc][slot][1][pidx];
     }
+
+    return true;
+}
+
+bool mmu_kernel_range_is_wb_is(u64 start, u64 size)
+{
+    if (size == 0U || start + size < start)
+        return false;
+    u64 page = start & ~(L3_PAGE_SIZE - 1U);
+    u64 end = (start + size + L3_PAGE_SIZE - 1U) &
+              ~(L3_PAGE_SIZE - 1U);
+    u64 *root = (u64 *)(usize)shared_ttbr0;
+    if (!root)
+        return false;
+    while (page < end) {
+        u32 l1idx = (u32)(page / L1_BLOCK_SIZE);
+        if (l1idx >= 512U)
+            return false;
+        u64 entry = root[l1idx];
+        if ((entry & (PTE_VALID | PTE_TABLE)) ==
+            (PTE_VALID | PTE_TABLE)) {
+            u64 *l2 = (u64 *)(usize)(entry & 0x0000FFFFFFFFF000ULL);
+            entry = l2[(page / L2_BLOCK_SIZE) & 511U];
+            if ((entry & (PTE_VALID | PTE_TABLE)) ==
+                (PTE_VALID | PTE_TABLE)) {
+                u64 *l3 =
+                    (u64 *)(usize)(entry & 0x0000FFFFFFFFF000ULL);
+                entry = l3[(page / L3_PAGE_SIZE) & 511U];
+            }
+        }
+        if (!(entry & PTE_VALID) ||
+            (entry & (7ULL << 2)) != PTE_ATTR(MT_NORMAL) ||
+            (entry & (3ULL << 8)) != PTE_SH_INNER)
+            return false;
+        page += L3_PAGE_SIZE;
+    }
     return true;
 }
 

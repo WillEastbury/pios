@@ -36,8 +36,7 @@
 #include "swake.h"
 #include "adrv.h"
 #include "kspin.h"
-
-#define PROC_OWNER_LOCKED 0x80000000U
+#include "proc_owner.h"
 
 /*
  * Per-core kernel service identities for the scheduler and the FIFO/doorbell
@@ -80,6 +79,26 @@ static void proc_register_core_services(void)
 }
 
 static struct process  procs[MAX_PROCS_PER_CORE] ALIGNED(64);
+
+/* ADR-035 also applies to scheduler CAS: Pi 5 faults on NC atomics.
+ * Allocate once, before SMP startup, from already-mapped WB-IS core RAM.
+ * Keep procs[] NC; no physical page gains a conflicting alias. */
+static struct proc_owner_record *proc_owners;
+
+static inline struct proc_owner_record *proc_owner_record(const struct process *p)
+{
+    return &proc_owners[p - procs];
+}
+
+static inline u32 proc_owner_core(const struct process *p)
+{
+    return proc_owner_load(proc_owner_record(p));
+}
+
+static inline void proc_owner_set(struct process *p, u32 owner)
+{
+    proc_owner_publish(proc_owner_record(p), p->generation, owner);
+}
 
 static inline volatile struct el0_sched_slot *el0_sched_slot_kernel(u32 slot)
 {
@@ -481,6 +500,7 @@ static void proc_mark_empty(u32 slot)
     if (slot >= MAX_PROCS_PER_CORE)
         return;
     proc_bump_generation(slot);
+    proc_owner_set(&procs[slot], PROC_CORE_NONE);
     procs[slot].state = PROC_EMPTY;
     procs[slot].pid = 0;
     swake_slot_reset(slot);
@@ -792,14 +812,9 @@ static enum pctl_verdict proc_el0_control_verdict_trace(u32 slot,
 {
     volatile struct pctl_line *line =
         &el0_sched_slot_kernel(slot)->control;
-    volatile struct pctl_line *identity =
-        (volatile struct pctl_line *)(usize)(PIOS_IPC_SHM_BASE +
-            EL0_SCHED_OFFSET +
-            (u64)slot * sizeof(struct el0_sched_slot) +
-            __builtin_offsetof(struct el0_sched_slot, control));
     u32 uc = user_core_slot();
     preempt_state[uc].wfx_last_state = line->state;
-    preempt_state[uc].wfx_last_generation = identity->state;
+    preempt_state[uc].wfx_last_generation = p->generation;
     preempt_state[uc].wfx_last_slot_va = line->publish_seq;
     u64 l1e = 0, l2e = 0, l3e = 0;
     (void)mmu_user_pte_snapshot(core_id(), slot, el0_slot_va,
@@ -823,23 +838,6 @@ static void proc_el0_control_clear(u32 slot, const struct process *p)
 }
 
 static bool proc_eligible_on_core(const struct process *p, u32 core);
-
-static bool proc_owner_try_claim(volatile u32 *owner, u32 expected, u32 desired)
-{
-    u32 observed;
-    u32 status;
-    __asm__ volatile(
-        "1: ldaxr %w0, [%2]\n"
-        "   cmp %w0, %w3\n"
-        "   b.ne 2f\n"
-        "   stlxr %w1, %w4, [%2]\n"
-        "   cbnz %w1, 1b\n"
-        "2:"
-        : "=&r"(observed), "=&r"(status)
-        : "r"(owner), "r"(expected), "r"(desired)
-        : "cc", "memory");
-    return observed == expected;
-}
 
 static bool proc_qbank_others_runnable(u32 chosen)
 {
@@ -866,19 +864,23 @@ static bool proc_claim_owner(struct process *p, u32 core)
 {
     if (!p || !proc_eligible_on_core(p, core))
         return false;
-    u32 owner = p->owner_core;
+    u32 owner = proc_owner_core(p);
     if (p->state != PROC_READY)
         return false;
     u32 generation = p->generation;
-    if (!proc_owner_try_claim(&p->owner_core, owner,
-                              PROC_OWNER_LOCKED | core))
+    if (!proc_owner_claim(proc_owner_record(p), generation, owner, core))
         return false;
     if (p->generation != generation || p->state != PROC_READY) {
-        p->owner_core = owner;
+        (void)proc_owner_finish(proc_owner_record(p), generation, core, owner);
         return false;
     }
     p->state = PROC_CLAIMED;
-    p->owner_core = core;
+    if (!proc_owner_finish(proc_owner_record(p), generation, core, core)) {
+        u64 values[3] = { (u64)(p - procs), generation, core };
+        exception_pisod_reboot("Process ownership changed",
+                              EXCEPTION_CRASH_KIND_EL1_INTEGRITY,
+                              0x504F574EU, values, 3U);
+    }
     dmb_ishst();
     return true;
 }
@@ -931,6 +933,10 @@ bool proc_handle_wfx(struct irq_frame *frame, u64 esr)
     (void)esr;
     if (!frame || !on_user_core())
         return false;
+    /* A trapped WFI/WFE is complete. ELR points at the trapping instruction;
+     * without advancing it, every wake erets to the same WFI forever and the
+     * process never reaches its queue re-check. A64 instructions are 4 bytes. */
+    frame->elr += 4U;
     (void)proc_drain_el0_commands(frame);
     if (current_proc < EL0_SCHED_SLOT_COUNT) {
         struct process *p = &procs[current_proc];
@@ -960,6 +966,7 @@ bool proc_handle_wfx(struct irq_frame *frame, u64 esr)
                 proc_exit(0xFFFF0011U);
                 __builtin_unreachable();
             }
+            proc_el0_control_clear(current_proc, p);
         }
     }
     frame->x[0] = 0;
@@ -1027,6 +1034,16 @@ void proc_el0_diag_snapshot(i32 *launch_status, u32 *launch_pid, u32 *launch_slo
     if (fault_par0w)  *fault_par0w  = el0_fault_par0w;
     if (fault_par0r)  *fault_par0r  = el0_fault_par0r;
     if (fault_par1w)  *fault_par1w  = el0_fault_par1w;
+}
+
+u32 proc_exit_snapshot(u32 *codes, u32 max)
+{
+    if (!codes)
+        return 0U;
+    u32 n = max < MAX_PROCS_PER_CORE ? max : MAX_PROCS_PER_CORE;
+    for (u32 i = 0; i < n; i++)
+        codes[i] = procs[i].exit_code;
+    return n;
 }
 
 static void proc_arena_update_high(struct process *p, u32 slot)
@@ -2267,12 +2284,24 @@ void proc_init_shared(void)
 {
     if (initialized)
         return;
+    proc_owners = core_alloc(CORE_NET,
+        MAX_PROCS_PER_CORE * sizeof(*proc_owners), 64U);
+    if (!proc_owners ||
+        !mmu_kernel_range_is_wb_is((u64)(usize)proc_owners,
+            MAX_PROCS_PER_CORE * sizeof(*proc_owners))) {
+        u64 values[3] = { (u64)(usize)proc_owners,
+            MAX_PROCS_PER_CORE * sizeof(*proc_owners), 0U };
+        exception_pisod_reboot("Process owner memory attributes",
+                              EXCEPTION_CRASH_KIND_EL1_INTEGRITY,
+                              0x504F5742U, values, 3U);
+    }
     kspin_init(proc_slot_alloc_lock());
     swake_reset();
     for (u32 i = 0; i < MAX_PROCS_PER_CORE; i++) {
         procs[i].state = PROC_EMPTY;
         procs[i].pid = 0;
         procs[i].generation = 0;
+        proc_owner_set(&procs[i], PROC_CORE_NONE);
         el0_sched_reset(i, 0);
     }
     for (u32 i = 0; i < MAX_PAGED_IO_HANDLES; i++)
@@ -2417,7 +2446,11 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     }
 
     u8 *base = slot_base((u32)slot);
-    dma_zero(5, base, PROC_SLOT_SIZE); /* DMA ch5 (SPARE) */
+    if (!dma_zero(DMA_CHAN_SPARE, base, PROC_SLOT_SIZE)) {
+        uart_puts("[proc] arena zero failed\n");
+        proc_mark_empty((u32)slot);
+        return -1;
+    }
     u32 loaded = walfs_read(inode, 0, base, (u32)info.size);
     if (loaded != (u32)info.size) {
         uart_puts("[proc] load incomplete\n");
@@ -2444,9 +2477,9 @@ static i32 proc_exec_with_policy(const char *path, u32 priority_class, u32 affin
     proc_wake_pending[slot].v = 0;
     p->principal_id = principal_current();
     p->affinity_core = affinity_core;
-    p->owner_core = affinity_core;
-    p->pinned_core = PROC_CORE_NONE;
-    p->eligible_core_mask = PROC_ELIGIBLE_USER_MASK;
+    proc_owner_set(p, affinity_core);
+    p->pinned_core = affinity_core;
+    p->eligible_core_mask = 1U << affinity_core;
     p->last_core = affinity_core;
     p->priority_class = priority_class;
     p->quantum_ticks = proc_quantum_for_prio(priority_class);
@@ -2605,7 +2638,11 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
         proc_mark_empty((u32)slot);
         return -1;
     }
-    dma_zero(5, base, PROC_SLOT_SIZE);
+    if (!dma_zero(DMA_CHAN_SPARE, base, PROC_SLOT_SIZE)) {
+        uart_puts("[proc] arena zero failed\n");
+        proc_mark_empty((u32)slot);
+        return -1;
+    }
     simd_memcpy(base, blob, blob_len);
     u32 loaded = blob_len;
     u32 exec_hash = hw_crc32c(base, loaded);
@@ -2623,9 +2660,9 @@ i32 proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
     proc_wake_pending[slot].v = 0;
     p->principal_id = PRINCIPAL_ROOT;   /* trusted: embedded in kernel image */
     p->affinity_core = affinity_core;
-    p->owner_core = affinity_core;
-    p->pinned_core = PROC_CORE_NONE;
-    p->eligible_core_mask = PROC_ELIGIBLE_USER_MASK;
+    proc_owner_set(p, affinity_core);
+    p->pinned_core = affinity_core;
+    p->eligible_core_mask = 1U << affinity_core;
     p->last_core = affinity_core;
     p->priority_class = priority_class;
     p->quantum_ticks = proc_quantum_for_prio(priority_class);
@@ -2758,7 +2795,11 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
         el0_launch_status = -8;
         return -1;
     }
-    dma_zero(5, base, PROC_SLOT_SIZE);
+    if (!dma_zero(DMA_CHAN_SPARE, base, PROC_SLOT_SIZE)) {
+        uart_puts("[proc] el0 arena zero failed\n");
+        el0_launch_status = -9;
+        return -1;
+    }
     simd_memcpy(base, blob, blob_len);
     u32 loaded = blob_len;
     u32 exec_hash = hw_crc32c(base, loaded);
@@ -2776,9 +2817,9 @@ i32 proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
     proc_wake_pending[slot].v = 0;
     p->principal_id = PRINCIPAL_ROOT;
     p->affinity_core = affinity_core;
-    p->owner_core = affinity_core;
-    p->pinned_core = PROC_CORE_NONE;
-    p->eligible_core_mask = PROC_ELIGIBLE_USER_MASK;
+    proc_owner_set(p, affinity_core);
+    p->pinned_core = affinity_core;
+    p->eligible_core_mask = 1U << affinity_core;
     p->last_core = affinity_core;
     p->priority_class = priority_class;
     p->quantum_ticks = proc_quantum_for_prio(priority_class);
@@ -2949,7 +2990,7 @@ void proc_schedule(void)
          * interrupt queue (bounded, so the scheduler is guaranteed its share),
          * then fall through to process dispatch with the remainder. This is
          * the only software interrupt a user core needs. */
-        {
+        if (airq_pending(core_id() & 3U)) {
             u64 sched_ms = 0ULL;
             (void)airq_quantum(core_id() & 3U, PROC_PREEMPT_QUANTUM_MS,
                                &sched_ms);
@@ -2960,7 +3001,7 @@ void proc_schedule(void)
         (void)swake_drain(core_id() & 3U, 16U);
         for (u32 si = 0; si < proc_slot_scan_limit(); si++) {
             struct process *sp = &procs[si];
-            if (!sp->run_at_el0 || sp->owner_core != core_id())
+            if (!sp->run_at_el0 || proc_owner_core(sp) != core_id())
                 continue;
             u64 inbound_seq = swake_seq(si);
             if (sp->el0_inbound_seq != inbound_seq) {
@@ -2982,6 +3023,7 @@ void proc_schedule(void)
             } else if (sp->state == PROC_BLOCKED &&
                        verdict == PCTL_KEEP_RUNNING) {
                 sp->state = PROC_READY;
+                proc_el0_control_clear(si, sp);
                 proc_publish_control(si);
             }
         }
@@ -3003,7 +3045,7 @@ void proc_schedule(void)
             /* Only reap processes homed to this core. procs[] is shared across
              * the per-core schedulers; without this gate one core could reap a
              * DEAD slot another core still owns. */
-            if (procs[i].owner_core != core_id())
+            if (proc_owner_core(&procs[i]) != core_id())
                 continue;
             if (procs[i].state == PROC_DEAD) {
                 if (procs[i].pid != 0) {
@@ -3082,10 +3124,8 @@ void proc_schedule(void)
                  * straight to EL0, spinning through exception handling.
                  */
                 procs[chosen].el0_inbound_seq = swake_seq(chosen);
-            if (procs[chosen].run_at_el0) {
+            if (procs[chosen].run_at_el0)
                 proc_publish_control(chosen);
-                proc_el0_control_clear(chosen, &procs[chosen]);
-            }
             {
                 struct process *qp = &procs[chosen];
                 bool others = proc_qbank_others_runnable(chosen);
@@ -3456,7 +3496,7 @@ void proc_timer_tick(u32 core, u64 tick)
     const u32 tick_scan_n = proc_slot_scan_limit();
     for (u32 i = 0; i < tick_scan_n; i++) {
         struct process *bp = &procs[i];
-        if (bp->owner_core != core || bp->state != PROC_BLOCKED)
+        if (proc_owner_core(bp) != core || bp->state != PROC_BLOCKED)
             continue;
         if (bp->wake_deadline_ms == 0U || now_ms < bp->wake_deadline_ms)
             continue;
@@ -3711,8 +3751,8 @@ bool proc_post_remote_wake(u32 target_core, u32 pid) {
     if (target_core >= 4U || pid == 0)
         return false;
     i32 owner_slot = proc_find_slot_by_pid(pid);
-    if (owner_slot >= 0 && procs[(u32)owner_slot].owner_core < 4U)
-        target_core = procs[(u32)owner_slot].owner_core;
+    if (owner_slot >= 0 && proc_owner_core(&procs[(u32)owner_slot]) < 4U)
+        target_core = proc_owner_core(&procs[(u32)owner_slot]);
     volatile struct proc_rwake_ring *r = &PROC_RWAKE_SHARED->ring[target_core];
     u64 daif = proc_irq_save();
     u32 head = r->head;        /* this core's own prior store: cached read is fine */
@@ -3944,12 +3984,12 @@ bool proc_buffer_ref_acquire(u32 core, u64 ptr, u32 len,
     proc_buffer_ref_refresh(&procs[slot], 64U);
     struct process *p = &procs[slot];
     u32 generation = p->generation;
-    if (p->owner_core != core || p->state != PROC_RUNNING)
+    if (proc_owner_core(p) != core || p->state != PROC_RUNNING)
         return false;
 
     dmb_ish();
     if (current_proc_arr[core].v != slot || p->generation != generation ||
-        p->owner_core != core || p->state != PROC_RUNNING)
+        proc_owner_core(p) != core || p->state != PROC_RUNNING)
         return false;
 
     out->slot = slot;
@@ -3967,7 +4007,7 @@ bool proc_buffer_ref_validate(u32 core, u64 ptr, u32 len,
     proc_buffer_ref_refresh(&procs[ref->slot], 64U);
     const struct process *p = &procs[ref->slot];
     return p->generation == ref->generation &&
-           p->owner_core == core &&
+           proc_owner_core(p) == core &&
            (p->state == PROC_READY || p->state == PROC_RUNNING ||
             p->state == PROC_BLOCKED);
 }
@@ -5278,8 +5318,8 @@ i32 proc_launch_on_core_as_prio(u32 target_core, const char *path, u32 principal
     launch_req[uc].migrate_exec_hash_last = 0;
     launch_req[uc].migrate_exec_hash_next_check_tick = 0;
     launch_req[uc].migrate_exec_hash_check_nonce = 0;
-    launch_req[uc].migrate_pinned_core = PROC_CORE_NONE;
-    launch_req[uc].migrate_eligible_core_mask = PROC_ELIGIBLE_USER_MASK;
+    launch_req[uc].migrate_pinned_core = target_core;
+    launch_req[uc].migrate_eligible_core_mask = 1U << target_core;
     launch_req[uc].migrate_last_core = target_core;
     launch_req[uc].has_migrate_state = 0;
     dmb();
@@ -5320,7 +5360,7 @@ bool proc_set_affinity(u32 pid, u32 core)
         if (procs[i].state == PROC_READY || procs[i].state == PROC_RUNNING || procs[i].state == PROC_BLOCKED) {
             if (procs[i].pinned_core == core)
                 return true;
-            if (procs[i].owner_core == core) {
+            if (proc_owner_core(&procs[i]) == core) {
                 procs[i].pinned_core = core;
                 procs[i].eligible_core_mask |= 1U << core;
                 procs[i].last_core = core;

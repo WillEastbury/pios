@@ -5,7 +5,7 @@ set LD=%TC%\aarch64-none-elf-ld.exe
 set OC=%TC%\aarch64-none-elf-objcopy.exe
 set FULL_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2 -fstack-protector-strong -fno-asynchronous-unwind-tables -fno-align-functions -fno-align-jumps -fno-align-labels -fno-align-loops -DPIOS_PLATFORM=PIOS_PLATFORM_PI5
 set BOOT_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -DPIOS_FB_NO_DOUBLE_BUFFER -DPIOS_RUNTIME_MMIO_BOOTSTRAP=1 -DPIOS_FB_MBOX_POLL_LIMIT=10000U -DPIOS_PLATFORM=PIOS_PLATFORM_PI5
-set USER_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -fno-builtin
+set USER_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -fno-builtin -ffixed-x21
 set QEMU_STAGE2_CFLAGS=-Wall -Wextra -Wno-unused-function -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8-a -mgeneral-regs-only -Iinclude -O2 -fno-builtin -DPIOS_PLATFORM=PIOS_PLATFORM_QEMU_VIRT
 set ASFLAGS=-march=armv8.2-a+simd+crc+crypto -DPIOS_PLATFORM=PIOS_PLATFORM_PI5
 
@@ -51,7 +51,7 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_httpd.elf user_httpd_vm.img
 if errorlevel 1 exit /b 1
-"%CC%" %USER_CFLAGS% -fno-gcse -DPIOS_USER_EL0 -DUHTTP_BRIDGE_INDEX=1 -c user\httpd.c -o build_user\httpd_native.o
+"%CC%" %USER_CFLAGS% -fno-gcse -DPIOS_USER_EL0 -DPIOS_HTTPD_NATIVE -DUHTTP_BRIDGE_INDEX=1 -c user\httpd.c -o build_user\httpd_native.o
 if errorlevel 1 exit /b 1
 "%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_httpd_native.elf build_user\ustart.o build_user\httpd_native.o build_user\picovm.o build_user\picovm_pios_optional.o build_user\simd.o build_user\sha256_hkdf.o build_user\sha512.o build_user\ed25519.o
 if errorlevel 1 exit /b 1

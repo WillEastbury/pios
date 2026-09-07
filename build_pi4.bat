@@ -15,7 +15,7 @@ mkdir build_pi4
 if exist build_user rmdir /S /Q build_user
 mkdir build_user
 
-set USER_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8-a+simd+crc+crypto -mno-outline-atomics -mgeneral-regs-only -Iinclude -O2 -fno-builtin
+set USER_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8-a+simd+crc+crypto -mno-outline-atomics -mgeneral-regs-only -Iinclude -O2 -fno-builtin -ffixed-x21
 set USER_ASFLAGS=-march=armv8-a+simd+crc+crypto -mno-outline-atomics -DPIOS_PLATFORM=PIOS_PLATFORM_PI4
 
 echo Building embedded userland binaries...
@@ -39,7 +39,7 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "%OC%" -O binary build_user\user_httpd.elf user_httpd_vm.img
 if errorlevel 1 exit /b 1
-"%CC%" %USER_CFLAGS% -fno-gcse -DPIOS_USER_EL0 -DUHTTP_BRIDGE_INDEX=1 -c user\httpd.c -o build_user\httpd_native.o
+"%CC%" %USER_CFLAGS% -fno-gcse -DPIOS_USER_EL0 -DPIOS_HTTPD_NATIVE -DUHTTP_BRIDGE_INDEX=1 -c user\httpd.c -o build_user\httpd_native.o
 if errorlevel 1 exit /b 1
 "%LD%" -T user\httpd_el0.ld -nostdlib -o build_user\user_httpd_native.elf build_user\ustart.o build_user\httpd_native.o build_user\picovm.o build_user\picovm_pios_optional.o build_user\simd.o build_user\sha256_hkdf.o build_user\sha512.o build_user\ed25519.o
 if errorlevel 1 exit /b 1

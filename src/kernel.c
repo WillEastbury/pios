@@ -1871,8 +1871,14 @@ static u32 http_core_ram_used_kib(u32 core)
     struct core_env *e = core_env_of(core);
     if (e->id == core && e->ram_base == (u8 *)(usize)core_ram_bases[core] &&
         e->ram_end == e->ram_base + CORE_PRIV_SIZE &&
-        e->heap_ptr >= e->ram_base && e->heap_ptr <= e->ram_end)
-        return (u32)((usize)(e->heap_ptr - e->ram_base) >> 10);
+        e->heap_ptr >= e->ram_base && e->heap_ptr <= e->ram_end) {
+        extern u8 __heap_start;
+        usize base = (usize)e->ram_base;
+        if (core == CORE_NET && base < (usize)&__heap_start)
+            base = (usize)&__heap_start;
+        return (usize)e->heap_ptr >= base ?
+            (u32)(((usize)e->heap_ptr - base) >> 10) : 0U;
+    }
     return 0;
 }
 
@@ -4447,8 +4453,18 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, d.last_channel);
         http_append(out, &len, max, " len=");
         http_append_u64(out, &len, max, d.last_len);
-        http_append(out, &len, max, " enable=");
-        http_append_u64(out, &len, max, d.enable_reg);
+        http_append(out, &len, max, " channel_mask=");
+        http_append_u64(out, &len, max, d.channel_mask);
+        http_append(out, &len, max, " hw_copies=");
+        http_append_u64(out, &len, max, d.hw_copies);
+        http_append(out, &len, max, " hw_zeroes=");
+        http_append_u64(out, &len, max, d.hw_zeroes);
+        http_append(out, &len, max, " last_cs=");
+        http_append_hex32(out, &len, max, d.last_cs);
+        http_append(out, &len, max, " last_debug=");
+        http_append_hex32(out, &len, max, d.last_debug);
+        http_append(out, &len, max, " last_cb=");
+        http_append_hex32(out, &len, max, d.last_cbaddr);
         http_append(out, &len, max, "\nCH CS CBADDR TI SRC DST LEN DEBUG\n");
         for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
             http_append_u64(out, &len, max, ch);
@@ -5313,10 +5329,40 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " load_dram=");
         http_append_u64(out, &len, max, r[4] / 1000ULL);
         http_append(out, &len, max, " cyc/load (lo~=hi~=dram => caches dead; hi<<lo => remap bug)\n");
+    } else if (http_streq(cmd, "proc el0")) {
+        i32 launch_status;
+        u32 launch_pid, launch_slot, enters, enter_pid, fault_pid;
+        u64 base, pc, sp, esr, elr, far, l1, l2, l3, p0w, p0r, p1w;
+        proc_el0_diag_snapshot(&launch_status, &launch_pid, &launch_slot,
+            &base, &enters, &enter_pid, &pc, &sp, &fault_pid, &esr, &elr,
+            &far, &l1, &l2, &l3, &p0w, &p0r, &p1w);
+        const char *names[] = { "launch", "launch_pid", "slot", "enters",
+            "enter_pid", "fault_pid", "pc", "sp", "esr", "elr", "far",
+            "l1", "l2", "l3", "par0w", "par0r", "par1w" };
+        u64 values[] = { (u32)launch_status, launch_pid, launch_slot, enters,
+            enter_pid, fault_pid, pc, sp, esr, elr, far, l1, l2, l3, p0w, p0r, p1w };
+        for (u32 i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+            http_append(out, &len, max, names[i]);
+            http_append(out, &len, max, "=0x");
+            http_append_hex32(out, &len, max, (u32)(values[i] >> 32));
+            http_append_hex32(out, &len, max, (u32)values[i]);
+            http_append(out, &len, max, "\n");
+        }
+        u32 exits[MAX_PROCS_PER_CORE];
+        u32 n = proc_exit_snapshot(exits, MAX_PROCS_PER_CORE);
+        for (u32 i = 0; i < n; i++) {
+            if (!exits[i])
+                continue;
+            http_append(out, &len, max, "slot ");
+            http_append_u64(out, &len, max, i);
+            http_append(out, &len, max, " exit=0x");
+            http_append_hex32(out, &len, max, exits[i]);
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "proc sched")) {
         struct proc_sched_core_snapshot ps[3];
         u32 pn = proc_sched_snapshot(ps, 3);
-        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST TIMER_IRQ WFX AWAIT KEEP ALIAS_STATE PHYS_STATE PUBLISH L3_PTE\n");
+        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST TIMER_IRQ WFX AWAIT KEEP ALIAS_STATE GENERATION PUBLISH L3_PTE\n");
         for (u32 i = 0; i < pn; i++) {
             http_append_u64(out, &len, max, ps[i].core);
             http_append(out, &len, max, " ");
@@ -15004,8 +15050,18 @@ static void ui_print_dma_diag(void)
     ui_console_u32_dec(d.last_channel);
     ui_console_write(" len=");
     ui_console_u32_dec(d.last_len);
-    ui_console_write(" enable=");
-    ui_console_hex_fixed(d.enable_reg, 8);
+    ui_console_write(" channel_mask=");
+    ui_console_hex_fixed(d.channel_mask, 8);
+    ui_console_write(" hw_copies=");
+    ui_console_u32_dec(d.hw_copies);
+    ui_console_write(" hw_zeroes=");
+    ui_console_u32_dec(d.hw_zeroes);
+    ui_console_write(" last_cs=");
+    ui_console_hex_fixed(d.last_cs, 8);
+    ui_console_write(" last_debug=");
+    ui_console_hex_fixed(d.last_debug, 8);
+    ui_console_write(" last_cb=");
+    ui_console_hex_fixed(d.last_cbaddr, 8);
     ui_console_write("\nCH CS CBADDR TI SRC DST LEN DEBUG\n");
     for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
         ui_console_u32_dec(ch);
@@ -20777,7 +20833,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("watchdog status\nwatchdog arm|disarm\nwatchdog timeout <ticks>\nwatchdog mode <halt|reboot>\nwatchdog trip\nwatchdog hw-arm <secs>\nwatchdog hw-pet\nwatchdog hw-disable\nwatchdog hw-trip confirm\n  Hardware BCM2712 PM watchdog at 0x107D200000 (arms a chip-level auto-reset).\n");
     } else if (ui_streq(topic, "dma")) {
         ui_console_write("dma status\n  Show DMA enable state, CB address mode, selftest counters, and channel registers.\n");
-        ui_console_write("dma selftest\n  Re-run the memcpy selftest and auto-select raw/shifted CB address mode if hardware passes.\n");
+        ui_console_write("dma selftest\n  Run bounded hardware copy/zero proofs using BCM2712 shifted CB addresses.\n");
     } else if (ui_streq(topic, "keystore")) {
         ui_console_write("keystore status\n  Show sealed-root status, user-records LBA, and non-secret fingerprint.\n");
         ui_console_write("keystore derive <label>\n  Derive and print a non-secret fingerprint for a label.\n");
@@ -23395,7 +23451,7 @@ static void hdmi_dashboard_render(void)
         fb_puts(" ");
         fb_set_color(C_GRY, 0x00000000);
         fb_puts("probe_fail=");
-        fb_set_color(C_WHT, 0x00000000);   /* mode-probe failures are expected; last_err is the real signal */
+        fb_set_color(dd.selftest_failures ? C_RED : C_WHT, 0x00000000);
         fb_printf("%u", dd.selftest_failures);
         fb_set_cursor(dc, er++);
         fb_set_color(C_GRY, 0x00000000);
@@ -23403,9 +23459,9 @@ static void hdmi_dashboard_render(void)
         fb_set_color(dd.last_error ? C_RED : C_WHT, 0x00000000);
         fb_printf("%x", dd.last_error);
         fb_set_color(C_GRY, 0x00000000);
-        fb_puts(" en=0x");
+        fb_puts(" mask=0x");
         fb_set_color(C_WHT, 0x00000000);
-        fb_printf("%x", dd.enable_reg);
+        fb_printf("%x", dd.channel_mask);
 
         /* ---- FIFO / LEASE ARENAS ---- */
         struct lease_stats ls;
@@ -24106,15 +24162,11 @@ NORETURN void core0_main(void) {
 
     fb_set_color(0x00FFAA00, 0x00000000);
 #if PIOS_HAS_DMA
-    /*
-     * Hardware DMA probing is an explicit diagnostic operation, not boot
-     * work. A failing controller can hold core 0 in MMIO/spin waits long
-     * enough to trip the watchdog before the reactor is alive. Keep the
-     * engine disabled and use the proven NEON fallback until an operator
-     * runs `dma selftest` under the guarded harness.
-     */
-    fb_puts("[dma] hardware selftest deferred; NEON fallback\n");
-    uart_puts("[dma] hardware selftest deferred; NEON fallback\n");
+    bool dma_ok = dma_selftest();
+    fb_puts(dma_ok ? "[dma] hardware copy/zero enabled\n" :
+                     "[dma] hardware proof failed; see dma status\n");
+    uart_puts(dma_ok ? "[dma] hardware copy/zero enabled\n" :
+                       "[dma] hardware proof failed; see dma status\n");
 #else
     fb_puts("[dma] late memcpy selftest skipped on this platform\n");
     uart_puts("[dma] late memcpy selftest skipped on this platform\n");

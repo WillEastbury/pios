@@ -21,7 +21,7 @@ in this document are real measurements, not estimates.
 | Cache coherency | All 4 cores are in the **Inner Shareable** domain, hardware-coherent | cross-core data sharing needs **barriers only**, never cache maintenance |
 | Cache line | 64 bytes | descriptor/ring structures are 64B aligned to avoid false sharing |
 | SIMD | NEON / ASIMD 128-bit, 32 vector regs; DotProd, FP16, crypto, CRC32 | the copy/accel engine; **no SVE** on A76 |
-| DMA | BCM2712 `dma32` engine, channels 0/2/4/5; 40-bit addressing | bulk async transfers; **not** I/O-coherent into cacheable RAM |
+| DMA | BCM2712 `dma32` LITE channels 0/2/4/5; 40-bit descriptor data addresses | 65,532 bytes per CB; **not** I/O-coherent into cacheable RAM |
 | Interrupts | GIC-400 (`GICD=0x107FFF9000`, `GICC=0x107FFFA000`); per-core CNTPNS PPI 30; RP1 peripherals via PCIe/MSI-X → GIC SPI | timer + device IRQ wake; RP1 routing is delicate |
 | System counter | `CNTPCT_EL0`, fixed frequency (`CNTFRQ_EL0`, tens of MHz on this SoC) | all bench "ticks" are CNTPCT counts; relative comparison is what matters |
 
@@ -67,12 +67,28 @@ bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len) {
         simd_memcpy(dst, src, len);
         return len != 0;
     }
-    if (dma_hw_memcpy_enabled && dma_memcpy_hw(channel, dst, src, len))
-        return true;
+    /* The live implementation splits eligible core-0 low-RAM transfers
+     * into <=32 KiB DMA quanta and reports a hardware error explicitly. */
     simd_memcpy(dst, src, len);           /* fallback */
     return len != 0;
 }
 ```
+
+BCM2712 uses a fixed shifted CB pointer (`PA >> 5`), with source/destination
+high bytes in the stride word. It does not use DMA40 CS protection/error bits,
+raw CB-pointer guesses, or writes to the undocumented global `+0xff0` offset.
+The available channels report DEBUG.LITE, limiting each CB to 65,532 bytes.
+Bulk convenience copies use <=32 KiB quanta and dispatch posted network work
+between quanta, without NIC polling. Only core 0 programs hardware; other cores
+and spans outside the existing low-1-GiB convenience window use CPU copies.
+Completion waits stop at an error or a bounded deadline; reset must prove the
+channel and outstanding writes idle before memory can be reused. Boot performs
+real 16 KiB copy and zero-fill proofs before publishing hardware enablement.
+
+Reference: Raspberry Pi Linux
+[`bcm2835-dma.c`](https://github.com/raspberrypi/linux/blob/rpi-6.12.y/drivers/dma/bcm2835-dma.c)
+(`to_40bit_cbaddr`, `MAX_LITE_DMA_LEN`, `is_2712`, and `bcm2835_dma_abort`).
+Channels 6-11 belong to the different DMA40 register block and are not used here.
 
 The 4096 B threshold is a conservative initial value; the true cross-over point
 is being measured empirically (see §6, open item).

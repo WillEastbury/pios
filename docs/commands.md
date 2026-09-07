@@ -148,6 +148,7 @@ In the tables below the **Surfaces** column marks availability:
 | `poke <addr> <value> [1\|2\|4\|8]` | H U | Write live MMIO/RAM (admin/debug). |
 | `dumpmem <addr> [bytes]` | H U | Dump a memory range. |
 | `dma status` / `dma selftest` | H U | DMA channel registers, selftest, CB address mode. |
+| `proc el0` | H U | Read-only EL0 launch/fault details and retained process-slot exit codes. |
 | `irq status` / `irq probe` / `irq selftest` | H U | IRQ counters, read-only GIC probes, delivery selftest. |
 | `macbdiag` / `rxdiag` | H U | MAC RX ownership topology (`contig`, `after_gap`, `first_after`), hole/BNA/liveness recoveries, NIC/net/IRQ pipeline counters. |
 | `net dispatch` | H U | FIFO RX backpressure/resume counts, coalesced indications, deferred wake attempts, and RX/TX drops. Does not poll the NIC. |

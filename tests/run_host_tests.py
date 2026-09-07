@@ -151,6 +151,8 @@ TESTS_MANIFEST = {
     "test_net_dispatch.c": ["src/net_dispatch.c", "src/airq.c"],
     "test_nic_receive.c": ["src/nic.c"],
     "test_tcp_pending.c": ["src/tcp.c"],
+    "test_dma_logic.c": ["src/dma_logic.c"],
+    "test_proc_owner.c": [],
 }
 
 TEST_CFLAGS = {
