@@ -382,7 +382,8 @@ class Smoke:
         loadtest = REPO / "tools" / "qemu_loadtest.py"
         r = subprocess.run(
             [sys.executable, str(loadtest),
-             "--profile", "all", "--duration", "8", "--concurrency", "4"],
+             "--profile", "all", "--duration", "8", "--concurrency", "4",
+             "--no-retry"],
             capture_output=False
         )
         ok = r.returncode == 0

@@ -33,7 +33,10 @@ eth_irq = body_after("static void core0_eth_irq_handler(void)\n{")
 assert "airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX" in eth_irq
 assert "CORE0_IO_NET" not in eth_irq
 assert "net_poll(" not in eth_irq
-assert "net_dispatch_" not in eth_irq
+assert "if (!airq_post_from(" in eth_irq
+assert "net_dispatch_publish_transport(" in eth_irq  # retain work if AIRQ is full
+assert "net_dispatch_handle_" not in eth_irq
+assert "net_ingress_" not in eth_irq
 
 tick = body_after("static void core0_io_tick_hook(u32 core, u64 tick)\n{")
 assert "net_poll(" not in tick

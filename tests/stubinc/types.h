@@ -34,6 +34,9 @@ typedef size_t   usize;
 #ifndef NORETURN
 #define NORETURN    __attribute__((noreturn))
 #endif
+#ifndef UNUSED
+#define UNUSED      __attribute__((unused))
+#endif
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)

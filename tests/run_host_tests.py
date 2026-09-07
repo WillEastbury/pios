@@ -148,9 +148,14 @@ TESTS_MANIFEST = {
     # verified LevelZero proof.
     "test_pcie1.c": [],
     "test_nvme.c": ["src/nvme.c"],
+    "test_net_dispatch.c": ["src/net_dispatch.c", "src/airq.c"],
+    "test_nic_receive.c": ["src/nic.c"],
+    "test_tcp_pending.c": ["src/tcp.c"],
 }
 
 TEST_CFLAGS = {
+    "test_net_dispatch.c": ["-DPIOS_PLATFORM=2"],
+    "test_nic_receive.c": ["-DPIOS_PLATFORM=2"],
     "test_crypto_soft.c": ["-DPIOS_PLATFORM=6"],
     "test_airq_concurrency.c": ["-DPIOS_HOST_CORE_ID_FN", "-pthread"],
     "test_tls_event.c": ["-DPIOS_PLATFORM=6"],
@@ -209,6 +214,7 @@ def main() -> int:
                  "test_issue_137_pcie1_host_contract.py",
                  "test_picoscript_datagram_contract.py",
                  "test_dma_boot_contract.py",
+                 "test_issue_166_ota_transport_budget.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)

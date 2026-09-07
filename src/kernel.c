@@ -5453,8 +5453,11 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                http_streq(cmd, "rp1 irq arm-host6-1") || http_streq(cmd, "rp1 irq source-diag") ||
                http_starts_with(cmd, "rp1 irq storm")) {
         if (http_streq(cmd, "rp1 irq clear")) {
-            core0_eth_irq_drain_and_quench(false);
-            http_append(out, &len, max, "rp1 eth irq quench\n");
+            core0_eth_irq_deferred_quench = true;
+            bool queued = net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                                         NET_DISPATCH_CAUSE_IRQ);
+            http_append(out, &len, max, queued ? "rp1 eth irq quench queued\n" :
+                                               "rp1 eth irq quench unavailable\n");
         } else if (http_streq(cmd, "rp1 irq source-diag")) {
             u32 old_ncr = mmio_read(MACB_BASE + 0x00);
             u32 old_imr = mmio_read(MACB_BASE + 0x30);
@@ -8726,6 +8729,26 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         bool on = http_streq(cmd, "nic dump on");
         nic_set_packet_dump(on);
         http_append(out, &len, max, on ? "nic packet dump ENABLED\n" : "nic packet dump disabled\n");
+    } else if (http_streq(cmd, "net dispatch")) {
+        struct net_dispatch_diag d;
+        net_dispatch_diag_snapshot(&d);
+        http_append(out, &len, max, "net dispatch rx=");
+        http_append_u64(out, &len, max, d.rx_published);
+        http_append(out, &len, max, " rx_drop=");
+        http_append_u64(out, &len, max, d.rx_dropped);
+        http_append(out, &len, max, " backpressure=");
+        http_append_u64(out, &len, max, d.rx_backpressure);
+        http_append(out, &len, max, " resumed=");
+        http_append_u64(out, &len, max, d.rx_resumed);
+        http_append(out, &len, max, " wake_retries=");
+        http_append_u64(out, &len, max, d.wake_retries);
+        http_append(out, &len, max, " coalesced=");
+        http_append_u64(out, &len, max, d.transport_coalesced);
+        http_append(out, &len, max, " tx=");
+        http_append_u64(out, &len, max, d.tx_handled);
+        http_append(out, &len, max, " tx_drop=");
+        http_append_u64(out, &len, max, d.tx_dropped);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "net pump")) {
         /* Issue #94: explicit diagnostic NIC pump. Not used by services. */
         u32 got = net_poll();
@@ -10185,11 +10208,12 @@ static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *
         }
         pos += n;
         written += n;
-        /* Pet the 5s hardware watchdog during a large flush (e.g. the OTA commit
-         * writes ~1.2MB = thousands of blocks); without this the bulk write
-         * would trip the watchdog and reboot mid-write, corrupting the slot. */
-        if (++since_pet >= 64U) {
+        /* Completed writes prove progress. Between small SD quanta, dispatch
+         * queued ingress/egress so a full-image commit cannot starve GEM.
+         * SERVICE's running guard prevents recursively entering this commit. */
+        if (++since_pet >= 8U) {
             since_pet = 0;
+            net_dispatch_yield();
             watchdog_hw_pet();
         }
     }
@@ -10590,10 +10614,10 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
     } else if (http_streq(action, "commit") || http_streq(action, "writeandreboot")) {
         /* writeandreboot = the user's flow: after blocks are uploaded (RAM-staged)
          * and verified (received==total), flush the staged image to the SD slot in
-         * ONE pass and reboot into it. core0 is unresponsive only during this final
-         * flush, which is fine because the board is about to reboot anyway (and the
-         * SD-write loop pets the watchdog). The A/B header is written valid LAST and
-         * the slot is marked pending (health-gated), so a failed flush is safe. */
+         * one synchronous pass and reboot into it. The write loop yields queued
+         * network work between small SD quanta; it never feeds the watchdog in
+         * a stalled write. The A/B header is written valid LAST and the slot is
+         * marked pending (health-gated), so a failed flush is safe. */
         bool force_reboot = http_streq(action, "writeandreboot");
         if (!ota_update.active) {
             error = "no OTA update active";
@@ -13078,7 +13102,7 @@ static void echo_tcp_poll(void) {
                 u32 remain = http_static_len - http_static_off;
                 if (writable > 0) {
                     u32 chunk = remain < writable ? remain : writable;
-                    if (chunk > 512) chunk = 512;
+                    if (chunk > HTTP_TX_CHUNK_MAX) chunk = HTTP_TX_CHUNK_MAX;
                     u32 n = tcp_write(http_client_conn, http_static_body + http_static_off, chunk);
                     http_diag.write_calls++;
                     http_last_write = n;
@@ -23773,7 +23797,9 @@ static void core0_eth_irq_handler(void)
     core0_eth_irq_count++;
     /* Top half: record and return. The record carries the MIP status so the
      * bottom half needs no further hardware read to know why it was woken. */
-    (void)airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, core0_eth_irq_last_mip);
+    if (!airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, core0_eth_irq_last_mip))
+        (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                             NET_DISPATCH_CAUSE_IRQ);
 }
 
 #if PIOS_GENET_IRQ
@@ -23781,7 +23807,9 @@ static void core0_genet_irq_handler(void)
 {
     genet_irq_mask_rx();
     (void)genet_irq_ack();
-    (void)airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, NET_DISPATCH_CAUSE_IRQ);
+    if (!airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, NET_DISPATCH_CAUSE_IRQ))
+        (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                             NET_DISPATCH_CAUSE_IRQ);
 }
 
 static void core0_genet_irq_arm(void)
@@ -23840,11 +23868,17 @@ static void airq_net_transport_handler(const struct airq_record *rec, void *ctx)
 {
     (void)rec;
     (void)ctx;
-    net_dispatch_handle_transport();
-    if (core0_eth_irq_deferred_quench) {
+    bool quench = core0_eth_irq_deferred_quench;
+    if (quench) {
         core0_eth_irq_deferred_quench = false;
-        (void)core0_eth_irq_drain_and_quench(false);
+        /* Clear the cause BEFORE receiving. Clearing it after an empty read
+         * can erase a new packet's only indication while RP1 awaits IACK. */
+        core0_eth_irq_last_macb_isr = macb_irq_ack_rx();
+        dsb();
     }
+    net_dispatch_handle_transport();
+    if (quench)
+        (void)core0_eth_irq_drain_and_quench(false);
 #if PIOS_HAS_GENET
     genet_irq_unmask_rx();
 #endif
@@ -23918,11 +23952,10 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
     const u32 eth_bit = 1U << RP1_INT_ETH;
     /*
      * ADR-033 transport completion.  This no longer drains RX or invokes
-     * protocol work: the transport FIFO handler has already consumed one
-     * bounded ingress quantum.  We only acknowledge hardware and either
-     * re-arm the edge or publish another bounded transport indication.
+     * protocol work: the transport FIFO handler cleared GEM before consuming
+     * its bounded ingress quantum. Do not clear GEM again here: arrivals after
+     * its final receive must remain asserted when IACK returns MSI credit.
      */
-    core0_eth_irq_last_macb_isr = macb_irq_ack_rx();
     dsb();
     core0_eth_irq_last_mip = rp1_mip_host_status_l();
     bool clear = (rp1_irq_status_l() & eth_bit) == 0U;
@@ -23936,20 +23969,22 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
     }
 #endif
     if (clear) {
-        rp1_eth_irq_rearm();
         core0_eth_irq_stall_streak = 0;
-        return true;
+    } else {
+        core0_eth_irq_stall_streak++;
     }
 
     /*
-     * Do not self-publish a transport retry here. A level that remains
-     * asserted after its bounded quantum cannot be converted into an
-     * unbounded software-event loop: that was a core-0 hot poll which kept
-     * airq_pending() true forever. Leave it quiesced for the next explicit
-     * hardware interrupt/recovery path instead.
+     * IACK_EN holds off the next MSI until IACK is written. A packet arriving
+     * between the GEM ack and INTSTAT read can keep the level high; withholding
+     * IACK then waits forever for an interrupt RP1 is forbidden to send.
+     * Return the hardware credit once per scheduled quantum, even if the
+     * level has reasserted. This neither polls nor self-posts protocol work.
+     * RX backpressure retains the transport token without dispatching it
+     * until a downstream stage frees a slot, so IACK is not a busy loop.
      */
-    core0_eth_irq_stall_streak++;
-    return false;
+    rp1_eth_irq_rearm();
+    return clear;
 }
 
 static u32 core0_io_take_flags(void)
