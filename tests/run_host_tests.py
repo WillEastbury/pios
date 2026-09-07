@@ -164,6 +164,7 @@ TESTS_MANIFEST = {
     "test_tcp_pending.c": ["src/tcp.c"],
     "test_dma_logic.c": ["src/dma_logic.c"],
     "test_proc_owner.c": [],
+    "test_usb_descriptor.c": ["src/usb_descriptor.c"],
 }
 
 TEST_CFLAGS = {
