@@ -335,15 +335,19 @@ static inline bool pcie1_cpu_win_overlaps(u64 a_base, u64 a_size,
 static inline bool pcie1_dma_addr_in(u64 pa, u64 n, u64 arena, u64 arena_sz,
                                      u64 pcie_base, u64 *out)
 {
+    u64 off;
     if (!out || n == 0ULL || arena_sz == 0ULL)
+        return false;
+    if (arena > ~0ULL - arena_sz || pcie_base > ~0ULL - arena_sz)
         return false;
     if (pa < arena)
         return false;
     if (pa >= arena + arena_sz)
         return false;
-    if (n > arena_sz - (pa - arena))
+    off = pa - arena;
+    if (n > arena_sz - off || off > ~0ULL - pcie_base)
         return false;
-    *out = pcie_base + (pa - arena);
+    *out = pcie_base + off;
     return true;
 }
 
@@ -359,6 +363,9 @@ bool pcie1_init(void);
 bool pcie1_link_up(void);
 bool pcie1_set_outbound_window(u64 size);
 bool pcie1_enable_memory_path(u32 target_bus);
+bool pcie1_dma_prepare_to_device(const void *ptr, u64 len, u64 *pci_addr);
+bool pcie1_dma_prepare_from_device(void *ptr, u64 len, u64 *pci_addr);
+bool pcie1_dma_complete_from_device(void *ptr, u64 len);
 void pcie1_status(struct pcie1_status *out);
 void pcie1_rescan(void);
 void pcie1_aer_init(void);

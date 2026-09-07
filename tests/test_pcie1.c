@@ -99,6 +99,12 @@ int main(void)
         expect_true("dma process arena fails",
                     !pcie1_dma_addr_in(PIOS_PROC_ARENA_BASE, 64, arena, asz, pcie, &out));
         expect_true("dma null fails", !pcie1_dma_addr(NULL, 64, &out));
+        expect_true("dma arena overflow fails",
+                    !pcie1_dma_addr_in(~0ULL - 1ULL, 1,
+                                       ~0ULL - 1ULL, 4, pcie, &out));
+        expect_true("dma PCIe address overflow fails",
+                    !pcie1_dma_addr_in(arena, 1, arena, asz,
+                                       ~0ULL - 1ULL, &out));
         expect_true("wrapper matches arena",
                     pcie1_dma_addr((const void *)(usize)arena, 16, &out) &&
                     out == pcie);
