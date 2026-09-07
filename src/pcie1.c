@@ -267,6 +267,11 @@ static void record_function(struct pcie1_status *s, u32 bus, u32 dev, u32 func)
     cfg18 = pcie1_cfg_read(bus, dev, func, 0x18);
     e = &s->eps[s->ep_count];
     pcie1_fill_ep(e, (u8)bus, (u8)dev, (u8)func, cfg0, cfg8, cfgc, cfg18);
+    {
+        u32 cmd = pcie1_cfg_read(bus, dev, func, PCI_REG_CMD);
+        cmd &= ~(PCI_CMD_MEM | PCI_CMD_MASTER);
+        pcie1_cfg_write(bus, dev, func, PCI_REG_CMD, cmd);
+    }
     if (s->ep_count == 0) {
         s->first_vendor = e->vendor;
         s->first_device = e->device;
