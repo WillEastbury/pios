@@ -169,8 +169,8 @@ static inline const char *lzero_next_from_facts(const struct lzero_facts *f)
     switch (lzero_block_from_facts(f)) {
     case LZERO_BLOCK_NO_GPU:    return "pcie1 scan: wait for class 03:02/12:00";
     case LZERO_BLOCK_NO_BARS:   return "lzero probe (config BAR sizes)";
-    case LZERO_BLOCK_ATU:       return "grow pcie1 ATU to fit BAR0; never map LMEM";
-    case LZERO_BLOCK_NO_MAP:    return "lzero map (BAR0 into 32MiB Device ATU)";
+    case LZERO_BLOCK_ATU:        return "lzero map: BAR0 must be aligned and fit ATU";
+    case LZERO_BLOCK_NO_MAP:     return "lzero map (BAR0 into sized Device ATU)";
     case LZERO_BLOCK_NO_GUC_FW: return "WALFS guc blob + adrv load (not yet)";
     case LZERO_BLOCK_NO_PROOF:  return "host-compiled ZEBIN known-answer";
     default:                    return "verified";
@@ -222,17 +222,35 @@ static inline const char *lzero_state_name(u32 state)
     }
 }
 
+static inline u32 lzero_compute_rank(const struct pcie1_ep *e)
+{
+    if (!e || !pcie1_is_compute_ep(e))
+        return 0U;
+    if (pcie1_is_b50(e->vendor, e->device))
+        return 400U;
+    if (e->base_class == 0x03U && e->subclass == 0x02U)
+        return 300U;
+    if (e->base_class == 0x12U)
+        return 200U;
+    return 100U; /* VGA/display is a fallback, not the preferred compute fn. */
+}
+
 static inline const struct pcie1_ep *lzero_pick_compute(const struct pcie1_ep *eps,
                                                        u32 n)
 {
+    const struct pcie1_ep *best = NULL;
+    u32 best_rank = 0U;
     u32 i;
     if (!eps)
         return NULL;
     for (i = 0; i < n; i++) {
-        if (pcie1_is_compute_ep(&eps[i]))
-            return &eps[i];
+        u32 rank = lzero_compute_rank(&eps[i]);
+        if (rank > best_rank) {
+            best = &eps[i];
+            best_rank = rank;
+        }
     }
-    return NULL;
+    return best;
 }
 
 void lzero_probe(void);

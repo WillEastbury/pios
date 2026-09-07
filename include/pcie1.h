@@ -357,6 +357,8 @@ static inline bool pcie1_dma_addr(const void *ptr, u64 n, u64 *out)
 
 bool pcie1_init(void);
 bool pcie1_link_up(void);
+bool pcie1_set_outbound_window(u64 size);
+bool pcie1_enable_memory_path(u32 target_bus);
 void pcie1_status(struct pcie1_status *out);
 void pcie1_rescan(void);
 void pcie1_aer_init(void);
