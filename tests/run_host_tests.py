@@ -199,6 +199,7 @@ def main() -> int:
                  "test_issue_112_bcache.py",
                  "test_qemu_blk_probe.py",
                  "test_sdio_io_only_cmd5.py",
+                 "test_irq_fifo_intids.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)
