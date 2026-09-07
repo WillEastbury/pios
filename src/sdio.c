@@ -682,17 +682,17 @@ bool sdio_init(void)
 
     timer_delay_ms(20U);
 
-    /* CMD0: GO_IDLE_STATE */
-    sdio_send_cmd(SDIO_CMD0, 0, NULL);
-    /* Reset CMD line and wait for auto-clear */
-    sw8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD);
-    timeout = 100000;
-    while ((sr8(SDHCI_SOFTWARE_RESET) & SDHCI_RESET_CMD) && timeout--)
-        delay_cycles(10);
+    /*
+     * Do not send CMD0 here. CMD0 is the SD memory-card GO_IDLE command;
+     * CYW43 is an IO-only SDIO card and enumeration starts with CMD5.
+     * Some parts tolerate CMD0, while others leave the command line in an
+     * error state and make the first CMD5 probe flaky.
+     */
+    uart_puts("[sdio] skip CMD0 for IO-only card\n");
     sw(REG_INTERRUPT, 0xFFFFFFFF);
     delay_cycles(100000);
 
-    /* Re-check PRESENT_STATE after CMD0 + clock */
+    /* Re-check PRESENT_STATE after clock setup */
     pstate = sr(REG_STATUS);
     uart_puts("[sdio] post-CMD0 PRESENT=");
     uart_hex(pstate);
