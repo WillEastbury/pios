@@ -71,7 +71,8 @@ struct dma_diag_snapshot {
 #define DMA_CS_ACTIVE        (1 << 0)
 #define DMA_CS_END           (1 << 1)
 #define DMA_CS_INT           (1 << 2)
-#define DMA_CS_ERROR         (1 << 8)
+#define DMA_CS_PROT          (3 << 8)     /* DMA40 supervisor protection */
+#define DMA_CS_ERROR         (1 << 10)    /* DMA40 hardware error */
 #define DMA_CS_RESET         (1 << 31)
 #define DMA_CS_ABORT         (1 << 30)
 

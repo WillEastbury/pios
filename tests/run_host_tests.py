@@ -209,6 +209,7 @@ def main() -> int:
                  "test_issue_137_pcie1_host_contract.py",
                  "test_picoscript_datagram_contract.py",
                  "test_dma_boot_contract.py",
+                 "test_dma40_contract.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)

@@ -93,7 +93,8 @@ void dma_init(void) {
         mmio_write(dma_reg(ch, DMA_CH_CS), DMA_CS_RESET);
         delay_cycles(1000);
         /* Clear status bits */
-        mmio_write(dma_reg(ch, DMA_CH_CS), DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
+        mmio_write(dma_reg(ch, DMA_CH_CS),
+                   DMA_CS_PROT | DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
     }
 
     /* Zero the CB pool */
@@ -253,7 +254,8 @@ static bool dma_start_direct(u32 channel, u32 ti, u32 src, u32 dst, u32 len)
     if (channel >= DMA_NUM_CHANNELS) return false;
     if (!dma_channel_allowed(channel)) return false;
     if (dma_busy(channel)) return false;
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
+    mmio_write(dma_reg(channel, DMA_CH_CS),
+               DMA_CS_PROT | DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
     mmio_write(dma_reg(channel, DMA_CH_TI), ti);
     mmio_write(dma_reg(channel, DMA_CH_SRC), src);
     mmio_write(dma_reg(channel, DMA_CH_DST), dst);
@@ -261,7 +263,7 @@ static bool dma_start_direct(u32 channel, u32 ti, u32 src, u32 dst, u32 len)
     mmio_write(dma_reg(channel, DMA_CH_STRIDE), 0);
     mmio_write(dma_reg(channel, DMA_CH_NEXTCB), 0);
     dsb();
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_ACTIVE);
+    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_PROT | DMA_CS_ACTIVE);
     return true;
 }
 
@@ -278,17 +280,18 @@ void dma_wait(u32 channel) {
     while ((mmio_read(dma_reg(channel, DMA_CH_CS)) & DMA_CS_ACTIVE) && spin--)
         ;
     /* Clear end/int flags */
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_END | DMA_CS_INT);
+    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_PROT | DMA_CS_END | DMA_CS_INT);
 }
 
 void dma_abort(u32 channel) {
     if (channel >= DMA_NUM_CHANNELS) return;
     if (!dma_channel_allowed(channel)) return;
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_ABORT);
+    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_PROT | DMA_CS_ABORT);
     delay_cycles(1000);
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_RESET);
+    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_PROT | DMA_CS_RESET);
     delay_cycles(1000);
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
+    mmio_write(dma_reg(channel, DMA_CH_CS),
+               DMA_CS_PROT | DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
 }
 
 bool dma_start(u32 channel, struct dma_cb *cb) {
@@ -304,7 +307,7 @@ bool dma_start(u32 channel, struct dma_cb *cb) {
     mmio_write(dma_reg(channel, DMA_CH_CBADDR), dma_cb_addr(cb));
 
     /* Activate */
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_ACTIVE);
+    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_PROT | DMA_CS_ACTIVE);
 
     return true;
 }
@@ -367,7 +370,7 @@ static bool dma_memcpy_hw(u32 channel, void *dst, const void *src, u32 len) {
     u32 cs = mmio_read(dma_reg(channel, DMA_CH_CS));
     if (cs & DMA_CS_ERROR) {
         dma_last_error = DMA_ERR_HW_ERROR;
-        mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_ERROR);
+        mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_PROT | DMA_CS_ERROR);
         return false;
     }
 
