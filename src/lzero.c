@@ -93,7 +93,8 @@ bool lzero_probe_bars(void)
         slot += is64 ? 2U : 1U;
     }
 
-    pcie1_cfg_write(bus, dev, fn, PCI_REG_CMD, cmd);
+    pcie1_cfg_write(bus, dev, fn, PCI_REG_CMD,
+                    cmd & ~(PCI_CMD_MEM | PCI_CMD_MASTER));
 
     g_lzero.bar0_size = bar0;
     g_lzero.lmem_size = lmem;
