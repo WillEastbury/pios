@@ -6,7 +6,7 @@ on every mapping of a PA. Hardware is a capability set selected at compile
 time (`PIOS_PLATFORM` in `include/platform.h`), not “always BCM2712 + RP1”.
 
 Kernel contracts: [`architecture_system.md`](architecture_system.md).
-Decisions: ADR-038 through ADR-043 in
+Decisions: ADR-038 through ADR-049 in
 [`architecture_decision_log.md`](architecture_decision_log.md).
 Traps: [`gotchas.md`](gotchas.md).
 
@@ -89,6 +89,12 @@ IRQ). WiFi is `nic_load("wifi-cyw43455")` and DAT1/SDHCI IRQ → FIFO on GIC
 hosts. BCM2837 has no GIC; GPU SDIO IRQ is not routed yet. Pi 4 and Pi 5 stay
 wired-first (`.201`); `wifi activate` adds `.202`. BCM2837 boards have no
 wired MAC, so stage2 may auto-init Wi-Fi (ADR-041).
+
+**Zero 2 W firmware (ADR-049).** Before SDIO1 disturbs FAT, preload and
+validate the two pinned `/wifi/zero2w/43436*` records. The raw ChipCommon
+chip/revision word, not the VideoCore PCB revision, selects exactly one
+candidate: 43430 rev1 uses 43436s with no CLM; rev2–15 uses 43436 plus CLM.
+All other values fail closed.
 
 **MMU trap.** BCM2837 UART/SD/QA7 sit **inside** the low 4 GiB, so stage0
 cannot reuse the Pi 5 1 GiB Normal-NC L1[0]. Unknown MIDR fails closed rather

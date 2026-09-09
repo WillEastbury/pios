@@ -92,6 +92,8 @@ decision)
 | [045](#adr-045) | Pi 5 pcie1 FFC is a second RC; LevelZero stays fail-closed | Owner | Accepted |
 | [046](#adr-046) | LevelZero B→E path: compute-class, BAR0 only, no LMEM | Owner | Accepted |
 | [047](#adr-047) | Event-driven real TLS 1.3 client and server I/O | Owner | Accepted |
+| [048](#adr-048) | Gate SDIO1 high speed on Function-1 proof | Owner | Accepted |
+| [049](#adr-049) | Zero 2 W dual-preload firmware manifest | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -616,6 +618,36 @@ testing its supported configuration.
 
 **Validation.** Host source contracts pin proof ordering; hardware validation
 must demonstrate the two successful Function-1 proofs on each SDIO1 platform.
+
+---
+
+<a name="adr-049"></a>
+## ADR-049 — Zero 2 W dual-preload firmware manifest
+
+**Date:** 2026-09-09 · **Decider:** Owner · **Status:** Accepted
+
+**Approved design: `dual-preload-manifest`.** SDIO1 setup can disturb access
+to the FAT volume that holds radio firmware, but the Zero 2 W radio variant
+cannot safely be inferred from its PCB/VideoCore board revision.
+
+**Decision.** Before initializing SDIO1, stage2 reads two immutable,
+version-1 manifest records from FAT and validates each artifact's exact length
+and SHA-256. The records are the pinned RPi-Distro `firmware-nonfree`
+`3bab0f823f5b53150b76aab77093adef6655b920` CYW43436 set (firmware, NVRAM,
+CLM) and CYW43436s set (firmware, NVRAM, explicitly no CLM). Their combined
+storage is 872,412 bytes. After SDIO exposes ChipCommon, only the raw word
+selects one record: `(raw & 0xffff) == 43430` decimal (`0xA9A6`) is required;
+`(raw >> 16) & 0x0f == 1` selects 43436s without a CLM; revisions 2–15 select
+43436 with its required CLM; revision zero and every other value fail closed.
+
+**Rejected.** Selecting by Zero 2 W PCB/VideoCore board revision, accepting a
+generic 43436 record after a validation failure, loading an optional CLM for
+43436s, or reopening FAT after SDIO initialization.
+
+**Safety.** Candidate buffers remain internal to the driver and become
+read-only-by-contract after validation. The selected firmware/NVRAM/CLM
+pointers never leave the driver, no heap is used, and manifest/hash, missing
+artifact, chip-id, and revision failures abort before firmware upload.
 
 ---
 

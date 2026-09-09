@@ -53,7 +53,8 @@ TESTS_MANIFEST = {
     "test_board_detect.c": ["src/board_detect.c"],
     # Board-specific CYW blob selection, BCM2712 stepping classification,
     # BCM2711 pull fields, and VideoCore GPIO property-tag layout.
-    "test_wifi_platform.c": ["src/wifi_platform.c", "src/mailbox.c"],
+    "test_wifi_platform.c": ["src/wifi_platform.c", "src/mailbox.c",
+                             "src/sha256_hkdf.c"],
     "test_sdhost.c": ["src/sdhost_logic.c"],
     # USB Bulk-Only/SCSI geometry discovery. The test supplies a deterministic
     # transport mock and verifies READ CAPACITY(16) is issued only after the
@@ -238,6 +239,7 @@ def main() -> int:
                  "test_issue_100_sdio_50mhz_strap.py",
                  "test_sdio_clock_contract.py",
                  "test_issue_120_sdio1_high_speed_probe.py",
+                 "test_issue_70_usb3_phy.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)

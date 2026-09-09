@@ -28,4 +28,9 @@ auto_hook = kernel.index("cyw43_set_progress_hook(wifi_upload_progress);", auto_
 auto_init = kernel.index("wifi_boot_ready = nic_init_wifi();", auto_wifi)
 assert auto_hook < auto_init
 
+cyw_init = source.index("bool cyw43_init(void)")
+zero2w_guard = source.index("if (!zero2w_candidates_loaded)", cyw_init)
+sdio_init = source.index("if (!sdio_init())", cyw_init)
+assert zero2w_guard < sdio_init
+
 print("WiFi preload renews watchdog only after bounded FAT-read progress")
