@@ -592,6 +592,33 @@ heap”. `clCreateProgramWithSource` / IGC on the board. Porting xe/i915.
 
 ---
 
+<a name="adr-048"></a>
+## ADR-048 — Gate SDIO1 high speed on Function-1 proof
+
+**Date:** 2026-09-09 · **Decider:** Owner · **Status:** Accepted
+
+**Context.** SDIO1 capability bits and the controller clock rate advertise
+possible high-speed operation but do not prove that the onboard radio can
+complete a multi-block CMD53 transfer at that rate. Enabling 50 MHz during
+host initialization made any later Function-1 probe incapable of gating the
+transition.
+
+**Decision.** Initialize every host at 25 MHz. After CYW Function 1 is
+enabled, run the bounded 64-block read/write proof, enable high speed only
+when the card and host support it, then run the proof again. Any requested
+transition or post-transition proof failure aborts firmware loading before a
+firmware transfer. A host/card without high-speed capability remains at the
+already-proven 25 MHz rate.
+
+**Rejected.** Trusting CAP0 or CCCR high-speed advertisement alone; enabling
+50 MHz before Function 1 exists; and disabling high speed permanently without
+testing its supported configuration.
+
+**Validation.** Host source contracts pin proof ordering; hardware validation
+must demonstrate the two successful Function-1 proofs on each SDIO1 platform.
+
+---
+
 <a name="adr-047"></a>
 ## ADR-047 — Event-driven real TLS 1.3 client and server I/O
 

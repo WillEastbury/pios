@@ -237,6 +237,7 @@ def main() -> int:
                  "test_wifi_preload_progress.py",
                  "test_issue_100_sdio_50mhz_strap.py",
                  "test_sdio_clock_contract.py",
+                 "test_issue_120_sdio1_high_speed_probe.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)

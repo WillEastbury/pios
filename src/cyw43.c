@@ -2732,6 +2732,17 @@ bool cyw43_load_firmware(void)
     cyw_diag.f1_batch_blocks = CYW_F1_BATCH_BLOCKS;
     uart_puts("[cyw] F1 multiblock verified\n");
 
+    /*
+     * SDIO1 must prove a complete Function-1 transaction before and after
+     * its optional 50MHz transition. This keeps CAP/CCCR advertisement from
+     * being mistaken for a usable high-speed transport.
+     */
+    if (!sdio_enable_high_speed() || !probe_f1_multiblock()) {
+        cyw_diag.last_error = 27U;
+        uart_puts("[cyw] F1 high-speed verify failed\n");
+        return false;
+    }
+
     /* Request ALP clock for backplane memory access */
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqALP);
     for (u32 i = 0; i < 1000; i++) {

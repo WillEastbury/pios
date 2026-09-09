@@ -33,7 +33,6 @@ assert "return true;" in clock
 
 init = body_after("bool sdio_init(void)")
 assert init.count("if (!sdio_set_clock(") >= 2
-assert init.index("sdio_cmd52_write(SDIO_FUNC_CIA, CCCR_HIGH_SPEED") < \
-       init.index("!sdio_set_clock(50000U)")
+assert "CCCR_HIGH_SPEED" not in init
 
 print("SDIO uses controller-specific clocks and fails closed on setup failure")

@@ -182,6 +182,9 @@ void sdio_irq_snapshot(u32 *status, u32 *signal_enable, u32 *mask,
                        u32 *gic_enable, u32 *gic_pending,
                        u32 *gic_target);
 bool sdio_set_bus_width_4bit(void);
+/* Enables card/host high-speed mode if advertised. Safe no-op when absent;
+ * false only when a requested transition cannot be completed. */
+bool sdio_enable_high_speed(void);
 
 /* Power control */
 bool sdio_power_on(void);

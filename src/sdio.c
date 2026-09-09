@@ -347,6 +347,23 @@ static bool sdio_enable_bcm2712_50mhz(void)
 #endif
 }
 
+bool sdio_enable_high_speed(void)
+{
+    u8 high_speed = 0U;
+    if (!sdio_enable_bcm2712_50mhz() ||
+        !sdio_cmd52_read(SDIO_FUNC_CIA, CCCR_HIGH_SPEED, &high_speed) ||
+        (high_speed & HIGH_SPEED_SHS) == 0U)
+        return true; /* Remain in the proven 25MHz mode. */
+    if (!sdio_cmd52_write(SDIO_FUNC_CIA, CCCR_HIGH_SPEED,
+                          high_speed | HIGH_SPEED_EHS) ||
+        !sdio_set_clock(50000U)) {
+        uart_puts("[sdio] high speed transition failed\n");
+        return false;
+    }
+    uart_puts("[sdio] high speed 50MHz\n");
+    return true;
+}
+
 /* ── GPIO and power setup ── */
 
 /* ── BCM2712 SoC GPIO/pinctrl helpers ── */
@@ -908,21 +925,6 @@ bool sdio_init(void)
     uart_puts("[sdio] CCCR=");
     uart_hex(cccr_rev);
     uart_puts("\n");
-
-    u8 high_speed = 0U;
-    if (sdio_enable_bcm2712_50mhz() &&
-        sdio_cmd52_read(SDIO_FUNC_CIA, CCCR_HIGH_SPEED, &high_speed) &&
-        (high_speed & HIGH_SPEED_SHS) != 0U) {
-        if (!sdio_cmd52_write(SDIO_FUNC_CIA, CCCR_HIGH_SPEED,
-                              high_speed | HIGH_SPEED_EHS) ||
-            !sdio_set_clock(50000U)) {
-            uart_puts("[sdio] high speed transition failed\n");
-            return false;
-        }
-        uart_puts("[sdio] high speed 50MHz\n");
-    } else if (PIOS_HAS_WIFI_SDIO2) {
-        uart_puts("[sdio] high speed unavailable; staying at 25MHz\n");
-    }
 
     sdio_initialized = true;
     sdio_diag.initialized = 1U;
