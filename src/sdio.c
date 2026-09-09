@@ -301,6 +301,24 @@ static void sdio_set_clock(u32 freq_khz)
     delay_cycles(1000);
 }
 
+static bool sdio_enable_bcm2712_50mhz(void)
+{
+#if PIOS_HAS_WIFI_SDIO2
+    u64 cfg = WIFI_SDIO_HOST_BASE + BCM2712_SDIO2_CFG_OFFSET;
+    u32 mode = mmio_read(cfg + SDIO_CFG_MAX_50MHZ_MODE);
+    mode |= SDIO_CFG_MAX_50MHZ_STRAP_OVERRIDE |
+            SDIO_CFG_MAX_50MHZ_ENABLE;
+    mmio_write(cfg + SDIO_CFG_MAX_50MHZ_MODE, mode);
+    u32 readback = mmio_read(cfg + SDIO_CFG_MAX_50MHZ_MODE);
+    return (readback & (SDIO_CFG_MAX_50MHZ_STRAP_OVERRIDE |
+                        SDIO_CFG_MAX_50MHZ_ENABLE)) ==
+           (SDIO_CFG_MAX_50MHZ_STRAP_OVERRIDE |
+            SDIO_CFG_MAX_50MHZ_ENABLE);
+#else
+    return true;
+#endif
+}
+
 /* ── GPIO and power setup ── */
 
 /* ── BCM2712 SoC GPIO/pinctrl helpers ── */
@@ -660,9 +678,6 @@ bool sdio_init(void)
     uart_hex(sdio_diag.cfg_ctrl);
     uart_puts("\n");
 
-    /* MAX_50MHZ strap — leave as-is for basic 25MHz bring-up.
-     * Only override if implementing UHS/tuning modes (>50MHz). */
-
     /* Set SD_PIN_SEL to SD mode (not eMMC) — BCM2712-specific */
     u32 pinsel = mmio_read(cfg + SDIO_CFG_SD_PIN_SEL);
     pinsel &= ~0x3U;
@@ -861,12 +876,15 @@ bool sdio_init(void)
     uart_puts("\n");
 
     u8 high_speed = 0U;
-    if (sdio_cmd52_read(SDIO_FUNC_CIA, CCCR_HIGH_SPEED, &high_speed) &&
+    if (sdio_enable_bcm2712_50mhz() &&
+        sdio_cmd52_read(SDIO_FUNC_CIA, CCCR_HIGH_SPEED, &high_speed) &&
         (high_speed & HIGH_SPEED_SHS) != 0U &&
         sdio_cmd52_write(SDIO_FUNC_CIA, CCCR_HIGH_SPEED,
                          high_speed | HIGH_SPEED_EHS)) {
         sdio_set_clock(50000U);
         uart_puts("[sdio] high speed 50MHz\n");
+    } else if (PIOS_HAS_WIFI_SDIO2) {
+        uart_puts("[sdio] high speed unavailable; staying at 25MHz\n");
     }
 
     sdio_initialized = true;
