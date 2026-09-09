@@ -51,7 +51,14 @@ TESTS_MANIFEST = {
     # (Cortex-A76 -> Pi5, Cortex-A53 -> BCM2837-family). Pure bit-decode
     # logic, no asm/MMIO. See src/board_detect.c, include/board_detect.h.
     "test_board_detect.c": ["src/board_detect.c"],
+    # Board-specific CYW blob selection, BCM2712 stepping classification,
+    # BCM2711 pull fields, and VideoCore GPIO property-tag layout.
+    "test_wifi_platform.c": ["src/wifi_platform.c", "src/mailbox.c"],
     "test_sdhost.c": ["src/sdhost_logic.c"],
+    # USB Bulk-Only/SCSI geometry discovery. The test supplies a deterministic
+    # transport mock and verifies READ CAPACITY(16) is issued only after the
+    # READ CAPACITY(10) sentinel, including malformed-response rejection.
+    "test_usb_storage.c": [],
     "test_crypto_soft.c": ["src/crypto.c"],
     # P-256 general-point ECDH multiply (added for TLS 1.3 server-side
     # ECDHE key exchange). Pure math, no MMIO/asm deps beyond simd_memset
@@ -217,6 +224,8 @@ def main() -> int:
                  "test_picoscript_datagram_contract.py",
                  "test_dma_boot_contract.py",
                  "test_issue_166_ota_transport_budget.py",
+                 "test_pios_ota_update.py",
+                 "test_stage0_pkg_check.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)

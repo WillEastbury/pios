@@ -29,6 +29,7 @@
 #include "exception.h"
 #include "board_detect.h"
 #include "mailbox.h"
+#include "wifi_platform.h"
 
 /* ── Constants ── */
 
@@ -272,6 +273,11 @@ static u32 cyw43_board_model(void)
         return board_model_from_revision(board_mbox[5]);
 #endif
     return BOARD_MODEL_UNKNOWN;
+}
+
+static bool cyw43_firmware_paths(struct wifi_firmware_paths *paths)
+{
+    return wifi_firmware_paths_for(PIOS_PLATFORM, cyw43_board_model(), paths);
 }
 
 /* Pre-loaded blobs (loaded before cyw43_init disturbs SD) */
@@ -677,11 +683,12 @@ static u32 cyw43_firmware_ramsize(void)
 static bool chip_identify(void)
 {
     u32 chip_id;
+    struct wifi_firmware_paths paths;
     if (!bp_read32(CYW_CHIPCOMMON_BASE, &chip_id))
         return false;
 
     u16 id = (u16)(chip_id & 0xFFFF);
-    u16 rev = (u16)((chip_id >> 16) & 0xF);
+    u16 rev = (u16)(chip_id >> 16);
     cyw_chip_id = id;
 
     uart_puts("[cyw] chip=");
@@ -690,8 +697,12 @@ static bool chip_identify(void)
     uart_hex(rev);
     uart_puts("\n");
 
-    if (id != CYW43455_CHIP_ID && id != CYW43430_CHIP_ID) {
-        uart_puts("[cyw] bad chip ID\n");
+    if (!cyw43_firmware_paths(&paths)) {
+        uart_puts("[cyw] board profile unavailable\n");
+        return false;
+    }
+    if (id != paths.expected_chip_id) {
+        uart_puts("[cyw] chip/profile mismatch\n");
         return false;
     }
     return true;
@@ -2569,24 +2580,18 @@ bool cyw43_preload_blobs(void)
         return false;
     }
 
-    const char *fw_path = "/wifi/firmware.bin";
-    const char *nv_path = "/wifi/nvram.txt";
-    const char *clm_path = "/wifi/clm.bin";
-#if PIOS_PLATFORM == PIOS_PLATFORM_PI3
-    if (cyw43_board_model() == BOARD_MODEL_PI3_B_PLUS) {
-        fw_path = "/wifi/pi3bp/firmware.bin";
-        nv_path = "/wifi/pi3bp/nvram.txt";
-        clm_path = "/wifi/pi3bp/clm.bin";
-    } else {
-        fw_path = "/wifi/pi3b/firmware.bin";
-        nv_path = "/wifi/pi3b/nvram.txt";
-        clm_path = "/wifi/pi3b/clm.bin";
+    struct wifi_firmware_paths paths;
+    if (!cyw43_firmware_paths(&paths)) {
+        cyw_diag.last_error = 10U;
+        uart_puts("[cyw-pre] unsupported board profile\n");
+        return false;
     }
-#elif PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
-    fw_path = "/wifi/zero2w/firmware.bin";
-    nv_path = "/wifi/zero2w/nvram.txt";
-    clm_path = "/wifi/zero2w/clm.bin";
-#endif
+    const char *fw_path = paths.firmware;
+    const char *nv_path = paths.nvram;
+    const char *clm_path = paths.clm;
+    uart_puts("[cyw-pre] profile ");
+    uart_puts(paths.name);
+    uart_puts("\n");
 
     /* Firmware */
     {

@@ -55,25 +55,29 @@ boards have no GEM, so stage2 may auto-init Wi-Fi as the only path
 
 Core 0 owns:
 
-- NIC descriptor and SDIO polling.
+- NIC descriptor recovery and bounded SDIO hardware polling where the
+  controller lacks an IRQ.
 - Ethernet validation and firewalling.
 - ARP, routes, IPv4, ICMP, UDP, TCP, and DNS.
 - TLS records and the in-kernel service dispatch boundary.
 - Network diagnostics and performance snapshots.
 
-The wired receive path is IRQ-driven with bounded polling and recovery:
+The wired receive path is IRQ-driven. Hardware delivery publishes a bounded
+descriptor, then a core-0 software interrupt runs the next network stage:
 
 ```text
 GEM/RP1 Ethernet IRQ
-  -> core0_eth_irq_handler()
-  -> set CORE0_IO_NET and CORE0_IO_TCP
-  -> core 0 reactor drains net_poll()
-  -> accepted TCP input schedules TCP/service work immediately
-  -> admin, echo, TLS, uhttp bridge, and capsvc pumps run
+  -> IRQ top half acknowledges/quiesces hardware and publishes ingress
+  -> AIRQ/FIFO software handler drains a bounded transport quantum
+  -> each network stage publishes its next FIFO/software event
+  -> service/capsule delivery
 ```
 
-Periodic reactor ticks remain a correctness backstop for TX pumping, TCP
-timers, DNS, WiFi polling, and NIC liveness recovery.
+Timer work may run timers, bounded hardware recovery, and SDIO polling, but it
+does not execute MAC/IP/TCP protocol work to rescue a missing network event.
+That would conceal a lost FIFO/interrupt continuation instead of fixing it.
+See [`network_stack.md`](network_stack.md#fifo-backpressure-and-interrupt-re-arm-166)
+for the re-arm and backpressure contract.
 
 ### Other cores
 

@@ -21,6 +21,7 @@
 #include "gic.h"
 #include "fb.h"
 #include "mailbox.h"
+#include "wifi_platform.h"
 #include "exception.h"
 #include "airq.h"
 #include "core.h"
@@ -306,20 +307,24 @@ static void sdio_set_clock(u32 freq_khz)
 
 static u32 soc_stepping;
 
-static void detect_soc_stepping(void)
+static bool detect_soc_stepping(void)
 {
     u32 val = mmio_read(BCM2712_SOC_STEPPING);
+    u32 stepping_class = wifi_bcm2712_stepping_from_register(val);
     uart_puts("[sdio] SOC_STEPPING=");
     uart_hex(val);
-    if ((val >> 16) == 0x2712) {
+    if (stepping_class != WIFI_BCM2712_STEPPING_UNKNOWN) {
         soc_stepping = val & 0xFF;
         uart_puts(" rev=");
         uart_hex(soc_stepping);
     } else {
-        soc_stepping = 0xFF;  /* unknown — assume pre-D0 */
-        uart_puts(" (unknown SoC)");
+        soc_stepping = 0U;
+        uart_puts(" (unknown; refusing pinmux)");
+        uart_puts("\n");
+        return false;
     }
     uart_puts("\n");
+    return true;
 }
 
 static bool is_d0_stepping(void)
@@ -384,10 +389,11 @@ static void bcm2712_gpio_set_pull(u32 pin, u32 mode)
 #define PULL_NONE 0
 #define PULL_UP   2
 
-static void sdio_gpio_init(void)
+static bool sdio_gpio_init(void)
 {
 #if PIOS_HAS_WIFI_SDIO2
-    detect_soc_stepping();
+    if (!detect_soc_stepping())
+        return false;
 
     /* Read current FSEL for SDIO2 pins */
     uart_puts("[sdio] FSEL: ");
@@ -437,8 +443,11 @@ static void sdio_gpio_init(void)
      * (function-select value 7), with the controller's card-side pull-ups
      * enabled during identification. */
     static const u32 pins[] = { 34U, 35U, 36U, 37U, 38U, 39U };
-    const u32 pin_mask = 0xFCU; /* GPIO34-39 in GPIO bank 1 */
-    uart_puts("[sdio] configuring BCM2837 SDIO1 GPIO34-39\n");
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI4
+     uart_puts("[sdio] configuring BCM2711 SDIO1 GPIO34-39\n");
+#else
+     uart_puts("[sdio] configuring BCM2837 SDIO1 GPIO34-39\n");
+#endif
     for (u32 i = 0U; i < sizeof(pins) / sizeof(pins[0]); i++) {
         u32 pin = pins[i];
         u32 off = (pin / 10U) * 4U;
@@ -448,18 +457,39 @@ static void sdio_gpio_init(void)
         fsel |= 7U << shift; /* ALT3 = SD1_CLK/CMD/DAT[0..3] */
         mmio_write(PIOS_PERIPH_BASE + 0x200000UL + off, fsel);
     }
+    /* BCM2711 replaces BCM2837's GPPUD/GPPUDCLK handshake with a two-bit
+     * pull field per GPIO. */
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI4
+    u32 pull_offset, pull_shift;
+    u32 pull_mask = 0U;
+    for (u32 i = 0U; i < sizeof(pins) / sizeof(pins[0]); i++) {
+        if (!wifi_bcm2711_pull_register(pins[i], &pull_offset, &pull_shift))
+            return false;
+        pull_mask |= 3U << pull_shift;
+    }
+    u32 pulls = mmio_read(PIOS_PERIPH_BASE + 0x200000UL + pull_offset);
+    pulls &= ~pull_mask;
+    for (u32 i = 0U; i < sizeof(pins) / sizeof(pins[0]); i++) {
+        (void)wifi_bcm2711_pull_register(pins[i], &pull_offset, &pull_shift);
+        pulls |= 1U << pull_shift; /* BCM2711: 01 = pull-up */
+    }
+    mmio_write(PIOS_PERIPH_BASE + 0x200000UL + pull_offset, pulls);
+#else
     /* BCM2835/2837 GPIO pull sequence: select pull-up, clock it into the
      * bank-1 pins, then return the global pull selector to disabled. */
+    const u32 pin_mask = 0xFCU; /* GPIO34-39 in GPIO bank 1 */
     mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x94U, 2U);
     delay_cycles(150U);
     mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x9CU, pin_mask);
     delay_cycles(150U);
     mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x94U, 0U);
     mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x9CU, 0U);
+#endif
     uart_puts("[sdio] SDIO1 pins ready\n");
 #else
     uart_puts("[sdio] no WiFi SDIO GPIO configuration\n");
 #endif
+    return true;
 }
 
 bool sdio_power_on(void)
@@ -500,13 +530,20 @@ bool sdio_power_on(void)
     uart_puts("\n");
     return true;
 #elif PIOS_HAS_WIFI_SDIO1 && PIOS_WIFI_WL_REG_ON_FIRMWARE
-    if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false)) {
-        uart_puts("[sdio] firmware WL_ON low failed\n");
+    u32 mbox_status = 0U;
+    if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false,
+                              &mbox_status)) {
+        uart_puts("[sdio] firmware WL_ON low failed response=");
+        uart_hex(mbox_status);
+        uart_puts("\n");
         return false;
     }
     timer_delay_ms(20U);
-    if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, true)) {
-        uart_puts("[sdio] firmware WL_ON high failed\n");
+    if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, true,
+                              &mbox_status)) {
+        uart_puts("[sdio] firmware WL_ON high failed response=");
+        uart_hex(mbox_status);
+        uart_puts("\n");
         return false;
     }
     timer_delay_ms(150U);
@@ -546,7 +583,7 @@ void sdio_power_off(void)
     mmio_write(BCM2712_GPIO1_DATA0, data & ~bit);
     timer_delay_ms(20U);
 #elif PIOS_HAS_WIFI_SDIO1 && PIOS_WIFI_WL_REG_ON_FIRMWARE
-    (void)mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false);
+    (void)mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false, 0);
     timer_delay_ms(20U);
 #elif PIOS_HAS_WIFI_SDIO1
     const u32 bit = 1U << (PIOS_WIFI_WL_REG_ON_GPIO - 32U);
@@ -586,7 +623,10 @@ bool sdio_init(void)
     uart_puts("\n");
 
     /* Configure GPIOs for SDIO */
-    sdio_gpio_init();
+    if (!sdio_gpio_init()) {
+        uart_puts("[sdio] WiFi GPIO setup failed\n");
+        return false;
+    }
 
     /* Power-cycle the WiFi chip */
     if (!sdio_power_on()) {

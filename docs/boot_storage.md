@@ -153,6 +153,18 @@ grinds through a NIC wedge and resumes from the server's acknowledged
 > the board is under stress, because a lost response costs one chunk rather than
 > the whole transfer.
 
+The HTTP updater writes a **single raw platform payload**, capped at
+`PIOS_STAGE2_ZONE_BYTES`; it must not receive FAT `PIOSSTG2.PKG`, which is a
+larger `PGS2` container consumed by stage0. For Pi 5 use
+`build_pi5_stage2\PIOS_PI5_STAGE2.BIN`. A rebooted upload must name the exact
+candidate version, so an older rollback/FAT boot fails rather than reporting
+reachability as success:
+
+```powershell
+python tools\pios_ota_update.py build_pi5_stage2\PIOS_PI5_STAGE2.BIN `
+  --chunked --reboot --expected-version vYYYYMMDD.HHMMSS
+```
+
 Staging is `ota_stage_buf` (highmem when available, capacity
 `PIOS_STAGE2_ZONE_BYTES`; QEMU uses a static fallback). Commit order is
 **payload first, header last**: `http_write_kernel_payload_range()` then
@@ -403,9 +415,10 @@ python tests\run_host_tests.py
 # QEMU regression: 29 assertions + load battery
 $env:PYTHONIOENCODING="utf-8"; python tools\qemu_smoke.py --build
 
-# OTA to a live board (resumable path)
-python tools\pios_ota_update.py real_kernel.img --host 192.168.0.201 `
-    --chunked --reboot --commit-timeout 240 --timeout 15
+# OTA to a live board (resumable raw-payload path)
+python tools\pios_ota_update.py build_pi5_stage2\PIOS_PI5_STAGE2.BIN `
+    --host 192.168.0.201 --chunked --reboot `
+    --expected-version vYYYYMMDD.HHMMSS --commit-timeout 240 --timeout 15
 ```
 
 Environment notes: do not assume `make` exists or that the AArch64 toolchain and

@@ -22,7 +22,8 @@
 
 /* ── CYW43455 chip identifiers ── */
 #define CYW43455_CHIP_ID        0x4345
-#define CYW43430_CHIP_ID        0x4343
+/* ChipCommon reports this as decimal 43430, not hexadecimal 0x4343. */
+#define CYW43430_CHIP_ID        0xA9A6
 #define CYW43455_CHIP_REV       6
 
 /* ── Silicon Backplane (AXI) core addresses ── */

@@ -116,7 +116,7 @@ pios/
 ## Networking
 
 ### `src/nic.c` — NIC Abstraction Layer
-- **Role:** Single active NIC backend dispatch — Ethernet (MACB) or WiFi (CYW43455)
+- **Role:** Interface-aware backend dispatch for wired Ethernet and WiFi
 - **API:** `nic_init()`, `nic_init_wifi()`, `nic_send()`, `nic_recv()`, `nic_get_mac()`, `nic_link_up()`
 - **Interactions:** Called by `net.c`, delegates to `macb.c` or `wifi_nic.c`
 
@@ -130,7 +130,8 @@ pios/
 - **Role:** IP/UDP/TCP demux, packet send/receive, ARP, static neighbors, FIFO bridge
 - **Features:** Ingress validation, checksum offload, GARP announcements
 - **API:** `net_init()`, `net_poll()`, `net_send_udp()`, `net_udp_subscribe()`
-- **Hot path:** `net_poll()` runs on Core 0 every iteration — processes one frame + FIFO + workq
+- **Hot path:** hardware NICs reach `net_poll()` from a bounded FIFO/AIRQ
+  transport event; it is not a core-0 polling loop
 
 ### `src/tcp.c` — TCP Implementation
 - **Role:** Full TCP state machine — connect, listen, accept, send, recv, close
@@ -149,9 +150,9 @@ pios/
 - **Role:** Query DNS server, cache responses
 - **API:** `dns_init()`, `dns_resolve()`
 
-### `src/tls.c` — TLS 1.2
-- **Role:** TLS handshake, record layer encryption/decryption
-- **Features:** Basic cipher suite, certificate handling
+### `src/tls.c` — TLS 1.3
+- **Role:** Event-driven TLS handshake and record transport adapter
+- **Features:** RFC 8446 TLS 1.3 with certificate handling
 - **Interactions:** Uses `crypto.c` for AES/SHA
 
 ### `src/socket.c` — Socket API
@@ -162,15 +163,19 @@ pios/
 
 ## WiFi (Work In Progress)
 
-### `src/sdio.c` — BCM2712 SDIO2 Host Controller
-- **Role:** SDHCI driver for WiFi SDIO at 0x1001100000
-- **Features:** CMD0/CMD5/CMD3/CMD7/CMD52/CMD53, polling mode, 400kHz-25MHz clock
-- **Status:** Controller responds (CAP0/CAP1 valid), CMD5 gets zero response (needs CFG block fix)
+### `src/sdio.c` — SDIO Host Controller
+- **Role:** SDHCI driver for Pi 5 SDIO2 and BCM2837-family SDIO1 WiFi hosts
+- **Features:** bounded CMD5/CMD3/CMD7/CMD52/CMD53, controller-specific clock
+  negotiation, and IRQ-published completion handling
+- **Status:** Pi 5 scanning is operational; association and cross-board
+  firmware/pin selection remain open
 
-### `src/cyw43.c` — CYW43455 WiFi FullMAC Driver
-- **Role:** Broadcom WiFi chip — SDIO enumeration, firmware load, SDPCM/BCDC protocol
+### `src/cyw43.c` — CYW43 WiFi FullMAC Driver
+- **Role:** Broadcom 43430/43436/43455 family — SDIO enumeration, firmware
+  load, SDPCM/BCDC protocol
 - **Features:** Scan, join, disconnect, link status, RSSI, event handling
-- **Status:** Framework complete, needs firmware boot sequence fixes and BCDC message format correction
+- **Status:** Pi 5 scan is operational; association and board-specific firmware
+  selection remain incomplete
 
 ### `src/wifi_nic.c` — WiFi NIC Backend
 - **Role:** Implements `nic.h` interface by delegating to CYW43455 driver
@@ -346,7 +351,7 @@ pios/
 
 ### Network Packet RX
 ```
-NIC hardware → macb_recv() → nic_recv() → net_poll()
+NIC IRQ → AIRQ transport event → `nic_recv()` → `net_poll()`
   → IP validation → TCP/UDP demux
     → tcp: state machine → user socket buffer
     → udp: subscriber callbacks → FIFO → user process
