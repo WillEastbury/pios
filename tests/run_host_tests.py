@@ -228,6 +228,7 @@ def main() -> int:
                  "test_stage0_pkg_check.py",
                  "test_wifi_command_watchdog.py",
                  "test_issue_106_zero2w_wifi_activation.py",
+                 "test_issue_131_zero2w_wl_on.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)
