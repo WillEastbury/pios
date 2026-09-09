@@ -94,6 +94,7 @@ decision)
 | [047](#adr-047) | Event-driven real TLS 1.3 client and server I/O | Owner | Accepted |
 | [048](#adr-048) | Gate SDIO1 high speed on Function-1 proof | Owner | Accepted |
 | [049](#adr-049) | Zero 2 W dual-preload firmware manifest | Owner | Accepted |
+| [050](#adr-050) | Pi5 editor assets ship in raw stage2 and install to WALFS | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -492,9 +493,10 @@ is one shared stack. WiFi is the same `nic_ops` vtable, loaded on demand.
   `nic_load(name, iface)` binds optional backends. WiFi is
   `nic_load("wifi-cyw43455", NIC_IFACE_WIFI)` — never boot-probed, because
   firmware upload must not own core 0.
-- PicoScript IDE blobs live once in the package as platform_id SHARED (16)
-  and are copied by stage0 to `PIOS_SHARED_ASSET_BASE`. Kernel payloads omit
-  `src/ide_assets.c`.
+- Non-Pi5 package flows may carry PicoScript IDE blobs once as platform_id
+  SHARED (16), copied by stage0 to `PIOS_SHARED_ASSET_BASE`. Pi5 supersedes
+  that path under ADR-050: its raw stage2 embeds the compressed source pack
+  and installs it to WALFS. Kernel payloads omit `src/ide_assets.c`.
 
 **Rejected.** Using GENET on Pi 5. Treating `PIOS_HAS_GENET` as “has Ethernet”.
 A second TCP/IP stack for Pi 4. Auto-probing WiFi at `nic_init()`.
@@ -1868,3 +1870,24 @@ it, otherwise supervision reports stale data, which is worse than no data.
 
 **Cost.** Small — one call site, one cache line, no hot-path work. The gating
 item is the publication contract above, not the logic.
+
+<a name="adr-050"></a>
+## ADR-050 — Pi5 editor assets ship in raw stage2 and install to WALFS
+
+**Date:** 2026-09-09 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Embed a Brotli-compressed PicoScript editor pack in the
+raw Pi5 stage2 payload, extract it only after WALFS mounts, and serve it from
+WALFS. Raw OTA must not depend on stage0 copying a FAT `PIOS_SHARED` payload.
+
+**Decision.** The deterministic offline packer emits a versioned `PBRP`
+envelope containing a Brotli-compressed, checksummed `PIAS` asset table. The
+Pi5 kernel verifies compressed CRC32C, bounded decompression, uncompressed
+CRC32C, and the complete asset table before any WALFS write. It writes and
+verifies each named asset in bounded WALFS chunks; an already matching install
+is a no-op. HTTP retains only inode IDs, lengths, and bounded WALFS reads.
+
+**Failure policy.** A bad/truncated pack, decode failure, or failed WALFS
+write leaves the editor unavailable and prevents the candidate boot from being
+marked healthy. It does not attempt repair from partially written data. QEMU's
+existing compiled-in direct-boot fallback is unchanged.

@@ -105,6 +105,7 @@
 #include "pixe_request.h"
 #include "pixe_host.h"
 #include "ide_assets.h"
+#include "ide_asset_pack.h"
 #include "pico_hooks.h"
 #include "keystore.h"
 #include "tls.h"
@@ -11536,10 +11537,51 @@ static u32 http_build_picoscript_asset_response(char *out, u32 max,
     return len;
 }
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+static u32 http_build_picoscript_walfs_response(char *out, u32 max, u32 asset_id,
+                                                 const char *content_type)
+{
+    u32 len = 0;
+    u64 id;
+    u32 bytes;
+    if (!ide_assets_walfs_file(asset_id, &id, &bytes)) {
+        http_append(out, &len, max,
+                    "HTTP/1.0 503 Service Unavailable\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: 20\r\n"
+                    "Connection: close\r\n\r\n"
+                    "IDE assets missing\n");
+        return len;
+    }
+    http_file_id = id;
+    http_file_len = bytes;
+    http_file_off = 0;
+    http_append(out, &len, max, "HTTP/1.0 200 OK\r\nContent-Type: ");
+    http_append(out, &len, max, content_type);
+    http_append(out, &len, max, "\r\nCache-Control: no-store\r\nContent-Length: ");
+    http_append_u64(out, &len, max, bytes);
+    http_append(out, &len, max, "\r\nConnection: close\r\n\r\n");
+    return len;
+}
+#endif
+
 static u32 http_build_picoscript_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     if (http_request_path_is(req, req_len, "/picoscript/config"))
         return http_build_picoscript_config_response(out, max);
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+    if (http_request_path_is(req, req_len, "/picoscript/picowal.html"))
+        return http_build_picoscript_walfs_response(out, max,
+            PIOS_ASSET_IDE_PICOWAL, "text/html; charset=utf-8");
+    if (http_request_path_is(req, req_len, "/picoscript/pico_hooks.js"))
+        return http_build_picoscript_walfs_response(out, max,
+            PIOS_ASSET_IDE_HOOKS, "application/javascript; charset=utf-8");
+    if (http_request_path_is(req, req_len, "/picoscript/baremetal-binary.js"))
+        return http_build_picoscript_walfs_response(out, max,
+            PIOS_ASSET_IDE_BAREMETAL, "application/javascript; charset=utf-8");
+    return http_build_picoscript_walfs_response(out, max,
+        PIOS_ASSET_IDE_HTML, "text/html; charset=utf-8");
+#else
     if (http_request_path_is(req, req_len, "/picoscript/picowal.html"))
         return http_build_picoscript_asset_response(out, max,
             IDE_PICOWAL_HTML, IDE_PICOWAL_HTML_LEN, "text/html; charset=utf-8");
@@ -11552,6 +11594,7 @@ static u32 http_build_picoscript_response(char *out, u32 max, const u8 *req, u32
     /* Portal (root/index.html/playground.html and any other /picoscript request). */
     return http_build_picoscript_asset_response(out, max,
         IDE_HTML, IDE_HTML_LEN, "text/html; charset=utf-8");
+#endif
 }
 
 static bool http_static_path_from_req(const u8 *req, u32 req_len, char *out, u32 out_max)
@@ -24353,7 +24396,7 @@ NORETURN void core0_main(void) {
             ksvc_run(ksvc_timer_id);
             /* Once we have run cleanly for a while, declare the boot healthy so
              * crash-loop protection re-arms for the next genuine fault. */
-            if (!crash_boot_marked_healthy &&
+            if (!crash_boot_marked_healthy && ide_assets_boot_ready() &&
                 timer_monotonic_ms() >= CRASH_HEALTHY_UPTIME_MS) {
                 crash_boot_marked_healthy = true;
                 exception_crash_mark_healthy();
@@ -25395,6 +25438,12 @@ void kernel_main(void) {
                 uart_hex((u32)wh.scan_end);
                 uart_puts("\n");
             }
+            watchdog_hw_pet();
+            bp_log("[ide] install WALFS editor assets...");
+            if (ide_assets_install())
+                bp_ok("[ide] WALFS editor assets ready");
+            else
+                bp_warn("[ide] WALFS editor unavailable; boot remains untrusted");
             watchdog_hw_pet();
             bp_log("[walfs] crashdump archive...");
             if (crashdump_archive_pending())

@@ -41,9 +41,11 @@ before any MMIO:
 
 MIDR splits Pi 5 / Pi 4 / A53. Firmware board-revision then selects Pi 3 vs
 Zero 2 W (`BOARD_MODEL_PI3_B` / `PI3_B_PLUS` / `ZERO2W`). A single
-`PIOSSTG2.PKG` may carry Raspberry payloads plus one SHARED asset pack;
-stage0 copies **only** the matching kernel entry into the raw slot and the
-SHARED pack to `PIOS_SHARED_ASSET_BASE`.
+`PIOSSTG2.PKG` may carry Raspberry payloads plus one legacy SHARED asset pack;
+stage0 copies **only** the matching kernel entry into the raw slot and, when
+present, the SHARED pack to `PIOS_SHARED_ASSET_BASE`. Pi5 raw OTA uses the
+ADR-050 Brotli editor pack embedded in stage2 and installs it to WALFS, so it
+does not require that FAT-side copy.
 
 Stage2 is **compile-time single-platform**. Rebuilding the whole kernel as
 runtime-multi-board is not worthwhile. Images:

@@ -41,6 +41,7 @@ assert not ota.status_has_expected_version("not JSON", "v20260909.115725")
 responses = iter([
     (200, '{"ok":true,"version":"v20260909.115724"}'),
     (200, '{"ok":true,"version":"v20260909.115725"}'),
+    (200, "PicoScript"),
 ])
 original_request = ota.request
 original_sleep = ota.time.sleep
@@ -50,14 +51,14 @@ try:
     assert ota.wait_for_expected_version(
         "unused", 8080, "v20260909.115725", attempts=2, delay_seconds=0
     )
-    ota.request = lambda *args, **kwargs: (
-        200, '{"ok":true,"version":"v20260909.115724"}'
-    )
+    ota.request = lambda *args, **kwargs: (200, '{"ok":true,"version":"v20260909.115724"}')
     assert not ota.wait_for_expected_version(
         "unused", 8080, "v20260909.115725", attempts=1, delay_seconds=0
     )
+    ota.request = lambda *args, **kwargs: (503, "IDE assets missing")
+    assert not ota.editor_is_available("unused", 8080)
 finally:
     ota.request = original_request
     ota.time.sleep = original_sleep
 
-print("pios OTA updater: raw-image and candidate-version gates passed")
+print("pios OTA updater: raw-image, candidate-version, and editor gates passed")

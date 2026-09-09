@@ -29,6 +29,10 @@ OUT = TESTS / "_build"
 # test file -> kernel source files it links against
 TESTS_MANIFEST = {
     "test_picocompress.c": ["src/picocompress.c"],
+    # The Pi5 editor PBRP envelope is made by tools/pios_brotli.py. This test
+    # proves that it is accepted by the in-kernel decoder, validates both
+    # checksummed headers, and rejects/re-recognizes corrupt and truncated data.
+    "test_ide_asset_pack.c": ["src/brotli.c", "src/ide_asset_pack.c"],
     # DHCP option parser: compiled from src/dhcp_options.c (the standalone
     # parser extracted from dhcp.c, pure logic, no MMIO/asm/network deps).
     "test_dhcp.c": ["src/dhcp_options.c"],
@@ -194,6 +198,14 @@ def main() -> int:
               "-Wno-unused-parameter", "-fno-strict-aliasing"]
 
     total_fail = 0
+    asset_pack = subprocess.run(
+        [sys.executable, str(REPO / "tools" / "pack_ide_assets.py"), "--brotli"],
+        cwd=REPO, capture_output=True, text=True
+    )
+    if asset_pack.returncode != 0:
+        print("[BUILD FAIL] editor Brotli asset pack")
+        print(asset_pack.stderr[-2000:])
+        total_fail += 1
     for test, srcs in TESTS_MANIFEST.items():
         exe = OUT / (pathlib.Path(test).stem + (".exe" if sys.platform == "win32" else ""))
         cmd = [cc, *cflags, *TEST_CFLAGS.get(test, []), *inc, str(TESTS / test),
@@ -231,6 +243,7 @@ def main() -> int:
                  "test_dma_boot_contract.py",
                  "test_issue_166_ota_transport_budget.py",
                  "test_pios_ota_update.py",
+                 "test_ide_asset_pack.py",
                  "test_stage0_pkg_check.py",
                  "test_wifi_command_watchdog.py",
                  "test_issue_106_zero2w_wifi_activation.py",

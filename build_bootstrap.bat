@@ -3,11 +3,11 @@ set TC=C:\aarch64-none-elf\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-aarch64-no
 set CC=%TC%\aarch64-none-elf-gcc.exe
 set LD=%TC%\aarch64-none-elf-ld.exe
 set OC=%TC%\aarch64-none-elf-objcopy.exe
-set FULL_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2 -fstack-protector-strong -fno-asynchronous-unwind-tables -fno-align-functions -fno-align-jumps -fno-align-labels -fno-align-loops -DPIOS_PLATFORM=PIOS_PLATFORM_PI5
+set FULL_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -Iinclude -O2 -fstack-protector-strong -fno-asynchronous-unwind-tables -fno-align-functions -fno-align-jumps -fno-align-labels -fno-align-loops -DPIOS_PLATFORM=PIOS_PLATFORM_PI5 -DPIOS_EMBED_RAW_IDE_ASSETS
 set BOOT_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -DPIOS_FB_NO_DOUBLE_BUFFER -DPIOS_RUNTIME_MMIO_BOOTSTRAP=1 -DPIOS_FB_MBOX_POLL_LIMIT=10000U -DPIOS_PLATFORM=PIOS_PLATFORM_PI5
 set USER_CFLAGS=-Wall -Wextra -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8.2-a+simd+crc+crypto -mgeneral-regs-only -Iinclude -O2 -fno-builtin -ffixed-x21
 set QEMU_STAGE2_CFLAGS=-Wall -Wextra -Wno-unused-function -ffreestanding -nostdlib -nostartfiles -std=gnu11 -march=armv8-a -mgeneral-regs-only -Iinclude -O2 -fno-builtin -DPIOS_PLATFORM=PIOS_PLATFORM_QEMU_VIRT
-set ASFLAGS=-march=armv8.2-a+simd+crc+crypto -DPIOS_PLATFORM=PIOS_PLATFORM_PI5
+set ASFLAGS=-march=armv8.2-a+simd+crc+crypto -DPIOS_PLATFORM=PIOS_PLATFORM_PI5 -DPIOS_EMBED_RAW_IDE_ASSETS
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyyyMMdd.HHmmss'"') do set BUILD_STAMP=%%i
 > include\build_version.h echo #pragma once
@@ -84,6 +84,8 @@ if errorlevel 1 exit /b 1
 for %%f in (user_capsvc_host0.img) do echo user_capsvc_host0.img size: %%~zf bytes
 
 echo Building Pi5 stage2 payload...
+python tools\pack_ide_assets.py --brotli
+if errorlevel 1 exit /b 1
 if not exist build mkdir build
 for %%f in (src\*.S) do (
     if /I not "%%~nxf"=="bootstrap_start.S" if /I not "%%~nxf"=="bootstrap_trampoline.S" if /I not "%%~nxf"=="provision_payload.S" if /I not "%%~nxf"=="provision_revert_payload.S" if /I not "%%~nxf"=="qemu_virt_start.S" if /I not "%%~nxf"=="qemu_stage2_start.S" if /I not "%%~nxf"=="qemu_stage2_manifest.S" if /I not "%%~nxf"=="qemu_boot_stage2_manifest.S" (
@@ -104,6 +106,8 @@ for %%f in (src\*.c) do (
 if errorlevel 1 exit /b 1
 "%OC%" -O binary real_kernel.elf build_pi5_stage2\PIOS_PI5_STAGE2.BIN
 if errorlevel 1 exit /b 1
+python tools\stage2_size_gate.py build_pi5_stage2\PIOS_PI5_STAGE2.BIN
+if errorlevel 1 exit /b 1
 
 echo Building full QEMU feature-parity payload...
 call .\build_qemu_full.bat
@@ -118,9 +122,7 @@ REM A combined Pi5+QEMU package no longer fits the slot. The Pi5 FAT slot never
 REM needs the QEMU image
 REM (qemu_smoke boots build_qemu_full\PIOS_QEMU_FULL.BIN directly and the QEMU
 REM UEFI path builds its own QEMU-only package), so package Pi5-only here.
-python tools\pack_ide_assets.py
-if errorlevel 1 exit /b 1
-python tools\build_stage2_package.py --pi build_pi5_stage2\PIOS_PI5_STAGE2.BIN --shared assets\pios_shared_assets.bin --out real_kernel.img
+python tools\build_stage2_package.py --pi build_pi5_stage2\PIOS_PI5_STAGE2.BIN --out real_kernel.img
 if errorlevel 1 exit /b 1
 copy /Y real_kernel.img PIOSSTG2.PKG >nul
 

@@ -47,16 +47,30 @@ def status_has_expected_version(body: str, expected_version: str) -> bool:
     return payload.get("ok") is True and payload.get("version") == expected_version
 
 
+def editor_is_available(host: str, editor_port: int) -> bool:
+    """Raw Pi5 OTA candidates are accepted only after WALFS editor extraction."""
+    try:
+        status, body = request(host, editor_port, "GET", "/picoscript", timeout=8)
+    except Exception:
+        return False
+    return status == 200 and "PicoScript" in body
+
+
 def wait_for_expected_version(host: str, status_port: int, expected_version: str,
-                              attempts: int, delay_seconds: float) -> bool:
+                              attempts: int, delay_seconds: float,
+                              editor_port: int = 80) -> bool:
     """Wait for the requested candidate, not merely for any older image."""
     last_status = ""
     for _ in range(attempts):
         try:
             status, body = request(host, status_port, "GET", "/api/status", timeout=4)
             if status == 200 and status_has_expected_version(body, expected_version):
-                print(f"[ota] candidate online: version={expected_version}")
-                return True
+                if editor_is_available(host, editor_port):
+                    print(f"[ota] candidate online: version={expected_version}; editor ready")
+                    return True
+                last_status = f"{expected_version} (editor unavailable)"
+                time.sleep(delay_seconds)
+                continue
             if status == 200:
                 try:
                     last_status = str(json.loads(body).get("version", "missing version"))
@@ -232,6 +246,8 @@ def main() -> int:
     ap.add_argument("--host", default="192.168.0.201")
     ap.add_argument("--update-port", type=int, default=8082)
     ap.add_argument("--status-port", type=int, default=8080)
+    ap.add_argument("--editor-port", type=int, default=80,
+                    help="HTTP port serving /picoscript for post-boot acceptance")
     ap.add_argument("--reboot-port", type=int, default=8081)
     ap.add_argument("--chunk-size", type=int, default=4096)
     ap.add_argument("--log-every", type=int, default=16)
@@ -275,7 +291,8 @@ def main() -> int:
         print(f"[ota] waiting for candidate {args.expected_version}...")
         time.sleep(8)
         return 0 if wait_for_expected_version(args.host, args.status_port,
-                                              args.expected_version, 40, 4) else 1
+                                              args.expected_version, 40, 4,
+                                              args.editor_port) else 1
 
     log_seq = fetch_logs(args.host, args.status_port, 0, args.timeout)
     begin = request_json(
@@ -363,7 +380,8 @@ def main() -> int:
         print(f"[ota] waiting for candidate {args.expected_version}...")
         time.sleep(8)
         return 0 if wait_for_expected_version(args.host, args.status_port,
-                                              args.expected_version, 30, 4) else 1
+                                              args.expected_version, 30, 4,
+                                              args.editor_port) else 1
 
     commit = request_json(
         args.host,
