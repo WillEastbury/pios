@@ -144,6 +144,10 @@ TESTS_MANIFEST = {
     # queries.  The test uses an in-memory authoritative document callback,
     # so no WALFS or hardware dependencies are pulled into the host build.
     "test_ppos.c": ["src/ppos.c"],
+    # Issue #92 PPOS persistence/provider integration. The test supplies a
+    # deterministic in-memory WALFS, PicoWAL, and pv_ctx host mock to cover
+    # immutable page reload/rebuild and the existing Storage.* hook ABI.
+    "test_ppos_provider.c": ["src/ppos.c", "src/ppos_provider.c"],
     # ABI-level dual-NIC contract: distinct backend identities, preserved
     # 64-byte FIFO messages, and interface-scoped firewall rule defaults.
     "test_dual_nic.c": [],
