@@ -424,7 +424,7 @@ hardware has not yet delivered a handler hit. PIOS retains a one-second
 edge/probe fallback, so this is currently an efficiency limitation rather than
 a WiFi correctness dependency.
 
-`wifi init` performs the blob preload before touching SDIO2. Do not call
+`wifi init`, `wifi prepare`, and `wifi chip` perform the blob preload before touching SDIO2. Do not call
 `wifi load` or `wifi joinpmk` on a board that has not been preloaded: SDIO2
 initialization disturbs EMMC2 and the board will reset.
 

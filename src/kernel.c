@@ -849,6 +849,19 @@ static void wifi_upload_progress(void)
     watchdog_hw_pet();
 }
 
+static void wifi_command_begin(void)
+{
+    cyw43_set_progress_hook(wifi_upload_progress);
+    watchdog_hw_pet();
+}
+
+static void wifi_command_finish(void)
+{
+    /* Restore the normal post-boot watchdog policy; never leave a failed
+     * bring-up command able to turn a later hardware stall into a hang. */
+    watchdog_hw_pet();
+}
+
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
     PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
 static void pi3_wifi_boot_progress(u32 stage)
@@ -3816,40 +3829,39 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append_hex32(out, &len, max, cd.eapol_words[i]);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "wifi probe")) {
-        watchdog_hw_arm_seconds(15U);
+        wifi_command_begin();
         bool ok = sdio_init();
-        watchdog_hw_disable();
+        wifi_command_finish();
         http_append(out, &len, max,
                     ok ? "WiFi SDIO probe OK\n" :
                          "WiFi SDIO probe FAILED; reboot recommended\n");
     } else if (http_streq(cmd, "wifi prepare")) {
-        watchdog_hw_arm_seconds(15U);
+        wifi_command_begin();
         bool ok = cyw43_preload_blobs() && cyw43_init();
-        watchdog_hw_disable();
+        wifi_command_finish();
         http_append(out, &len, max,
                     ok ? "WiFi prepare OK\n" : "WiFi prepare FAILED\n");
     } else if (http_streq(cmd, "wifi load")) {
-        cyw43_set_progress_hook(wifi_upload_progress);
-        watchdog_hw_arm_seconds(15U);
+        wifi_command_begin();
         bool ok = cyw43_load_firmware();
-        watchdog_hw_disable();
+        wifi_command_finish();
         http_append(out, &len, max,
                     ok ? "WiFi firmware load OK\n" :
                          "WiFi firmware load FAILED\n");
     } else if (http_streq(cmd, "wifi chip")) {
-        watchdog_hw_arm_seconds(15U);
-        bool ok = cyw43_init();
-        watchdog_hw_disable();
+        /* FAT reads must finish before SDIO2 takes over the controller. */
+        wifi_command_begin();
+        bool ok = cyw43_preload_blobs() && cyw43_init();
+        wifi_command_finish();
         http_append(out, &len, max,
                     ok ? "WiFi chip probe OK ram=" :
                          "WiFi chip probe FAILED ram=");
         http_append_u64(out, &len, max, cyw43_ram_size());
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "wifi init")) {
-        cyw43_set_progress_hook(wifi_upload_progress);
-        watchdog_hw_arm_seconds(15U);
+        wifi_command_begin();
         bool ok = nic_init_wifi();
-        watchdog_hw_disable();
+        wifi_command_finish();
         http_append(out, &len, max,
                     ok ? "WiFi init OK\n" : "WiFi init FAILED\n");
     } else if (http_streq(cmd, "wifi scan")) {
