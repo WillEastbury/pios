@@ -261,8 +261,35 @@ static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
     return true;
 }
 
-static void sdio_set_clock(u32 freq_khz)
+static bool sdio_controller_base_khz(u32 *base_khz)
 {
+    if (!base_khz)
+        return false;
+#if PIOS_HAS_WIFI_SDIO1
+    /*
+     * Pi 3, Zero 2 W, and Pi 4 route onboard WiFi through the non-removable
+     * BCM2835-compatible SDHCI (Linux: BCM2835_CLOCK_EMMC), not EMMC2.
+     * CAP0's base-frequency field is not populated reliably on this host.
+     */
+    u32 base_hz = fb_get_clock_rate_id(1U); /* VideoCore clock ID: EMMC. */
+    if (base_hz < 1000000U || base_hz > 1000000000U)
+        return false;
+    *base_khz = base_hz / 1000U;
+    return *base_khz != 0U;
+#else
+    u32 cap = sr(REG_CAP0);
+    u32 base_mhz = (cap >> 8) & 0xFFU;
+    if (base_mhz == 0U)
+        return false;
+    *base_khz = base_mhz * 1000U;
+    return true;
+#endif
+}
+
+static bool sdio_set_clock(u32 freq_khz)
+{
+    if (freq_khz == 0U)
+        return false;
     /* Disable SD clock via 16-bit CLOCK_CONTROL */
     sw16(SDHCI_CLOCK_CONTROL, 0);
     delay_cycles(1000);
@@ -270,11 +297,9 @@ static void sdio_set_clock(u32 freq_khz)
     /* Set timeout via 8-bit register */
     sw8(SDHCI_TIMEOUT_CONTROL, 0x0E);
 
-    /* Derive base clock from SDHCI capabilities register */
-    u32 cap = sr(REG_CAP0);
-    u32 base_mhz = (cap >> 8) & 0xFF;
-    if (base_mhz == 0) base_mhz = 50;  /* fallback */
-    u32 base_khz = base_mhz * 1000;
+    u32 base_khz = 0U;
+    if (!sdio_controller_base_khz(&base_khz))
+        return false;
 
     /* Calculate divider — must produce even real divisor per SDHCI v3 spec */
     u32 real_div = (base_khz + freq_khz - 1) / freq_khz;
@@ -293,12 +318,15 @@ static void sdio_set_clock(u32 freq_khz)
     u32 timeout = 100000;
     while (!(sr16(SDHCI_CLOCK_CONTROL) & 0x02) && timeout--)
         delay_cycles(10);
+    if (timeout == 0U)
+        return false;
 
     /* Enable SD clock (bit 2) */
     clk = sr16(SDHCI_CLOCK_CONTROL);
     clk |= 0x04;
     sw16(SDHCI_CLOCK_CONTROL, clk);
     delay_cycles(1000);
+    return true;
 }
 
 static bool sdio_enable_bcm2712_50mhz(void)
@@ -719,7 +747,10 @@ bool sdio_init(void)
      * Circle: single write with divider + timeout + internal clock enable */
     uart_puts("[sdio] setting 400kHz clock...\n");
     sdio_diag.last_stage = 3U;
-    sdio_set_clock(400);
+    if (!sdio_set_clock(400U)) {
+        uart_puts("[sdio] 400kHz clock failed\n");
+        return false;
+    }
     delay_cycles(500000);
 
     /* Set up interrupts per SDHCI spec */
@@ -863,7 +894,10 @@ bool sdio_init(void)
     }
 
     /* Switch to higher clock (25 MHz) */
-    sdio_set_clock(25000);
+    if (!sdio_set_clock(25000U)) {
+        uart_puts("[sdio] 25MHz clock failed\n");
+        return false;
+    }
 
     /* Verify CCCR access */
     u8 cccr_rev;
@@ -878,10 +912,13 @@ bool sdio_init(void)
     u8 high_speed = 0U;
     if (sdio_enable_bcm2712_50mhz() &&
         sdio_cmd52_read(SDIO_FUNC_CIA, CCCR_HIGH_SPEED, &high_speed) &&
-        (high_speed & HIGH_SPEED_SHS) != 0U &&
-        sdio_cmd52_write(SDIO_FUNC_CIA, CCCR_HIGH_SPEED,
-                         high_speed | HIGH_SPEED_EHS)) {
-        sdio_set_clock(50000U);
+        (high_speed & HIGH_SPEED_SHS) != 0U) {
+        if (!sdio_cmd52_write(SDIO_FUNC_CIA, CCCR_HIGH_SPEED,
+                              high_speed | HIGH_SPEED_EHS) ||
+            !sdio_set_clock(50000U)) {
+            uart_puts("[sdio] high speed transition failed\n");
+            return false;
+        }
         uart_puts("[sdio] high speed 50MHz\n");
     } else if (PIOS_HAS_WIFI_SDIO2) {
         uart_puts("[sdio] high speed unavailable; staying at 25MHz\n");
