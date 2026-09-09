@@ -5,7 +5,8 @@
 #include "highmem.h"
 #include "dtrace.h"
 
-static u32 failures, sent_seq, sent_ack;
+static u32 failures, sent_seq, sent_ack, send_calls;
+static bool reject_next_send;
 static const u8 mac[6] = {2, 0, 0, 0, 0, 1};
 #define CHECK(c) do { if (!(c)) { \
     printf("FAIL line %u: %s\n", (unsigned)__LINE__, #c); failures++; \
@@ -33,6 +34,11 @@ bool nic_send_on(nic_iface_t iface, const u8 *frame, u32 len)
     CHECK(len >= 54);
     sent_seq = be32(frame + 38);
     sent_ack = be32(frame + 42);
+    send_calls++;
+    if (reject_next_send) {
+        reject_next_send = false;
+        return false;
+    }
     return true;
 }
 bool nic_send_parts_on(nic_iface_t iface, const void *head, u32 head_len,
@@ -109,6 +115,26 @@ int main(void)
     CHECK(sent_ack == 101);
     tcp_conn_t conn = tcp_accept(listener);
     CHECK(conn >= 0 && tcp_readable(conn) == 0);
+
+    tcp_init();
+    listener = tcp_listen(80);
+    input(200, 0, 0x02, NULL, 0);
+    cookie = sent_seq;
+    input(201, cookie + 1, 0x10, NULL, 0);
+    conn = tcp_accept(listener);
+    CHECK(conn >= 0);
+    const u8 outbound[] = {'q', 'u', 'e', 'u', 'e'};
+    reject_next_send = true;
+    u32 before_calls = send_calls;
+    CHECK(tcp_write(conn, outbound, sizeof(outbound)) == sizeof(outbound));
+    CHECK(send_calls == before_calls + 1U);
+    u32 rejected_seq = sent_seq;
+    /* A service revisit after queue credit returns must retry the same
+     * sequence without a peer ACK or retransmission timeout. */
+    u8 ignored = 0U;
+    CHECK(tcp_write(conn, &ignored, 0U) == 0U);
+    CHECK(send_calls == before_calls + 2U);
+    CHECK(sent_seq == rejected_seq);
     printf("TCP pending: %u failures\n", failures);
     return failures ? 1 : 0;
 }

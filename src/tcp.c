@@ -718,21 +718,23 @@ static void tcp_send_segment(struct tcb *t, u8 flags,
         tcp_diag_counts.tx_send_fail++;
 }
 
-static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
+static bool tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
                                         u32 tx_off, u32 data_len) {
     /* Guard against u16 overflow: max frame 2048 minus IP+TCP headers */
-    if (data_len > 2048 - 54) return;
+    if (data_len > 2048 - 54)
+        return false;
 
     const u8 *dst_mac = net_resolve_mac_on(t->iface, t->remote_ip);
     if (unlikely(!dst_mac)) {
         tcp_diag_counts.tx_no_mac++;
-        return;
+        return false;
     }
 
     u16 tcp_len = TCP_HDR_SIZE + data_len;
     u16 ip_total = IP_HDR_SIZE + tcp_len;
     u32 frame_len = ETH_HDR_SIZE + ip_total;
-    if (frame_len > MAX_FRAME) return;
+    if (frame_len > MAX_FRAME)
+        return false;
 
     struct eth_hdr *eth = (struct eth_hdr *)tx_frame;
     simd_memcpy(eth->dst, dst_mac, 6);
@@ -774,8 +776,10 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
         if (!tx_offload_window)
             tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
         tcp_diag_counts.tx_segments++;
-        if (!nic_send_on(t->iface, tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
-        return;
+        bool sent = nic_send_on(t->iface, tx_frame, frame_len);
+        if (!sent)
+            tcp_diag_counts.tx_send_fail++;
+        return sent;
     }
 
     u32 contig = 0;
@@ -785,16 +789,21 @@ static void tcp_send_segment_from_txbuf(struct tcb *t, u8 flags,
             tcp->checksum = tcp_checksum_split(t->local_ip, t->remote_ip,
                                                tcp, TCP_HDR_SIZE, lin, data_len);
         tcp_diag_counts.tx_segments++;
-        if (!nic_send_parts_on(t->iface, tx_frame, TCP_OVERHEAD, lin, data_len))
+        bool sent = nic_send_parts_on(t->iface, tx_frame, TCP_OVERHEAD,
+                                      lin, data_len);
+        if (!sent)
             tcp_diag_counts.tx_send_fail++;
-        return;
+        return sent;
     }
 
     ring_copy_from_offset(&t->tx_buf, tx_off, tx_frame + TCP_OVERHEAD, data_len);
     if (!tx_offload_window)
         tcp->checksum = tcp_checksum(t->local_ip, t->remote_ip, tcp, tcp_len);
     tcp_diag_counts.tx_segments++;
-    if (!nic_send_on(t->iface, tx_frame, frame_len)) tcp_diag_counts.tx_send_fail++;
+    bool sent = nic_send_on(t->iface, tx_frame, frame_len);
+    if (!sent)
+        tcp_diag_counts.tx_send_fail++;
+    return sent;
 }
 
 static bool tcp_send_control(nic_iface_t iface, u32 src_ip, u32 dst_ip,
@@ -941,17 +950,17 @@ static void tcp_output(struct tcb *t) {
         to_send = min32(to_send, TCP_MSS);
         if (to_send == 0) break;
 
+        u8 flags = TCP_ACK;
+        if (to_send >= unsent)
+            flags |= TCP_PSH;
+
+        if (!tcp_send_segment_from_txbuf(t, flags, unsent_off, to_send))
+            break;
         if (!t->rtt_active) {
             t->rtt_seq    = t->snd_nxt;
             t->rtt_start  = tcp_now_ms();
             t->rtt_active = true;
         }
-
-        u8 flags = TCP_ACK;
-        if (to_send >= unsent)
-            flags |= TCP_PSH;
-
-        tcp_send_segment_from_txbuf(t, flags, unsent_off, to_send);
         t->snd_nxt += to_send;
         sent_any = true;
 
@@ -984,7 +993,7 @@ static void tcp_retransmit(struct tcb *t) {
 
     u32 saved_nxt = t->snd_nxt;
     t->snd_nxt = t->snd_una;
-    tcp_send_segment_from_txbuf(t, TCP_ACK | TCP_PSH, 0, len);
+    (void)tcp_send_segment_from_txbuf(t, TCP_ACK | TCP_PSH, 0, len);
     t->snd_nxt = saved_nxt;
     if (seq_lt(t->snd_una + len, t->snd_nxt))
         ; /* snd_nxt stays */
