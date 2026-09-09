@@ -2556,6 +2556,29 @@ bool cyw43_init(void)
     return true;
 }
 
+static bool cyw43_preload_file(fat32_file_t *file, u8 *buffer,
+                               u32 capacity, u32 *loaded)
+{
+    if (!file || !buffer || !loaded || file->file_size > capacity)
+        return false;
+    u32 off = 0U;
+    while (off < file->file_size) {
+        u32 chunk = file->file_size - off;
+        if (chunk > 4096U)
+            chunk = 4096U;
+        u32 got = fat32_read(file, buffer + off, chunk);
+        if (got == 0U || got > chunk)
+            return false;
+        off += got;
+        /* A completed FAT read is forward progress; never feed the watchdog
+         * while the read itself is stalled. */
+        if (cyw_progress_hook)
+            cyw_progress_hook();
+    }
+    *loaded = off;
+    return true;
+}
+
 bool cyw43_preload_blobs(void)
 {
     if (blobs_loaded) {
@@ -2605,22 +2628,13 @@ bool cyw43_preload_blobs(void)
             fat32_close(&fw);
             return false;
         }
-        u32 off = 0;
-        while (off < fw.file_size) {
-            u32 chunk = fw.file_size - off;
-            if (chunk > 4096) chunk = 4096;
-            u32 got = fat32_read(&fw, fw_buf + off, chunk);
-            if (got == 0) {
-                uart_puts("[cyw-pre] fw read err @");
-                uart_hex(off);
-                uart_puts("\n");
-                fat32_close(&fw);
-                return false;
-            }
-            off += got;
+        if (!cyw43_preload_file(&fw, fw_buf, CYW_FW_MAX_SIZE,
+                                 &fw_buf_len)) {
+            uart_puts("[cyw-pre] fw read err\n");
+            fat32_close(&fw);
+            return false;
         }
         fat32_close(&fw);
-        fw_buf_len = off;
         uart_puts("[cyw-pre] fw loaded ");
         uart_hex(fw_buf_len);
         uart_puts("\n");
@@ -2631,7 +2645,12 @@ bool cyw43_preload_blobs(void)
         fat32_file_t nv;
         if (fat32_open(nv_path, &nv)) {
             if (nv.file_size <= CYW_NVRAM_MAX) {
-                nvram_buf_len = fat32_read(&nv, nvram_buf, nv.file_size);
+                if (!cyw43_preload_file(&nv, nvram_buf, CYW_NVRAM_MAX,
+                                         &nvram_buf_len)) {
+                    uart_puts("[cyw-pre] nvram read err\n");
+                    fat32_close(&nv);
+                    return false;
+                }
                 uart_puts("[cyw-pre] nvram loaded ");
                 uart_hex(nvram_buf_len);
                 uart_puts("\n");
@@ -2645,7 +2664,12 @@ bool cyw43_preload_blobs(void)
         fat32_file_t clm;
         if (fat32_open(clm_path, &clm)) {
             if (clm.file_size <= CYW_CLM_MAX) {
-                clm_buf_len = fat32_read(&clm, clm_buf, clm.file_size);
+                if (!cyw43_preload_file(&clm, clm_buf, CYW_CLM_MAX,
+                                         &clm_buf_len)) {
+                    uart_puts("[cyw-pre] clm read err\n");
+                    fat32_close(&clm);
+                    return false;
+                }
                 uart_puts("[cyw-pre] clm loaded ");
                 uart_hex(clm_buf_len);
                 uart_puts("\n");
