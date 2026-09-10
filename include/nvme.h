@@ -120,6 +120,7 @@ bool nvme_build_identify_controller(struct nvme_admin_cmd *cmd,
                                     u64 data_address, u32 data_length);
 bool nvme_identify_parse(const u8 *data, u32 length,
                          struct nvme_identify_info *out);
+/* Queue initialization is one-shot over fresh all-zero storage. */
 bool nvme_admin_queue_init(struct nvme_admin_queue *queue, u32 depth);
 bool nvme_admin_submit(struct nvme_admin_queue *queue, u64 now_ms,
                        u64 timeout_ms, struct nvme_admin_handle *out);

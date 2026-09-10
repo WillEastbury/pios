@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "nvme.h"
 
 static int failures;
@@ -20,9 +21,12 @@ static void test_admin_queue(void)
     u32 result = 0U;
     u16 status = 0U;
 
+    memset(&queue, 0, sizeof(queue));
     expect_true("invalid queue depth rejected",
                 !nvme_admin_queue_init(&queue, 3U));
     expect_true("admin queue initialises", nvme_admin_queue_init(&queue, 16U));
+    expect_true("admin queue reinit rejected",
+                !nvme_admin_queue_init(&queue, 16U));
     expect_true("timeout zero rejected",
                 !nvme_admin_submit(&queue, 100U, 0U, &first));
     expect_true("oversized timeout rejected",
@@ -80,6 +84,20 @@ static void test_admin_queue(void)
                 nvme_admin_expire(&queue, &second, 320U));
     expect_true("expired handle is stale",
                 !nvme_admin_expire(&queue, &second, 321U));
+
+    queue.generation = ~0U;
+    expect_true("exhaustion command submits",
+                nvme_admin_submit(&queue, 400U, 20U, &second));
+    cqe.command_id = second.command_id;
+    cqe.sq_id = 0U;
+    cqe.sq_head = 1U;
+    cqe.status = 0U;
+    expect_true("exhaustion completion accepted",
+                nvme_admin_complete(&queue, &second, &cqe, NULL, NULL) ==
+                NVME_ADMIN_COMPLETION_SUCCESS);
+    expect_true("exhausted queue is retired", queue.generation == 0U);
+    expect_true("retired queue rejects commands",
+                !nvme_admin_submit(&queue, 500U, 20U, &first));
 }
 
 int main(void)

@@ -131,6 +131,8 @@ static void test_abi_facts(void)
     memset(&contract, 0, sizeof(contract));
     CHECK(!pisp_be_contract_init(NULL, 1U));
     CHECK(!pisp_be_contract_init(&contract, 0U));
+    CHECK(pisp_be_contract_init(&contract, 1U));
+    CHECK(!pisp_be_contract_init(&contract, 1U));
 }
 
 static void test_config_validation(void)
@@ -447,13 +449,13 @@ static void test_canary_and_pool(void)
     }
 }
 
-static void test_full_generation_wrap(void)
+static void test_full_generation_exhaustion(void)
 {
     struct pisp_be_contract contract;
     struct media_engine_controller controller;
     struct media_engine_lease lease;
     struct pisp_be_dma_span spans[PISP_BE_MAX_SPANS];
-    struct pisp_be_job_handle wrapped, stale, reused;
+    struct pisp_be_job_handle exhausted, stale, next;
     u8 config[PISP_BE_CONFIG_BYTES];
 
     init_contract(&contract, 49U);
@@ -462,17 +464,20 @@ static void test_full_generation_wrap(void)
     make_spans(spans);
     contract.jobs[0].generation = ~0ULL;
     CHECK(prepare(&contract, &controller, &lease, config, spans, 3U,
-                  &wrapped));
-    CHECK(wrapped._generation == ~0ULL);
-    stale = wrapped;
-    CHECK(pisp_be_contract_abort(&contract, &controller, &lease, &wrapped));
-    CHECK(pisp_be_contract_release(&contract, &controller, &lease, &wrapped));
+                  &exhausted));
+    CHECK(exhausted._generation == ~0ULL);
+    stale = exhausted;
+    CHECK(pisp_be_contract_abort(&contract, &controller, &lease, &exhausted));
+    CHECK(pisp_be_contract_release(&contract, &controller, &lease,
+                                   &exhausted));
+    CHECK(contract.jobs[0].state == PISP_BE_JOB_RETIRED);
+    CHECK(contract.jobs[0].generation == 0U);
     CHECK(prepare(&contract, &controller, &lease, config, spans, 3U,
-                  &reused));
-    CHECK(reused._generation == 1U);
+                  &next));
+    CHECK((next._token & 0xffU) != 0U);
     CHECK(!pisp_be_contract_abort(&contract, &controller, &lease, &stale));
-    CHECK(pisp_be_contract_abort(&contract, &controller, &lease, &reused));
-    CHECK(pisp_be_contract_release(&contract, &controller, &lease, &reused));
+    CHECK(pisp_be_contract_abort(&contract, &controller, &lease, &next));
+    CHECK(pisp_be_contract_release(&contract, &controller, &lease, &next));
 }
 
 int main(void)
@@ -482,7 +487,7 @@ int main(void)
     test_span_validation();
     test_lease_binding_and_lifecycle();
     test_canary_and_pool();
-    test_full_generation_wrap();
+    test_full_generation_exhaustion();
 
     if (failures) {
         printf("pisp be contract: %d/%d checks failed\n", failures, checks);

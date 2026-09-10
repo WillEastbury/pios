@@ -17,6 +17,21 @@ static u32 pisp_be_load_le32(const u8 *bytes)
            ((u32)bytes[2] << 16) | ((u32)bytes[3] << 24);
 }
 
+static bool pisp_be_contract_fresh(const struct pisp_be_contract *contract)
+{
+    const u8 *bytes;
+    usize i;
+
+    if (!contract)
+        return false;
+    bytes = (const u8 *)contract;
+    for (i = 0U; i < sizeof(*contract); i++) {
+        if (bytes[i] != 0U)
+            return false;
+    }
+    return true;
+}
+
 static void pisp_be_clear_handle(struct pisp_be_job_handle *handle)
 {
     if (!handle)
@@ -250,7 +265,8 @@ bool pisp_be_contract_init(struct pisp_be_contract *contract, u32 controller_id)
 {
     u32 i;
 
-    if (!contract || controller_id == 0U)
+    if (!contract || controller_id == 0U ||
+        !pisp_be_contract_fresh(contract))
         return false;
     contract->owner.controller_id = controller_id;
     for (i = 0U; i < PISP_BE_JOB_CAPACITY; i++) {
@@ -415,9 +431,16 @@ bool pisp_be_contract_release(
          control->canaries_intact == 0U))
         return false;
     pisp_be_publish_state(control, PISP_BE_JOB_RELEASED);
+    if (control->generation == ~0ULL) {
+        control->generation = 0U;
+        dmb_ishst();
+        memset(&contract->payloads[slot], 0,
+               sizeof(contract->payloads[slot]));
+        control->canaries_intact = 0U;
+        pisp_be_publish_state(control, PISP_BE_JOB_RETIRED);
+        return true;
+    }
     control->generation++;
-    if (control->generation == 0U)
-        control->generation = 1U;
     dmb_ishst();
     memset(&contract->payloads[slot], 0, sizeof(contract->payloads[slot]));
     control->canaries_intact = 0U;

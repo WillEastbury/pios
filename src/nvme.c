@@ -25,6 +25,21 @@ static void copy_trimmed(u8 *dst, u32 dst_cap, const u8 *src, u32 src_len)
     dst[n] = 0;
 }
 
+static bool nvme_admin_queue_fresh(const struct nvme_admin_queue *queue)
+{
+    const u8 *bytes;
+    usize i;
+
+    if (!queue)
+        return false;
+    bytes = (const u8 *)queue;
+    for (i = 0U; i < sizeof(*queue); i++) {
+        if (bytes[i] != 0U)
+            return false;
+    }
+    return true;
+}
+
 bool nvme_identify_buffer_valid(u64 address, u32 length)
 {
     return address != 0ULL &&
@@ -69,14 +84,16 @@ static void nvme_admin_release(struct nvme_admin_queue *queue)
     queue->active = false;
     queue->active_command_id = 0U;
     queue->deadline_ms = 0ULL;
-    queue->generation++;
-    if (queue->generation == 0U)
-        queue->generation = 1U;
+    if (queue->generation == ~0U)
+        queue->generation = 0U;
+    else
+        queue->generation++;
 }
 
 bool nvme_admin_queue_init(struct nvme_admin_queue *queue, u32 depth)
 {
-    if (!queue || !nvme_queue_depth_valid(depth))
+    if (!queue || !nvme_queue_depth_valid(depth) ||
+        !nvme_admin_queue_fresh(queue))
         return false;
     *queue = (struct nvme_admin_queue){0};
     queue->generation = 1U;

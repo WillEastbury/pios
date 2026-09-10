@@ -318,11 +318,16 @@ static void test_deadlines_owner_rearm_and_generation(void)
     }
     init_contract(&c, &h, 0U);
     CHECK(!hvs_handoff_snapshot(&c, &h, 1U, 1U, &s));
-    CHECK(c.control.fault == HVS_HANDOFF_FAULT_OWNER);
-    CHECK(hvs_handoff_rearm(&c, &h, 0U, 2U, &new_h));
+    CHECK(c.control.state == HVS_HANDOFF_MAILBOX_OWNER);
+    CHECK(c.control.fault == HVS_HANDOFF_FAULT_NONE);
+    CHECK(c.control.failure_count == 0U);
+    CHECK(snapshot_contract(&c, &h, 2U, &s));
+    CHECK(!hvs_handoff_stage_list(&c, &h, 0U, 3U, NULL));
+    CHECK(c.control.state == HVS_HANDOFF_QUARANTINED);
+    CHECK(hvs_handoff_rearm(&c, &h, 0U, 4U, &new_h));
     CHECK(new_h._generation != h._generation);
-    CHECK(!hvs_handoff_snapshot(&c, &h, 0U, 3U, &s));
-    CHECK(snapshot_contract(&c, &new_h, 3U, &s));
+    CHECK(!hvs_handoff_snapshot(&c, &h, 0U, 5U, &s));
+    CHECK(snapshot_contract(&c, &new_h, 5U, &s));
 
     init_contract(&c, &h, 0U);
     CHECK(!snapshot_contract(&c, &h, 1U, NULL));

@@ -27,6 +27,8 @@ enum dwc2_transfer_state {
     DWC2_TRANSFER_HARDWARE,
     DWC2_TRANSFER_COMPLETED,
     DWC2_TRANSFER_FAILED,
+    /* A generation that reaches UINT64_MAX is permanently unavailable. */
+    DWC2_TRANSFER_RETIRED,
 };
 
 /*
@@ -65,7 +67,8 @@ struct dwc2_transfer_pool {
 _Static_assert((sizeof(struct dwc2_transfer_pool) % 64U) == 0U,
                "DWC2 transfer pool records must retain cache-line stride");
 
-void dwc2_transfer_pool_init(struct dwc2_transfer_pool *pool);
+/* Initialization is one-shot over fresh all-zero storage. */
+bool dwc2_transfer_pool_init(struct dwc2_transfer_pool *pool);
 
 /*
  * Validate a CPU-physical DMA span and return its BCM2837 bus address.

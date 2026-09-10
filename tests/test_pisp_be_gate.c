@@ -241,6 +241,7 @@ static void test_identity_and_sequence(void)
     CHECK(engine_state == MEDIA_ENGINE_QUARANTINED);
 
     fixture_init(&f, 100U, 10U);
+    memset(&other, 0, sizeof(other));
     CHECK(media_engine_controller_init(&other, 72U));
     CHECK(!pisp_be_gate_passive_identify(&f.gate, &f.gate_handle, 0U, &other,
                                          100U, 0x02252700U));

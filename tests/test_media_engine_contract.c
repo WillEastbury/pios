@@ -227,9 +227,11 @@ static void test_controller_identity(void)
     struct media_engine_lease first_lease;
 
     memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
     CHECK(!media_engine_controller_init(NULL, 1U));
     CHECK(!media_engine_controller_init(&first, 0U));
     CHECK(media_engine_controller_init(&first, 1U));
+    CHECK(!media_engine_controller_init(&first, 1U));
     CHECK(media_engine_controller_init(&second, 2U));
     CHECK(media_engine_passive_identify(&first, MEDIA_ENGINE_HEVC, 0x202U));
     CHECK(media_engine_passive_identify(&second, MEDIA_ENGINE_HEVC, 0x202U));
@@ -240,6 +242,27 @@ static void test_controller_identity(void)
     CHECK(media_engine_lease_release(&first, &first_lease));
 }
 
+static void test_generation_exhaustion(void)
+{
+    struct media_engine_controller controller;
+    struct media_engine_lease lease;
+    enum media_engine_state state;
+    u32 index = (u32)MEDIA_ENGINE_HEVC - 1U;
+
+    init(&controller, 3U);
+    controller.engines[index].generation = ~0U;
+    CHECK(media_engine_passive_identify(&controller, MEDIA_ENGINE_HEVC,
+                                        0x202U));
+    CHECK(media_engine_lease_acquire(&controller, MEDIA_ENGINE_HEVC, &lease));
+    CHECK(media_engine_lease_complete(&controller, &lease));
+    CHECK(media_engine_lease_release(&controller, &lease));
+    CHECK(media_engine_state_get(&controller, MEDIA_ENGINE_HEVC, &state));
+    CHECK(state == MEDIA_ENGINE_RETIRED);
+    CHECK(controller.engines[index].generation == 0U);
+    CHECK(!media_engine_passive_identify(&controller, MEDIA_ENGINE_HEVC,
+                                         0x202U));
+}
+
 int main(void)
 {
     test_resource_facts();
@@ -248,6 +271,7 @@ int main(void)
     test_hevc_lifecycle_and_handles();
     test_hvs_and_iommu2_exclusion();
     test_controller_identity();
+    test_generation_exhaustion();
 
     if (failures) {
         printf("media engine contract: %d/%d checks failed\n", failures, checks);

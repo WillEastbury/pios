@@ -121,6 +121,22 @@ static const struct media_engine_descriptor media_engines[MEDIA_ENGINE_COUNT] = 
     },
 };
 
+static bool media_engine_controller_fresh(
+    const struct media_engine_controller *controller)
+{
+    const u8 *bytes;
+    usize i;
+
+    if (!controller)
+        return false;
+    bytes = (const u8 *)controller;
+    for (i = 0U; i < sizeof(*controller); i++) {
+        if (bytes[i] != 0U)
+            return false;
+    }
+    return true;
+}
+
 static u32 media_engine_index(enum media_engine_kind kind)
 {
     if (kind < MEDIA_ENGINE_HEVC || kind > MEDIA_ENGINE_HVS)
@@ -137,12 +153,16 @@ static void media_engine_clear_lease(struct media_engine_lease *lease)
     }
 }
 
-static void media_engine_bump_generation(struct media_engine_owner_record *record)
+static bool media_engine_bump_generation(
+    struct media_engine_owner_record *record)
 {
-    record->generation++;
-    if (record->generation == 0U)
-        record->generation = 1U;
     record->lease_generation = 0U;
+    if (record->generation == ~0U) {
+        record->generation = 0U;
+        return false;
+    }
+    record->generation++;
+    return true;
 }
 
 static u64 media_engine_token(enum media_engine_kind kind, u32 generation)
@@ -227,7 +247,8 @@ bool media_engine_controller_init(struct media_engine_controller *controller,
 {
     u32 i;
 
-    if (!controller || controller_id == 0U)
+    if (!controller || controller_id == 0U ||
+        !media_engine_controller_fresh(controller))
         return false;
     controller->owner.controller_id = controller_id;
     for (i = 0U; i < MEDIA_ENGINE_COUNT; i++) {
@@ -252,13 +273,15 @@ bool media_engine_passive_identify(struct media_engine_controller *controller,
         (desc->capabilities & MEDIA_ENGINE_CAP_PASSIVE_IDENTIFY) == 0U)
         return false;
     record = &controller->engines[index];
+    if (record->generation == 0U)
+        return false;
     if (record->state != MEDIA_ENGINE_DISABLED &&
         record->state != MEDIA_ENGINE_RELEASED)
         return false;
     if (!media_engine_version_matches(kind, raw_version)) {
         record->identified_version = 0U;
-        media_engine_bump_generation(record);
-        record->state = MEDIA_ENGINE_QUARANTINED;
+        record->state = media_engine_bump_generation(record) ?
+            MEDIA_ENGINE_QUARANTINED : MEDIA_ENGINE_RETIRED;
         return false;
     }
     record->identified_version = raw_version;
@@ -281,7 +304,8 @@ bool media_engine_lease_acquire(struct media_engine_controller *controller,
         (desc->known_mask & MEDIA_ENGINE_KNOWN_IOMMU) == 0U)
         return false;
     record = &controller->engines[index];
-    if (record->state != MEDIA_ENGINE_PASSIVELY_IDENTIFIED)
+    if (record->generation == 0U ||
+        record->state != MEDIA_ENGINE_PASSIVELY_IDENTIFIED)
         return false;
 
     /*
@@ -328,8 +352,8 @@ bool media_engine_lease_release(struct media_engine_controller *controller,
     generation = record->generation;
     media_engine_drop_iommu2(controller, kind, generation);
     record->identified_version = 0U;
-    media_engine_bump_generation(record);
-    record->state = MEDIA_ENGINE_RELEASED;
+    record->state = media_engine_bump_generation(record) ?
+        MEDIA_ENGINE_RELEASED : MEDIA_ENGINE_RETIRED;
     return true;
 }
 
@@ -346,8 +370,8 @@ bool media_engine_lease_abort(struct media_engine_controller *controller,
     generation = record->generation;
     media_engine_drop_iommu2(controller, kind, generation);
     record->identified_version = 0U;
-    media_engine_bump_generation(record);
-    record->state = MEDIA_ENGINE_QUARANTINED;
+    record->state = media_engine_bump_generation(record) ?
+        MEDIA_ENGINE_QUARANTINED : MEDIA_ENGINE_RETIRED;
     return true;
 }
 
@@ -389,7 +413,10 @@ bool media_engine_rearm(struct media_engine_controller *controller,
     if (record->state != MEDIA_ENGINE_QUARANTINED)
         return false;
     record->identified_version = 0U;
-    media_engine_bump_generation(record);
+    if (!media_engine_bump_generation(record)) {
+        record->state = MEDIA_ENGINE_RETIRED;
+        return false;
+    }
     record->state = MEDIA_ENGINE_DISABLED;
     return true;
 }

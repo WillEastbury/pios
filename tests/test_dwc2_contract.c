@@ -18,11 +18,13 @@ static int checks;
 static void init_pool(struct dwc2_transfer_pool *pool)
 {
     memset(pool, 0, sizeof(*pool));
-    dwc2_transfer_pool_init(pool);
+    CHECK(dwc2_transfer_pool_init(pool));
 }
 
 static void test_constants(void)
 {
+    struct dwc2_transfer_pool pool;
+
     CHECK(DWC2_BCM2837_BASE == 0x3F980000ULL);
     CHECK(DWC2_ARMCTRL_BANK1_IRQ_BIT == 9U);
     CHECK(DWC2_GPU_IRQ == 41U);
@@ -30,6 +32,10 @@ static void test_constants(void)
     CHECK(DWC2_DMA_BUS_ALIAS == 0xC0000000ULL);
     CHECK(DWC2_DMA_PHYS_LIMIT == 0x3F000000ULL);
     CHECK(DWC2_DMA_ALIGNMENT == 4U);
+    memset(&pool, 0, sizeof(pool));
+    CHECK(!dwc2_transfer_pool_init(NULL));
+    CHECK(dwc2_transfer_pool_init(&pool));
+    CHECK(!dwc2_transfer_pool_init(&pool));
 }
 
 static void test_dma_conversion_rejections(void)
@@ -118,12 +124,32 @@ static void test_saturation_and_unique_ownership(void)
     }
 }
 
+static void test_generation_exhaustion_retires_slot(void)
+{
+    struct dwc2_transfer_pool pool;
+    struct dwc2_transfer_handle handle;
+    enum dwc2_transfer_state state;
+
+    init_pool(&pool);
+    pool.records[0].generation = ~0ULL;
+    CHECK(dwc2_transfer_prepare(&pool, 0x6000U, 0x40U, 0x40U, &handle));
+    CHECK(handle.slot == 0U && handle.generation == ~0ULL);
+    CHECK(dwc2_transfer_submit(&pool, &handle));
+    CHECK(dwc2_transfer_complete(&pool, &handle, 0x40U));
+    CHECK(dwc2_transfer_release(&pool, &handle));
+    CHECK(!dwc2_transfer_get_state(&pool, &handle, &state));
+    CHECK(pool.records[0].state == DWC2_TRANSFER_RETIRED);
+    CHECK(!dwc2_transfer_prepare(&pool, 0x7000U, 0x40U, 0x40U, &handle) ||
+          handle.slot != 0U);
+}
+
 int main(void)
 {
     test_constants();
     test_dma_conversion_rejections();
     test_lifecycle_and_generations();
     test_saturation_and_unique_ownership();
+    test_generation_exhaustion_retires_slot();
 
     if (failures) {
         printf("dwc2 contract: %d/%d checks failed\n", failures, checks);

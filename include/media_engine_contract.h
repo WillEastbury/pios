@@ -49,6 +49,7 @@ enum media_engine_state {
     MEDIA_ENGINE_COMPLETED,
     MEDIA_ENGINE_RELEASED,
     MEDIA_ENGINE_QUARANTINED,
+    MEDIA_ENGINE_RETIRED,
 };
 
 struct media_engine_mmio_window {
@@ -144,7 +145,8 @@ bool media_engine_version_matches(enum media_engine_kind kind, u32 raw_version);
 
 /*
  * `controller_id` is a nonzero stable identity unique among concurrently
- * active controllers. Every lease is bound to it as well as to its generation.
+ * active controllers. Storage must be fresh and all-zero; initialization is
+ * one-shot. Every lease is bound to the identity and its generation.
  */
 bool media_engine_controller_init(struct media_engine_controller *controller,
                                   u32 controller_id);

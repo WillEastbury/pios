@@ -24,7 +24,8 @@ static bool dwc2_handle_record(struct dwc2_transfer_pool *pool,
         return false;
     record = &pool->records[handle->slot];
     if (record->generation != handle->generation ||
-        record->state == DWC2_TRANSFER_FREE)
+        record->state == DWC2_TRANSFER_FREE ||
+        record->state == DWC2_TRANSFER_RETIRED)
         return false;
     *record_out = record;
     return true;
@@ -42,18 +43,34 @@ static bool dwc2_handle_record_const(
         return false;
     record = &pool->records[handle->slot];
     if (record->generation != handle->generation ||
-        record->state == DWC2_TRANSFER_FREE)
+        record->state == DWC2_TRANSFER_FREE ||
+        record->state == DWC2_TRANSFER_RETIRED)
         return false;
     *record_out = record;
     return true;
 }
 
-void dwc2_transfer_pool_init(struct dwc2_transfer_pool *pool)
+static bool dwc2_pool_fresh(const struct dwc2_transfer_pool *pool)
+{
+    const u8 *bytes;
+    usize i;
+
+    if (!pool)
+        return false;
+    bytes = (const u8 *)pool;
+    for (i = 0U; i < sizeof(*pool); i++) {
+        if (bytes[i] != 0U)
+            return false;
+    }
+    return true;
+}
+
+bool dwc2_transfer_pool_init(struct dwc2_transfer_pool *pool)
 {
     u32 i;
 
-    if (!pool)
-        return;
+    if (!pool || !dwc2_pool_fresh(pool))
+        return false;
     for (i = 0U; i < DWC2_TRANSFER_CAPACITY; i++) {
         struct dwc2_transfer_record *record = &pool->records[i];
 
@@ -65,6 +82,7 @@ void dwc2_transfer_pool_init(struct dwc2_transfer_pool *pool)
         record->actual = 0U;
         record->state = DWC2_TRANSFER_FREE;
     }
+    return true;
 }
 
 bool dwc2_dma_bus_addr(u64 cpu_phys, u32 length, u32 capacity,
@@ -173,9 +191,12 @@ bool dwc2_transfer_release(struct dwc2_transfer_pool *pool,
     record->capacity = 0U;
     record->requested = 0U;
     record->actual = 0U;
+    if (record->generation == ~0ULL) {
+        /* Do not wrap a stale handle back into validity. */
+        record->state = DWC2_TRANSFER_RETIRED;
+        return true;
+    }
     record->generation++;
-    if (record->generation == 0U)
-        record->generation = 1U;
     record->state = DWC2_TRANSFER_FREE;
     return true;
 }

@@ -50,6 +50,7 @@ enum pisp_be_job_state {
     PISP_BE_JOB_COMPLETE,
     PISP_BE_JOB_FAILED,
     PISP_BE_JOB_RELEASED,
+    PISP_BE_JOB_RETIRED,
 };
 
 /*
@@ -144,7 +145,8 @@ _Static_assert(__builtin_offsetof(struct pisp_be_contract, payloads) ==
 
 /*
  * `controller_id` must be nonzero and unique among concurrently active
- * contracts. Job handles are bound to both this identity and a full generation.
+ * contracts. Storage must be fresh and all-zero; initialization is one-shot.
+ * Job handles are bound to both this identity and a full generation.
  */
 bool pisp_be_contract_init(struct pisp_be_contract *contract, u32 controller_id);
 

@@ -94,11 +94,8 @@ static bool hvs_handoff_mutable(struct hvs_handoff_contract *contract,
     if (!hvs_handoff_handle_valid(contract, handle))
         return false;
     if (owner_core != HVS_HANDOFF_OWNER_CORE ||
-        contract->control.owner_core != owner_core) {
-        hvs_handoff_quarantine(contract, HVS_HANDOFF_FAULT_OWNER, owner_core,
-                               now_ms);
+        contract->control.owner_core != owner_core)
         return false;
-    }
     return hvs_handoff_time_valid(contract, now_ms);
 }
 

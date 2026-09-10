@@ -12607,10 +12607,26 @@ static void admin_service_poll(struct admin_http_service *svc)
                         pios_boot_slot_offset(ota_update.target_slot);
                     ota_update.total = total;
                     ota_update.received = 0;
-                    ota_update.active = true;
+                    ota_update.active = false;
                     ota_update.last_error = NULL;
-                    http_write_kernel_slot_header(
-                        ota_update.target_slot_offset, total, false);
+                    if (!http_write_kernel_slot_header(
+                            ota_update.target_slot_offset, total, false)) {
+                        ota_update.last_error =
+                            "failed to invalidate slot header";
+                        svc->stream_mode = false;
+                        svc->resp_len = 0;
+                        http_append(
+                            svc->resp, &svc->resp_len, sizeof(svc->resp),
+                            "HTTP/1.0 500 Internal Server Error\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"ok\":false,\"error\":"
+                            "\"failed to invalidate slot header\"}\n");
+                        svc->resp_off = 0;
+                        svc->last_activity_ms = now;
+                        return;
+                    }
+                    ota_update.active = true;
                 }
                 svc->stream_mode = true;
                 svc->stream_kind = stream_kind;
