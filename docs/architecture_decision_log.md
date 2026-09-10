@@ -99,6 +99,7 @@ decision)
 | [052](#adr-052) | Bluetooth H4 receive framing before hardware enablement | Owner | Accepted |
 | [053](#adr-053) | USB HCI boundary and offline DWC2 contract | Owner | Accepted |
 | [054](#adr-054) | Unified dedicated-media hardware bring-up scope | Owner | Accepted |
+| [055](#adr-055) | PiSP BE is the first dedicated-media implementation lane | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -1983,3 +1984,24 @@ IOMMU, IRQ, PiSP tile, HEVC decode, camera, or display transition requires its
 own bounded implementation step, explicit diagnostics, and preserved fallback.
 An absent, unexpected, busy, faulted, or unowned engine stays disabled; it
 must never degrade the wired management path or existing framebuffer.
+
+<a name="adr-055"></a>
+## ADR-055 — PiSP BE is the first dedicated-media implementation lane
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Begin #169 with PiSP BE, the documented DRAM-to-DRAM ISP
+path, before HEVC, PiSP FE/camera ingress, or HVS native-display takeover.
+
+**Decision.** The first implementation is a bounded PiSP BE request,
+configuration, tile, DMA/IOMMU, completion, and quarantine foundation. It
+uses only specification- or independently verified `libpisp`-compatible
+configuration data; PIOS must not invent a guessed no-op tile descriptor.
+HEVC remains blocked on a stateless H.265 control/parser path, PiSP FE remains
+blocked on RP1/CSI/sensor ownership, and HVS remains passive-only until its
+framebuffer handoff/restoration protocol is proven.
+
+**Gates.** The initial code remains hardware-disabled until a later bounded
+clock/IOMMU/descriptor/IRQ transition is individually implemented and
+diagnosed. Each PiSP BE request has an exclusive IOMMU2 lease, explicit
+lengths and cache attributes, a deadline, and a deterministic quarantine path.
