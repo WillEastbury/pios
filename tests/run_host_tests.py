@@ -85,6 +85,9 @@ TESTS_MANIFEST = {
     "test_pisp_be_gate.c": ["src/media_engine_contract.c",
                             "src/pisp_be_contract.c",
                             "src/pisp_be_gate.c"],
+    # ADR-054 HVS V1 handoff lifecycle. Pure numeric ownership, private
+    # snapshots/list descriptors, and backend readback attestations only.
+    "test_hvs_handoff_contract.c": ["src/hvs_handoff_contract.c"],
     # USB Bulk-Only/SCSI geometry discovery. The test supplies a deterministic
     # transport mock and verifies READ CAPACITY(16) is issued only after the
     # READ CAPACITY(10) sentinel, including malformed-response rejection.
