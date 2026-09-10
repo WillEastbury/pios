@@ -96,6 +96,7 @@ decision)
 | [049](#adr-049) | Zero 2 W dual-preload firmware manifest | Owner | Accepted |
 | [050](#adr-050) | Pi5 editor assets ship in raw stage2 and install to WALFS | Owner | Accepted |
 | [051](#adr-051) | BCM2837 SDIO1 IRQ uses ARMCTRL → QA7 → AIRQ | Owner | Accepted |
+| [052](#adr-052) | Bluetooth H4 receive framing before hardware enablement | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -1917,3 +1918,28 @@ signal. EOI is intentionally a no-op for this cascade.
 **Scope and failure policy.** The route is accepted only on core 0 after the
 IRQ callback is registered. A non-core-0 arm or failed QA7 readback remains
 masked and is recorded. Pi 5, Pi 4, and QEMU retain their existing GIC paths.
+
+<a name="adr-052"></a>
+## ADR-052 — Bluetooth H4 receive framing before hardware enablement
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Begin Bluetooth support with an offline-only HCI H4 parser
+and bounded queue. Defer all hardware activation until its board-specific
+transport, reset ownership, and firmware sequence have separately been proven.
+
+**Decision.** `bt_h4` accepts only controller-to-host H4 Event, ACL, SCO, and
+ISO frames. It reconstructs fragmented frames into a fixed 1 KiB packet,
+rejects an unsupported type or oversized declared payload before copying that
+payload, and queues at most eight immutable records. A full queue retains the
+complete frame and reports explicit backpressure until the consumer releases
+credit. Consumer access is a generation-checked dequeue/copy/release protocol;
+abort discards only incomplete producer state and reset requires both sides
+quiesced.
+
+**Scope and failure policy.** This module is pure framing and ownership logic:
+it has no UART, GPIO, pinmux, mailbox, power, firmware-download, controller
+command, scan, pairing, L2CAP, BLE, or user-interface dependency. In
+particular, it does not write BT_ON/BT_REG_ON and does not enable a transport.
+Later Pi 5, Pi 3/4, and Zero 2 W transport work must have a new approved
+board-specific decision.

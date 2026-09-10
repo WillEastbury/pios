@@ -60,6 +60,9 @@ TESTS_MANIFEST = {
     "test_wifi_platform.c": ["src/wifi_platform.c", "src/mailbox.c",
                              "src/sha256_hkdf.c"],
     "test_sdhost.c": ["src/sdhost_logic.c"],
+    # Offline HCI H4 controller receive framing. This is deliberately pure
+    # parsing/ownership logic: no hardware or platform dependency.
+    "test_bt_h4.c": ["src/bt_h4.c"],
     # USB Bulk-Only/SCSI geometry discovery. The test supplies a deterministic
     # transport mock and verifies READ CAPACITY(16) is issued only after the
     # READ CAPACITY(10) sentinel, including malformed-response rejection.
