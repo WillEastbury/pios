@@ -63,6 +63,9 @@ TESTS_MANIFEST = {
     # Offline HCI H4 controller receive framing. This is deliberately pure
     # parsing/ownership logic: no hardware or platform dependency.
     "test_bt_h4.c": ["src/bt_h4.c"],
+    # ADR-060 immutable Bluetooth transport/reset topology facts. This does
+    # not depend on board detection, UART, control lines, or hardware.
+    "test_bluetooth_platform_contract.c": ["src/bluetooth_platform_contract.c"],
     # First DWC2 milestone: verified BCM2837 DMA/IRQ-route facts plus a pure
     # generation-safe transfer ownership model. No controller hardware is
     # enabled or accessed by this host-tested contract.

@@ -2109,3 +2109,35 @@ requires release and a new generation with a fresh external attestation; fault
 state is never silently cleared. This ADR adds no MMIO, mailbox, GPIO, RP1,
 timer, watchdog, IRQ, DMA, controller initialization, role-switch, or power
 operation.
+
+<a name="adr-060"></a>
+## ADR-060 — Immutable Bluetooth topology facts; activation disabled
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Implement #180 as a pure immutable board transport/reset
+profile catalogue from `raspberrypi/linux` commit
+`50f88724518d2eafe75bfae7923e90a8fe171c66`. Do not activate Bluetooth.
+
+**Decision.** `bluetooth_platform_contract` owns five catalogue identifiers
+that are explicitly separate from runtime board-detection identifiers: Pi 5,
+Pi 4 B, Pi 3 B, Pi 3 B+, and Zero 2 W. Each fixed record captures the
+upstream-DTS UART H4 topology, source bus range, CTS/RTS/TX/RX line numbers
+and mux evidence, shutdown-line topology/polarity, maximum baud, radio
+compatible, and console-conflict requirement. Pi 5 is BCM2712 SoC UARTA at
+`0x7d50c000` (not RP1); its separate `uart10` console is not a Bluetooth
+transport. The pinned source contains conflicting Pi 3/B+ board-description
+families for maximum baud and B+ CTS/RTS attachment. Those profiles retain
+the common physical signal/control facts but omit maximum-baud proof and
+cannot become transport candidates.
+
+**Failure policy.** The records intentionally declare no initial baud,
+reset/device/host-wake line, PIOS ownership, or activation proof. A direct
+DTS shutdown line is a topology fact only, never PIOS write authority.
+Candidate selection requires an exact catalogue record, complete immutable
+transport facts, the base overlay, and an identity distinct from the active
+console. mini-UART and disable-Bluetooth overlay changes are unsupported and
+reject. Activation is permanently false and reports the missing PIOS
+ownership, pinmux-control, reset/power, and firmware/baud proofs (plus the
+Pi 3 flow-control mux proof). This ADR adds no board discovery, UART, pin,
+firmware, reset, wake, mailbox, or hardware operation.
