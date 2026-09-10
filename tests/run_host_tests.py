@@ -67,6 +67,9 @@ TESTS_MANIFEST = {
     # generation-safe transfer ownership model. No controller hardware is
     # enabled or accessed by this host-tested contract.
     "test_dwc2_contract.c": ["src/dwc2_contract.c"],
+    # ADR-054 media engines: passive resource facts plus generation-safe
+    # ownership. This contract has no hardware, DMA, IRQ, or platform deps.
+    "test_media_engine_contract.c": ["src/media_engine_contract.c"],
     # USB Bulk-Only/SCSI geometry discovery. The test supplies a deterministic
     # transport mock and verifies READ CAPACITY(16) is issued only after the
     # READ CAPACITY(10) sentinel, including malformed-response rejection.

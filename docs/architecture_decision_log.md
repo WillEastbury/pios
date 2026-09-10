@@ -98,6 +98,7 @@ decision)
 | [051](#adr-051) | BCM2837 SDIO1 IRQ uses ARMCTRL → QA7 → AIRQ | Owner | Accepted |
 | [052](#adr-052) | Bluetooth H4 receive framing before hardware enablement | Owner | Accepted |
 | [053](#adr-053) | USB HCI boundary and offline DWC2 contract | Owner | Accepted |
+| [054](#adr-054) | Unified dedicated-media hardware bring-up scope | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -1958,3 +1959,27 @@ bounded, generation-safe transfer ownership without enabling a controller.
 **Deferred.** Actual DWC2 MMIO, ARMCTRL routing/unmask, DMA allocations and
 cache policy, hub enumeration, and VBUS ownership require separate approval.
 This milestone neither selects DWC2 nor performs hardware initialization.
+
+<a name="adr-054"></a>
+## ADR-054 — Unified dedicated-media hardware bring-up scope
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Track BCM2712 HEVC, PiSP FE/BE, and HVS native-display
+work together in #169 rather than splitting camera and display ownership into
+separate issues.
+
+**Decision.** #169 owns the staged hardware bring-up of all four blocks. Each
+engine nevertheless retains a separate core-0-owned state machine, clock,
+IOMMU/DMA domain, IRQ source, cache-line-isolated ownership records, and
+failure/quarantine state. No engine may borrow another engine's MMIO, DMA
+mapping, clock, interrupt, or completion state. HVS/display takeover remains
+independent of the mailbox framebuffer until a bounded handoff and restoration
+protocol is implemented and proven.
+
+**Gates.** The initial work is host-testable resource and ownership contracts
+plus passive read-only identification. Any write-capable clock, reset, DMA,
+IOMMU, IRQ, PiSP tile, HEVC decode, camera, or display transition requires its
+own bounded implementation step, explicit diagnostics, and preserved fallback.
+An absent, unexpected, busy, faulted, or unowned engine stays disabled; it
+must never degrade the wired management path or existing framebuffer.
