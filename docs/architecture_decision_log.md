@@ -103,6 +103,7 @@ decision)
 | [056](#adr-056) | HEVC uses PIOS-owned stateless controls before bitstream parsing | Owner | Accepted |
 | [057](#adr-057) | BCM2837 ARMCTRL uses a registered multi-source demultiplexer | Owner | Accepted |
 | [058](#adr-058) | Reserve a Normal-NC BCM2837 DWC2 DMA arena | Owner | Accepted |
+| [059](#adr-059) | BCM2837 USB VBUS remains externally attested and no-write | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2079,3 +2080,32 @@ cancelled or released until a trusted completion/failure attestation returns
 ownership. Generation exhaustion permanently retires a slot. This decision
 reserves memory only; it does not register IRQ41, control VBUS, initialize
 DWC2, or submit a transfer.
+
+<a name="adr-059"></a>
+## ADR-059 — BCM2837 USB VBUS remains externally attested and no-write
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Implement #179 as a pure, hardware-disabled BCM2837 USB
+VBUS/current-limit ownership contract, one subtask at a time.
+
+**Decision.** Pi 3 B (LAN9514 topology), Pi 3 B+ (LAN7515 nested-hub topology),
+and Zero 2 W (separate OTG data connector) have no proven PIOS-controllable
+VBUS regulator, GPIO, current-limit, or overcurrent mechanism. Their USB power
+remains no-write and externally attested until a board-specific, independently
+verified electrical ownership path is accepted in a later ADR. The contract
+records only private copies of PIOS-owned numeric operator/backend evidence:
+an externally powered topology, independent current protection, verified
+port/cable, and no-backfeed evidence. Optional current/overcurrent
+observations are likewise evidence, not a PIOS hardware read.
+
+**Failure policy and gate.** External evidence may permit a later *passive*
+DWC2/controller probe only. It never authorizes sourcing or toggling VBUS;
+software enablement remains false with CONTROL, CURRENT_LIMIT, and OVERCURRENT
+proofs explicitly absent. Unknown, stale, mismatched, incomplete, or
+out-of-bound evidence fails closed. A positive overcurrent observation or
+current above its externally declared bound quarantines the record. Recovery
+requires release and a new generation with a fresh external attestation; fault
+state is never silently cleared. This ADR adds no MMIO, mailbox, GPIO, RP1,
+timer, watchdog, IRQ, DMA, controller initialization, role-switch, or power
+operation.

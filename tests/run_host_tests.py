@@ -71,6 +71,10 @@ TESTS_MANIFEST = {
     # Normal-NC publication contract; it starts no hardware transfer.
     "test_dwc2_dma_arena.c": ["src/dwc2_contract.c",
                               "src/dwc2_dma_arena.c"],
+    # ADR-059 BCM2837 USB VBUS evidence only. This records external topology
+    # attestations and current observations without a board/platform or
+    # hardware dependency, and cannot authorize software VBUS control.
+    "test_usb_vbus_contract.c": ["src/usb_vbus_contract.c"],
     # BCM2837 ARMCTRL source registry and pending demux. DWC2 IRQ41 remains a
     # dormant known route until a future driver explicitly registers it.
     "test_legacy_armctrl.c": ["src/legacy_armctrl.c"],
