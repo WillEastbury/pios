@@ -67,6 +67,10 @@ TESTS_MANIFEST = {
     # generation-safe transfer ownership model. No controller hardware is
     # enabled or accessed by this host-tested contract.
     "test_dwc2_contract.c": ["src/dwc2_contract.c"],
+    # #176 BCM2837-only reserved DWC2 DMA arena. This is a pure ownership and
+    # Normal-NC publication contract; it starts no hardware transfer.
+    "test_dwc2_dma_arena.c": ["src/dwc2_contract.c",
+                              "src/dwc2_dma_arena.c"],
     # BCM2837 ARMCTRL source registry and pending demux. DWC2 IRQ41 remains a
     # dormant known route until a future driver explicitly registers it.
     "test_legacy_armctrl.c": ["src/legacy_armctrl.c"],
@@ -211,6 +215,7 @@ TEST_CFLAGS = {
     "test_net_dispatch.c": ["-DPIOS_PLATFORM=2"],
     "test_nic_receive.c": ["-DPIOS_PLATFORM=2"],
     "test_crypto_soft.c": ["-DPIOS_PLATFORM=6"],
+    "test_dwc2_dma_arena.c": ["-DPIOS_PLATFORM=6"],
     "test_airq_concurrency.c": ["-DPIOS_HOST_CORE_ID_FN", "-pthread"],
     "test_tls_event.c": ["-DPIOS_PLATFORM=6"],
     "test_tls_api.c": ["-DPIOS_PLATFORM=6"],
@@ -289,6 +294,7 @@ def main() -> int:
                  "test_sdio_clock_contract.py",
                  "test_issue_120_sdio1_high_speed_probe.py",
                  "test_issue_70_usb3_phy.py",
+                 "test_dwc2_dma_arena_gate.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)

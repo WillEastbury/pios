@@ -124,11 +124,16 @@ Identity mapped (VA == PA) on every target. Cacheability is region-specific.
 0x04B00000 +2MB     DMA DISK                   Normal-NC
 0x04D00000 +1MB     IPC SHM                    Normal-NC
 0x05000000 +16MB    HDMI back buffer
+0x06000000 +4MB     Shared asset window        Pi 3/Zero 2 W package builds
+0x06400000 +2MB     DWC2 DMA arena             BCM2837 Pi 3/Zero 2 W only,
+                                                Normal-NC, hardware-unassigned
 0x10000000 +32MB    Process arena (ADR-024)
 ```
 
 Pi 5 MMIO: BCM2712 peripherals `0x107C000000`, RP1 `0x1F00000000` (Device).
 BCM2837 MMIO: `0x3F000000` low peripherals + QA7 `0x40000000` (Device).
+The BCM2837 DWC2 arena is a reserved ownership/cache-transition contract only:
+it neither enables DWC2 nor authorizes a BCM bus alias as a CPU mapping.
 
 ### QEMU `virt`
 

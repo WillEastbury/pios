@@ -28,6 +28,22 @@
 #include "proc.h"
 #include "fb.h"
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+/*
+ * #176: the DWC2 reservation is exactly L2 block 50. It intentionally stays
+ * out of both WB predicates in mmu_init()/mmu_enable_caching(), so it is
+ * Normal-NC from the first MMU enable and never undergoes an attribute
+ * transition. Any future CPU alias must retain these identical NC attributes.
+ */
+_Static_assert(PIOS_DWC2_DMA_BASE ==
+               PIOS_SHARED_ASSET_BASE + PIOS_SHARED_ASSET_SIZE,
+               "BCM2837 DWC2 arena must start after shared assets");
+_Static_assert(PIOS_DWC2_DMA_BASE == 50ULL * L2_BLOCK_SIZE &&
+               PIOS_DWC2_DMA_SIZE == L2_BLOCK_SIZE,
+               "BCM2837 DWC2 arena must remain one Normal-NC L2 block");
+#endif
+
 /* Page tables — 4KB aligned (l1_table used by start.S for early MMU) */
 u64 l1_table[512] ALIGNED(4096);
 u64 l2_table_boot[512] ALIGNED(4096);  /* start.S low-1GB split; never edited live */
@@ -688,7 +704,9 @@ void mmu_init(void) {
  *   blocks 4-35   0x00800000-0x047FFFFF  per-core private RAM        -> WB IS
  *   blocks 36-39  0x04800000-0x04FFFFFF  FIFO/DMA_NET/DISK/IPC/PCIE1 -> NC
  *   blocks 40-47  0x05000000-0x05FFFFFF  HDMI back buffer           -> WB IS
- *   blocks 48-511 0x06000000-0x3FFFFFFF  high RAM + VideoCore scanout-> NC
+ *   blocks 48-49  0x06000000-0x063FFFFF  stage0 shared assets        -> NC
+ *   block 50      0x06400000-0x065FFFFF  BCM2837 DWC2 arena          -> NC
+ *   blocks 51-511 0x06600000-0x3FFFFFFF  high RAM + VideoCore scanout-> NC
  *
  * Break-before-make is honoured at the TRANSLATION ROOT rather than by an
  * in-place edit of the live l1_table[0] descriptor (block->table in place lets

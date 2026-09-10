@@ -17,6 +17,8 @@
  *   0x04D00000 - 0x04DFFFFF  Shared process IPC SHM pool (1MB)
  *   0x04E00000 - 0x04FFFFFF  DMA PCIE1 inbound arena (2MB, NC; #141)
  *   0x05000000 - 0x05FFFFFF  HDMI double-buffer back buffer (16MB)
+ *   0x06400000 - 0x065FFFFF  BCM2837 DWC2 DMA arena (2MB, NC; Pi3/Zero2W
+ *                             only; allocated but hardware-unassigned)
  *
  * QEMU's equivalent map is offset upward by 2MB to leave room for the larger
  * kernel image while preserving the 0x48000000 stage0 staging window:
@@ -54,6 +56,11 @@
 
 #define DMA_PCIE1_BASE      PIOS_DMA_PCIE1_BASE
 #define DMA_PCIE1_SIZE      PIOS_DMA_PCIE1_SIZE
+
+/* BCM2837-only, Normal-NC DWC2 reservation. This names physical storage;
+ * a BCM bus alias is DMA authority only and is never a CPU pointer. */
+#define DWC2_DMA_BASE       PIOS_DWC2_DMA_BASE
+#define DWC2_DMA_SIZE       PIOS_DWC2_DMA_SIZE
 
 #define IPC_SHM_BASE        PIOS_IPC_SHM_BASE
 #define IPC_SHM_SIZE        PIOS_IPC_SHM_SIZE

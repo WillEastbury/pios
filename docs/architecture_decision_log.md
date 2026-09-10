@@ -102,6 +102,7 @@ decision)
 | [055](#adr-055) | PiSP BE is the first dedicated-media implementation lane | Owner | Accepted |
 | [056](#adr-056) | HEVC uses PIOS-owned stateless controls before bitstream parsing | Owner | Accepted |
 | [057](#adr-057) | BCM2837 ARMCTRL uses a registered multi-source demultiplexer | Owner | Accepted |
+| [058](#adr-058) | Reserve a Normal-NC BCM2837 DWC2 DMA arena | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2053,3 +2054,28 @@ or unmasks it in this decision.
 unregistered operations fail closed. Removing a source masks it before
 releasing its generation. A simultaneous second registered source remains
 pending for the next acknowledgement; no polling fallback is introduced.
+
+<a name="adr-058"></a>
+## ADR-058 — Reserve a Normal-NC BCM2837 DWC2 DMA arena
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Implement #176 after the ARMCTRL demultiplexer.
+
+**Decision.** Pi 3 and Zero 2 W reserve physical
+`0x06400000–0x065FFFFF` for future DWC2 DMA. The existing stage0 shared-asset
+window remains unchanged at `0x06000000–0x063FFFFF`; the new arena occupies
+the next complete 2 MiB L2 block, remains below the `0x08000000` staging
+window and the BCM2837 DMA limit, and is Normal-NC from the first MMU enable.
+Eight fixed 256 KiB slots have cache-line-isolated controls, immutable numeric
+spans, full-generation handles, and explicit CPU/device ownership transitions.
+
+**Cache and failure policy.** Publication and consumption use system-scoped
+DMA barriers only: no cache maintenance is performed because every CPU alias
+must remain Normal-NC. Inner-shareable barriers continue to publish metadata
+between cores but are insufficient to order the external DWC2 master. A BCM
+bus alias is DMA authority, never a CPU mapping. Device-owned slots cannot be
+cancelled or released until a trusted completion/failure attestation returns
+ownership. Generation exhaustion permanently retires a slot. This decision
+reserves memory only; it does not register IRQ41, control VBUS, initialize
+DWC2, or submit a transfer.

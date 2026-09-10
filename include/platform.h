@@ -392,6 +392,20 @@
 #define PIOS_FB_BACK_SIZE           0x01000000UL
 
 /*
+ * BCM2837 DWC2 DMA reservation (#176). This is deliberately only a physical
+ * Normal-NC reservation and ownership contract; it does not enable DWC2 or
+ * create a CPU mapping for its BCM bus alias.
+ */
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+#define PIOS_DWC2_DMA_BASE          0x06400000UL
+#define PIOS_DWC2_DMA_SIZE          0x00200000UL
+#else
+#define PIOS_DWC2_DMA_BASE          0UL
+#define PIOS_DWC2_DMA_SIZE          0UL
+#endif
+
+/*
  * Shared asset window (PicoScript IDE HTML/JS, etc.). One copy lives in
  * PIOSSTG2.PKG as platform_id SHARED; stage0 copies it here so every
  * kernel payload can omit the ~2 MiB blob. Must sit outside kernel, FIFO,
