@@ -97,6 +97,7 @@ decision)
 | [050](#adr-050) | Pi5 editor assets ship in raw stage2 and install to WALFS | Owner | Accepted |
 | [051](#adr-051) | BCM2837 SDIO1 IRQ uses ARMCTRL → QA7 → AIRQ | Owner | Accepted |
 | [052](#adr-052) | Bluetooth H4 receive framing before hardware enablement | Owner | Accepted |
+| [053](#adr-053) | USB HCI boundary and offline DWC2 contract | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -1943,3 +1944,17 @@ command, scan, pairing, L2CAP, BLE, or user-interface dependency. In
 particular, it does not write BT_ON/BT_REG_ON and does not enable a transport.
 Later Pi 5, Pi 3/4, and Zero 2 W transport work must have a new approved
 board-specific decision.
+
+<a name="adr-053"></a>
+## ADR-053 — USB HCI boundary and offline DWC2 contract
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** Current xHCI becomes a thin adapter behind transport-neutral
+`usb_hci_ops`; USB enumeration and class drivers use only that boundary. The
+pure DWC2 contract records BCM2837 DMA and IRQ-route facts and host-tests
+bounded, generation-safe transfer ownership without enabling a controller.
+
+**Deferred.** Actual DWC2 MMIO, ARMCTRL routing/unmask, DMA allocations and
+cache policy, hub enumeration, and VBUS ownership require separate approval.
+This milestone neither selects DWC2 nor performs hardware initialization.

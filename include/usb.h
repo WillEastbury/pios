@@ -10,9 +10,10 @@
 
 #pragma once
 #include "types.h"
+#include "usb_hci.h"
 
 #define USB_MAX_DRIVERS     4
-#define USB_MAX_ENDPOINTS   8
+#define USB_MAX_ENDPOINTS   USB_HCI_MAX_ENDPOINTS
 #define USB_MAX_CONFIG_DESC 1024
 
 #define USB_DIR_IN          0x80
@@ -24,6 +25,7 @@
 
 /* Device descriptor parsed from enumeration */
 struct usb_device {
+    u32 controller;
     u32 slot;
     u32 port;
     u32 speed;
@@ -71,6 +73,9 @@ bool usb_control_msg(struct usb_device *dev, u8 bmReq, u8 bReq,
                      u16 wVal, u16 wIdx, u16 wLen, void *data, u32 *actual);
 bool usb_bulk_msg(struct usb_device *dev, u8 ep_addr,
                   void *data, u32 len, u32 *actual);
+bool usb_interrupt_submit(struct usb_device *dev, u8 ep_addr,
+                          void *data, u32 len);
+bool usb_interrupt_poll(struct usb_device *dev, u32 *actual, bool *complete);
 
 /* Get the currently enumerated device (NULL if none) */
 struct usb_device *usb_get_device(void);

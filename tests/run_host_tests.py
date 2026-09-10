@@ -63,6 +63,10 @@ TESTS_MANIFEST = {
     # Offline HCI H4 controller receive framing. This is deliberately pure
     # parsing/ownership logic: no hardware or platform dependency.
     "test_bt_h4.c": ["src/bt_h4.c"],
+    # First DWC2 milestone: verified BCM2837 DMA/IRQ-route facts plus a pure
+    # generation-safe transfer ownership model. No controller hardware is
+    # enabled or accessed by this host-tested contract.
+    "test_dwc2_contract.c": ["src/dwc2_contract.c"],
     # USB Bulk-Only/SCSI geometry discovery. The test supplies a deterministic
     # transport mock and verifies READ CAPACITY(16) is issued only after the
     # READ CAPACITY(10) sentinel, including malformed-response rejection.
