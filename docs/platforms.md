@@ -6,7 +6,7 @@ on every mapping of a PA. Hardware is a capability set selected at compile
 time (`PIOS_PLATFORM` in `include/platform.h`), not “always BCM2712 + RP1”.
 
 Kernel contracts: [`architecture_system.md`](architecture_system.md).
-Decisions: ADR-038 through ADR-049 in
+Decisions: ADR-038 through ADR-051 in
 [`architecture_decision_log.md`](architecture_decision_log.md).
 Traps: [`gotchas.md`](gotchas.md).
 
@@ -87,10 +87,13 @@ into one payload.
 
 **Network (ADR-043 / ADR-044).** One TCP/IP stack. Wired `nic_ops`: MACB on
 Pi 5 (RP1 IRQ), GENET on Pi 4 (GIC SPI 157), virtio on QEMU (paced; no RX
-IRQ). WiFi is `nic_load("wifi-cyw43455")` and DAT1/SDHCI IRQ → FIFO on GIC
-hosts. BCM2837 has no GIC; GPU SDIO IRQ is not routed yet. Pi 4 and Pi 5 stay
-wired-first (`.201`); `wifi activate` adds `.202`. BCM2837 boards have no
-wired MAC, so stage2 may auto-init Wi-Fi (ADR-041).
+IRQ). WiFi is `nic_load("wifi-cyw43455")` and DAT1/SDHCI IRQ → FIFO. On
+BCM2837, SDIO1's GPU IRQ62 is routed through ARMCTRL bank 2 and the QA7 normal
+GPU cascade to core 0, where `irqc_legacy` exposes private compatibility intid
+62 (not a GIC SPI or Linux IRQ-domain number); its top half only masks/W1Cs and
+publishes AIRQ work (ADR-051). Pi 4 and Pi 5 stay wired-first (`.201`);
+`wifi activate` adds `.202`. BCM2837 boards have no wired MAC, so stage2 may
+auto-init Wi-Fi (ADR-041).
 
 **Zero 2 W firmware (ADR-049).** Before SDIO1 disturbs FAT, preload and
 validate the two pinned `/wifi/zero2w/43436*` records. The raw ChipCommon

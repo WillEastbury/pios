@@ -7,7 +7,8 @@
  * SDHCI-compatible register layout. Reuses the same command encoding
  * scheme as sd.c (EMMC2) but adds SDIO-specific CMD5/CMD52/CMD53.
  *
- * Polling mode, no DMA, no interrupts.
+ * Command transfers are polling/no-DMA; DAT1 card events use the guarded
+ * host-IRQ route where the platform supplies one.
  *
  * Reference: SD Host Controller Simplified Spec v3.0
  *            SDIO Simplified Spec v3.0
@@ -114,6 +115,7 @@
 /* Card state */
 static u32 sdio_rca;
 static struct sdio_diag sdio_diag ALIGNED(64);
+static volatile struct sdio_irq_diag sdio_irq_diag ALIGNED(64);
 static bool sdio_initialized;
 
 /* ── Register helpers ── */
@@ -1460,10 +1462,14 @@ void sdio_card_irq_mask(void)
 #if PIOS_HAS_WIFI_SDIO
     u16 signal = sr16(REG_IRPT_EN);
     sw16(REG_IRPT_EN, (u16)(signal & ~(u16)INT_CARD));
+#if !PIOS_HAS_GIC && PIOS_WIFI_SDIO_IRQ != 0
+    /* Keep ARMCTRL disabled until AIRQ's controlled drain re-arms us. */
+    gic_disable_irq(PIOS_WIFI_SDIO_IRQ);
+#endif
 #endif
 }
 
-void sdio_card_irq_unmask(void)
+static void sdio_card_irq_host_unmask(void)
 {
 #if PIOS_HAS_WIFI_SDIO
     u16 signal = sr16(REG_IRPT_EN);
@@ -1471,15 +1477,40 @@ void sdio_card_irq_unmask(void)
 #endif
 }
 
+void sdio_card_irq_unmask(void)
+{
+#if !PIOS_HAS_GIC && PIOS_WIFI_SDIO_IRQ != 0
+    /* Bottom half only: controller source first, SDHCI host signal last. */
+    gic_enable_irq(PIOS_WIFI_SDIO_IRQ);
+#endif
+    sdio_card_irq_host_unmask();
+}
+
 static void sdio_gic_irq_handler(void)
 {
-    /* Top half: mask the level line, ack, post. Drain is FIFO/AIRQ only. */
+    /* Historical name retained for GIC callers. The legacy path is likewise a
+     * top half only: mask, record/W1C, AIRQ-publish, and return. */
     sdio_card_irq_mask();
+#if !PIOS_HAS_GIC
+    u16 status = sr16(REG_INTERRUPT);
+    sdio_irq_diag.last_status = status;
+    if (status & INT_CARD) {
+        sdio_card_irq_latched = true;
+        sdio_card_irq_ack();
+    }
+    if (!airq_post_from(CORE_NET, AIRQ_SRC_WIFI, NET_DISPATCH_CAUSE_IRQ)) {
+        sdio_card_irq_latched = false;
+        sdio_irq_diag.airq_post_failed++;
+        /* Both SDHCI and ARMCTRL remain masked. Do not fall back to polling. */
+        return;
+    }
+#else
     if (sdio_card_irq_pending()) {
         sdio_card_irq_latched = true;
         sdio_card_irq_ack();
     }
     (void)airq_post_from(CORE_NET, AIRQ_SRC_WIFI, NET_DISPATCH_CAUSE_IRQ);
+#endif
 }
 
 void sdio_card_irq_arm(void)
@@ -1487,9 +1518,30 @@ void sdio_card_irq_arm(void)
 #if PIOS_HAS_WIFI_SDIO
     sdio_card_irq_latched = false;
     sdio_card_irq_level = false;
-    sdio_card_irq_unmask();
+#if !PIOS_HAS_GIC
+    /* SDIO1's ARMCTRL -> QA7 cascade is owned exclusively by core 0. Keep the
+     * host source masked until its callback, route, and ARMCTRL source live. */
+    sdio_card_irq_mask();
+    if ((core_id() & 3U) != CORE_NET) {
+        sdio_irq_diag.arm_rejected_noncore0++;
+        return;
+    }
+#endif
 #if PIOS_WIFI_SDIO_IRQ != 0
     irq_register(PIOS_WIFI_SDIO_IRQ, sdio_gic_irq_handler);
+#if !PIOS_HAS_GIC
+    if (!gic_legacy_sdhci_route_core0()) {
+        sdio_irq_diag.route_failed++;
+        return;
+    }
+    /* ARMCTRL EN2 is W1; only after route readback and callback registration
+     * may the SDHCI host signal be exposed. */
+    gic_enable_irq(PIOS_WIFI_SDIO_IRQ);
+    sdio_card_irq_host_unmask();
+    sdio_irq_diag.armed++;
+    uart_puts("[sdio] card IRQ armed legacy GPU62\n");
+#else
+    sdio_card_irq_unmask();
     gic_set_group1(PIOS_WIFI_SDIO_IRQ);
     gic_set_priority(PIOS_WIFI_SDIO_IRQ, 0x60U);
     gic_set_target(PIOS_WIFI_SDIO_IRQ, 1U);
@@ -1498,10 +1550,19 @@ void sdio_card_irq_arm(void)
     uart_puts("[sdio] card IRQ armed intid=");
     uart_hex(PIOS_WIFI_SDIO_IRQ);
     uart_puts("\n");
+#endif
 #else
     uart_puts("[sdio] card IRQ: no host INTID on this platform\n");
 #endif
 #endif
+}
+
+void sdio_irq_diag_snapshot(struct sdio_irq_diag *out)
+{
+    if (!out)
+        return;
+    dmb_ishld();
+    *out = sdio_irq_diag;
 }
 
 bool sdio_card_irq_take(void)

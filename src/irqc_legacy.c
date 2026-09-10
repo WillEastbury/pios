@@ -31,9 +31,8 @@
  *   0xC0 + 16*cpu + 4*mbox  LOCAL_MAILBOXn_CLRm (write bits to ack/clear)
  *
  * LOCAL_IRQ_PENDING bit layout: 0=CNTPSIRQ 1=CNTPNSIRQ 2=CNTHPIRQ 3=CNTVIRQ
- * 4-7=MAILBOX0-3 8=GPU_FAST (peripheral IRQs routed from the separate legacy
- * Broadcom interrupt controller -- not yet wired here, see follow-up notes
- * at the bottom of this file) 9=PMU_FAST.
+ * 4-7=MAILBOX0-3 8=GPU_FAST (the manual's name for the normal peripheral
+ * cascade; it is not an FIQ) 9=PMU_FAST.
  *
  * We translate these local bit positions into the SAME intid numbering
  * space PIOS already uses on GIC (GIC_TIMER_NS_PHYS=30, GIC_TIMER_VIRT=27,
@@ -49,6 +48,7 @@
 
 #define QA7_LOCAL_TIMER_INT_CONTROL0   0x40U
 #define QA7_LOCAL_MAILBOX_INT_CONTROL0 0x50U
+#define QA7_LOCAL_GPU_ROUTING           0x0CU
 #define QA7_LOCAL_IRQ_PENDING0         0x60U
 #define QA7_LOCAL_MAILBOX0_SET0        0x80U
 #define QA7_LOCAL_MAILBOX0_CLR0        0xC0U
@@ -58,6 +58,17 @@
 #define QA7_BIT_CNTHPIRQ   2U
 #define QA7_BIT_CNTVIRQ    3U
 #define QA7_BIT_MAILBOX0   4U
+#define QA7_BIT_GPU_FAST   8U
+
+/* ARMCTRL's bank-2 bit 30 is GPU IRQ62, the BCM2837 Arasan SDIO1 interrupt.
+ * This is the first and only legacy peripheral route: ARMCTRL -> QA7 -> the
+ * compatibility intid consumed by exception.c. */
+#define ARMCTRL_BASE                 (PIOS_PERIPH_BASE + 0xB200UL)
+#define ARMCTRL_IRQ_PENDING2         0x08U
+#define ARMCTRL_ENABLE_IRQS2         0x14U
+#define ARMCTRL_DISABLE_IRQS2        0x20U
+#define ARMCTRL_GPU_IRQ_SDIO1_BIT    (1U << 30)
+#define QA7_GPU_ROUTE_CORE_MASK      0x3U
 
 static inline u64 qa7_reg(u32 off, u32 core)
 {
@@ -74,6 +85,21 @@ void gic_init(void)
     uart_puts("[irqc] legacy BCM local interrupt controller initialised (QA7 base=");
     uart_hex(QA7_BASE);
     uart_puts(")\n");
+}
+
+bool gic_legacy_sdhci_route_core0(void)
+{
+    if ((core_id() & 3U) != 0U)
+        return false;
+
+    /* LOCAL_GPU_ROUTING[1:0] selects the normal GPU cascade target. Preserve
+     * [3:2], which independently select FIQ routing and must remain untouched. */
+    u32 route = mmio_read(QA7_BASE + QA7_LOCAL_GPU_ROUTING);
+    route &= ~QA7_GPU_ROUTE_CORE_MASK;
+    mmio_write(QA7_BASE + QA7_LOCAL_GPU_ROUTING, route);
+    dsb();
+    return (mmio_read(QA7_BASE + QA7_LOCAL_GPU_ROUTING) &
+            QA7_GPU_ROUTE_CORE_MASK) == 0U;
 }
 
 /* No multi-candidate-address probing on this platform -- QA7_BASE is a
@@ -112,6 +138,12 @@ void gic_enable_irq(u32 intid)
 {
     u32 core = core_id() & 3U;
     u32 bit;
+    if (intid == LEGACY_GPU_IRQ_SDHCI) {
+        if (core == 0U)
+            mmio_write(ARMCTRL_BASE + ARMCTRL_ENABLE_IRQS2,
+                       ARMCTRL_GPU_IRQ_SDIO1_BIT);
+        return;
+    }
     if (intid == GIC_TIMER_NS_PHYS) bit = QA7_BIT_CNTPNSIRQ;
     else if (intid == GIC_TIMER_VIRT) bit = QA7_BIT_CNTVIRQ;
     else return; /* no peripheral/SPI routing on this platform yet */
@@ -123,6 +155,12 @@ void gic_disable_irq(u32 intid)
 {
     u32 core = core_id() & 3U;
     u32 bit;
+    if (intid == LEGACY_GPU_IRQ_SDHCI) {
+        if (core == 0U)
+            mmio_write(ARMCTRL_BASE + ARMCTRL_DISABLE_IRQS2,
+                       ARMCTRL_GPU_IRQ_SDIO1_BIT);
+        return;
+    }
     if (intid == GIC_TIMER_NS_PHYS) bit = QA7_BIT_CNTPNSIRQ;
     else if (intid == GIC_TIMER_VIRT) bit = QA7_BIT_CNTVIRQ;
     else return;
@@ -150,6 +188,10 @@ u32 gic_acknowledge(void)
         return GIC_TIMER_NS_PHYS;
     if (pending & (1U << QA7_BIT_CNTVIRQ))
         return GIC_TIMER_VIRT;
+    if ((pending & (1U << QA7_BIT_GPU_FAST)) &&
+        (mmio_read(ARMCTRL_BASE + ARMCTRL_IRQ_PENDING2) &
+         ARMCTRL_GPU_IRQ_SDIO1_BIT))
+        return LEGACY_GPU_IRQ_SDHCI;
     return GIC_INTID_SPURIOUS;
 }
 
@@ -166,6 +208,8 @@ void gic_end_of_interrupt(u32 iar_value)
         mmio_write(QA7_BASE + QA7_LOCAL_MAILBOX0_CLR0 + (u64)(core * 16U),
                    0xFFFFFFFFU);
     }
+    /* ARMCTRL/QA7 peripheral cascades have no IAR/EOIR transaction. SDHCI's
+     * top half owns its status W1C and line masking. */
 }
 
 void gic_send_sgi(u8 target_mask, u32 sgi_id)

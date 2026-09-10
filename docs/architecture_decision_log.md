@@ -95,6 +95,7 @@ decision)
 | [048](#adr-048) | Gate SDIO1 high speed on Function-1 proof | Owner | Accepted |
 | [049](#adr-049) | Zero 2 W dual-preload firmware manifest | Owner | Accepted |
 | [050](#adr-050) | Pi5 editor assets ship in raw stage2 and install to WALFS | Owner | Accepted |
+| [051](#adr-051) | BCM2837 SDIO1 IRQ uses ARMCTRL → QA7 → AIRQ | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -1891,3 +1892,28 @@ is a no-op. HTTP retains only inode IDs, lengths, and bounded WALFS reads.
 write leaves the editor unavailable and prevents the candidate boot from being
 marked healthy. It does not attempt repair from partially written data. QEMU's
 existing compiled-in direct-boot fallback is unchanged.
+
+<a name="adr-051"></a>
+## ADR-051 — BCM2837 SDIO1 IRQ uses ARMCTRL → QA7 → AIRQ
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Issue #134 uses the guarded, interrupt-driven route:
+ARMCTRL → QA7 → AIRQ. This is the most faithful BCM2837 design.
+
+**Decision.** SDIO1 is ARMCTRL bank-2 GPU IRQ62 (bit 30). Core 0 clears only
+`LOCAL_GPU_ROUTING[1:0]`, preserving its FIQ-routing bits, and verifies the
+readback before ARMCTRL EN2 is written. QA7 `LOCAL_IRQ_PENDING0.bit8`
+(`GPU_FAST` is only the hardware name for this normal cascade) gates the
+ARMCTRL `PENDING2.bit30` check. `irqc_legacy` maps that result to the private
+compatibility intid 62; it is neither a GIC SPI nor a Linux IRQ-domain number.
+
+The SDIO top half masks SDHCI and ARMCTRL, records and W1Cs SDHCI `INT_CARD`,
+then publishes exactly one `AIRQ_SRC_WIFI` record. It parses no packets and
+does no polling. A failed publication is counted and leaves both sources
+masked. Only the AIRQ bottom half re-enables ARMCTRL, then the SDHCI host
+signal. EOI is intentionally a no-op for this cascade.
+
+**Scope and failure policy.** The route is accepted only on core 0 after the
+IRQ callback is registered. A non-core-0 arm or failed QA7 readback remains
+masked and is recorded. Pi 5, Pi 4, and QEMU retain their existing GIC paths.

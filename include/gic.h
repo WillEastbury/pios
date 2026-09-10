@@ -37,6 +37,9 @@
 #define GIC_TIMER_VIRT      27      /* Virtual timer PPI */
 #define GIC_RP1_ETH_MSI     166     /* GIC_SPI 128 => INTID 160, plus RP1_INT_ETH(6) */
 #define GIC_SGI_WAKE        9       /* SW-generated inter-core wake doorbell (SGI) */
+/* BCM2837 ARMCTRL GPU IRQ62, exposed only as a private compatibility intid by
+ * irqc_legacy. It is neither a GIC SPI nor Linux's remapped IRQ domain. */
+#define LEGACY_GPU_IRQ_SDHCI PIOS_BCM2837_GPU_IRQ_SDIO1
 
 /* Max interrupts */
 #define GIC_MAX_IRQ         320
@@ -64,3 +67,9 @@ void gic_send_sgi(u8 target_mask, u32 sgi_id);
 /* Enable the calling core's GIC CPU interface (banked). MUST be called on each
  * secondary core or it will never receive any interrupt. */
 void gic_cpu_init(void);
+
+#if !PIOS_HAS_GIC
+/* Route the BCM2837 normal GPU cascade to core 0 and verify the field before
+ * ARMCTRL's SDIO1 source is enabled. */
+bool gic_legacy_sdhci_route_core0(void);
+#endif

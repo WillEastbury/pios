@@ -233,6 +233,7 @@ def main() -> int:
                  "test_qemu_blk_probe.py",
                  "test_sdio_io_only_cmd5.py",
                  "test_irq_fifo_intids.py",
+                 "test_issue_134_bcm2837_sdio_irq.py",
                  "test_issue_143_pcie1_bus_master.py",
                  "test_issue_146_pcie1_aer.py",
                  "test_issue_145_pcie1_enum_map.py",

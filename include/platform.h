@@ -245,6 +245,7 @@
 #define PIOS_HAS_VMBUS              0
 #define PIOS_HAS_WIFI_SDIO2         0
 #define PIOS_WIFI_SDIO2_BASE        0UL
+#define PIOS_BCM2837_GPU_IRQ_SDIO1  62U   /* ARMCTRL bank2 bit30; not a GIC SPI */
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI3
 /* Pi 3 B/B+ onboard radio: legacy Arasan SDIO1 on GPIO34-39. WL_ON is
  * firmware expgpio line 1 (property GPIO 129), not SoC GPIO43. */
@@ -306,6 +307,10 @@
 #define PIOS_WIFI_WL_REG_ON_FIRMWARE 0
 #endif
 
+#ifndef PIOS_BCM2837_GPU_IRQ_SDIO1
+#define PIOS_BCM2837_GPU_IRQ_SDIO1  62U
+#endif
+
 #ifndef PIOS_HAS_WIFI_SDIO1
 #define PIOS_HAS_WIFI_SDIO1         0
 #define PIOS_WIFI_SDIO1_BASE        0UL
@@ -340,6 +345,10 @@
 #define PIOS_WIFI_SDIO_IRQ          306U   /* GIC_SPI 274 */
 #elif PIOS_HAS_WIFI_SDIO1 && PIOS_HAS_GIC
 #define PIOS_WIFI_SDIO_IRQ          158U   /* GIC_SPI 126, Arasan @ 0xFE300000 */
+#elif PIOS_HAS_WIFI_SDIO1
+/* BCM2837 routes the SDIO1 GPU IRQ through ARMCTRL -> QA7, where
+ * irqc_legacy translates it into its private compatibility intid. */
+#define PIOS_WIFI_SDIO_IRQ          PIOS_BCM2837_GPU_IRQ_SDIO1
 #else
 #define PIOS_WIFI_SDIO_IRQ          0U
 #endif
