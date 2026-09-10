@@ -75,6 +75,11 @@ TESTS_MANIFEST = {
     # it never identifies, enables, or accesses PiSP-BE hardware.
     "test_pisp_be_contract.c": ["src/media_engine_contract.c",
                                 "src/pisp_be_contract.c"],
+    # ADR-056 HEVC request/frame/job contract. Pure numeric metadata and
+    # lifecycle validation only: it contains no compressed-input interpretation
+    # or hardware.
+    "test_hevc_contract.c": ["src/media_engine_contract.c",
+                             "src/hevc_contract.c"],
     # ADR-055 PiSP-BE brick-test gate. It accepts only caller-supplied
     # observations and contract capabilities; it has no platform or I/O path.
     "test_pisp_be_gate.c": ["src/media_engine_contract.c",

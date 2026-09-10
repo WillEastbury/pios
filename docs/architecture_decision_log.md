@@ -100,6 +100,7 @@ decision)
 | [053](#adr-053) | USB HCI boundary and offline DWC2 contract | Owner | Accepted |
 | [054](#adr-054) | Unified dedicated-media hardware bring-up scope | Owner | Accepted |
 | [055](#adr-055) | PiSP BE is the first dedicated-media implementation lane | Owner | Accepted |
+| [056](#adr-056) | HEVC uses PIOS-owned stateless controls before bitstream parsing | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2005,3 +2006,27 @@ framebuffer handoff/restoration protocol is proven.
 clock/IOMMU/descriptor/IRQ transition is individually implemented and
 diagnosed. Each PiSP BE request has an exclusive IOMMU2 lease, explicit
 lengths and cache attributes, a deadline, and a deterministic quarantine path.
+
+<a name="adr-056"></a>
+## ADR-056 — HEVC uses PIOS-owned stateless controls before bitstream parsing
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Implement #172 as the next hardware-disabled media
+subtask.
+
+**Decision.** The initial HEVC path accepts only a PIOS-owned, versioned,
+fixed-capacity stateless control request. Encoded H.265 bytes remain opaque
+source-span contents: PIOS does not yet parse VPS/SPS/PPS RBSP, NAL units,
+Exp-Golomb values, or slice headers. The contract admits only a conservative
+4:2:0 8/10-bit metadata subset, bounded frames/references/slices, default
+scaling, explicit source/capture spans, and generation-safe frame identities.
+Unsupported syntax, control fields, layouts, and nonzero reserved fields
+reject before a request becomes visible to a future hardware backend.
+
+**Rationale and gates.** BCM2712's upstream stateless driver consumes
+caller-parsed controls; it does not manufacture them from the elementary
+stream. This boundary matches that ownership split without importing a
+GPL-family parser or creating a Linux V4L2 ABI in PIOS. It does not authorize
+HEVC MMIO, clock 11, IOMMU2, DMA, SPI 98, phase-1/phase-2 submission, or
+decode. Those require separate bounded hardware transitions and a live proof.
