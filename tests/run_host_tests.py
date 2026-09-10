@@ -75,6 +75,11 @@ TESTS_MANIFEST = {
     # it never identifies, enables, or accesses PiSP-BE hardware.
     "test_pisp_be_contract.c": ["src/media_engine_contract.c",
                                 "src/pisp_be_contract.c"],
+    # ADR-055 PiSP-BE brick-test gate. It accepts only caller-supplied
+    # observations and contract capabilities; it has no platform or I/O path.
+    "test_pisp_be_gate.c": ["src/media_engine_contract.c",
+                            "src/pisp_be_contract.c",
+                            "src/pisp_be_gate.c"],
     # USB Bulk-Only/SCSI geometry discovery. The test supplies a deterministic
     # transport mock and verifies READ CAPACITY(16) is issued only after the
     # READ CAPACITY(10) sentinel, including malformed-response rejection.
