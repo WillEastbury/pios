@@ -166,6 +166,15 @@ bool media_engine_lease_release(struct media_engine_controller *controller,
 bool media_engine_lease_abort(struct media_engine_controller *controller,
                               const struct media_engine_lease *lease);
 
+/*
+ * Read-only capability check for contracts layered above engine ownership.
+ * It exposes neither the owner record nor a mutation path. A true result
+ * means `lease` is current and the specified engine remains actively leased.
+ */
+bool media_engine_lease_active_for(
+    const struct media_engine_controller *controller,
+    const struct media_engine_lease *lease, enum media_engine_kind kind);
+
 /* Quarantine can only be left through this explicit administrative action. */
 bool media_engine_rearm(struct media_engine_controller *controller,
                         enum media_engine_kind kind);

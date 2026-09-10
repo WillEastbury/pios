@@ -351,6 +351,32 @@ bool media_engine_lease_abort(struct media_engine_controller *controller,
     return true;
 }
 
+bool media_engine_lease_active_for(
+    const struct media_engine_controller *controller,
+    const struct media_engine_lease *lease, enum media_engine_kind kind)
+{
+    u32 index = media_engine_index(kind);
+    u32 generation;
+    u64 token;
+
+    if (!controller || !lease || index == MEDIA_ENGINE_COUNT ||
+        lease->_controller_id == 0U ||
+        lease->_controller_id != controller->owner.controller_id ||
+        lease->_reserved != 0U)
+        return false;
+    token = lease->_token;
+    if ((token >> MEDIA_ENGINE_TOKEN_MAGIC_SHIFT) != MEDIA_ENGINE_TOKEN_MAGIC ||
+        (enum media_engine_kind)(token & MEDIA_ENGINE_TOKEN_KIND_MASK) != kind)
+        return false;
+    generation = (u32)((token >> MEDIA_ENGINE_TOKEN_GENERATION_SHIFT) &
+                       MEDIA_ENGINE_TOKEN_GENERATION_MASK);
+    dmb_ishld();
+    return generation != 0U &&
+           controller->engines[index].generation == generation &&
+           controller->engines[index].lease_generation == generation &&
+           controller->engines[index].state == MEDIA_ENGINE_LEASED;
+}
+
 bool media_engine_rearm(struct media_engine_controller *controller,
                         enum media_engine_kind kind)
 {

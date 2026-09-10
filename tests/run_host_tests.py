@@ -70,6 +70,11 @@ TESTS_MANIFEST = {
     # ADR-054 media engines: passive resource facts plus generation-safe
     # ownership. This contract has no hardware, DMA, IRQ, or platform deps.
     "test_media_engine_contract.c": ["src/media_engine_contract.c"],
+    # ADR-055 PiSP-BE request/configuration/span ownership contract. It
+    # validates a private configuration copy and numeric DMA authority only;
+    # it never identifies, enables, or accesses PiSP-BE hardware.
+    "test_pisp_be_contract.c": ["src/media_engine_contract.c",
+                                "src/pisp_be_contract.c"],
     # USB Bulk-Only/SCSI geometry discovery. The test supplies a deterministic
     # transport mock and verifies READ CAPACITY(16) is issued only after the
     # READ CAPACITY(10) sentinel, including malformed-response rejection.
