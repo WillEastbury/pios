@@ -67,6 +67,10 @@ TESTS_MANIFEST = {
     # generation-safe transfer ownership model. No controller hardware is
     # enabled or accessed by this host-tested contract.
     "test_dwc2_contract.c": ["src/dwc2_contract.c"],
+    # RP1 CFE / PiSP-FE source-resource facts and stream ownership are
+    # deliberately offline: this verifies no-hardware V1 validation,
+    # generation handling, and permanent activation rejection.
+    "test_rp1_cfe_contract.c": ["src/rp1_cfe_contract.c"],
     # ADR-054 media engines: passive resource facts plus generation-safe
     # ownership. This contract has no hardware, DMA, IRQ, or platform deps.
     "test_media_engine_contract.c": ["src/media_engine_contract.c"],
