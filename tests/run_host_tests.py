@@ -67,6 +67,9 @@ TESTS_MANIFEST = {
     # generation-safe transfer ownership model. No controller hardware is
     # enabled or accessed by this host-tested contract.
     "test_dwc2_contract.c": ["src/dwc2_contract.c"],
+    # BCM2837 ARMCTRL source registry and pending demux. DWC2 IRQ41 remains a
+    # dormant known route until a future driver explicitly registers it.
+    "test_legacy_armctrl.c": ["src/legacy_armctrl.c"],
     # RP1 CFE / PiSP-FE source-resource facts and stream ownership are
     # deliberately offline: this verifies no-hardware V1 validation,
     # generation handling, and permanent activation rejection.

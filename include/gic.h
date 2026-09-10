@@ -40,6 +40,7 @@
 /* BCM2837 ARMCTRL GPU IRQ62, exposed only as a private compatibility intid by
  * irqc_legacy. It is neither a GIC SPI nor Linux's remapped IRQ domain. */
 #define LEGACY_GPU_IRQ_SDHCI PIOS_BCM2837_GPU_IRQ_SDIO1
+#define LEGACY_GPU_IRQ_DWC2   PIOS_BCM2837_GPU_IRQ_DWC2
 
 /* Max interrupts */
 #define GIC_MAX_IRQ         320
@@ -69,7 +70,11 @@ void gic_send_sgi(u8 target_mask, u32 sgi_id);
 void gic_cpu_init(void);
 
 #if !PIOS_HAS_GIC
-/* Route the BCM2837 normal GPU cascade to core 0 and verify the field before
- * ARMCTRL's SDIO1 source is enabled. */
-bool gic_legacy_sdhci_route_core0(void);
+/* Registering a known ARMCTRL source never unmasks it. A source can be
+ * enabled/acknowledged only after its IRQ handler owns this registration. */
+bool gic_legacy_register_gpu_irq(u32 intid);
+bool gic_legacy_unregister_gpu_irq(u32 intid);
+/* Route the normal GPU cascade to core 0 before any registered source is
+ * enabled. The FIQ routing field is preserved. */
+bool gic_legacy_route_gpu_core0(void);
 #endif

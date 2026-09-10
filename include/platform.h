@@ -245,6 +245,7 @@
 #define PIOS_HAS_VMBUS              0
 #define PIOS_HAS_WIFI_SDIO2         0
 #define PIOS_WIFI_SDIO2_BASE        0UL
+#define PIOS_BCM2837_GPU_IRQ_DWC2   41U   /* ARMCTRL bank1 bit9; not a GIC SPI */
 #define PIOS_BCM2837_GPU_IRQ_SDIO1  62U   /* ARMCTRL bank2 bit30; not a GIC SPI */
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI3
 /* Pi 3 B/B+ onboard radio: legacy Arasan SDIO1 on GPIO34-39. WL_ON is
@@ -309,6 +310,9 @@
 
 #ifndef PIOS_BCM2837_GPU_IRQ_SDIO1
 #define PIOS_BCM2837_GPU_IRQ_SDIO1  62U
+#endif
+#ifndef PIOS_BCM2837_GPU_IRQ_DWC2
+#define PIOS_BCM2837_GPU_IRQ_DWC2   41U
 #endif
 
 #ifndef PIOS_HAS_WIFI_SDIO1

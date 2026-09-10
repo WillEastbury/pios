@@ -1530,7 +1530,12 @@ void sdio_card_irq_arm(void)
 #if PIOS_WIFI_SDIO_IRQ != 0
     irq_register(PIOS_WIFI_SDIO_IRQ, sdio_gic_irq_handler);
 #if !PIOS_HAS_GIC
-    if (!gic_legacy_sdhci_route_core0()) {
+    if (!gic_legacy_register_gpu_irq(PIOS_WIFI_SDIO_IRQ)) {
+        sdio_irq_diag.route_failed++;
+        return;
+    }
+    if (!gic_legacy_route_gpu_core0()) {
+        (void)gic_legacy_unregister_gpu_irq(PIOS_WIFI_SDIO_IRQ);
         sdio_irq_diag.route_failed++;
         return;
     }

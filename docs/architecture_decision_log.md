@@ -101,6 +101,7 @@ decision)
 | [054](#adr-054) | Unified dedicated-media hardware bring-up scope | Owner | Accepted |
 | [055](#adr-055) | PiSP BE is the first dedicated-media implementation lane | Owner | Accepted |
 | [056](#adr-056) | HEVC uses PIOS-owned stateless controls before bitstream parsing | Owner | Accepted |
+| [057](#adr-057) | BCM2837 ARMCTRL uses a registered multi-source demultiplexer | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2030,3 +2031,25 @@ stream. This boundary matches that ownership split without importing a
 GPL-family parser or creating a Linux V4L2 ABI in PIOS. It does not authorize
 HEVC MMIO, clock 11, IOMMU2, DMA, SPI 98, phase-1/phase-2 submission, or
 decode. Those require separate bounded hardware transitions and a live proof.
+
+<a name="adr-057"></a>
+## ADR-057 — BCM2837 ARMCTRL uses a registered multi-source demultiplexer
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Implement the planned USB and interrupt subtasks one by
+one, beginning with #175.
+
+**Decision.** The QA7 normal GPU cascade remains routed exclusively to core 0,
+but ARMCTRL peripheral sources are now selected through a fixed,
+generation-safe registry rather than a single hard-coded SDIO pending bit.
+Only a known source whose handler owner has registered it may be enabled or
+returned by controller acknowledgement. GPU IRQ62 (SDIO1, bank 2 bit 30)
+retains priority and its existing top-half/AIRQ rearm behavior. GPU IRQ41
+(DWC2, bank 1 bit 9) is a dormant known route only; no DWC2 driver registers
+or unmasks it in this decision.
+
+**Failure policy.** Unknown, duplicate, stale-generation, non-core-0, and
+unregistered operations fail closed. Removing a source masks it before
+releasing its generation. A simultaneous second registered source remains
+pending for the next acknowledgement; no polling fallback is introduced.
