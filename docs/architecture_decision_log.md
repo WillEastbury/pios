@@ -104,6 +104,7 @@ decision)
 | [057](#adr-057) | BCM2837 ARMCTRL uses a registered multi-source demultiplexer | Owner | Accepted |
 | [058](#adr-058) | Reserve a Normal-NC BCM2837 DWC2 DMA arena | Owner | Accepted |
 | [059](#adr-059) | BCM2837 USB VBUS remains externally attested and no-write | Owner | Accepted |
+| [061](#adr-061) | FAT-direct one-shot stage0 override O | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2141,3 +2142,27 @@ reject. Activation is permanently false and reports the missing PIOS
 ownership, pinmux-control, reset/power, and firmware/baud proofs (plus the
 Pi 3 flow-control mux proof). This ADR adds no board discovery, UART, pin,
 firmware, reset, wake, mailbox, or hardware operation.
+
+<a name="adr-061"></a>
+## ADR-061 — FAT-direct one-shot stage0 override O
+
+**Date:** 2026-09-11 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** Issue #184 adds logical slot O as an armed, one-shot,
+FAT-direct stage0 override, not a third raw slot. Its boot-control v2 record
+stores mode, one attempt, and the exact whole-`PIOSSTG2.PKG` package identity
+without changing the 512-byte sector or any disk partition/layout.
+
+**Precedence and safety.** Stage0 selects valid O, then a validated pending
+A/B candidate, then a validated known-good active A/B slot, then imports a
+validated FAT package to raw slot A only if no raw choice is bootable. Shared
+FAT assets load independently. Before jumping O, stage0 atomically clears its
+fields, records `last_boot=O`, and increments generation; a failed control
+write refuses the O jump. Missing, invalid, or mismatched FAT packages also
+clear O and fall through to A/B. O never becomes active/good and never
+mutates A/B pending/active/good/tries fields.
+
+**Compatibility.** Version-1 control records are checksum-validated at their
+old offset, migrated in memory to v2 with O clear while preserving A/B fields,
+and written as v2 when safe. The old checksum bytes are never treated as O
+metadata.

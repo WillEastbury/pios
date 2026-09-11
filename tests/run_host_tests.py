@@ -55,6 +55,9 @@ TESTS_MANIFEST = {
     # (Cortex-A76 -> Pi5, Cortex-A53 -> BCM2837-family). Pure bit-decode
     # logic, no asm/MMIO. See src/board_detect.c, include/board_detect.h.
     "test_board_detect.c": ["src/board_detect.c"],
+    # ADR-061 boot-control v1->v2 migration/checksum and exhaustive pure
+    # O -> pending -> active -> FAT recovery precedence matrix.
+    "test_boot_precedence.c": ["src/boot_precedence.c"],
     # Board-specific CYW blob selection, BCM2712 stepping classification,
     # BCM2711 pull fields, and VideoCore GPIO property-tag layout.
     "test_wifi_platform.c": ["src/wifi_platform.c", "src/mailbox.c",

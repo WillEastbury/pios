@@ -44,11 +44,14 @@ BPB, walk cluster chains.
 
 ### 1.3 Payload selection
 
-1. If `PIOSSTG2.PKG` exists on the FAT partition, load it to
-   `BOOT_STAGING_ADDR`, parse the manifest, select the entry matching this
-   platform, write it into the raw slot and update boot control.
-2. Otherwise boot from the raw slot: **pending → active → FAT fallback**
-   (`BOOT_FALLBACK_LBA` 2048).
+Stage0 uses **armed O → validated pending A/B → validated known-good active
+A/B → FAT recovery import to A**. O is not a third raw slot: it loads the
+selected platform payload from FAT `PIOSSTG2.PKG` directly through the
+trampoline only after the exact whole-package identity matches boot control.
+Stage0 consumes O before jumping it, so a wedged O image cannot loop; it never
+changes A/B active/good/pending state. An unarmed FAT package is recovery-only
+while a raw choice is bootable. Shared FAT assets load independently in every
+path.
 
 Platform id: QEMU builds always select `QEMU_VIRT`; otherwise
 `BOARD_FAMILY_BCM2837 → BCM2837_FAMILY`, else `PI5`.
@@ -106,11 +109,12 @@ From `include/walfs.h`:
 | Slot A offset | `0x000000` |
 | Slot B offset | `0x400000` |
 | Bootctrl offset | `0x380000` |
-| Bootctrl magic / version | `'PBC0'` / 1 |
+| Bootctrl magic / version | `'PBC0'` / 2 |
 | Default tries | 1 |
 
 Bootctrl fields: `active`, `pending`, `tries_left`, `last_boot`, `good_mask`,
-`generation`, `checksum`. Its LBA is
+`generation`, plus `override_mode`, `override_tries`, exact u64
+`override_package_id`, and a version-aware checksum. Its LBA is
 `walfs_partition_lba() + PIOS_BOOTCTRL_OFFSET/512`.
 
 ### 2.2 State machine
@@ -119,8 +123,8 @@ Bootctrl fields: `active`, `pending`, `tries_left`, `last_boot`, `good_mask`,
   the read fails.
 - `pios_bootctrl_mark_pending()` — set `pending`, `tries = 1`, clear `last_boot`,
   clear that slot's good bit, bump generation.
-- `pios_bootctrl_mark_success()` — `active = last_boot`, clear pending, clear
-  tries, OR the booted slot into `good_mask`.
+- `pios_bootctrl_mark_success()` — promotes only A/B `last_boot` values. A
+  consumed O boot is a no-op: O never becomes active or good.
 
 A pending slot that fails to boot exhausts its single try and stage0 falls back
 to the previous active slot.

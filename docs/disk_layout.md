@@ -131,31 +131,44 @@ selected.
 
 ---
 
-## 3. Boot-control sector (`PBC0`)
+## 3. Boot-control sector (`PBC0`, v2)
 
-A single 512-byte sector at partition-2 offset `0x200000` (LBA =
-`walfs_partition_lba() + 0x200000/512`) that stage0 and the kernel use to drive
-A/B selection (`src/kernel.c:3799-3818`).
+A single 512-byte sector at partition-2 offset `0x380000` (LBA =
+`walfs_partition_lba() + 0x380000/512`) that stage0 and the kernel use to
+drive A/B selection and the one-shot FAT-direct O override.
 
-Little-endian u32 layout (`include/walfs.h:71-85`):
+Little-endian layout (`include/walfs.h`):
 
 | Offset | Field | Meaning |
 |---|---|---|
 | `0x00` | magic | `PIOS_BOOTCTRL_MAGIC = 0x50424330` (`'PBC0'`) |
-| `0x04` | version | `PIOS_BOOTCTRL_VERSION = 1` |
+| `0x04` | version | `PIOS_BOOTCTRL_VERSION = 2` |
 | `0x08` | active_slot | currently-good slot (A=0, B=1) |
 | `0x0C` | pending_slot | candidate slot, or `0xFFFFFFFF` (NONE) |
 | `0x10` | tries_left | boot attempts remaining for the pending slot |
 | `0x14` | last_boot | slot stage0 last jumped into |
 | `0x18` | good_mask | bitmask of slots proven healthy (`1<<slot`) |
 | `0x1C` | generation | monotonically increasing version |
-| `0x20` | checksum | rolling hash over bytes `[0x00..0x1F]` |
+| `0x20` | override_mode | `NONE=0`, `O=1` |
+| `0x24` | override_tries | one-shot O attempt count (normally 1) |
+| `0x28` | override_package_id | exact whole-FAT-package FNV-1a identity (u64) |
+| `0x30` | checksum | rolling hash over bytes `[0x00..0x2F]` |
 
-- Slot ids: `SLOT_A=0`, `SLOT_B=1`, `SLOT_NONE=0xFFFFFFFF`, default tries `1`
-  (`include/walfs.h:73-76`).
+- Slot ids: `SLOT_A=0`, `SLOT_B=1`, `SLOT_O=2`, `SLOT_NONE=0xFFFFFFFF`.
+  O is a logical FAT-direct override, never a raw disk slot and never active
+  or good.
 - Checksum: seed `0xB007C0DE`, `sum = (sum<<5) ^ (sum>>27) ^ byte` over the first
-  `0x20` bytes (`src/kernel.c:3782-3787`). A block is valid only if magic,
-  version, and checksum all match (`src/kernel.c:3790-3797`).
+  `0x30` bytes. Version-1 records retain their checksum at `0x20` over
+  `[0x00..0x1F]`; both kernel and stage0 validate and migrate valid v1 records
+  in memory to v2 with the O fields clear, then persist v2 when a safe sector
+  write succeeds.
+
+Stage0 precedence is **armed valid O → validated pending A/B → validated
+known-good active A/B → FAT recovery import to A**. O is consumed and written
+clear with `last_boot=O` and `generation++` before its FAT payload is jumped;
+a missing, invalid, or identity-mismatched package is likewise cleared and
+falls through to A/B in that same boot. A bootable raw choice suppresses the
+ordinary FAT installer, while shared FAT assets remain independently loaded.
 
 ### State transitions (`src/kernel.c`)
 
@@ -167,9 +180,9 @@ Little-endian u32 layout (`include/walfs.h:71-85`):
 | `pios_bootctrl_reset_a()` | hard reset to A | `3881-3893` |
 | `pios_bootctrl_mark_success()` | sets `good_mask |= 1<<last_boot`, pending=NONE, tries=0, gen++ | `3916-3932` |
 
-Operator commands: `bootctrl status | clear-pending | reset-a confirm |
-test-invalid-b confirm` (`src/kernel.c:3981-4012`); status fields printed by
-`http_append_bootctrl_status()` (`src/kernel.c:3942-3979`). See
+Operator commands: `bootctrl status | arm-o <package-id> confirm | clear-o |
+clear-pending | reset-a confirm | test-invalid-b confirm`; status prints O
+state/id alongside A/B fields. See
 [boot.md](boot.md#6-health-gated-ab-success-and-rollback) for the health gate.
 
 ---

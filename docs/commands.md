@@ -173,7 +173,8 @@ In the tables below the **Surfaces** column marks availability:
 | Command | Surfaces | Description |
 |---|---|---|
 | **`watchdog`** / **`watchdog status`** | **H** U | Watchdog `armed`, mode (reboot/halt), `timeout_ticks`, `trips`, `last_core`, `hw_remaining_ticks`. *(HTTP wiring added for parity with UART.)* |
-| `bootctrl status` | H U | Stage0 A/B boot-control state (active/pending/tries/good_mask/generation). |
+| `bootctrl status` | H U | Stage0 A/B state plus one-shot FAT-direct O status, tries, and package ID. |
+| `bootctrl arm-o <package-id> confirm` / `bootctrl clear-o` | H U | Arm or clear exact-identity one-shot FAT-direct override O. |
 | `bootctrl clear-pending` / `bootctrl reset-a confirm` | H U | Repair boot-control without host raw-disk access. |
 | `bootctrl test-invalid-b confirm` | H U | Non-destructive invalid-header rollback test. |
 
