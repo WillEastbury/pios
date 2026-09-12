@@ -241,6 +241,10 @@ TESTS_MANIFEST = {
     # enumerated immutable facts and can only attach one explicitly requested
     # PIOSXFER candidate; no parser, storage, or filesystem code is linked.
     "test_exchange_volume_policy.c": ["src/exchange_volume_policy.c"],
+    # ADR-071's offline FAT32 exchange partition mechanics.  This receives
+    # only injected identity/geometry plus exact-sector callbacks; it does
+    # not link the live FAT32, SD, WALFS, bootstrap, or kernel paths.
+    "test_fat32_exchange_core.c": ["src/fat32_exchange_core.c"],
     "test_nvme.c": ["src/nvme.c"],
     # ADR-066 #192 offline callback-backed single-namespace provider plus a
     # deliberately test-only fixed persistence model. No live storage code.
@@ -329,6 +333,7 @@ def main() -> int:
                  "test_issue_97_gpu_fabric_control_gate.py",
                  "test_partition_table_gate.py",
                  "test_exchange_volume_policy_gate.py",
+                 "test_fat32_exchange_core_gate.py",
                  "test_issue_137_pcie1_host_contract.py",
                  "test_picoscript_datagram_contract.py",
                  "test_dma_boot_contract.py",

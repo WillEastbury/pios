@@ -113,6 +113,7 @@ decision)
 | [068](#adr-068) | Bluetooth HCD/baud bootstrap remains offline-safe | Owner | Accepted |
 | [069](#adr-069) | Bluetooth HCI lifecycle; passive LE scan remains disabled | Owner | Accepted |
 | [070](ADR-070-gpu-fabric-control.md) | Offline GPU-fabric control-plane contract | Owner | Accepted |
+| [071](#adr-071) | Offline FAT32 exchange-volume mutation core | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2454,3 +2455,29 @@ access, PCIe operation, packet exchange, model interpretation, or runtime
 integration. Any future execution adapter requires a separately approved ADR
 and hardware proof. See [ADR-070](ADR-070-gpu-fabric-control.md) for the
 complete API and verification contract.
+
+---
+
+<a name="adr-071"></a>
+## ADR-071 — Offline FAT32 exchange-volume mutation core
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#193](https://github.com/WillEastbury/pios/issues/193))
+
+**Owner direction.** Implement a pure, host-testable FAT32 mechanics slice
+for the dedicated `PIOSXFER` exchange partition. It must not select a
+partition, attach live storage, or modify the existing FAT32/SD/WALFS/boot
+paths.
+
+**Decision.** The callback-backed `fat32_exchange_core` accepts only
+prevalidated attachment facts: identity, epoch, partition bounds, an exact
+eleven-byte volume label, and exact 512-byte callbacks. It supports bounded
+root-only uppercase ASCII 8.3 files and mirrors every FAT update to both FAT
+copies. Core-0/non-IRQ ownership and identity/epoch/generation-bound file
+capabilities are mandatory.
+
+**Failure boundary.** I/O failure or FAT-copy disagreement faults the mounted
+instance. This is not crash safe: no journal, atomic multi-sector protocol,
+recovery marker, host/PIOS shared ownership, LFN, directory, or live-mount
+claim is made. Future policy attachment and live wiring require a new owner
+decision and proof.
