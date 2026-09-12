@@ -108,6 +108,7 @@ decision)
 | [062](#adr-062) | PCIe1 MSI and inbound DMA remain capability-gated | Owner | Accepted |
 | [063](#adr-063) | PCIe1 endpoint BAR/MMIO requires one offline lease | Owner | Accepted |
 | [064](#adr-064) | Read-only bounded partition-table observation | Owner | Accepted |
+| [066](#adr-066) | Offline callback-backed NVMe block-provider foundation | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2277,3 +2278,39 @@ not a claim of Windows or Linux filesystem interoperability.
 exchange-partition decision. Writable exchange-partition policy remains
 owner-gated and requires a later explicit decision plus separate storage,
 filesystem, ownership, and hardware proof.
+
+---
+
+<a name="adr-066"></a>
+## ADR-066 — Offline callback-backed NVMe block-provider foundation
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#192](https://github.com/WillEastbury/pios/issues/192))
+
+**Owner direction.** Implement only the host-testable, offline-safe foundation:
+one validated namespace exposed through bounded injected read/write callbacks.
+Do not integrate a filesystem, boot path, live controller, or storage driver.
+
+**Decision.** `nvme_block_provider` copies one immutable geometry carrying
+block size, logical block count, checked byte capacity, a maximum transfer
+bound, namespace generation, and an externally supplied never-reused instance
+epoch. Its cache-line-isolated
+control holds a distinct provider generation, fault state, and synchronous
+callback-active latch. Public handles carry the instance, namespace, and
+provider generations, so revocation makes every prior handle stale. A callback
+receives only an explicit pointer/length/capacity/used span, must report the
+exact requested transfer, and is never retained beyond that synchronous call.
+False or partial transfer quarantines the provider; timeout, AER, and removal
+also revoke it. Generation exhaustion permanently retires storage. Reuse needs
+fresh all-zero contract storage plus a unique external instance epoch, avoiding
+ABA across replacement instances.
+
+**Ownership boundary.** The contract is core-0-owned and caller-serialized:
+its callbacks are synchronous, no API is IRQ-safe, and callback reentry is
+refused. It has no hardware, queue, DMA, interrupt, filesystem, boot, or
+storage-driver integration. The accompanying fixed record/superblock model is
+test-only persistence coverage, not a PIOS filesystem format or implementation.
+
+**Blocked follow-up.** Live filesystem integration, SD boot preservation,
+concurrent load, and physical NVMe proof remain blocked pending their own
+reviewed, hardware-safe work.
