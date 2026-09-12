@@ -69,6 +69,11 @@ TESTS_MANIFEST = {
     # ADR-060 immutable Bluetooth transport/reset topology facts. This does
     # not depend on board detection, UART, control lines, or hardware.
     "test_bluetooth_platform_contract.c": ["src/bluetooth_platform_contract.c"],
+    # #182 HCD artifact/baud bootstrap evidence state machine. It is
+    # deliberately offline: injected artifacts and acknowledgements only;
+    # it has no controller I/O or physical activation path.
+    "test_bluetooth_hcd_bootstrap.c": ["src/bluetooth_platform_contract.c",
+                                       "src/bluetooth_hcd_bootstrap.c"],
     # First DWC2 milestone: verified BCM2837 DMA/IRQ-route facts plus a pure
     # generation-safe transfer ownership model. No controller hardware is
     # enabled or accessed by this host-tested contract.
@@ -301,6 +306,7 @@ def main() -> int:
                  "test_issue_112_bcache.py",
                  "test_qemu_blk_probe.py",
                  "test_sdio_io_only_cmd5.py",
+                 "test_issue_182_bluetooth_bootstrap_gate.py",
                  "test_irq_fifo_intids.py",
                  "test_issue_134_bcm2837_sdio_irq.py",
                  "test_issue_143_pcie1_bus_master.py",
