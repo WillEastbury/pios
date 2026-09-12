@@ -229,6 +229,10 @@ TESTS_MANIFEST = {
     # configuration/probe/aperture descriptors, makes one generation-safe
     # endpoint lease, and remains hardware-disabled pending live proof.
     "test_pcie1_bar_lease.c": ["src/pcie1_bar_lease.c"],
+    # #97 fixed-size GPU-fabric control plane. This contract models verified
+    # node facts, placement and activation credits only; it has no GPU, PCIe,
+    # network, packet, model-data, or runtime integration.
+    "test_gpu_fabric_control.c": ["src/gpu_fabric_control.c"],
     # ADR-064 bounded, read-only MBR/GPT parser. It receives only a
     # callback-backed 512-byte span and produces a caller-owned snapshot;
     # no storage, filesystem, mount, or writable-target code is linked.
@@ -322,6 +326,7 @@ def main() -> int:
                  "test_issue_188_pcie1_bar_lease_gate.py",
                  "test_issue_192_nvme_block_provider_gate.py",
                  "test_issue_183_bluetooth_hci_lifecycle_gate.py",
+                 "test_issue_97_gpu_fabric_control_gate.py",
                  "test_partition_table_gate.py",
                  "test_exchange_volume_policy_gate.py",
                  "test_issue_137_pcie1_host_contract.py",
