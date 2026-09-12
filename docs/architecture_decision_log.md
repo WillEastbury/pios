@@ -111,6 +111,7 @@ decision)
 | [066](#adr-066) | Offline callback-backed NVMe block-provider foundation | Owner | Accepted |
 | [067](#adr-067) | Offline dedicated FAT32 exchange-partition policy | Owner | Accepted |
 | [068](#adr-068) | Bluetooth HCD/baud bootstrap remains offline-safe | Owner | Accepted |
+| [069](#adr-069) | Bluetooth HCI lifecycle; passive LE scan remains disabled | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2377,3 +2378,48 @@ acknowledgement, deadline, or baud result enters permanent quarantine. The
 module contains no UART, GPIO, reset, firmware read/transfer, AIRQ, or kernel
 integration, and hardware enable always returns false pending #181 and guarded
 board proof.
+
+---
+
+<a name="adr-069"></a>
+## ADR-069 — Offline Bluetooth HCI lifecycle; passive LE scan remains disabled
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#183](https://github.com/WillEastbury/pios/issues/183))
+
+**Owner direction.** Build only an offline-safe HCI command/event lifecycle.
+Do not select or initialize a UART/transport, change GPIO/reset/wake lines,
+load an HCD, register AIRQ work, wire the kernel, or activate Bluetooth.
+
+**Decision.** `bt_hci_lifecycle` is a core-0-owned, fixed-capacity contract
+for explicit-length HCI command requests and full H4 Event spans. Commands
+are copied into four fixed slots with bounded payloads, deadlines, request
+IDs, per-slot generations, and an instance epoch. Handles carry all four
+identity values. The wire model permits only one transmitted command at once:
+HCI Command Complete and Command Status identify an opcode but carry no
+request ID, so the one live attempt is the required correlation authority.
+Reported command credits are copied from valid terminal events, clamped to
+the fixed slot maximum, and never create unbounded work.
+
+The IRQ-safe core-0 admission point parses only a complete H4 Event packet
+with exact header/parameter length. It recognizes only Command Complete
+(`0x0e`) and Command Status (`0x0f`), creates a copied immutable result, and
+never retains an untrusted transport pointer. Unknown well-formed events are
+ignored and counted. Malformed, duplicate, unsolicited, or mismatched command
+events fail closed by quarantining the contract. Queued cancellation produces
+a cancellation result; cancellation after transmission, deadline expiry,
+logical controller reset, and AER-like failure quarantine outstanding work.
+Controller reset bumps the instance epoch and invalidates every prior handle.
+This is a model of required lifecycle behavior only: it sends no reset command
+and performs no hardware operation.
+
+**Capability and acceptance gate.** Passive LE scanning is selected solely as
+the eventual first capability because it is observational; no scan opcode is
+implemented. `bt_hci_hardware_enable_allowed()` and every capability
+authorization return false, and implicit pairing is prohibited. Activation
+requires a later owner-approved ADR plus live hardware acceptance: proven
+board transport/pin/reset authority, controller/HCD compatibility, transport
+fragment and recovery proof, IRQ/AIRQ routing proof, reset/quarantine
+recovery, credit/completion stress, privacy/pairing review, and an explicit
+passive-scan acceptance test. Until then this contract remains pure and
+offline.

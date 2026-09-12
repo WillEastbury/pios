@@ -74,6 +74,10 @@ TESTS_MANIFEST = {
     # it has no controller I/O or physical activation path.
     "test_bluetooth_hcd_bootstrap.c": ["src/bluetooth_platform_contract.c",
                                        "src/bluetooth_hcd_bootstrap.c"],
+    # #183 core-0-owned HCI command/event lifecycle. This is a bounded,
+    # offline parser/ownership contract and deliberately has no H4 transport
+    # adapter, controller reset, or capability activation path.
+    "test_bt_hci_lifecycle.c": ["src/bt_hci_lifecycle.c"],
     # First DWC2 milestone: verified BCM2837 DMA/IRQ-route facts plus a pure
     # generation-safe transfer ownership model. No controller hardware is
     # enabled or accessed by this host-tested contract.
@@ -317,6 +321,7 @@ def main() -> int:
                  "test_issue_189_pcie1_containment_gate.py",
                  "test_issue_188_pcie1_bar_lease_gate.py",
                  "test_issue_192_nvme_block_provider_gate.py",
+                 "test_issue_183_bluetooth_hci_lifecycle_gate.py",
                  "test_partition_table_gate.py",
                  "test_exchange_volume_policy_gate.py",
                  "test_issue_137_pcie1_host_contract.py",
