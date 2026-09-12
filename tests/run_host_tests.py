@@ -224,6 +224,10 @@ TESTS_MANIFEST = {
     # callback-backed 512-byte span and produces a caller-owned snapshot;
     # no storage, filesystem, mount, or writable-target code is linked.
     "test_partition_table.c": ["src/partition_table.c"],
+    # ADR-067 dedicated FAT32 exchange selection. This consumes independently
+    # enumerated immutable facts and can only attach one explicitly requested
+    # PIOSXFER candidate; no parser, storage, or filesystem code is linked.
+    "test_exchange_volume_policy.c": ["src/exchange_volume_policy.c"],
     "test_nvme.c": ["src/nvme.c"],
     # ADR-066 #192 offline callback-backed single-namespace provider plus a
     # deliberately test-only fixed persistence model. No live storage code.
@@ -308,6 +312,7 @@ def main() -> int:
                  "test_issue_188_pcie1_bar_lease_gate.py",
                  "test_issue_192_nvme_block_provider_gate.py",
                  "test_partition_table_gate.py",
+                 "test_exchange_volume_policy_gate.py",
                  "test_issue_137_pcie1_host_contract.py",
                  "test_picoscript_datagram_contract.py",
                  "test_dma_boot_contract.py",
