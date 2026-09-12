@@ -109,6 +109,7 @@ decision)
 | [063](#adr-063) | PCIe1 endpoint BAR/MMIO requires one offline lease | Owner | Accepted |
 | [064](#adr-064) | Read-only bounded partition-table observation | Owner | Accepted |
 | [066](#adr-066) | Offline callback-backed NVMe block-provider foundation | Owner | Accepted |
+| [067](#adr-067) | Offline dedicated FAT32 exchange-partition policy | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2314,3 +2315,43 @@ test-only persistence coverage, not a PIOS filesystem format or implementation.
 **Blocked follow-up.** Live filesystem integration, SD boot preservation,
 concurrent load, and physical NVMe proof remain blocked pending their own
 reviewed, hardware-safe work.
+
+---
+
+<a name="adr-067"></a>
+## ADR-067 — Offline dedicated FAT32 exchange-partition policy
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#193](https://github.com/WillEastbury/pios/issues/193))
+
+**Owner direction.** Establish only an offline-safe policy contract.  No boot,
+WALFS, SD, partition-parser, FAT32, mount, formatting, read, or write path is
+changed or authorized.
+
+**Decision.** `exchange_volume_policy` receives independently enumerated,
+fixed-capacity immutable facts: explicit external partition identity, table
+index, start and count, MBR type or GPT type GUID, explicit-length filesystem
+label, and boot/PIOS-system flags.  The caller supplies total device blocks,
+one known table scheme, and a nonzero enumeration generation.  Geometry,
+overlap, identity/index duplication, reserved bytes, unsupported schemes, and
+overflow fail closed before selection.
+
+Exactly one candidate is required: it must be non-boot and non-PIOS-system,
+reported FAT32, named exactly `PIOSXFER`, and use MBR FAT32 type `0x0b` or
+`0x0c`, or the exact GPT Microsoft Basic Data GUID (UEFI on-disk order).  The
+operator must explicitly request that candidate's external identity; no
+label-only, first-match, positional, automatic selection, or fallback exists.
+Duplicate eligible candidates reject the whole attachment.  The resulting
+handle binds the copied immutable fact to the policy instance epoch,
+enumeration generation, attachment generation, and full-fact fingerprint.
+
+**Ownership boundary.** This is fixed caller-owned storage, fresh-zeroed and
+one-shot initialized, with core-0 ownership checked against the actual core
+and local IRQ serialization for its small state transition.  It retains no
+input pointer and exports only selection/immutable-attachment inspection.
+It does not convey a block or filesystem capability.
+
+**Next future subtask (explicitly not implemented).** A separately approved
+work item must design and prove the actual FAT32 mount and any read/write
+authority, including live SD/boot/WALFS preservation, ownership, media-change,
+and hardware testing.  ADR-067 grants none of that authority.
