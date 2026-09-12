@@ -95,8 +95,9 @@ struct macb_rx_hole_image {
 bool macb_rx_engine_init(const struct macb_rx_config *config);
 
 /* Drain one completed descriptor into frame[0..frame_capacity). Sets
- * *frame_length and *checksum_trusted. Returns true only when a well-formed
- * frame was copied; malformed completions are released and reported false. */
+ * *frame_length and *checksum_trusted. Returns true when a descriptor was
+ * consumed; malformed completions are released with length zero so callers
+ * retain their drain indication. False means no descriptor was consumed. */
 bool macb_rx_engine_recv(u8 *frame, u32 frame_capacity, u32 *frame_length,
                          bool *checksum_trusted);
 

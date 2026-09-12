@@ -150,6 +150,7 @@ In the tables below the **Surfaces** column marks availability:
 | `dma status` / `dma selftest` | H U | DMA channel registers, selftest, CB address mode. |
 | `irq status` / `irq probe` / `irq selftest` | H U | IRQ counters, read-only GIC probes, delivery selftest. |
 | `macbdiag` / `rxdiag` | H U | MAC RX ownership topology (`contig`, `after_gap`, `first_after`), hole/BNA/liveness recoveries, NIC/net/IRQ pipeline counters. |
+| `net dispatch` | H U | FIFO RX backpressure/resume counts, coalesced indications, deferred wake attempts, and RX/TX drops. Does not poll the NIC. |
 | `break [core]` / `freeze status` / `regs <core>` / `resume [core]` | H U | Freeze/inspect/resume secondary cores; core 0 remains live as the control plane. |
 | `irq cntpns confirm` / `irq cntpns step <n>` | H | Opt-in watchdog-protected CNTPNS/PPI30 delivery test / stepped probe. |
 | `irq trace [reset]` / `irq sdtrace [wipe]` | H | IRQ dispatch / SD trace rings. |

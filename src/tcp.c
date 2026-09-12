@@ -10,6 +10,7 @@
  * References: RFC 793, RFC 5681, RFC 5961, RFC 6528
  */
 
+#include "types.h"
 #include "tcp.h"
 #include "net.h"
 #include "nic.h"
@@ -1296,6 +1297,19 @@ void tcp_input(const u8 *frame UNUSED, u32 len UNUSED, u32 src_ip, u32 dst_ip,
                     listen->pending[i].remote_port == src_port &&
                     listen->pending[i].iface == ingress_iface) {
                     u32 ack = seg_seq;
+                    /* A pure handshake ACK can queue the connection before
+                     * its first data segment arrives in the same RX batch.
+                     * Retain that segment just as for ACK+data in one packet;
+                     * service scheduling must not force a TCP retransmission. */
+                    if (seg_seq == listen->pending[i].irs + 1U &&
+                        listen->pending[i].data_slot == TCP_SYN_PAYLOAD_INVALID &&
+                        data_len > 0U) {
+                        u16 slot = tcp_syn_payload_alloc(seg_data, data_len);
+                        if (slot != TCP_SYN_PAYLOAD_INVALID) {
+                            listen->pending[i].data_slot = slot;
+                            listen->pending[i].data_len = (u16)data_len;
+                        }
+                    }
                     if (seg_seq == listen->pending[i].irs + 1U &&
                         listen->pending[i].data_slot != TCP_SYN_PAYLOAD_INVALID &&
                         listen->pending[i].data_len == data_len)

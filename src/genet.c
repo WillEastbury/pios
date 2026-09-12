@@ -5,6 +5,7 @@
  */
 
 #include "genet.h"
+#include "nic.h"
 #include "platform.h"
 #include "mmio.h"
 #include "uart.h"
@@ -555,8 +556,8 @@ bool genet_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
     st = (const struct genet_status64 *)&rx_bufs[idx][0];
     u32 pkt_len = (st->length_status >> DESC_LEN_SHIFT) & 0xFFFF;
     u32 max_payload = BUF_SIZE - sizeof(struct genet_status64);
-    if (pkt_len > max_payload)
-        pkt_len = max_payload;
+    if (pkt_len > max_payload || pkt_len > ETH_FRAME_MAX)
+        pkt_len = 0U;
 
     if (checksum_trusted) {
         /*

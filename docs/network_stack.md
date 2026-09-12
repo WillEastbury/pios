@@ -45,6 +45,54 @@ transport indication. See [`platforms.md`](platforms.md) and ADR-043.
 Core 0 owns all of this. Other cores reach it through FIFO messages and capsule
 bridges, never by touching NIC, route or TCP state directly.
 
+### FIFO backpressure and interrupt re-arm (#166)
+
+The four RX slots remain owned until MAC/IP/L4 completes them. If transport
+runs out of slots, its indication stays queued; releasing a slot rings the
+transport doorbell again. Only an empty device receive ends the indication.
+One handler makes at most eight receive attempts, including invalid frames.
+QEMU's paced indication is not required to rescue a stalled FIFO.
+NIC receive consumes only one completion per attempt: filtered or malformed
+completions return a zero-length progress result, not a false "ring empty".
+Wired backends reject oversize frames before copying into the caller's
+`ETH_FRAME_MAX` buffer.
+
+Each stage has at most one queued doorbell and cannot re-enter itself during a
+diagnostic dispatch yield. FIFO payloads are published before their doorbells,
+with local IRQ exclusion for timer/reactor publishers. AIRQ overflow retains
+the FIFO work for a later stage completion or existing service event to wake.
+
+RP1 `IACK_EN` suppresses another Ethernet MSI until software writes IACK. GEM's
+cause is cleared before the receive quantum, never after the final empty read;
+otherwise an arrival in that gap loses its only indication. The scheduled
+completion path writes IACK even if INTSTAT has reasserted; waiting for a low
+sample can permanently suppress the next IRQ. A full top-half AIRQ lane retains
+the transport FIFO indication instead of losing a masked device's only wake.
+These are hardware/FIFO handoffs, not periodic protocol polls.
+
+The final staged-image SD commit dispatches already-posted network work after
+each eight successfully written sectors. It does not poll the NIC or re-enter
+the running SERVICE handler. This removes whole-image RX starvation; a single
+slow SD operation still bounds the service gap, and management HTTP replies may
+wait for the synchronous commit to finish.
+Static HTTP responses advance by at most one MSS per service event, matching
+the ordinary response path without depending on duplicate service doorbells.
+TCP retains the first data segment even when a pure handshake ACK has already
+queued the pending connection. ACK and request can arrive in one RX batch
+before SERVICE calls `accept()`; that ordering must not force retransmission.
+
+`net dispatch` exposes `backpressure`, `resumed`, `wake_retries`, and
+`coalesced`. A nonzero backpressure count is normal; queued frames failing to
+resume is not. Host tests drive the real AIRQ/FIFO implementation with a single
+IRQ, no paced indication, mixed interfaces, malformed input, and full AIRQ lanes.
+Physical repeated OTA staging/commit acceptance remains required on Pi 5.
+
+The no-retry staging profile is
+`python tools/qemu_loadtest.py --profile ota-chunked --host 192.168.0.201 --port 80 --ota-bytes 1713304 --ota-rounds 5`.
+It monitors management responsiveness while staging each image, then cancels;
+synthetic data is never committed. It invalidates the inactive OTA slot header
+at begin, so use it only on a board with a known-good active slot/recovery card.
+
 ---
 
 ## 2. NIC boundary

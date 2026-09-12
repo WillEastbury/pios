@@ -5,6 +5,7 @@
  * by registered AIRQ software handlers after a descriptor is published.
  */
 
+#include "types.h"
 #include "net_dispatch.h"
 #include "net.h"
 #include "nic.h"
@@ -104,8 +105,10 @@ struct net_dispatch_state {
     u32 rx_generation;
     u32 service_generation;
     u32 tx_generation;
+    u32 wake_armed;
+    u32 stage_running;
     bool enabled;
-    u8 _pad[43];
+    u8 _pad[35];
 } ALIGNED(64);
 
 static struct net_dispatch_state dispatch_state;
@@ -114,9 +117,77 @@ static struct net_dispatch_diag dispatch_diag ALIGNED(64);
  * Keeping it out of an IRQ-handler stack bounds exception-stack pressure. */
 static u8 transport_frame[NET_DISPATCH_FRAME_BYTES] ALIGNED(64);
 
-static bool publish_airq(u32 source)
+static u64 dispatch_irq_save(void)
 {
-    return airq_post_from(CORE_NET, source, 0U);
+#ifdef PIOS_HOST_TYPES_SHIM
+    return 0U;
+#else
+    u64 daif;
+    __asm__ volatile("mrs %0, daif\nmsr daifset, #2" : "=r"(daif) :: "memory");
+    return daif;
+#endif
+}
+
+static void dispatch_irq_restore(u64 daif)
+{
+#ifndef PIOS_HOST_TYPES_SHIM
+    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+#else
+    (void)daif;
+#endif
+}
+
+static bool rx_has_credit(void)
+{
+    return dispatch_state.rx_head - dispatch_state.rx_release_tail <
+           NET_DISPATCH_RX_CAPACITY;
+}
+
+/* Queue contents are the sticky work record; an AIRQ is only its doorbell.
+ * Retry failed doorbells from subsequent publications/stage completions, never
+ * by polling hardware. Serialize the timer and reactor publishers on core 0. */
+static void wake_queues(void)
+{
+    u64 daif = dispatch_irq_save();
+    bool ready[] = {
+        dispatch_state.hint_head != dispatch_state.hint_tail && rx_has_credit(),
+        dispatch_state.rx_head != dispatch_state.rx_tail,
+        dispatch_state.ip_head != dispatch_state.ip_tail,
+        dispatch_state.tcp_head != dispatch_state.tcp_tail,
+        dispatch_state.service_head != dispatch_state.service_tail,
+        dispatch_state.tx_head != dispatch_state.tx_tail,
+    };
+    for (u32 i = 0; i < sizeof(ready) / sizeof(ready[0]); i++) {
+        u32 bit = 1U << i;
+        if (!ready[i] ||
+            ((dispatch_state.wake_armed | dispatch_state.stage_running) & bit))
+            continue;
+        if (airq_post_from(CORE_NET, AIRQ_SRC_NET_TRANSPORT + i, 0U))
+            dispatch_state.wake_armed |= bit;
+        else
+            dispatch_diag.wake_retries++;
+    }
+    dispatch_irq_restore(daif);
+}
+
+static bool stage_begin(u32 source)
+{
+    u32 bit = 1U << (source - AIRQ_SRC_NET_TRANSPORT);
+    u64 daif = dispatch_irq_save();
+    dispatch_state.wake_armed &= ~bit;
+    bool run = (dispatch_state.stage_running & bit) == 0U;
+    if (run)
+        dispatch_state.stage_running |= bit;
+    dispatch_irq_restore(daif);
+    return run;
+}
+
+static void stage_end(u32 source)
+{
+    u64 daif = dispatch_irq_save();
+    dispatch_state.stage_running &= ~(1U << (source - AIRQ_SRC_NET_TRANSPORT));
+    wake_queues();
+    dispatch_irq_restore(daif);
 }
 
 static bool hint_push(nic_iface_t iface, u32 cause)
@@ -132,6 +203,19 @@ static bool hint_push(nic_iface_t iface, u32 cause)
     dmb_ishst();
     dispatch_state.hint_head = head + 1U;
     return true;
+}
+
+static bool hint_pending_for(nic_iface_t iface)
+{
+    u32 tail = dispatch_state.hint_tail;
+    u32 head = dispatch_state.hint_head;
+    for (u32 n = 0; tail != head && n < NET_DISPATCH_HINT_CAPACITY; n++, tail++) {
+        const struct net_dispatch_hint *hint =
+            &dispatch_state.hints[tail % NET_DISPATCH_HINT_CAPACITY];
+        if (hint->iface == (u32)iface)
+            return true;
+    }
+    return false;
 }
 
 static bool hint_pop(struct net_dispatch_hint *out)
@@ -224,6 +308,7 @@ static bool rx_complete(const struct net_dispatch_rx_desc *desc)
      * generation and reclaimed only from the FIFO head; a later slot can
      * never be reused while an earlier descriptor still owns its payload.
      */
+    bool was_full = !rx_has_credit();
     u32 tail = dispatch_state.rx_release_tail;
     while (tail != dispatch_state.rx_head) {
         struct net_dispatch_rx_slot *head_slot =
@@ -236,6 +321,10 @@ static bool rx_complete(const struct net_dispatch_rx_desc *desc)
         tail++;
         dispatch_state.rx_release_tail = tail;
     }
+    if (was_full && rx_has_credit() &&
+        dispatch_state.hint_head != dispatch_state.hint_tail)
+        dispatch_diag.rx_resumed++;
+    /* The consuming stage's stage_end() rings the retained transport token. */
     return true;
 }
 
@@ -286,115 +375,97 @@ bool net_dispatch_publish_transport(nic_iface_t iface, u32 cause)
     if (!net_dispatch_enabled() ||
         (iface != NIC_IFACE_WIRED && iface != NIC_IFACE_WIFI))
         return false;
-    /*
-     * Publish the AIRQ record first.  AIRQ dispatch cannot run concurrently
-     * with this core-0 publication, so by the time its handler consumes the
-     * wake record the release-published hint below is visible.  Publishing in
-     * this order fails closed if the bounded software-interrupt lane is full:
-     * no descriptor is made unreachable in the transport FIFO.
-     */
-    if (!publish_airq(AIRQ_SRC_NET_TRANSPORT)) {
+    u64 daif = dispatch_irq_save();
+    bool ok = true;
+    if (hint_pending_for(iface)) {
+        dispatch_diag.transport_coalesced++;
+    } else if (!hint_push(iface, cause)) {
         dispatch_diag.transport_dropped++;
-        return false;
+        ok = false;
+    } else {
+        dispatch_diag.transport_published++;
     }
-    if (!hint_push(iface, cause)) {
-        dispatch_diag.transport_dropped++;
-        return false;
-    }
-    dispatch_diag.transport_published++;
-    return true;
-}
-
-static void publish_mac(void)
-{
-    if (!publish_airq(AIRQ_SRC_NET_MAC))
-        dispatch_diag.rx_dropped++;
-}
-
-static void publish_ip(void)
-{
-    if (!publish_airq(AIRQ_SRC_NET_IP))
-        dispatch_diag.rx_dropped++;
-}
-
-static void publish_tcp(void)
-{
-    if (!publish_airq(AIRQ_SRC_NET_TCP))
-        dispatch_diag.rx_dropped++;
-}
-
-static bool wake_service(void)
-{
-    if (!publish_airq(AIRQ_SRC_NET_SERVICE)) {
-        dispatch_diag.service_dropped++;
-        return false;
-    }
-    return true;
+    wake_queues();
+    dispatch_irq_restore(daif);
+    return ok;
 }
 
 bool net_dispatch_publish_service(void)
 {
-    if (!wake_service())
+    if (!net_dispatch_enabled())
         return false;
-    if (!service_push()) {
-        dispatch_diag.service_dropped++;
-        return false;
+    u64 daif = dispatch_irq_save();
+    bool ok = true;
+    /* All service owners are revisited by one event. */
+    if (dispatch_state.service_head == dispatch_state.service_tail) {
+        if (service_push())
+            dispatch_diag.service_published++;
+        else {
+            dispatch_diag.service_dropped++;
+            ok = false;
+        }
     }
-    dispatch_diag.service_published++;
-    return true;
+    wake_queues();
+    dispatch_irq_restore(daif);
+    return ok;
 }
 
 void net_dispatch_handle_transport(void)
 {
     struct net_dispatch_hint hint;
-    u32 handled = 0U;
-
-    while (handled < NET_DISPATCH_TRANSPORT_BURST && hint_pop(&hint)) {
-        handled++;
-        if (!nic_iface_active((nic_iface_t)hint.iface))
-            continue;
-#if PIOS_HAS_WIFI_SDIO
-        if (hint.iface == NIC_IFACE_WIFI && cyw43_runtime_ready())
-            cyw43_poll();
-#endif
-        u32 received = 0U;
-        while (received < NET_DISPATCH_TRANSPORT_BURST) {
-            if (dispatch_state.rx_head - dispatch_state.rx_release_tail >= NET_DISPATCH_RX_CAPACITY) {
-                dispatch_diag.rx_dropped++;
-                break;
-            }
-            u32 len = 0U;
-            bool checksum_trusted = false;
-            if (!net_ingress_receive((nic_iface_t)hint.iface, transport_frame,
-                                     sizeof(transport_frame),
-                                     &len, &checksum_trusted))
-                break;
-            if (len == 0U || len > NET_DISPATCH_FRAME_BYTES) {
-                dispatch_diag.rx_dropped++;
-                continue;
-            }
-            if (!rx_push((nic_iface_t)hint.iface, transport_frame, len,
-                         checksum_trusted)) {
-                dispatch_diag.rx_dropped++;
-                break;
-            }
-            dispatch_diag.rx_published++;
-            received++;
-        }
-        if (received != 0U)
-            publish_mac();
-        /*
-         * This is not a polling fallback. A consumed indication that produced
-         * work publishes its explicit successor descriptor, allowing a
-         * back-to-back device burst to progress without waiting for a timer.
-         * The first empty receive stops the chain; no reactor loop reads the
-         * NIC behind this stage.
-         */
-        if (received != 0U)
-            (void)net_dispatch_publish_transport((nic_iface_t)hint.iface,
-                                                  NET_DISPATCH_CAUSE_RECHECK);
+    if (!stage_begin(AIRQ_SRC_NET_TRANSPORT))
+        return;
+    if (!rx_has_credit()) {
+        dispatch_diag.rx_backpressure++;
+        stage_end(AIRQ_SRC_NET_TRANSPORT);
+        return; /* Keep the token until a downstream stage releases a slot. */
     }
-    dispatch_diag.transport_handled += handled;
+    if (!hint_pop(&hint)) {
+        stage_end(AIRQ_SRC_NET_TRANSPORT);
+        return;
+    }
+    dispatch_diag.transport_handled++;
+    if (!nic_iface_active((nic_iface_t)hint.iface)) {
+        stage_end(AIRQ_SRC_NET_TRANSPORT);
+        return;
+    }
+#if PIOS_HAS_WIFI_SDIO
+    if (hint.iface == NIC_IFACE_WIFI && cyw43_runtime_ready())
+        cyw43_poll();
+#endif
+    u32 attempts = 0U;
+    bool recheck = true;
+    while (attempts < NET_DISPATCH_TRANSPORT_BURST) {
+        if (!rx_has_credit()) {
+            dispatch_diag.rx_backpressure++;
+            break;
+        }
+        attempts++;
+        u32 len = 0U;
+        bool checksum_trusted = false;
+        if (!net_ingress_receive((nic_iface_t)hint.iface, transport_frame,
+                                 sizeof(transport_frame),
+                                 &len, &checksum_trusted)) {
+            recheck = false;
+            break;
+        }
+        if (len == 0U || len > NET_DISPATCH_FRAME_BYTES) {
+            dispatch_diag.rx_dropped++;
+            continue;
+        }
+        if (!rx_push((nic_iface_t)hint.iface, transport_frame, len,
+                     checksum_trusted)) {
+            dispatch_diag.rx_dropped++;
+            break;
+        }
+        dispatch_diag.rx_published++;
+    }
+    /* Only an empty receive ends the indication. In particular, exhausting
+     * the four RX slots is not evidence that the hardware ring is empty. */
+    if (recheck)
+        (void)net_dispatch_publish_transport((nic_iface_t)hint.iface,
+                                              NET_DISPATCH_CAUSE_RECHECK);
+    stage_end(AIRQ_SRC_NET_TRANSPORT);
 }
 
 static bool desc_slot_valid(const struct net_dispatch_rx_desc *desc,
@@ -413,9 +484,12 @@ static bool desc_slot_valid(const struct net_dispatch_rx_desc *desc,
 
 void net_dispatch_handle_mac(void)
 {
+    if (!stage_begin(AIRQ_SRC_NET_MAC))
+        return;
     struct net_dispatch_rx_desc desc;
     u32 handled = 0U;
     while (handled < NET_DISPATCH_STAGE_BURST && mac_pop(&desc)) {
+        handled++;
         struct net_dispatch_rx_slot *slot;
         if (!desc_slot_valid(&desc, &slot)) {
             dispatch_diag.rx_dropped++;
@@ -427,7 +501,6 @@ void net_dispatch_handle_mac(void)
             ethertype != 0x0800U) {
             if (!rx_complete(&desc))
                 dispatch_diag.rx_dropped++;
-            handled++;
             continue;
         }
         if (!stage_push(dispatch_state.ip_descs, &dispatch_state.ip_head,
@@ -436,17 +509,15 @@ void net_dispatch_handle_mac(void)
             if (!rx_complete(&desc))
                 dispatch_diag.rx_dropped++;
         }
-        handled++;
     }
     dispatch_diag.protocol_handled += handled;
-    if (dispatch_state.ip_tail != dispatch_state.ip_head)
-        publish_ip();
-    if (dispatch_state.rx_tail != dispatch_state.rx_head)
-        publish_mac();
+    stage_end(AIRQ_SRC_NET_MAC);
 }
 
 void net_dispatch_handle_ip(void)
 {
+    if (!stage_begin(AIRQ_SRC_NET_IP))
+        return;
     struct net_dispatch_rx_desc desc;
     u32 handled = 0U;
     while (handled < NET_DISPATCH_STAGE_BURST &&
@@ -468,14 +539,13 @@ void net_dispatch_handle_ip(void)
         }
         handled++;
     }
-    if (dispatch_state.tcp_tail != dispatch_state.tcp_head)
-        publish_tcp();
-    if (dispatch_state.ip_tail != dispatch_state.ip_head)
-        publish_ip();
+    stage_end(AIRQ_SRC_NET_IP);
 }
 
 void net_dispatch_handle_tcp(void)
 {
+    if (!stage_begin(AIRQ_SRC_NET_TCP))
+        return;
     struct net_dispatch_rx_desc desc;
     u32 handled = 0U;
     while (handled < NET_DISPATCH_STAGE_BURST &&
@@ -496,12 +566,13 @@ void net_dispatch_handle_tcp(void)
     dispatch_diag.protocol_handled += handled;
     if (handled != 0U)
         (void)net_dispatch_publish_service();
-    if (dispatch_state.tcp_tail != dispatch_state.tcp_head)
-        publish_tcp();
+    stage_end(AIRQ_SRC_NET_TCP);
 }
 
 void net_dispatch_handle_service(net_dispatch_service_fn service)
 {
+    if (!stage_begin(AIRQ_SRC_NET_SERVICE))
+        return;
     u32 handled = 0U;
     while (handled < NET_DISPATCH_SERVICE_BURST && service_pop()) {
         if (service)
@@ -509,22 +580,18 @@ void net_dispatch_handle_service(net_dispatch_service_fn service)
         handled++;
     }
     dispatch_diag.service_handled += handled;
-    if (dispatch_state.service_tail != dispatch_state.service_head)
-        (void)wake_service();
+    stage_end(AIRQ_SRC_NET_SERVICE);
 }
 
 bool net_dispatch_submit_egress(nic_iface_t iface, const u8 *frame, u32 len)
 {
     if (!net_dispatch_enabled())
         return false;
-    if (!frame || len == 0U || len > NET_DISPATCH_FRAME_BYTES)
+    if (!frame || len == 0U || len > NET_DISPATCH_FRAME_BYTES ||
+        (iface != NIC_IFACE_WIRED && iface != NIC_IFACE_WIFI))
         return false;
     u32 head = dispatch_state.tx_head;
     if (head - dispatch_state.tx_tail >= NET_DISPATCH_TX_CAPACITY) {
-        dispatch_diag.tx_dropped++;
-        return false;
-    }
-    if (!publish_airq(AIRQ_SRC_NET_EGRESS)) {
         dispatch_diag.tx_dropped++;
         return false;
     }
@@ -537,11 +604,14 @@ bool net_dispatch_submit_egress(nic_iface_t iface, const u8 *frame, u32 len)
     dmb_ishst();
     dispatch_state.tx_head = head + 1U;
     dispatch_diag.tx_published++;
+    wake_queues();
     return true;
 }
 
 void net_dispatch_handle_egress(void)
 {
+    if (!stage_begin(AIRQ_SRC_NET_EGRESS))
+        return;
     u32 handled = 0U;
     while (handled < NET_DISPATCH_TX_BURST) {
         u32 tail = dispatch_state.tx_tail;
@@ -558,19 +628,22 @@ void net_dispatch_handle_egress(void)
              * The span is immutable and owned by this FIFO slot until the
              * final MAC call returns.  No protocol caller holds this pointer.
              */
-            (void)nic_send_owned_on((nic_iface_t)slot->iface, slot->frame, slot->len);
+            if (!nic_send_owned_on((nic_iface_t)slot->iface, slot->frame, slot->len))
+                dispatch_diag.tx_dropped++;
         }
         dmb_ish();
         dispatch_state.tx_tail = tail + 1U;
         handled++;
     }
     dispatch_diag.tx_handled += handled;
-    if (dispatch_state.tx_tail != dispatch_state.tx_head)
-        (void)publish_airq(AIRQ_SRC_NET_EGRESS);
+    stage_end(AIRQ_SRC_NET_EGRESS);
 }
 
 void net_dispatch_diag_snapshot(struct net_dispatch_diag *out)
 {
-    if (out)
+    if (out) {
+        u64 daif = dispatch_irq_save();
         *out = dispatch_diag;
+        dispatch_irq_restore(daif);
+    }
 }

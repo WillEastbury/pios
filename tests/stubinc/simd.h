@@ -6,6 +6,8 @@
  * pick up the host types shim; these stubs satisfy the linker.
  */
 #pragma once
+unsigned short simd_checksum(const void *data, unsigned int len);
+unsigned int hw_crc32c(const void *data, unsigned int len);
 
 /* simd_zero: used by parse_dhcp_options to clear the dhcp_parsed struct. */
 #include <string.h>

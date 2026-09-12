@@ -20,6 +20,9 @@ bool nic_is_wifi(void);
 bool nic_wifi_active(void);
 bool nic_send(const u8 *frame, u32 len);
 bool nic_send_parts(const void *head, u32 head_len, const void *tail, u32 tail_len);
+/* Receive one completion into at least ETH_FRAME_MAX bytes. True means one
+ * descriptor consumed; len==0 means it was rejected. False means no progress,
+ * not a filtered packet. Callers must budget rejected completions too. */
 bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted);
 bool nic_send_on(nic_iface_t iface, const u8 *frame, u32 len);
 bool nic_send_parts_on(nic_iface_t iface, const void *head, u32 head_len,
@@ -54,6 +57,7 @@ struct nic_ops {
     bool (*probe)(void);                                  /* hardware present? */
     bool (*init)(void);                                   /* full bring-up */
     bool (*send)(const u8 *frame, u32 len);
+    /* Same one-completion/ETH_FRAME_MAX contract as nic_recv(). */
     bool (*recv)(u8 *frame, u32 *len, bool *checksum_trusted);
     void (*get_mac)(u8 *mac);
     bool (*link_up)(void);

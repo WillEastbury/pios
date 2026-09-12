@@ -34,7 +34,10 @@ assert "genet_irq_mask_rx();" in genet_irq
 assert "genet_irq_ack();" in genet_irq
 assert "airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX" in genet_irq
 assert "net_poll(" not in genet_irq
-assert "net_dispatch_" not in genet_irq
+assert "if (!airq_post_from(" in genet_irq
+assert "net_dispatch_publish_transport(" in genet_irq
+assert "net_dispatch_handle_" not in genet_irq
+assert "net_ingress_" not in genet_irq
 
 genet_arm = body_after(kernel, "static void core0_genet_irq_arm(void)\n{")
 assert "irq_register(PIOS_GENET_IRQ, core0_genet_irq_handler);" in genet_arm
