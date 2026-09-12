@@ -329,6 +329,7 @@ def main() -> int:
                  "test_issue_189_pcie1_containment_gate.py",
                  "test_issue_188_pcie1_bar_lease_gate.py",
                  "test_issue_192_nvme_block_provider_gate.py",
+                 "test_issue_191_nvme_namespace_io_gate.py",
                  "test_issue_183_bluetooth_hci_lifecycle_gate.py",
                  "test_issue_97_gpu_fabric_control_gate.py",
                  "test_partition_table_gate.py",
