@@ -220,6 +220,10 @@ TESTS_MANIFEST = {
     # configuration/probe/aperture descriptors, makes one generation-safe
     # endpoint lease, and remains hardware-disabled pending live proof.
     "test_pcie1_bar_lease.c": ["src/pcie1_bar_lease.c"],
+    # ADR-064 bounded, read-only MBR/GPT parser. It receives only a
+    # callback-backed 512-byte span and produces a caller-owned snapshot;
+    # no storage, filesystem, mount, or writable-target code is linked.
+    "test_partition_table.c": ["src/partition_table.c"],
     "test_nvme.c": ["src/nvme.c"],
     "test_net_dispatch.c": ["src/net_dispatch.c", "src/airq.c"],
     "test_nic_receive.c": ["src/nic.c"],
@@ -299,6 +303,7 @@ def main() -> int:
                  "test_issue_147_pcie1_msi_mask.py",
                  "test_issue_189_pcie1_containment_gate.py",
                  "test_issue_188_pcie1_bar_lease_gate.py",
+                 "test_partition_table_gate.py",
                  "test_issue_137_pcie1_host_contract.py",
                  "test_picoscript_datagram_contract.py",
                  "test_dma_boot_contract.py",

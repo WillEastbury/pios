@@ -107,6 +107,7 @@ decision)
 | [061](#adr-061) | FAT-direct one-shot stage0 override O | Owner | Accepted |
 | [062](#adr-062) | PCIe1 MSI and inbound DMA remain capability-gated | Owner | Accepted |
 | [063](#adr-063) | PCIe1 endpoint BAR/MMIO requires one offline lease | Owner | Accepted |
+| [064](#adr-064) | Read-only bounded partition-table observation | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2244,3 +2245,35 @@ configuration write, interrupt/AIRQ, Memory Space, or Bus Master code.
 proof remains required: config readback/restore, Device mapping audit, command
 register proof that Memory Space and Bus Master remain clear, and an AER,
 removal, and clean-revocation test on the live FFC endpoint.
+
+---
+
+<a name="adr-064"></a>
+## ADR-064 — Read-only bounded partition-table observation
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#193](https://github.com/WillEastbury/pios/issues/193))
+
+**Owner direction.** Implement only the offline parser sub-milestone. Do not
+mount, modify, select, or otherwise grant authority over any partition.
+
+**Decision.** `partition_table` accepts an injected 512-byte read callback and
+an explicit device-block and GPT-entry bound, then produces a caller-owned,
+fixed-capacity immutable snapshot. It has no MMIO, SD, filesystem, WALFS,
+boot, allocation, global mutable state, or retained raw pointer. MBR primary
+entries and GPT entries are range-checked against the supplied capacity and
+reject overlaps. Extended MBR is an explicit unsupported observation, never a
+silently skipped chain. A protective MBR whose LBA1 header or entry table is
+not valid GPT is also explicit and produces no candidate entries.
+
+GPT uses little-endian fields and its actual reflected IEEE 802.3 CRC32
+contract (initial `0xffffffff`, polynomial `0xedb88320`, final xor
+`0xffffffff`); GUID type bytes remain in on-disk order. The parser validates
+header/table bounds and CRCs before reporting usable entries. Records retain
+numeric type/start/count/index evidence only. This is parser-format support,
+not a claim of Windows or Linux filesystem interoperability.
+
+**Authority boundary.** The snapshot is read-only observation, not a writable
+exchange-partition decision. Writable exchange-partition policy remains
+owner-gated and requires a later explicit decision plus separate storage,
+filesystem, ownership, and hardware proof.
