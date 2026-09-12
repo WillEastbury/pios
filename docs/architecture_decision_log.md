@@ -112,6 +112,7 @@ decision)
 | [067](#adr-067) | Offline dedicated FAT32 exchange-partition policy | Owner | Accepted |
 | [068](#adr-068) | Bluetooth HCD/baud bootstrap remains offline-safe | Owner | Accepted |
 | [069](#adr-069) | Bluetooth HCI lifecycle; passive LE scan remains disabled | Owner | Accepted |
+| [070](ADR-070-gpu-fabric-control.md) | Offline GPU-fabric control-plane contract | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2423,3 +2424,33 @@ fragment and recovery proof, IRQ/AIRQ routing proof, reset/quarantine
 recovery, credit/completion stress, privacy/pairing review, and an explicit
 passive-scan acceptance test. Until then this contract remains pure and
 offline.
+
+---
+
+<a name="adr-070"></a>
+## ADR-070 — Offline GPU-fabric control-plane contract
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#97](https://github.com/WillEastbury/pios/issues/97))
+
+**Owner direction.** Add only an offline-safe, fixed-capacity GPU-fabric
+control contract. Do not modify GPU, PCIe, network, or DeveloperCLI runtime
+paths, and do not create an execution path.
+
+**Decision.** The contract models no more than eight node advertisements and
+accepts a node only when caller-supplied GPU validation is true, its immutable
+facts are internally consistent, and its health is OK. Exact model generation,
+shard size/kernel/affinity requirements, capacity reservations, and
+generation-backed placement handles make deterministic placement possible
+without payload or model data. Activations carry numeric spans, endpoint
+generations, monotonic sequence, and credit only. Backpressure retains its
+continuation; malformed, stale, duplicate, or out-of-order records fail
+closed. Node removal or failed health invalidates dependent placement and
+activation state. Reassignment is an explicit new request, never migration.
+
+**Authority boundary.** `gpu_fabric_hardware_enable_allowed()` returns false.
+This is simulation/control-plane logic only: it issues no GPU work, hardware
+access, PCIe operation, packet exchange, model interpretation, or runtime
+integration. Any future execution adapter requires a separately approved ADR
+and hardware proof. See [ADR-070](ADR-070-gpu-fabric-control.md) for the
+complete API and verification contract.
