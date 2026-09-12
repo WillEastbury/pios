@@ -147,6 +147,7 @@
 #define AIRQ_SRC_NET_TCP       11U         /* HIGH: TCP/UDP/ICMP descriptor stage */
 #define AIRQ_SRC_NET_SERVICE   12U         /* HIGH: TCP/UDP/service stage */
 #define AIRQ_SRC_NET_EGRESS    13U         /* HIGH: final owned NIC spans */
+#define AIRQ_SRC_PCIE1_MSI     14U         /* NORMAL: masked PCIe1 MSI continuation */
 
 /* A queued event. Deliberately small and fixed: the top half stores one of
  * these and returns. */

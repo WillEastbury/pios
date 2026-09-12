@@ -2166,3 +2166,45 @@ mutates A/B pending/active/good/tries fields.
 old offset, migrated in memory to v2 with O clear while preserving A/B fields,
 and written as v2 when safe. The old checksum bytes are never treated as O
 metadata.
+
+---
+
+<a name="adr-062"></a>
+## ADR-062 — PCIe1 MSI and inbound DMA remain capability-gated
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#189](https://github.com/WillEastbury/pios/issues/189))
+
+**Owner direction.** Start the offline-safe portion of #189 without the PCIe1
+endpoint hardware. Do not enable bus mastering, MSI, MMIO, or a device queue.
+
+**Decision.** `pcie1_containment` is the sole planned capability boundary
+between a future #188 endpoint lease and PCIe1 DMA/MSI hardware. One endpoint
+generation owns eight fixed 256 KiB slices of the existing 2 MiB Normal-NC
+inbound arena. Each slice reserves a 64-byte red zone at both ends and
+publishes an immutable numeric span carrying CPU PA, endpoint IOVA, explicit
+used/requested/capacity, direction, request id, endpoint generation, and slot
+generation. Mutable endpoint, MSI, and per-slot controls each own separate
+64-byte cache lines. Handles are generation-backed capabilities; release
+poisons the span and generation-bumps or permanently retires an exhausted
+slot.
+
+MSI remains masked until a future adapter has registered the dedicated core-0
+AIRQ source. The pure contract models the required top-half sequence:
+acknowledge and mask the line, create one sequence-backed ticket, retain that
+ticket while AIRQ lacks credit, queue it exactly once, then require an explicit
+scheduled-dispatch entry before accepting completion records. That entry
+performs the system acquire barrier before the handler may inspect device
+memory. Completion identity contains endpoint generation, slot generation,
+and a strictly increasing request id. Duplicate IRQs, unknown or malformed
+completion identity/length, red-zone damage, timeout, AER, endpoint removal,
+or generation exhaustion quarantine the endpoint and every live DMA
+capability. Every public state transition and snapshot masks local IRQs so a
+same-core top half cannot overwrite quarantine state. Normal-NC publication
+uses a system-scoped barrier because the endpoint is an external DMA master.
+
+**Activation boundary.** The module contains no MMIO, cache maintenance, IRQ
+registration, AIRQ post, endpoint command write, or bus-master transition.
+`pcie1_containment_hardware_enable_allowed()` deliberately returns false.
+Hardware authorization remains blocked on #188 plus the live #189 canary,
+MSI, AER, timeout, and serial-recovery brick test.
