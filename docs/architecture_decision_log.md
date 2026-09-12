@@ -110,6 +110,7 @@ decision)
 | [064](#adr-064) | Read-only bounded partition-table observation | Owner | Accepted |
 | [066](#adr-066) | Offline callback-backed NVMe block-provider foundation | Owner | Accepted |
 | [067](#adr-067) | Offline dedicated FAT32 exchange-partition policy | Owner | Accepted |
+| [065](#adr-065) | Core-0-owned bounded NVMe namespace I/O contract | Owner | Accepted |
 | [068](#adr-068) | Bluetooth HCD/baud bootstrap remains offline-safe | Owner | Accepted |
 | [069](#adr-069) | Bluetooth HCI lifecycle; passive LE scan remains disabled | Owner | Accepted |
 | [070](ADR-070-gpu-fabric-control.md) | Offline GPU-fabric control-plane contract | Owner | Accepted |
@@ -2481,3 +2482,22 @@ instance. This is not crash safe: no journal, atomic multi-sector protocol,
 recovery marker, host/PIOS shared ownership, LFN, directory, or live-mount
 claim is made. Future policy attachment and live wiring require a new owner
 decision and proof.
+
+---
+
+<a name="adr-065"></a>
+## ADR-065 — Core-0-owned bounded NVMe namespace I/O contract
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#191](https://github.com/WillEastbury/pios/issues/191))
+
+**Decision.** Offline NVMe I/O admits only a validated metadata-free namespace
+with 4 KiB MPS, bounded MDTS, strict thin-provisioning semantics, one/two-page
+DWORD-aligned PRPs, and fixed core-0-owned queues. Handles bind the caller's
+unique instance epoch, namespace generation, command, and request identity.
+Malformed/partial completion, deadline, cancellation, AER, or removal
+quarantines the contract.
+
+**Activation boundary.** This contract contains no PCIe/MMIO/DMA/AIRQ/block or
+WALFS wiring. Live I/O remains blocked on physical controller proof and the
+#188/#189 ownership boundaries.
