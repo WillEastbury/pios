@@ -216,6 +216,10 @@ TESTS_MANIFEST = {
     # spans, endpoint/request generations, sticky AIRQ continuation, and
     # quarantine only; no MMIO, bus mastering, or interrupt enablement.
     "test_pcie1_containment.c": ["src/pcie1_containment.c"],
+    # #188 BAR/MMIO ownership evidence gate. It accepts only numeric PCI
+    # configuration/probe/aperture descriptors, makes one generation-safe
+    # endpoint lease, and remains hardware-disabled pending live proof.
+    "test_pcie1_bar_lease.c": ["src/pcie1_bar_lease.c"],
     "test_nvme.c": ["src/nvme.c"],
     "test_net_dispatch.c": ["src/net_dispatch.c", "src/airq.c"],
     "test_nic_receive.c": ["src/nic.c"],
@@ -294,6 +298,7 @@ def main() -> int:
                  "test_issue_142_pcie1_dma_cache.py",
                  "test_issue_147_pcie1_msi_mask.py",
                  "test_issue_189_pcie1_containment_gate.py",
+                 "test_issue_188_pcie1_bar_lease_gate.py",
                  "test_issue_137_pcie1_host_contract.py",
                  "test_picoscript_datagram_contract.py",
                  "test_dma_boot_contract.py",

@@ -105,6 +105,8 @@ decision)
 | [058](#adr-058) | Reserve a Normal-NC BCM2837 DWC2 DMA arena | Owner | Accepted |
 | [059](#adr-059) | BCM2837 USB VBUS remains externally attested and no-write | Owner | Accepted |
 | [061](#adr-061) | FAT-direct one-shot stage0 override O | Owner | Accepted |
+| [062](#adr-062) | PCIe1 MSI and inbound DMA remain capability-gated | Owner | Accepted |
+| [063](#adr-063) | PCIe1 endpoint BAR/MMIO requires one offline lease | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2208,3 +2210,37 @@ registration, AIRQ post, endpoint command write, or bus-master transition.
 `pcie1_containment_hardware_enable_allowed()` deliberately returns false.
 Hardware authorization remains blocked on #188 plus the live #189 canary,
 MSI, AER, timeout, and serial-recovery brick test.
+
+---
+
+<a name="adr-063"></a>
+## ADR-063 — PCIe1 endpoint BAR/MMIO requires one offline lease
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#188](https://github.com/WillEastbury/pios/issues/188))
+
+**Decision.** The offline-safe #188 boundary is
+`pcie1_bar_lease`: one explicit core-0 endpoint lease, represented only by a
+generation-backed numeric handle. It validates saved configuration BAR
+encodings and all-ones probe masks before accepting a 32-bit or 64-bit memory
+BAR. I/O BARs, reserved encodings, prefetchable/LMEM windows, zero or
+non-power-of-two ranges, misalignment, malformed mask shape, and every
+overflow reject. The CPU aperture must exactly cover the decoded PCI BAR span,
+fit the dedicated PCIe1 aperture, explicitly declare Device-nGnRnE, and not
+overlap RP1 or any caller-supplied numeric reservation in either address
+space.
+
+The request descriptors are copied before publication; no raw CPU pointer is
+an endpoint capability. Mutable lease control, immutable mapping evidence, and
+each reservation have independent cache-line ownership. Release clears the
+mapping evidence then generation-bumps before reuse; generation exhaustion
+poisons and retires it. AER, removal, or any adapter-declared failure clears
+the mapping and permanently quarantines (or retires) the contract.
+
+**Activation boundary.** This module has no MMIO, cache maintenance, mapping,
+configuration write, interrupt/AIRQ, Memory Space, or Bus Master code.
+`pcie1_bar_lease_hardware_enable_allowed()` always returns false. Existing
+`pcie1` and `lzero` code is deliberately not integrated or changed. Hardware
+proof remains required: config readback/restore, Device mapping audit, command
+register proof that Memory Space and Bus Master remain clear, and an AER,
+removal, and clean-revocation test on the live FFC endpoint.
