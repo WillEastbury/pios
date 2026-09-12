@@ -212,6 +212,10 @@ TESTS_MANIFEST = {
     # BAR size, RP1 window non-overlap, and that finding a GPU is not a
     # verified LevelZero proof.
     "test_pcie1.c": [],
+    # #189 offline PCIe1 inbound-DMA/MSI containment. Numeric Normal-NC
+    # spans, endpoint/request generations, sticky AIRQ continuation, and
+    # quarantine only; no MMIO, bus mastering, or interrupt enablement.
+    "test_pcie1_containment.c": ["src/pcie1_containment.c"],
     "test_nvme.c": ["src/nvme.c"],
     "test_net_dispatch.c": ["src/net_dispatch.c", "src/airq.c"],
     "test_nic_receive.c": ["src/nic.c"],
@@ -289,6 +293,7 @@ def main() -> int:
                  "test_issue_145_pcie1_enum_map.py",
                  "test_issue_142_pcie1_dma_cache.py",
                  "test_issue_147_pcie1_msi_mask.py",
+                 "test_issue_189_pcie1_containment_gate.py",
                  "test_issue_137_pcie1_host_contract.py",
                  "test_picoscript_datagram_contract.py",
                  "test_dma_boot_contract.py",
