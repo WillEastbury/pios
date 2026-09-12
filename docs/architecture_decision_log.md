@@ -110,6 +110,7 @@ decision)
 | [064](#adr-064) | Read-only bounded partition-table observation | Owner | Accepted |
 | [066](#adr-066) | Offline callback-backed NVMe block-provider foundation | Owner | Accepted |
 | [067](#adr-067) | Offline dedicated FAT32 exchange-partition policy | Owner | Accepted |
+| [068](#adr-068) | Bluetooth HCD/baud bootstrap remains offline-safe | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2355,3 +2356,24 @@ It does not convey a block or filesystem capability.
 work item must design and prove the actual FAT32 mount and any read/write
 authority, including live SD/boot/WALFS preservation, ownership, media-change,
 and hardware testing.  ADR-067 grants none of that authority.
+
+---
+
+<a name="adr-068"></a>
+## ADR-068 — Bluetooth HCD/baud bootstrap remains offline-safe
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#182](https://github.com/WillEastbury/pios/issues/182))
+
+**Decision.** `bluetooth_hcd_bootstrap` is an injected-evidence, asynchronous
+state machine only. It binds source, profile, controller, artifact, command,
+and acknowledgement facts to a caller-assigned instance epoch and monotonically
+increasing attempt generation. It permits only the bounded sequence safe-off
+evidence, HCD acknowledgement, baud-request publication, baud acknowledgement,
+and completion. Progress evidence is the sole watchdog input.
+
+**Failure and activation boundary.** Mismatched identity, digest, sequence,
+acknowledgement, deadline, or baud result enters permanent quarantine. The
+module contains no UART, GPIO, reset, firmware read/transfer, AIRQ, or kernel
+integration, and hardware enable always returns false pending #181 and guarded
+board proof.
