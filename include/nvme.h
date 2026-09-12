@@ -16,6 +16,7 @@
 #define NVME_IDENTIFY_CONTROLLER     0x01U
 #define NVME_IDENTIFY_BYTES          4096U
 #define NVME_MAX_QUEUE_DEPTH         1024U
+#define NVME_ADMIN_TIMEOUT_MAX_MS    60000ULL
 
 struct nvme_admin_cmd {
     u32 cdw0;
@@ -34,6 +35,43 @@ struct nvme_admin_cmd {
 
 _Static_assert(sizeof(struct nvme_admin_cmd) == 64,
                "NVMe admin command must be 64 bytes");
+
+struct nvme_admin_cqe {
+    u32 result;
+    u32 reserved;
+    u16 sq_head;
+    u16 sq_id;
+    u16 command_id;
+    u16 status;
+} PACKED ALIGNED(16);
+
+_Static_assert(sizeof(struct nvme_admin_cqe) == 16,
+               "NVMe completion queue entry must be 16 bytes");
+
+struct nvme_admin_handle {
+    u16 command_id;
+    u16 reserved;
+    u32 generation;
+};
+
+struct nvme_admin_queue {
+    u64 deadline_ms;
+    u32 generation;
+    u32 depth;
+    u16 next_command_id;
+    u16 active_command_id;
+    u8 active;
+    u8 reserved[43];
+} ALIGNED(64);
+
+_Static_assert(sizeof(struct nvme_admin_queue) == 64,
+               "NVMe admin queue state must own one cache line");
+
+enum nvme_admin_completion {
+    NVME_ADMIN_COMPLETION_INVALID = 0,
+    NVME_ADMIN_COMPLETION_SUCCESS,
+    NVME_ADMIN_COMPLETION_FAILURE,
+};
 
 struct nvme_identify_info {
     u16 vendor_id;
@@ -82,3 +120,12 @@ bool nvme_build_identify_controller(struct nvme_admin_cmd *cmd,
                                     u64 data_address, u32 data_length);
 bool nvme_identify_parse(const u8 *data, u32 length,
                          struct nvme_identify_info *out);
+/* Queue initialization is one-shot over fresh all-zero storage. */
+bool nvme_admin_queue_init(struct nvme_admin_queue *queue, u32 depth);
+bool nvme_admin_submit(struct nvme_admin_queue *queue, u64 now_ms,
+                       u64 timeout_ms, struct nvme_admin_handle *out);
+enum nvme_admin_completion nvme_admin_complete(
+    struct nvme_admin_queue *queue, const struct nvme_admin_handle *handle,
+    const struct nvme_admin_cqe *cqe, u32 *result_out, u16 *status_out);
+bool nvme_admin_expire(struct nvme_admin_queue *queue,
+                       const struct nvme_admin_handle *handle, u64 now_ms);

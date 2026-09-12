@@ -16,6 +16,10 @@ call "%~dp0build_pizero2w.bat"
 if errorlevel 1 exit /b 1
 
 echo Packaging autodetected multi-board stage2...
+REM BCM2837/Pi4 retain the legacy stage0 SHARED asset ABI; Pi5 uses its
+REM raw-stage2 Brotli pack and does not consume this entry.
+python tools\pack_ide_assets.py --shared
+if errorlevel 1 exit /b 1
 python tools\build_stage2_package.py ^
     --pi build_pi5_stage2\PIOS_PI5_STAGE2.BIN ^
     --pi4 build_pi4\kernel8_pi4.img ^

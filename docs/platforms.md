@@ -6,7 +6,7 @@ on every mapping of a PA. Hardware is a capability set selected at compile
 time (`PIOS_PLATFORM` in `include/platform.h`), not “always BCM2712 + RP1”.
 
 Kernel contracts: [`architecture_system.md`](architecture_system.md).
-Decisions: ADR-038 through ADR-043 in
+Decisions: ADR-038 through ADR-051 in
 [`architecture_decision_log.md`](architecture_decision_log.md).
 Traps: [`gotchas.md`](gotchas.md).
 
@@ -41,9 +41,11 @@ before any MMIO:
 
 MIDR splits Pi 5 / Pi 4 / A53. Firmware board-revision then selects Pi 3 vs
 Zero 2 W (`BOARD_MODEL_PI3_B` / `PI3_B_PLUS` / `ZERO2W`). A single
-`PIOSSTG2.PKG` may carry Raspberry payloads plus one SHARED asset pack;
-stage0 copies **only** the matching kernel entry into the raw slot and the
-SHARED pack to `PIOS_SHARED_ASSET_BASE`.
+`PIOSSTG2.PKG` may carry Raspberry payloads plus one legacy SHARED asset pack;
+stage0 copies **only** the matching kernel entry into the raw slot and, when
+present, the SHARED pack to `PIOS_SHARED_ASSET_BASE`. Pi5 raw OTA uses the
+ADR-050 Brotli editor pack embedded in stage2 and installs it to WALFS, so it
+does not require that FAT-side copy.
 
 Stage2 is **compile-time single-platform**. Rebuilding the whole kernel as
 runtime-multi-board is not worthwhile. Images:
@@ -85,10 +87,19 @@ into one payload.
 
 **Network (ADR-043 / ADR-044).** One TCP/IP stack. Wired `nic_ops`: MACB on
 Pi 5 (RP1 IRQ), GENET on Pi 4 (GIC SPI 157), virtio on QEMU (paced; no RX
-IRQ). WiFi is `nic_load("wifi-cyw43455")` and DAT1/SDHCI IRQ → FIFO on GIC
-hosts. BCM2837 has no GIC; GPU SDIO IRQ is not routed yet. Pi 4 and Pi 5 stay
-wired-first (`.201`); `wifi activate` adds `.202`. BCM2837 boards have no
-wired MAC, so stage2 may auto-init Wi-Fi (ADR-041).
+IRQ). WiFi is `nic_load("wifi-cyw43455")` and DAT1/SDHCI IRQ → FIFO. On
+BCM2837, SDIO1's GPU IRQ62 is routed through ARMCTRL bank 2 and the QA7 normal
+GPU cascade to core 0, where `irqc_legacy` exposes private compatibility intid
+62 (not a GIC SPI or Linux IRQ-domain number); its top half only masks/W1Cs and
+publishes AIRQ work (ADR-051). Pi 4 and Pi 5 stay wired-first (`.201`);
+`wifi activate` adds `.202`. BCM2837 boards have no wired MAC, so stage2 may
+auto-init Wi-Fi (ADR-041).
+
+**Zero 2 W firmware (ADR-049).** Before SDIO1 disturbs FAT, preload and
+validate the two pinned `/wifi/zero2w/43436*` records. The raw ChipCommon
+chip/revision word, not the VideoCore PCB revision, selects exactly one
+candidate: 43430 rev1 uses 43436s with no CLM; rev2–15 uses 43436 plus CLM.
+All other values fail closed.
 
 **MMU trap.** BCM2837 UART/SD/QA7 sit **inside** the low 4 GiB, so stage0
 cannot reuse the Pi 5 1 GiB Normal-NC L1[0]. Unknown MIDR fails closed rather
@@ -113,11 +124,16 @@ Identity mapped (VA == PA) on every target. Cacheability is region-specific.
 0x04B00000 +2MB     DMA DISK                   Normal-NC
 0x04D00000 +1MB     IPC SHM                    Normal-NC
 0x05000000 +16MB    HDMI back buffer
+0x06000000 +4MB     Shared asset window        Pi 3/Zero 2 W package builds
+0x06400000 +2MB     DWC2 DMA arena             BCM2837 Pi 3/Zero 2 W only,
+                                                Normal-NC, hardware-unassigned
 0x10000000 +32MB    Process arena (ADR-024)
 ```
 
 Pi 5 MMIO: BCM2712 peripherals `0x107C000000`, RP1 `0x1F00000000` (Device).
 BCM2837 MMIO: `0x3F000000` low peripherals + QA7 `0x40000000` (Device).
+The BCM2837 DWC2 arena is a reserved ownership/cache-transition contract only:
+it neither enables DWC2 nor authorizes a BCM bus alias as a CPU mapping.
 
 ### QEMU `virt`
 

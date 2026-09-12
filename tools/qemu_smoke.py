@@ -54,8 +54,8 @@ def term(cmd: str, timeout: float = 8.0) -> str:
         return r.read().decode("utf-8", "replace")
 
 
-def get(path: str, timeout: float = 8.0):
-    with urllib.request.urlopen(f"{HTTP}{path}", timeout=timeout) as r:
+def get(path: str, timeout: float = 8.0, base: str = HTTP):
+    with urllib.request.urlopen(f"{base}{path}", timeout=timeout) as r:
         return r.status, r.read().decode("utf-8", "replace")
 
 
@@ -127,6 +127,21 @@ class Smoke:
                        f"{len(body)} bytes")
         except Exception as e:
             self.check("picoscript WebIDE portal served", False, str(e))
+
+        # Exercise real EL0 workers, not just the core-0 listener/health path.
+        expected = {
+            8282: ("PicoScript", "PicoScript webserver"),
+            8283: ("native tiny fallback",),
+            8091: ('"ok":true', '"capsule":"picoscript"'),
+        }
+        for port, markers in expected.items():
+            try:
+                code, body = get("/hello/smoke", base=f"http://127.0.0.1:{port}")
+                self.check(f"EL0 capsule on host port {port}",
+                           code == 200 and all(marker in body for marker in markers),
+                           body[:100].replace("\n", " "))
+            except Exception as e:
+                self.check(f"EL0 capsule on host port {port}", False, str(e))
 
         # /picoscript/config JSON (endpoint prefixes + current hook table version)
         try:
@@ -429,6 +444,9 @@ def main() -> int:
 
     net = ("user,id=n0,net=192.168.0.0/24,host=192.168.0.1,"
            "hostfwd=tcp:127.0.0.1:8088-192.168.0.201:80,"
+           "hostfwd=tcp:127.0.0.1:8282-192.168.0.201:82,"
+           "hostfwd=tcp:127.0.0.1:8283-192.168.0.201:83,"
+           "hostfwd=tcp:127.0.0.1:8091-192.168.0.201:8090,"
            "hostfwd=tcp:127.0.0.1:8082-192.168.0.201:8082")
     qargs = [QEMU, "-M", "virt", "-cpu", "cortex-a76", "-smp", "4", "-m", "1G",
              "-display", "none", "-serial", f"file:{SERIAL_LOG}",

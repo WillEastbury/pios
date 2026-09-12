@@ -637,6 +637,13 @@ void net_dispatch_handle_egress(void)
     }
     dispatch_diag.tx_handled += handled;
     stage_end(AIRQ_SRC_NET_EGRESS);
+    /*
+     * Egress capacity is now available. Revisit service-owned TCP output so
+     * a frame rejected by the bounded queue retries without requiring a peer
+     * ACK, retransmission timeout, or another hardware ingress event.
+     */
+    if (handled != 0U)
+        (void)net_dispatch_publish_service();
 }
 
 void net_dispatch_diag_snapshot(struct net_dispatch_diag *out)

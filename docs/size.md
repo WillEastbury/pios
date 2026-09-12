@@ -96,14 +96,16 @@ Largest translation units by flashed bytes:
 | `tests/` (C) | 1,846 |
 | Python tooling (`tools/`, `tests/`) | 5,404 |
 
-## Headroom warning
+## Pi5 editor asset packing
 
-The stage2 package is at **98.6 %** of `PIOS_STAGE2_ZONE_BYTES` (0x37FE00). Any
-further growth of the embedded IDE assets or of `kernel.c` will fail the build's
-hard size cap. The cheapest recovery levers, in order:
+The Pi5 raw stage2 no longer relies on FAT stage0 copying `PIOS_SHARED` assets.
+`tools/pack_ide_assets.py --brotli` deterministically builds
+`assets/pios_ide_assets.brp`: a 28-byte versioned `PBRP` header plus a
+Brotli-compressed `PIAS` table. The measured 2,002,970-byte raw pack is
+389,613 bytes compressed. The build embeds that blob in Pi5 stage2, and the
+kernel verifies/decompresses it into WALFS after mount.
 
-1. Compress `ide_assets` (the repo already has `picocompress`/`brotli`) or serve
-   the IDE from a WALFS card instead of embedding it.
-2. Drop `.eh_frame` (112,884 bytes) with `-fno-asynchronous-unwind-tables`.
-3. Deduplicate the three embedded EL0 payloads (310,784 bytes combined) which all
-   statically link their own copy of `picovm.o`.
+`tools/stage2_size_gate.py build_pi5_stage2\PIOS_PI5_STAGE2.BIN` is invoked by
+the Pi5 build before packaging and rejects any payload above the raw A/B-slot
+cap of 3,669,504 bytes. This is deliberately a payload gate, not a FAT-package
+gate. QEMU keeps its compiled-in asset fallback.

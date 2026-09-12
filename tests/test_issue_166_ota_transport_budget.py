@@ -62,4 +62,19 @@ static_body = kernel.split(
 )[1].split("else if (http_resp_len > 0 && http_file_id", 1)[0]
 assert "if (chunk > HTTP_TX_CHUNK_MAX)" in static_body
 
+stream_setup = kernel.split(
+    "if (is_kernel_stream) {\n"
+    "                    ota_update.target_slot = pios_bootctrl_target_slot();",
+    1,
+)[1].split("svc->stream_mode = true;", 1)[0]
+invalidate = "if (!http_write_kernel_slot_header("
+assert "ota_update.active = false;" in stream_setup
+assert invalidate in stream_setup
+assert stream_setup.index("ota_update.active = false;") < stream_setup.index(invalidate)
+failure = stream_setup.split(invalidate, 1)[1]
+assert '"failed to invalidate slot header"' in failure
+assert "svc->stream_mode = false;" in failure
+assert "500 Internal Server Error" in failure
+assert failure.index("return;") < failure.index("ota_update.active = true;")
+
 print("issue #166: bounded RX/SD progress, pre-drain GEM ack and scheduled RP1 IACK")

@@ -10,7 +10,8 @@
  *
  * SDIO pins use BCM2712 SoC GPIOs 30-35 (sdio2_30_pins in DTB), not RP1 GPIO.
  *
- * Polling mode only — no DMA, no interrupts.
+ * Command transfers are polling/no-DMA; DAT1 card events use the guarded
+ * host-IRQ route where the platform supplies one.
  * 1-bit bus width initially; upgraded to 4-bit after card init.
  *
  * Reference: SD Host Controller Simplified Specification v3.0
@@ -105,6 +106,20 @@ struct sdio_diag {
 _Static_assert(sizeof(struct sdio_diag) == 64U,
                "SDIO diagnostics must occupy one cache line");
 
+/* IRQ-top-half state. Kept separate from setup diagnostics so every mutable
+ * record remains one cache line. */
+struct sdio_irq_diag {
+    u32 last_status;
+    u32 arm_rejected_noncore0;
+    u32 route_failed;
+    u32 airq_post_failed;
+    u32 armed;
+    u32 reserved[11];
+} ALIGNED(64);
+
+_Static_assert(sizeof(struct sdio_irq_diag) == 64U,
+               "SDIO IRQ diagnostics must occupy one cache line");
+
 /* CCCR (Card Common Control Registers) offsets */
 #define CCCR_SDIO_REV       0x00
 #define CCCR_SD_REV         0x01
@@ -142,6 +157,7 @@ _Static_assert(sizeof(struct sdio_diag) == 64U,
 bool sdio_init(void);
 bool sdio_card_present(void);
 void sdio_diag_snapshot(struct sdio_diag *out);
+void sdio_irq_diag_snapshot(struct sdio_irq_diag *out);
 
 /* CMD52: IO_RW_DIRECT — single byte read/write */
 bool sdio_cmd52_read(u32 func, u32 addr, u8 *val);
@@ -182,6 +198,9 @@ void sdio_irq_snapshot(u32 *status, u32 *signal_enable, u32 *mask,
                        u32 *gic_enable, u32 *gic_pending,
                        u32 *gic_target);
 bool sdio_set_bus_width_4bit(void);
+/* Enables card/host high-speed mode if advertised. Safe no-op when absent;
+ * false only when a requested transition cannot be completed. */
+bool sdio_enable_high_speed(void);
 
 /* Power control */
 bool sdio_power_on(void);

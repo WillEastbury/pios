@@ -5,6 +5,31 @@ Primary agent instructions live in [`.github/copilot-instructions.md`](.github/c
 
 ---
 
+## Current network execution contract
+
+When continuation notes below conflict with current code, this block and
+[`docs/network_stack.md`](docs/network_stack.md) take precedence.
+
+- Pi hardware NIC ingress is **IRQ → FIFO → AIRQ software handler → next
+  FIFO stage**. MAC, IP, TCP, service, and egress work never run from a timer
+  poll or a core-0 hot-loop fallback.
+- Hardware IRQ handlers are trigger-only: record/quiesce hardware, publish one
+  bounded event, and return. They do not parse packets or invoke services.
+- A full queue retains its sequence-backed continuation until downstream credit
+  returns; a missing continuation/re-arm is fixed at that handoff, never by
+  polling the device.
+- Timer work may perform timeouts, bounded hardware recovery, QEMU virtio
+  pacing, and explicitly scheduled service output. It must not manufacture Pi
+  MAC/IP/TCP ingress.
+- `wifi_upload_progress()` is legacy hardware-liveness support only: bounded
+  MAC recovery plus the established watchdog signal. It does **not** call
+  `net_poll()` or publish protocol work. New WiFi paths use `adrv`.
+
+The lengthy notes below preserve investigation history; they are not an
+alternative implementation specification.
+
+---
+
 ## Operational quick reference (build / OTA / diagnostics / console)
 
 Verified working this session. Read this first after a machine restart.
@@ -98,12 +123,14 @@ python tools\qemu_preempt_soak.py --host 192.168.0.201 --units 60 # same, agains
 
 ```powershell
 cmd.exe /d /c "C:\source\pios\build_bootstrap.bat"
-python tools\pios_ota_update.py --chunked --reboot
+python tools\pios_ota_update.py build_pi5_stage2\PIOS_PI5_STAGE2.BIN `
+  --chunked --reboot --expected-version vYYYYMMDD.HHMMSS
 ```
 
-`--chunked --reboot` is the **reliable** path; the plain streaming path silently
-failed to commit once. A/B slots plus auto-rollback protect a bad image, so an
-OTA is a safe way to test — but the board must be reachable first.
+`--chunked --reboot` is the reliable path. The updater rejects FAT
+`PIOSSTG2.PKG` because OTA accepts only one raw platform payload, and it fails
+if the reboot reaches any version other than `--expected-version`. A/B slots
+plus auto-rollback protect a bad image, but the board must be reachable first.
 
 ### Diagnostics
 

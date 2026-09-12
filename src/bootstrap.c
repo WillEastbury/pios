@@ -446,10 +446,15 @@ static bool select_stage2_image(const u8 *image, u32 image_len, struct stage2_se
     return true;
 }
 
-static u32 bootctrl_checksum(const u8 *p)
+/* Keep this byte-level v1/v2 validation identical to boot_precedence.c.
+ * Stage0 is deliberately linked without that general kernel module. */
+static u32 bootctrl_checksum(const u8 *p, u32 version)
 {
+    u32 checksum_off = version == PIOS_BOOTCTRL_VERSION_V1 ?
+                       PIOS_BOOTCTRL_V1_CHECKSUM_OFF :
+                       PIOS_BOOTCTRL_V2_CHECKSUM_OFF;
     u32 sum = 0xB007C0DEU;
-    for (u32 i = 0; i < PIOS_BOOTCTRL_CHECKSUM_OFF; i++)
+    for (u32 i = 0; i < checksum_off; i++)
         sum = (sum << 5) ^ (sum >> 27) ^ p[i];
     return sum;
 }
@@ -655,32 +660,51 @@ static bool bootctrl_valid(const u8 *p)
 {
     if (read_le32(p + PIOS_BOOTCTRL_MAGIC_OFF) != PIOS_BOOTCTRL_MAGIC)
         return false;
-    if (read_le32(p + PIOS_BOOTCTRL_VERSION_OFF) != PIOS_BOOTCTRL_VERSION)
+    u32 version = read_le32(p + PIOS_BOOTCTRL_VERSION_OFF);
+    if (version != PIOS_BOOTCTRL_VERSION_V1 &&
+        version != PIOS_BOOTCTRL_VERSION)
         return false;
-    return read_le32(p + PIOS_BOOTCTRL_CHECKSUM_OFF) == bootctrl_checksum(p);
+    u32 checksum_off = version == PIOS_BOOTCTRL_VERSION_V1 ?
+                       PIOS_BOOTCTRL_V1_CHECKSUM_OFF :
+                       PIOS_BOOTCTRL_V2_CHECKSUM_OFF;
+    return read_le32(p + checksum_off) == bootctrl_checksum(p, version);
+}
+
+static bool bootctrl_migrate_v1(u8 *p)
+{
+    if (!bootctrl_valid(p) ||
+        read_le32(p + PIOS_BOOTCTRL_VERSION_OFF) != PIOS_BOOTCTRL_VERSION_V1)
+        return false;
+    memset(p + PIOS_BOOTCTRL_OVERRIDE_MODE_OFF, 0,
+           PIOS_BOOTCTRL_V2_CHECKSUM_OFF - PIOS_BOOTCTRL_OVERRIDE_MODE_OFF);
+    write_le32(p + PIOS_BOOTCTRL_VERSION_OFF, PIOS_BOOTCTRL_VERSION);
+    write_le32(p + PIOS_BOOTCTRL_V2_CHECKSUM_OFF,
+               bootctrl_checksum(p, PIOS_BOOTCTRL_VERSION));
+    return true;
 }
 
 static bool bootctrl_write(u32 root_lba, u8 *p)
 {
-    write_le32(p + PIOS_BOOTCTRL_CHECKSUM_OFF, bootctrl_checksum(p));
+    if (!p)
+        return false;
+    write_le32(p + PIOS_BOOTCTRL_VERSION_OFF, PIOS_BOOTCTRL_VERSION);
+    write_le32(p + PIOS_BOOTCTRL_V2_CHECKSUM_OFF,
+               bootctrl_checksum(p, PIOS_BOOTCTRL_VERSION));
     return sd_write_block(root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE), p);
 }
 
-static void bootctrl_mark_fallback_a(u32 root_lba)
+static bool bootctrl_read(u32 root_lba, u8 *p)
 {
-    u32 ctl_lba = root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE);
-    if (!sd_read_block(ctl_lba, bootctl) || !bootctrl_valid(bootctl))
-        return;
-    u32 good = read_le32(bootctl + PIOS_BOOTCTRL_GOOD_MASK_OFF) |
-               (1U << PIOS_BOOTCTRL_SLOT_A);
-    u32 gen = read_le32(bootctl + PIOS_BOOTCTRL_GENERATION_OFF);
-    write_le32(bootctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF, PIOS_BOOTCTRL_SLOT_A);
-    write_le32(bootctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF, PIOS_BOOTCTRL_SLOT_NONE);
-    write_le32(bootctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, 0);
-    write_le32(bootctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, PIOS_BOOTCTRL_SLOT_A);
-    write_le32(bootctl + PIOS_BOOTCTRL_GOOD_MASK_OFF, good);
-    write_le32(bootctl + PIOS_BOOTCTRL_GENERATION_OFF, gen + 1U);
-    (void)bootctrl_write(root_lba, bootctl);
+    if (!p || !sd_read_block(root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE), p) ||
+        !bootctrl_valid(p))
+        return false;
+    if (read_le32(p + PIOS_BOOTCTRL_VERSION_OFF) == PIOS_BOOTCTRL_VERSION_V1) {
+        if (!bootctrl_migrate_v1(p))
+            return false;
+        /* Migration is in-memory until an intentional state transition.
+         * A read must never risk tearing the only checksum-valid v1 record. */
+    }
+    return true;
 }
 
 struct fat32_ro {
@@ -982,8 +1006,7 @@ static bool write_slot_package(u32 slot_lba, const u8 *image, u32 image_len)
 
 static bool bootctrl_activate_slot_a(u32 root_lba)
 {
-    u32 ctl_lba = root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE);
-    if (!sd_read_block(ctl_lba, bootctl) || !bootctrl_valid(bootctl)) {
+    if (!bootctrl_read(root_lba, bootctl)) {
         memset(bootctl, 0, sizeof(bootctl));
         write_le32(bootctl + PIOS_BOOTCTRL_MAGIC_OFF, PIOS_BOOTCTRL_MAGIC);
         write_le32(bootctl + PIOS_BOOTCTRL_VERSION_OFF, PIOS_BOOTCTRL_VERSION);
@@ -1017,10 +1040,15 @@ static void stage0_install_shared(const u8 *image, u32 image_len)
         u16 entry_bytes = read_le16(h + 10);
         u32 flags = read_le32(h + 12);
         if (ver != PIOS_STAGE2_MANIFEST_VERSION ||
+            header_bytes < sizeof(struct pios_stage2_manifest_header) ||
             !(flags & PIOS_STAGE2_MANIFEST_FLAG_PACKAGED) ||
             entry_bytes < PIOS_STAGE2_PACKAGED_ENTRY_BYTES ||
             entry_count == 0 || entry_count > 16U)
             continue;
+        u64 table_bytes = (u64)header_bytes +
+                          (u64)entry_count * (u64)entry_bytes;
+        if (table_bytes > image_len - off)
+            return;
         for (u32 i = 0; i < entry_count; i++) {
             const u8 *e = h + header_bytes + i * (u32)entry_bytes;
             if (read_le32(e) != PIOS_STAGE2_PLATFORM_SHARED)
@@ -1044,71 +1072,72 @@ static void stage0_install_shared(const u8 *image, u32 image_len)
     }
 }
 
-static bool stage0_load_shared_from_fat(void)
+struct stage0_fat_package {
+    bool attempted;
+    bool loaded;
+    bool selected;
+    u32 bytes;
+    u64 package_id;
+    struct stage2_selection selection;
+};
+
+static NORETURN void stage0_jump_staged(const struct stage2_selection *sel);
+
+static bool stage0_load_fat_package(struct stage0_fat_package *package)
 {
     struct fat32_ro fs;
     u32 first_cluster = 0;
     u32 file_size = 0;
     u8 *staging = (u8 *)(usize)BOOT_STAGING_ADDR;
+    if (!package)
+        return false;
+    if (package->attempted)
+        return package->loaded;
+    package->attempted = true;
     if (!fat32_mount(&fs) ||
-        !fat32_find_stage2(&fs, &first_cluster, &file_size))
+        !fat32_find_stage2(&fs, &first_cluster, &file_size) ||
+        !fat32_load_file(&fs, first_cluster, file_size, staging) ||
+        !package_identity(staging, file_size, &package->package_id))
         return false;
-    if (!fat32_load_file(&fs, first_cluster, file_size, staging))
-        return false;
-    stage0_install_shared(staging, file_size);
+    package->bytes = file_size;
+    package->loaded = true;
+    package->selected = select_stage2_image(staging, file_size,
+                                             &package->selection);
     return true;
 }
 
-static bool stage0_apply_fat_update(u32 root_lba)
+/* Shared assets are independent from the raw boot selection.  Passing the
+ * cached package prevents the O path from reading PIOSSTG2.PKG twice. */
+static bool stage0_load_shared_from_fat(struct stage0_fat_package *package)
 {
-    struct fat32_ro fs;
-    u32 first_cluster = 0;
-    u32 file_size = 0;
-    u8 *staging = (u8 *)(usize)BOOT_STAGING_ADDR;
-    if (!fat32_mount(&fs) ||
-        !fat32_find_stage2(&fs, &first_cluster, &file_size))
+    if (!stage0_load_fat_package(package))
         return false;
+    stage0_install_shared((const u8 *)(usize)BOOT_STAGING_ADDR, package->bytes);
+    return true;
+}
 
-    fb_puts("[stage0] FAT update found\n");
-    uart_puts("[boot] FAT PIOSSTG2.PKG found\n");
-    if (!fat32_load_file(&fs, first_cluster, file_size, staging)) {
-        fb_puts("[stage0] FAT update read failed\n");
-        uart_puts("[boot] FAT update read failed\n");
-        return false;
-    }
-
-    u64 update_id = 0;
-    struct stage2_selection selection;
-    if (!package_identity(staging, file_size, &update_id) ||
-        !select_stage2_image(staging, file_size, &selection)) {
+static bool stage0_apply_fat_update(u32 root_lba,
+                                    struct stage0_fat_package *package)
+{
+    if (!stage0_load_fat_package(package) || !package->selected) {
         fb_puts("[stage0] FAT package invalid\n");
         uart_puts("[boot] FAT package invalid\n");
         return false;
     }
 
-    /* Write only the SELECTED platform's payload subset into the raw slot,
-     * not the whole (potentially multi-platform) FAT package -- the raw
-     * slot is sized for one platform's payload (PIOS_STAGE2_ZONE_BYTES,
-     * ~3.5 MiB) and stays that size regardless of how many platforms the
-     * FAT-resident PIOSSTG2.PKG carries. This is what makes it possible for
-     * ONE PIOSSTG2.PKG to hold both a Pi5 and a BCM2837-family payload
-     * (bigger than any single raw slot could hold) while this stage0
-     * loader -- now genuinely multi-platform itself, see board_detect.c --
-     * still only ever writes the one payload matching the board it's
-     * actually running on. */
-    const u8 *payload = staging + selection.payload_offset;
-    u32 payload_len = selection.payload_bytes;
-
+    const u8 *payload = (const u8 *)(usize)BOOT_STAGING_ADDR +
+                        package->selection.payload_offset;
+    u32 payload_len = package->selection.payload_bytes;
     u32 target_lba = root_lba +
                      (slot_offset(PIOS_BOOTCTRL_SLOT_A) / SD_BLOCK_SIZE);
     if (slot_package_matches(target_lba, payload, payload_len, true)) {
         uart_puts("[boot] FAT package already cached in slot A\n");
-        return true;
+        return bootctrl_activate_slot_a(root_lba);
     }
 
     fb_puts("[stage0] installing FAT package to slot A\n");
     uart_puts("[boot] installing FAT package id=");
-    uart_hex(update_id);
+    uart_hex(package->package_id);
     uart_puts("\n");
     if (!write_slot_package(target_lba, payload, payload_len) ||
         !bootctrl_activate_slot_a(root_lba)) {
@@ -1119,6 +1148,44 @@ static bool stage0_apply_fat_update(u32 root_lba)
     fb_puts("[stage0] FAT install complete\n");
     uart_puts("[boot] FAT install complete\n");
     return true;
+}
+
+/* O is FAT-direct and never a raw slot.  Consumption is committed before the
+ * trampoline jump, so an O image that wedges cannot be retried indefinitely. */
+static bool stage0_try_override_o(u32 root_lba,
+                                  struct stage0_fat_package *package)
+{
+    if (!bootctrl_read(root_lba, bootctl))
+        return false;
+    if (read_le32(bootctl + PIOS_BOOTCTRL_OVERRIDE_MODE_OFF) !=
+        PIOS_BOOTCTRL_OVERRIDE_O)
+        return false;
+
+    u64 wanted = read_le64(bootctl + PIOS_BOOTCTRL_OVERRIDE_PACKAGE_ID_OFF);
+    bool valid = read_le32(bootctl + PIOS_BOOTCTRL_OVERRIDE_TRIES_OFF) ==
+                     PIOS_BOOTCTRL_OVERRIDE_TRIES_DEFAULT &&
+                 wanted != 0U && stage0_load_fat_package(package) &&
+                 package->selected &&
+                 package->package_id == wanted;
+    u32 generation = read_le32(bootctl + PIOS_BOOTCTRL_GENERATION_OFF);
+    write_le32(bootctl + PIOS_BOOTCTRL_OVERRIDE_MODE_OFF,
+               PIOS_BOOTCTRL_OVERRIDE_NONE);
+    write_le32(bootctl + PIOS_BOOTCTRL_OVERRIDE_TRIES_OFF, 0U);
+    write_le32(bootctl + PIOS_BOOTCTRL_OVERRIDE_PACKAGE_ID_OFF, 0U);
+    write_le32(bootctl + PIOS_BOOTCTRL_OVERRIDE_PACKAGE_ID_OFF + 4U, 0U);
+    if (valid)
+        write_le32(bootctl + PIOS_BOOTCTRL_LAST_BOOT_OFF,
+                   PIOS_BOOTCTRL_SLOT_O);
+    write_le32(bootctl + PIOS_BOOTCTRL_GENERATION_OFF, generation + 1U);
+
+    /* A failed clear means the override remains armed on media: never boot it. */
+    if (!bootctrl_write(root_lba, bootctl))
+        return false;
+    if (!valid)
+        return false;
+
+    (void)stage0_load_shared_from_fat(package);
+    stage0_jump_staged(&package->selection);
 }
 
 static bool slot_header_bootable(u32 slot_lba)
@@ -1137,70 +1204,106 @@ static bool slot_header_bootable(u32 slot_lba)
            (stage2_bytes == 0 || stage2_bytes == PIOS_STAGE2_ZONE_BYTES);
 }
 
-/* A staged OTA update has precedence over the FAT bootstrap package. The FAT
- * file is an installation/recovery source, not an authority that should
- * overwrite a valid raw slot on every reboot. Validate pending first, then the
- * known-good active slot, before suppressing FAT recovery. */
-static bool bootctrl_has_bootable_raw_slot(u32 root_lba)
+static bool stage0_load_raw_slot(u32 slot_lba,
+                                 struct stage2_selection *selection,
+                                 u32 *image_len_out)
 {
-    u32 ctl_lba = root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE);
-    if (!sd_read_block(ctl_lba, bootctl) || !bootctrl_valid(bootctl))
-        return slot_header_bootable(root_lba +
-                                    (slot_offset(PIOS_BOOTCTRL_SLOT_A) /
-                                     SD_BLOCK_SIZE));
-    u32 pending = read_le32(bootctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF);
-    u32 tries = read_le32(bootctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF);
-    if (pending <= PIOS_BOOTCTRL_SLOT_B && tries > 0) {
-        u32 pending_lba = root_lba + (slot_offset(pending) / SD_BLOCK_SIZE);
-        if (slot_header_bootable(pending_lba))
-            return true;
-    }
+    if (!selection || !image_len_out || !slot_header_bootable(slot_lba))
+        return false;
 
-    u32 active = read_le32(bootctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF);
-    u32 good = read_le32(bootctl + PIOS_BOOTCTRL_GOOD_MASK_OFF);
-    if (active <= PIOS_BOOTCTRL_SLOT_B && (good & (1U << active))) {
-        u32 active_lba = root_lba + (slot_offset(active) / SD_BLOCK_SIZE);
-        if (slot_header_bootable(active_lba))
-            return true;
+    u32 image_len = read_le32(hdr + PIOS_HDR_STAGE2_LEN_OFF);
+    u8 *staging = (u8 *)(usize)BOOT_STAGING_ADDR;
+    u32 blocks = (image_len + SD_BLOCK_SIZE - 1U) / SD_BLOCK_SIZE;
+    for (u32 i = 0; i < blocks; i++) {
+        if (!sd_read_block(slot_lba + 1U + i,
+                           staging + i * SD_BLOCK_SIZE))
+            return false;
     }
-    return false;
+    if (!select_stage2_image(staging, image_len, selection))
+        return false;
+    *image_len_out = image_len;
+    return true;
 }
 
-static u32 select_kernel_slot_lba(u32 root_lba)
+/* Fully load and manifest-check each raw candidate before its control-state
+ * transition is committed. A header alone is never authority to suppress FAT
+ * recovery. On success the selected image remains staged for the jump. */
+static bool stage0_select_raw_slot(u32 root_lba, u32 *slot_lba,
+                                   struct stage2_selection *selection,
+                                   u32 *image_len_out)
 {
-    u32 slot = PIOS_BOOTCTRL_SLOT_A;
-    u32 ctl_lba = root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE);
-    if (!sd_read_block(ctl_lba, bootctl) || !bootctrl_valid(bootctl))
-        return root_lba + (slot_offset(slot) / SD_BLOCK_SIZE);
+    if (!slot_lba || !selection || !image_len_out)
+        return false;
+
+    if (!bootctrl_read(root_lba, bootctl)) {
+        u32 fallback_lba = root_lba +
+                           (slot_offset(PIOS_BOOTCTRL_SLOT_A) /
+                            SD_BLOCK_SIZE);
+        if (stage0_load_raw_slot(fallback_lba, selection, image_len_out)) {
+            *slot_lba = fallback_lba;
+            return true;
+        }
+        return false;
+    }
 
     u32 active = read_le32(bootctl + PIOS_BOOTCTRL_ACTIVE_SLOT_OFF);
     u32 pending = read_le32(bootctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF);
     u32 tries = read_le32(bootctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF);
     u32 good = read_le32(bootctl + PIOS_BOOTCTRL_GOOD_MASK_OFF);
+    u32 last = read_le32(bootctl + PIOS_BOOTCTRL_LAST_BOOT_OFF);
+    bool control_dirty = false;
 
-    if (active > PIOS_BOOTCTRL_SLOT_B || ((good & (1U << active)) == 0))
-        active = PIOS_BOOTCTRL_SLOT_A;
-
-    if (pending <= PIOS_BOOTCTRL_SLOT_B) {
-        if (tries > 0) {
-            slot = pending;
+    if (pending <= PIOS_BOOTCTRL_SLOT_B && tries > 0U) {
+        u32 pending_lba = root_lba +
+                          (slot_offset(pending) / SD_BLOCK_SIZE);
+        if (stage0_load_raw_slot(pending_lba, selection, image_len_out)) {
             write_le32(bootctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, tries - 1U);
-            write_le32(bootctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, slot);
-            if (!bootctrl_write(root_lba, bootctl))
-                slot = active;
+            write_le32(bootctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, pending);
+            if (bootctrl_write(root_lba, bootctl)) {
+                *slot_lba = pending_lba;
+                return true;
+            }
+            /* The pending attempt was not consumed. Preserve it while trying
+             * the known-good active image below. */
+            write_le32(bootctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, tries);
+            write_le32(bootctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, last);
         } else {
-            slot = active;
-            write_le32(bootctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF, PIOS_BOOTCTRL_SLOT_NONE);
-            write_le32(bootctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, slot);
-            (void)bootctrl_write(root_lba, bootctl);
+            write_le32(bootctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF,
+                       PIOS_BOOTCTRL_SLOT_NONE);
+            write_le32(bootctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, 0U);
+            control_dirty = true;
         }
-    } else {
-        slot = active;
-        write_le32(bootctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, slot);
-        (void)bootctrl_write(root_lba, bootctl);
+    } else if (pending != PIOS_BOOTCTRL_SLOT_NONE) {
+        write_le32(bootctl + PIOS_BOOTCTRL_PENDING_SLOT_OFF,
+                   PIOS_BOOTCTRL_SLOT_NONE);
+        write_le32(bootctl + PIOS_BOOTCTRL_TRIES_LEFT_OFF, 0U);
+        control_dirty = true;
     }
 
-    return root_lba + (slot_offset(slot) / SD_BLOCK_SIZE);
+    if (active <= PIOS_BOOTCTRL_SLOT_B && (good & (1U << active))) {
+        u32 active_lba = root_lba +
+                         (slot_offset(active) / SD_BLOCK_SIZE);
+        if (!stage0_load_raw_slot(active_lba, selection, image_len_out)) {
+            if (control_dirty)
+                (void)bootctrl_write(root_lba, bootctl);
+            return false;
+        }
+        write_le32(bootctl + PIOS_BOOTCTRL_LAST_BOOT_OFF, active);
+        if (control_dirty || last != active) {
+            bool safe_without_write =
+                last == active || last == PIOS_BOOTCTRL_SLOT_O ||
+                last == PIOS_BOOTCTRL_SLOT_NONE ||
+                last > PIOS_BOOTCTRL_SLOT_B;
+            if (!bootctrl_write(root_lba, bootctl) && !safe_without_write)
+                return false;
+        }
+        *slot_lba = active_lba;
+        return true;
+    }
+
+    if (control_dirty)
+        (void)bootctrl_write(root_lba, bootctl);
+    return false;
 }
 
 void core1_main(void) { for (;;) wfi(); }
@@ -1248,114 +1351,60 @@ NORETURN void bootstrap_main(void)
 
     u32 root_lba = 0;
     bool partition_valid = discover_kernel_partition(&root_lba);
-    if (!partition_valid)
+    struct stage0_fat_package fat_package = {0};
+    struct stage2_selection sel;
+    u32 slot_lba = BOOT_FALLBACK_LBA;
+    u32 image_len = 0;
+    if (!partition_valid) {
+        /* Preserve the legacy no-partition fallback: no control-sector write
+         * is safe until partition-2 geometry has been validated. */
         root_lba = BOOT_FALLBACK_LBA;
-    else
-        /*
-         * The FAT package is the physical recovery/update authority. Its
-         * installer validates the package and skips the raw-slot write when
-         * the selected payload already matches, so a healthy raw slot must
-         * never suppress an available staged update.
-         */
-        (void)stage0_apply_fat_update(root_lba);
-        (void)stage0_load_shared_from_fat();
-    u32 slot_lba = partition_valid ? select_kernel_slot_lba(root_lba)
-                                   : BOOT_FALLBACK_LBA;
+        if (!stage0_load_raw_slot(root_lba, &sel, &image_len))
+            goto boot_failed;
+    } else {
+        /* O -> pending -> known-good active -> FAT recovery.  O is consumed
+         * before its jump and never changes A/B state other than last_boot. */
+        (void)stage0_try_override_o(root_lba, &fat_package);
+        /* Assets are FAT-owned and load independently of the boot source. */
+        (void)stage0_load_shared_from_fat(&fat_package);
+        if (!stage0_select_raw_slot(root_lba, &slot_lba, &sel,
+                                    &image_len)) {
+            /* Raw validation reused the staging area. Reload the FAT package
+             * before recovery rather than trusting stale cache metadata. */
+            memset(&fat_package, 0, sizeof(fat_package));
+            if (!stage0_apply_fat_update(root_lba, &fat_package))
+                goto boot_failed;
+            (void)stage0_load_shared_from_fat(&fat_package);
+            slot_lba = root_lba +
+                       (slot_offset(PIOS_BOOTCTRL_SLOT_A) / SD_BLOCK_SIZE);
+            sel = fat_package.selection;
+            image_len = sel.payload_bytes;
+        }
+    }
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_printf("[stage0] slot LBA=%u\n", slot_lba);
     uart_puts("[boot] slot LBA=");
     uart_hex(slot_lba);
     uart_puts("\n");
-
-    if (!sd_read_block(slot_lba, hdr)) {
-        if (slot_lba != root_lba) {
-            fb_puts("[stage0] candidate read failed; falling back to A\n");
-            uart_puts("[boot] candidate read failed; fallback A\n");
-            bootctrl_mark_fallback_a(root_lba);
-            slot_lba = root_lba;
-            if (sd_read_block(slot_lba, hdr))
-                goto have_header;
-        }
-        fb_set_color(0x00FF0000, 0x00000000);
-        fb_puts("[stage0] header read failed\n");
-        uart_puts("[boot] header read failed\n");
-        for (;;) wfi();
-    }
-have_header:
-    u32 magic = read_le32(hdr + PIOS_HDR_MAGIC_OFF);
-    u32 image_len = read_le32(hdr + PIOS_HDR_STAGE2_LEN_OFF);
-    u32 layout_ver = read_le32(hdr + PIOS_HDR_LAYOUT_VERSION_OFF);
-    u32 stage2_off = read_le32(hdr + PIOS_HDR_STAGE2_OFFSET_OFF);
-    u32 stage2_bytes = read_le32(hdr + PIOS_HDR_STAGE2_BYTES_OFF);
-    bool bad_header = magic != BOOT_SLOT_MAGIC || image_len == 0 || image_len > PIOS_STAGE2_ZONE_BYTES ||
-                      (layout_ver != 0 && layout_ver != PIOS_RESERVED_LAYOUT_VERSION) ||
-                      (stage2_off != 0 && stage2_off != PIOS_STAGE2_OFFSET) ||
-                      (stage2_bytes != 0 && stage2_bytes != PIOS_STAGE2_ZONE_BYTES);
-    if (bad_header) {
-        /* Bidirectional slot fallback: if the active slot's header is bad, try
-         * the OTHER slot before giving up. The original code only fell back
-         * B->A (slot_lba != root_lba), so a corrupt active slot A would halt
-         * with no recovery — which is exactly the brick this fixes. */
-        u32 other = (slot_lba == root_lba)
-                        ? root_lba + (PIOS_BOOT_SLOT_B_OFFSET / SD_BLOCK_SIZE)
-                        : root_lba;
-        if (other != slot_lba) {
-            fb_puts("[stage0] active slot bad; trying other slot\n");
-            uart_puts("[boot] active slot bad; trying other\n");
-            slot_lba = other;
-            if (sd_read_block(slot_lba, hdr)) {
-                magic = read_le32(hdr + PIOS_HDR_MAGIC_OFF);
-                image_len = read_le32(hdr + PIOS_HDR_STAGE2_LEN_OFF);
-                layout_ver = read_le32(hdr + PIOS_HDR_LAYOUT_VERSION_OFF);
-                stage2_off = read_le32(hdr + PIOS_HDR_STAGE2_OFFSET_OFF);
-                stage2_bytes = read_le32(hdr + PIOS_HDR_STAGE2_BYTES_OFF);
-                bad_header = magic != BOOT_SLOT_MAGIC || image_len == 0 || image_len > PIOS_STAGE2_ZONE_BYTES ||
-                             (layout_ver != 0 && layout_ver != PIOS_RESERVED_LAYOUT_VERSION) ||
-                             (stage2_off != 0 && stage2_off != PIOS_STAGE2_OFFSET) ||
-                             (stage2_bytes != 0 && stage2_bytes != PIOS_STAGE2_ZONE_BYTES);
-            }
-        }
-    }
-    if (bad_header) {
-        fb_set_color(0x00FF0000, 0x00000000);
-        fb_printf("[stage0] bad header magic=%x len=%u\n", magic, image_len);
-        uart_puts("[boot] bad slot header magic=");
-        uart_hex(magic);
-        uart_puts(" len=");
-        uart_hex(image_len);
-        uart_puts("\n");
-        for (;;) wfi();
-    }
     fb_set_color(0x0000FF00, 0x00000000);
     fb_printf("[stage0] image bytes=%u\n", image_len);
-    if (layout_ver)
-        fb_printf("[stage0] layout v%u walfs=0x%x\n", layout_ver, PIOS_WALFS_OFFSET);
     uart_puts("[boot] image bytes=");
     uart_hex(image_len);
     uart_puts("\n");
-
-    u8 *staging = (u8 *)(usize)BOOT_STAGING_ADDR;
-    u32 blocks = (image_len + SD_BLOCK_SIZE - 1) / SD_BLOCK_SIZE;
-    for (u32 i = 0; i < blocks; i++) {
-        if (!sd_read_block(slot_lba + 1 + i, staging + (i * SD_BLOCK_SIZE))) {
-            fb_set_color(0x00FF0000, 0x00000000);
-            fb_printf("[stage0] read failed block=%u\n", i);
-            uart_puts("[boot] read failed block=");
-            uart_hex(i);
-            uart_puts("\n");
-            for (;;) wfi();
-        }
-    }
-    struct stage2_selection sel;
-    if (!select_stage2_image(staging, image_len, &sel)) {
-        fb_set_color(0x00FF0000, 0x00000000);
-        fb_puts("[stage0] stage2 manifest select failed\n");
-        uart_puts("[boot] stage2 manifest select failed\n");
-        for (;;) wfi();
-    }
     fb_set_color(0x0000FF00, 0x00000000);
     fb_printf("[stage0] jumping entry=0x%x\n", sel.entry_offset);
 
+    stage0_jump_staged(&sel);
+
+boot_failed:
+    fb_set_color(0x00FF0000, 0x00000000);
+    fb_puts("[stage0] no validated boot image\n");
+    uart_puts("[boot] no validated boot image\n");
+    for (;;) wfi();
+}
+
+static NORETURN void stage0_jump_staged(const struct stage2_selection *sel)
+{
     u8 *tramp_dst = (u8 *)(usize)BOOT_TRAMP_ADDR;
     u32 tramp_len = (u32)(bootstrap_trampoline_end - bootstrap_trampoline);
     memcpy(tramp_dst, bootstrap_trampoline, tramp_len);
@@ -1363,13 +1412,14 @@ have_header:
     isb();
 
     uart_puts("[boot] jumping real kernel\n");
-    uart_puts("[boot] sel.payload_offset="); uart_hex(sel.payload_offset);
-    uart_puts(" sel.payload_bytes="); uart_hex(sel.payload_bytes);
-    uart_puts(" sel.entry_offset="); uart_hex(sel.entry_offset);
+    uart_puts("[boot] sel.payload_offset="); uart_hex(sel->payload_offset);
+    uart_puts(" sel.payload_bytes="); uart_hex(sel->payload_bytes);
+    uart_puts(" sel.entry_offset="); uart_hex(sel->entry_offset);
     uart_puts("\n");
     stage0_watchdog_disable();
-    void (*tramp)(u64, u64, u64, u64) = (void (*)(u64, u64, u64, u64))(usize)BOOT_TRAMP_ADDR;
-    tramp(BOOT_DST_ADDR, BOOT_STAGING_ADDR + sel.payload_offset, sel.payload_bytes,
-          BOOT_DST_ADDR + sel.entry_offset);
+    void (*tramp)(u64, u64, u64, u64) =
+        (void (*)(u64, u64, u64, u64))(usize)BOOT_TRAMP_ADDR;
+    tramp(BOOT_DST_ADDR, BOOT_STAGING_ADDR + sel->payload_offset,
+          sel->payload_bytes, BOOT_DST_ADDR + sel->entry_offset);
     for (;;) wfi();
 }

@@ -56,6 +56,7 @@ assert "(1ULL << 16) | (1ULL << 18)" in preempt_init
 assert "msr sctlr_el1" in preempt_init
 
 wfx = function_body(proc, "bool proc_handle_wfx(struct irq_frame *frame, u64 esr)")
+assert wfx.index("frame->elr += 4U;") < wfx.index("proc_drain_el0_commands(frame)")
 assert "proc_el0_control_verdict_trace(current_proc, p, frame->x[21])" in wfx
 assert "PCTL_DESCHEDULE_AWAIT" in wfx
 assert "proc_park();" in wfx
@@ -65,7 +66,8 @@ wfx_trace = function_body(
 )
 assert "el0_sched_invalidate" not in wfx_trace
 assert "wfx_last_state = line->state" in wfx_trace
-assert "wfx_last_generation = identity->state" in wfx_trace
+assert "wfx_last_generation = p->generation" in wfx_trace
+assert "PIOS_IPC_SHM_BASE" not in wfx_trace  # identity PA is unmapped under user TTBR
 assert "wfx_last_slot_va = line->publish_seq" in wfx_trace
 assert "mmu_user_pte_snapshot(core_id(), slot, el0_slot_va" in wfx_trace
 
@@ -81,8 +83,30 @@ assert "sp->el0_inbound_seq != inbound_seq" in scheduler
 assert "sp->state == PROC_READY &&" in scheduler
 assert "verdict == PCTL_DESCHEDULE_AWAIT" in scheduler
 assert "sp->state = PROC_BLOCKED;" in scheduler
+keep_branch = scheduler[scheduler.index("sp->state == PROC_BLOCKED"):
+                        scheduler.index("proc_sched_heartbeat()")]
+assert keep_branch.index("sp->state = PROC_READY;") < \
+       keep_branch.index("proc_el0_control_clear(si, sp);")
 assert "procs[chosen].el0_inbound_seq = swake_seq(chosen);" in scheduler
 assert "proc_publish_control(chosen);" in scheduler
+dispatch = scheduler[scheduler.index("if (chosen != 0xFFFFFFFFU)"):]
+assert "proc_el0_control_clear(chosen" not in dispatch
+assert "if (airq_pending(core_id() & 3U))" in scheduler
+assert proc.count("p->pinned_core = affinity_core;") == 3
+assert proc.count("p->eligible_core_mask = 1U << affinity_core;") == 3
+shared_init = function_body(proc, "void proc_init_shared(void)")
+assert "mmu_kernel_range_is_wb_is" in shared_init
+assert "cohdiag_probe_attr" not in shared_init
+launch = function_body(proc, "i32 proc_launch_on_core_as_prio")
+assert "migrate_pinned_core = target_core" in launch
+assert "migrate_eligible_core_mask = 1U << target_core" in launch
+for build in ("build_bootstrap.bat", "build_pi4.bat"):
+    build_text = (ROOT / build).read_text(encoding="utf-8")
+    flags = build_text.split("set USER_CFLAGS=", 1)[1].splitlines()[0]
+    assert "-ffixed-x21" in flags, build
+    native_line = next(line for line in build_text.splitlines()
+                       if "httpd_native.o" in line and " -c " in line)
+    assert "-DPIOS_HTTPD_NATIVE" in native_line, build
 
 notify = function_body(fifo, "static inline void fifo_notify(u32 src, u32 dst)")
 assert "gic_send_sgi((u8)(1U << dst), GIC_SGI_WAKE)" in notify

@@ -31,9 +31,8 @@
  *   0xC0 + 16*cpu + 4*mbox  LOCAL_MAILBOXn_CLRm (write bits to ack/clear)
  *
  * LOCAL_IRQ_PENDING bit layout: 0=CNTPSIRQ 1=CNTPNSIRQ 2=CNTHPIRQ 3=CNTVIRQ
- * 4-7=MAILBOX0-3 8=GPU_FAST (peripheral IRQs routed from the separate legacy
- * Broadcom interrupt controller -- not yet wired here, see follow-up notes
- * at the bottom of this file) 9=PMU_FAST.
+ * 4-7=MAILBOX0-3 8=GPU_FAST (the manual's name for the normal peripheral
+ * cascade; it is not an FIQ) 9=PMU_FAST.
  *
  * We translate these local bit positions into the SAME intid numbering
  * space PIOS already uses on GIC (GIC_TIMER_NS_PHYS=30, GIC_TIMER_VIRT=27,
@@ -46,9 +45,11 @@
 
 #include "mmio.h"
 #include "uart.h"
+#include "legacy_armctrl.h"
 
 #define QA7_LOCAL_TIMER_INT_CONTROL0   0x40U
 #define QA7_LOCAL_MAILBOX_INT_CONTROL0 0x50U
+#define QA7_LOCAL_GPU_ROUTING           0x0CU
 #define QA7_LOCAL_IRQ_PENDING0         0x60U
 #define QA7_LOCAL_MAILBOX0_SET0        0x80U
 #define QA7_LOCAL_MAILBOX0_CLR0        0xC0U
@@ -58,6 +59,58 @@
 #define QA7_BIT_CNTHPIRQ   2U
 #define QA7_BIT_CNTVIRQ    3U
 #define QA7_BIT_MAILBOX0   4U
+#define QA7_BIT_GPU_FAST   8U
+
+#define ARMCTRL_BASE                 (PIOS_PERIPH_BASE + 0xB200UL)
+#define ARMCTRL_IRQ_PENDING1         0x04U
+#define ARMCTRL_IRQ_PENDING2         0x08U
+#define ARMCTRL_ENABLE_IRQS1         0x10U
+#define ARMCTRL_ENABLE_IRQS2         0x14U
+#define ARMCTRL_DISABLE_IRQS1        0x1CU
+#define ARMCTRL_DISABLE_IRQS2        0x20U
+#define QA7_GPU_ROUTE_CORE_MASK      0x3U
+
+struct legacy_irq_handle_slot {
+    struct legacy_armctrl_source_handle handle;
+    u8 _reserved[48U];
+} ALIGNED(64);
+
+_Static_assert(sizeof(struct legacy_irq_handle_slot) == 64U,
+               "legacy IRQ registration handles need cache-line stride");
+
+static struct legacy_armctrl_registry legacy_registry ALIGNED(64);
+static struct legacy_irq_handle_slot legacy_handles[
+    LEGACY_ARMCTRL_SOURCE_CAPACITY] ALIGNED(64);
+
+static struct legacy_irq_handle_slot *legacy_handle_slot(u32 intid)
+{
+    if (intid == LEGACY_GPU_IRQ_SDHCI)
+        return &legacy_handles[0];
+    if (intid == LEGACY_GPU_IRQ_DWC2)
+        return &legacy_handles[1];
+    return NULL;
+}
+
+static bool armctrl_route_registers(
+    const struct legacy_armctrl_route *route, u32 *pending_off,
+    u32 *enable_off, u32 *disable_off)
+{
+    if (!route || !pending_off || !enable_off || !disable_off)
+        return false;
+    if (route->bank == LEGACY_ARMCTRL_BANK1) {
+        *pending_off = ARMCTRL_IRQ_PENDING1;
+        *enable_off = ARMCTRL_ENABLE_IRQS1;
+        *disable_off = ARMCTRL_DISABLE_IRQS1;
+        return true;
+    }
+    if (route->bank == LEGACY_ARMCTRL_BANK2) {
+        *pending_off = ARMCTRL_IRQ_PENDING2;
+        *enable_off = ARMCTRL_ENABLE_IRQS2;
+        *disable_off = ARMCTRL_DISABLE_IRQS2;
+        return true;
+    }
+    return false;
+}
 
 static inline u64 qa7_reg(u32 off, u32 core)
 {
@@ -71,9 +124,58 @@ static inline u64 qa7_reg(u32 off, u32 core)
 
 void gic_init(void)
 {
+    if (!legacy_armctrl_registry_init(&legacy_registry, 0U))
+        uart_puts("[irqc] ARMCTRL registry init failed\n");
     uart_puts("[irqc] legacy BCM local interrupt controller initialised (QA7 base=");
     uart_hex(QA7_BASE);
     uart_puts(")\n");
+}
+
+bool gic_legacy_register_gpu_irq(u32 intid)
+{
+    struct legacy_irq_handle_slot *slot;
+
+    if ((core_id() & 3U) != 0U)
+        return false;
+    if (legacy_armctrl_registered(&legacy_registry, intid))
+        return true;
+    slot = legacy_handle_slot(intid);
+    if (!slot)
+        return false;
+    return legacy_armctrl_register(&legacy_registry, 0U, intid,
+                                   &slot->handle);
+}
+
+bool gic_legacy_unregister_gpu_irq(u32 intid)
+{
+    struct legacy_irq_handle_slot *slot;
+
+    if ((core_id() & 3U) != 0U)
+        return false;
+    slot = legacy_handle_slot(intid);
+    if (!slot || !legacy_armctrl_registered(&legacy_registry, intid))
+        return false;
+    gic_disable_irq(intid);
+    if (!legacy_armctrl_unregister(&legacy_registry, 0U, &slot->handle))
+        return false;
+    slot->handle = (struct legacy_armctrl_source_handle){0};
+    dmb_ishst();
+    return true;
+}
+
+bool gic_legacy_route_gpu_core0(void)
+{
+    if ((core_id() & 3U) != 0U)
+        return false;
+
+    /* LOCAL_GPU_ROUTING[1:0] selects the normal GPU cascade target. Preserve
+     * [3:2], which independently select FIQ routing and must remain untouched. */
+    u32 route = mmio_read(QA7_BASE + QA7_LOCAL_GPU_ROUTING);
+    route &= ~QA7_GPU_ROUTE_CORE_MASK;
+    mmio_write(QA7_BASE + QA7_LOCAL_GPU_ROUTING, route);
+    dsb();
+    return (mmio_read(QA7_BASE + QA7_LOCAL_GPU_ROUTING) &
+            QA7_GPU_ROUTE_CORE_MASK) == 0U;
 }
 
 /* No multi-candidate-address probing on this platform -- QA7_BASE is a
@@ -112,6 +214,20 @@ void gic_enable_irq(u32 intid)
 {
     u32 core = core_id() & 3U;
     u32 bit;
+    const struct legacy_armctrl_route *route =
+        legacy_armctrl_route_get(intid);
+    if (route) {
+        u32 pending_off, enable_off, disable_off;
+        if (core == 0U &&
+            legacy_armctrl_registered(&legacy_registry, intid) &&
+            armctrl_route_registers(route, &pending_off, &enable_off,
+                                    &disable_off)) {
+            (void)pending_off;
+            (void)disable_off;
+            mmio_write(ARMCTRL_BASE + enable_off, 1U << route->bit);
+        }
+        return;
+    }
     if (intid == GIC_TIMER_NS_PHYS) bit = QA7_BIT_CNTPNSIRQ;
     else if (intid == GIC_TIMER_VIRT) bit = QA7_BIT_CNTVIRQ;
     else return; /* no peripheral/SPI routing on this platform yet */
@@ -123,6 +239,19 @@ void gic_disable_irq(u32 intid)
 {
     u32 core = core_id() & 3U;
     u32 bit;
+    const struct legacy_armctrl_route *route =
+        legacy_armctrl_route_get(intid);
+    if (route) {
+        u32 pending_off, enable_off, disable_off;
+        if (core == 0U &&
+            armctrl_route_registers(route, &pending_off, &enable_off,
+                                    &disable_off)) {
+            (void)pending_off;
+            (void)enable_off;
+            mmio_write(ARMCTRL_BASE + disable_off, 1U << route->bit);
+        }
+        return;
+    }
     if (intid == GIC_TIMER_NS_PHYS) bit = QA7_BIT_CNTPNSIRQ;
     else if (intid == GIC_TIMER_VIRT) bit = QA7_BIT_CNTVIRQ;
     else return;
@@ -144,12 +273,24 @@ u32 gic_acknowledge(void)
 {
     u32 core = core_id() & 3U;
     u32 pending = mmio_read(qa7_reg(QA7_LOCAL_IRQ_PENDING0, core));
+    u32 cascade_intid;
     if (pending & (1U << QA7_BIT_MAILBOX0))
         return GIC_SGI_WAKE;
     if (pending & (1U << QA7_BIT_CNTPNSIRQ))
         return GIC_TIMER_NS_PHYS;
     if (pending & (1U << QA7_BIT_CNTVIRQ))
         return GIC_TIMER_VIRT;
+    if (pending & (1U << QA7_BIT_GPU_FAST)) {
+        u32 pending1 = legacy_armctrl_registered_mask(
+            &legacy_registry, LEGACY_ARMCTRL_BANK1)
+            ? mmio_read(ARMCTRL_BASE + ARMCTRL_IRQ_PENDING1) : 0U;
+        u32 pending2 = legacy_armctrl_registered_mask(
+            &legacy_registry, LEGACY_ARMCTRL_BANK2)
+            ? mmio_read(ARMCTRL_BASE + ARMCTRL_IRQ_PENDING2) : 0U;
+        if (legacy_armctrl_select_pending(&legacy_registry, pending1,
+                                          pending2, &cascade_intid))
+            return cascade_intid;
+    }
     return GIC_INTID_SPURIOUS;
 }
 
@@ -166,6 +307,8 @@ void gic_end_of_interrupt(u32 iar_value)
         mmio_write(QA7_BASE + QA7_LOCAL_MAILBOX0_CLR0 + (u64)(core * 16U),
                    0xFFFFFFFFU);
     }
+    /* ARMCTRL/QA7 peripheral cascades have no IAR/EOIR transaction. SDHCI's
+     * top half owns its status W1C and line masking. */
 }
 
 void gic_send_sgi(u8 target_mask, u32 sgi_id)

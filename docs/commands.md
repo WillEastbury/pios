@@ -148,6 +148,7 @@ In the tables below the **Surfaces** column marks availability:
 | `poke <addr> <value> [1\|2\|4\|8]` | H U | Write live MMIO/RAM (admin/debug). |
 | `dumpmem <addr> [bytes]` | H U | Dump a memory range. |
 | `dma status` / `dma selftest` | H U | DMA channel registers, selftest, CB address mode. |
+| `proc el0` | H U | Read-only EL0 launch/fault details and retained process-slot exit codes. |
 | `irq status` / `irq probe` / `irq selftest` | H U | IRQ counters, read-only GIC probes, delivery selftest. |
 | `macbdiag` / `rxdiag` | H U | MAC RX ownership topology (`contig`, `after_gap`, `first_after`), hole/BNA/liveness recoveries, NIC/net/IRQ pipeline counters. |
 | `net dispatch` | H U | FIFO RX backpressure/resume counts, coalesced indications, deferred wake attempts, and RX/TX drops. Does not poll the NIC. |
@@ -172,7 +173,8 @@ In the tables below the **Surfaces** column marks availability:
 | Command | Surfaces | Description |
 |---|---|---|
 | **`watchdog`** / **`watchdog status`** | **H** U | Watchdog `armed`, mode (reboot/halt), `timeout_ticks`, `trips`, `last_core`, `hw_remaining_ticks`. *(HTTP wiring added for parity with UART.)* |
-| `bootctrl status` | H U | Stage0 A/B boot-control state (active/pending/tries/good_mask/generation). |
+| `bootctrl status` | H U | Stage0 A/B state plus one-shot FAT-direct O status, tries, and package ID. |
+| `bootctrl arm-o <package-id> confirm` / `bootctrl clear-o` | H U | Arm or clear exact-identity one-shot FAT-direct override O. |
 | `bootctrl clear-pending` / `bootctrl reset-a confirm` | H U | Repair boot-control without host raw-disk access. |
 | `bootctrl test-invalid-b confirm` | H U | Non-destructive invalid-header rollback test. |
 

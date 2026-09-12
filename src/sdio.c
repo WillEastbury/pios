@@ -7,7 +7,8 @@
  * SDHCI-compatible register layout. Reuses the same command encoding
  * scheme as sd.c (EMMC2) but adds SDIO-specific CMD5/CMD52/CMD53.
  *
- * Polling mode, no DMA, no interrupts.
+ * Command transfers are polling/no-DMA; DAT1 card events use the guarded
+ * host-IRQ route where the platform supplies one.
  *
  * Reference: SD Host Controller Simplified Spec v3.0
  *            SDIO Simplified Spec v3.0
@@ -21,6 +22,7 @@
 #include "gic.h"
 #include "fb.h"
 #include "mailbox.h"
+#include "wifi_platform.h"
 #include "exception.h"
 #include "airq.h"
 #include "core.h"
@@ -113,6 +115,7 @@
 /* Card state */
 static u32 sdio_rca;
 static struct sdio_diag sdio_diag ALIGNED(64);
+static volatile struct sdio_irq_diag sdio_irq_diag ALIGNED(64);
 static bool sdio_initialized;
 
 /* ── Register helpers ── */
@@ -260,8 +263,35 @@ static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
     return true;
 }
 
-static void sdio_set_clock(u32 freq_khz)
+static bool sdio_controller_base_khz(u32 *base_khz)
 {
+    if (!base_khz)
+        return false;
+#if PIOS_HAS_WIFI_SDIO1
+    /*
+     * Pi 3, Zero 2 W, and Pi 4 route onboard WiFi through the non-removable
+     * BCM2835-compatible SDHCI (Linux: BCM2835_CLOCK_EMMC), not EMMC2.
+     * CAP0's base-frequency field is not populated reliably on this host.
+     */
+    u32 base_hz = fb_get_clock_rate_id(1U); /* VideoCore clock ID: EMMC. */
+    if (base_hz < 1000000U || base_hz > 1000000000U)
+        return false;
+    *base_khz = base_hz / 1000U;
+    return *base_khz != 0U;
+#else
+    u32 cap = sr(REG_CAP0);
+    u32 base_mhz = (cap >> 8) & 0xFFU;
+    if (base_mhz == 0U)
+        return false;
+    *base_khz = base_mhz * 1000U;
+    return true;
+#endif
+}
+
+static bool sdio_set_clock(u32 freq_khz)
+{
+    if (freq_khz == 0U)
+        return false;
     /* Disable SD clock via 16-bit CLOCK_CONTROL */
     sw16(SDHCI_CLOCK_CONTROL, 0);
     delay_cycles(1000);
@@ -269,11 +299,9 @@ static void sdio_set_clock(u32 freq_khz)
     /* Set timeout via 8-bit register */
     sw8(SDHCI_TIMEOUT_CONTROL, 0x0E);
 
-    /* Derive base clock from SDHCI capabilities register */
-    u32 cap = sr(REG_CAP0);
-    u32 base_mhz = (cap >> 8) & 0xFF;
-    if (base_mhz == 0) base_mhz = 50;  /* fallback */
-    u32 base_khz = base_mhz * 1000;
+    u32 base_khz = 0U;
+    if (!sdio_controller_base_khz(&base_khz))
+        return false;
 
     /* Calculate divider — must produce even real divisor per SDHCI v3 spec */
     u32 real_div = (base_khz + freq_khz - 1) / freq_khz;
@@ -292,12 +320,50 @@ static void sdio_set_clock(u32 freq_khz)
     u32 timeout = 100000;
     while (!(sr16(SDHCI_CLOCK_CONTROL) & 0x02) && timeout--)
         delay_cycles(10);
+    if (timeout == 0U)
+        return false;
 
     /* Enable SD clock (bit 2) */
     clk = sr16(SDHCI_CLOCK_CONTROL);
     clk |= 0x04;
     sw16(SDHCI_CLOCK_CONTROL, clk);
     delay_cycles(1000);
+    return true;
+}
+
+static bool sdio_enable_bcm2712_50mhz(void)
+{
+#if PIOS_HAS_WIFI_SDIO2
+    u64 cfg = WIFI_SDIO_HOST_BASE + BCM2712_SDIO2_CFG_OFFSET;
+    u32 mode = mmio_read(cfg + SDIO_CFG_MAX_50MHZ_MODE);
+    mode |= SDIO_CFG_MAX_50MHZ_STRAP_OVERRIDE |
+            SDIO_CFG_MAX_50MHZ_ENABLE;
+    mmio_write(cfg + SDIO_CFG_MAX_50MHZ_MODE, mode);
+    u32 readback = mmio_read(cfg + SDIO_CFG_MAX_50MHZ_MODE);
+    return (readback & (SDIO_CFG_MAX_50MHZ_STRAP_OVERRIDE |
+                        SDIO_CFG_MAX_50MHZ_ENABLE)) ==
+           (SDIO_CFG_MAX_50MHZ_STRAP_OVERRIDE |
+            SDIO_CFG_MAX_50MHZ_ENABLE);
+#else
+    return true;
+#endif
+}
+
+bool sdio_enable_high_speed(void)
+{
+    u8 high_speed = 0U;
+    if (!sdio_enable_bcm2712_50mhz() ||
+        !sdio_cmd52_read(SDIO_FUNC_CIA, CCCR_HIGH_SPEED, &high_speed) ||
+        (high_speed & HIGH_SPEED_SHS) == 0U)
+        return true; /* Remain in the proven 25MHz mode. */
+    if (!sdio_cmd52_write(SDIO_FUNC_CIA, CCCR_HIGH_SPEED,
+                          high_speed | HIGH_SPEED_EHS) ||
+        !sdio_set_clock(50000U)) {
+        uart_puts("[sdio] high speed transition failed\n");
+        return false;
+    }
+    uart_puts("[sdio] high speed 50MHz\n");
+    return true;
 }
 
 /* ── GPIO and power setup ── */
@@ -306,20 +372,24 @@ static void sdio_set_clock(u32 freq_khz)
 
 static u32 soc_stepping;
 
-static void detect_soc_stepping(void)
+static bool detect_soc_stepping(void)
 {
     u32 val = mmio_read(BCM2712_SOC_STEPPING);
+    u32 stepping_class = wifi_bcm2712_stepping_from_register(val);
     uart_puts("[sdio] SOC_STEPPING=");
     uart_hex(val);
-    if ((val >> 16) == 0x2712) {
+    if (stepping_class != WIFI_BCM2712_STEPPING_UNKNOWN) {
         soc_stepping = val & 0xFF;
         uart_puts(" rev=");
         uart_hex(soc_stepping);
     } else {
-        soc_stepping = 0xFF;  /* unknown — assume pre-D0 */
-        uart_puts(" (unknown SoC)");
+        soc_stepping = 0U;
+        uart_puts(" (unknown; refusing pinmux)");
+        uart_puts("\n");
+        return false;
     }
     uart_puts("\n");
+    return true;
 }
 
 static bool is_d0_stepping(void)
@@ -384,10 +454,11 @@ static void bcm2712_gpio_set_pull(u32 pin, u32 mode)
 #define PULL_NONE 0
 #define PULL_UP   2
 
-static void sdio_gpio_init(void)
+static bool sdio_gpio_init(void)
 {
 #if PIOS_HAS_WIFI_SDIO2
-    detect_soc_stepping();
+    if (!detect_soc_stepping())
+        return false;
 
     /* Read current FSEL for SDIO2 pins */
     uart_puts("[sdio] FSEL: ");
@@ -437,8 +508,11 @@ static void sdio_gpio_init(void)
      * (function-select value 7), with the controller's card-side pull-ups
      * enabled during identification. */
     static const u32 pins[] = { 34U, 35U, 36U, 37U, 38U, 39U };
-    const u32 pin_mask = 0xFCU; /* GPIO34-39 in GPIO bank 1 */
-    uart_puts("[sdio] configuring BCM2837 SDIO1 GPIO34-39\n");
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI4
+     uart_puts("[sdio] configuring BCM2711 SDIO1 GPIO34-39\n");
+#else
+     uart_puts("[sdio] configuring BCM2837 SDIO1 GPIO34-39\n");
+#endif
     for (u32 i = 0U; i < sizeof(pins) / sizeof(pins[0]); i++) {
         u32 pin = pins[i];
         u32 off = (pin / 10U) * 4U;
@@ -448,18 +522,39 @@ static void sdio_gpio_init(void)
         fsel |= 7U << shift; /* ALT3 = SD1_CLK/CMD/DAT[0..3] */
         mmio_write(PIOS_PERIPH_BASE + 0x200000UL + off, fsel);
     }
+    /* BCM2711 replaces BCM2837's GPPUD/GPPUDCLK handshake with a two-bit
+     * pull field per GPIO. */
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI4
+    u32 pull_offset, pull_shift;
+    u32 pull_mask = 0U;
+    for (u32 i = 0U; i < sizeof(pins) / sizeof(pins[0]); i++) {
+        if (!wifi_bcm2711_pull_register(pins[i], &pull_offset, &pull_shift))
+            return false;
+        pull_mask |= 3U << pull_shift;
+    }
+    u32 pulls = mmio_read(PIOS_PERIPH_BASE + 0x200000UL + pull_offset);
+    pulls &= ~pull_mask;
+    for (u32 i = 0U; i < sizeof(pins) / sizeof(pins[0]); i++) {
+        (void)wifi_bcm2711_pull_register(pins[i], &pull_offset, &pull_shift);
+        pulls |= 1U << pull_shift; /* BCM2711: 01 = pull-up */
+    }
+    mmio_write(PIOS_PERIPH_BASE + 0x200000UL + pull_offset, pulls);
+#else
     /* BCM2835/2837 GPIO pull sequence: select pull-up, clock it into the
      * bank-1 pins, then return the global pull selector to disabled. */
+    const u32 pin_mask = 0xFCU; /* GPIO34-39 in GPIO bank 1 */
     mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x94U, 2U);
     delay_cycles(150U);
     mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x9CU, pin_mask);
     delay_cycles(150U);
     mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x94U, 0U);
     mmio_write(PIOS_PERIPH_BASE + 0x200000UL + 0x9CU, 0U);
+#endif
     uart_puts("[sdio] SDIO1 pins ready\n");
 #else
     uart_puts("[sdio] no WiFi SDIO GPIO configuration\n");
 #endif
+    return true;
 }
 
 bool sdio_power_on(void)
@@ -500,13 +595,20 @@ bool sdio_power_on(void)
     uart_puts("\n");
     return true;
 #elif PIOS_HAS_WIFI_SDIO1 && PIOS_WIFI_WL_REG_ON_FIRMWARE
-    if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false)) {
-        uart_puts("[sdio] firmware WL_ON low failed\n");
+    u32 mbox_status = 0U;
+    if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false,
+                              &mbox_status)) {
+        uart_puts("[sdio] firmware WL_ON low failed response=");
+        uart_hex(mbox_status);
+        uart_puts("\n");
         return false;
     }
     timer_delay_ms(20U);
-    if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, true)) {
-        uart_puts("[sdio] firmware WL_ON high failed\n");
+    if (!mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, true,
+                              &mbox_status)) {
+        uart_puts("[sdio] firmware WL_ON high failed response=");
+        uart_hex(mbox_status);
+        uart_puts("\n");
         return false;
     }
     timer_delay_ms(150U);
@@ -546,7 +648,7 @@ void sdio_power_off(void)
     mmio_write(BCM2712_GPIO1_DATA0, data & ~bit);
     timer_delay_ms(20U);
 #elif PIOS_HAS_WIFI_SDIO1 && PIOS_WIFI_WL_REG_ON_FIRMWARE
-    (void)mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false);
+    (void)mbox_set_gpio_output(PIOS_WIFI_WL_REG_ON_GPIO, false, 0);
     timer_delay_ms(20U);
 #elif PIOS_HAS_WIFI_SDIO1
     const u32 bit = 1U << (PIOS_WIFI_WL_REG_ON_GPIO - 32U);
@@ -586,7 +688,10 @@ bool sdio_init(void)
     uart_puts("\n");
 
     /* Configure GPIOs for SDIO */
-    sdio_gpio_init();
+    if (!sdio_gpio_init()) {
+        uart_puts("[sdio] WiFi GPIO setup failed\n");
+        return false;
+    }
 
     /* Power-cycle the WiFi chip */
     if (!sdio_power_on()) {
@@ -619,9 +724,6 @@ bool sdio_init(void)
     uart_puts(" after=");
     uart_hex(sdio_diag.cfg_ctrl);
     uart_puts("\n");
-
-    /* MAX_50MHZ strap — leave as-is for basic 25MHz bring-up.
-     * Only override if implementing UHS/tuning modes (>50MHz). */
 
     /* Set SD_PIN_SEL to SD mode (not eMMC) — BCM2712-specific */
     u32 pinsel = mmio_read(cfg + SDIO_CFG_SD_PIN_SEL);
@@ -664,7 +766,10 @@ bool sdio_init(void)
      * Circle: single write with divider + timeout + internal clock enable */
     uart_puts("[sdio] setting 400kHz clock...\n");
     sdio_diag.last_stage = 3U;
-    sdio_set_clock(400);
+    if (!sdio_set_clock(400U)) {
+        uart_puts("[sdio] 400kHz clock failed\n");
+        return false;
+    }
     delay_cycles(500000);
 
     /* Set up interrupts per SDHCI spec */
@@ -808,7 +913,10 @@ bool sdio_init(void)
     }
 
     /* Switch to higher clock (25 MHz) */
-    sdio_set_clock(25000);
+    if (!sdio_set_clock(25000U)) {
+        uart_puts("[sdio] 25MHz clock failed\n");
+        return false;
+    }
 
     /* Verify CCCR access */
     u8 cccr_rev;
@@ -819,15 +927,6 @@ bool sdio_init(void)
     uart_puts("[sdio] CCCR=");
     uart_hex(cccr_rev);
     uart_puts("\n");
-
-    u8 high_speed = 0U;
-    if (sdio_cmd52_read(SDIO_FUNC_CIA, CCCR_HIGH_SPEED, &high_speed) &&
-        (high_speed & HIGH_SPEED_SHS) != 0U &&
-        sdio_cmd52_write(SDIO_FUNC_CIA, CCCR_HIGH_SPEED,
-                         high_speed | HIGH_SPEED_EHS)) {
-        sdio_set_clock(50000U);
-        uart_puts("[sdio] high speed 50MHz\n");
-    }
 
     sdio_initialized = true;
     sdio_diag.initialized = 1U;
@@ -1363,10 +1462,14 @@ void sdio_card_irq_mask(void)
 #if PIOS_HAS_WIFI_SDIO
     u16 signal = sr16(REG_IRPT_EN);
     sw16(REG_IRPT_EN, (u16)(signal & ~(u16)INT_CARD));
+#if !PIOS_HAS_GIC && PIOS_WIFI_SDIO_IRQ != 0
+    /* Keep ARMCTRL disabled until AIRQ's controlled drain re-arms us. */
+    gic_disable_irq(PIOS_WIFI_SDIO_IRQ);
+#endif
 #endif
 }
 
-void sdio_card_irq_unmask(void)
+static void sdio_card_irq_host_unmask(void)
 {
 #if PIOS_HAS_WIFI_SDIO
     u16 signal = sr16(REG_IRPT_EN);
@@ -1374,15 +1477,40 @@ void sdio_card_irq_unmask(void)
 #endif
 }
 
+void sdio_card_irq_unmask(void)
+{
+#if !PIOS_HAS_GIC && PIOS_WIFI_SDIO_IRQ != 0
+    /* Bottom half only: controller source first, SDHCI host signal last. */
+    gic_enable_irq(PIOS_WIFI_SDIO_IRQ);
+#endif
+    sdio_card_irq_host_unmask();
+}
+
 static void sdio_gic_irq_handler(void)
 {
-    /* Top half: mask the level line, ack, post. Drain is FIFO/AIRQ only. */
+    /* Historical name retained for GIC callers. The legacy path is likewise a
+     * top half only: mask, record/W1C, AIRQ-publish, and return. */
     sdio_card_irq_mask();
+#if !PIOS_HAS_GIC
+    u16 status = sr16(REG_INTERRUPT);
+    sdio_irq_diag.last_status = status;
+    if (status & INT_CARD) {
+        sdio_card_irq_latched = true;
+        sdio_card_irq_ack();
+    }
+    if (!airq_post_from(CORE_NET, AIRQ_SRC_WIFI, NET_DISPATCH_CAUSE_IRQ)) {
+        sdio_card_irq_latched = false;
+        sdio_irq_diag.airq_post_failed++;
+        /* Both SDHCI and ARMCTRL remain masked. Do not fall back to polling. */
+        return;
+    }
+#else
     if (sdio_card_irq_pending()) {
         sdio_card_irq_latched = true;
         sdio_card_irq_ack();
     }
     (void)airq_post_from(CORE_NET, AIRQ_SRC_WIFI, NET_DISPATCH_CAUSE_IRQ);
+#endif
 }
 
 void sdio_card_irq_arm(void)
@@ -1390,9 +1518,35 @@ void sdio_card_irq_arm(void)
 #if PIOS_HAS_WIFI_SDIO
     sdio_card_irq_latched = false;
     sdio_card_irq_level = false;
-    sdio_card_irq_unmask();
+#if !PIOS_HAS_GIC
+    /* SDIO1's ARMCTRL -> QA7 cascade is owned exclusively by core 0. Keep the
+     * host source masked until its callback, route, and ARMCTRL source live. */
+    sdio_card_irq_mask();
+    if ((core_id() & 3U) != CORE_NET) {
+        sdio_irq_diag.arm_rejected_noncore0++;
+        return;
+    }
+#endif
 #if PIOS_WIFI_SDIO_IRQ != 0
     irq_register(PIOS_WIFI_SDIO_IRQ, sdio_gic_irq_handler);
+#if !PIOS_HAS_GIC
+    if (!gic_legacy_register_gpu_irq(PIOS_WIFI_SDIO_IRQ)) {
+        sdio_irq_diag.route_failed++;
+        return;
+    }
+    if (!gic_legacy_route_gpu_core0()) {
+        (void)gic_legacy_unregister_gpu_irq(PIOS_WIFI_SDIO_IRQ);
+        sdio_irq_diag.route_failed++;
+        return;
+    }
+    /* ARMCTRL EN2 is W1; only after route readback and callback registration
+     * may the SDHCI host signal be exposed. */
+    gic_enable_irq(PIOS_WIFI_SDIO_IRQ);
+    sdio_card_irq_host_unmask();
+    sdio_irq_diag.armed++;
+    uart_puts("[sdio] card IRQ armed legacy GPU62\n");
+#else
+    sdio_card_irq_unmask();
     gic_set_group1(PIOS_WIFI_SDIO_IRQ);
     gic_set_priority(PIOS_WIFI_SDIO_IRQ, 0x60U);
     gic_set_target(PIOS_WIFI_SDIO_IRQ, 1U);
@@ -1401,10 +1555,19 @@ void sdio_card_irq_arm(void)
     uart_puts("[sdio] card IRQ armed intid=");
     uart_hex(PIOS_WIFI_SDIO_IRQ);
     uart_puts("\n");
+#endif
 #else
     uart_puts("[sdio] card IRQ: no host INTID on this platform\n");
 #endif
 #endif
+}
+
+void sdio_irq_diag_snapshot(struct sdio_irq_diag *out)
+{
+    if (!out)
+        return;
+    dmb_ishld();
+    *out = sdio_irq_diag;
 }
 
 bool sdio_card_irq_take(void)

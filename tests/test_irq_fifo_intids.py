@@ -27,7 +27,8 @@ assert "#define PIOS_GENET_IRQ              189U   /* GIC_SPI 157 */" in platfor
 assert "#define PIOS_WIFI_SDIO_IRQ          306U   /* GIC_SPI 274 */" in platform
 assert "#define PIOS_WIFI_SDIO_IRQ          158U   /* GIC_SPI 126, Arasan" in platform
 assert "#define PIOS_GENET_IRQ              0U" in platform
-assert "#define PIOS_WIFI_SDIO_IRQ          0U" in platform
+assert "#define PIOS_BCM2837_GPU_IRQ_SDIO1  62U" in platform
+assert "#define PIOS_WIFI_SDIO_IRQ          PIOS_BCM2837_GPU_IRQ_SDIO1" in platform
 
 genet_irq = body_after(kernel, "static void core0_genet_irq_handler(void)\n{")
 assert "genet_irq_mask_rx();" in genet_irq

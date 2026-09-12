@@ -19,9 +19,9 @@ Pi 5 / Pi 3 / Pi Zero 2 W firmware
    │  loads FAT:/kernel8.img → 0x80000, enters at EL1, MMU off
    ▼
 Stage0 bootstrap  (kernel8.img — small, stable, never OTA'd, multi-platform)
-   │  detects board via MIDR_EL1 (§2.0), arms HW watchdog, optionally imports
-   │  FAT:/PIOSSTG2.PKG's matching-platform payload into raw slot A, reads
-   │  boot control, validates the selected slot, stages and jumps
+   │  detects board via MIDR_EL1 (§2.0), arms HW watchdog, consumes a valid
+   │  one-shot FAT-direct O override or selects pending/known-good raw A/B;
+   │  FAT imports to A only when no raw choice is bootable, then stages/jumps
    ▼
 Real kernel  (real_kernel.img / kernel8_pi3.img / kernel8_pizero2w.img —
               the OTA'able, single-platform stage-2)  src/start.S → kernel_main
@@ -118,11 +118,14 @@ uncached and ACMD41 never finishes. Payload handoff then goes through the shared
 the stage-2 entry. Stage0 is otherwise intentionally minimal: it brings up just
 enough (SD + serial + framebuffer) to choose and load a stage-2 image.
 
-Before slot selection, stage0 mounts FAT32 read-only, searches the root directory for the exact
-8.3 name `PIOSSTG2.PKG`, validates its bounded manifest and whole-package FNV-1a ID, and compares
-it against raw slot A. A changed package is written with an invalid header, read back byte-for-byte,
-then committed by writing the valid header last. Invalid partition geometry disables all updater
-and boot-control writes.
+Stage0 checks boot control before ordinary FAT recovery. The order is armed,
+identity-matched one-shot O (loaded directly from FAT), validated pending A/B,
+validated known-good active A/B, then FAT recovery import to A only if no raw
+choice is bootable. O is consumed on disk before its jump and never alters A/B
+pending/active/good/tries state. Shared FAT assets are loaded independently.
+A recovery import is written with an invalid header, read back byte-for-byte,
+then committed by writing the valid header last. Invalid partition geometry
+disables all updater and boot-control writes.
 
 ### 2.1 Arm the hardware watchdog first
 
@@ -142,21 +145,21 @@ bad candidate self-recovers:
 This `root_lba` is the base for the boot-control sector and the A/B raw kernel
 slots.
 
-### 2.3 Read the boot-control sector and select a slot
+### 2.3 Read boot control and select a source
 
 Control sector LBA = `root_lba + PIOS_BOOTCTRL_OFFSET/512`
 (`src/bootstrap.c:181-195,198-231`). See
 [disk_layout.md](disk_layout.md#3-boot-control-sector-pbc0) for the full
 `PBC0` structure.
 
-Selection logic (`src/bootstrap.c:200-229`):
-
-1. If the control block is invalid → boot **slot A** (`PIOS_BOOTCTRL_SLOT_A`).
-2. Read `ACTIVE_SLOT`, `PENDING_SLOT`, `TRIES_LEFT`, `GOOD_MASK`; an invalid
-   active slot forces **A**.
-3. If a **pending** slot is valid and `TRIES_LEFT > 0`: boot the pending slot,
-   decrement tries (`tries - 1`), write `LAST_BOOT`.
-4. Otherwise boot the active slot, clear pending, write `LAST_BOOT`.
+Boot-control v2 keeps the original A/B fields and adds a logical O override:
+mode/armed, one-shot tries, exact 64-bit FAT package identity, and a checksum
+at byte 48. Valid v1 records (whose checksum is at byte 32) are migrated with
+O clear without interpreting their old checksum as override data. Selection is
+**valid armed O → validated pending A/B → validated known-good active A/B →
+validated FAT recovery import to A**. Before O's trampoline jump, stage0
+clears its O fields, writes `last_boot=O`, and increments generation; a failed
+control write rejects O and continues to A/B.
 
 ### 2.4 Validate and load the stage-2 image
 

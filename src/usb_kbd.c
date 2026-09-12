@@ -16,11 +16,7 @@
 
 #include "usb_kbd.h"
 #include "usb.h"
-#include "xhci.h"
-#include "mmio.h"
 #include "uart.h"
-#include "timer.h"
-#include "mmu.h"
 
 /* ---- HID Class Requests ---- */
 
@@ -180,7 +176,7 @@ static void queue_poll(void) {
     if (poll_pending) {
         u32 actual = 0U;
         bool complete = false;
-        if (!xhci_interrupt_poll(&actual, &complete)) {
+        if (!usb_interrupt_poll(kbd_dev, &actual, &complete)) {
             poll_pending = false;
             return;
         }
@@ -190,8 +186,7 @@ static void queue_poll(void) {
         if (actual >= 8U)
             process_report(report_buf);
     }
-    if (xhci_interrupt_submit(kbd_dev->slot, int_ep_addr,
-                              report_buf, xfer_len))
+    if (usb_interrupt_submit(kbd_dev, int_ep_addr, report_buf, xfer_len))
         poll_pending = true;
 }
 
