@@ -119,6 +119,7 @@ decision)
 | [074](ADR-074-precreated-three-partition-layout.md) | Pre-created three-primary storage layout | Owner | Accepted |
 | [075](ADR-075-exchange-partition-autosetup.md) | Automatic PIOSXFER attachment and raw-p3 autoformat | Owner | Superseded by ADR-076 |
 | [076](ADR-076-discovery-only-storage-layout.md) | Discovery-only storage layout | Owner | Accepted |
+| [077](ADR-077-wifi-association-control.md) | Offline Wi-Fi association control contract | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |

@@ -78,6 +78,9 @@ TESTS_MANIFEST = {
     # offline parser/ownership contract and deliberately has no H4 transport
     # adapter, controller reset, or capability activation path.
     "test_bt_hci_lifecycle.c": ["src/bt_hci_lifecycle.c"],
+    # #76 association is evidence-only: fixed states, injected credit/control
+    # publication/event/EAPOL summaries, liveness proof, and no CYW transport.
+    "test_wifi_assoc_contract.c": ["src/wifi_assoc_contract.c"],
     # First DWC2 milestone: verified BCM2837 DMA/IRQ-route facts plus a pure
     # generation-safe transfer ownership model. No controller hardware is
     # enabled or accessed by this host-tested contract.
@@ -277,6 +280,7 @@ TEST_CFLAGS = {
     "test_crypto_soft.c": ["-DPIOS_PLATFORM=6"],
     "test_dwc2_dma_arena.c": ["-DPIOS_PLATFORM=6"],
     "test_airq_concurrency.c": ["-DPIOS_HOST_CORE_ID_FN", "-pthread"],
+    "test_wifi_assoc_contract.c": ["-DPIOS_HOST_CORE_ID_FN"],
     "test_media_admission.c": ["-DPIOS_HOST_CORE_ID_FN"],
     "test_tls_event.c": ["-DPIOS_PLATFORM=6"],
     "test_tls_api.c": ["-DPIOS_PLATFORM=6"],
@@ -346,6 +350,7 @@ def main() -> int:
                  "test_issue_192_nvme_block_provider_gate.py",
                  "test_issue_191_nvme_namespace_io_gate.py",
                  "test_issue_183_bluetooth_hci_lifecycle_gate.py",
+                 "test_issue_76_wifi_assoc_contract_gate.py",
                  "test_issue_97_gpu_fabric_control_gate.py",
                  "test_issue_169_media_admission_gate.py",
                  "test_partition_table_gate.py",
