@@ -8,10 +8,6 @@
 #include "types.h"
 #include "exchange_volume_policy.h"
 
-static const u8 exchange_label[] = {
-    0x50U, 0x49U, 0x4FU, 0x53U, 0x58U, 0x46U, 0x45U, 0x52U
-};
-
 /* Microsoft basic data partition GUID, in GPT's on-disk byte order. */
 static const u8 microsoft_basic_data_guid[] = {
     0xA2U, 0xA0U, 0xD0U, 0xEBU, 0xE5U, 0xB9U, 0x33U, 0x44U,
@@ -125,13 +121,10 @@ static bool fact_valid(const struct exchange_volume_partition_fact *fact,
 static bool fact_candidate(const struct exchange_volume_partition_fact *fact)
 {
     if (fact->filesystem != EXCHANGE_VOLUME_FILESYSTEM_FAT32 ||
-        fact->flags != 0U ||
-        fact->filesystem_label_bytes != sizeof(exchange_label) ||
-        !bytes_equal(fact->filesystem_label, exchange_label,
-                     sizeof(exchange_label)))
+        fact->flags != 0U)
         return false;
     if (fact->table_scheme == EXCHANGE_VOLUME_TABLE_MBR)
-        return mbr_type_is_fat32(fact->mbr_type);
+        return mbr_type_is_fat32(fact->mbr_type) || fact->mbr_type == 0xDAU;
     return fact->table_scheme == EXCHANGE_VOLUME_TABLE_GPT &&
            bytes_equal(fact->gpt_type_guid, microsoft_basic_data_guid,
                        sizeof(microsoft_basic_data_guid));

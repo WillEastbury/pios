@@ -1,16 +1,9 @@
 /*
- * Generic PIOSXFER attachment.  It has no SD/WALFS/platform dependency:
+ * Generic PIOSXFER attachment and raw-p3 format gate. It has no SD/WALFS/platform dependency:
  * callers must supply an MBR snapshot and exact-sector backend.
  */
 #include "types.h"
 #include "exchange_service.h"
-
-static const u8 exchange_label[8U] = {
-    'P', 'I', 'O', 'S', 'X', 'F', 'E', 'R'
-};
-static const u8 exchange_bpb_label[FAT32_EXCHANGE_NAME_BYTES] = {
-    'P', 'I', 'O', 'S', 'X', 'F', 'E', 'R', ' ', ' ', ' '
-};
 
 static bool authorized_lba(const struct exchange_service *service, u32 lba)
 {
@@ -36,11 +29,29 @@ static bool service_write(void *context, u32 lba, const u8 in[512])
            service->backend.write(service->backend.context, lba, in);
 }
 
-static void policy_fact_make(const struct storage_layout_fact *p3,
-                             struct exchange_volume_partition_fact *fact)
+static bool service_format_write(void *context, u32 lba, const u8 in[512])
+{
+    struct exchange_service *service = context;
+
+    return service && service->backend.format_writable && service->backend.write &&
+           authorized_lba(service, lba) &&
+           service->backend.write(service->backend.context, lba, in);
+}
+
+static bool boot_sector_is_all_zero(const u8 sector[512])
 {
     u32 i;
 
+    for (i = 0U; i < 512U; i++) {
+        if (sector[i] != 0U)
+            return false;
+    }
+    return true;
+}
+
+static void policy_fact_make(const struct storage_layout_fact *p3,
+                             struct exchange_volume_partition_fact *fact)
+{
     *fact = (struct exchange_volume_partition_fact){0};
     fact->identity = ((u64)p3->disk_id << 32) | p3->first_lba;
     fact->first_lba = p3->first_lba;
@@ -49,9 +60,6 @@ static void policy_fact_make(const struct storage_layout_fact *p3,
     fact->table_scheme = EXCHANGE_VOLUME_TABLE_MBR;
     fact->filesystem = EXCHANGE_VOLUME_FILESYSTEM_FAT32;
     fact->mbr_type = p3->mbr_type;
-    fact->filesystem_label_bytes = sizeof(exchange_label);
-    for (i = 0U; i < sizeof(exchange_label); i++)
-        fact->filesystem_label[i] = exchange_label[i];
 }
 
 static enum exchange_service_result core_result(
@@ -77,10 +85,12 @@ enum exchange_service_result exchange_service_init(
     struct exchange_volume_policy_input input;
     struct exchange_volume_policy_request request;
     struct fat32_exchange_io io;
+    struct fat32_exchange_io format_io;
     const struct storage_layout_fact *p3;
     enum storage_layout_result layout_result;
     enum exchange_volume_policy_result policy_result;
     enum fat32_exchange_result mount_result;
+    u8 boot[512];
 
     if (!service)
         return EXCHANGE_SERVICE_INVALID;
@@ -144,8 +154,6 @@ enum exchange_service_result exchange_service_init(
     service->attachment.epoch = p3->disk_id;
     service->attachment.first_lba = (u32)attached.first_lba;
     service->attachment.block_count = (u32)attached.block_count;
-    for (u32 i = 0U; i < sizeof(exchange_bpb_label); i++)
-        service->attachment.expected_label[i] = exchange_bpb_label[i];
     io = (struct fat32_exchange_io) {
         .read = service_read,
         .write = service_write,
@@ -154,6 +162,50 @@ enum exchange_service_result exchange_service_init(
     fat32_exchange_volume_init(&service->volume);
     mount_result = fat32_exchange_mount(&service->volume, &service->attachment,
                                         &io, 0U, false);
+    if (mount_result == FAT32_EXCHANGE_OK) {
+        service->status.format_reason = EXCHANGE_SERVICE_FORMAT_EXISTING;
+        return core_result(service, mount_result);
+    }
+
+    /*
+     * Formatting is deliberately narrower than mounting: only an explicitly
+     * raw p3 whose complete boot sector is positively known blank may be
+     * initialized. Any residue is treated as user data, including damaged or
+     * unrecognizable filesystem metadata.
+     */
+    if (!service_read(service, p3->first_lba, boot)) {
+        service->status.format_reason = EXCHANGE_SERVICE_FORMAT_IO;
+        return core_result(service, mount_result);
+    }
+    if (p3->mbr_type != STORAGE_LAYOUT_MBR_TYPE_PIOS_RAW) {
+        service->status.format_reason = EXCHANGE_SERVICE_FORMAT_RAW_NOT_ALLOWED;
+        return core_result(service, mount_result);
+    }
+    if (!boot_sector_is_all_zero(boot)) {
+        service->status.format_reason = EXCHANGE_SERVICE_FORMAT_CORRUPT;
+        return core_result(service, mount_result);
+    }
+    if (!service->backend.format_writable) {
+        service->status.format_reason = EXCHANGE_SERVICE_FORMAT_RAW_READ_ONLY;
+        return core_result(service, mount_result);
+    }
+    format_io = (struct fat32_exchange_io) {
+        .read = service_read,
+        .write = service_format_write,
+        .context = service,
+    };
+    mount_result = fat32_exchange_format(&service->attachment, &format_io);
+    if (mount_result != FAT32_EXCHANGE_OK) {
+        service->status.format_reason = EXCHANGE_SERVICE_FORMAT_IO;
+        return core_result(service, mount_result);
+    }
+    fat32_exchange_volume_init(&service->volume);
+    mount_result = fat32_exchange_mount(&service->volume, &service->attachment,
+                                        &io, 0U, false);
+    if (mount_result == FAT32_EXCHANGE_OK) {
+        service->status.formatted_this_boot = 1U;
+        service->status.format_reason = EXCHANGE_SERVICE_FORMAT_RAW_FORMATTED;
+    }
     return core_result(service, mount_result);
 }
 

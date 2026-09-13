@@ -67,6 +67,19 @@ static bool bytes_equal(const u8 *a, const u8 *b, u32 bytes)
     return true;
 }
 
+static bool bytes_all_zero(const u8 *value, u32 bytes)
+{
+    u32 i;
+
+    for (i = 0U; i < bytes; i++) {
+        if (value[i] != 0U)
+            return false;
+    }
+    return true;
+}
+
+static bool lba_range_representable(u32 first, u32 sectors);
+
 static enum fat32_exchange_result fault(struct fat32_exchange_volume *volume,
                                         enum fat32_exchange_result result)
 {
@@ -78,6 +91,154 @@ void fat32_exchange_volume_init(struct fat32_exchange_volume *volume)
 {
     if (volume)
         *volume = (struct fat32_exchange_volume){0};
+}
+
+static bool attachment_range_valid(const struct fat32_exchange_attachment *a)
+{
+    return a && a->identity != 0U && a->epoch != 0U &&
+           lba_range_representable(a->first_lba, a->block_count);
+}
+
+static bool format_write(const struct fat32_exchange_attachment *a,
+                         const struct fat32_exchange_io *io, u32 relative,
+                         const u8 sector[FAT32_EXCHANGE_SECTOR_BYTES])
+{
+    u32 lba;
+
+    if (!attachment_range_valid(a) || !io || !io->write ||
+        relative >= a->block_count || a->first_lba > ~0U - relative)
+        return false;
+    lba = a->first_lba + relative;
+    return io->write(io->context, lba, sector);
+}
+
+static bool format_read(const struct fat32_exchange_attachment *a,
+                        const struct fat32_exchange_io *io, u32 relative,
+                        u8 sector[FAT32_EXCHANGE_SECTOR_BYTES])
+{
+    u32 lba;
+
+    if (!attachment_range_valid(a) || !io || !io->read ||
+        relative >= a->block_count || a->first_lba > ~0U - relative)
+        return false;
+    lba = a->first_lba + relative;
+    return io->read(io->context, lba, sector);
+}
+
+/*
+ * The format is intentionally fixed at 512-byte sectors, SPC=1, two FATs,
+ * 32 reserved sectors, and root cluster 2.  SPC=1 keeps the minimum valid
+ * FAT32 geometry below the supported 64 MiB exchange partition.
+ */
+enum fat32_exchange_result fat32_exchange_format(
+    const struct fat32_exchange_attachment *attachment,
+    const struct fat32_exchange_io *io)
+{
+    static const u8 label[FAT32_EXCHANGE_NAME_BYTES] = {
+        'P', 'I', 'O', 'S', 'X', 'F', 'E', 'R', ' ', ' ', ' '
+    };
+    u8 boot[FAT32_EXCHANGE_SECTOR_BYTES];
+    u8 fsinfo[FAT32_EXCHANGE_SECTOR_BYTES];
+    u8 verify[FAT32_EXCHANGE_SECTOR_BYTES];
+    u32 fat_sectors;
+    u32 data_sectors;
+    u32 clusters;
+    u32 needed;
+    u32 i;
+
+    if (!attachment_range_valid(attachment) || !io || !io->read ||
+        !io->write ||
+        attachment->block_count <= FAT32_EXCHANGE_FORMAT_RESERVED)
+        return FAT32_EXCHANGE_INVALID;
+    fat_sectors = (u32)((((u64)attachment->block_count -
+                          FAT32_EXCHANGE_FORMAT_RESERVED + 2U) * 4U +
+                         FAT32_EXCHANGE_SECTOR_BYTES +
+                         FAT32_EXCHANGE_FORMAT_FATS * 4U - 1U) /
+                        (FAT32_EXCHANGE_SECTOR_BYTES +
+                         FAT32_EXCHANGE_FORMAT_FATS * 4U));
+    if (fat_sectors == 0U || fat_sectors >
+        (attachment->block_count - FAT32_EXCHANGE_FORMAT_RESERVED) /
+        FAT32_EXCHANGE_FORMAT_FATS)
+        return FAT32_EXCHANGE_BPB;
+    data_sectors = attachment->block_count - FAT32_EXCHANGE_FORMAT_RESERVED -
+                   FAT32_EXCHANGE_FORMAT_FATS * fat_sectors;
+    clusters = data_sectors;
+    needed = (u32)((((u64)clusters + 2U) * 4U +
+                    FAT32_EXCHANGE_SECTOR_BYTES - 1U) /
+                   FAT32_EXCHANGE_SECTOR_BYTES);
+    if (needed > fat_sectors || clusters < 65525U ||
+        clusters > FAT32_EXCHANGE_MAX_CLUSTERS ||
+        fat_sectors > FAT32_EXCHANGE_MAX_FAT_SECTORS ||
+        FAT32_EXCHANGE_FORMAT_RESERVED < 8U ||
+        !lba_range_representable(attachment->first_lba,
+                                 attachment->block_count))
+        return FAT32_EXCHANGE_BPB;
+
+    bytes_zero(boot, sizeof(boot));
+    boot[0U] = 0xEBU;
+    boot[1U] = 0x58U;
+    boot[2U] = 0x90U;
+    boot[3U] = 'P'; boot[4U] = 'I'; boot[5U] = 'O'; boot[6U] = 'S';
+    boot[7U] = 'X'; boot[8U] = 'F'; boot[9U] = 'E'; boot[10U] = 'R';
+    put_le16(boot + 11U, FAT32_EXCHANGE_SECTOR_BYTES);
+    boot[13U] = 1U;
+    put_le16(boot + 14U, FAT32_EXCHANGE_FORMAT_RESERVED);
+    boot[16U] = FAT32_EXCHANGE_FORMAT_FATS;
+    boot[21U] = 0xF8U;
+    put_le16(boot + 24U, 63U);
+    put_le16(boot + 26U, 255U);
+    put_le32(boot + 28U, attachment->first_lba);
+    put_le32(boot + 32U, attachment->block_count);
+    put_le32(boot + 36U, fat_sectors);
+    put_le32(boot + 44U, FAT32_EXCHANGE_FORMAT_ROOT);
+    put_le16(boot + 48U, 1U);
+    put_le16(boot + 50U, 6U);
+    boot[64U] = 0x80U;
+    boot[66U] = 0x29U;
+    put_le32(boot + 67U, attachment->identity & 0xFFFFFFFFU);
+    bytes_copy(boot + 71U, label, sizeof(label));
+    boot[82U] = 'F'; boot[83U] = 'A'; boot[84U] = 'T'; boot[85U] = '3';
+    boot[86U] = '2'; boot[87U] = ' '; boot[88U] = ' '; boot[89U] = ' ';
+    boot[510U] = 0x55U;
+    boot[511U] = 0xAAU;
+
+    bytes_zero(fsinfo, sizeof(fsinfo));
+    put_le32(fsinfo, 0x41615252U);
+    put_le32(fsinfo + 484U, 0x61417272U);
+    put_le32(fsinfo + 488U, ~0U);
+    put_le32(fsinfo + 492U, 3U);
+    put_le32(fsinfo + 508U, 0xAA550000U);
+    if (!format_write(attachment, io, 0U, boot) ||
+        !format_write(attachment, io, 6U, boot) ||
+        !format_write(attachment, io, 1U, fsinfo) ||
+        !format_write(attachment, io, 7U, fsinfo))
+        return FAT32_EXCHANGE_IO;
+
+    for (i = 0U; i < fat_sectors; i++) {
+        bytes_zero(verify, sizeof(verify));
+        if (i == 0U) {
+            put_le32(verify, 0x0FFFFFF8U);
+            put_le32(verify + 4U, 0xFFFFFFFFU);
+            put_le32(verify + 8U, 0x0FFFFFFFU);
+        }
+        if (!format_write(attachment, io,
+                          FAT32_EXCHANGE_FORMAT_RESERVED + i, verify) ||
+            !format_write(attachment, io,
+                          FAT32_EXCHANGE_FORMAT_RESERVED + fat_sectors + i,
+                          verify))
+            return FAT32_EXCHANGE_IO;
+    }
+    bytes_zero(verify, sizeof(verify));
+    if (!format_write(attachment, io,
+                      FAT32_EXCHANGE_FORMAT_RESERVED +
+                      FAT32_EXCHANGE_FORMAT_FATS * fat_sectors, verify))
+        return FAT32_EXCHANGE_IO;
+    if (!format_read(attachment, io, 0U, verify) ||
+        !bytes_equal(verify, boot, sizeof(boot)) ||
+        !format_read(attachment, io, 6U, verify) ||
+        !bytes_equal(verify, boot, sizeof(boot)))
+        return FAT32_EXCHANGE_IO;
+    return FAT32_EXCHANGE_OK;
 }
 
 static enum fat32_exchange_result sector_read(struct fat32_exchange_volume *v,
@@ -948,11 +1109,15 @@ enum fat32_exchange_result fat32_exchange_mount(
         boot[82U] != 'F' || boot[83U] != 'A' || boot[84U] != 'T' ||
         boot[85U] != '3' || boot[86U] != '2' ||
         boot[87U] != ' ' || boot[88U] != ' ' || boot[89U] != ' ' ||
-        !bytes_equal(boot + 71U, attachment->expected_label,
-                     FAT32_EXCHANGE_NAME_BYTES))
-        return fault(v, bytes_equal(boot + 71U, attachment->expected_label,
-                                    FAT32_EXCHANGE_NAME_BYTES) ?
-                     FAT32_EXCHANGE_BPB : FAT32_EXCHANGE_LABEL);
+        (!bytes_all_zero(attachment->expected_label,
+                         FAT32_EXCHANGE_NAME_BYTES) &&
+         !bytes_equal(boot + 71U, attachment->expected_label,
+                      FAT32_EXCHANGE_NAME_BYTES)))
+        return fault(v, (!bytes_all_zero(attachment->expected_label,
+                                         FAT32_EXCHANGE_NAME_BYTES) &&
+                         !bytes_equal(boot + 71U, attachment->expected_label,
+                                      FAT32_EXCHANGE_NAME_BYTES)) ?
+                     FAT32_EXCHANGE_LABEL : FAT32_EXCHANGE_BPB);
     sectors_per_cluster = boot[13U];
     reserved = le16(boot + 14U);
     fats = boot[16U];

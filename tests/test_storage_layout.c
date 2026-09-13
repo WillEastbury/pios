@@ -52,6 +52,12 @@ int main(void)
     CHECK(layout.facts[2].role == STORAGE_LAYOUT_ROLE_EXCHANGE &&
           layout.facts[2].first_lba == 5048U &&
           layout.p3_present && layout.p3_result == STORAGE_LAYOUT_OK);
+    valid_three(mbr);
+    entry(mbr, 2U, 0U, STORAGE_LAYOUT_MBR_TYPE_PIOS_RAW, 5048U, 1000U);
+    CHECK(storage_layout_validate_exchange(mbr, 6048U, &layout) ==
+          STORAGE_LAYOUT_OK &&
+          layout.facts[2].mbr_type == STORAGE_LAYOUT_MBR_TYPE_PIOS_RAW);
+    valid_three(mbr);
     mbr[446U] = 0U;
     CHECK(storage_layout_validate(mbr, 6048U, &layout) == STORAGE_LAYOUT_OK &&
           layout.kind == STORAGE_LAYOUT_THREE_PARTITION);

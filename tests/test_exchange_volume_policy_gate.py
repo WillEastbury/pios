@@ -20,7 +20,7 @@ required = (
     "requested_identity",
     "enumeration_generation",
     "microsoft_basic_data_guid",
-    "exchange_label",
+    "label_canonical",
     "exchange_policy_irq_save",
     "core_id()",
 )

@@ -395,6 +395,24 @@ static int test_high_lba_and_cluster_bounds(void)
     return 0;
 }
 
+static int test_format_at_max_mbr_lba(void)
+{
+    struct fat32_exchange_volume v;
+    struct fat32_exchange_attachment a;
+    struct fat32_exchange_io backend;
+
+    setup_image();
+    disk.lba_base = ~0U - (IMAGE_SECTORS - 1U);
+    a = attachment();
+    backend = io();
+    CHECK(fat32_exchange_format(&a, &backend) == FAT32_EXCHANGE_OK);
+    fat32_exchange_volume_init(&v);
+    CHECK(mount(&v, &a) == FAT32_EXCHANGE_OK);
+    CHECK(disk.image[0U][510U] == 0x55U &&
+          disk.image[0U][511U] == 0xAAU);
+    return 0;
+}
+
 static int test_lfn_mutation_rejected(void)
 {
     struct fat32_exchange_volume v;
@@ -580,6 +598,7 @@ int main(void)
 {
     if (test_mutations() || test_rejections() || test_failure_and_full() ||
         test_root_extension() || test_high_lba_and_cluster_bounds() ||
+        test_format_at_max_mbr_lba() ||
         test_lfn_mutation_rejected() || test_lfn_deleted_create_rejected() ||
         test_lfn_end_marker_create_rejected() || test_fsinfo_and_file_aliases() ||
         test_count_free_sector_bounded())

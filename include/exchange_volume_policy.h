@@ -140,7 +140,8 @@ enum exchange_volume_policy_result exchange_volume_policy_init(
 /*
  * The sole selection operation.  It accepts exactly one non-boot,
  * non-PIOS-system FAT32 fact, with exact `PIOSXFER` label and the table-type
- * constraints documented in ADR-067.  Any multiple eligible facts fail
+ * constraints documented in ADR-067. FAT32 labels are descriptive and never
+ * authority. Any multiple eligible facts fail
  * closed, even if the operator names one of them.
  */
 enum exchange_volume_policy_result exchange_volume_policy_attach(

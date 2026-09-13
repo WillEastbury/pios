@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import pathlib
 import socket
 import subprocess
@@ -237,11 +238,39 @@ def persistence(a: Acceptance) -> None:
 
 
 def reject_exchange_p3(disk: pathlib.Path) -> None:
-    """Turn the optional p3 into a wrong-type record without touching p1/p2."""
+    """Leave damaged FAT residue that must not be mistaken for blank raw p3."""
+    p3_start = 2048 + 64 * 1024 * 1024 // 512 + 96 * 1024 * 1024 // 512
     with disk.open("r+b") as image:
-        image.seek(0x1DE + 4)
-        image.write(b"\x83")
+        image.seek(p3_start * 512 + 44)
+        image.write(b"\x00" * 4)  # destroy the FAT32 root-cluster field
+        image.seek(p3_start * 512 + 71)
+        image.write(b"\x00" * 11)  # remove the volume label
+        image.seek(p3_start * 512 + 82)
+        image.write(b"\x00" * 8)  # remove FAT32 type marker
+        image.seek(p3_start * 512 + 510)
+        image.write(b"\x00\x00")  # remove terminal boot signature
         image.flush()
+
+def relabel_exchange_p3(disk: pathlib.Path) -> None:
+    """Give an otherwise-valid formatted p3 a non-PIOSXFER label."""
+    p3_start = 2048 + 64 * 1024 * 1024 // 512 + 96 * 1024 * 1024 // 512
+    with disk.open("r+b") as image:
+        image.seek(p3_start * 512 + 71)
+        image.write(b"USER VOLUME")
+        image.flush()
+
+def digest_range(path: pathlib.Path, first_sector: int, sectors: int) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as image:
+        image.seek(first_sector * 512)
+        remaining = sectors * 512
+        while remaining:
+            data = image.read(min(1024 * 1024, remaining))
+            if not data:
+                raise RuntimeError("short disk image while hashing")
+            digest.update(data)
+            remaining -= len(data)
+    return digest.hexdigest()
 
 
 def exercise_rejected_exchange(a: Acceptance) -> None:
@@ -276,7 +305,7 @@ def main() -> int:
         builder = subprocess.run(
             [sys.executable, str(REPO / "tools" / "build_qemu_disk_image.py"),
              "--pkg", str(KERNEL), "--out", str(DISK), "--disk-id", "0x71584F52",
-             "--exchange"],
+             "--exchange-raw"],
             cwd=REPO, capture_output=True, text=True,
         )
         if builder.returncode != 0 or not DISK.exists():
@@ -286,6 +315,8 @@ def main() -> int:
         proc = launch(KERNEL, DISK)
         if not wait_boot(proc):
             raise RuntimeError("QEMU never reached /api/status")
+        a.command("exchange status", "exchange available=yes")
+        a.command("exchange status", "formatted=yes")
         a.command("walfs format confirm", "WALFS format OK")
         # Formatting is explicitly requested and initialization-dependent
         # services (principals/setup) come up only on the next boot.
@@ -308,13 +339,32 @@ def main() -> int:
         stop(proc)
         proc = None
 
-        # A malformed optional p3 cannot prevent valid legacy p1/p2 WALFS
-        # discovery. It also must not leave the prior exchange mount usable.
-        reject_exchange_p3(DISK)
+        # A valid FAT32 p3 attaches regardless of its descriptive volume
+        # label, and boot must not rewrite it.
+        relabel_exchange_p3(DISK)
+        p3_start = 2048 + 64 * 1024 * 1024 // 512 + 96 * 1024 * 1024 // 512
+        p3_before = digest_range(DISK, p3_start, 64 * 1024 * 1024 // 512)
         proc = launch(KERNEL, DISK)
         if not wait_boot(proc):
-            raise RuntimeError("QEMU rejected-p3 reboot never reached /api/status")
+            raise RuntimeError("QEMU unlabeled-p3 reboot never reached /api/status")
+        a.command("exchange status", "exchange available=yes")
+        a.command("exchange status", "formatted=no")
+        if digest_range(DISK, p3_start, 64 * 1024 * 1024 // 512) != p3_before:
+            raise RuntimeError("valid unlabeled p3 was rewritten")
+        stop(proc)
+        proc = None
+
+        reject_exchange_p3(DISK)
+        p3_corrupt = digest_range(DISK, p3_start, 64 * 1024 * 1024 // 512)
+        protected_before = digest_range(DISK, 0, p3_start)
+        proc = launch(KERNEL, DISK)
+        if not wait_boot(proc):
+            raise RuntimeError("QEMU corrupt-p3 reboot never reached /api/status")
         exercise_rejected_exchange(a)
+        if digest_range(DISK, p3_start, 64 * 1024 * 1024 // 512) != p3_corrupt:
+            raise RuntimeError("corrupt p3 was overwritten")
+        if digest_range(DISK, 0, p3_start) != protected_before:
+            raise RuntimeError("p1/p2 changed during corrupt-p3 boot")
         if a.errors:
             raise RuntimeError("; ".join(a.errors))
         average = sum(a.latencies) / len(a.latencies) if a.latencies else 0.0

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build a QEMU disk with pre-created boot p1 + raw WALFS p2.
 
-Default output remains the production-shaped two-partition image.  ``--exchange``
-adds the validated FAT32 p3 fixture labelled exactly ``PIOSXFER``; normal
-runtime still does not mount that exchange volume outside its QEMU adapter.
+Default output remains the production-shaped two-partition image. ``--exchange``
+adds a valid p3 fixture, while ``--exchange-raw`` adds a blank, explicitly raw
+p3 suitable for the boot autoformat acceptance test.
 
 Attach with (see tools/qemu_stage0_boot.py):
   -drive if=none,format=raw,file=<this image>,id=hd0
@@ -142,7 +142,7 @@ def build_fat32_partition(payload: bytes, part_sectors: int, start_lba: int,
     return part
 
 
-def build_mbr(disk_id: int, exchange: bool) -> bytearray:
+def build_mbr(disk_id: int, exchange: bool, raw_exchange: bool = False) -> bytearray:
     """Return the exact MBR used by build_image, useful for static layout tests."""
     part2_start = PART1_START + PART1_SECTORS
     part3_start = part2_start + PART2_SECTORS
@@ -162,7 +162,7 @@ def build_mbr(disk_id: int, exchange: bool) -> bytearray:
     if exchange:
         # The exchange fixture is isolated from both boot p1 and raw p2.
         mbr[0x1DE + 0] = 0x00
-        mbr[0x1DE + 4] = 0x0C
+        mbr[0x1DE + 4] = 0xDA if raw_exchange else 0x0C
         mbr[0x1DE + 8:0x1DE + 12] = le32(part3_start)
         mbr[0x1DE + 12:0x1DE + 16] = le32(PART3_SECTORS)
     mbr[510:512] = b"\x55\xAA"
@@ -170,18 +170,18 @@ def build_mbr(disk_id: int, exchange: bool) -> bytearray:
 
 
 def build_image(pkg: bytes, out_path: pathlib.Path, disk_id: int,
-                exchange: bool = False) -> None:
+                exchange: bool = False, raw_exchange: bool = False) -> None:
     part1 = build_fat32_partition(pkg, PART1_SECTORS, PART1_START,
                                   b"PIOS BOOT  ")
     part2_start = PART1_START + PART1_SECTORS
     part3_start = part2_start + PART2_SECTORS
     total_sectors = part3_start + (PART3_SECTORS if exchange else 0)
-    part3 = (build_fat32_partition(b"", PART3_SECTORS, part3_start,
-                                   b"PIOSXFER   ", b"PIOSXFER")
-             if exchange else None)
+    part3 = (bytearray(PART3_SECTORS * SECTOR) if raw_exchange else
+             build_fat32_partition(b"", PART3_SECTORS, part3_start,
+                                   b"PIOSXFER   ", b"PIOSXFER")) if exchange else None
 
     img = bytearray(total_sectors * SECTOR)
-    mbr = build_mbr(disk_id, exchange)
+    mbr = build_mbr(disk_id, exchange, raw_exchange)
     img[0:SECTOR] = mbr
 
     img[PART1_START * SECTOR:(PART1_START + PART1_SECTORS) * SECTOR] = part1
@@ -198,7 +198,7 @@ def build_image(pkg: bytes, out_path: pathlib.Path, disk_id: int,
           f"part1_lba={PART1_START} part1_sectors={PART1_SECTORS} "
           f"part2_lba={part2_start} part2_sectors={PART2_SECTORS}"
           + (f" part3_lba={part3_start} part3_sectors={PART3_SECTORS}"
-             " label=PIOSXFER" if exchange else ""))
+             + (" raw" if raw_exchange else " label=PIOSXFER") if exchange else ""))
 
 
 def main() -> int:
@@ -208,8 +208,11 @@ def main() -> int:
     ap.add_argument("--out", type=pathlib.Path, required=True)
     ap.add_argument("--disk-id", type=lambda value: int(value, 0),
                     help="nonzero 32-bit MBR disk identity (default: generated)")
-    ap.add_argument("--exchange", action="store_true",
-                    help="add validated FAT32 p3 labelled PIOSXFER")
+    group = ap.add_mutually_exclusive_group()
+    group.add_argument("--exchange", action="store_true",
+                       help="add valid FAT32 p3 labelled PIOSXFER")
+    group.add_argument("--exchange-raw", action="store_true",
+                       help="add blank raw (0xDA) p3 for boot autoformat")
     args = ap.parse_args()
     pkg = args.pkg.read_bytes()
     if not pkg:
@@ -218,7 +221,8 @@ def main() -> int:
     disk_id &= 0xFFFFFFFF
     if disk_id == 0:
         disk_id = 1
-    build_image(pkg, args.out, disk_id, args.exchange)
+    build_image(pkg, args.out, disk_id, args.exchange or args.exchange_raw,
+                args.exchange_raw)
     return 0
 
 
