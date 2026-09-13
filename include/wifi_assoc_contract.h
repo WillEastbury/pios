@@ -81,6 +81,8 @@ struct wifi_assoc_handle {
 
 /* All event values are copied evidence.  No source transport span is kept. */
 struct wifi_assoc_event {
+    u64 instance_epoch;
+    u64 attempt_generation;
     u64 timestamp_ms;
     u32 flags;
     u16 reason;
@@ -90,6 +92,8 @@ struct wifi_assoc_event {
 
 /* A decoder produces this passive structural summary; it contains no key data. */
 struct wifi_assoc_eapol_summary {
+    u64 instance_epoch;
+    u64 attempt_generation;
     u64 replay_counter;
     u16 key_info;
     u8 classification;
@@ -97,13 +101,22 @@ struct wifi_assoc_eapol_summary {
     u8 _reserved[4U];
 };
 
+/* Acknowledges exactly one immutable control publication. */
+struct wifi_assoc_control_publish_ack {
+    u64 instance_epoch;
+    u64 attempt_generation;
+    u64 publication_sequence;
+    bool verified;
+    u8 _reserved[7U];
+};
+
 struct wifi_assoc_observation {
     u64 now_ms;
     u64 liveness_sequence;
     struct wifi_assoc_event event;
     struct wifi_assoc_eapol_summary eapol;
+    struct wifi_assoc_control_publish_ack control_publish_ack;
     bool credit_available;
-    bool control_publish_verified;
     bool liveness_ran;
     bool eapol_present;
 };
@@ -131,6 +144,13 @@ struct wifi_assoc_event_record {
     u8 _reserved[35U];
 } ALIGNED(64);
 
+/* A separate owner cache line keeps time watermarks from straddling control. */
+struct wifi_assoc_time_watermark {
+    u64 attempt_start_ms;
+    u64 last_observation_ms;
+    u8 _reserved[48U];
+} ALIGNED(64);
+
 /* The mutable owner control and every history record have cache-line stride. */
 struct wifi_assoc_control {
     u64 instance_epoch;
@@ -150,6 +170,7 @@ struct wifi_assoc_control {
 
 struct wifi_assoc_contract {
     struct wifi_assoc_control control;
+    struct wifi_assoc_time_watermark watermark;
     struct wifi_assoc_event_record history[WIFI_ASSOC_EVENT_HISTORY];
 } ALIGNED(64);
 
@@ -157,6 +178,8 @@ struct wifi_assoc_status {
     u64 instance_epoch;
     u64 attempt_generation;
     u64 deadline_ms;
+    u64 attempt_start_ms;
+    u64 last_observation_ms;
     u64 last_liveness_sequence;
     u64 last_event_timestamp;
     u64 last_eapol_replay;
@@ -173,14 +196,22 @@ _Static_assert(sizeof(struct wifi_assoc_event_record) == 64U,
                "association event records need cache-line stride");
 _Static_assert(sizeof(struct wifi_assoc_control_publication) == 64U,
                "control publications need cache-line stride");
-_Static_assert(__builtin_offsetof(struct wifi_assoc_contract, history) == 64U,
+_Static_assert(sizeof(struct wifi_assoc_time_watermark) == 64U,
+               "association time watermarks need exclusive ownership");
+_Static_assert(__builtin_offsetof(struct wifi_assoc_contract, watermark) == 64U,
+               "watermarks must not share the mutable owner cache line");
+_Static_assert(__builtin_offsetof(struct wifi_assoc_contract, history) == 128U,
                "history must not share the mutable owner cache line");
 
 /* Hardware activation remains impossible until a later owner-approved ADR. */
 bool wifi_assoc_hardware_enable_allowed(void);
 
-/* Fresh zeroed caller storage; all public operations require actual Core 0. */
-bool wifi_assoc_init(struct wifi_assoc_contract *contract, u32 caller_core);
+/*
+ * Fresh zeroed caller storage; instance_epoch must be nonzero and globally
+ * unique for each reuse of this storage.  All operations require actual Core 0.
+ */
+bool wifi_assoc_init(struct wifi_assoc_contract *contract, u32 caller_core,
+                     u64 instance_epoch);
 bool wifi_assoc_start(struct wifi_assoc_contract *contract, u32 caller_core,
                       u64 now_ms, u32 timeout_ms,
                       struct wifi_assoc_handle *out);
@@ -202,6 +233,10 @@ bool wifi_assoc_history_copy(const struct wifi_assoc_contract *contract,
                              u32 caller_core, u32 oldest_index,
                              struct wifi_assoc_event_record *out);
 
-/* Parses a complete explicit EAPOL-Key span; it never transmits or retains it. */
+/*
+ * Parses and binds one complete explicit EAPOL-Key span; it never transmits or
+ * retains it.  The supplied epoch/generation are copied into the summary.
+ */
 bool wifi_assoc_eapol_decode(const u8 *packet, u32 packet_len,
+                             u64 instance_epoch, u64 attempt_generation,
                              struct wifi_assoc_eapol_summary *out);

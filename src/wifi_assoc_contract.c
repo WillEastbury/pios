@@ -7,6 +7,8 @@
 #include "types.h"
 #include "wifi_assoc_contract.h"
 
+#define EAPOL_KEY_INFO_INVALID_HIGH_BITS 0xE000U
+
 static u64 assoc_irq_save(void)
 {
 #ifdef PIOS_HOST_TYPES_SHIM
@@ -81,6 +83,15 @@ static bool assoc_handle_valid(const struct wifi_assoc_contract *contract,
            handle->attempt_generation != 0U;
 }
 
+static bool assoc_binding_matches(const struct wifi_assoc_contract *contract,
+                                  u64 instance_epoch,
+                                  u64 attempt_generation)
+{
+    return instance_epoch == contract->control.instance_epoch &&
+           attempt_generation == contract->control.attempt_generation &&
+           instance_epoch != 0U && attempt_generation != 0U;
+}
+
 static void assoc_publish(struct wifi_assoc_contract *contract, u32 state)
 {
     dmb_ishst();
@@ -127,26 +138,83 @@ static bool assoc_psk_state_valid(u8 state)
            state <= WIFI_ASSOC_PSK_SUP_PREP_G2;
 }
 
+static bool assoc_eapol_key_info_valid(u16 key_info)
+{
+    u16 key_version = key_info & 0x0007U;
+
+    return key_version >= 1U && key_version <= 3U &&
+           (key_info & 0x0C00U) == 0U &&
+           (key_info & EAPOL_KEY_INFO_INVALID_HIGH_BITS) == 0U;
+}
+
 static bool assoc_eapol_summary_valid(
     const struct wifi_assoc_eapol_summary *summary)
 {
-    u8 classification;
+    u16 key_flags;
+    u8 classification = WIFI_ASSOC_EAPOL_OTHER;
 
     if (!summary)
         return false;
-    classification = WIFI_ASSOC_EAPOL_OTHER;
-    if ((summary->key_info & 0x0188U) == 0x0088U)
+    key_flags = summary->key_info & 0x0FF8U;
+    if ((summary->key_info & 0x0C00U) == 0U &&
+        key_flags == 0x0088U)
         classification = WIFI_ASSOC_EAPOL_M1;
-    else if ((summary->key_info & 0x03C8U) == 0x03C8U)
+    else if ((summary->key_info & 0x0C00U) == 0U &&
+             key_flags == 0x03C8U)
         classification = WIFI_ASSOC_EAPOL_M3;
-    else if ((summary->key_info & 0x0388U) == 0x0380U)
+    else if ((summary->key_info & 0x0C00U) == 0U &&
+             key_flags == 0x0380U)
         classification = WIFI_ASSOC_EAPOL_G1;
     return summary->valid && summary->replay_counter != 0U &&
+           summary->instance_epoch != 0U &&
+           summary->attempt_generation != 0U &&
            summary->classification <= WIFI_ASSOC_EAPOL_G1 &&
-           (summary->key_info & 0x0007U) != 0U &&
+           assoc_eapol_key_info_valid(summary->key_info) &&
            summary->classification == classification &&
            summary->_reserved[0] == 0U && summary->_reserved[1] == 0U &&
            summary->_reserved[2] == 0U && summary->_reserved[3] == 0U;
+}
+
+static bool assoc_control_ack_valid(
+    const struct wifi_assoc_contract *contract,
+    const struct wifi_assoc_control_publish_ack *ack)
+{
+    return ack->verified && contract->control.state ==
+           WIFI_ASSOC_SET_SSID_PUBLISHED && assoc_binding_matches(
+               contract, ack->instance_epoch, ack->attempt_generation) &&
+           ack->publication_sequence == contract->control.watchdog_evidence &&
+           ack->_reserved[0] == 0U && ack->_reserved[1] == 0U &&
+           ack->_reserved[2] == 0U && ack->_reserved[3] == 0U &&
+           ack->_reserved[4] == 0U && ack->_reserved[5] == 0U &&
+           ack->_reserved[6] == 0U;
+}
+
+static bool assoc_observation_bindings_match(
+    const struct wifi_assoc_contract *contract,
+    const struct wifi_assoc_observation *observation)
+{
+    if (observation->event.type == WIFI_ASSOC_EVENT_NONE) {
+        if (observation->event.instance_epoch != 0U ||
+            observation->event.attempt_generation != 0U ||
+            observation->event.timestamp_ms != 0U ||
+            observation->event.flags != 0U || observation->event.reason != 0U ||
+            observation->event.status != 0U)
+            return false;
+    } else if (!assoc_binding_matches(contract,
+                                      observation->event.instance_epoch,
+                                      observation->event.attempt_generation)) {
+        return false;
+    }
+    if (observation->eapol_present &&
+        !assoc_binding_matches(contract, observation->eapol.instance_epoch,
+                               observation->eapol.attempt_generation))
+        return false;
+    if (observation->control_publish_ack.verified &&
+        !assoc_binding_matches(contract,
+                               observation->control_publish_ack.instance_epoch,
+                               observation->control_publish_ack.attempt_generation))
+        return false;
+    return true;
 }
 
 static bool assoc_event_valid_for_state(
@@ -156,7 +224,8 @@ static bool assoc_event_valid_for_state(
     const struct wifi_assoc_event *event = &observation->event;
 
     if (event->type == WIFI_ASSOC_EVENT_NONE)
-        return event->timestamp_ms == 0U && event->flags == 0U &&
+        return event->instance_epoch == 0U && event->attempt_generation == 0U &&
+               event->timestamp_ms == 0U && event->flags == 0U &&
                event->reason == 0U && event->status == 0U;
     if (contract->control.state != WIFI_ASSOC_WAIT_ASSOC ||
         event->timestamp_ms == 0U || event->timestamp_ms > observation->now_ms ||
@@ -183,6 +252,11 @@ static enum wifi_assoc_step_result assoc_consume_event(
 
     if (event->type == WIFI_ASSOC_EVENT_NONE)
         return WIFI_ASSOC_STEP_NO_PROGRESS;
+    if (!assoc_binding_matches(contract, event->instance_epoch,
+                               event->attempt_generation)) {
+        assoc_fail(contract, WIFI_ASSOC_FAULT_STALE_EVIDENCE, true);
+        return WIFI_ASSOC_STEP_QUARANTINED;
+    }
     if (!assoc_event_valid_for_state(contract, observation)) {
         assoc_fail(contract, WIFI_ASSOC_FAULT_EVENT, true);
         return WIFI_ASSOC_STEP_QUARANTINED;
@@ -210,22 +284,24 @@ bool wifi_assoc_hardware_enable_allowed(void)
 }
 
 static bool assoc_init_locked(struct wifi_assoc_contract *contract,
-                              u32 caller_core)
+                              u32 caller_core, u64 instance_epoch)
 {
     if (caller_core != WIFI_ASSOC_OWNER_CORE ||
-        core_id() != WIFI_ASSOC_OWNER_CORE || !assoc_fresh(contract))
+        core_id() != WIFI_ASSOC_OWNER_CORE || instance_epoch == 0U ||
+        !assoc_fresh(contract))
         return false;
-    contract->control.instance_epoch = 1U;
+    contract->control.instance_epoch = instance_epoch;
     contract->control.owner_core = WIFI_ASSOC_OWNER_CORE;
     contract->control.state = WIFI_ASSOC_IDLE;
     dmb_ishst();
     return true;
 }
 
-bool wifi_assoc_init(struct wifi_assoc_contract *contract, u32 caller_core)
+bool wifi_assoc_init(struct wifi_assoc_contract *contract, u32 caller_core,
+                     u64 instance_epoch)
 {
     u64 irq_state = assoc_irq_save();
-    bool result = assoc_init_locked(contract, caller_core);
+    bool result = assoc_init_locked(contract, caller_core, instance_epoch);
 
     assoc_irq_restore(irq_state);
     return result;
@@ -246,8 +322,10 @@ static bool assoc_start_locked(struct wifi_assoc_contract *contract,
     contract->control.attempt_generation++;
     contract->control.deadline_ms = now_ms + timeout_ms;
     contract->control.last_liveness_sequence = 0U;
-    contract->control.last_event_timestamp = 0U;
+    contract->control.last_event_timestamp = now_ms;
     contract->control.last_eapol_replay = 0U;
+    contract->watermark.attempt_start_ms = now_ms;
+    contract->watermark.last_observation_ms = now_ms;
     contract->control.step_count = 0U;
     contract->control.watchdog_evidence = 0U;
     contract->control.history_head = 0U;
@@ -284,6 +362,18 @@ static enum wifi_assoc_step_result assoc_step_locked(
     if (!assoc_owner(contract, caller_core) || !assoc_handle_valid(contract, handle) ||
         !observation || !assoc_active(contract))
         return WIFI_ASSOC_STEP_REJECTED;
+    if (observation->now_ms < contract->watermark.attempt_start_ms ||
+        observation->now_ms < contract->watermark.last_observation_ms ||
+        !assoc_observation_bindings_match(contract, observation)) {
+        assoc_fail(contract, WIFI_ASSOC_FAULT_STALE_EVIDENCE, true);
+        return WIFI_ASSOC_STEP_QUARANTINED;
+    }
+    contract->watermark.last_observation_ms = observation->now_ms;
+    if (observation->control_publish_ack.verified &&
+        !assoc_control_ack_valid(contract, &observation->control_publish_ack)) {
+        assoc_fail(contract, WIFI_ASSOC_FAULT_STALE_EVIDENCE, true);
+        return WIFI_ASSOC_STEP_QUARANTINED;
+    }
     if (observation->now_ms >= contract->control.deadline_ms) {
         assoc_fail(contract, WIFI_ASSOC_FAULT_DEADLINE, false);
         return WIFI_ASSOC_STEP_FAILED;
@@ -319,7 +409,7 @@ static enum wifi_assoc_step_result assoc_step_locked(
         return WIFI_ASSOC_STEP_PROGRESS;
     }
     if (contract->control.state == WIFI_ASSOC_SET_SSID_PUBLISHED &&
-        observation->control_publish_verified) {
+        observation->control_publish_ack.verified) {
         assoc_publish(contract, WIFI_ASSOC_WAIT_ASSOC);
         return WIFI_ASSOC_STEP_PROGRESS;
     }
@@ -372,6 +462,8 @@ static bool assoc_reset_locked(struct wifi_assoc_contract *contract,
     contract->control.instance_epoch++;
     contract->control.attempt_generation = 0U;
     contract->control.deadline_ms = 0U;
+    contract->watermark.attempt_start_ms = 0U;
+    contract->watermark.last_observation_ms = 0U;
     contract->control.state = WIFI_ASSOC_IDLE;
     return true;
 }
@@ -394,6 +486,8 @@ static bool assoc_status_copy_locked(const struct wifi_assoc_contract *contract,
     out->instance_epoch = contract->control.instance_epoch;
     out->attempt_generation = contract->control.attempt_generation;
     out->deadline_ms = contract->control.deadline_ms;
+    out->attempt_start_ms = contract->watermark.attempt_start_ms;
+    out->last_observation_ms = contract->watermark.last_observation_ms;
     out->last_liveness_sequence = contract->control.last_liveness_sequence;
     out->last_event_timestamp = contract->control.last_event_timestamp;
     out->last_eapol_replay = contract->control.last_eapol_replay;
@@ -477,6 +571,7 @@ bool wifi_assoc_history_copy(const struct wifi_assoc_contract *contract,
 }
 
 bool wifi_assoc_eapol_decode(const u8 *packet, u32 packet_len,
+                             u64 instance_epoch, u64 attempt_generation,
                              struct wifi_assoc_eapol_summary *out)
 {
     u16 declared;
@@ -488,7 +583,8 @@ bool wifi_assoc_eapol_decode(const u8 *packet, u32 packet_len,
     if (!out)
         return false;
     assoc_zero(out, sizeof(*out));
-    if (!packet || packet_len < 99U || packet[0] < 1U || packet[0] > 3U ||
+    if (!packet || instance_epoch == 0U || attempt_generation == 0U ||
+        packet_len < 99U || packet[0] < 1U || packet[0] > 3U ||
         packet[1] != 3U)
         return false;
     declared = ((u16)packet[2] << 8U) | packet[3];
@@ -497,21 +593,27 @@ bool wifi_assoc_eapol_decode(const u8 *packet, u32 packet_len,
         return false;
     key_info = ((u16)packet[5] << 8U) | packet[6];
     key_data_len = ((u16)packet[97] << 8U) | packet[98];
-    if ((u32)key_data_len + 95U != declared || (key_info & 0x0007U) == 0U)
+    if ((u32)key_data_len + 95U != declared ||
+        !assoc_eapol_key_info_valid(key_info))
         return false;
     replay = 0U;
     for (i = 0U; i < 8U; i++)
         replay = (replay << 8U) | packet[9U + i];
     if (replay == 0U)
         return false;
+    out->instance_epoch = instance_epoch;
+    out->attempt_generation = attempt_generation;
     out->replay_counter = replay;
     out->key_info = key_info;
     out->classification = WIFI_ASSOC_EAPOL_OTHER;
-    if ((key_info & 0x0188U) == 0x0088U)
+    if ((key_info & 0x0C00U) == 0U &&
+        (key_info & 0x0FF8U) == 0x0088U)
         out->classification = WIFI_ASSOC_EAPOL_M1;
-    else if ((key_info & 0x03C8U) == 0x03C8U)
+    else if ((key_info & 0x0C00U) == 0U &&
+             (key_info & 0x0FF8U) == 0x03C8U)
         out->classification = WIFI_ASSOC_EAPOL_M3;
-    else if ((key_info & 0x0388U) == 0x0380U)
+    else if ((key_info & 0x0C00U) == 0U &&
+             (key_info & 0x0FF8U) == 0x0380U)
         out->classification = WIFI_ASSOC_EAPOL_G1;
     out->valid = true;
     return true;
