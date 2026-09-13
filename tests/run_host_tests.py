@@ -242,6 +242,7 @@ TESTS_MANIFEST = {
     # callback-backed 512-byte span and produces a caller-owned snapshot;
     # no storage, filesystem, mount, or writable-target code is linked.
     "test_partition_table.c": ["src/partition_table.c"],
+    "test_storage_layout.c": ["src/storage_layout.c"],
     # ADR-067 dedicated FAT32 exchange selection. This consumes independently
     # enumerated immutable facts and can only attach one explicitly requested
     # PIOSXFER candidate; no parser, storage, or filesystem code is linked.
@@ -252,7 +253,8 @@ TESTS_MANIFEST = {
     "test_fat32_exchange_core.c": ["src/fat32_exchange_core.c"],
     # QEMU-only p3 adapter selection is a pure MBR/capacity check.  Actual
     # mount and I/O are covered only by tools/qemu_storage_acceptance.py.
-    "test_qemu_xfer_partition.c": ["src/qemu_xfer_partition.c"],
+    "test_qemu_xfer_partition.c": ["src/qemu_xfer_partition.c",
+                                   "src/storage_layout.c"],
     "test_nvme.c": ["src/nvme.c"],
     # ADR-066 #192 offline callback-backed single-namespace provider plus a
     # deliberately test-only fixed persistence model. No live storage code.
@@ -343,6 +345,7 @@ def main() -> int:
                  "test_issue_97_gpu_fabric_control_gate.py",
                  "test_issue_169_media_admission_gate.py",
                  "test_partition_table_gate.py",
+                 "test_storage_layout_gate.py",
                  "test_exchange_volume_policy_gate.py",
                  "test_fat32_exchange_core_gate.py",
                  "test_qemu_disk_image.py",

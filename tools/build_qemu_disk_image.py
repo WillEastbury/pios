@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build a QEMU disk with boot p1 + raw WALFS p2.
+"""Build a QEMU disk with pre-created boot p1 + raw WALFS p2.
 
 Default output remains the production-shaped two-partition image.  ``--exchange``
-adds a QEMU-acceptance-only FAT32 p3 labelled exactly ``PIOSXFER``; it is never
-used by the Pi boot or WALFS paths.
+adds the validated FAT32 p3 fixture labelled exactly ``PIOSXFER``; normal
+runtime still does not mount that exchange volume outside its QEMU adapter.
 
 Attach with (see tools/qemu_stage0_boot.py):
   -drive if=none,format=raw,file=<this image>,id=hd0
@@ -153,15 +153,14 @@ def build_mbr(disk_id: int, exchange: bool) -> bytearray:
     mbr[0x1BE + 4] = 0x0C          # FAT32 LBA type
     mbr[0x1BE + 8:0x1BE + 12] = le32(PART1_START)
     mbr[0x1BE + 12:0x1BE + 16] = le32(PART1_SECTORS)
-    # Partition 2: raw PIOS system area, entry at 0x1CE (type is not gated by
-    # discover_partition(), which only logs it -- 0xDA "non-fs data" signals
-    # "not a filesystem partition" to any other tooling that might inspect it).
+    # Partition 2: raw PIOS system area. The shared three-partition validator
+    # requires 0xDA ("non-filesystem data") for this fixed role.
     mbr[0x1CE + 0] = 0x00
     mbr[0x1CE + 4] = 0xDA
     mbr[0x1CE + 8:0x1CE + 12] = le32(part2_start)
     mbr[0x1CE + 12:0x1CE + 16] = le32(PART2_SECTORS)
     if exchange:
-        # QEMU acceptance only: p3 is isolated from both boot p1 and raw p2.
+        # The exchange fixture is isolated from both boot p1 and raw p2.
         mbr[0x1DE + 0] = 0x00
         mbr[0x1DE + 4] = 0x0C
         mbr[0x1DE + 8:0x1DE + 12] = le32(part3_start)
@@ -210,7 +209,7 @@ def main() -> int:
     ap.add_argument("--disk-id", type=lambda value: int(value, 0),
                     help="nonzero 32-bit MBR disk identity (default: generated)")
     ap.add_argument("--exchange", action="store_true",
-                    help="add QEMU-acceptance-only FAT32 p3 labelled PIOSXFER")
+                    help="add validated FAT32 p3 labelled PIOSXFER")
     args = ap.parse_args()
     pkg = args.pkg.read_bytes()
     if not pkg:

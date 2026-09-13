@@ -261,6 +261,16 @@ bool setup_run(bool fb_available, bool net_ready, bool usb_ready)
     setup_log_bool("[setup] HDMI/framebuffer: ", fb_available);
     setup_log_bool("[setup] USB subsystem: ", usb_ready);
     setup_log_bool("[setup] USB keyboard: ", usb_kbd_available());
+    {
+        struct walfs_status_snapshot storage;
+
+        walfs_status(&storage);
+        setup_log("[setup] Storage layout: ");
+        setup_log(storage.storage_layout_kind == STORAGE_LAYOUT_THREE_PARTITION ?
+                  "pre-created boot/system/exchange\n" :
+                  storage.storage_layout_kind == STORAGE_LAYOUT_LEGACY_TWO_PARTITION ?
+                  "legacy boot/system; exchange missing\n" : "unavailable\n");
+    }
 
     if (!usb_kbd_available()) {
         setup_log("[setup] Keyboard unavailable; continuing non-interactive boot.\n");

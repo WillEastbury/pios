@@ -8043,6 +8043,12 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, ws.super_ok ? "ok" : "bad");
         http_append(out, &len, max, " legacy=");
         http_append(out, &len, max, ws.legacy_present ? "yes" : "no");
+        http_append(out, &len, max, " layout=");
+        http_append(out, &len, max,
+                    storage_layout_kind_name(
+                        (enum storage_layout_kind)ws.storage_layout_kind));
+        http_append(out, &len, max, " exchange=");
+        http_append(out, &len, max, ws.exchange_present ? "present" : "missing");
         http_append(out, &len, max, " p2_lba=");
         http_append_u64(out, &len, max, ws.partition_lba);
         http_append(out, &len, max, " walfs_lba=");

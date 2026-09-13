@@ -49,7 +49,7 @@ for path in (
     # Kernel commands are independently permitted for other isolated QEMU
     # acceptance adapters.  The provider's own source/header checks above
     # still prohibit it from gaining any integration dependency.
-    "src/walfs.c", "src/sd.c", "src/bootstrap.c",
+    "src/sd.c", "src/bootstrap.c",
     "src/start.S", "src/bootstrap_start.S", "src/bootstrap_trampoline.S",
 ):
     working = subprocess.run(

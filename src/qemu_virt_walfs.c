@@ -13,6 +13,7 @@
 #include "walfs.h"
 #include "fifo.h"
 #include "principal.h"
+#include "proc_buffer.h"
 
 #define QEMU_UART_DR   (PIOS_UART0_BASE + 0x00)
 #define QEMU_UART_FR   (PIOS_UART0_BASE + 0x18)
@@ -134,6 +135,41 @@ bool principal_has_cap(u32 id, u32 cap_flag)
     return true;
 }
 
+bool proc_buffer_ref_acquire(u32 core, u64 ptr, u32 len,
+                             struct proc_buffer_ref *out)
+{
+    (void)core;
+    (void)ptr;
+    (void)len;
+    if (out) {
+        out->slot = 0U;
+        out->generation = 0U;
+    }
+    return false;
+}
+
+bool proc_buffer_ref_validate(u32 core, u64 ptr, u32 len,
+                              const struct proc_buffer_ref *ref)
+{
+    (void)core;
+    (void)ptr;
+    (void)len;
+    (void)ref;
+    return false;
+}
+
+void dcache_clean_range(u64 start, u64 size)
+{
+    (void)start;
+    (void)size;
+}
+
+void dcache_invalidate_range(u64 start, u64 size)
+{
+    (void)start;
+    (void)size;
+}
+
 static void qemu_fail(const char *msg)
 {
     uart_puts("FAIL: ");
@@ -142,12 +178,45 @@ static void qemu_fail(const char *msg)
     for (;;) __asm__ volatile("wfe");
 }
 
+static void qemu_write_le32(u8 *dst, u32 value)
+{
+    dst[0] = (u8)value;
+    dst[1] = (u8)(value >> 8);
+    dst[2] = (u8)(value >> 16);
+    dst[3] = (u8)(value >> 24);
+}
+
+/* This smoke image has a test-only RAM disk. Pre-create its legacy p1/p2
+ * partition table before the explicit WALFS format; production never creates
+ * or repartitions storage. */
+static bool qemu_seed_legacy_mbr(void)
+{
+    u8 mbr[SD_BLOCK_SIZE] = {0};
+    u8 *p1 = mbr + 0x1BEU;
+    u8 *p2 = p1 + 16U;
+
+    p1[4] = 0x0CU;
+    qemu_write_le32(p1 + 8U, 2048U);
+    qemu_write_le32(p1 + 12U, 2048U);
+    p2[4] = 0xDAU;
+    qemu_write_le32(p2 + 8U, 4096U);
+    qemu_write_le32(p2 + 12U, 28672U);
+    mbr[510] = 0x55U;
+    mbr[511] = 0xAAU;
+    return sd_write_block(0U, mbr);
+}
+
 void qemu_virt_main(void)
 {
     uart_puts("\nPIOS qemu-virt RAM WALFS smoke\n");
     if (!sd_init()) qemu_fail("sd_init");
+    uart_puts("[smoke] seed MBR\n");
+    if (!qemu_seed_legacy_mbr()) qemu_fail("seed_legacy_mbr");
+    uart_puts("[smoke] bcache\n");
     bcache_init();
+    uart_puts("[smoke] format\n");
     if (!walfs_format_reserved()) qemu_fail("walfs_format_reserved");
+    uart_puts("[smoke] mount\n");
     if (!walfs_init()) qemu_fail("walfs_init");
 
     u64 id = walfs_create(WALFS_ROOT_INODE, "qemu.txt", WALFS_FILE, 0644);

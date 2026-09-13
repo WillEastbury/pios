@@ -11,6 +11,7 @@
 
 #pragma once
 #include "types.h"
+#include "storage_layout.h"
 
 /* Superblock magic */
 #define WALFS_MAGIC         0x57414C46  /* 'WALF' */
@@ -228,6 +229,9 @@ struct walfs_status_snapshot {
     bool legacy_present;
     bool root_ok;
     bool super_ok;
+    bool exchange_present;
+    u8 storage_layout_kind;
+    u8 _layout_pad[2];
     u32 partition_lba;
     u32 base_lba;
     u32 partition_blocks;
@@ -241,7 +245,7 @@ struct walfs_status_snapshot {
 
 /* ---- API ---- */
 
-/* Init/format filesystem on SD card. If not formatted, creates one. */
+/* Mount filesystem on validated p2. Blank media requires explicit format. */
 bool walfs_init(void);
 
 /* Create a file. Returns inode_id or 0 on error. */

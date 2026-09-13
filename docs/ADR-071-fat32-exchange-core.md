@@ -45,6 +45,8 @@ The module is host-tested against a fake, Windows/Linux-compatible FAT32
 geometry, including fragmented allocation and fault injection.  It remains
 unwired to existing generic `fat32`, production media, and hardware paths.
 ADR-073 adds only a QEMU-test adapter with a range-limited p3 callback; it
-does not change the core's no live mount boundary.  A future approved
+does not change the core's no live mount boundary. ADR-074 supplies the
+shared, read-only production MBR role validation that the adapter consumes;
+it grants no p3 authority beyond this adapter. A future approved
 exchange-policy/live integration must provide ownership exclusion and a
 separate crash-consistency decision.

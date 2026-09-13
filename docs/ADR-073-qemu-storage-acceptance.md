@@ -4,15 +4,19 @@
 
 ## Decision
 
-QEMU storage acceptance may add an optional third MBR primary partition,
-`PIOSXFER`, after boot FAT32 p1 and raw PIOS/WALFS p2.  The default QEMU disk
-builder layout is unchanged; only `tools/build_qemu_disk_image.py --exchange`
-creates p3.
+QEMU storage acceptance consumes the shared pre-created three-primary MBR
+layout: boot FAT32 p1, raw PIOS/WALFS p2, and FAT32 p3 `PIOSXFER`. The default
+QEMU disk builder retains a two-partition legacy fixture; only
+`tools/build_qemu_disk_image.py --exchange` creates the three-partition
+acceptance fixture. This builder is test-media construction, not a PIOS
+runtime partitioning path.
 
 `qemu_xfer` is a narrow test adapter.  It is compiled as a no-op unavailable
 stub on every non-QEMU platform.  On QEMU it requires a virtio-blk backend,
-validates the MBR signature, nonzero disk identity, p1/p2/p3 in-device
-non-overlapping spans, inactive FAT32 p3, and the `PIOSXFER` FAT32 BPB label.
+validates the shared MBR signature and fixed role/type/non-overlap predicate,
+then requires a nonzero disk identity and the `PIOSXFER` FAT32 BPB label.
+The MBR status bit is not authority; active/inactive is accepted as valid
+wire evidence.
 It derives an attachment from that p3 fact and its callback rejects every LBA
 outside the exact p3 span.  It never selects, reads through, or writes through
 boot p1 or WALFS p2.  Generic `fat32.c` behavior remains unchanged.
