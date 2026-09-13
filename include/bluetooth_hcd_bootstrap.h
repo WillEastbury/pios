@@ -112,7 +112,7 @@ struct bluetooth_hcd_bootstrap_safe_state_evidence {
     bool controller_safe_off;
     bool hardware_enable_allowed;
     bool activation_authority_attested;
-    u8 _reserved[13U];
+    u8 _reserved[12U];
 } ALIGNED(64);
 
 struct bluetooth_hcd_bootstrap_hcd_ack {
@@ -127,7 +127,7 @@ struct bluetooth_hcd_bootstrap_hcd_ack {
     bool accepted;
     u8 _reserved[3U];
     u8 command_sha256[BLUETOOTH_HCD_BOOTSTRAP_SHA256_BYTES];
-    u8 _pad[40U];
+    u8 _pad[37U];
 } ALIGNED(64);
 
 _Static_assert(sizeof(struct bluetooth_hcd_bootstrap_safe_state_evidence) ==

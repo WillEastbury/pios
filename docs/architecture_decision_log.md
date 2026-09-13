@@ -115,6 +115,7 @@ decision)
 | [069](#adr-069) | Bluetooth HCI lifecycle; passive LE scan remains disabled | Owner | Accepted |
 | [070](ADR-070-gpu-fabric-control.md) | Offline GPU-fabric control-plane contract | Owner | Accepted |
 | [071](#adr-071) | Offline FAT32 exchange-volume mutation core | Owner | Accepted |
+| [073](ADR-073-qemu-storage-acceptance.md) | QEMU-only storage acceptance adapter | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |

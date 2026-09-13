@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""build_qemu_disk_image.py - build a virtual SD-card-shaped disk image for
-QEMU that matches docs/disk_layout.md exactly: MBR (LBA 0) + partition 1
-(FAT32 boot, holding PIOSSTG2.PKG) + partition 2 (raw PIOS system area,
-WALFS-formatted on first mount). This lets a QEMU-booted stage0 take the
-SAME "partition-2" discovery path as real Pi5 hardware (src/walfs.c
-discover_partition()), instead of the no-attached-disk RAM fallback.
+"""Build a QEMU disk with boot p1 + raw WALFS p2.
+
+Default output remains the production-shaped two-partition image.  ``--exchange``
+adds a QEMU-acceptance-only FAT32 p3 labelled exactly ``PIOSXFER``; it is never
+used by the Pi boot or WALFS paths.
 
 Attach with (see tools/qemu_stage0_boot.py):
   -drive if=none,format=raw,file=<this image>,id=hd0
@@ -23,6 +22,7 @@ SECTOR = 512
 PART1_START = 2048           # matches BOOT_FALLBACK_LBA / real hardware convention
 PART1_SECTORS = 64 * 1024 * 1024 // SECTOR    # 64 MiB FAT32 boot partition
 PART2_SECTORS = 96 * 1024 * 1024 // SECTOR    # 96 MiB raw PIOS system area (> 10 MiB reserved)
+PART3_SECTORS = 64 * 1024 * 1024 // SECTOR    # QEMU-only PIOSXFER FAT32 acceptance volume
 SPC = 1
 RESERVED = 32
 FATS = 2
@@ -53,8 +53,13 @@ def short_entry(name: bytes, ext: bytes, attr: int, cluster: int, size: int = 0)
     return bytes(e)
 
 
-def build_fat32_partition(pkg: bytes, part_sectors: int) -> bytearray:
+def build_fat32_partition(payload: bytes, part_sectors: int, start_lba: int,
+                          label: bytes, oem: bytes = b"PIOSFAT ") -> bytearray:
     """Builds one FAT32 partition image (relative sector 0 == partition start)."""
+    if len(label) != 11:
+        raise ValueError("FAT32 label must be exactly 11 bytes")
+    if len(oem) != 8:
+        raise ValueError("FAT32 OEM field must be exactly 8 bytes")
     fat_sectors = math.ceil((((part_sectors - RESERVED) // SPC) + 2) * 4 / SECTOR)
     while True:
         data_sectors = part_sectors - RESERVED - (FATS * fat_sectors)
@@ -73,7 +78,7 @@ def build_fat32_partition(pkg: bytes, part_sectors: int) -> bytearray:
 
     bpb = bytearray(SECTOR)
     bpb[0:3] = b"\xEB\x58\x90"
-    bpb[3:11] = b"PIOSFAT "
+    bpb[3:11] = oem
     bpb[11:13] = le16(SECTOR)
     bpb[13] = SPC
     bpb[14:16] = le16(RESERVED)
@@ -81,7 +86,7 @@ def build_fat32_partition(pkg: bytes, part_sectors: int) -> bytearray:
     bpb[21] = 0xF8
     bpb[24:26] = le16(63)
     bpb[26:28] = le16(255)
-    bpb[28:32] = le32(PART1_START)
+    bpb[28:32] = le32(start_lba)
     bpb[32:36] = le32(part_sectors)
     bpb[36:40] = le32(fat_sectors)
     bpb[44:48] = le32(ROOT_CLUSTER)
@@ -90,7 +95,7 @@ def build_fat32_partition(pkg: bytes, part_sectors: int) -> bytearray:
     bpb[64] = 0x80
     bpb[66] = 0x29
     bpb[67:71] = le32(0x50494F53)
-    bpb[71:82] = b"PIOS BOOT  "
+    bpb[71:82] = label
     bpb[82:90] = b"FAT32   "
     bpb[510:512] = b"\x55\xAA"
     part[0:SECTOR] = bpb
@@ -103,8 +108,10 @@ def build_fat32_partition(pkg: bytes, part_sectors: int) -> bytearray:
     fsinfo[492:496] = le32(3)
     fsinfo[508:512] = b"\x00\x00\x55\xAA"
     part[1 * SECTOR:2 * SECTOR] = fsinfo
+    # FAT32's BPB backup boot sector is at 6; keep its matching FSInfo at 7.
+    part[7 * SECTOR:8 * SECTOR] = fsinfo
 
-    file_clusters = max(1, math.ceil(len(pkg) / (SPC * SECTOR)))
+    file_clusters = math.ceil(len(payload) / (SPC * SECTOR))
     file_start = 3
     fat_entries = [0] * (clusters + 2)
     fat_entries[0] = 0x0FFFFFF8
@@ -122,24 +129,23 @@ def build_fat32_partition(pkg: bytes, part_sectors: int) -> bytearray:
         part[start:start + len(fat)] = fat
 
     root = bytearray(SPC * SECTOR)
-    root[0:32] = short_entry(FAT_NAME[:8], FAT_NAME[8:11], 0x20, file_start, len(pkg))
+    if payload:
+        root[0:32] = short_entry(FAT_NAME[:8], FAT_NAME[8:11], 0x20,
+                                 file_start, len(payload))
     part[cluster_lba(2) * SECTOR:(cluster_lba(2) * SECTOR) + len(root)] = root
 
     for i in range(file_clusters):
-        chunk = pkg[i * SPC * SECTOR:(i + 1) * SPC * SECTOR]
+        chunk = payload[i * SPC * SECTOR:(i + 1) * SPC * SECTOR]
         off = cluster_lba(file_start + i) * SECTOR
         part[off:off + len(chunk)] = chunk
 
     return part
 
 
-def build_image(pkg: bytes, out_path: pathlib.Path, disk_id: int) -> None:
-    part1 = build_fat32_partition(pkg, PART1_SECTORS)
+def build_mbr(disk_id: int, exchange: bool) -> bytearray:
+    """Return the exact MBR used by build_image, useful for static layout tests."""
     part2_start = PART1_START + PART1_SECTORS
-    total_sectors = part2_start + PART2_SECTORS
-
-    img = bytearray(total_sectors * SECTOR)
-
+    part3_start = part2_start + PART2_SECTORS
     mbr = bytearray(SECTOR)
     mbr[440:444] = le32(disk_id)
     # Partition 1: FAT32 LBA, entry at 0x1BE.
@@ -154,10 +160,34 @@ def build_image(pkg: bytes, out_path: pathlib.Path, disk_id: int) -> None:
     mbr[0x1CE + 4] = 0xDA
     mbr[0x1CE + 8:0x1CE + 12] = le32(part2_start)
     mbr[0x1CE + 12:0x1CE + 16] = le32(PART2_SECTORS)
+    if exchange:
+        # QEMU acceptance only: p3 is isolated from both boot p1 and raw p2.
+        mbr[0x1DE + 0] = 0x00
+        mbr[0x1DE + 4] = 0x0C
+        mbr[0x1DE + 8:0x1DE + 12] = le32(part3_start)
+        mbr[0x1DE + 12:0x1DE + 16] = le32(PART3_SECTORS)
     mbr[510:512] = b"\x55\xAA"
+    return mbr
+
+
+def build_image(pkg: bytes, out_path: pathlib.Path, disk_id: int,
+                exchange: bool = False) -> None:
+    part1 = build_fat32_partition(pkg, PART1_SECTORS, PART1_START,
+                                  b"PIOS BOOT  ")
+    part2_start = PART1_START + PART1_SECTORS
+    part3_start = part2_start + PART2_SECTORS
+    total_sectors = part3_start + (PART3_SECTORS if exchange else 0)
+    part3 = (build_fat32_partition(b"", PART3_SECTORS, part3_start,
+                                   b"PIOSXFER   ", b"PIOSXFER")
+             if exchange else None)
+
+    img = bytearray(total_sectors * SECTOR)
+    mbr = build_mbr(disk_id, exchange)
     img[0:SECTOR] = mbr
 
     img[PART1_START * SECTOR:(PART1_START + PART1_SECTORS) * SECTOR] = part1
+    if part3 is not None:
+        img[part3_start * SECTOR:(part3_start + PART3_SECTORS) * SECTOR] = part3
     # Partition 2 stays all-zero -- WALFS formats it on first mount, exactly
     # like a fresh real SD card (src/walfs.c discover_partition_fallback()/
     # walfs_format() path), so no WALFS-specific bytes need to be pre-built
@@ -167,7 +197,9 @@ def build_image(pkg: bytes, out_path: pathlib.Path, disk_id: int) -> None:
     print(f"QEMU disk image: {out_path} bytes={len(img)} "
           f"disk_id=0x{disk_id:08x} "
           f"part1_lba={PART1_START} part1_sectors={PART1_SECTORS} "
-          f"part2_lba={part2_start} part2_sectors={PART2_SECTORS}")
+          f"part2_lba={part2_start} part2_sectors={PART2_SECTORS}"
+          + (f" part3_lba={part3_start} part3_sectors={PART3_SECTORS}"
+             " label=PIOSXFER" if exchange else ""))
 
 
 def main() -> int:
@@ -177,6 +209,8 @@ def main() -> int:
     ap.add_argument("--out", type=pathlib.Path, required=True)
     ap.add_argument("--disk-id", type=lambda value: int(value, 0),
                     help="nonzero 32-bit MBR disk identity (default: generated)")
+    ap.add_argument("--exchange", action="store_true",
+                    help="add QEMU-acceptance-only FAT32 p3 labelled PIOSXFER")
     args = ap.parse_args()
     pkg = args.pkg.read_bytes()
     if not pkg:
@@ -185,7 +219,7 @@ def main() -> int:
     disk_id &= 0xFFFFFFFF
     if disk_id == 0:
         disk_id = 1
-    build_image(pkg, args.out, disk_id)
+    build_image(pkg, args.out, disk_id, args.exchange)
     return 0
 
 

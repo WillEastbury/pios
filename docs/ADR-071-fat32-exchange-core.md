@@ -43,6 +43,8 @@ durability/barrier claim beyond the injected callback's exact-write contract.
 
 The module is host-tested against a fake, Windows/Linux-compatible FAT32
 geometry, including fragmented allocation and fault injection.  It remains
-unwired: no existing `fat32`, SD, WALFS, bootstrap, kernel, or live path is
-modified.  A future approved exchange-policy/live integration must provide
-ownership exclusion and a separate crash-consistency decision.
+unwired to existing generic `fat32`, production media, and hardware paths.
+ADR-073 adds only a QEMU-test adapter with a range-limited p3 callback; it
+does not change the core's no live mount boundary.  A future approved
+exchange-policy/live integration must provide ownership exclusion and a
+separate crash-consistency decision.

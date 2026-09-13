@@ -98,6 +98,7 @@
 #include "stackprot.h"
 #include "stack_canary.h"
 #include "fat32.h"
+#include "qemu_xfer.h"
 #include "pios_addr.h"
 #include "picoscript.h"
 #include "mailbox.h"
@@ -3146,7 +3147,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
             "Examples: status | ps | services | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
-            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | pcie1 | pcie1 aer | lzero | picocompress selftest | picoweb selftest\n"
+            "Diagnostics: walfs verify | xfer status | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | pcie1 | pcie1 aer | lzero | picocompress selftest | picoweb selftest\n"
             "Client tools: arp | route | ping <ip-or-cached-host> [count] | traceroute <ip-or-cached-host> [max_hops] | dnslookup <hostname>\n"
             "Command help: help status | help netstat | help firewall | help reboot | help peek | help walfs | help db | help cachestats\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
@@ -3238,6 +3239,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                 "  Pi 5 FFC/HAT root. Enum any device/switch. LevelZero B→E path; MSI masked.\n");
         } else if (http_streq(topic, "walfs") || http_streq(topic, "disk")) {
             http_append(out, &len, max, "walfs verify | walfs compact | walfs status | walfs format confirm\n  Verify WAL metadata/record-chain integrity, compact the WAL (non-destructive), or status.\n");
+        } else if (http_streq(topic, "xfer")) {
+            http_append(out, &len, max,
+                        "xfer status | xfer write <8.3> <hex> | xfer read <8.3> | xfer append <8.3> <hex> | xfer rename <old 8.3> <new 8.3> | xfer delete <8.3> | xfer verify\n"
+                        "  QEMU-only FAT32 acceptance adapter. It is hard-bound to p3 PIOSXFER; p1 boot and p2 WALFS are never writable through this command.\n");
         } else if (http_streq(topic, "db")) {
             http_append(out, &len, max,
                 "db key|get|put|save|add|update|del|copy|rename|editor|list <addr>\n"
@@ -8060,6 +8065,103 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, ok ? "WALFS format OK\n" : "WALFS format FAILED\n");
         if (ok)
             http_append_walfs_list_text(out, &len, max, "/");
+    } else if (http_streq(cmd, "xfer") || http_starts_with(cmd, "xfer ")) {
+        char *argv[4];
+        u32 argc = http_split_args(cmd, argv, 4);
+        struct qemu_xfer_status xs;
+        enum qemu_xfer_result xr = QEMU_XFER_ARGUMENT;
+
+        if (argc == 1U || (argc == 2U && http_streq(argv[1], "status"))) {
+            qemu_xfer_status(&xs);
+            http_append(out, &len, max, "xfer available=");
+            http_append(out, &len, max, xs.available ? "yes" : "no");
+            http_append(out, &len, max, " mounted=");
+            http_append(out, &len, max, xs.mounted ? "yes" : "no");
+            http_append(out, &len, max, " p3_lba=");
+            http_append_u64(out, &len, max, xs.first_lba);
+            http_append(out, &len, max, " p3_blocks=");
+            http_append_u64(out, &len, max, xs.block_count);
+            http_append(out, &len, max, " disk_id=");
+            http_append_hex32(out, &len, max, xs.disk_id);
+            http_append(out, &len, max, " last=");
+            http_append(out, &len, max,
+                        qemu_xfer_result_name((enum qemu_xfer_result)xs.last_result));
+            http_append(out, &len, max, " core=");
+            http_append_u64(out, &len, max, xs.core_result);
+            http_append(out, &len, max, "\n");
+        } else if (argc == 2U && http_streq(argv[1], "verify")) {
+            xr = qemu_xfer_verify_remount();
+            http_append(out, &len, max, xr == QEMU_XFER_OK ?
+                        "xfer verify OK\n" : "ERR: xfer verify ");
+            if (xr != QEMU_XFER_OK) {
+                http_append(out, &len, max, qemu_xfer_result_name(xr));
+                http_append(out, &len, max, "\n");
+            }
+        } else if (argc == 3U && http_streq(argv[1], "read")) {
+            static u8 data[QEMU_XFER_COMMAND_BYTES];
+            u32 bytes = 0U;
+            xr = qemu_xfer_read(argv[2], data, sizeof(data), &bytes);
+            if (xr != QEMU_XFER_OK) {
+                http_append(out, &len, max, "ERR: xfer read ");
+                http_append(out, &len, max, qemu_xfer_result_name(xr));
+                http_append(out, &len, max, "\n");
+            } else {
+                http_append(out, &len, max, "xfer read OK bytes=");
+                http_append_u64(out, &len, max, bytes);
+                http_append(out, &len, max, " hex=");
+                for (u32 i = 0U; i < bytes; i++)
+                    http_append_hex8(out, &len, max, data[i]);
+                http_append(out, &len, max, "\n");
+            }
+        } else if (argc == 4U && (http_streq(argv[1], "write") ||
+                                   http_streq(argv[1], "append"))) {
+            static u8 data[QEMU_XFER_COMMAND_BYTES];
+            u32 hex_len = pios_strlen(argv[3]);
+            u32 bytes = hex_len / 2U;
+            bool valid = hex_len != 0U && (hex_len & 1U) == 0U &&
+                         bytes <= sizeof(data);
+
+            for (u32 i = 0U; valid && i < bytes; i++)
+                valid = pixe_parse_hex_byte_pair(argv[3] + i * 2U, &data[i]);
+            if (!valid) {
+                http_append(out, &len, max, "ERR: xfer bad hex payload\n");
+            } else {
+                xr = http_streq(argv[1], "write") ?
+                     qemu_xfer_write(argv[2], data, bytes) :
+                     qemu_xfer_append(argv[2], data, bytes);
+                if (xr == QEMU_XFER_OK) {
+                    http_append(out, &len, max, "xfer ");
+                    http_append(out, &len, max, argv[1]);
+                    http_append(out, &len, max, " OK bytes=");
+                    http_append_u64(out, &len, max, bytes);
+                    http_append(out, &len, max, "\n");
+                } else {
+                    http_append(out, &len, max, "ERR: xfer ");
+                    http_append(out, &len, max, argv[1]);
+                    http_append(out, &len, max, " ");
+                    http_append(out, &len, max, qemu_xfer_result_name(xr));
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        } else if (argc == 4U && http_streq(argv[1], "rename")) {
+            xr = qemu_xfer_rename(argv[2], argv[3]);
+            http_append(out, &len, max, xr == QEMU_XFER_OK ?
+                        "xfer rename OK\n" : "ERR: xfer rename ");
+            if (xr != QEMU_XFER_OK) {
+                http_append(out, &len, max, qemu_xfer_result_name(xr));
+                http_append(out, &len, max, "\n");
+            }
+        } else if (argc == 3U && http_streq(argv[1], "delete")) {
+            xr = qemu_xfer_delete(argv[2]);
+            http_append(out, &len, max, xr == QEMU_XFER_OK ?
+                        "xfer delete OK\n" : "ERR: xfer delete ");
+            if (xr != QEMU_XFER_OK) {
+                http_append(out, &len, max, qemu_xfer_result_name(xr));
+                http_append(out, &len, max, "\n");
+            }
+        } else {
+            http_append(out, &len, max, "ERR: usage xfer status|write|read|append|rename|delete|verify\n");
+        }
     } else if (http_streq(cmd, "bootctrl") || http_streq(cmd, "bootctrl status")) {
         http_append_bootctrl_status(out, &len, max);
     } else if (http_starts_with(cmd, "bootctrl arm-o ")) {
@@ -25638,6 +25740,9 @@ void kernel_main(void) {
         }
         if (walfs_ok) bp_ok("[fs] SD + WALFS online");
         else bp_warn("[fs] SD ok, WALFS failed");
+        /* QEMU storage acceptance only.  The adapter validates and binds
+         * exclusively p3/PIOSXFER; it cannot use the boot p1 or WALFS p2. */
+        qemu_xfer_init();
         bp_log("[key] keystore_init...");
         if (keystore_init()) {            bp_ok("[key] sealed root ready");
             bp_log("[x509] x509_init...");

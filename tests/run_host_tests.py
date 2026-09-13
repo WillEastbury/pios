@@ -100,6 +100,11 @@ TESTS_MANIFEST = {
     # ADR-054 media engines: passive resource facts plus generation-safe
     # ownership. This contract has no hardware, DMA, IRQ, or platform deps.
     "test_media_engine_contract.c": ["src/media_engine_contract.c"],
+    # #169 / ADR-072 cross-engine media admission. This is a Core-0-owned,
+    # offline control contract over immutable numeric resources and existing
+    # media-engine leases; it does not link a media execution path.
+    "test_media_admission.c": ["src/media_engine_contract.c",
+                               "src/media_admission.c"],
     # ADR-055 PiSP-BE request/configuration/span ownership contract. It
     # validates a private configuration copy and numeric DMA authority only;
     # it never identifies, enables, or accesses PiSP-BE hardware.
@@ -245,6 +250,9 @@ TESTS_MANIFEST = {
     # only injected identity/geometry plus exact-sector callbacks; it does
     # not link the live FAT32, SD, WALFS, bootstrap, or kernel paths.
     "test_fat32_exchange_core.c": ["src/fat32_exchange_core.c"],
+    # QEMU-only p3 adapter selection is a pure MBR/capacity check.  Actual
+    # mount and I/O are covered only by tools/qemu_storage_acceptance.py.
+    "test_qemu_xfer_partition.c": ["src/qemu_xfer_partition.c"],
     "test_nvme.c": ["src/nvme.c"],
     # ADR-066 #192 offline callback-backed single-namespace provider plus a
     # deliberately test-only fixed persistence model. No live storage code.
@@ -263,6 +271,7 @@ TEST_CFLAGS = {
     "test_crypto_soft.c": ["-DPIOS_PLATFORM=6"],
     "test_dwc2_dma_arena.c": ["-DPIOS_PLATFORM=6"],
     "test_airq_concurrency.c": ["-DPIOS_HOST_CORE_ID_FN", "-pthread"],
+    "test_media_admission.c": ["-DPIOS_HOST_CORE_ID_FN"],
     "test_tls_event.c": ["-DPIOS_PLATFORM=6"],
     "test_tls_api.c": ["-DPIOS_PLATFORM=6"],
 }
@@ -332,9 +341,11 @@ def main() -> int:
                  "test_issue_191_nvme_namespace_io_gate.py",
                  "test_issue_183_bluetooth_hci_lifecycle_gate.py",
                  "test_issue_97_gpu_fabric_control_gate.py",
+                 "test_issue_169_media_admission_gate.py",
                  "test_partition_table_gate.py",
                  "test_exchange_volume_policy_gate.py",
                  "test_fat32_exchange_core_gate.py",
+                 "test_qemu_disk_image.py",
                  "test_issue_137_pcie1_host_contract.py",
                  "test_picoscript_datagram_contract.py",
                  "test_dma_boot_contract.py",

@@ -25,7 +25,6 @@ protected = {
     "src/sd.c", "include/sd.h", "src/sdhost.c", "include/sdhost.h",
     "src/walfs.c", "include/walfs.h",
     "src/bootstrap.c", "src/bootstrap_start.S", "src/bootstrap_trampoline.S",
-    "src/kernel.c", "include/kernel.h",
 }
 assert not (changed & protected), (
     "ADR-071 must not modify live storage or boot paths: "
@@ -49,5 +48,15 @@ for forbidden in ('#include "sd.h"', '#include "fat32.h"', '#include "walfs.h"',
 assert "identity" in header and "epoch" in header
 assert "no LFN" in adr and "no live mount" in adr
 assert "not crash safe" in adr
+
+adapter = (ROOT / "src" / "qemu_xfer.c").read_text(encoding="utf-8")
+selector = (ROOT / "src" / "qemu_xfer_partition.c").read_text(encoding="utf-8")
+for needle in ("PIOS_PLATFORM_QEMU_VIRT", "authorized_lba",
+               "qemu_xfer_partition_select", "sd_qemu_virtio_blk_ready"):
+    assert needle in adapter, f"QEMU adapter missing isolation guard: {needle}"
+for forbidden in ('"fat32.h"', '"walfs.h"', '"bootstrap.h"'):
+    assert forbidden not in adapter, f"QEMU adapter must not use live FS path: {forbidden}"
+for needle in ("p3", "spans_overlap", "PIOSXFER"):
+    assert needle in selector or needle in (ROOT / "include" / "qemu_xfer_partition.h").read_text(encoding="utf-8")
 
 print(f"ADR-071 exchange core gate: merge-base {base[:12]}, live paths isolated")
