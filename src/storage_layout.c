@@ -141,8 +141,7 @@ enum storage_layout_result storage_layout_validate(
         }
     }
     if (p3_valid && (out->facts[1U].mbr_type != STORAGE_LAYOUT_MBR_TYPE_PIOS_RAW ||
-                     (!is_fat_type(out->facts[2U].mbr_type) &&
-                      out->facts[2U].mbr_type != STORAGE_LAYOUT_MBR_TYPE_PIOS_RAW))) {
+                     !is_fat_type(out->facts[2U].mbr_type))) {
         out->p3_result = STORAGE_LAYOUT_ROLE_MISMATCH;
     } else if (p3_valid) {
         out->kind = STORAGE_LAYOUT_THREE_PARTITION;

@@ -35,10 +35,8 @@ void exchange_init(void)
         .context = NULL,
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
         .writable = true,
-        .format_writable = true,
 #else
         .writable = false,
-        .format_writable = true,
 #endif
     };
     enum exchange_service_result result;

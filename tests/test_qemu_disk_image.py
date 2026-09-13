@@ -51,12 +51,10 @@ check_fat32(part3, part3_start, b"PIOSXFER   ")
 # layout at two entries and add exactly p3 after raw WALFS p2 when requested.
 plain_mbr = builder.build_mbr(0x12345678, False)
 xfer_mbr = builder.build_mbr(0x12345678, True)
-raw_mbr = builder.build_mbr(0x12345678, True, True)
 assert plain_mbr[0x1DE:0x1EE] == b"\0" * 16
 assert le32(xfer_mbr, 0x1DE + 8) == part3_start
 assert le32(xfer_mbr, 0x1DE + 12) == builder.PART3_SECTORS
 assert xfer_mbr[0x1DE + 4] == 0x0C and xfer_mbr[510:512] == b"\x55\xAA"
-assert raw_mbr[0x1DE + 4] == 0xDA
 assert builder.PART1_START == 2048
 assert part3_start == builder.PART1_START + builder.PART1_SECTORS + builder.PART2_SECTORS
 assert builder.PART3_SECTORS >= 65525

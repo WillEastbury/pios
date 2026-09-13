@@ -10,7 +10,7 @@ setup = (ROOT / "src" / "setup.c").read_text(encoding="utf-8")
 
 for token in ("STORAGE_LAYOUT_THREE_PARTITION", "STORAGE_LAYOUT_LEGACY_TWO_PARTITION",
               "STORAGE_LAYOUT_P3_ABSENT", "storage_layout_validate_exchange",
-              "p3_present", "p3_result", "0xDAU", "is_fat_type", "entry_empty",
+              "p3_present", "p3_result", "is_fat_type", "entry_empty",
               "overlap"):
     assert token in source or token in header, f"missing layout guard: {token}"
 for forbidden in ("sd_", "walfs", "fat32_", "write(", "format_", "partition_create",
@@ -23,4 +23,5 @@ for path, text in (("src/walfs.c", walfs), ("src/setup.c", setup)):
     )
 init = walfs[walfs.index("bool walfs_init(void)"):walfs.index("void walfs_status")]
 assert "format_disk" not in init, "WALFS normal initialization must not format"
+assert "out->facts[2U].mbr_type != STORAGE_LAYOUT_MBR_TYPE_PIOS_RAW" not in source
 print("storage layout source gate: read-only fixed MBR roles")

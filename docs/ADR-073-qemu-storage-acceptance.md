@@ -17,8 +17,8 @@ platform after SD/WALFS setup, with an immutable MBR snapshot and p3-only
 callbacks. Hardware mounts are read-only and expose `exchange status`; QEMU
 alone enables the bounded mutation commands for acceptance. On QEMU it
 requires a virtio-blk backend, validates the shared MBR signature and fixed
-role/type/non-overlap predicate, then requires a nonzero disk identity and the
-`PIOSXFER` FAT32 BPB label.
+role/type/non-overlap predicate, then requires a nonzero disk identity and a
+mountable FAT32 p3. The `PIOSXFER` BPB label in the fixture is diagnostic only.
 The MBR status bit is not authority; active/inactive is accepted as valid
 wire evidence.
 It derives an attachment from that p3 fact and its callback rejects every LBA
@@ -34,7 +34,7 @@ LFNs/directories and concurrent host mounting are outside this test.
 ## Verification
 
 `tools/qemu_storage_acceptance.py` builds a direct QEMU kernel, makes a
-persistent `--exchange` disk, attaches it twice for the QEMU virtio-block
+persistent preformatted `--exchange` disk, attaches it twice for the QEMU virtio-block
 probe, and drives real HTTP terminal commands.  It verifies FAT write/read/
 rewrite/append/rename/delete/remount plus WALFS create/update/read/copy/delete
 and `walfs verify`.  It then reboots QEMU against the same disk to prove both

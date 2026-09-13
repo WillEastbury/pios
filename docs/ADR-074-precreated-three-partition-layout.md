@@ -19,8 +19,8 @@ mount WALFS. `storage_layout_validate_exchange()` is the separate strict
 three-partition validation gate used only by exchange attachment, so no
 malformed p3 can become an exchange target.
 
-The exact `PIOSXFER` label is a FAT32 adapter check after p3 selection, never
-an MBR claim. At normal boot, after SD/WALFS setup, `exchange_service` receives
+The `PIOSXFER` label is diagnostic only after p3 selection, never an MBR claim
+or attachment authorization. At normal boot, after SD/WALFS setup, `exchange_service` receives
 an immutable MBR snapshot and mounts valid p3 on every platform. Its callbacks
 are permanently range-fenced to validated p3. The mount is read-only on
 hardware; QEMU alone enables its existing bounded acceptance mutation commands.

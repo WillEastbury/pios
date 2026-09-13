@@ -124,7 +124,7 @@ static bool fact_candidate(const struct exchange_volume_partition_fact *fact)
         fact->flags != 0U)
         return false;
     if (fact->table_scheme == EXCHANGE_VOLUME_TABLE_MBR)
-        return mbr_type_is_fat32(fact->mbr_type) || fact->mbr_type == 0xDAU;
+        return mbr_type_is_fat32(fact->mbr_type);
     return fact->table_scheme == EXCHANGE_VOLUME_TABLE_GPT &&
            bytes_equal(fact->gpt_type_guid, microsoft_basic_data_guid,
                        sizeof(microsoft_basic_data_guid));

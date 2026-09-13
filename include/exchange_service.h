@@ -3,9 +3,8 @@
  *
  * The caller provides the already-read MBR and a block callback.  The service
  * validates only p3, then permanently fences every FAT32 callback to that
- * validated span. It mounts a valid FAT32 p3 regardless of label. An
- * explicitly raw 0xDA p3 may be formatted in place only when its entire boot
- * sector is all zero; it never discovers or repartitions a partition.
+ * validated span. It mounts a valid FAT32 p3 regardless of label. It never
+ * discovers, formats, or repartitions a partition.
  */
 #pragma once
 
@@ -29,17 +28,6 @@ struct exchange_service_backend {
     fat32_exchange_write_sector_fn write;
     void *context;
     bool writable;
-    bool format_writable;
-};
-
-enum exchange_service_format_reason {
-    EXCHANGE_SERVICE_FORMAT_NONE = 0U,
-    EXCHANGE_SERVICE_FORMAT_EXISTING,
-    EXCHANGE_SERVICE_FORMAT_RAW_READ_ONLY,
-    EXCHANGE_SERVICE_FORMAT_RAW_NOT_ALLOWED,
-    EXCHANGE_SERVICE_FORMAT_RAW_FORMATTED,
-    EXCHANGE_SERVICE_FORMAT_CORRUPT,
-    EXCHANGE_SERVICE_FORMAT_IO,
 };
 
 struct exchange_service_status {
@@ -53,9 +41,7 @@ struct exchange_service_status {
     u32 layout_result;
     u32 policy_result;
     u32 core_result;
-    u32 formatted_this_boot;
-    u32 format_reason;
-    u8 _pad[16U];
+    u8 _pad[24U];
 } ALIGNED(64);
 
 struct exchange_service {
@@ -71,11 +57,11 @@ _Static_assert(sizeof(struct exchange_service_status) == 64U,
                "exchange status requires one cache line");
 
 /*
- * Reads and, when format_writable, writes only the supplied p3 range through
- * backend callbacks. `mbr` is an
- * immutable snapshot acquired by the platform storage adapter, not through
- * this service's exchange callback. A successful mount is read-only unless
- * backend->writable is explicitly true.
+ * The boot attachment reads only the supplied p3 range through backend
+ * callbacks. `mbr` is an immutable snapshot acquired by the platform storage
+ * adapter, not through this service's exchange callback. A successful mount is
+ * read-only unless backend->writable is explicitly true for explicit runtime
+ * exchange operations.
  */
 enum exchange_service_result exchange_service_init(
     struct exchange_service *service,

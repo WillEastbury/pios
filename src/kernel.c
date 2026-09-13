@@ -8108,10 +8108,6 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, xs.policy_result);
         http_append(out, &len, max, " fat32=");
         http_append_u64(out, &len, max, xs.core_result);
-        http_append(out, &len, max, " formatted=");
-        http_append(out, &len, max, xs.formatted_this_boot ? "yes" : "no");
-        http_append(out, &len, max, " format_reason=");
-        http_append_u64(out, &len, max, xs.format_reason);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "walfs format confirm")) {
         bool ok = walfs_format_reserved();

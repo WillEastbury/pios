@@ -154,8 +154,8 @@ static void test_candidate_rejections(void)
            EXCHANGE_VOLUME_POLICY_OK);
     REJECT("label mismatch accepted", facts[0].filesystem_label[7U] = 0x53U,
            EXCHANGE_VOLUME_POLICY_OK);
-    REJECT("raw exchange type accepted", facts[0].mbr_type = 0xDAU,
-           EXCHANGE_VOLUME_POLICY_OK);
+    REJECT("raw exchange type rejected", facts[0].mbr_type = 0xDAU,
+           EXCHANGE_VOLUME_POLICY_REJECTED);
     REJECT("non-FAT32 excluded",
            facts[0].filesystem = EXCHANGE_VOLUME_FILESYSTEM_UNKNOWN,
            EXCHANGE_VOLUME_POLICY_REJECTED);
