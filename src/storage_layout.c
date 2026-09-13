@@ -81,7 +81,7 @@ enum storage_layout_result storage_layout_validate(
     const u8 *p2;
     const u8 *p3;
     const u8 *p4;
-    bool three;
+    bool p3_valid;
     u32 disk_id;
     u32 i;
 
@@ -115,15 +115,13 @@ enum storage_layout_result storage_layout_validate(
         return STORAGE_LAYOUT_ROLE_MISMATCH;
     }
 
-    three = !entry_empty(p3);
-    if (three && !parse_fact(p3, disk_id, total_blocks,
-                             STORAGE_LAYOUT_ROLE_EXCHANGE, 2U,
-                             &out->facts[2U])) {
-        layout_clear(out);
-        out->result = STORAGE_LAYOUT_MALFORMED;
-        return STORAGE_LAYOUT_MALFORMED;
-    }
-    for (i = 0U; i < (three ? 3U : 2U); i++) {
+    out->p3_present = !entry_empty(p3);
+    out->p3_result = out->p3_present ? STORAGE_LAYOUT_MALFORMED :
+                                       STORAGE_LAYOUT_P3_ABSENT;
+    p3_valid = out->p3_present &&
+        parse_fact(p3, disk_id, total_blocks, STORAGE_LAYOUT_ROLE_EXCHANGE,
+                   2U, &out->facts[2U]);
+    for (i = 0U; i < 2U; i++) {
         u32 j;
 
         for (j = 0U; j < i; j++) {
@@ -134,21 +132,43 @@ enum storage_layout_result storage_layout_validate(
             }
         }
     }
-    if (three) {
-        if (out->facts[1U].mbr_type != 0xDAU ||
-            !is_fat_type(out->facts[2U].mbr_type)) {
-            layout_clear(out);
-            out->result = STORAGE_LAYOUT_ROLE_MISMATCH;
-            return STORAGE_LAYOUT_ROLE_MISMATCH;
+    if (p3_valid) {
+        for (i = 0U; i < 2U; i++) {
+            if (overlap(&out->facts[2U], &out->facts[i])) {
+                p3_valid = false;
+                break;
+            }
         }
-        out->kind = STORAGE_LAYOUT_THREE_PARTITION;
-    } else {
-        out->kind = STORAGE_LAYOUT_LEGACY_TWO_PARTITION;
     }
+    if (p3_valid && (out->facts[1U].mbr_type != 0xDAU ||
+                     !is_fat_type(out->facts[2U].mbr_type))) {
+        out->p3_result = STORAGE_LAYOUT_ROLE_MISMATCH;
+    } else if (p3_valid) {
+        out->kind = STORAGE_LAYOUT_THREE_PARTITION;
+        out->p3_result = STORAGE_LAYOUT_OK;
+    }
+    if (out->kind != STORAGE_LAYOUT_THREE_PARTITION)
+        out->kind = STORAGE_LAYOUT_LEGACY_TWO_PARTITION;
+    if (out->p3_result != STORAGE_LAYOUT_OK)
+        out->facts[2U] = (struct storage_layout_fact){0};
     out->total_blocks = total_blocks;
     out->disk_id = disk_id;
     out->result = STORAGE_LAYOUT_OK;
     return STORAGE_LAYOUT_OK;
+}
+
+enum storage_layout_result storage_layout_validate_exchange(
+    const u8 mbr[STORAGE_LAYOUT_MBR_BYTES], u64 total_blocks,
+    struct storage_layout *out)
+{
+    enum storage_layout_result result = storage_layout_validate(mbr,
+                                                                 total_blocks,
+                                                                 out);
+
+    if (result != STORAGE_LAYOUT_OK)
+        return result;
+    return out->kind == STORAGE_LAYOUT_THREE_PARTITION ?
+           STORAGE_LAYOUT_OK : (enum storage_layout_result)out->p3_result;
 }
 
 const char *storage_layout_kind_name(enum storage_layout_kind kind)

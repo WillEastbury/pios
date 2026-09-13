@@ -7,8 +7,8 @@
 After SD and WALFS setup, PIOS automatically evaluates the optional third
 primary partition. `exchange_service` accepts only an immutable MBR snapshot
 and the authoritative card sector count. It requires
-`storage_layout_validate()` to accept the pre-created p1/p2/p3 layout, binds
-only validated p3 through `exchange_volume_policy`, and then requires
+`storage_layout_validate_exchange()` to accept the pre-created p1/p2/p3
+layout, binds only validated p3 through `exchange_volume_policy`, and then requires
 `fat32_exchange_core` to accept p3's real FAT32 BPB and exact eleven-byte
 `PIOSXFER   ` label.
 
@@ -19,9 +19,11 @@ does not create, format, repartition, or write p3. Hardware starts with a
 read-only attachment and only reports `exchange status`. QEMU retains the
 bounded `xfer` mutation commands for its existing acceptance harness.
 
-Legacy valid p1/p2 cards report exchange unavailable and boot normally. Invalid
-p3 layout, BPB, label, or mount state is diagnostic-only and cannot quarantine
-or block the core system.
+Legacy valid p1/p2 cards report exchange unavailable and boot normally. An
+invalid p3 layout is rejected by the strict exchange gate but remains
+diagnostic-only to WALFS; it cannot quarantine or block the core system. Every
+attachment attempt starts from a cleared service state, so failed remounts
+cannot leave a prior successful exchange mount visible.
 
 ## Consequences
 

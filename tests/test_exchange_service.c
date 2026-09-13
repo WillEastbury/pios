@@ -170,6 +170,35 @@ static int test_invalid_p3_never_mounts(void)
     return 0;
 }
 
+static int test_failed_reinit_clears_prior_mount(void)
+{
+    struct exchange_service service;
+    struct exchange_service_status status;
+    struct exchange_service_backend io = backend();
+    u8 mbr[512];
+
+    valid_mbr(mbr);
+    setup_fat32((const u8 *)"PIOSXFER   ");
+    CHECK(exchange_service_init(&service, mbr, TOTAL_BLOCKS, &io) ==
+          EXCHANGE_SERVICE_OK);
+    CHECK(service.volume.mounted);
+    disk.reads = 0U;
+    disk.writes = 0U;
+    disk.touched_non_p3 = false;
+
+    entry(mbr, 2U, 0x83U, P3_FIRST, P3_BLOCKS);
+    CHECK(exchange_service_init(&service, mbr, TOTAL_BLOCKS, &io) ==
+          EXCHANGE_SERVICE_PARTITION_REJECTED);
+    exchange_service_status(&service, &status);
+    CHECK(!status.available && !status.mounted &&
+          status.last_result == EXCHANGE_SERVICE_PARTITION_REJECTED &&
+          status.layout_result == STORAGE_LAYOUT_ROLE_MISMATCH &&
+          status.first_lba == 0U && status.block_count == 0U &&
+          status.disk_id == 0U && !service.volume.mounted);
+    CHECK(disk.reads == 0U && disk.writes == 0U && !disk.touched_non_p3);
+    return 0;
+}
+
 static int test_valid_p3_mounts_read_only_once(void)
 {
     struct exchange_service service;
@@ -193,6 +222,7 @@ static int test_valid_p3_mounts_read_only_once(void)
 int main(void)
 {
     if (test_legacy_is_nonfatal() || test_invalid_p3_never_mounts() ||
+        test_failed_reinit_clears_prior_mount() ||
         test_valid_p3_mounts_read_only_once())
         return 1;
     puts("exchange service: p3-only non-format boot attachment PASS");

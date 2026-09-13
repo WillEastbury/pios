@@ -82,21 +82,25 @@ enum exchange_service_result exchange_service_init(
     enum exchange_volume_policy_result policy_result;
     enum fat32_exchange_result mount_result;
 
-    if (!service || !mbr || !backend || !backend->read || total_blocks == 0U)
+    if (!service)
         return EXCHANGE_SERVICE_INVALID;
     *service = (struct exchange_service){0};
+    if (!mbr || !backend || !backend->read || total_blocks == 0U) {
+        service->status.last_result = EXCHANGE_SERVICE_INVALID;
+        return EXCHANGE_SERVICE_INVALID;
+    }
     service->status.read_only = !backend->writable;
     service->backend = *backend;
 
-    layout_result = storage_layout_validate(mbr, total_blocks, &layout);
+    layout_result = storage_layout_validate_exchange(mbr, total_blocks, &layout);
     service->status.layout_result = (u32)layout_result;
+    if (layout_result == STORAGE_LAYOUT_P3_ABSENT) {
+        service->status.last_result = EXCHANGE_SERVICE_UNAVAILABLE;
+        return EXCHANGE_SERVICE_UNAVAILABLE;
+    }
     if (layout_result != STORAGE_LAYOUT_OK) {
         service->status.last_result = EXCHANGE_SERVICE_PARTITION_REJECTED;
         return EXCHANGE_SERVICE_PARTITION_REJECTED;
-    }
-    if (layout.kind != STORAGE_LAYOUT_THREE_PARTITION) {
-        service->status.last_result = EXCHANGE_SERVICE_UNAVAILABLE;
-        return EXCHANGE_SERVICE_UNAVAILABLE;
     }
     p3 = &layout.facts[STORAGE_LAYOUT_ROLE_EXCHANGE - 1U];
     if (p3->disk_id == 0U || p3->first_lba > 0xFFFFFFFFULL ||

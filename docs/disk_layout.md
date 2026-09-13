@@ -30,13 +30,16 @@ SD card (pre-created primary MBR layout; PIOS never creates or repartitions it)
 └── Partition 3  — FAT32 PIOSXFER    dedicated exchange volume (adapter-owned)
 ```
 
-`storage_layout_validate()` validates the required three-partition layout
-before WALFS accepts p2: the MBR signature; non-overlapping, in-device
-512-byte-sector spans; p1 type `0x0B`/`0x0C`, p2 type `0xDA`, p3 type
-`0x0B`/`0x0C`; and an all-zero p4. The numeric start/count/type/index records
-are immutable observations. The MBR active/status byte is retained only as
-diagnostic evidence: p1 may be active or inactive, and it never authorizes a
-role or writable access.
+`storage_layout_validate()` validates the WALFS-required p1/p2 layout before
+WALFS accepts p2: the MBR signature, in-device 512-byte-sector spans,
+non-overlap, p1 type `0x0B`/`0x0C`, and an all-zero p4. P3 is optional to
+WALFS: an absent, malformed, wrong-type, out-of-range, or overlapping p3
+leaves valid p1/p2 as `legacy-2` with the p3 diagnostic recorded. Only
+`storage_layout_validate_exchange()` applies the strict p1/p2/p3 type and
+non-overlap rules before an exchange attachment. The numeric
+start/count/type/index records are immutable observations. The MBR
+active/status byte is retained only as diagnostic evidence: p1 may be active
+or inactive, and it never authorizes a role or writable access.
 
 `PIOSXFER` is an exact FAT32 volume-label requirement enforced by the
 filesystem adapter after it receives the p3 facts; it is not an MBR field.

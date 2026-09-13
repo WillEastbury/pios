@@ -200,7 +200,7 @@ enum qemu_xfer_result qemu_xfer_verify_remount(void)
     exchange_init();
     qemu_xfer_status(&status);
     if (!status.available)
-        return (enum qemu_xfer_result)status.last_result;
+        return QEMU_XFER_UNAVAILABLE;
     return core_result(exchange_service_flush(exchange_runtime_service()));
 #endif
 }

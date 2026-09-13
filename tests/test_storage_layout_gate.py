@@ -9,7 +9,9 @@ walfs = (ROOT / "src" / "walfs.c").read_text(encoding="utf-8")
 setup = (ROOT / "src" / "setup.c").read_text(encoding="utf-8")
 
 for token in ("STORAGE_LAYOUT_THREE_PARTITION", "STORAGE_LAYOUT_LEGACY_TWO_PARTITION",
-              "0xDAU", "is_fat_type", "entry_empty", "overlap"):
+              "STORAGE_LAYOUT_P3_ABSENT", "storage_layout_validate_exchange",
+              "p3_present", "p3_result", "0xDAU", "is_fat_type", "entry_empty",
+              "overlap"):
     assert token in source or token in header, f"missing layout guard: {token}"
 for forbidden in ("sd_", "walfs", "fat32_", "write(", "format_", "partition_create",
                   "repartition", "malloc", "free("):

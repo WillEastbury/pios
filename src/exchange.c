@@ -7,6 +7,12 @@
 
 static struct exchange_service g_exchange ALIGNED(64);
 
+static void exchange_unavailable(void)
+{
+    g_exchange = (struct exchange_service){0};
+    g_exchange.status.last_result = EXCHANGE_SERVICE_UNAVAILABLE;
+}
+
 static bool exchange_sd_read(void *context, u32 lba, u8 out[512])
 {
     (void)context;
@@ -37,7 +43,7 @@ void exchange_init(void)
 
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
     if (!sd_qemu_virtio_blk_ready()) {
-        (void)exchange_service_init(&g_exchange, mbr, 0U, &backend);
+        exchange_unavailable();
         uart_puts("[xfer] unavailable (no virtio block)\n");
         return;
     }
@@ -45,7 +51,7 @@ void exchange_init(void)
     if (!card || card->capacity == 0U ||
         (card->capacity % SD_BLOCK_SIZE) != 0U ||
         !sd_read_block(0U, mbr)) {
-        (void)exchange_service_init(&g_exchange, mbr, 0U, &backend);
+        exchange_unavailable();
         uart_puts("[xfer] unavailable (MBR)\n");
         return;
     }

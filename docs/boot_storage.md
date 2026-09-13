@@ -199,12 +199,15 @@ Partition 3      FAT32 PIOSXFER exchange volume (auto-mounted read-only when val
 ```
 
 `WALFS_BOOT_SLOT_LBAS` = 10 MiB / 512 = 20480, so `WALFS_BASE_LBA` = 2048 +
-20480 = **22528**. The required pre-created MBR primary entries are p1 FAT32
-(`0x0B`/`0x0C`), p2 raw PIOS/WALFS (`0xDA`), and p3 FAT32 (`0x0B`/`0x0C`),
-with p4 empty. `storage_layout_validate()` checks the signature, sector-capacity
-bounds, and non-overlap before `discover_partition()` consumes p2. The active
-bit is diagnostic only, not storage authority. The exact `PIOSXFER` label is
-verified by a filesystem adapter, not inferred from the MBR.
+20480 = **22528**. The required WALFS MBR entries are p1 FAT32
+(`0x0B`/`0x0C`) and p2 raw PIOS/WALFS, with p4 empty. P3 FAT32 PIOSXFER is
+optional: `storage_layout_validate()` checks p1/p2 signature,
+sector-capacity bounds, and non-overlap before `discover_partition()` consumes
+p2, while retaining an invalid p3 only as a diagnostic. The strict
+three-partition `storage_layout_validate_exchange()` gate alone authorizes p3
+for exchange attachment. The active bit is diagnostic only, not storage
+authority. The exact `PIOSXFER` label is verified by a filesystem adapter, not
+inferred from the MBR.
 
 Two-partition p1/p2 cards remain `legacy-2` compatible for WALFS mounting and
 report a missing exchange volume. At boot, a valid p3 is verified against its

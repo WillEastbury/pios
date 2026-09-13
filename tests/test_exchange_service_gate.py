@@ -8,7 +8,7 @@ adapter = (ROOT / "src" / "exchange.c").read_text(encoding="utf-8")
 kernel = (ROOT / "src" / "kernel.c").read_text(encoding="utf-8")
 header = (ROOT / "include" / "exchange_service.h").read_text(encoding="utf-8")
 
-for token in ("storage_layout_validate", "exchange_volume_policy_attach",
+for token in ("storage_layout_validate_exchange", "exchange_volume_policy_attach",
               "fat32_exchange_mount", "authorized_lba", "exchange_bpb_label"):
     assert token in service, f"missing attachment guard: {token}"
 for forbidden in ("format_", "partition_create", "repartition", "malloc", "free("):
