@@ -32,6 +32,9 @@ enum storage_layout_result {
     STORAGE_LAYOUT_P3_ABSENT,
 };
 
+/* 0xDA identifies raw PIOS-owned data, including an unformatted p3. */
+#define STORAGE_LAYOUT_MBR_TYPE_PIOS_RAW 0xDAU
+
 /* Observed numeric facts. MBR status is retained as evidence, never authority. */
 struct storage_layout_fact {
     u64 first_lba;
@@ -71,7 +74,8 @@ _Static_assert(sizeof(struct storage_layout) ==
  * STORAGE_LAYOUT_LEGACY_TWO_PARTITION. It accepts the old p2 type so old
  * cards can mount read-only/explicitly formatted WALFS without migration. An
  * optional p3 is diagnostic only: p3_present records its presence and
- * p3_result is OK only for a complete, non-overlapping PIOSXFER candidate;
+ * p3_result is OK only for a complete, non-overlapping exchange candidate
+ * whose type is FAT32 or explicitly raw PIOS data (0xDA);
  * otherwise WALFS still receives the valid p1/p2 facts as legacy layout.
  * `total_blocks` is the authoritative count of 512-byte sectors.
  */

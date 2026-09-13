@@ -148,12 +148,14 @@ static void test_candidate_rejections(void)
            EXCHANGE_VOLUME_POLICY_REJECTED);
     REJECT("wrong MBR type excluded", facts[0].mbr_type = 0x07U,
            EXCHANGE_VOLUME_POLICY_REJECTED);
-    REJECT("label absent excluded", facts[0].filesystem_label_bytes = 0U;
+    REJECT("label absent accepted", facts[0].filesystem_label_bytes = 0U;
            memset(facts[0].filesystem_label, 0,
                   sizeof(facts[0].filesystem_label)),
-           EXCHANGE_VOLUME_POLICY_REJECTED);
-    REJECT("label mismatch excluded", facts[0].filesystem_label[7U] = 0x53U,
-           EXCHANGE_VOLUME_POLICY_REJECTED);
+           EXCHANGE_VOLUME_POLICY_OK);
+    REJECT("label mismatch accepted", facts[0].filesystem_label[7U] = 0x53U,
+           EXCHANGE_VOLUME_POLICY_OK);
+    REJECT("raw exchange type accepted", facts[0].mbr_type = 0xDAU,
+           EXCHANGE_VOLUME_POLICY_OK);
     REJECT("non-FAT32 excluded",
            facts[0].filesystem = EXCHANGE_VOLUME_FILESYSTEM_UNKNOWN,
            EXCHANGE_VOLUME_POLICY_REJECTED);

@@ -1,4 +1,4 @@
-# ADR-075: Automatic read-only PIOSXFER attachment
+# ADR-075: Automatic PIOSXFER attachment and raw-p3 autoformat
 
 **Date:** 2026-09-13 · **Decider:** Owner (explicit request) · **Status:** Accepted
 
@@ -8,16 +8,24 @@ After SD and WALFS setup, PIOS automatically evaluates the optional third
 primary partition. `exchange_service` accepts only an immutable MBR snapshot
 and the authoritative card sector count. It requires
 `storage_layout_validate_exchange()` to accept the pre-created p1/p2/p3
-layout, binds only validated p3 through `exchange_volume_policy`, and then requires
-`fat32_exchange_core` to accept p3's real FAT32 BPB and exact eleven-byte
-`PIOSXFER   ` label.
+layout, binds only validated p3 through `exchange_volume_policy`, and then
+requires `fat32_exchange_core` to accept p3's real mountable FAT32 BPB. A
+volume label is descriptive: valid FAT32 p3 attaches whether its label is
+`PIOSXFER`, absent, or different.
 
 The platform SD adapter acquires the MBR snapshot before attachment. All later
 filesystem callbacks are range-fenced to the selected p3 span, so p1 boot and
-p2 WALFS sectors are inaccessible through the exchange service. Boot mounting
-does not create, format, repartition, or write p3. Hardware starts with a
-read-only attachment and only reports `exchange status`. QEMU retains the
-bounded `xfer` mutation commands for its existing acceptance harness.
+p2 WALFS sectors are inaccessible through the exchange service. Boot does not
+create or repartition a partition. If p3 has explicit raw PIOS type `0xDA`
+and sector zero has neither a FAT boot signature nor a FAT32 type marker, boot
+formats only that p3 range as FAT32. The generic callback-backed formatter
+writes fixed 512-byte metadata (primary/backup BPB, FSInfo pair, both FAT
+mirrors, and root cluster), verifies its BPBs, and then remounts.
+
+FAT-looking invalid p3 content fails closed rather than being overwritten;
+FAT32-typed p3 cannot be autoformatted. Hardware remains read-only after the
+optional format; `exchange status` reports `formatted` and `format_reason`.
+QEMU retains its bounded `xfer` mutation commands for acceptance.
 
 Legacy valid p1/p2 cards report exchange unavailable and boot normally. An
 invalid p3 layout is rejected by the strict exchange gate but remains
@@ -28,10 +36,10 @@ cannot leave a prior successful exchange mount visible.
 ## Consequences
 
 The generic logic has an injected block callback host test covering legacy
-absence, type and label rejection, a successful one-time read-only mount, no
-automatic write/format, and p3-only callback access. A source gate prevents
-the boot attachment path from acquiring mutation operations.
+absence, unlabeled valid FAT32 attachment, raw-p3 geometry/range format, and
+FAT-looking-corruption rejection without p1/p2 writes. The QEMU acceptance
+boot provisions raw p3, exercises autoformat and remount, then proves
+unlabeled attachment and corrupt-p3 no-write behavior.
 
-This does not authorize concurrent host/PIOS mounting, production writes,
-crash consistency, automatic remediation, or partition-table changes. Those
-require a separate owner decision.
+This does not authorize concurrent host/PIOS mounting, production file writes,
+crash consistency, broader automatic remediation, or partition-table changes.

@@ -195,7 +195,7 @@ Partition 2      Raw:
    +0x380000       boot control
    +0x400000       stage2 slot B
    +10 MiB         WALFS region
-Partition 3      FAT32 PIOSXFER exchange volume (auto-mounted read-only when valid)
+Partition 3      FAT32 exchange volume; blank raw 0xDA p3 autoformats at boot
 ```
 
 `WALFS_BOOT_SLOT_LBAS` = 10 MiB / 512 = 20480, so `WALFS_BASE_LBA` = 2048 +
@@ -206,17 +206,17 @@ sector-capacity bounds, and non-overlap before `discover_partition()` consumes
 p2, while retaining an invalid p3 only as a diagnostic. The strict
 three-partition `storage_layout_validate_exchange()` gate alone authorizes p3
 for exchange attachment. The active bit is diagnostic only, not storage
-authority. The exact `PIOSXFER` label is verified by a filesystem adapter, not
-inferred from the MBR.
+authority. The volume label is descriptive only and is not inferred from the
+MBR.
 
 Two-partition p1/p2 cards remain `legacy-2` compatible for WALFS mounting and
-report a missing exchange volume. At boot, a valid p3 is verified against its
-FAT32 BPB and exact eleven-byte `PIOSXFER   ` label, then mounted through
-p3-only callbacks. Hardware mounts are read-only and have no transfer commands;
-QEMU retains its bounded acceptance commands. Invalid p3 is diagnostic-only and
-does not prevent p1/p2 boot. PIOS never creates/repartitions entries, writes
-the MBR, or implicitly formats any partition. A blank WALFS area is initialized
-only by explicit `walfs format confirm`, which is restricted to validated p2.
+report a missing exchange volume. At boot, any mountable FAT32 p3 attaches
+regardless of label. A blank or non-FAT-signature p3 may be formatted only when
+its validated MBR type is raw PIOS `0xDA`; FAT-looking invalid content fails
+closed. Formatting is p3-range-fenced metadata only and never writes MBR, p1,
+or p2. Hardware mounts are read-only afterward and has no transfer commands;
+QEMU retains bounded acceptance commands. A blank WALFS area is initialized
+only by explicit `walfs format confirm`, restricted to validated p2.
 
 ---
 
