@@ -251,10 +251,13 @@ TESTS_MANIFEST = {
     # only injected identity/geometry plus exact-sector callbacks; it does
     # not link the live FAT32, SD, WALFS, bootstrap, or kernel paths.
     "test_fat32_exchange_core.c": ["src/fat32_exchange_core.c"],
-    # QEMU-only p3 adapter selection is a pure MBR/capacity check.  Actual
-    # mount and I/O are covered only by tools/qemu_storage_acceptance.py.
-    "test_qemu_xfer_partition.c": ["src/qemu_xfer_partition.c",
-                                   "src/storage_layout.c"],
+    # Production-safe p3 boot attachment. The fake backend proves legacy
+    # media remains non-fatal, invalid labels never mount, exact FAT32 labels
+    # mount once without writes, and callback traffic never reaches p1/p2.
+    "test_exchange_service.c": ["src/exchange_service.c",
+                                "src/exchange_volume_policy.c",
+                                "src/fat32_exchange_core.c",
+                                "src/storage_layout.c"],
     "test_nvme.c": ["src/nvme.c"],
     # ADR-066 #192 offline callback-backed single-namespace provider plus a
     # deliberately test-only fixed persistence model. No live storage code.
@@ -348,6 +351,7 @@ def main() -> int:
                  "test_storage_layout_gate.py",
                  "test_exchange_volume_policy_gate.py",
                  "test_fat32_exchange_core_gate.py",
+                 "test_exchange_service_gate.py",
                  "test_qemu_disk_image.py",
                  "test_issue_137_pcie1_host_contract.py",
                  "test_picoscript_datagram_contract.py",

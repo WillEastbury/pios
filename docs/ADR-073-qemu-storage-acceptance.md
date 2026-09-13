@@ -11,15 +11,20 @@ QEMU disk builder retains a two-partition legacy fixture; only
 acceptance fixture. This builder is test-media construction, not a PIOS
 runtime partitioning path.
 
-`qemu_xfer` is a narrow test adapter.  It is compiled as a no-op unavailable
-stub on every non-QEMU platform.  On QEMU it requires a virtio-blk backend,
-validates the shared MBR signature and fixed role/type/non-overlap predicate,
-then requires a nonzero disk identity and the `PIOSXFER` FAT32 BPB label.
+`qemu_xfer` is a narrow compatibility command surface over the generic
+`exchange_service` attachment. The generic service mounts valid p3 on every
+platform after SD/WALFS setup, with an immutable MBR snapshot and p3-only
+callbacks. Hardware mounts are read-only and expose `exchange status`; QEMU
+alone enables the bounded mutation commands for acceptance. On QEMU it
+requires a virtio-blk backend, validates the shared MBR signature and fixed
+role/type/non-overlap predicate, then requires a nonzero disk identity and the
+`PIOSXFER` FAT32 BPB label.
 The MBR status bit is not authority; active/inactive is accepted as valid
 wire evidence.
 It derives an attachment from that p3 fact and its callback rejects every LBA
-outside the exact p3 span.  It never selects, reads through, or writes through
-boot p1 or WALFS p2.  Generic `fat32.c` behavior remains unchanged.
+outside the exact p3 span. The MBR snapshot is acquired before attachment;
+afterward it never reads through or writes through boot p1 or WALFS p2.
+Generic `fat32.c` behavior remains unchanged.
 
 The acceptance surface is intentionally small: bounded 8.3 root files and
 1 KiB hex command payloads only.  `xfer verify` remounts p3 and checks mirrored

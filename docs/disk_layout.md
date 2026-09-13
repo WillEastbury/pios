@@ -40,8 +40,10 @@ role or writable access.
 
 `PIOSXFER` is an exact FAT32 volume-label requirement enforced by the
 filesystem adapter after it receives the p3 facts; it is not an MBR field.
-PIOS does not mount p3 on hardware. The present QEMU adapter is deliberately
-range-limited to p3 and verifies that label.
+After SD/WALFS setup, PIOS automatically mounts a valid p3 through
+range-limited callbacks. Hardware attachment is read-only and reported by
+`exchange status`; only QEMU's acceptance commands can mutate the volume.
+PIOS never formats p3 automatically.
 
 An existing two-entry p1/p2 MBR is classified as `legacy-2` for read/mount
 compatibility and reports the exchange partition as missing. PIOS neither

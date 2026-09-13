@@ -13,8 +13,11 @@ It publishes immutable numeric role facts. MBR status is observation only;
 p1 may be active or inactive and no status bit grants storage authority.
 
 The exact `PIOSXFER` label is a FAT32 adapter check after p3 selection, never
-an MBR claim. p3 remains unmounted on hardware; QEMU's constrained adapter is
-the only current p3 consumer.
+an MBR claim. At normal boot, after SD/WALFS setup, `exchange_service` receives
+an immutable MBR snapshot and mounts valid p3 on every platform. Its callbacks
+are permanently range-fenced to validated p3. The mount is read-only on
+hardware; QEMU alone enables its existing bounded acceptance mutation commands.
+No mount creates, formats, repartitions, or writes p3.
 
 PIOS never writes an MBR, creates/repartitions a partition, or implicitly
 formats a partition. `walfs format confirm` remains the sole explicit action
