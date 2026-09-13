@@ -29,6 +29,7 @@ enum storage_layout_result {
     STORAGE_LAYOUT_MBR_SIGNATURE,
     STORAGE_LAYOUT_MALFORMED,
     STORAGE_LAYOUT_ROLE_MISMATCH,
+    STORAGE_LAYOUT_P3_ABSENT,
 };
 
 /* Observed numeric facts. MBR status is retained as evidence, never authority. */
@@ -48,8 +49,9 @@ struct storage_layout {
     u32 disk_id;
     u32 kind;
     u32 result;
-    u32 _reserved;
-    u8 _pad[40U];
+    u32 p3_present;
+    u32 p3_result;
+    u8 _pad[32U];
     struct storage_layout_fact facts[STORAGE_LAYOUT_FACT_COUNT];
 } ALIGNED(64);
 
@@ -60,18 +62,25 @@ _Static_assert(sizeof(struct storage_layout) ==
                "storage layout must isolate immutable facts");
 
 /*
- * Validates an MBR against the fixed PIOS roles:
+ * Validates the WALFS-required MBR roles:
  *   p1 (index 0): FAT32 0x0b/0x0c boot
- *   p2 (index 1): raw PIOS/WALFS 0xda system
- *   p3 (index 2): FAT32 0x0b/0x0c PIOSXFER
+ *   p2 (index 1): raw PIOS/WALFS system
  *   p4 (index 3): empty
  *
  * A historical two-partition p1/p2 layout remains observable as
  * STORAGE_LAYOUT_LEGACY_TWO_PARTITION. It accepts the old p2 type so old
- * cards can mount read-only/explicitly formatted WALFS without migration.
+ * cards can mount read-only/explicitly formatted WALFS without migration. An
+ * optional p3 is diagnostic only: p3_present records its presence and
+ * p3_result is OK only for a complete, non-overlapping PIOSXFER candidate;
+ * otherwise WALFS still receives the valid p1/p2 facts as legacy layout.
  * `total_blocks` is the authoritative count of 512-byte sectors.
  */
 enum storage_layout_result storage_layout_validate(
+    const u8 mbr[STORAGE_LAYOUT_MBR_BYTES], u64 total_blocks,
+    struct storage_layout *out);
+
+/* Strict p1/p2/p3 validator used only before an exchange attachment. */
+enum storage_layout_result storage_layout_validate_exchange(
     const u8 mbr[STORAGE_LAYOUT_MBR_BYTES], u64 total_blocks,
     struct storage_layout *out);
 

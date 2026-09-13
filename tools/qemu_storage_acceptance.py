@@ -236,6 +236,21 @@ def persistence(a: Acceptance) -> None:
     a.command("xfer verify", "xfer verify OK")
 
 
+def reject_exchange_p3(disk: pathlib.Path) -> None:
+    """Turn the optional p3 into a wrong-type record without touching p1/p2."""
+    with disk.open("r+b") as image:
+        image.seek(0x1DE + 4)
+        image.write(b"\x83")
+        image.flush()
+
+
+def exercise_rejected_exchange(a: Acceptance) -> None:
+    a.command("exchange status", "exchange available=no")
+    a.command("xfer status", "xfer available=no")
+    a.command("xfer verify", "ERR: xfer verify unavailable")
+    a.command("walfs verify", "walfs verify ok=yes")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", action="store_true", help="build direct QEMU kernel")
@@ -290,6 +305,16 @@ def main() -> int:
         if not wait_boot(proc):
             raise RuntimeError("QEMU persistence reboot never reached /api/status")
         persistence(a)
+        stop(proc)
+        proc = None
+
+        # A malformed optional p3 cannot prevent valid legacy p1/p2 WALFS
+        # discovery. It also must not leave the prior exchange mount usable.
+        reject_exchange_p3(DISK)
+        proc = launch(KERNEL, DISK)
+        if not wait_boot(proc):
+            raise RuntimeError("QEMU rejected-p3 reboot never reached /api/status")
+        exercise_rejected_exchange(a)
         if a.errors:
             raise RuntimeError("; ".join(a.errors))
         average = sum(a.latencies) / len(a.latencies) if a.latencies else 0.0

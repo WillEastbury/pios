@@ -13,6 +13,7 @@
 #include "nic.h"
 #include "usb_kbd.h"
 #include "walfs.h"
+#include "exchange.h"
 #include "principal.h"
 #include "picowal_db.h"
 #include "simd.h"
@@ -263,13 +264,20 @@ bool setup_run(bool fb_available, bool net_ready, bool usb_ready)
     setup_log_bool("[setup] USB keyboard: ", usb_kbd_available());
     {
         struct walfs_status_snapshot storage;
+        struct exchange_service_status exchange;
 
         walfs_status(&storage);
+        exchange_status(&exchange);
         setup_log("[setup] Storage layout: ");
         setup_log(storage.storage_layout_kind == STORAGE_LAYOUT_THREE_PARTITION ?
                   "pre-created boot/system/exchange\n" :
                   storage.storage_layout_kind == STORAGE_LAYOUT_LEGACY_TWO_PARTITION ?
                   "legacy boot/system; exchange missing\n" : "unavailable\n");
+        setup_log("[setup] Exchange: ");
+        setup_log(exchange.available ? (exchange.read_only ?
+                  "PIOSXFER mounted read-only\n" :
+                  "PIOSXFER mounted read-write (QEMU acceptance)\n") :
+                  "unavailable (p1/p2 unaffected)\n");
     }
 
     if (!usb_kbd_available()) {

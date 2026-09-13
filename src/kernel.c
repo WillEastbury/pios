@@ -98,6 +98,7 @@
 #include "stackprot.h"
 #include "stack_canary.h"
 #include "fat32.h"
+#include "exchange.h"
 #include "qemu_xfer.h"
 #include "pios_addr.h"
 #include "picoscript.h"
@@ -3147,7 +3148,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
             "Examples: status | ps | services | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
-            "Diagnostics: walfs verify | xfer status | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | pcie1 | pcie1 aer | lzero | picocompress selftest | picoweb selftest\n"
+            "Diagnostics: walfs verify | exchange status | xfer status | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | pcie1 | pcie1 aer | lzero | picocompress selftest | picoweb selftest\n"
             "Client tools: arp | route | ping <ip-or-cached-host> [count] | traceroute <ip-or-cached-host> [max_hops] | dnslookup <hostname>\n"
             "Command help: help status | help netstat | help firewall | help reboot | help peek | help walfs | help db | help cachestats\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
@@ -3194,7 +3195,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         } else if (http_streq(topic, "mem")) {
             http_append(out, &len, max, "mem analyze\n  Show kernel image, raw-slot, per-core RAM, and process memory layout diagnostics.\n");
         } else if (http_streq(topic, "fs") || http_streq(topic, "ls") || http_streq(topic, "fsinspect")) {
-            http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path] | walfs status | walfs verify | walfs compact | walfs format confirm\n  WALFS listing/status, integrity verify, non-destructive compact, plus confirmed reserved-base format.\n");
+            http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path] | walfs status | exchange status | walfs verify | walfs compact | walfs format confirm\n  WALFS listing/status, read-only exchange attachment status, integrity verify, non-destructive compact, plus confirmed reserved-base format.\n");
         } else if (http_streq(topic, "bootctrl")) {
             http_append(out, &len, max, "bootctrl status | bootctrl arm-o <package-id> confirm | bootctrl clear-o | bootctrl clear-pending | bootctrl reset-a confirm | bootctrl test-invalid-b confirm\n  Arm/clear one-shot FAT-direct O or inspect/repair A/B boot control.\n");
         } else if (http_streq(topic, "dma")) {
@@ -3239,10 +3240,13 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                 "  Pi 5 FFC/HAT root. Enum any device/switch. LevelZero B→E path; MSI masked.\n");
         } else if (http_streq(topic, "walfs") || http_streq(topic, "disk")) {
             http_append(out, &len, max, "walfs verify | walfs compact | walfs status | walfs format confirm\n  Verify WAL metadata/record-chain integrity, compact the WAL (non-destructive), or status.\n");
+        } else if (http_streq(topic, "exchange")) {
+            http_append(out, &len, max,
+                        "exchange status\n  Show optional p3 PIOSXFER validation and mount diagnostics. Hardware attachment is read-only.\n");
         } else if (http_streq(topic, "xfer")) {
             http_append(out, &len, max,
                         "xfer status | xfer write <8.3> <hex> | xfer read <8.3> | xfer append <8.3> <hex> | xfer rename <old 8.3> <new 8.3> | xfer delete <8.3> | xfer verify\n"
-                        "  QEMU-only FAT32 acceptance adapter. It is hard-bound to p3 PIOSXFER; p1 boot and p2 WALFS are never writable through this command.\n");
+                        "  QEMU acceptance commands. It is hard-bound to p3 PIOSXFER; use exchange status on hardware.\n");
         } else if (http_streq(topic, "db")) {
             http_append(out, &len, max,
                 "db key|get|put|save|add|update|del|copy|rename|editor|list <addr>\n"
@@ -8049,6 +8053,17 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                         (enum storage_layout_kind)ws.storage_layout_kind));
         http_append(out, &len, max, " exchange=");
         http_append(out, &len, max, ws.exchange_present ? "present" : "missing");
+        {
+            struct exchange_service_status xs;
+
+            exchange_status(&xs);
+            http_append(out, &len, max, " exchange_mount=");
+            http_append(out, &len, max, xs.mounted ? "ok" : "unavailable");
+            http_append(out, &len, max, " exchange_result=");
+            http_append(out, &len, max,
+                        exchange_service_result_name(
+                            (enum exchange_service_result)xs.last_result));
+        }
         http_append(out, &len, max, " p2_lba=");
         http_append_u64(out, &len, max, ws.partition_lba);
         http_append(out, &len, max, " walfs_lba=");
@@ -8065,6 +8080,34 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, ws.super_head);
         http_append(out, &len, max, " tree_root=");
         http_append_u64(out, &len, max, ws.super_tree_root);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "exchange") ||
+               http_streq(cmd, "exchange status")) {
+        struct exchange_service_status xs;
+
+        exchange_status(&xs);
+        http_append(out, &len, max, "exchange available=");
+        http_append(out, &len, max, xs.available ? "yes" : "no");
+        http_append(out, &len, max, " mounted=");
+        http_append(out, &len, max, xs.mounted ? "yes" : "no");
+        http_append(out, &len, max, " mode=");
+        http_append(out, &len, max, xs.read_only ? "read-only" : "read-write");
+        http_append(out, &len, max, " p3_lba=");
+        http_append_u64(out, &len, max, xs.first_lba);
+        http_append(out, &len, max, " p3_blocks=");
+        http_append_u64(out, &len, max, xs.block_count);
+        http_append(out, &len, max, " disk_id=");
+        http_append_hex32(out, &len, max, xs.disk_id);
+        http_append(out, &len, max, " last=");
+        http_append(out, &len, max,
+                    exchange_service_result_name(
+                        (enum exchange_service_result)xs.last_result));
+        http_append(out, &len, max, " layout=");
+        http_append_u64(out, &len, max, xs.layout_result);
+        http_append(out, &len, max, " policy=");
+        http_append_u64(out, &len, max, xs.policy_result);
+        http_append(out, &len, max, " fat32=");
+        http_append_u64(out, &len, max, xs.core_result);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "walfs format confirm")) {
         bool ok = walfs_format_reserved();
@@ -8089,6 +8132,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append_u64(out, &len, max, xs.block_count);
             http_append(out, &len, max, " disk_id=");
             http_append_hex32(out, &len, max, xs.disk_id);
+            http_append(out, &len, max, " writable=");
+            http_append(out, &len, max, xs.writable ? "yes" : "no");
             http_append(out, &len, max, " last=");
             http_append(out, &len, max,
                         qemu_xfer_result_name((enum qemu_xfer_result)xs.last_result));
@@ -25746,9 +25791,11 @@ void kernel_main(void) {
         }
         if (walfs_ok) bp_ok("[fs] SD + WALFS online");
         else bp_warn("[fs] SD ok, WALFS failed");
-        /* QEMU storage acceptance only.  The adapter validates and binds
-         * exclusively p3/PIOSXFER; it cannot use the boot p1 or WALFS p2. */
-        qemu_xfer_init();
+        /*
+         * Optional p3 attachment is non-fatal.  It uses a pre-read MBR
+         * snapshot and range-fenced callbacks, so it cannot access p1/p2.
+         */
+        exchange_init();
         bp_log("[key] keystore_init...");
         if (keystore_init()) {            bp_ok("[key] sealed root ready");
             bp_log("[x509] x509_init...");

@@ -50,7 +50,8 @@ int main(void)
     CHECK(layout.facts[1].role == STORAGE_LAYOUT_ROLE_SYSTEM &&
           layout.facts[1].mbr_type == 0xDAU);
     CHECK(layout.facts[2].role == STORAGE_LAYOUT_ROLE_EXCHANGE &&
-          layout.facts[2].first_lba == 5048U);
+          layout.facts[2].first_lba == 5048U &&
+          layout.p3_present && layout.p3_result == STORAGE_LAYOUT_OK);
     mbr[446U] = 0U;
     CHECK(storage_layout_validate(mbr, 6048U, &layout) == STORAGE_LAYOUT_OK &&
           layout.kind == STORAGE_LAYOUT_THREE_PARTITION);
@@ -62,21 +63,36 @@ int main(void)
     valid_three(mbr);
     memset(mbr + 446U + 2U * 16U, 0, 16U);
     CHECK(storage_layout_validate(mbr, 6048U, &layout) == STORAGE_LAYOUT_OK &&
-          layout.kind == STORAGE_LAYOUT_LEGACY_TWO_PARTITION);
+          layout.kind == STORAGE_LAYOUT_LEGACY_TWO_PARTITION &&
+          !layout.p3_present && layout.p3_result == STORAGE_LAYOUT_P3_ABSENT);
     mbr[446U + 16U + 4U] = 0x07U;
     CHECK(storage_layout_validate(mbr, 6048U, &layout) == STORAGE_LAYOUT_OK &&
           layout.kind == STORAGE_LAYOUT_LEGACY_TWO_PARTITION);
     valid_three(mbr);
     entry(mbr, 2U, 0U, 0x83U, 5048U, 1000U);
-    CHECK(storage_layout_validate(mbr, 6048U, &layout) ==
+    CHECK(storage_layout_validate(mbr, 6048U, &layout) == STORAGE_LAYOUT_OK &&
+          layout.kind == STORAGE_LAYOUT_LEGACY_TWO_PARTITION &&
+          layout.p3_present &&
+          layout.p3_result == STORAGE_LAYOUT_ROLE_MISMATCH &&
+          layout.facts[1].first_lba == 3048U &&
+          layout.facts[2].block_count == 0U);
+    CHECK(storage_layout_validate_exchange(mbr, 6048U, &layout) ==
           STORAGE_LAYOUT_ROLE_MISMATCH);
     valid_three(mbr);
-    entry(mbr, 1U, 0U, 0xDAU, 3000U, 2000U);
-    CHECK(storage_layout_validate(mbr, 6048U, &layout) ==
+    entry(mbr, 2U, 0U, 0x0CU, 5000U, 1000U);
+    CHECK(storage_layout_validate(mbr, 6048U, &layout) == STORAGE_LAYOUT_OK &&
+          layout.kind == STORAGE_LAYOUT_LEGACY_TWO_PARTITION &&
+          layout.p3_present && layout.p3_result == STORAGE_LAYOUT_MALFORMED &&
+          layout.facts[1].first_lba == 3048U);
+    CHECK(storage_layout_validate_exchange(mbr, 6048U, &layout) ==
           STORAGE_LAYOUT_MALFORMED);
     valid_three(mbr);
     entry(mbr, 2U, 0U, 0x0CU, 5048U, 1001U);
-    CHECK(storage_layout_validate(mbr, 6048U, &layout) ==
+    CHECK(storage_layout_validate(mbr, 6048U, &layout) == STORAGE_LAYOUT_OK &&
+          layout.kind == STORAGE_LAYOUT_LEGACY_TWO_PARTITION &&
+          layout.p3_present && layout.p3_result == STORAGE_LAYOUT_MALFORMED &&
+          layout.facts[1].first_lba == 3048U);
+    CHECK(storage_layout_validate_exchange(mbr, 6048U, &layout) ==
           STORAGE_LAYOUT_MALFORMED);
     valid_three(mbr);
     entry(mbr, 3U, 0U, 0x0CU, 1U, 1U);
@@ -88,7 +104,11 @@ int main(void)
           STORAGE_LAYOUT_ROLE_MISMATCH);
     valid_three(mbr);
     entry(mbr, 1U, 0U, 0x07U, 3048U, 2000U);
-    CHECK(storage_layout_validate(mbr, 6048U, &layout) ==
+    CHECK(storage_layout_validate(mbr, 6048U, &layout) == STORAGE_LAYOUT_OK &&
+          layout.kind == STORAGE_LAYOUT_LEGACY_TWO_PARTITION &&
+          layout.p3_present &&
+          layout.p3_result == STORAGE_LAYOUT_ROLE_MISMATCH);
+    CHECK(storage_layout_validate_exchange(mbr, 6048U, &layout) ==
           STORAGE_LAYOUT_ROLE_MISMATCH);
     puts("storage layout: PASS");
     return 0;

@@ -48,17 +48,16 @@ assert "identity" in header and "epoch" in header
 assert "no LFN" in adr and "no live mount" in adr
 assert "not crash safe" in adr
 
-adapter = (ROOT / "src" / "qemu_xfer.c").read_text(encoding="utf-8")
-selector = (ROOT / "src" / "qemu_xfer_partition.c").read_text(encoding="utf-8")
-for needle in ("PIOS_PLATFORM_QEMU_VIRT", "authorized_lba",
-               "qemu_xfer_partition_select", "sd_qemu_virtio_blk_ready"):
-    assert needle in adapter, f"QEMU adapter missing isolation guard: {needle}"
+adapter = (ROOT / "src" / "exchange_service.c").read_text(encoding="utf-8")
+for needle in ("authorized_lba", "storage_layout_validate",
+               "exchange_volume_policy_attach", "fat32_exchange_mount"):
+    assert needle in adapter, f"generic adapter missing isolation guard: {needle}"
 for forbidden in ('"fat32.h"', '"walfs.h"', '"bootstrap.h"'):
-    assert forbidden not in adapter, f"QEMU adapter must not use live FS path: {forbidden}"
+    assert forbidden not in adapter, f"exchange service must not use live FS path: {forbidden}"
 for needle in ("p3", "PIOSXFER"):
-    assert needle in selector or needle in (ROOT / "include" / "qemu_xfer_partition.h").read_text(encoding="utf-8")
-assert "storage_layout_validate" in selector, (
-    "QEMU exchange selection must use the shared production layout validator"
+    assert needle in adapter
+assert "storage_layout_validate" in adapter, (
+    "exchange selection must use the shared production layout validator"
 )
 
 print(f"ADR-071 exchange core gate: merge-base {base[:12]}, live paths isolated")

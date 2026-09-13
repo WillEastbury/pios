@@ -4,17 +4,27 @@
 
 ## Decision
 
-PIOS consumes only a pre-created MBR primary layout: index 0 is FAT32 boot
-(`0x0B`/`0x0C`), index 1 is raw PIOS/WALFS (`0xDA`), index 2 is FAT32
+PIOS consumes a pre-created MBR layout: index 0 is FAT32 boot
+(`0x0B`/`0x0C`), index 1 is raw PIOS/WALFS, index 2 is optional FAT32
 PIOSXFER (`0x0B`/`0x0C`), and index 3 is empty. The shared pure
 `storage_layout` validator verifies the signature, 512-sector capacity bounds,
-spans, types, ordering, and p4 emptiness before production WALFS uses p2.
-It publishes immutable numeric role facts. MBR status is observation only;
-p1 may be active or inactive and no status bit grants storage authority.
+and non-overlap of p1/p2 before production WALFS uses p2. It publishes
+immutable numeric role facts. MBR status is observation only; p1 may be active
+or inactive and no status bit grants storage authority.
+
+P3 is not authority for WALFS. Its presence and validation result are retained
+as diagnostics; malformed, wrong-type, out-of-range, or overlapping p3 is
+treated exactly like an absent exchange volume while valid p1/p2 continues to
+mount WALFS. `storage_layout_validate_exchange()` is the separate strict
+three-partition validation gate used only by exchange attachment, so no
+malformed p3 can become an exchange target.
 
 The exact `PIOSXFER` label is a FAT32 adapter check after p3 selection, never
-an MBR claim. p3 remains unmounted on hardware; QEMU's constrained adapter is
-the only current p3 consumer.
+an MBR claim. At normal boot, after SD/WALFS setup, `exchange_service` receives
+an immutable MBR snapshot and mounts valid p3 on every platform. Its callbacks
+are permanently range-fenced to validated p3. The mount is read-only on
+hardware; QEMU alone enables its existing bounded acceptance mutation commands.
+No mount creates, formats, repartitions, or writes p3.
 
 PIOS never writes an MBR, creates/repartitions a partition, or implicitly
 formats a partition. `walfs format confirm` remains the sole explicit action

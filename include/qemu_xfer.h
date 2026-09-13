@@ -1,8 +1,10 @@
 /*
- * qemu_xfer.h - narrow, QEMU-only FAT32 exchange acceptance adapter.
+ * qemu_xfer.h - compatibility command adapter for the generic exchange service.
  *
- * This is unavailable outside QEMU.  It can only authorize the validated
- * PIOSXFER MBR partition 3 and never discovers or accesses p1/p2.
+ * `xfer status` reports the generic boot attachment on every platform.  File
+ * mutation commands remain QEMU-only acceptance tooling; production mounts
+ * the validated PIOSXFER partition read-only until a separate host ownership
+ * and crash-consistency decision authorizes writes.
  */
 #pragma once
 
@@ -16,6 +18,7 @@ enum qemu_xfer_result {
     QEMU_XFER_PARTITION_REJECTED,
     QEMU_XFER_CORE_FAILED,
     QEMU_XFER_ARGUMENT,
+    QEMU_XFER_READ_ONLY,
 };
 
 struct qemu_xfer_status {
@@ -26,13 +29,13 @@ struct qemu_xfer_status {
     u32 last_result;
     u32 core_result;
     u32 disk_id;
-    u32 _reserved;
+    u32 writable;
+    u8 _pad[28U];
 } ALIGNED(64);
 
 _Static_assert(sizeof(struct qemu_xfer_status) == 64U,
                "QEMU xfer status requires one cache line");
 
-void qemu_xfer_init(void);
 void qemu_xfer_status(struct qemu_xfer_status *out);
 const char *qemu_xfer_result_name(enum qemu_xfer_result result);
 

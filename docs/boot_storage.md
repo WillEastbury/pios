@@ -195,22 +195,28 @@ Partition 2      Raw:
    +0x380000       boot control
    +0x400000       stage2 slot B
    +10 MiB         WALFS region
-Partition 3      FAT32 PIOSXFER exchange volume (not mounted by normal runtime)
+Partition 3      FAT32 PIOSXFER exchange volume (auto-mounted read-only when valid)
 ```
 
 `WALFS_BOOT_SLOT_LBAS` = 10 MiB / 512 = 20480, so `WALFS_BASE_LBA` = 2048 +
-20480 = **22528**. The required pre-created MBR primary entries are p1 FAT32
-(`0x0B`/`0x0C`), p2 raw PIOS/WALFS (`0xDA`), and p3 FAT32 (`0x0B`/`0x0C`),
-with p4 empty. `storage_layout_validate()` checks the signature, sector-capacity
-bounds, and non-overlap before `discover_partition()` consumes p2. The active
-bit is diagnostic only, not storage authority. The exact `PIOSXFER` label is
-verified by a filesystem adapter, not inferred from the MBR.
+20480 = **22528**. The required WALFS MBR entries are p1 FAT32
+(`0x0B`/`0x0C`) and p2 raw PIOS/WALFS, with p4 empty. P3 FAT32 PIOSXFER is
+optional: `storage_layout_validate()` checks p1/p2 signature,
+sector-capacity bounds, and non-overlap before `discover_partition()` consumes
+p2, while retaining an invalid p3 only as a diagnostic. The strict
+three-partition `storage_layout_validate_exchange()` gate alone authorizes p3
+for exchange attachment. The active bit is diagnostic only, not storage
+authority. The exact `PIOSXFER` label is verified by a filesystem adapter, not
+inferred from the MBR.
 
 Two-partition p1/p2 cards remain `legacy-2` compatible for WALFS mounting and
-report a missing exchange volume. PIOS never creates/repartitions entries,
-writes the MBR, mounts p3 outside its QEMU acceptance adapter, or implicitly
-formats any partition. A blank WALFS area is initialized only by explicit
-`walfs format confirm`, which is restricted to validated p2.
+report a missing exchange volume. At boot, a valid p3 is verified against its
+FAT32 BPB and exact eleven-byte `PIOSXFER   ` label, then mounted through
+p3-only callbacks. Hardware mounts are read-only and have no transfer commands;
+QEMU retains its bounded acceptance commands. Invalid p3 is diagnostic-only and
+does not prevent p1/p2 boot. PIOS never creates/repartitions entries, writes
+the MBR, or implicitly formats any partition. A blank WALFS area is initialized
+only by explicit `walfs format confirm`, which is restricted to validated p2.
 
 ---
 
