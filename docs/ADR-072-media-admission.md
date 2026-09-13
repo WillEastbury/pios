@@ -1,8 +1,8 @@
 # ADR-072 — Offline cross-engine media admission/orchestration
 
-**Date:** 2026-09-13  
-**Decider:** Owner  
-**Status:** Accepted  
+**Date:** 2026-09-13
+**Decider:** Owner
+**Status:** Accepted
 **Issue:** #169
 
 ## Decision
