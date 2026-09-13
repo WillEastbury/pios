@@ -4,8 +4,8 @@
  * The caller provides the already-read MBR and a block callback.  The service
  * validates only p3, then permanently fences every FAT32 callback to that
  * validated span. It mounts a valid FAT32 p3 regardless of label. An
- * explicitly raw 0xDA p3 with no FAT signature may be formatted in place;
- * it never discovers or repartitions a partition.
+ * explicitly raw 0xDA p3 may be formatted in place only when its entire boot
+ * sector is all zero; it never discovers or repartitions a partition.
  */
 #pragma once
 

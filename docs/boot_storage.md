@@ -195,7 +195,7 @@ Partition 2      Raw:
    +0x380000       boot control
    +0x400000       stage2 slot B
    +10 MiB         WALFS region
-Partition 3      FAT32 exchange volume; blank raw 0xDA p3 autoformats at boot
+Partition 3      FAT32 exchange volume; all-zero raw 0xDA p3 autoformats at boot
 ```
 
 `WALFS_BOOT_SLOT_LBAS` = 10 MiB / 512 = 20480, so `WALFS_BASE_LBA` = 2048 +
@@ -211,8 +211,8 @@ MBR.
 
 Two-partition p1/p2 cards remain `legacy-2` compatible for WALFS mounting and
 report a missing exchange volume. At boot, any mountable FAT32 p3 attaches
-regardless of label. A blank or non-FAT-signature p3 may be formatted only when
-its validated MBR type is raw PIOS `0xDA`; FAT-looking invalid content fails
+regardless of label. Autoformat requires raw PIOS `0xDA` type and a complete
+all-zero p3 boot sector; every nonzero boot-sector residue fails
 closed. Formatting is p3-range-fenced metadata only and never writes MBR, p1,
 or p2. Hardware mounts are read-only afterward and has no transfer commands;
 QEMU retains bounded acceptance commands. A blank WALFS area is initialized

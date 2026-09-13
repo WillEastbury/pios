@@ -16,9 +16,11 @@ volume label is descriptive: valid FAT32 p3 attaches whether its label is
 The platform SD adapter acquires the MBR snapshot before attachment. All later
 filesystem callbacks are range-fenced to the selected p3 span, so p1 boot and
 p2 WALFS sectors are inaccessible through the exchange service. Boot does not
-create or repartition a partition. If p3 has explicit raw PIOS type `0xDA`
-and sector zero has neither a FAT boot signature nor a FAT32 type marker, boot
-formats only that p3 range as FAT32. The generic callback-backed formatter
+create or repartition a partition. If p3 has explicit raw PIOS type `0xDA` and its entire sector-zero boot sector
+is all zero, boot formats only that p3 range as FAT32. This is a positive blank
+media test, not a recognition heuristic: any nonzero byte, including damaged
+or partial BPB geometry, root-cluster fields, labels, signatures, or unrelated
+residue, fails closed without writes. The generic callback-backed formatter
 writes fixed 512-byte metadata (primary/backup BPB, FSInfo pair, both FAT
 mirrors, and root cluster), verifies its BPBs, and then remounts.
 
@@ -37,9 +39,10 @@ cannot leave a prior successful exchange mount visible.
 
 The generic logic has an injected block callback host test covering legacy
 absence, unlabeled valid FAT32 attachment, raw-p3 geometry/range format, and
-FAT-looking-corruption rejection without p1/p2 writes. The QEMU acceptance
-boot provisions raw p3, exercises autoformat and remount, then proves
-unlabeled attachment and corrupt-p3 no-write behavior.
+nonblank raw-p3 residue rejection without p1/p2 writes, including damaged
+root-cluster and other geometry with labels and signatures absent. The QEMU
+acceptance boot provisions all-zero raw p3, exercises autoformat and remount,
+then proves unlabeled attachment and corrupt-p3 no-write behavior.
 
 This does not authorize concurrent host/PIOS mounting, production file writes,
 crash consistency, broader automatic remediation, or partition-table changes.

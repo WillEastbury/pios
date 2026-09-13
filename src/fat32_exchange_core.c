@@ -170,7 +170,8 @@ enum fat32_exchange_result fat32_exchange_format(
         clusters > FAT32_EXCHANGE_MAX_CLUSTERS ||
         fat_sectors > FAT32_EXCHANGE_MAX_FAT_SECTORS ||
         FAT32_EXCHANGE_FORMAT_RESERVED < 8U ||
-        attachment->block_count > ~0U - attachment->first_lba)
+        !lba_range_representable(attachment->first_lba,
+                                 attachment->block_count))
         return FAT32_EXCHANGE_BPB;
 
     bytes_zero(boot, sizeof(boot));

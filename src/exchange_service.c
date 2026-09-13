@@ -38,13 +38,15 @@ static bool service_format_write(void *context, u32 lba, const u8 in[512])
            service->backend.write(service->backend.context, lba, in);
 }
 
-static bool fat32_signature_present(const u8 sector[512])
+static bool boot_sector_is_all_zero(const u8 sector[512])
 {
-    return (sector[510U] == 0x55U && sector[511U] == 0xAAU) ||
-           (sector[82U] == 'F' && sector[83U] == 'A' &&
-            sector[84U] == 'T' && sector[85U] == '3' &&
-            sector[86U] == '2' && sector[87U] == ' ' &&
-            sector[88U] == ' ' && sector[89U] == ' ');
+    u32 i;
+
+    for (i = 0U; i < 512U; i++) {
+        if (sector[i] != 0U)
+            return false;
+    }
+    return true;
 }
 
 static void policy_fact_make(const struct storage_layout_fact *p3,
@@ -166,9 +168,10 @@ enum exchange_service_result exchange_service_init(
     }
 
     /*
-     * Formatting is deliberately narrower than mounting: only p3 explicitly
-     * typed raw PIOS data may be initialized, and FAT-looking corruption is
-     * evidence of user data rather than blank media.
+     * Formatting is deliberately narrower than mounting: only an explicitly
+     * raw p3 whose complete boot sector is positively known blank may be
+     * initialized. Any residue is treated as user data, including damaged or
+     * unrecognizable filesystem metadata.
      */
     if (!service_read(service, p3->first_lba, boot)) {
         service->status.format_reason = EXCHANGE_SERVICE_FORMAT_IO;
@@ -178,7 +181,7 @@ enum exchange_service_result exchange_service_init(
         service->status.format_reason = EXCHANGE_SERVICE_FORMAT_RAW_NOT_ALLOWED;
         return core_result(service, mount_result);
     }
-    if (fat32_signature_present(boot)) {
+    if (!boot_sector_is_all_zero(boot)) {
         service->status.format_reason = EXCHANGE_SERVICE_FORMAT_CORRUPT;
         return core_result(service, mount_result);
     }

@@ -238,11 +238,17 @@ def persistence(a: Acceptance) -> None:
 
 
 def reject_exchange_p3(disk: pathlib.Path) -> None:
-    """Make p3 FAT-looking but invalid without changing its MBR entry."""
+    """Leave damaged FAT residue that must not be mistaken for blank raw p3."""
     p3_start = 2048 + 64 * 1024 * 1024 // 512 + 96 * 1024 * 1024 // 512
     with disk.open("r+b") as image:
-        image.seek(p3_start * 512 + 14)
-        image.write(b"\x00\x00")  # invalid FAT32 reserved-sector count
+        image.seek(p3_start * 512 + 44)
+        image.write(b"\x00" * 4)  # destroy the FAT32 root-cluster field
+        image.seek(p3_start * 512 + 71)
+        image.write(b"\x00" * 11)  # remove the volume label
+        image.seek(p3_start * 512 + 82)
+        image.write(b"\x00" * 8)  # remove FAT32 type marker
+        image.seek(p3_start * 512 + 510)
+        image.write(b"\x00\x00")  # remove terminal boot signature
         image.flush()
 
 def relabel_exchange_p3(disk: pathlib.Path) -> None:
