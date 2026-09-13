@@ -117,7 +117,8 @@ decision)
 | [071](#adr-071) | Offline FAT32 exchange-volume mutation core | Owner | Accepted |
 | [073](ADR-073-qemu-storage-acceptance.md) | QEMU-only storage acceptance adapter | Owner | Accepted |
 | [074](ADR-074-precreated-three-partition-layout.md) | Pre-created three-primary storage layout | Owner | Accepted |
-| [075](ADR-075-exchange-partition-autosetup.md) | Automatic PIOSXFER attachment and raw-p3 autoformat | Owner | Accepted |
+| [075](ADR-075-exchange-partition-autosetup.md) | Automatic PIOSXFER attachment and raw-p3 autoformat | Owner | Superseded by ADR-076 |
+| [076](ADR-076-discovery-only-storage-layout.md) | Discovery-only storage layout | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2345,13 +2346,14 @@ overlap, identity/index duplication, reserved bytes, unsupported schemes, and
 overflow fail closed before selection.
 
 Exactly one candidate is required: it must be non-boot and non-PIOS-system,
-reported FAT32, named exactly `PIOSXFER`, and use MBR FAT32 type `0x0b` or
-`0x0c`, or the exact GPT Microsoft Basic Data GUID (UEFI on-disk order).  The
-operator must explicitly request that candidate's external identity; no
-label-only, first-match, positional, automatic selection, or fallback exists.
-Duplicate eligible candidates reject the whole attachment.  The resulting
-handle binds the copied immutable fact to the policy instance epoch,
-enumeration generation, attachment generation, and full-fact fingerprint.
+reported FAT32, and use MBR FAT32 type `0x0b` or `0x0c`, or the exact GPT
+Microsoft Basic Data GUID (UEFI on-disk order). The volume label is diagnostic
+rather than authorization under ADR-076. The operator must explicitly request
+that candidate's external identity; no label-only, first-match, positional,
+automatic selection, or fallback exists. Duplicate eligible candidates reject
+the whole attachment. The resulting handle binds the copied immutable fact to
+the policy instance epoch, enumeration generation, attachment generation, and
+full-fact fingerprint.
 
 **Ownership boundary.** This is fixed caller-owned storage, fresh-zeroed and
 one-shot initialized, with core-0 ownership checked against the actual core
@@ -2474,8 +2476,8 @@ partition, attach live storage, or modify the existing FAT32/SD/WALFS/boot
 paths.
 
 **Decision.** The callback-backed `fat32_exchange_core` accepts only
-prevalidated attachment facts: identity, epoch, partition bounds, an exact
-eleven-byte volume label, and exact 512-byte callbacks. It supports bounded
+prevalidated attachment facts: identity, epoch, partition bounds, an optional
+exact eleven-byte expected volume label, and exact 512-byte callbacks. It supports bounded
 root-only uppercase ASCII 8.3 files and mirrors every FAT update to both FAT
 copies. Core-0/non-IRQ ownership and identity/epoch/generation-bound file
 capabilities are mandatory.

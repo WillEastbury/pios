@@ -99,6 +99,11 @@ static bool attachment_range_valid(const struct fat32_exchange_attachment *a)
            lba_range_representable(a->first_lba, a->block_count);
 }
 
+#ifdef FAT32_EXCHANGE_ENABLE_TEST_FORMAT
+#define FAT32_EXCHANGE_FORMAT_RESERVED    32U
+#define FAT32_EXCHANGE_FORMAT_FATS        2U
+#define FAT32_EXCHANGE_FORMAT_ROOT        2U
+
 static bool format_write(const struct fat32_exchange_attachment *a,
                          const struct fat32_exchange_io *io, u32 relative,
                          const u8 sector[FAT32_EXCHANGE_SECTOR_BYTES])
@@ -240,6 +245,7 @@ enum fat32_exchange_result fat32_exchange_format(
         return FAT32_EXCHANGE_IO;
     return FAT32_EXCHANGE_OK;
 }
+#endif
 
 static enum fat32_exchange_result sector_read(struct fat32_exchange_volume *v,
                                               u32 lba, u8 *out)

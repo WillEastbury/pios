@@ -127,7 +127,6 @@ static struct exchange_service_backend backend(void)
         .write = fake_write,
         .context = &disk,
         .writable = false,
-        .format_writable = false,
     };
 }
 
@@ -162,8 +161,7 @@ static int test_unlabeled_p3_mounts(void)
     CHECK(exchange_service_init(&service, mbr, TOTAL_BLOCKS, &io) ==
           EXCHANGE_SERVICE_OK);
     exchange_service_status(&service, &status);
-    CHECK(status.available && status.mounted &&
-          status.format_reason == EXCHANGE_SERVICE_FORMAT_EXISTING);
+    CHECK(status.available && status.mounted);
     CHECK(disk.reads > FAT_SECTORS * 2U && disk.writes == 0U &&
           !disk.touched_non_p3);
 
@@ -176,7 +174,7 @@ static int test_unlabeled_p3_mounts(void)
     return 0;
 }
 
-static int test_raw_p3_formats_only_p3(void)
+static int test_raw_p3_is_never_an_exchange_volume(void)
 {
     struct exchange_service service;
     struct exchange_service_status status;
@@ -187,87 +185,32 @@ static int test_raw_p3_formats_only_p3(void)
     entry(mbr, 2U, 0xDAU, P3_FIRST, P3_BLOCKS);
     memset(&disk, 0, sizeof(disk));
     disk.write_enabled = true;
-    io.format_writable = true;
     CHECK(exchange_service_init(&service, mbr, TOTAL_BLOCKS, &io) ==
-          EXCHANGE_SERVICE_OK);
+          EXCHANGE_SERVICE_PARTITION_REJECTED);
     exchange_service_status(&service, &status);
-    CHECK(status.available && status.mounted && status.read_only &&
-          status.formatted_this_boot &&
-          status.format_reason == EXCHANGE_SERVICE_FORMAT_RAW_FORMATTED);
-    CHECK(disk.writes > FAT_SECTORS * 2U && !disk.touched_non_p3);
-    CHECK(disk.sectors[0U][510U] == 0x55U &&
-          memcmp(disk.sectors[0U] + 71U, "PIOSXFER   ", 11U) == 0);
+    CHECK(!status.available && !status.mounted &&
+          status.last_result == EXCHANGE_SERVICE_PARTITION_REJECTED);
+    CHECK(disk.reads == 0U && disk.writes == 0U && !disk.touched_non_p3);
     return 0;
 }
 
-static void remove_fat_markers(void)
-{
-    memset(disk.sectors[0U] + 71U, 0, 11U);
-    memset(disk.sectors[0U] + 82U, 0, 8U);
-    disk.sectors[0U][510U] = 0U;
-    disk.sectors[0U][511U] = 0U;
-}
-
-static int expect_raw_residue_rejected(const u8 mbr[512])
+static int test_corrupt_fat32_p3_never_overwrites(void)
 {
     struct exchange_service service;
     struct exchange_service_status status;
     struct exchange_service_backend io = backend();
-
-    disk.write_enabled = true;
-    io.format_writable = true;
-    CHECK(exchange_service_init(&service, mbr, TOTAL_BLOCKS, &io) ==
-          EXCHANGE_SERVICE_CORE_FAILED);
-    exchange_service_status(&service, &status);
-    CHECK(!status.available && !status.mounted &&
-          status.format_reason == EXCHANGE_SERVICE_FORMAT_CORRUPT &&
-          disk.writes == 0U && !disk.touched_non_p3);
-    return 0;
-}
-
-static int test_raw_p3_residue_never_overwrites(void)
-{
     u8 mbr[512];
 
     valid_mbr(mbr);
-    entry(mbr, 2U, 0xDAU, P3_FIRST, P3_BLOCKS);
-
-    /* A damaged FAT32 root cluster stays protected without label/signatures. */
     setup_fat32((const u8 *)"PIOSXFER   ");
-    remove_fat_markers();
     memset(disk.sectors[0U] + 44U, 0, 4U);
-    if (expect_raw_residue_rejected(mbr))
-        return 1;
-
-    /* Other damaged BPB geometry is residue too, not permission to format. */
-    setup_fat32((const u8 *)"PIOSXFER   ");
-    remove_fat_markers();
-    memset(disk.sectors[0U] + 11U, 0, 2U);
-    memset(disk.sectors[0U] + 14U, 0, 2U);
-    disk.sectors[0U][13U] = 0U;
-    disk.sectors[0U][16U] = 0U;
-    memset(disk.sectors[0U] + 32U, 0, 4U);
-    memset(disk.sectors[0U] + 36U, 0, 4U);
-    return expect_raw_residue_rejected(mbr);
-}
-
-static int test_raw_p3_write_failure_is_bounded(void)
-{
-    struct exchange_service service;
-    struct exchange_service_status status;
-    struct exchange_service_backend io = backend();
-    u8 mbr[512];
-
-    valid_mbr(mbr);
-    entry(mbr, 2U, 0xDAU, P3_FIRST, P3_BLOCKS);
-    memset(&disk, 0, sizeof(disk));
-    io.format_writable = true;
+    disk.write_enabled = true;
     CHECK(exchange_service_init(&service, mbr, TOTAL_BLOCKS, &io) ==
           EXCHANGE_SERVICE_CORE_FAILED);
     exchange_service_status(&service, &status);
     CHECK(!status.available && !status.mounted &&
-          status.format_reason == EXCHANGE_SERVICE_FORMAT_IO &&
-          disk.writes == 1U && !disk.touched_non_p3);
+          status.last_result == EXCHANGE_SERVICE_CORE_FAILED);
+    CHECK(disk.reads > 0U && disk.writes == 0U && !disk.touched_non_p3);
     return 0;
 }
 
@@ -323,11 +266,11 @@ static int test_valid_p3_mounts_read_only_once(void)
 int main(void)
 {
     if (test_legacy_is_nonfatal() || test_unlabeled_p3_mounts() ||
-        test_raw_p3_formats_only_p3() || test_raw_p3_residue_never_overwrites() ||
-        test_raw_p3_write_failure_is_bounded() ||
+        test_raw_p3_is_never_an_exchange_volume() ||
+        test_corrupt_fat32_p3_never_overwrites() ||
         test_failed_reinit_clears_prior_mount() ||
         test_valid_p3_mounts_read_only_once())
         return 1;
-    puts("exchange service: p3-only attachment and raw autoformat PASS");
+    puts("exchange service: discovery-only p3 attachment PASS");
     return 0;
 }

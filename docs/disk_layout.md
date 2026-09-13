@@ -41,8 +41,8 @@ start/count/type/index records are immutable observations. The MBR
 active/status byte is retained only as diagnostic evidence: p1 may be active
 or inactive, and it never authorizes a role or writable access.
 
-`PIOSXFER` is an exact FAT32 volume-label requirement enforced by the
-filesystem adapter after it receives the p3 facts; it is not an MBR field.
+`PIOSXFER` is a diagnostic FAT32 volume label, not an attachment requirement;
+it is not an MBR field.
 After SD/WALFS setup, PIOS automatically mounts a valid p3 through
 range-limited callbacks. Hardware attachment is read-only and reported by
 `exchange status`; only QEMU's acceptance commands can mutate the volume.

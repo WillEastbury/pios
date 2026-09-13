@@ -251,9 +251,9 @@ TESTS_MANIFEST = {
     # only injected identity/geometry plus exact-sector callbacks; it does
     # not link the live FAT32, SD, WALFS, bootstrap, or kernel paths.
     "test_fat32_exchange_core.c": ["src/fat32_exchange_core.c"],
-    # Production-safe p3 boot attachment. The fake backend proves legacy
-    # media remains non-fatal, valid unlabeled FAT32 mounts without writes,
-    # and only explicitly raw blank p3 can be autoformatted in range.
+    # Production-safe discovery-only p3 boot attachment. The fake backend
+    # proves legacy media remains non-fatal, valid unlabeled FAT32 mounts
+    # without writes, and raw/corrupt p3 is unavailable without overwrites.
     "test_exchange_service.c": ["src/exchange_service.c",
                                 "src/exchange_volume_policy.c",
                                 "src/fat32_exchange_core.c",
@@ -271,6 +271,7 @@ TESTS_MANIFEST = {
 }
 
 TEST_CFLAGS = {
+    "test_fat32_exchange_core.c": ["-DFAT32_EXCHANGE_ENABLE_TEST_FORMAT"],
     "test_net_dispatch.c": ["-DPIOS_PLATFORM=2"],
     "test_nic_receive.c": ["-DPIOS_PLATFORM=2"],
     "test_crypto_soft.c": ["-DPIOS_PLATFORM=6"],

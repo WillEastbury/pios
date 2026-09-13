@@ -238,7 +238,7 @@ def persistence(a: Acceptance) -> None:
 
 
 def reject_exchange_p3(disk: pathlib.Path) -> None:
-    """Leave damaged FAT residue that must not be mistaken for blank raw p3."""
+    """Leave damaged FAT32 metadata that must remain unavailable and unchanged."""
     p3_start = 2048 + 64 * 1024 * 1024 // 512 + 96 * 1024 * 1024 // 512
     with disk.open("r+b") as image:
         image.seek(p3_start * 512 + 44)
@@ -258,6 +258,15 @@ def relabel_exchange_p3(disk: pathlib.Path) -> None:
         image.seek(p3_start * 512 + 71)
         image.write(b"USER VOLUME")
         image.flush()
+
+
+def mark_exchange_p3_raw(disk: pathlib.Path) -> None:
+    """Convert only the fixture's p3 type to raw to prove boot rejects it."""
+    with disk.open("r+b") as image:
+        image.seek(0x1DE + 4)
+        image.write(b"\xDA")
+        image.flush()
+
 
 def digest_range(path: pathlib.Path, first_sector: int, sectors: int) -> str:
     digest = hashlib.sha256()
@@ -305,7 +314,7 @@ def main() -> int:
         builder = subprocess.run(
             [sys.executable, str(REPO / "tools" / "build_qemu_disk_image.py"),
              "--pkg", str(KERNEL), "--out", str(DISK), "--disk-id", "0x71584F52",
-             "--exchange-raw"],
+             "--exchange"],
             cwd=REPO, capture_output=True, text=True,
         )
         if builder.returncode != 0 or not DISK.exists():
@@ -316,7 +325,6 @@ def main() -> int:
         if not wait_boot(proc):
             raise RuntimeError("QEMU never reached /api/status")
         a.command("exchange status", "exchange available=yes")
-        a.command("exchange status", "formatted=yes")
         a.command("walfs format confirm", "WALFS format OK")
         # Formatting is explicitly requested and initialization-dependent
         # services (principals/setup) come up only on the next boot.
@@ -348,7 +356,6 @@ def main() -> int:
         if not wait_boot(proc):
             raise RuntimeError("QEMU unlabeled-p3 reboot never reached /api/status")
         a.command("exchange status", "exchange available=yes")
-        a.command("exchange status", "formatted=no")
         if digest_range(DISK, p3_start, 64 * 1024 * 1024 // 512) != p3_before:
             raise RuntimeError("valid unlabeled p3 was rewritten")
         stop(proc)
@@ -365,6 +372,23 @@ def main() -> int:
             raise RuntimeError("corrupt p3 was overwritten")
         if digest_range(DISK, 0, p3_start) != protected_before:
             raise RuntimeError("p1/p2 changed during corrupt-p3 boot")
+        stop(proc)
+        proc = None
+
+        # Raw p3 is never an exchange target. The host fixture may change the
+        # MBR type to set up this negative case; PIOS itself must write neither
+        # the raw p3 contents nor p1/p2, while WALFS remains healthy.
+        mark_exchange_p3_raw(DISK)
+        p3_raw = digest_range(DISK, p3_start, 64 * 1024 * 1024 // 512)
+        protected_before = digest_range(DISK, 0, p3_start)
+        proc = launch(KERNEL, DISK)
+        if not wait_boot(proc):
+            raise RuntimeError("QEMU raw-p3 reboot never reached /api/status")
+        exercise_rejected_exchange(a)
+        if digest_range(DISK, p3_start, 64 * 1024 * 1024 // 512) != p3_raw:
+            raise RuntimeError("raw p3 was overwritten")
+        if digest_range(DISK, 0, p3_start) != protected_before:
+            raise RuntimeError("p1/p2 changed during raw-p3 boot")
         if a.errors:
             raise RuntimeError("; ".join(a.errors))
         average = sum(a.latencies) / len(a.latencies) if a.latencies else 0.0

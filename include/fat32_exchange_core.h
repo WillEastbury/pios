@@ -13,9 +13,6 @@
 #define FAT32_EXCHANGE_MAX_CLUSTERS       1048576U
 #define FAT32_EXCHANGE_MAX_FAT_SECTORS    8192U
 #define FAT32_EXCHANGE_MAX_FILE_BYTES     (2U * 1024U * 1024U)
-#define FAT32_EXCHANGE_FORMAT_RESERVED    32U
-#define FAT32_EXCHANGE_FORMAT_FATS        2U
-#define FAT32_EXCHANGE_FORMAT_ROOT        2U
 
 enum fat32_exchange_result {
     FAT32_EXCHANGE_OK = 0,
@@ -124,15 +121,12 @@ struct fat32_exchange_volume {
 /* Call before first mount; it also invalidates every prior file capability. */
 void fat32_exchange_volume_init(struct fat32_exchange_volume *volume);
 
-/*
- * Formats only this already-authorized partition as an empty FAT32 volume.
- * It writes boot/backup boot, FSInfo/backup FSInfo, both FAT mirrors, and the
- * root cluster; it never writes an MBR or data clusters beyond the root.
- * The caller must first establish that the existing sector is raw.
- */
+#ifdef FAT32_EXCHANGE_ENABLE_TEST_FORMAT
+/* Host-test-only formatter retained for the isolated FAT32 core proof. */
 enum fat32_exchange_result fat32_exchange_format(
     const struct fat32_exchange_attachment *attachment,
     const struct fat32_exchange_io *io);
+#endif
 
 enum fat32_exchange_result fat32_exchange_mount(
     struct fat32_exchange_volume *volume,
