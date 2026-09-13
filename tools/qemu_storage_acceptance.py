@@ -271,6 +271,13 @@ def main() -> int:
         proc = launch(KERNEL, DISK)
         if not wait_boot(proc):
             raise RuntimeError("QEMU never reached /api/status")
+        a.command("walfs format confirm", "WALFS format OK")
+        # Formatting is explicitly requested and initialization-dependent
+        # services (principals/setup) come up only on the next boot.
+        stop(proc)
+        proc = launch(KERNEL, DISK)
+        if not wait_boot(proc):
+            raise RuntimeError("QEMU did not boot after explicit WALFS format")
         exercise_fat(a)
         exercise_walfs(a)
         pressure(a)

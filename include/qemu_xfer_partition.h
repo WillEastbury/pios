@@ -1,5 +1,5 @@
 /*
- * qemu_xfer_partition.h - pure selection of the QEMU-only PIOSXFER MBR p3.
+ * qemu_xfer_partition.h - QEMU selection of shared-layout PIOSXFER MBR p3.
  *
  * This recognizes one deliberately fixed test layout.  It grants no block
  * authority; qemu_xfer.c binds the resulting facts to its QEMU-only callback.
@@ -32,9 +32,9 @@ _Static_assert(sizeof(struct qemu_xfer_partition) == 64U,
                "QEMU xfer partition facts require one cache line");
 
 /*
- * Selects exactly MBR primary partition 3.  All of p1/p2/p3 must have
- * non-overlapping, in-device spans; p3 is an inactive FAT32-LBA partition.
- * `total_blocks` is the authoritative capacity in 512-byte blocks.
+ * Selects exactly MBR primary partition 3 only after the shared validator
+ * accepts the fixed production p1/p2/p3 roles. `total_blocks` is the
+ * authoritative capacity in 512-byte blocks.
  */
 enum qemu_xfer_partition_result qemu_xfer_partition_select(
     const u8 mbr[QEMU_XFER_MBR_BYTES], u64 total_blocks,

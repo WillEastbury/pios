@@ -31,6 +31,14 @@ core0_main()  IRQ-driven network + disk + console reactor  (never returns)
 cores 1-3     per-core preemptive process schedulers
 ```
 
+The SD card uses a **pre-created** primary MBR layout: p1 FAT32 boot, p2 raw
+PIOS/WALFS, and p3 FAT32 `PIOSXFER`; p4 is empty. Stage0 remains a p1 reader.
+Stage2 validates the MBR and consumes only p2 for WALFS. It does not create,
+repartition, or implicitly format any partition; a blank p2 WALFS region needs
+the explicit `walfs format confirm` operation. See
+[disk_layout.md](disk_layout.md) for exact types and legacy two-partition
+compatibility.
+
 ---
 
 ## 1. Firmware → `kernel8.img`

@@ -58,8 +58,8 @@ for token in ("test_exchange_volume_policy.c",
 
 for path in (
     "src/bootstrap.c", "src/bootstrap_start.S", "src/bootstrap_trampoline.S",
-    "src/sd.c", "src/sdhost.c", "src/walfs.c", "src/fat32.c",
-    "include/sd.h", "include/walfs.h", "include/fat32.h",
+    "src/sd.c", "src/sdhost.c", "src/fat32.c",
+    "include/sd.h", "include/fat32.h",
 ):
     working = subprocess.run(
         ["git", "diff", "--quiet", "HEAD", "--", path], cwd=ROOT)

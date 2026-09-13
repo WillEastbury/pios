@@ -16,21 +16,39 @@ Related: [boot.md](boot.md) (how stage0 consumes these structures).
 ## 1. Partition map
 
 ```
-SD card
-├── MBR (LBA 0)                      0x55AA signature; p2 start @ mbr[0x1CE+8]
+SD card (pre-created primary MBR layout; PIOS never creates or repartitions it)
+├── MBR (LBA 0)                      0x55AA signature
 ├── Partition 1  — FAT32 boot        kernel8.img (stage0, board-detecting/
 │                                    multi-platform -- see §1.1), PIOSSTG2.PKG
 │                                    (may carry a Pi5 AND a BCM2837-family
 │                                    payload simultaneously), config.txt,
 │                                    start4.elf/fixup4.dat (Pi5), start.elf/
 │                                    fixup.dat (Pi3/Pi Zero 2W), *.dtb
-└── Partition 2  — PIOS system       raw kernel slots + control + records + WALFS
-    ├── 0x000000 .. 0x9FFFFF  (10 MiB)  reserved system area  (§2)
-    └── 0xA00000 .. end                 WALFS packs/cards/storage  (§5)
+├── Partition 2  — PIOS system       raw kernel slots + control + records + WALFS
+│   ├── 0x000000 .. 0x9FFFFF  (10 MiB)  reserved system area  (§2)
+│   └── 0xA00000 .. end                 WALFS packs/cards/storage  (§5)
+└── Partition 3  — FAT32 PIOSXFER    dedicated exchange volume (adapter-owned)
 ```
 
-Partition 2 is discovered at runtime from the MBR; all offsets below are
-**relative to the partition-2 start LBA**.
+`storage_layout_validate()` validates the required three-partition layout
+before WALFS accepts p2: the MBR signature; non-overlapping, in-device
+512-byte-sector spans; p1 type `0x0B`/`0x0C`, p2 type `0xDA`, p3 type
+`0x0B`/`0x0C`; and an all-zero p4. The numeric start/count/type/index records
+are immutable observations. The MBR active/status byte is retained only as
+diagnostic evidence: p1 may be active or inactive, and it never authorizes a
+role or writable access.
+
+`PIOSXFER` is an exact FAT32 volume-label requirement enforced by the
+filesystem adapter after it receives the p3 facts; it is not an MBR field.
+PIOS does not mount p3 on hardware. The present QEMU adapter is deliberately
+range-limited to p3 and verifies that label.
+
+An existing two-entry p1/p2 MBR is classified as `legacy-2` for read/mount
+compatibility and reports the exchange partition as missing. PIOS neither
+adds p3 nor changes the legacy table. Invalid or absent MBR layouts fail
+closed; no whole-disk or p1 fallback is used.
+
+All offsets below are **relative to the partition-2 start LBA**.
 
 - `walfs_partition_lba()` → partition-2 start LBA (the raw-slot/control/records
   base).
@@ -39,9 +57,11 @@ Partition 2 is discovered at runtime from the MBR; all offsets below are
 - `PIOS_RESERVED_BYTES = 10 MiB`, `WALFS_BOOT_SLOT_LBAS = 10 MiB/512 = 20480`
   sectors (`include/walfs.h:40-42,100-103`).
 
-> The legacy read-only fallback slot starts at LBA `2048` when the MBR is
-> unreadable. FAT update and boot-control writes are disabled unless partition 2
-> passes full bounds validation.
+> PIOS requires the partitions to be pre-created. It never writes the MBR,
+> creates/repartitions a partition, or implicitly formats any partition.
+> An empty p2 WALFS region remains offline until the explicit terminal command
+> `walfs format confirm`; that command formats WALFS data inside validated p2
+> only, never the MBR, p1, or p3.
 
 ### 1.1 Multi-platform stage0 and the two-tier size model
 

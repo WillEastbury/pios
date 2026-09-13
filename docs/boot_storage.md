@@ -195,12 +195,22 @@ Partition 2      Raw:
    +0x380000       boot control
    +0x400000       stage2 slot B
    +10 MiB         WALFS region
+Partition 3      FAT32 PIOSXFER exchange volume (not mounted by normal runtime)
 ```
 
 `WALFS_BOOT_SLOT_LBAS` = 10 MiB / 512 = 20480, so `WALFS_BASE_LBA` = 2048 +
-20480 = **22528**. `configure_walfs_region()` subtracts the reserved boot region
-from the partition size; `discover_partition()` prefers MBR partition 2 and can
-fall back to p1 or whole-disk.
+20480 = **22528**. The required pre-created MBR primary entries are p1 FAT32
+(`0x0B`/`0x0C`), p2 raw PIOS/WALFS (`0xDA`), and p3 FAT32 (`0x0B`/`0x0C`),
+with p4 empty. `storage_layout_validate()` checks the signature, sector-capacity
+bounds, and non-overlap before `discover_partition()` consumes p2. The active
+bit is diagnostic only, not storage authority. The exact `PIOSXFER` label is
+verified by a filesystem adapter, not inferred from the MBR.
+
+Two-partition p1/p2 cards remain `legacy-2` compatible for WALFS mounting and
+report a missing exchange volume. PIOS never creates/repartitions entries,
+writes the MBR, mounts p3 outside its QEMU acceptance adapter, or implicitly
+formats any partition. A blank WALFS area is initialized only by explicit
+`walfs format confirm`, which is restricted to validated p2.
 
 ---
 

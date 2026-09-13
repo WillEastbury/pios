@@ -23,7 +23,6 @@ changed = set(filter(None, git("diff", "--name-only", base).splitlines()))
 protected = {
     "src/fat32.c", "include/fat32.h",
     "src/sd.c", "include/sd.h", "src/sdhost.c", "include/sdhost.h",
-    "src/walfs.c", "include/walfs.h",
     "src/bootstrap.c", "src/bootstrap_start.S", "src/bootstrap_trampoline.S",
 }
 assert not (changed & protected), (
@@ -56,7 +55,10 @@ for needle in ("PIOS_PLATFORM_QEMU_VIRT", "authorized_lba",
     assert needle in adapter, f"QEMU adapter missing isolation guard: {needle}"
 for forbidden in ('"fat32.h"', '"walfs.h"', '"bootstrap.h"'):
     assert forbidden not in adapter, f"QEMU adapter must not use live FS path: {forbidden}"
-for needle in ("p3", "spans_overlap", "PIOSXFER"):
+for needle in ("p3", "PIOSXFER"):
     assert needle in selector or needle in (ROOT / "include" / "qemu_xfer_partition.h").read_text(encoding="utf-8")
+assert "storage_layout_validate" in selector, (
+    "QEMU exchange selection must use the shared production layout validator"
+)
 
 print(f"ADR-071 exchange core gate: merge-base {base[:12]}, live paths isolated")

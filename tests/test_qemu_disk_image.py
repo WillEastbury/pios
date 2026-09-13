@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static test for the optional QEMU p3 PIOSXFER disk layout."""
+"""Static test for the optional shared-layout p3 PIOSXFER disk fixture."""
 
 from __future__ import annotations
 
