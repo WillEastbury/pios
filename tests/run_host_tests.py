@@ -81,6 +81,9 @@ TESTS_MANIFEST = {
     # #76 association is evidence-only: fixed states, injected credit/control
     # publication/event/EAPOL summaries, liveness proof, and no CYW transport.
     "test_wifi_assoc_contract.c": ["src/wifi_assoc_contract.c"],
+    # #193 role-marker policy: p1 boot, explicitly marked p2 WALFS, and
+    # explicitly marked p3 FAT32 exchange. No storage I/O or formatting.
+    "test_storage_role_policy.c": ["src/storage_role_policy.c"],
     # First DWC2 milestone: verified BCM2837 DMA/IRQ-route facts plus a pure
     # generation-safe transfer ownership model. No controller hardware is
     # enabled or accessed by this host-tested contract.

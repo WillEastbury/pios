@@ -1,6 +1,6 @@
 # ADR-076: Discovery-only storage layout
 
-**Date:** 2026-09-13 · **Decider:** Owner (explicit correction) · **Status:** Accepted
+**Date:** 2026-09-13 · **Decider:** Owner (explicit correction) · **Status:** Superseded by ADR-078
 
 ## Decision
 

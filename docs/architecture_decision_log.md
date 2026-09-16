@@ -109,7 +109,7 @@ decision)
 | [063](#adr-063) | PCIe1 endpoint BAR/MMIO requires one offline lease | Owner | Accepted |
 | [064](#adr-064) | Read-only bounded partition-table observation | Owner | Accepted |
 | [066](#adr-066) | Offline callback-backed NVMe block-provider foundation | Owner | Accepted |
-| [067](#adr-067) | Offline dedicated FAT32 exchange-partition policy | Owner | Accepted |
+| [067](#adr-067) | Offline dedicated FAT32 exchange-partition policy | Owner | Superseded by ADR-078 |
 | [065](#adr-065) | Core-0-owned bounded NVMe namespace I/O contract | Owner | Accepted |
 | [068](#adr-068) | Bluetooth HCD/baud bootstrap remains offline-safe | Owner | Accepted |
 | [069](#adr-069) | Bluetooth HCI lifecycle; passive LE scan remains disabled | Owner | Accepted |
@@ -118,8 +118,9 @@ decision)
 | [073](ADR-073-qemu-storage-acceptance.md) | QEMU-only storage acceptance adapter | Owner | Accepted |
 | [074](ADR-074-precreated-three-partition-layout.md) | Pre-created three-primary storage layout | Owner | Accepted |
 | [075](ADR-075-exchange-partition-autosetup.md) | Automatic PIOSXFER attachment and raw-p3 autoformat | Owner | Superseded by ADR-076 |
-| [076](ADR-076-discovery-only-storage-layout.md) | Discovery-only storage layout | Owner | Accepted |
+| [076](ADR-076-discovery-only-storage-layout.md) | Discovery-only storage layout | Owner | Superseded by ADR-078 |
 | [077](ADR-077-wifi-association-control.md) | Offline Wi-Fi association control contract | Owner | Accepted |
+| [078](ADR-078-storage-role-markers.md) | Explicit storage role markers | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
