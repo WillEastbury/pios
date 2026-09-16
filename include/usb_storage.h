@@ -11,11 +11,12 @@
 #include "types.h"
 
 /*
- * READ CAPACITY(16) is implemented but disabled until it has been exercised
- * against a real >2 TB device. READ CAPACITY(10) remains the default path.
+ * SBC requires READ CAPACITY(16) after READ CAPACITY(10) returns its
+ * 0xffffffff sentinel.  Keep this overridable for deliberately constrained
+ * images, but enable large-media discovery in normal builds.
  */
 #ifndef PIOS_ENABLE_SCSI_CAPACITY16
-#define PIOS_ENABLE_SCSI_CAPACITY16 0
+#define PIOS_ENABLE_SCSI_CAPACITY16 1
 #endif
 
 /* Register the mass storage driver with the USB framework */

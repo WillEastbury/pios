@@ -550,7 +550,7 @@ bool macb_rx_engine_recv(u8 *frame, u32 frame_capacity, u32 *frame_length,
     rx_release_descriptor(i);
     rx_advance();
     DTRACE(DTRACE_CAT_MAC, DT_MAC_RXMALFORMED, i, ctrl, length, 0u);
-    return false;
+    return true;
 }
 
 /* ======================================================================== */

@@ -2750,9 +2750,13 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
         return;
     }
     if ((hook >= PV_HOOK_NET_LISTEN && hook <= PV_HOOK_NET_REGISTER) ||
-        (hook >= PV_HOOK_NET_CONNECT && hook <= PV_HOOK_NET_RECVSPAN)) {
+        (hook >= PV_HOOK_NET_CONNECT && hook <= PV_HOOK_NET_RECVSPAN) ||
+        (hook >= PV_HOOK_NET_DATAGRAMBIND &&
+         hook <= PV_HOOK_NET_DATAGRAMCLOSE)) {
         if (pv_net_hook && pv_net_hook(ctx, hook, rd, rs1, rs2)) return;
-        ctx->regs[rd] = (hook == PV_HOOK_NET_READ || hook == PV_HOOK_NET_RECVSPAN)
+        ctx->regs[rd] = (hook == PV_HOOK_NET_READ || hook == PV_HOOK_NET_RECVSPAN ||
+                         hook == PV_HOOK_NET_DATAGRAMRECV ||
+                         hook == PV_HOOK_NET_DATAGRAMPEER)
             ? pv_arena_finish(ctx, 0) : 0;
         ctx->host_status = 1;
         return;
@@ -3047,9 +3051,13 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
         return;
     }
     if ((hook >= PV_HOOK_NET_LISTEN && hook <= PV_HOOK_NET_REGISTER) ||
-        (hook >= PV_HOOK_NET_CONNECT && hook <= PV_HOOK_NET_RECVSPAN)) {
+        (hook >= PV_HOOK_NET_CONNECT && hook <= PV_HOOK_NET_RECVSPAN) ||
+        (hook >= PV_HOOK_NET_DATAGRAMBIND &&
+         hook <= PV_HOOK_NET_DATAGRAMCLOSE)) {
         if (pv_net_hook && pv_net_hook(ctx, hook, rd, rs1, rs2)) return;
-        ctx->regs[rd] = (hook == PV_HOOK_NET_READ || hook == PV_HOOK_NET_RECVSPAN)
+        ctx->regs[rd] = (hook == PV_HOOK_NET_READ || hook == PV_HOOK_NET_RECVSPAN ||
+                         hook == PV_HOOK_NET_DATAGRAMRECV ||
+                         hook == PV_HOOK_NET_DATAGRAMPEER)
             ? pv_arena_finish(ctx, 0) : 0;
         ctx->host_status = 1;
         return;

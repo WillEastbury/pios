@@ -82,6 +82,9 @@ bool mmu_switch_to_user(u32 core, u32 slot);
 /* Toggle user-process visibility of the IPC SHM window (coarse 2MB block). */
 bool mmu_user_ipc_shm_window(u32 core, u32 slot, bool enable);
 bool mmu_user_pte_snapshot(u32 core, u32 slot, u64 va, u64 *l1e, u64 *l2e, u64 *l3e);
+/* Verify an identity-mapped kernel span is Normal-WB, Inner-Shareable in the
+ * actual live low-memory tables. Intended for boot-time control allocation. */
+bool mmu_kernel_range_is_wb_is(u64 start, u64 size);
 
 /* Switch active TTBR0 back to the global kernel table */
 void mmu_switch_to_kernel(void);

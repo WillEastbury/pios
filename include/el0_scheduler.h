@@ -11,6 +11,8 @@
  * owns the pctl intent line and command-ring head/entries; the kernel owns the
  * ring tail and metadata line. A generation in every publication makes slot
  * reuse fail closed.
+ * User C must be compiled with -ffixed-x21: proc_el0_enter reserves x21 as the
+ * scheduler-slot pointer for the process lifetime, not just function entry.
  */
 #define EL0_SCHED_ALIAS_BASE   0x2003000000ULL
 #define EL0_SCHED_OFFSET       0x00080000UL

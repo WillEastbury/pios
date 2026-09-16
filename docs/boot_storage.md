@@ -44,11 +44,14 @@ BPB, walk cluster chains.
 
 ### 1.3 Payload selection
 
-1. If `PIOSSTG2.PKG` exists on the FAT partition, load it to
-   `BOOT_STAGING_ADDR`, parse the manifest, select the entry matching this
-   platform, write it into the raw slot and update boot control.
-2. Otherwise boot from the raw slot: **pending → active → FAT fallback**
-   (`BOOT_FALLBACK_LBA` 2048).
+Stage0 uses **armed O → validated pending A/B → validated known-good active
+A/B → FAT recovery import to A**. O is not a third raw slot: it loads the
+selected platform payload from FAT `PIOSSTG2.PKG` directly through the
+trampoline only after the exact whole-package identity matches boot control.
+Stage0 consumes O before jumping it, so a wedged O image cannot loop; it never
+changes A/B active/good/pending state. An unarmed FAT package is recovery-only
+while a raw choice is bootable. Shared FAT assets load independently in every
+path.
 
 Platform id: QEMU builds always select `QEMU_VIRT`; otherwise
 `BOARD_FAMILY_BCM2837 → BCM2837_FAMILY`, else `PI5`.
@@ -106,11 +109,12 @@ From `include/walfs.h`:
 | Slot A offset | `0x000000` |
 | Slot B offset | `0x400000` |
 | Bootctrl offset | `0x380000` |
-| Bootctrl magic / version | `'PBC0'` / 1 |
+| Bootctrl magic / version | `'PBC0'` / 2 |
 | Default tries | 1 |
 
 Bootctrl fields: `active`, `pending`, `tries_left`, `last_boot`, `good_mask`,
-`generation`, `checksum`. Its LBA is
+`generation`, plus `override_mode`, `override_tries`, exact u64
+`override_package_id`, and a version-aware checksum. Its LBA is
 `walfs_partition_lba() + PIOS_BOOTCTRL_OFFSET/512`.
 
 ### 2.2 State machine
@@ -119,8 +123,8 @@ Bootctrl fields: `active`, `pending`, `tries_left`, `last_boot`, `good_mask`,
   the read fails.
 - `pios_bootctrl_mark_pending()` — set `pending`, `tries = 1`, clear `last_boot`,
   clear that slot's good bit, bump generation.
-- `pios_bootctrl_mark_success()` — `active = last_boot`, clear pending, clear
-  tries, OR the booted slot into `good_mask`.
+- `pios_bootctrl_mark_success()` — promotes only A/B `last_boot` values. A
+  consumed O boot is a no-op: O never becomes active or good.
 
 A pending slot that fails to boot exhausts its single try and stage0 falls back
 to the previous active slot.
@@ -153,6 +157,18 @@ grinds through a NIC wedge and resumes from the server's acknowledged
 > the board is under stress, because a lost response costs one chunk rather than
 > the whole transfer.
 
+The HTTP updater writes a **single raw platform payload**, capped at
+`PIOS_STAGE2_ZONE_BYTES`; it must not receive FAT `PIOSSTG2.PKG`, which is a
+larger `PGS2` container consumed by stage0. For Pi 5 use
+`build_pi5_stage2\PIOS_PI5_STAGE2.BIN`. A rebooted upload must name the exact
+candidate version, so an older rollback/FAT boot fails rather than reporting
+reachability as success:
+
+```powershell
+python tools\pios_ota_update.py build_pi5_stage2\PIOS_PI5_STAGE2.BIN `
+  --chunked --reboot --expected-version vYYYYMMDD.HHMMSS
+```
+
 Staging is `ota_stage_buf` (highmem when available, capacity
 `PIOS_STAGE2_ZONE_BYTES`; QEMU uses a static fallback). Commit order is
 **payload first, header last**: `http_write_kernel_payload_range()` then
@@ -179,12 +195,28 @@ Partition 2      Raw:
    +0x380000       boot control
    +0x400000       stage2 slot B
    +10 MiB         WALFS region
+Partition 3      Existing FAT32 PIOSXFER exchange volume (optional)
 ```
 
 `WALFS_BOOT_SLOT_LBAS` = 10 MiB / 512 = 20480, so `WALFS_BASE_LBA` = 2048 +
-20480 = **22528**. `configure_walfs_region()` subtracts the reserved boot region
-from the partition size; `discover_partition()` prefers MBR partition 2 and can
-fall back to p1 or whole-disk.
+20480 = **22528**. The required WALFS MBR entries are p1 FAT32
+(`0x0B`/`0x0C`) and p2 raw PIOS/WALFS, with p4 empty. P3 FAT32 PIOSXFER is
+optional: `storage_layout_validate()` checks p1/p2 signature,
+sector-capacity bounds, and non-overlap before `discover_partition()` consumes
+p2, while retaining an invalid p3 only as a diagnostic. The strict
+three-partition `storage_layout_validate_exchange()` gate alone authorizes p3
+for exchange attachment. The active bit is diagnostic only, not storage
+authority. The volume label is descriptive only and is not inferred from the
+MBR.
+
+Two-partition p1/p2 cards remain `legacy-2` compatible for WALFS mounting and
+report a missing exchange volume. At boot, any mountable FAT32 p3 attaches
+regardless of label. Raw `0xDA`, malformed, and corrupt p3 is unavailable and
+remains unchanged. PIOS never automatically formats p3 or writes its MBR,
+while p1 and p2 remain inaccessible through exchange callbacks. Hardware
+mounts are read-only and have no transfer commands; QEMU retains bounded
+acceptance commands. A blank WALFS area is initialized
+only by explicit `walfs format confirm`, restricted to validated p2.
 
 ---
 
@@ -403,9 +435,10 @@ python tests\run_host_tests.py
 # QEMU regression: 29 assertions + load battery
 $env:PYTHONIOENCODING="utf-8"; python tools\qemu_smoke.py --build
 
-# OTA to a live board (resumable path)
-python tools\pios_ota_update.py real_kernel.img --host 192.168.0.201 `
-    --chunked --reboot --commit-timeout 240 --timeout 15
+# OTA to a live board (resumable raw-payload path)
+python tools\pios_ota_update.py build_pi5_stage2\PIOS_PI5_STAGE2.BIN `
+    --host 192.168.0.201 --chunked --reboot `
+    --expected-version vYYYYMMDD.HHMMSS --commit-timeout 240 --timeout 15
 ```
 
 Environment notes: do not assume `make` exists or that the AArch64 toolchain and

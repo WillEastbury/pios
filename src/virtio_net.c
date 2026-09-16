@@ -6,6 +6,7 @@
  */
 
 #include "virtio_net.h"
+#include "nic.h"
 
 #if PIOS_HAS_VIRTIO_NET
 
@@ -384,15 +385,14 @@ bool virtio_net_recv(u8 *frame, u32 *len)
     u32 id = e->id & (VQ_SIZE - 1);
     u32 used_len = e->len;
 
-    bool ok = false;
-    if (used_len > vnet_hdr_len) {
+    *len = 0U;
+    if (used_len > vnet_hdr_len &&
+        used_len <= VNET_BUF_SIZE &&
+        used_len - vnet_hdr_len <= ETH_FRAME_MAX) {
         u32 payload = used_len - vnet_hdr_len;
-        if (payload > VNET_BUF_SIZE - vnet_hdr_len)
-            payload = VNET_BUF_SIZE - vnet_hdr_len;
         invalidate(rx_buf[id], used_len);
         simd_memcpy(frame, rx_buf[id] + vnet_hdr_len, payload);
         *len = payload;
-        ok = true;
         g_vnet_rx_ok++;
         DTRACE(DTRACE_CAT_MAC, DT_MAC_RX, payload, g_vnet_rx_ok, backlog, 0);
     }
@@ -413,7 +413,7 @@ bool virtio_net_recv(u8 *frame, u32 *len)
     vnet_notify(VQ_RX);
 
     rx_used_seen++;
-    return ok;
+    return true;
 }
 
 #else  /* !PIOS_HAS_VIRTIO_NET */

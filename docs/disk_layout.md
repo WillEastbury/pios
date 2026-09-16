@@ -16,21 +16,44 @@ Related: [boot.md](boot.md) (how stage0 consumes these structures).
 ## 1. Partition map
 
 ```
-SD card
-├── MBR (LBA 0)                      0x55AA signature; p2 start @ mbr[0x1CE+8]
+SD card (pre-created primary MBR layout; PIOS never creates or repartitions it)
+├── MBR (LBA 0)                      0x55AA signature
 ├── Partition 1  — FAT32 boot        kernel8.img (stage0, board-detecting/
 │                                    multi-platform -- see §1.1), PIOSSTG2.PKG
 │                                    (may carry a Pi5 AND a BCM2837-family
 │                                    payload simultaneously), config.txt,
 │                                    start4.elf/fixup4.dat (Pi5), start.elf/
 │                                    fixup.dat (Pi3/Pi Zero 2W), *.dtb
-└── Partition 2  — PIOS system       raw kernel slots + control + records + WALFS
-    ├── 0x000000 .. 0x9FFFFF  (10 MiB)  reserved system area  (§2)
-    └── 0xA00000 .. end                 WALFS packs/cards/storage  (§5)
+├── Partition 2  — PIOS system       raw kernel slots + control + records + WALFS
+│   ├── 0x000000 .. 0x9FFFFF  (10 MiB)  reserved system area  (§2)
+│   └── 0xA00000 .. end                 WALFS packs/cards/storage  (§5)
+└── Partition 3  — FAT32 PIOSXFER    dedicated exchange volume (adapter-owned)
 ```
 
-Partition 2 is discovered at runtime from the MBR; all offsets below are
-**relative to the partition-2 start LBA**.
+`storage_layout_validate()` validates the WALFS-required p1/p2 layout before
+WALFS accepts p2: the MBR signature, in-device 512-byte-sector spans,
+non-overlap, p1 type `0x0B`/`0x0C`, and an all-zero p4. P3 is optional to
+WALFS: an absent, malformed, wrong-type, out-of-range, or overlapping p3
+leaves valid p1/p2 as `legacy-2` with the p3 diagnostic recorded. Only
+`storage_layout_validate_exchange()` applies the strict p1/p2/p3 type and
+non-overlap rules before an exchange attachment. The numeric
+start/count/type/index records are immutable observations. The MBR
+active/status byte is retained only as diagnostic evidence: p1 may be active
+or inactive, and it never authorizes a role or writable access.
+
+`PIOSXFER` is a diagnostic FAT32 volume label, not an attachment requirement;
+it is not an MBR field.
+After SD/WALFS setup, PIOS automatically mounts a valid p3 through
+range-limited callbacks. Hardware attachment is read-only and reported by
+`exchange status`; only QEMU's acceptance commands can mutate the volume.
+PIOS never formats p3 automatically.
+
+An existing two-entry p1/p2 MBR is classified as `legacy-2` for read/mount
+compatibility and reports the exchange partition as missing. PIOS neither
+adds p3 nor changes the legacy table. Invalid or absent MBR layouts fail
+closed; no whole-disk or p1 fallback is used.
+
+All offsets below are **relative to the partition-2 start LBA**.
 
 - `walfs_partition_lba()` → partition-2 start LBA (the raw-slot/control/records
   base).
@@ -39,9 +62,11 @@ Partition 2 is discovered at runtime from the MBR; all offsets below are
 - `PIOS_RESERVED_BYTES = 10 MiB`, `WALFS_BOOT_SLOT_LBAS = 10 MiB/512 = 20480`
   sectors (`include/walfs.h:40-42,100-103`).
 
-> The legacy read-only fallback slot starts at LBA `2048` when the MBR is
-> unreadable. FAT update and boot-control writes are disabled unless partition 2
-> passes full bounds validation.
+> PIOS requires the partitions to be pre-created. It never writes the MBR,
+> creates/repartitions a partition, or implicitly formats any partition.
+> An empty p2 WALFS region remains offline until the explicit terminal command
+> `walfs format confirm`; that command formats WALFS data inside validated p2
+> only, never the MBR, p1, or p3.
 
 ### 1.1 Multi-platform stage0 and the two-tier size model
 
@@ -131,31 +156,44 @@ selected.
 
 ---
 
-## 3. Boot-control sector (`PBC0`)
+## 3. Boot-control sector (`PBC0`, v2)
 
-A single 512-byte sector at partition-2 offset `0x200000` (LBA =
-`walfs_partition_lba() + 0x200000/512`) that stage0 and the kernel use to drive
-A/B selection (`src/kernel.c:3799-3818`).
+A single 512-byte sector at partition-2 offset `0x380000` (LBA =
+`walfs_partition_lba() + 0x380000/512`) that stage0 and the kernel use to
+drive A/B selection and the one-shot FAT-direct O override.
 
-Little-endian u32 layout (`include/walfs.h:71-85`):
+Little-endian layout (`include/walfs.h`):
 
 | Offset | Field | Meaning |
 |---|---|---|
 | `0x00` | magic | `PIOS_BOOTCTRL_MAGIC = 0x50424330` (`'PBC0'`) |
-| `0x04` | version | `PIOS_BOOTCTRL_VERSION = 1` |
+| `0x04` | version | `PIOS_BOOTCTRL_VERSION = 2` |
 | `0x08` | active_slot | currently-good slot (A=0, B=1) |
 | `0x0C` | pending_slot | candidate slot, or `0xFFFFFFFF` (NONE) |
 | `0x10` | tries_left | boot attempts remaining for the pending slot |
 | `0x14` | last_boot | slot stage0 last jumped into |
 | `0x18` | good_mask | bitmask of slots proven healthy (`1<<slot`) |
 | `0x1C` | generation | monotonically increasing version |
-| `0x20` | checksum | rolling hash over bytes `[0x00..0x1F]` |
+| `0x20` | override_mode | `NONE=0`, `O=1` |
+| `0x24` | override_tries | one-shot O attempt count (normally 1) |
+| `0x28` | override_package_id | exact whole-FAT-package FNV-1a identity (u64) |
+| `0x30` | checksum | rolling hash over bytes `[0x00..0x2F]` |
 
-- Slot ids: `SLOT_A=0`, `SLOT_B=1`, `SLOT_NONE=0xFFFFFFFF`, default tries `1`
-  (`include/walfs.h:73-76`).
+- Slot ids: `SLOT_A=0`, `SLOT_B=1`, `SLOT_O=2`, `SLOT_NONE=0xFFFFFFFF`.
+  O is a logical FAT-direct override, never a raw disk slot and never active
+  or good.
 - Checksum: seed `0xB007C0DE`, `sum = (sum<<5) ^ (sum>>27) ^ byte` over the first
-  `0x20` bytes (`src/kernel.c:3782-3787`). A block is valid only if magic,
-  version, and checksum all match (`src/kernel.c:3790-3797`).
+  `0x30` bytes. Version-1 records retain their checksum at `0x20` over
+  `[0x00..0x1F]`; both kernel and stage0 validate and migrate valid v1 records
+  in memory to v2 with the O fields clear, then persist v2 when a safe sector
+  write succeeds.
+
+Stage0 precedence is **armed valid O → validated pending A/B → validated
+known-good active A/B → FAT recovery import to A**. O is consumed and written
+clear with `last_boot=O` and `generation++` before its FAT payload is jumped;
+a missing, invalid, or identity-mismatched package is likewise cleared and
+falls through to A/B in that same boot. A bootable raw choice suppresses the
+ordinary FAT installer, while shared FAT assets remain independently loaded.
 
 ### State transitions (`src/kernel.c`)
 
@@ -167,9 +205,9 @@ Little-endian u32 layout (`include/walfs.h:71-85`):
 | `pios_bootctrl_reset_a()` | hard reset to A | `3881-3893` |
 | `pios_bootctrl_mark_success()` | sets `good_mask |= 1<<last_boot`, pending=NONE, tries=0, gen++ | `3916-3932` |
 
-Operator commands: `bootctrl status | clear-pending | reset-a confirm |
-test-invalid-b confirm` (`src/kernel.c:3981-4012`); status fields printed by
-`http_append_bootctrl_status()` (`src/kernel.c:3942-3979`). See
+Operator commands: `bootctrl status | arm-o <package-id> confirm | clear-o |
+clear-pending | reset-a confirm | test-invalid-b confirm`; status prints O
+state/id alongside A/B fields. See
 [boot.md](boot.md#6-health-gated-ab-success-and-rollback) for the health gate.
 
 ---

@@ -9,6 +9,7 @@
  * so CYW43455 SDIO1/SDIO2 hosts do not own core 0 at boot. TCP/IP is shared.
  */
 
+#include "types.h"
 #include "nic.h"
 #include "macb.h"
 #include "genet.h"
@@ -1282,53 +1283,55 @@ bool nic_recv_on(nic_iface_t iface, u8 *frame, u32 *len, bool *checksum_trusted)
     if (checksum_trusted)
         *checksum_trusted = false;
     const struct nic_ops *ops = nic_ops_for(iface);
-    if (!ops || !ops->recv) {
-        (void)frame;
-        (void)len;
+    if (!ops || !ops->recv || !frame || !len)
         return false;
+
+    bool rx_trusted = false;
+    *len = 0U;
+    if (!ops->recv(frame, len, &rx_trusted))
+        return false;
+    /* A consumed but rejected descriptor is progress, not an empty ring.
+     * The transport owner counts it against its bounded receive quantum. */
+    if (*len == 0U || *len > ETH_FRAME_MAX) {
+        *len = 0U;
+        pkt_counts.dropped++;
+        return true;
     }
+    if (checksum_trusted)
+        *checksum_trusted = rx_trusted;
 
-    for (u32 attempt = 0; attempt < 16; attempt++) {
-        bool rx_trusted = false;
-        bool ok = ops->recv(frame, len, &rx_trusted);
-        if (!ok)
-            return false;
-        if (checksum_trusted)
-            *checksum_trusted = rx_trusted;
-
-        if (nic_drop_arp_broadcast_not_for_us(iface, frame, *len)) {
-            filter_rx_dropped++;
-            pkt_counts.rx_arp_not_us++;
-            pkt_counts.dropped++;
-            pkt_counts.flood_blocked++;
-            nic_render_counter_panel();
-            continue;
-        }
-
-        if (!nic_filter_allows(NIC_FILTER_DIR_IN, frame, *len, iface)) {
-            filter_rx_dropped++;
-            pkt_counts.rx_filter_drop++;
-            pkt_counts.firewalled++;
-            nic_render_counter_panel();
-            fb_filter_drop('R', filter_rx_dropped);
-            continue;
-        }
-
-        nic_count_packet(false, frame, *len);
-        if (rx_trusted)
-            pkt_counts.rx_csum_trusted++;
-        else
-            pkt_counts.rx_csum_untrusted++;
-
-        if (packet_dump_enabled)
-            fb_pkt_dump('R', 0x0080C8FF, frame, *len);
-        pioscap_rx(frame, *len);
-        pkt_counts.processed++;
+    if (nic_drop_arp_broadcast_not_for_us(iface, frame, *len)) {
+        filter_rx_dropped++;
+        pkt_counts.rx_arp_not_us++;
+        pkt_counts.dropped++;
+        pkt_counts.flood_blocked++;
         nic_render_counter_panel();
+        *len = 0U;
         return true;
     }
 
-    return false;
+    if (!nic_filter_allows(NIC_FILTER_DIR_IN, frame, *len, iface)) {
+        filter_rx_dropped++;
+        pkt_counts.rx_filter_drop++;
+        pkt_counts.firewalled++;
+        nic_render_counter_panel();
+        fb_filter_drop('R', filter_rx_dropped);
+        *len = 0U;
+        return true;
+    }
+
+    nic_count_packet(false, frame, *len);
+    if (rx_trusted)
+        pkt_counts.rx_csum_trusted++;
+    else
+        pkt_counts.rx_csum_untrusted++;
+
+    if (packet_dump_enabled)
+        fb_pkt_dump('R', 0x0080C8FF, frame, *len);
+    pioscap_rx(frame, *len);
+    pkt_counts.processed++;
+    nic_render_counter_panel();
+    return true;
 }
 
 bool nic_recv(u8 *frame, u32 *len, bool *checksum_trusted)

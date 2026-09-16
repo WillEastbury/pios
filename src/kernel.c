@@ -33,6 +33,7 @@
 #include "core.h"
 #include "core_env.h"
 #include "stage0_diag.h"
+#include "boot_precedence.h"
 #include "simd.h"
 #include "mmu.h"
 #include "gic.h"
@@ -97,6 +98,8 @@
 #include "stackprot.h"
 #include "stack_canary.h"
 #include "fat32.h"
+#include "exchange.h"
+#include "qemu_xfer.h"
 #include "pios_addr.h"
 #include "picoscript.h"
 #include "mailbox.h"
@@ -105,6 +108,7 @@
 #include "pixe_request.h"
 #include "pixe_host.h"
 #include "ide_assets.h"
+#include "ide_asset_pack.h"
 #include "pico_hooks.h"
 #include "keystore.h"
 #include "tls.h"
@@ -846,6 +850,19 @@ static void wifi_upload_progress(void)
             (void)macb_rx_liveness_recover(timer_monotonic_ms());
     }
 #endif
+    watchdog_hw_pet();
+}
+
+static void wifi_command_begin(void)
+{
+    cyw43_set_progress_hook(wifi_upload_progress);
+    watchdog_hw_pet();
+}
+
+static void wifi_command_finish(void)
+{
+    /* Restore the normal post-boot watchdog policy; never leave a failed
+     * bring-up command able to turn a later hardware stall into a hang. */
     watchdog_hw_pet();
 }
 
@@ -1694,6 +1711,7 @@ static bool http_parse_u64(const char *s, u64 *out)
         else if (base == 16 && c >= 'A' && c <= 'F') d = (u32)(c - 'A' + 10);
         else return false;
         if (d >= base) return false;
+        if (v > (~(u64)0 - d) / base) return false;
         v = v * (u64)base + (u64)d;
     }
     *out = v;
@@ -1871,8 +1889,14 @@ static u32 http_core_ram_used_kib(u32 core)
     struct core_env *e = core_env_of(core);
     if (e->id == core && e->ram_base == (u8 *)(usize)core_ram_bases[core] &&
         e->ram_end == e->ram_base + CORE_PRIV_SIZE &&
-        e->heap_ptr >= e->ram_base && e->heap_ptr <= e->ram_end)
-        return (u32)((usize)(e->heap_ptr - e->ram_base) >> 10);
+        e->heap_ptr >= e->ram_base && e->heap_ptr <= e->ram_end) {
+        extern u8 __heap_start;
+        usize base = (usize)e->ram_base;
+        if (core == CORE_NET && base < (usize)&__heap_start)
+            base = (usize)&__heap_start;
+        return (usize)e->heap_ptr >= base ?
+            (u32)(((usize)e->heap_ptr - base) >> 10) : 0U;
+    }
     return 0;
 }
 
@@ -2602,11 +2626,14 @@ static void http_append_mem_analyze(char *out, u32 *len, u32 max);
 static void http_append_walfs_list_text(char *out, u32 *len, u32 max, const char *path);
 static void http_append_bootctrl_status(char *out, u32 *len, u32 max);
 static bool pios_bootctrl_clear_pending(void);
+static bool pios_bootctrl_clear_o(void);
+static bool pios_bootctrl_arm_o_text(const char *text);
 static bool pios_bootctrl_reset_a(void);
 static bool pios_bootctrl_test_invalid_b(void);
 static bool http_write_kernel_slot_header(u32 slot_offset, u32 payload_len, bool valid);
 static bool ui_parse_ip4(const char *s, u32 *out);
 static bool ui_parse_u32(const char *s, u32 *out);
+static bool ui_parse_u64(const char *s, u64 *out);
 static bool irq_cntpns_test(u64 *before_out, u64 *after_out, u32 *last_intid_out,
                             u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *unhandled_out);
 static u32 irq_cntpns_step(u32 depth, u32 *d_ctlr_out, u32 *c_ctlr_out, u32 *pmr_out,
@@ -3121,7 +3148,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             "PIOS terminal help\n"
             "Run commands exactly as shown; category names are help topics, not command prefixes.\n"
             "Examples: status | ps | services | netstat | ls / | firewall list | addr wal:0/3 | bootctrl status | reboot confirm\n"
-            "Diagnostics: walfs verify | walfs compact | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | pcie1 | pcie1 aer | lzero | picocompress selftest | picoweb selftest\n"
+            "Diagnostics: walfs verify | exchange status | xfer status | watchdog | crypto selftest | arp probe | nic dump on | nic counters | net pump | pcie1 | pcie1 aer | lzero | picocompress selftest | picoweb selftest\n"
             "Client tools: arp | route | ping <ip-or-cached-host> [count] | traceroute <ip-or-cached-host> [max_hops] | dnslookup <hostname>\n"
             "Command help: help status | help netstat | help firewall | help reboot | help peek | help walfs | help db | help cachestats\n"
             "Category help on UART/TCP console: help core | help fs | help net | help svc | help dev\n");
@@ -3168,9 +3195,9 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         } else if (http_streq(topic, "mem")) {
             http_append(out, &len, max, "mem analyze\n  Show kernel image, raw-slot, per-core RAM, and process memory layout diagnostics.\n");
         } else if (http_streq(topic, "fs") || http_streq(topic, "ls") || http_streq(topic, "fsinspect")) {
-            http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path] | walfs status | walfs verify | walfs compact | walfs format confirm\n  WALFS listing/status, integrity verify, non-destructive compact, plus confirmed reserved-base format.\n");
+            http_append(out, &len, max, "ls [absolute-path] | fsinspect [absolute-path] | walfs status | exchange status | walfs verify | walfs compact | walfs format confirm\n  WALFS listing/status, read-only exchange attachment status, integrity verify, non-destructive compact, plus confirmed reserved-base format.\n");
         } else if (http_streq(topic, "bootctrl")) {
-            http_append(out, &len, max, "bootctrl status | bootctrl clear-pending | bootctrl reset-a confirm | bootctrl test-invalid-b confirm\n  Show/repair/test stage0 A/B boot-control state without host raw-disk access.\n");
+            http_append(out, &len, max, "bootctrl status | bootctrl arm-o <package-id> confirm | bootctrl clear-o | bootctrl clear-pending | bootctrl reset-a confirm | bootctrl test-invalid-b confirm\n  Arm/clear one-shot FAT-direct O or inspect/repair A/B boot control.\n");
         } else if (http_streq(topic, "dma")) {
             http_append(out, &len, max, "dma status | dma selftest\n  Show DMA channel registers, selftest result, selected CB address mode, and retry selftest.\n");
         } else if (http_streq(topic, "adc")) {
@@ -3213,6 +3240,13 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                 "  Pi 5 FFC/HAT root. Enum any device/switch. LevelZero B→E path; MSI masked.\n");
         } else if (http_streq(topic, "walfs") || http_streq(topic, "disk")) {
             http_append(out, &len, max, "walfs verify | walfs compact | walfs status | walfs format confirm\n  Verify WAL metadata/record-chain integrity, compact the WAL (non-destructive), or status.\n");
+        } else if (http_streq(topic, "exchange")) {
+            http_append(out, &len, max,
+                        "exchange status\n  Show optional p3 PIOSXFER validation and mount diagnostics. Hardware attachment is read-only.\n");
+        } else if (http_streq(topic, "xfer")) {
+            http_append(out, &len, max,
+                        "xfer status | xfer write <8.3> <hex> | xfer read <8.3> | xfer append <8.3> <hex> | xfer rename <old 8.3> <new 8.3> | xfer delete <8.3> | xfer verify\n"
+                        "  QEMU acceptance commands. It is hard-bound to p3 PIOSXFER; use exchange status on hardware.\n");
         } else if (http_streq(topic, "db")) {
             http_append(out, &len, max,
                 "db key|get|put|save|add|update|del|copy|rename|editor|list <addr>\n"
@@ -3810,40 +3844,39 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append_hex32(out, &len, max, cd.eapol_words[i]);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "wifi probe")) {
-        watchdog_hw_arm_seconds(15U);
+        wifi_command_begin();
         bool ok = sdio_init();
-        watchdog_hw_disable();
+        wifi_command_finish();
         http_append(out, &len, max,
                     ok ? "WiFi SDIO probe OK\n" :
                          "WiFi SDIO probe FAILED; reboot recommended\n");
     } else if (http_streq(cmd, "wifi prepare")) {
-        watchdog_hw_arm_seconds(15U);
+        wifi_command_begin();
         bool ok = cyw43_preload_blobs() && cyw43_init();
-        watchdog_hw_disable();
+        wifi_command_finish();
         http_append(out, &len, max,
                     ok ? "WiFi prepare OK\n" : "WiFi prepare FAILED\n");
     } else if (http_streq(cmd, "wifi load")) {
-        cyw43_set_progress_hook(wifi_upload_progress);
-        watchdog_hw_arm_seconds(15U);
+        wifi_command_begin();
         bool ok = cyw43_load_firmware();
-        watchdog_hw_disable();
+        wifi_command_finish();
         http_append(out, &len, max,
                     ok ? "WiFi firmware load OK\n" :
                          "WiFi firmware load FAILED\n");
     } else if (http_streq(cmd, "wifi chip")) {
-        watchdog_hw_arm_seconds(15U);
-        bool ok = cyw43_init();
-        watchdog_hw_disable();
+        /* FAT reads must finish before SDIO2 takes over the controller. */
+        wifi_command_begin();
+        bool ok = cyw43_preload_blobs() && cyw43_init();
+        wifi_command_finish();
         http_append(out, &len, max,
                     ok ? "WiFi chip probe OK ram=" :
                          "WiFi chip probe FAILED ram=");
         http_append_u64(out, &len, max, cyw43_ram_size());
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "wifi init")) {
-        cyw43_set_progress_hook(wifi_upload_progress);
-        watchdog_hw_arm_seconds(15U);
+        wifi_command_begin();
         bool ok = nic_init_wifi();
-        watchdog_hw_disable();
+        wifi_command_finish();
         http_append(out, &len, max,
                     ok ? "WiFi init OK\n" : "WiFi init FAILED\n");
     } else if (http_streq(cmd, "wifi scan")) {
@@ -4447,8 +4480,18 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, d.last_channel);
         http_append(out, &len, max, " len=");
         http_append_u64(out, &len, max, d.last_len);
-        http_append(out, &len, max, " enable=");
-        http_append_u64(out, &len, max, d.enable_reg);
+        http_append(out, &len, max, " channel_mask=");
+        http_append_u64(out, &len, max, d.channel_mask);
+        http_append(out, &len, max, " hw_copies=");
+        http_append_u64(out, &len, max, d.hw_copies);
+        http_append(out, &len, max, " hw_zeroes=");
+        http_append_u64(out, &len, max, d.hw_zeroes);
+        http_append(out, &len, max, " last_cs=");
+        http_append_hex32(out, &len, max, d.last_cs);
+        http_append(out, &len, max, " last_debug=");
+        http_append_hex32(out, &len, max, d.last_debug);
+        http_append(out, &len, max, " last_cb=");
+        http_append_hex32(out, &len, max, d.last_cbaddr);
         http_append(out, &len, max, "\nCH CS CBADDR TI SRC DST LEN DEBUG\n");
         for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
             http_append_u64(out, &len, max, ch);
@@ -5313,10 +5356,40 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " load_dram=");
         http_append_u64(out, &len, max, r[4] / 1000ULL);
         http_append(out, &len, max, " cyc/load (lo~=hi~=dram => caches dead; hi<<lo => remap bug)\n");
+    } else if (http_streq(cmd, "proc el0")) {
+        i32 launch_status;
+        u32 launch_pid, launch_slot, enters, enter_pid, fault_pid;
+        u64 base, pc, sp, esr, elr, far, l1, l2, l3, p0w, p0r, p1w;
+        proc_el0_diag_snapshot(&launch_status, &launch_pid, &launch_slot,
+            &base, &enters, &enter_pid, &pc, &sp, &fault_pid, &esr, &elr,
+            &far, &l1, &l2, &l3, &p0w, &p0r, &p1w);
+        const char *names[] = { "launch", "launch_pid", "slot", "enters",
+            "enter_pid", "fault_pid", "pc", "sp", "esr", "elr", "far",
+            "l1", "l2", "l3", "par0w", "par0r", "par1w" };
+        u64 values[] = { (u32)launch_status, launch_pid, launch_slot, enters,
+            enter_pid, fault_pid, pc, sp, esr, elr, far, l1, l2, l3, p0w, p0r, p1w };
+        for (u32 i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+            http_append(out, &len, max, names[i]);
+            http_append(out, &len, max, "=0x");
+            http_append_hex32(out, &len, max, (u32)(values[i] >> 32));
+            http_append_hex32(out, &len, max, (u32)values[i]);
+            http_append(out, &len, max, "\n");
+        }
+        u32 exits[MAX_PROCS_PER_CORE];
+        u32 n = proc_exit_snapshot(exits, MAX_PROCS_PER_CORE);
+        for (u32 i = 0; i < n; i++) {
+            if (!exits[i])
+                continue;
+            http_append(out, &len, max, "slot ");
+            http_append_u64(out, &len, max, i);
+            http_append(out, &len, max, " exit=0x");
+            http_append_hex32(out, &len, max, exits[i]);
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "proc sched")) {
         struct proc_sched_core_snapshot ps[3];
         u32 pn = proc_sched_snapshot(ps, 3);
-        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST TIMER_IRQ WFX AWAIT KEEP ALIAS_STATE PHYS_STATE PUBLISH L3_PTE\n");
+        http_append(out, &len, max, "CORE BUSY_PERMILLE IDLE WAKE IDLE_T TOTAL_T PREEMPT SOFT_EVT SOFT_BOOST TIMER_IRQ WFX AWAIT KEEP ALIAS_STATE GENERATION PUBLISH L3_PTE\n");
         for (u32 i = 0; i < pn; i++) {
             http_append_u64(out, &len, max, ps[i].core);
             http_append(out, &len, max, " ");
@@ -5453,8 +5526,11 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                http_streq(cmd, "rp1 irq arm-host6-1") || http_streq(cmd, "rp1 irq source-diag") ||
                http_starts_with(cmd, "rp1 irq storm")) {
         if (http_streq(cmd, "rp1 irq clear")) {
-            core0_eth_irq_drain_and_quench(false);
-            http_append(out, &len, max, "rp1 eth irq quench\n");
+            core0_eth_irq_deferred_quench = true;
+            bool queued = net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                                         NET_DISPATCH_CAUSE_IRQ);
+            http_append(out, &len, max, queued ? "rp1 eth irq quench queued\n" :
+                                               "rp1 eth irq quench unavailable\n");
         } else if (http_streq(cmd, "rp1 irq source-diag")) {
             u32 old_ncr = mmio_read(MACB_BASE + 0x00);
             u32 old_imr = mmio_read(MACB_BASE + 0x30);
@@ -7971,6 +8047,23 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, ws.super_ok ? "ok" : "bad");
         http_append(out, &len, max, " legacy=");
         http_append(out, &len, max, ws.legacy_present ? "yes" : "no");
+        http_append(out, &len, max, " layout=");
+        http_append(out, &len, max,
+                    storage_layout_kind_name(
+                        (enum storage_layout_kind)ws.storage_layout_kind));
+        http_append(out, &len, max, " exchange=");
+        http_append(out, &len, max, ws.exchange_present ? "present" : "missing");
+        {
+            struct exchange_service_status xs;
+
+            exchange_status(&xs);
+            http_append(out, &len, max, " exchange_mount=");
+            http_append(out, &len, max, xs.mounted ? "ok" : "unavailable");
+            http_append(out, &len, max, " exchange_result=");
+            http_append(out, &len, max,
+                        exchange_service_result_name(
+                            (enum exchange_service_result)xs.last_result));
+        }
         http_append(out, &len, max, " p2_lba=");
         http_append_u64(out, &len, max, ws.partition_lba);
         http_append(out, &len, max, " walfs_lba=");
@@ -7988,12 +8081,149 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " tree_root=");
         http_append_u64(out, &len, max, ws.super_tree_root);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "exchange") ||
+               http_streq(cmd, "exchange status")) {
+        struct exchange_service_status xs;
+
+        exchange_status(&xs);
+        http_append(out, &len, max, "exchange available=");
+        http_append(out, &len, max, xs.available ? "yes" : "no");
+        http_append(out, &len, max, " mounted=");
+        http_append(out, &len, max, xs.mounted ? "yes" : "no");
+        http_append(out, &len, max, " mode=");
+        http_append(out, &len, max, xs.read_only ? "read-only" : "read-write");
+        http_append(out, &len, max, " p3_lba=");
+        http_append_u64(out, &len, max, xs.first_lba);
+        http_append(out, &len, max, " p3_blocks=");
+        http_append_u64(out, &len, max, xs.block_count);
+        http_append(out, &len, max, " disk_id=");
+        http_append_hex32(out, &len, max, xs.disk_id);
+        http_append(out, &len, max, " last=");
+        http_append(out, &len, max,
+                    exchange_service_result_name(
+                        (enum exchange_service_result)xs.last_result));
+        http_append(out, &len, max, " layout=");
+        http_append_u64(out, &len, max, xs.layout_result);
+        http_append(out, &len, max, " policy=");
+        http_append_u64(out, &len, max, xs.policy_result);
+        http_append(out, &len, max, " fat32=");
+        http_append_u64(out, &len, max, xs.core_result);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "walfs format confirm")) {
         bool ok = walfs_format_reserved();
         http_append(out, &len, max, ok ? "WALFS format OK\n" : "WALFS format FAILED\n");
         if (ok)
             http_append_walfs_list_text(out, &len, max, "/");
+    } else if (http_streq(cmd, "xfer") || http_starts_with(cmd, "xfer ")) {
+        char *argv[4];
+        u32 argc = http_split_args(cmd, argv, 4);
+        struct qemu_xfer_status xs;
+        enum qemu_xfer_result xr = QEMU_XFER_ARGUMENT;
+
+        if (argc == 1U || (argc == 2U && http_streq(argv[1], "status"))) {
+            qemu_xfer_status(&xs);
+            http_append(out, &len, max, "xfer available=");
+            http_append(out, &len, max, xs.available ? "yes" : "no");
+            http_append(out, &len, max, " mounted=");
+            http_append(out, &len, max, xs.mounted ? "yes" : "no");
+            http_append(out, &len, max, " p3_lba=");
+            http_append_u64(out, &len, max, xs.first_lba);
+            http_append(out, &len, max, " p3_blocks=");
+            http_append_u64(out, &len, max, xs.block_count);
+            http_append(out, &len, max, " disk_id=");
+            http_append_hex32(out, &len, max, xs.disk_id);
+            http_append(out, &len, max, " writable=");
+            http_append(out, &len, max, xs.writable ? "yes" : "no");
+            http_append(out, &len, max, " last=");
+            http_append(out, &len, max,
+                        qemu_xfer_result_name((enum qemu_xfer_result)xs.last_result));
+            http_append(out, &len, max, " core=");
+            http_append_u64(out, &len, max, xs.core_result);
+            http_append(out, &len, max, "\n");
+        } else if (argc == 2U && http_streq(argv[1], "verify")) {
+            xr = qemu_xfer_verify_remount();
+            http_append(out, &len, max, xr == QEMU_XFER_OK ?
+                        "xfer verify OK\n" : "ERR: xfer verify ");
+            if (xr != QEMU_XFER_OK) {
+                http_append(out, &len, max, qemu_xfer_result_name(xr));
+                http_append(out, &len, max, "\n");
+            }
+        } else if (argc == 3U && http_streq(argv[1], "read")) {
+            static u8 data[QEMU_XFER_COMMAND_BYTES];
+            u32 bytes = 0U;
+            xr = qemu_xfer_read(argv[2], data, sizeof(data), &bytes);
+            if (xr != QEMU_XFER_OK) {
+                http_append(out, &len, max, "ERR: xfer read ");
+                http_append(out, &len, max, qemu_xfer_result_name(xr));
+                http_append(out, &len, max, "\n");
+            } else {
+                http_append(out, &len, max, "xfer read OK bytes=");
+                http_append_u64(out, &len, max, bytes);
+                http_append(out, &len, max, " hex=");
+                for (u32 i = 0U; i < bytes; i++)
+                    http_append_hex8(out, &len, max, data[i]);
+                http_append(out, &len, max, "\n");
+            }
+        } else if (argc == 4U && (http_streq(argv[1], "write") ||
+                                   http_streq(argv[1], "append"))) {
+            static u8 data[QEMU_XFER_COMMAND_BYTES];
+            u32 hex_len = pios_strlen(argv[3]);
+            u32 bytes = hex_len / 2U;
+            bool valid = hex_len != 0U && (hex_len & 1U) == 0U &&
+                         bytes <= sizeof(data);
+
+            for (u32 i = 0U; valid && i < bytes; i++)
+                valid = pixe_parse_hex_byte_pair(argv[3] + i * 2U, &data[i]);
+            if (!valid) {
+                http_append(out, &len, max, "ERR: xfer bad hex payload\n");
+            } else {
+                xr = http_streq(argv[1], "write") ?
+                     qemu_xfer_write(argv[2], data, bytes) :
+                     qemu_xfer_append(argv[2], data, bytes);
+                if (xr == QEMU_XFER_OK) {
+                    http_append(out, &len, max, "xfer ");
+                    http_append(out, &len, max, argv[1]);
+                    http_append(out, &len, max, " OK bytes=");
+                    http_append_u64(out, &len, max, bytes);
+                    http_append(out, &len, max, "\n");
+                } else {
+                    http_append(out, &len, max, "ERR: xfer ");
+                    http_append(out, &len, max, argv[1]);
+                    http_append(out, &len, max, " ");
+                    http_append(out, &len, max, qemu_xfer_result_name(xr));
+                    http_append(out, &len, max, "\n");
+                }
+            }
+        } else if (argc == 4U && http_streq(argv[1], "rename")) {
+            xr = qemu_xfer_rename(argv[2], argv[3]);
+            http_append(out, &len, max, xr == QEMU_XFER_OK ?
+                        "xfer rename OK\n" : "ERR: xfer rename ");
+            if (xr != QEMU_XFER_OK) {
+                http_append(out, &len, max, qemu_xfer_result_name(xr));
+                http_append(out, &len, max, "\n");
+            }
+        } else if (argc == 3U && http_streq(argv[1], "delete")) {
+            xr = qemu_xfer_delete(argv[2]);
+            http_append(out, &len, max, xr == QEMU_XFER_OK ?
+                        "xfer delete OK\n" : "ERR: xfer delete ");
+            if (xr != QEMU_XFER_OK) {
+                http_append(out, &len, max, qemu_xfer_result_name(xr));
+                http_append(out, &len, max, "\n");
+            }
+        } else {
+            http_append(out, &len, max, "ERR: usage xfer status|write|read|append|rename|delete|verify\n");
+        }
     } else if (http_streq(cmd, "bootctrl") || http_streq(cmd, "bootctrl status")) {
+        http_append_bootctrl_status(out, &len, max);
+    } else if (http_starts_with(cmd, "bootctrl arm-o ")) {
+        http_append(out, &len, max,
+                    pios_bootctrl_arm_o_text(cmd + 15U) ?
+                    "bootctrl arm-o OK\n" : "bootctrl arm-o FAILED\n");
+        http_append_bootctrl_status(out, &len, max);
+    } else if (http_streq(cmd, "bootctrl clear-o")) {
+        http_append(out, &len, max,
+                    pios_bootctrl_clear_o() ? "bootctrl clear-o OK\n" :
+                                               "bootctrl clear-o FAILED\n");
         http_append_bootctrl_status(out, &len, max);
     } else if (http_streq(cmd, "bootctrl clear-pending")) {
         http_append(out, &len, max,
@@ -8726,6 +8956,26 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         bool on = http_streq(cmd, "nic dump on");
         nic_set_packet_dump(on);
         http_append(out, &len, max, on ? "nic packet dump ENABLED\n" : "nic packet dump disabled\n");
+    } else if (http_streq(cmd, "net dispatch")) {
+        struct net_dispatch_diag d;
+        net_dispatch_diag_snapshot(&d);
+        http_append(out, &len, max, "net dispatch rx=");
+        http_append_u64(out, &len, max, d.rx_published);
+        http_append(out, &len, max, " rx_drop=");
+        http_append_u64(out, &len, max, d.rx_dropped);
+        http_append(out, &len, max, " backpressure=");
+        http_append_u64(out, &len, max, d.rx_backpressure);
+        http_append(out, &len, max, " resumed=");
+        http_append_u64(out, &len, max, d.rx_resumed);
+        http_append(out, &len, max, " wake_retries=");
+        http_append_u64(out, &len, max, d.wake_retries);
+        http_append(out, &len, max, " coalesced=");
+        http_append_u64(out, &len, max, d.transport_coalesced);
+        http_append(out, &len, max, " tx=");
+        http_append_u64(out, &len, max, d.tx_handled);
+        http_append(out, &len, max, " tx_drop=");
+        http_append_u64(out, &len, max, d.tx_dropped);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "net pump")) {
         /* Issue #94: explicit diagnostic NIC pump. Not used by services. */
         u32 got = net_poll();
@@ -9902,10 +10152,16 @@ static u32 pios_boot_slot_offset(u32 slot)
     return slot == PIOS_BOOTCTRL_SLOT_B ? PIOS_BOOT_SLOT_B_OFFSET : PIOS_BOOT_SLOT_A_OFFSET;
 }
 
-static u32 pios_bootctrl_checksum(const u8 *p)
+/* Keep this byte-level v1/v2 validation identical to bootstrap.c and
+ * boot_precedence.c.  A v1 checksum ends at 32; its old checksum is never
+ * interpreted as O metadata during migration. */
+static u32 pios_bootctrl_checksum(const u8 *p, u32 version)
 {
+    u32 checksum_off = version == PIOS_BOOTCTRL_VERSION_V1 ?
+                       PIOS_BOOTCTRL_V1_CHECKSUM_OFF :
+                       PIOS_BOOTCTRL_V2_CHECKSUM_OFF;
     u32 sum = 0xB007C0DEU;
-    for (u32 i = 0; i < PIOS_BOOTCTRL_CHECKSUM_OFF; i++)
+    for (u32 i = 0; i < checksum_off; i++)
         sum = (sum << 5) ^ (sum >> 27) ^ p[i];
     return sum;
 }
@@ -9914,9 +10170,30 @@ static bool pios_bootctrl_valid(const u8 *p)
 {
     if (pios_read_le32(p + PIOS_BOOTCTRL_MAGIC_OFF) != PIOS_BOOTCTRL_MAGIC)
         return false;
-    if (pios_read_le32(p + PIOS_BOOTCTRL_VERSION_OFF) != PIOS_BOOTCTRL_VERSION)
+    u32 version = pios_read_le32(p + PIOS_BOOTCTRL_VERSION_OFF);
+    if (version != PIOS_BOOTCTRL_VERSION_V1 &&
+        version != PIOS_BOOTCTRL_VERSION)
         return false;
-    return pios_read_le32(p + PIOS_BOOTCTRL_CHECKSUM_OFF) == pios_bootctrl_checksum(p);
+    u32 checksum_off = version == PIOS_BOOTCTRL_VERSION_V1 ?
+                       PIOS_BOOTCTRL_V1_CHECKSUM_OFF :
+                       PIOS_BOOTCTRL_V2_CHECKSUM_OFF;
+    return pios_read_le32(p + checksum_off) ==
+           pios_bootctrl_checksum(p, version);
+}
+
+static bool pios_bootctrl_migrate_v1(u8 *p)
+{
+    if (!pios_bootctrl_valid(p) ||
+        pios_read_le32(p + PIOS_BOOTCTRL_VERSION_OFF) !=
+            PIOS_BOOTCTRL_VERSION_V1)
+        return false;
+    simd_zero(p + PIOS_BOOTCTRL_OVERRIDE_MODE_OFF,
+              PIOS_BOOTCTRL_V2_CHECKSUM_OFF -
+              PIOS_BOOTCTRL_OVERRIDE_MODE_OFF);
+    pios_write_le32(p + PIOS_BOOTCTRL_VERSION_OFF, PIOS_BOOTCTRL_VERSION);
+    pios_write_le32(p + PIOS_BOOTCTRL_V2_CHECKSUM_OFF,
+                    pios_bootctrl_checksum(p, PIOS_BOOTCTRL_VERSION));
+    return true;
 }
 
 static bool pios_bootctrl_read(u8 *out)
@@ -9924,14 +10201,25 @@ static bool pios_bootctrl_read(u8 *out)
     if (!out)
         return false;
     u32 lba = walfs_partition_lba() + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE);
-    return sd_read_block(lba, out) && pios_bootctrl_valid(out);
+    if (!sd_read_block(lba, out) || !pios_bootctrl_valid(out))
+        return false;
+    if (pios_read_le32(out + PIOS_BOOTCTRL_VERSION_OFF) ==
+        PIOS_BOOTCTRL_VERSION_V1) {
+        if (!pios_bootctrl_migrate_v1(out))
+            return false;
+        /* Keep migration in-memory until an intentional state transition;
+         * status reads must not risk tearing the only valid v1 record. */
+    }
+    return true;
 }
 
 static bool pios_bootctrl_write_at(u32 root_lba, u8 *p)
 {
     if (!p)
         return false;
-    pios_write_le32(p + PIOS_BOOTCTRL_CHECKSUM_OFF, pios_bootctrl_checksum(p));
+    pios_write_le32(p + PIOS_BOOTCTRL_VERSION_OFF, PIOS_BOOTCTRL_VERSION);
+    pios_write_le32(p + PIOS_BOOTCTRL_V2_CHECKSUM_OFF,
+                    pios_bootctrl_checksum(p, PIOS_BOOTCTRL_VERSION));
     u32 lba = root_lba + (PIOS_BOOTCTRL_OFFSET / SD_BLOCK_SIZE);
     return sd_write_block(lba, p);
 }
@@ -10001,6 +10289,57 @@ static bool pios_bootctrl_clear_pending(void)
     return pios_bootctrl_write(ctl);
 }
 
+static bool pios_bootctrl_arm_o(u64 package_id)
+{
+    static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
+    if (package_id == 0U || !pios_bootctrl_read(ctl))
+        return false;
+    u32 gen = pios_read_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_MODE_OFF,
+                    PIOS_BOOTCTRL_OVERRIDE_O);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_TRIES_OFF,
+                    PIOS_BOOTCTRL_OVERRIDE_TRIES_DEFAULT);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_PACKAGE_ID_OFF,
+                    (u32)package_id);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_PACKAGE_ID_OFF + 4U,
+                    (u32)(package_id >> 32));
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF, gen + 1U);
+    return pios_bootctrl_write(ctl);
+}
+
+static bool pios_bootctrl_clear_o(void)
+{
+    static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
+    if (!pios_bootctrl_read(ctl))
+        return false;
+    u32 gen = pios_read_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_MODE_OFF,
+                    PIOS_BOOTCTRL_OVERRIDE_NONE);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_TRIES_OFF, 0U);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_PACKAGE_ID_OFF, 0U);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_PACKAGE_ID_OFF + 4U, 0U);
+    pios_write_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF, gen + 1U);
+    return pios_bootctrl_write(ctl);
+}
+
+static bool pios_bootctrl_arm_o_text(const char *text)
+{
+    char package_id_text[24];
+    u32 i = 0;
+    if (!text)
+        return false;
+    while (text[i] && text[i] != ' ' && i + 1U < sizeof(package_id_text)) {
+        package_id_text[i] = text[i];
+        i++;
+    }
+    package_id_text[i] = '\0';
+    if (i == 0U || text[i] != ' ' || !http_streq(text + i + 1U, "confirm"))
+        return false;
+    u64 package_id = 0;
+    return bootctrl_parse_package_id(package_id_text, &package_id) &&
+           pios_bootctrl_arm_o(package_id);
+}
+
 static bool pios_bootctrl_reset_a(void)
 {
     static u8 ctl[SD_BLOCK_SIZE] ALIGNED(64);
@@ -10042,6 +10381,9 @@ static void pios_bootctrl_mark_success(void)
     if (!pios_bootctrl_read(ctl))
         return;
     u32 booted = pios_read_le32(ctl + PIOS_BOOTCTRL_LAST_BOOT_OFF);
+    /* Stage0 consumed O before jumping it.  It is never active or good. */
+    if (booted == PIOS_BOOTCTRL_SLOT_O)
+        return;
     if (booted > PIOS_BOOTCTRL_SLOT_B)
         return;
     u32 good = pios_read_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF) | (1U << booted);
@@ -10058,6 +10400,7 @@ static const char *pios_bootctrl_slot_name(u32 slot)
 {
     if (slot == PIOS_BOOTCTRL_SLOT_A) return "A";
     if (slot == PIOS_BOOTCTRL_SLOT_B) return "B";
+    if (slot == PIOS_BOOTCTRL_SLOT_O) return "O";
     if (slot == PIOS_BOOTCTRL_SLOT_NONE) return "none";
     return "bad";
 }
@@ -10081,6 +10424,12 @@ static void http_append_bootctrl_status(char *out, u32 *len, u32 max)
     u32 last = pios_read_le32(ctl + PIOS_BOOTCTRL_LAST_BOOT_OFF);
     u32 good = pios_read_le32(ctl + PIOS_BOOTCTRL_GOOD_MASK_OFF);
     u32 gen = pios_read_le32(ctl + PIOS_BOOTCTRL_GENERATION_OFF);
+    u32 override_mode = pios_read_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_MODE_OFF);
+    u32 override_tries = pios_read_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_TRIES_OFF);
+    u64 override_id =
+        (u64)pios_read_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_PACKAGE_ID_OFF) |
+        ((u64)pios_read_le32(ctl + PIOS_BOOTCTRL_OVERRIDE_PACKAGE_ID_OFF + 4U)
+         << 32);
 
     http_append(out, len, max, " active=");
     http_append(out, len, max, pios_bootctrl_slot_name(active));
@@ -10088,6 +10437,13 @@ static void http_append_bootctrl_status(char *out, u32 *len, u32 max)
     http_append(out, len, max, pios_bootctrl_slot_name(pending));
     http_append(out, len, max, " tries=");
     http_append_u64(out, len, max, tries);
+    http_append(out, len, max, " o=");
+    http_append(out, len, max,
+                override_mode == PIOS_BOOTCTRL_OVERRIDE_O ? "armed" : "none");
+    http_append(out, len, max, " o_tries=");
+    http_append_u64(out, len, max, override_tries);
+    http_append(out, len, max, " o_id=");
+    http_append_hex64(out, len, max, override_id);
     http_append(out, len, max, " last=");
     http_append(out, len, max, pios_bootctrl_slot_name(last));
     http_append(out, len, max, " good_mask=");
@@ -10117,6 +10473,24 @@ static void ui_cmd_bootctrl(u32 argc, char **argv)
         ui_console_write(out);
         return;
     }
+    if (ui_streq(argv[1], "arm-o") && argc == 4U &&
+        ui_streq(argv[3], "confirm")) {
+        u64 package_id = 0;
+        bool ok = bootctrl_parse_package_id(argv[2], &package_id) &&
+                  pios_bootctrl_arm_o(package_id);
+        ui_console_write(ok ? "bootctrl arm-o OK\n" :
+                              "bootctrl arm-o FAILED\n");
+        http_append_bootctrl_status(out, &len, sizeof(out));
+        ui_console_write(out);
+        return;
+    }
+    if (ui_streq(argv[1], "clear-o") && argc == 2U) {
+        ui_console_write(pios_bootctrl_clear_o() ? "bootctrl clear-o OK\n" :
+                                                   "bootctrl clear-o FAILED\n");
+        http_append_bootctrl_status(out, &len, sizeof(out));
+        ui_console_write(out);
+        return;
+    }
     if (ui_streq(argv[1], "reset-a") && argc >= 3 && ui_streq(argv[2], "confirm")) {
         ui_console_write(pios_bootctrl_reset_a() ? "bootctrl reset-a OK\n" :
                                                    "bootctrl reset-a FAILED\n");
@@ -10131,7 +10505,7 @@ static void ui_cmd_bootctrl(u32 argc, char **argv)
         ui_console_write(out);
         return;
     }
-    ui_console_write("ERR: usage bootctrl status | bootctrl clear-pending | bootctrl reset-a confirm | bootctrl test-invalid-b confirm\n");
+    ui_console_write("ERR: usage bootctrl status | bootctrl arm-o <package-id> confirm | bootctrl clear-o | bootctrl clear-pending | bootctrl reset-a confirm | bootctrl test-invalid-b confirm\n");
 }
 
 static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *data, u32 len,
@@ -10185,11 +10559,12 @@ static bool http_write_kernel_slot_range(u32 slot_offset, u32 offset, const u8 *
         }
         pos += n;
         written += n;
-        /* Pet the 5s hardware watchdog during a large flush (e.g. the OTA commit
-         * writes ~1.2MB = thousands of blocks); without this the bulk write
-         * would trip the watchdog and reboot mid-write, corrupting the slot. */
-        if (++since_pet >= 64U) {
+        /* Completed writes prove progress. Between small SD quanta, dispatch
+         * queued ingress/egress so a full-image commit cannot starve GEM.
+         * SERVICE's running guard prevents recursively entering this commit. */
+        if (++since_pet >= 8U) {
             since_pet = 0;
+            net_dispatch_yield();
             watchdog_hw_pet();
         }
     }
@@ -10590,10 +10965,10 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
     } else if (http_streq(action, "commit") || http_streq(action, "writeandreboot")) {
         /* writeandreboot = the user's flow: after blocks are uploaded (RAM-staged)
          * and verified (received==total), flush the staged image to the SD slot in
-         * ONE pass and reboot into it. core0 is unresponsive only during this final
-         * flush, which is fine because the board is about to reboot anyway (and the
-         * SD-write loop pets the watchdog). The A/B header is written valid LAST and
-         * the slot is marked pending (health-gated), so a failed flush is safe. */
+         * one synchronous pass and reboot into it. The write loop yields queued
+         * network work between small SD quanta; it never feeds the watchdog in
+         * a stalled write. The A/B header is written valid LAST and the slot is
+         * marked pending (health-gated), so a failed flush is safe. */
         bool force_reboot = http_streq(action, "writeandreboot");
         if (!ota_update.active) {
             error = "no OTA update active";
@@ -11454,10 +11829,51 @@ static u32 http_build_picoscript_asset_response(char *out, u32 max,
     return len;
 }
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+static u32 http_build_picoscript_walfs_response(char *out, u32 max, u32 asset_id,
+                                                 const char *content_type)
+{
+    u32 len = 0;
+    u64 id;
+    u32 bytes;
+    if (!ide_assets_walfs_file(asset_id, &id, &bytes)) {
+        http_append(out, &len, max,
+                    "HTTP/1.0 503 Service Unavailable\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: 20\r\n"
+                    "Connection: close\r\n\r\n"
+                    "IDE assets missing\n");
+        return len;
+    }
+    http_file_id = id;
+    http_file_len = bytes;
+    http_file_off = 0;
+    http_append(out, &len, max, "HTTP/1.0 200 OK\r\nContent-Type: ");
+    http_append(out, &len, max, content_type);
+    http_append(out, &len, max, "\r\nCache-Control: no-store\r\nContent-Length: ");
+    http_append_u64(out, &len, max, bytes);
+    http_append(out, &len, max, "\r\nConnection: close\r\n\r\n");
+    return len;
+}
+#endif
+
 static u32 http_build_picoscript_response(char *out, u32 max, const u8 *req, u32 req_len)
 {
     if (http_request_path_is(req, req_len, "/picoscript/config"))
         return http_build_picoscript_config_response(out, max);
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
+    if (http_request_path_is(req, req_len, "/picoscript/picowal.html"))
+        return http_build_picoscript_walfs_response(out, max,
+            PIOS_ASSET_IDE_PICOWAL, "text/html; charset=utf-8");
+    if (http_request_path_is(req, req_len, "/picoscript/pico_hooks.js"))
+        return http_build_picoscript_walfs_response(out, max,
+            PIOS_ASSET_IDE_HOOKS, "application/javascript; charset=utf-8");
+    if (http_request_path_is(req, req_len, "/picoscript/baremetal-binary.js"))
+        return http_build_picoscript_walfs_response(out, max,
+            PIOS_ASSET_IDE_BAREMETAL, "application/javascript; charset=utf-8");
+    return http_build_picoscript_walfs_response(out, max,
+        PIOS_ASSET_IDE_HTML, "text/html; charset=utf-8");
+#else
     if (http_request_path_is(req, req_len, "/picoscript/picowal.html"))
         return http_build_picoscript_asset_response(out, max,
             IDE_PICOWAL_HTML, IDE_PICOWAL_HTML_LEN, "text/html; charset=utf-8");
@@ -11470,6 +11886,7 @@ static u32 http_build_picoscript_response(char *out, u32 max, const u8 *req, u32
     /* Portal (root/index.html/playground.html and any other /picoscript request). */
     return http_build_picoscript_asset_response(out, max,
         IDE_HTML, IDE_HTML_LEN, "text/html; charset=utf-8");
+#endif
 }
 
 static bool http_static_path_from_req(const u8 *req, u32 req_len, char *out, u32 out_max)
@@ -12482,10 +12899,26 @@ static void admin_service_poll(struct admin_http_service *svc)
                         pios_boot_slot_offset(ota_update.target_slot);
                     ota_update.total = total;
                     ota_update.received = 0;
-                    ota_update.active = true;
+                    ota_update.active = false;
                     ota_update.last_error = NULL;
-                    http_write_kernel_slot_header(
-                        ota_update.target_slot_offset, total, false);
+                    if (!http_write_kernel_slot_header(
+                            ota_update.target_slot_offset, total, false)) {
+                        ota_update.last_error =
+                            "failed to invalidate slot header";
+                        svc->stream_mode = false;
+                        svc->resp_len = 0;
+                        http_append(
+                            svc->resp, &svc->resp_len, sizeof(svc->resp),
+                            "HTTP/1.0 500 Internal Server Error\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Connection: close\r\n\r\n"
+                            "{\"ok\":false,\"error\":"
+                            "\"failed to invalidate slot header\"}\n");
+                        svc->resp_off = 0;
+                        svc->last_activity_ms = now;
+                        return;
+                    }
+                    ota_update.active = true;
                 }
                 svc->stream_mode = true;
                 svc->stream_kind = stream_kind;
@@ -13078,7 +13511,7 @@ static void echo_tcp_poll(void) {
                 u32 remain = http_static_len - http_static_off;
                 if (writable > 0) {
                     u32 chunk = remain < writable ? remain : writable;
-                    if (chunk > 512) chunk = 512;
+                    if (chunk > HTTP_TX_CHUNK_MAX) chunk = HTTP_TX_CHUNK_MAX;
                     u32 n = tcp_write(http_client_conn, http_static_body + http_static_off, chunk);
                     http_diag.write_calls++;
                     http_last_write = n;
@@ -13950,6 +14383,7 @@ static bool ui_parse_u32(const char *s, u32 *out)
         else if (base == 16 && c >= 'A' && c <= 'F') d = (u32)(c - 'A' + 10);
         else return false;
         if (d >= base) return false;
+        if (v > (~(u32)0 - d) / base) return false;
         v = v * base + d;
     }
     *out = v;
@@ -13974,6 +14408,7 @@ static bool ui_parse_u64(const char *s, u64 *out)
         else if (base == 16 && c >= 'A' && c <= 'F') d = (u32)(c - 'A' + 10);
         else return false;
         if (d >= base) return false;
+        if (v > (~(u64)0 - d) / base) return false;
         v = v * base + d;
     }
     *out = v;
@@ -14980,8 +15415,18 @@ static void ui_print_dma_diag(void)
     ui_console_u32_dec(d.last_channel);
     ui_console_write(" len=");
     ui_console_u32_dec(d.last_len);
-    ui_console_write(" enable=");
-    ui_console_hex_fixed(d.enable_reg, 8);
+    ui_console_write(" channel_mask=");
+    ui_console_hex_fixed(d.channel_mask, 8);
+    ui_console_write(" hw_copies=");
+    ui_console_u32_dec(d.hw_copies);
+    ui_console_write(" hw_zeroes=");
+    ui_console_u32_dec(d.hw_zeroes);
+    ui_console_write(" last_cs=");
+    ui_console_hex_fixed(d.last_cs, 8);
+    ui_console_write(" last_debug=");
+    ui_console_hex_fixed(d.last_debug, 8);
+    ui_console_write(" last_cb=");
+    ui_console_hex_fixed(d.last_cbaddr, 8);
     ui_console_write("\nCH CS CBADDR TI SRC DST LEN DEBUG\n");
     for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
         ui_console_u32_dec(ch);
@@ -20748,12 +21193,12 @@ static bool ui_console_help_topic(const char *topic)
     } else if (ui_streq(topic, "reboot")) {
         ui_console_write("reboot confirm\n  Reboot via PSCI SYSTEM_RESET; confirmation word is required.\n");
     } else if (ui_streq(topic, "bootctrl")) {
-        ui_console_write("bootctrl status\nbootctrl clear-pending\nbootctrl reset-a confirm\nbootctrl test-invalid-b confirm\n  Show/repair/test stage0 A/B boot-control state without host raw-disk access.\n");
+        ui_console_write("bootctrl status\nbootctrl arm-o <package-id> confirm\nbootctrl clear-o\nbootctrl clear-pending\nbootctrl reset-a confirm\nbootctrl test-invalid-b confirm\n  Arm/clear one-shot FAT-direct O or inspect/repair A/B boot control.\n");
     } else if (ui_streq(topic, "watchdog")) {
         ui_console_write("watchdog status\nwatchdog arm|disarm\nwatchdog timeout <ticks>\nwatchdog mode <halt|reboot>\nwatchdog trip\nwatchdog hw-arm <secs>\nwatchdog hw-pet\nwatchdog hw-disable\nwatchdog hw-trip confirm\n  Hardware BCM2712 PM watchdog at 0x107D200000 (arms a chip-level auto-reset).\n");
     } else if (ui_streq(topic, "dma")) {
         ui_console_write("dma status\n  Show DMA enable state, CB address mode, selftest counters, and channel registers.\n");
-        ui_console_write("dma selftest\n  Re-run the memcpy selftest and auto-select raw/shifted CB address mode if hardware passes.\n");
+        ui_console_write("dma selftest\n  Run bounded hardware copy/zero proofs using BCM2712 shifted CB addresses.\n");
     } else if (ui_streq(topic, "keystore")) {
         ui_console_write("keystore status\n  Show sealed-root status, user-records LBA, and non-secret fingerprint.\n");
         ui_console_write("keystore derive <label>\n  Derive and print a non-secret fingerprint for a label.\n");
@@ -21074,7 +21519,7 @@ static void ui_console_exec(char *line)
             ui_console_write("  prio <pid> <lazy|low|normal|high|realtime>\n");
             ui_console_write("  affinity <pid> <1|2|3>\n");
             ui_console_write("  watchdog status|arm|disarm|timeout <ticks>|mode <halt|reboot>|trip\n");
-            ui_console_write("  bootctrl status|clear-pending|reset-a confirm|test-invalid-b confirm\n");
+            ui_console_write("  bootctrl status|arm-o <package-id> confirm|clear-o|clear-pending|reset-a confirm|test-invalid-b confirm\n");
             ui_console_write("  reboot confirm\n");
         } else if (ui_streq(argv[1], "fs")) {
             ui_console_write("Filesystem/storage commands:\n");
@@ -23371,7 +23816,7 @@ static void hdmi_dashboard_render(void)
         fb_puts(" ");
         fb_set_color(C_GRY, 0x00000000);
         fb_puts("probe_fail=");
-        fb_set_color(C_WHT, 0x00000000);   /* mode-probe failures are expected; last_err is the real signal */
+        fb_set_color(dd.selftest_failures ? C_RED : C_WHT, 0x00000000);
         fb_printf("%u", dd.selftest_failures);
         fb_set_cursor(dc, er++);
         fb_set_color(C_GRY, 0x00000000);
@@ -23379,9 +23824,9 @@ static void hdmi_dashboard_render(void)
         fb_set_color(dd.last_error ? C_RED : C_WHT, 0x00000000);
         fb_printf("%x", dd.last_error);
         fb_set_color(C_GRY, 0x00000000);
-        fb_puts(" en=0x");
+        fb_puts(" mask=0x");
         fb_set_color(C_WHT, 0x00000000);
-        fb_printf("%x", dd.enable_reg);
+        fb_printf("%x", dd.channel_mask);
 
         /* ---- FIFO / LEASE ARENAS ---- */
         struct lease_stats ls;
@@ -23773,7 +24218,9 @@ static void core0_eth_irq_handler(void)
     core0_eth_irq_count++;
     /* Top half: record and return. The record carries the MIP status so the
      * bottom half needs no further hardware read to know why it was woken. */
-    (void)airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, core0_eth_irq_last_mip);
+    if (!airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, core0_eth_irq_last_mip))
+        (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                             NET_DISPATCH_CAUSE_IRQ);
 }
 
 #if PIOS_GENET_IRQ
@@ -23781,7 +24228,9 @@ static void core0_genet_irq_handler(void)
 {
     genet_irq_mask_rx();
     (void)genet_irq_ack();
-    (void)airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, NET_DISPATCH_CAUSE_IRQ);
+    if (!airq_post_from(CORE_NET, AIRQ_SRC_ETH_RX, NET_DISPATCH_CAUSE_IRQ))
+        (void)net_dispatch_publish_transport(NIC_IFACE_WIRED,
+                                             NET_DISPATCH_CAUSE_IRQ);
 }
 
 static void core0_genet_irq_arm(void)
@@ -23840,11 +24289,17 @@ static void airq_net_transport_handler(const struct airq_record *rec, void *ctx)
 {
     (void)rec;
     (void)ctx;
-    net_dispatch_handle_transport();
-    if (core0_eth_irq_deferred_quench) {
+    bool quench = core0_eth_irq_deferred_quench;
+    if (quench) {
         core0_eth_irq_deferred_quench = false;
-        (void)core0_eth_irq_drain_and_quench(false);
+        /* Clear the cause BEFORE receiving. Clearing it after an empty read
+         * can erase a new packet's only indication while RP1 awaits IACK. */
+        core0_eth_irq_last_macb_isr = macb_irq_ack_rx();
+        dsb();
     }
+    net_dispatch_handle_transport();
+    if (quench)
+        (void)core0_eth_irq_drain_and_quench(false);
 #if PIOS_HAS_GENET
     genet_irq_unmask_rx();
 #endif
@@ -23918,11 +24373,10 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
     const u32 eth_bit = 1U << RP1_INT_ETH;
     /*
      * ADR-033 transport completion.  This no longer drains RX or invokes
-     * protocol work: the transport FIFO handler has already consumed one
-     * bounded ingress quantum.  We only acknowledge hardware and either
-     * re-arm the edge or publish another bounded transport indication.
+     * protocol work: the transport FIFO handler cleared GEM before consuming
+     * its bounded ingress quantum. Do not clear GEM again here: arrivals after
+     * its final receive must remain asserted when IACK returns MSI credit.
      */
-    core0_eth_irq_last_macb_isr = macb_irq_ack_rx();
     dsb();
     core0_eth_irq_last_mip = rp1_mip_host_status_l();
     bool clear = (rp1_irq_status_l() & eth_bit) == 0U;
@@ -23936,20 +24390,22 @@ static bool core0_eth_irq_drain_and_quench(bool host_route)
     }
 #endif
     if (clear) {
-        rp1_eth_irq_rearm();
         core0_eth_irq_stall_streak = 0;
-        return true;
+    } else {
+        core0_eth_irq_stall_streak++;
     }
 
     /*
-     * Do not self-publish a transport retry here. A level that remains
-     * asserted after its bounded quantum cannot be converted into an
-     * unbounded software-event loop: that was a core-0 hot poll which kept
-     * airq_pending() true forever. Leave it quiesced for the next explicit
-     * hardware interrupt/recovery path instead.
+     * IACK_EN holds off the next MSI until IACK is written. A packet arriving
+     * between the GEM ack and INTSTAT read can keep the level high; withholding
+     * IACK then waits forever for an interrupt RP1 is forbidden to send.
+     * Return the hardware credit once per scheduled quantum, even if the
+     * level has reasserted. This neither polls nor self-posts protocol work.
+     * RX backpressure retains the transport token without dispatching it
+     * until a downstream stage frees a slot, so IACK is not a busy loop.
      */
-    core0_eth_irq_stall_streak++;
-    return false;
+    rp1_eth_irq_rearm();
+    return clear;
 }
 
 static u32 core0_io_take_flags(void)
@@ -24071,15 +24527,11 @@ NORETURN void core0_main(void) {
 
     fb_set_color(0x00FFAA00, 0x00000000);
 #if PIOS_HAS_DMA
-    fb_puts("[dma] late memcpy selftest...\n");
-    uart_puts("[dma] late memcpy selftest...\n");
-    if (dma_selftest()) {
-        fb_puts("[dma] late memcpy selftest OK\n");
-        uart_puts("[dma] late memcpy selftest OK\n");
-    } else {
-        fb_puts("[dma] late memcpy selftest FAILED (using NEON fallback)\n");
-        uart_puts("[dma] late memcpy selftest FAILED (using NEON fallback)\n");
-    }
+    bool dma_ok = dma_selftest();
+    fb_puts(dma_ok ? "[dma] hardware copy/zero enabled\n" :
+                     "[dma] hardware proof failed; see dma status\n");
+    uart_puts(dma_ok ? "[dma] hardware copy/zero enabled\n" :
+                       "[dma] hardware proof failed; see dma status\n");
 #else
     fb_puts("[dma] late memcpy selftest skipped on this platform\n");
     uart_puts("[dma] late memcpy selftest skipped on this platform\n");
@@ -24254,7 +24706,7 @@ NORETURN void core0_main(void) {
             ksvc_run(ksvc_timer_id);
             /* Once we have run cleanly for a while, declare the boot healthy so
              * crash-loop protection re-arms for the next genuine fault. */
-            if (!crash_boot_marked_healthy &&
+            if (!crash_boot_marked_healthy && ide_assets_boot_ready() &&
                 timer_monotonic_ms() >= CRASH_HEALTHY_UPTIME_MS) {
                 crash_boot_marked_healthy = true;
                 exception_crash_mark_healthy();
@@ -25297,6 +25749,12 @@ void kernel_main(void) {
                 uart_puts("\n");
             }
             watchdog_hw_pet();
+            bp_log("[ide] install WALFS editor assets...");
+            if (ide_assets_install())
+                bp_ok("[ide] WALFS editor assets ready");
+            else
+                bp_warn("[ide] WALFS editor unavailable; boot remains untrusted");
+            watchdog_hw_pet();
             bp_log("[walfs] crashdump archive...");
             if (crashdump_archive_pending())
                 bp_warn("[crash] previous boot ended in a PiSOD — archived to "
@@ -25333,6 +25791,11 @@ void kernel_main(void) {
         }
         if (walfs_ok) bp_ok("[fs] SD + WALFS online");
         else bp_warn("[fs] SD ok, WALFS failed");
+        /*
+         * Optional p3 attachment is non-fatal.  It uses a pre-read MBR
+         * snapshot and range-fenced callbacks, so it cannot access p1/p2.
+         */
+        exchange_init();
         bp_log("[key] keystore_init...");
         if (keystore_init()) {            bp_ok("[key] sealed root ready");
             bp_log("[x509] x509_init...");

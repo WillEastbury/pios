@@ -20,4 +20,11 @@
 #define TAG_END                 0x00000000
 
 bool mbox_call(u8 channel, volatile u32 *mbox_buf);
-bool mbox_set_gpio_output(u32 gpio, bool high);
+
+#define MBOX_GPIO_OUTPUT_REQUEST_WORDS 16U
+
+/* Build the complete property-tag request for an output GPIO.  Kept separate
+ * from MMIO so the VideoCore tag layout has a deterministic host test. */
+bool mbox_build_gpio_output_request(volatile u32 *buf, u32 words,
+                                    u32 gpio, bool high);
+bool mbox_set_gpio_output(u32 gpio, bool high, u32 *response_code);

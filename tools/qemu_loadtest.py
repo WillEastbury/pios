@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import socket
 import threading
 import time
@@ -265,6 +266,66 @@ def prof_ota_transport(base, cfg) -> bool:
     return ok
 
 
+def prof_ota_chunked(base, cfg) -> bool:
+    """Stage only: never commit synthetic bytes or mark a boot slot pending."""
+    from pios_ota_update import request_json, update_path
+
+    def update(action, body=b"", **values):
+        return request_json(cfg.host, cfg.ota_port, "POST",
+                            update_path(action=action, **values), body, timeout=10)
+
+    def status():
+        with urllib.request.urlopen(base + "/api/status", timeout=5) as response:
+            return json.loads(response.read())
+
+    print(f"{YEL}ota-chunked{RST} — {cfg.ota_rounds} x {cfg.ota_bytes} bytes; "
+          "concurrent health probes, cancel without commit, no retry")
+    image = bytes((i * 29 + 3) & 255 for i in range(cfg.ota_bytes))
+    active = False
+    ok = True
+    try:
+        before = status()
+        with Health(base) as health:
+            for _ in range(cfg.ota_rounds):
+                begin = update("begin", total=len(image))
+                active = True
+                if not begin.get("stageReady") or begin.get("nextOffset") != 0:
+                    raise RuntimeError("OTA did not allocate a fresh RAM staging session")
+                for off in range(0, len(image), 4096):
+                    part = image[off:off + 4096]
+                    reply = update("chunk", part, offset=off, total=len(image))
+                    if reply.get("nextOffset") != off + len(part):
+                        raise RuntimeError(f"OTA lost staged bytes at {off}")
+                final = update("status")
+                if final.get("received") != len(image):
+                    raise RuntimeError("OTA receive count did not match payload")
+                update("cancel")
+                active = False
+            dips = health.dips
+        after = status()
+        ok = (dips == 0 and before["version"] == after["version"] and
+              after["uptime"] >= before["uptime"])
+        for counter in ("nic_rx_wedge", "nic_rx_hole_recover"):
+            if after.get("perf", {}).get(counter, 0) != 0:
+                ok = False
+        with urllib.request.urlopen(
+                base + "/api/terminal?cmd=net%20dispatch", timeout=5) as response:
+            print("  " + response.read().decode("utf-8").strip())
+        print(f"  health dips={dips}, version={after['version']}")
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        print(f"  OTA staging failed: {exc}")
+        ok = False
+    finally:
+        if active:
+            try:
+                update("cancel")
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"  OTA cancel failed: {exc}")
+                ok = False
+    print(f"  [{'PASS' if ok else 'FAIL'}] ota-chunked")
+    return ok
+
+
 # --------------------------------------------------------------------- profiles
 def prof_idle(base, cfg) -> bool:
     """Validate idle behaviour: with no load, the board must answer promptly and
@@ -433,9 +494,11 @@ PROFILES = {
     "bursty": prof_bursty,
     "malformed": prof_malformed,
     "ota-transport": prof_ota_transport,
+    "ota-chunked": prof_ota_chunked,
     "fallover": prof_fallover,
 }
-BATTERY = ["idle", "sequential", "parallel", "bursty", "malformed", "intermixed"]
+BATTERY = ["idle", "sequential", "parallel", "bursty", "malformed", "intermixed",
+           "ota-chunked"]
 
 
 def main() -> int:
@@ -447,15 +510,19 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8088)
     ap.add_argument("--ota-port", type=int, default=8082)
+    ap.add_argument("--ota-bytes", type=int, default=128 * 1024)
+    ap.add_argument("--ota-rounds", type=int, default=2)
     ap.add_argument("--min-success", type=float, default=0.98)
     ap.add_argument("--no-retry", action="store_true",
                      help="disable the retry-on-failure below (see comment) -- use this "
                           "for manual/diagnostic single-profile runs where you want the "
                           "raw first-attempt result, not a smoothed one")
     ap.add_argument("--max-retries", type=int, default=2,
-                     help="max retries per profile in the 'all' battery for the known "
-                          "QEMU/SLIRP burst-noise smoothing below (0 = same as --no-retry)")
+                     help="optional retries per profile in the 'all' battery "
+                          "(0 = same as --no-retry; deploy gates use --no-retry)")
     cfg = ap.parse_args()
+    if not 1 <= cfg.ota_bytes <= 0x37FE00 or not 1 <= cfg.ota_rounds <= 20:
+        ap.error("OTA staging requires 1..3669504 bytes and 1..20 rounds")
     base = f"http://{cfg.host}:{cfg.port}"
 
     names = BATTERY if cfg.profile == "all" else [cfg.profile]
@@ -463,28 +530,15 @@ def main() -> int:
     for n in names:
         print()
         results[n] = PROFILES[n](base, cfg)
-        # Known QEMU-only flakiness (confirmed 2026-07-23, not a PIOS bug): under
-        # QEMU's user-mode networking (SLIRP), bursts of near-simultaneous new TCP
-        # connections (bursty/intermixed profiles) occasionally see the HOST-side
-        # proxy reset/drop one connection while PIOS itself stays fully healthy --
-        # verified via extensive live investigation (every kernel-side HTTP abort
-        # path instrumented and confirmed NOT firing; PIOS's own vnetdiag tx_drop/
-        # rx_starve counters clean in every observed failure; the identical test
-        # run 13/13 clean against real Pi5 hardware with the same PIOS binary and
-        # zero code changes, where there is no SLIRP proxy layer to introduce this
-        # noise). A tiny 8s/~16-request sample also means a single such hiccup can
-        # swing success rate several points below --min-success, so the gate is
-        # statistically fragile at this sample size regardless of true health.
-        # A single retry measurably helps but is not fully reliable on its own
-        # (observed one double-failure -- two independent noisy 8s windows back
-        # to back -- across 5 live QEMU runs during hardening); up to
-        # --max-retries=2 (3 total attempts) makes a false-negative gate trip
-        # from environment noise alone rare, while a genuine PIOS regression
-        # still reproduces across all attempts and correctly fails the gate.
+        # Retain optional retries for exploratory runs, but never infer the
+        # cause from clean NIC counters. Issue #166 reproduced real pre-accept
+        # TCP data loss with tx_drop=rx_starve=0. The smoke/deploy gate passes
+        # --no-retry; staging always fails on its first error.
         attempt = 1
-        while not results[n] and cfg.profile == "all" and not cfg.no_retry and attempt <= cfg.max_retries:
-            print(f"  {DIM}retrying {n} (attempt {attempt + 1}/{cfg.max_retries + 1}; known QEMU/SLIRP"
-                  f" burst noise, not a PIOS bug -- see tools/qemu_loadtest.py main() comment){RST}")
+        while (not results[n] and n != "ota-chunked" and cfg.profile == "all" and
+               not cfg.no_retry and attempt <= cfg.max_retries):
+            print(f"  {DIM}retrying {n} (attempt {attempt + 1}/{cfg.max_retries + 1};"
+                  f" first-attempt failure remains diagnostic evidence){RST}")
             print()
             results[n] = PROFILES[n](base, cfg)
             attempt += 1

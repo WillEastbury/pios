@@ -29,6 +29,10 @@ OUT = TESTS / "_build"
 # test file -> kernel source files it links against
 TESTS_MANIFEST = {
     "test_picocompress.c": ["src/picocompress.c"],
+    # The Pi5 editor PBRP envelope is made by tools/pios_brotli.py. This test
+    # proves that it is accepted by the in-kernel decoder, validates both
+    # checksummed headers, and rejects/re-recognizes corrupt and truncated data.
+    "test_ide_asset_pack.c": ["src/brotli.c", "src/ide_asset_pack.c"],
     # DHCP option parser: compiled from src/dhcp_options.c (the standalone
     # parser extracted from dhcp.c, pure logic, no MMIO/asm/network deps).
     "test_dhcp.c": ["src/dhcp_options.c"],
@@ -51,7 +55,84 @@ TESTS_MANIFEST = {
     # (Cortex-A76 -> Pi5, Cortex-A53 -> BCM2837-family). Pure bit-decode
     # logic, no asm/MMIO. See src/board_detect.c, include/board_detect.h.
     "test_board_detect.c": ["src/board_detect.c"],
+    # ADR-061 boot-control v1->v2 migration/checksum and exhaustive pure
+    # O -> pending -> active -> FAT recovery precedence matrix.
+    "test_boot_precedence.c": ["src/boot_precedence.c"],
+    # Board-specific CYW blob selection, BCM2712 stepping classification,
+    # BCM2711 pull fields, and VideoCore GPIO property-tag layout.
+    "test_wifi_platform.c": ["src/wifi_platform.c", "src/mailbox.c",
+                             "src/sha256_hkdf.c"],
     "test_sdhost.c": ["src/sdhost_logic.c"],
+    # Offline HCI H4 controller receive framing. This is deliberately pure
+    # parsing/ownership logic: no hardware or platform dependency.
+    "test_bt_h4.c": ["src/bt_h4.c"],
+    # ADR-060 immutable Bluetooth transport/reset topology facts. This does
+    # not depend on board detection, UART, control lines, or hardware.
+    "test_bluetooth_platform_contract.c": ["src/bluetooth_platform_contract.c"],
+    # #182 HCD artifact/baud bootstrap evidence state machine. It is
+    # deliberately offline: injected artifacts and acknowledgements only;
+    # it has no controller I/O or physical activation path.
+    "test_bluetooth_hcd_bootstrap.c": ["src/bluetooth_platform_contract.c",
+                                       "src/bluetooth_hcd_bootstrap.c"],
+    # #183 core-0-owned HCI command/event lifecycle. This is a bounded,
+    # offline parser/ownership contract and deliberately has no H4 transport
+    # adapter, controller reset, or capability activation path.
+    "test_bt_hci_lifecycle.c": ["src/bt_hci_lifecycle.c"],
+    # #76 association is evidence-only: fixed states, injected credit/control
+    # publication/event/EAPOL summaries, liveness proof, and no CYW transport.
+    "test_wifi_assoc_contract.c": ["src/wifi_assoc_contract.c"],
+    # #193 role-marker policy: p1 boot, explicitly marked p2 WALFS, and
+    # explicitly marked p3 FAT32 exchange. No storage I/O or formatting.
+    "test_storage_role_policy.c": ["src/storage_role_policy.c"],
+    # First DWC2 milestone: verified BCM2837 DMA/IRQ-route facts plus a pure
+    # generation-safe transfer ownership model. No controller hardware is
+    # enabled or accessed by this host-tested contract.
+    "test_dwc2_contract.c": ["src/dwc2_contract.c"],
+    # #176 BCM2837-only reserved DWC2 DMA arena. This is a pure ownership and
+    # Normal-NC publication contract; it starts no hardware transfer.
+    "test_dwc2_dma_arena.c": ["src/dwc2_contract.c",
+                              "src/dwc2_dma_arena.c"],
+    # ADR-059 BCM2837 USB VBUS evidence only. This records external topology
+    # attestations and current observations without a board/platform or
+    # hardware dependency, and cannot authorize software VBUS control.
+    "test_usb_vbus_contract.c": ["src/usb_vbus_contract.c"],
+    # BCM2837 ARMCTRL source registry and pending demux. DWC2 IRQ41 remains a
+    # dormant known route until a future driver explicitly registers it.
+    "test_legacy_armctrl.c": ["src/legacy_armctrl.c"],
+    # RP1 CFE / PiSP-FE source-resource facts and stream ownership are
+    # deliberately offline: this verifies no-hardware V1 validation,
+    # generation handling, and permanent activation rejection.
+    "test_rp1_cfe_contract.c": ["src/rp1_cfe_contract.c"],
+    # ADR-054 media engines: passive resource facts plus generation-safe
+    # ownership. This contract has no hardware, DMA, IRQ, or platform deps.
+    "test_media_engine_contract.c": ["src/media_engine_contract.c"],
+    # #169 / ADR-072 cross-engine media admission. This is a Core-0-owned,
+    # offline control contract over immutable numeric resources and existing
+    # media-engine leases; it does not link a media execution path.
+    "test_media_admission.c": ["src/media_engine_contract.c",
+                               "src/media_admission.c"],
+    # ADR-055 PiSP-BE request/configuration/span ownership contract. It
+    # validates a private configuration copy and numeric DMA authority only;
+    # it never identifies, enables, or accesses PiSP-BE hardware.
+    "test_pisp_be_contract.c": ["src/media_engine_contract.c",
+                                "src/pisp_be_contract.c"],
+    # ADR-056 HEVC request/frame/job contract. Pure numeric metadata and
+    # lifecycle validation only: it contains no compressed-input interpretation
+    # or hardware.
+    "test_hevc_contract.c": ["src/media_engine_contract.c",
+                             "src/hevc_contract.c"],
+    # ADR-055 PiSP-BE brick-test gate. It accepts only caller-supplied
+    # observations and contract capabilities; it has no platform or I/O path.
+    "test_pisp_be_gate.c": ["src/media_engine_contract.c",
+                            "src/pisp_be_contract.c",
+                            "src/pisp_be_gate.c"],
+    # ADR-054 HVS V1 handoff lifecycle. Pure numeric ownership, private
+    # snapshots/list descriptors, and backend readback attestations only.
+    "test_hvs_handoff_contract.c": ["src/hvs_handoff_contract.c"],
+    # USB Bulk-Only/SCSI geometry discovery. The test supplies a deterministic
+    # transport mock and verifies READ CAPACITY(16) is issued only after the
+    # READ CAPACITY(10) sentinel, including malformed-response rejection.
+    "test_usb_storage.c": [],
     "test_crypto_soft.c": ["src/crypto.c"],
     # P-256 general-point ECDH multiply (added for TLS 1.3 server-side
     # ECDHE key exchange). Pure math, no MMIO/asm deps beyond simd_memset
@@ -137,6 +218,10 @@ TESTS_MANIFEST = {
     # queries.  The test uses an in-memory authoritative document callback,
     # so no WALFS or hardware dependencies are pulled into the host build.
     "test_ppos.c": ["src/ppos.c"],
+    # Issue #92 PPOS persistence/provider integration. The test supplies a
+    # deterministic in-memory WALFS, PicoWAL, and pv_ctx host mock to cover
+    # immutable page reload/rebuild and the existing Storage.* hook ABI.
+    "test_ppos_provider.c": ["src/ppos.c", "src/ppos_provider.c"],
     # ABI-level dual-NIC contract: distinct backend identities, preserved
     # 64-byte FIFO messages, and interface-scoped firewall rule defaults.
     "test_dual_nic.c": [],
@@ -147,12 +232,59 @@ TESTS_MANIFEST = {
     # BAR size, RP1 window non-overlap, and that finding a GPU is not a
     # verified LevelZero proof.
     "test_pcie1.c": [],
+    # #189 offline PCIe1 inbound-DMA/MSI containment. Numeric Normal-NC
+    # spans, endpoint/request generations, sticky AIRQ continuation, and
+    # quarantine only; no MMIO, bus mastering, or interrupt enablement.
+    "test_pcie1_containment.c": ["src/pcie1_containment.c"],
+    # #188 BAR/MMIO ownership evidence gate. It accepts only numeric PCI
+    # configuration/probe/aperture descriptors, makes one generation-safe
+    # endpoint lease, and remains hardware-disabled pending live proof.
+    "test_pcie1_bar_lease.c": ["src/pcie1_bar_lease.c"],
+    # #97 fixed-size GPU-fabric control plane. This contract models verified
+    # node facts, placement and activation credits only; it has no GPU, PCIe,
+    # network, packet, model-data, or runtime integration.
+    "test_gpu_fabric_control.c": ["src/gpu_fabric_control.c"],
+    # ADR-064 bounded, read-only MBR/GPT parser. It receives only a
+    # callback-backed 512-byte span and produces a caller-owned snapshot;
+    # no storage, filesystem, mount, or writable-target code is linked.
+    "test_partition_table.c": ["src/partition_table.c"],
+    "test_storage_layout.c": ["src/storage_layout.c"],
+    # ADR-067 dedicated FAT32 exchange selection. This consumes independently
+    # enumerated immutable facts and can only attach one explicitly requested
+    # PIOSXFER candidate; no parser, storage, or filesystem code is linked.
+    "test_exchange_volume_policy.c": ["src/exchange_volume_policy.c"],
+    # ADR-071's offline FAT32 exchange partition mechanics.  This receives
+    # only injected identity/geometry plus exact-sector callbacks; it does
+    # not link the live FAT32, SD, WALFS, bootstrap, or kernel paths.
+    "test_fat32_exchange_core.c": ["src/fat32_exchange_core.c"],
+    # Production-safe discovery-only p3 boot attachment. The fake backend
+    # proves legacy media remains non-fatal, valid unlabeled FAT32 mounts
+    # without writes, and raw/corrupt p3 is unavailable without overwrites.
+    "test_exchange_service.c": ["src/exchange_service.c",
+                                "src/exchange_volume_policy.c",
+                                "src/fat32_exchange_core.c",
+                                "src/storage_layout.c"],
+    "test_nvme.c": ["src/nvme.c"],
+    # ADR-066 #192 offline callback-backed single-namespace provider plus a
+    # deliberately test-only fixed persistence model. No live storage code.
+    "test_nvme_block_provider.c": ["src/nvme_block_provider.c"],
+    "test_net_dispatch.c": ["src/net_dispatch.c", "src/airq.c"],
+    "test_nic_receive.c": ["src/nic.c"],
+    "test_tcp_pending.c": ["src/tcp.c"],
+    "test_dma_logic.c": ["src/dma_logic.c"],
+    "test_proc_owner.c": [],
     "test_usb_descriptor.c": ["src/usb_descriptor.c"],
 }
 
 TEST_CFLAGS = {
+    "test_fat32_exchange_core.c": ["-DFAT32_EXCHANGE_ENABLE_TEST_FORMAT"],
+    "test_net_dispatch.c": ["-DPIOS_PLATFORM=2"],
+    "test_nic_receive.c": ["-DPIOS_PLATFORM=2"],
     "test_crypto_soft.c": ["-DPIOS_PLATFORM=6"],
+    "test_dwc2_dma_arena.c": ["-DPIOS_PLATFORM=6"],
     "test_airq_concurrency.c": ["-DPIOS_HOST_CORE_ID_FN", "-pthread"],
+    "test_wifi_assoc_contract.c": ["-DPIOS_HOST_CORE_ID_FN"],
+    "test_media_admission.c": ["-DPIOS_HOST_CORE_ID_FN"],
     "test_tls_event.c": ["-DPIOS_PLATFORM=6"],
     "test_tls_api.c": ["-DPIOS_PLATFORM=6"],
 }
@@ -174,6 +306,14 @@ def main() -> int:
               "-Wno-unused-parameter", "-fno-strict-aliasing"]
 
     total_fail = 0
+    asset_pack = subprocess.run(
+        [sys.executable, str(REPO / "tools" / "pack_ide_assets.py"), "--brotli"],
+        cwd=REPO, capture_output=True, text=True
+    )
+    if asset_pack.returncode != 0:
+        print("[BUILD FAIL] editor Brotli asset pack")
+        print(asset_pack.stderr[-2000:])
+        total_fail += 1
     for test, srcs in TESTS_MANIFEST.items():
         exe = OUT / (pathlib.Path(test).stem + (".exe" if sys.platform == "win32" else ""))
         cmd = [cc, *cflags, *TEST_CFLAGS.get(test, []), *inc, str(TESTS / test),
@@ -200,13 +340,44 @@ def main() -> int:
                  "test_issue_112_bcache.py",
                  "test_qemu_blk_probe.py",
                  "test_sdio_io_only_cmd5.py",
+                 "test_issue_182_bluetooth_bootstrap_gate.py",
                  "test_irq_fifo_intids.py",
+                 "test_issue_134_bcm2837_sdio_irq.py",
                  "test_issue_143_pcie1_bus_master.py",
                  "test_issue_146_pcie1_aer.py",
                  "test_issue_145_pcie1_enum_map.py",
                  "test_issue_142_pcie1_dma_cache.py",
                  "test_issue_147_pcie1_msi_mask.py",
+                 "test_issue_189_pcie1_containment_gate.py",
+                 "test_issue_188_pcie1_bar_lease_gate.py",
+                 "test_issue_192_nvme_block_provider_gate.py",
+                 "test_issue_191_nvme_namespace_io_gate.py",
+                 "test_issue_183_bluetooth_hci_lifecycle_gate.py",
+                 "test_issue_76_wifi_assoc_contract_gate.py",
+                 "test_issue_97_gpu_fabric_control_gate.py",
+                 "test_issue_169_media_admission_gate.py",
+                 "test_partition_table_gate.py",
+                 "test_storage_layout_gate.py",
+                 "test_exchange_volume_policy_gate.py",
+                 "test_fat32_exchange_core_gate.py",
+                 "test_exchange_service_gate.py",
+                 "test_qemu_disk_image.py",
                  "test_issue_137_pcie1_host_contract.py",
+                 "test_picoscript_datagram_contract.py",
+                 "test_dma_boot_contract.py",
+                 "test_issue_166_ota_transport_budget.py",
+                 "test_pios_ota_update.py",
+                 "test_ide_asset_pack.py",
+                 "test_stage0_pkg_check.py",
+                 "test_wifi_command_watchdog.py",
+                 "test_issue_106_zero2w_wifi_activation.py",
+                 "test_issue_131_zero2w_wl_on.py",
+                 "test_wifi_preload_progress.py",
+                 "test_issue_100_sdio_50mhz_strap.py",
+                 "test_sdio_clock_contract.py",
+                 "test_issue_120_sdio1_high_speed_probe.py",
+                 "test_issue_70_usb3_phy.py",
+                 "test_dwc2_dma_arena_gate.py",
                  "test_tls_source_gate.py"):
         run = subprocess.run([sys.executable, str(TESTS / test)],
                              capture_output=True, text=True)

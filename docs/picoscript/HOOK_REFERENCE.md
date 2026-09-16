@@ -22,7 +22,7 @@ Each hook is a deterministic primitive callable from any of the 7 language surfa
 |--------|------|-------------|
 | Thread.YieldCounted() | 0x0070 | Deterministic cooperative-yield counter; increments and returns a per-VM sequence number. Real on all 3 runtimes. |
 
-### Net.* (10 hooks)
+### Net.* (16 hooks)
 
 | Method | Code | Description |
 |--------|------|-------------|
@@ -36,6 +36,12 @@ Each hook is a deterministic primitive callable from any of the 7 language surfa
 | Net.Connect() | 0x037E | Connect a client socket to endpoint + port. |
 | Net.SendSpan() | 0x037F | Span-oriented send alias. |
 | Net.RecvSpan() | 0x0380 | Span-oriented receive alias. |
+| Net.DatagramBind() | 0x038B | Bind a bounded UDP socket. |
+| Net.DatagramRecv() | 0x038C | Receive one UDP payload span and remember its peer. |
+| Net.DatagramPeer() | 0x038D | Return a six-byte IPv4/port endpoint span. |
+| Net.DatagramSetPeer() | 0x038E | Select a six-byte IPv4/port destination endpoint. |
+| Net.DatagramSend() | 0x038F | Send a payload to the selected endpoint. |
+| Net.DatagramClose() | 0x0390 | Close a UDP socket. |
 
 ---
 

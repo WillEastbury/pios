@@ -34,7 +34,7 @@ bool wifi_nic_init(void)
     wifi_rx_bytes = 0U;
     wifi_tx_bytes = 0U;
 
-    uart_puts("[wnic] init CYW43455...\n");
+    uart_puts("[wnic] init CYW SDIO...\n");
 
     /* Pre-load firmware blobs from SD before native SDIO init disturbs EMMC2. */
     uart_puts("[wnic] preload blobs...\n");

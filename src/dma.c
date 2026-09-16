@@ -12,17 +12,18 @@
 #include "simd.h"
 #include "uart.h"
 #include "fb.h"
+#include "timer.h"
+#include "watchdog.h"
+#include "net.h"
 
-#define DMA_ENABLE_OFFSET 0xFF0U
+#define DMA_WAIT_MS 5U
+#define DMA_WAIT_SPINS 100000U
 
 /* Below this transfer size, DMA setup + cache maintenance + completion-wait
  * costs more than a NEON copy, so dma_memcpy()/dma_zero() shortcut straight to
  * simd_*(). Conservative initial value; tuned empirically by the IPC
  * DMA-crossover benchmark (the cross-over point where the engine wins). */
 #define DMA_MIN_EFFECTIVE_BYTES 4096U
-
-static bool dma_cbaddr_shifted;
-static bool dma_direct_mode;
 
 /* DMA channel register access */
 static inline u64 dma_reg(u32 ch, u32 off) {
@@ -31,17 +32,16 @@ static inline u64 dma_reg(u32 ch, u32 off) {
 
 static inline u32 dma_cb_addr(const struct dma_cb *cb)
 {
-    u32 bus = (u32)(usize)cb;
-    return dma_cbaddr_shifted ? (bus >> 5) : bus;
+    return (u32)((u64)(usize)cb >> 5);
 }
 
 /* Static control block pool — 16 CBs per channel, 32-byte aligned */
 #define CBS_PER_CHAN    16
-static struct dma_cb cb_pool[DMA_NUM_CHANNELS][CBS_PER_CHAN] ALIGNED(32);
+static struct dma_cb cb_pool[DMA_NUM_CHANNELS][CBS_PER_CHAN] ALIGNED(64);
 
 static const u32 zero_word ALIGNED(32) = 0;
-static u8 dma_test_src[1024] ALIGNED(64);
-static u8 dma_test_dst[1024] ALIGNED(64);
+static u8 dma_test_src[16384] ALIGNED(64);
+static u8 dma_test_dst[16384] ALIGNED(64);
 static bool dma_hw_memcpy_enabled;
 static u32 dma_selftest_runs;
 static u32 dma_selftest_failures;
@@ -51,6 +51,11 @@ static u32 dma_last_len;
 static u32 dma_last_mismatch_off;
 static u32 dma_last_got;
 static u32 dma_last_expected;
+static u32 dma_hw_copies;
+static u32 dma_hw_zeroes;
+static u32 dma_last_cs;
+static u32 dma_last_debug;
+static u32 dma_last_cbaddr;
 
 #define DMA_ERR_NONE        0U
 #define DMA_ERR_START       1U
@@ -59,13 +64,9 @@ static u32 dma_last_expected;
 #define DMA_ERR_MISMATCH    4U
 #define DMA_ERR_ADDR_RANGE  5U
 
-static inline u32 dma_ram_addr(const void *p)
-{
-    return (u32)(usize)p;
-}
-
 static bool dma_memcpy_hw(u32 channel, void *dst, const void *src, u32 len);
-static bool dma_selftest_mode(u32 mode);
+static bool dma_zero_hw(u32 channel, void *dst, u32 len);
+static bool dma_selftest_transfer(void);
 
 static bool dma_channel_allowed(u32 ch)
 {
@@ -75,25 +76,16 @@ static bool dma_channel_allowed(u32 ch)
 void dma_init(void) {
 #if !PIOS_HAS_DMA
     dma_hw_memcpy_enabled = false;
-    dma_direct_mode = false;
-    dma_cbaddr_shifted = false;
     dma_last_error = DMA_ERR_NONE;
     return;
 #else
     dma_hw_memcpy_enabled = false;
-    dma_direct_mode = false;
-    dma_cbaddr_shifted = false;
     dma_last_error = DMA_ERR_NONE;
-    mmio_write(DMA_BASE + DMA_ENABLE_OFFSET, DMA_CHAN_MASK);
-    delay_cycles(1000);
     /* Reset usable dma32 channels. DT mask 0x35 exposes channels 0,2,4,5. */
     for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
         if (!dma_channel_allowed(ch))
             continue;
-        mmio_write(dma_reg(ch, DMA_CH_CS), DMA_CS_RESET);
-        delay_cycles(1000);
-        /* Clear status bits */
-        mmio_write(dma_reg(ch, DMA_CH_CS), DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
+        dma_abort(ch);
     }
 
     /* Zero the CB pool */
@@ -136,8 +128,8 @@ void dma_diag_snapshot(struct dma_diag_snapshot *out)
     return;
 #else
     out->hw_memcpy_enabled = dma_hw_memcpy_enabled;
-    out->direct_mode = dma_direct_mode;
-    out->cbaddr_shifted = dma_cbaddr_shifted;
+    out->direct_mode = false;
+    out->cbaddr_shifted = true;
     out->selftest_runs = dma_selftest_runs;
     out->selftest_failures = dma_selftest_failures;
     out->last_error = dma_last_error;
@@ -146,7 +138,12 @@ void dma_diag_snapshot(struct dma_diag_snapshot *out)
     out->last_mismatch_off = dma_last_mismatch_off;
     out->last_got = dma_last_got;
     out->last_expected = dma_last_expected;
-    out->enable_reg = mmio_read(DMA_BASE + DMA_ENABLE_OFFSET);
+    out->channel_mask = DMA_CHAN_MASK;
+    out->hw_copies = dma_hw_copies;
+    out->hw_zeroes = dma_hw_zeroes;
+    out->last_cs = dma_last_cs;
+    out->last_debug = dma_last_debug;
+    out->last_cbaddr = dma_last_cbaddr;
     for (u32 ch = 0; ch < DMA_NUM_CHANNELS; ch++) {
         out->channel[ch].cs = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_CS)) : 0;
         out->channel[ch].cbaddr = dma_channel_allowed(ch) ? mmio_read(dma_reg(ch, DMA_CH_CBADDR)) : 0;
@@ -164,43 +161,27 @@ bool dma_selftest(void)
 #if !PIOS_HAS_DMA
     return false;
 #else
+    if (core_id() != 0U) {
+        uart_puts("[dma] selftest requires core 0\n");
+        return false;
+    }
     dma_selftest_runs++;
     dma_hw_memcpy_enabled = false;
     dma_last_error = DMA_ERR_NONE;
-    if (dma_selftest_mode(0)) {
-        dma_direct_mode = true;
-        dma_cbaddr_shifted = false;
-        dma_hw_memcpy_enabled = true;
-        uart_puts("[dma] selftest ok mode=direct\n");
-        return true;
-    }
-    dma_selftest_failures++;
-    if (dma_selftest_mode(1)) {
-        dma_direct_mode = false;
-        dma_cbaddr_shifted = false;
-        dma_hw_memcpy_enabled = true;
-        uart_puts("[dma] selftest ok cbaddr=raw\n");
-        return true;
-    }
-    dma_selftest_failures++;
-    if (dma_selftest_mode(2)) {
-        dma_direct_mode = false;
-        dma_cbaddr_shifted = true;
+    if (dma_selftest_transfer()) {
         dma_hw_memcpy_enabled = true;
         uart_puts("[dma] selftest ok cbaddr=shifted\n");
         return true;
     }
     dma_selftest_failures++;
     dma_hw_memcpy_enabled = false;
-    uart_puts("[dma] selftest failed both cbaddr modes\n");
+    uart_puts("[dma] selftest failed\n");
     return false;
 #endif
 }
 
-static bool dma_selftest_mode(u32 mode)
+static bool dma_selftest_transfer(void)
 {
-    dma_direct_mode = mode == 0;
-    dma_cbaddr_shifted = mode == 2;
     for (u32 i = 0; i < sizeof(dma_test_src); i++) {
         dma_test_src[i] = (u8)(0xA5U ^ (i * 37U) ^ (i >> 2));
         dma_test_dst[i] = 0;
@@ -214,10 +195,7 @@ static bool dma_selftest_mode(u32 mode)
     uart_hex((u32)(usize)dma_test_dst);
     uart_puts(" cb=");
     uart_hex((u32)(usize)&cb_pool[DMA_CHAN_MEMCPY][0]);
-    uart_puts(" mode=");
-    if (mode == 0) uart_puts("direct");
-    else uart_puts(dma_cbaddr_shifted ? "shifted" : "raw");
-    uart_puts("\n");
+    uart_puts(" mode=shifted\n");
 
     dma_abort(DMA_CHAN_MEMCPY);
     if (!dma_memcpy_hw(DMA_CHAN_MEMCPY, dma_test_dst, dma_test_src, sizeof(dma_test_src))) {
@@ -245,56 +223,100 @@ static bool dma_selftest_mode(u32 mode)
         }
     }
 
-    return true;
-}
-
-static bool dma_start_direct(u32 channel, u32 ti, u32 src, u32 dst, u32 len)
-{
-    if (channel >= DMA_NUM_CHANNELS) return false;
-    if (!dma_channel_allowed(channel)) return false;
-    if (dma_busy(channel)) return false;
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
-    mmio_write(dma_reg(channel, DMA_CH_TI), ti);
-    mmio_write(dma_reg(channel, DMA_CH_SRC), src);
-    mmio_write(dma_reg(channel, DMA_CH_DST), dst);
-    mmio_write(dma_reg(channel, DMA_CH_LEN), len);
-    mmio_write(dma_reg(channel, DMA_CH_STRIDE), 0);
-    mmio_write(dma_reg(channel, DMA_CH_NEXTCB), 0);
-    dsb();
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_ACTIVE);
+    if (!dma_zero_hw(DMA_CHAN_MEMCPY, dma_test_dst, sizeof(dma_test_dst)))
+        return false;
+    for (u32 i = 0; i < sizeof(dma_test_dst); i++) {
+        if (dma_test_dst[i] != 0U) {
+            dma_last_error = DMA_ERR_MISMATCH;
+            dma_last_mismatch_off = i;
+            dma_last_got = dma_test_dst[i];
+            dma_last_expected = 0U;
+            return false;
+        }
+    }
     return true;
 }
 
 bool dma_busy(u32 channel) {
+    if (!PIOS_HAS_DMA || core_id() != 0U) return false;
     if (channel >= DMA_NUM_CHANNELS) return false;
     if (!dma_channel_allowed(channel)) return false;
-    return (mmio_read(dma_reg(channel, DMA_CH_CS)) & DMA_CS_ACTIVE) != 0;
+    return mmio_read(dma_reg(channel, DMA_CH_CBADDR)) != 0U ||
+           (mmio_read(dma_reg(channel, DMA_CH_CS)) &
+            (DMA_CS_ACTIVE | DMA_CS_WAITING_WRITES)) != 0U;
+}
+
+static bool dma_wait_complete(u32 channel)
+{
+    u64 start = timer_monotonic_ms();
+    for (u32 spin = 0; spin < DMA_WAIT_SPINS; spin++) {
+        u32 cs = mmio_read(dma_reg(channel, DMA_CH_CS));
+        if (cs & DMA_CS_ERROR) {
+            dma_last_error = DMA_ERR_HW_ERROR;
+            break;
+        }
+        if (!(cs & (DMA_CS_ACTIVE | DMA_CS_WAITING_WRITES)) && (cs & DMA_CS_END) &&
+            mmio_read(dma_reg(channel, DMA_CH_CBADDR)) == 0U) {
+            mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_END | DMA_CS_INT);
+            return true;
+        }
+        if (timer_monotonic_ms() - start >= DMA_WAIT_MS) {
+            dma_last_error = DMA_ERR_TIMEOUT;
+            break;
+        }
+    }
+    if (dma_last_error == DMA_ERR_NONE)
+        dma_last_error = DMA_ERR_TIMEOUT;
+    dma_last_cs = mmio_read(dma_reg(channel, DMA_CH_CS));
+    dma_last_debug = mmio_read(dma_reg(channel, DMA_CH_DEBUG));
+    dma_last_cbaddr = mmio_read(dma_reg(channel, DMA_CH_CBADDR));
+    dma_dump_channel(channel, "transfer-fail");
+    dma_abort(channel);
+    return false;
 }
 
 void dma_wait(u32 channel) {
-    if (channel >= DMA_NUM_CHANNELS) return;
-    if (!dma_channel_allowed(channel)) return;
-    u32 spin = 1000000;
-    while ((mmio_read(dma_reg(channel, DMA_CH_CS)) & DMA_CS_ACTIVE) && spin--)
-        ;
-    /* Clear end/int flags */
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_END | DMA_CS_INT);
+    if (!PIOS_HAS_DMA || core_id() != 0U) return;
+    if (channel >= DMA_NUM_CHANNELS || !dma_channel_allowed(channel)) return;
+    (void)dma_wait_complete(channel);
 }
 
 void dma_abort(u32 channel) {
+    if (!PIOS_HAS_DMA || core_id() != 0U) return;
     if (channel >= DMA_NUM_CHANNELS) return;
     if (!dma_channel_allowed(channel)) return;
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_ABORT);
-    delay_cycles(1000);
+    mmio_write(dma_reg(channel, DMA_CH_NEXTCB), 0U);
+    u32 cs = mmio_read(dma_reg(channel, DMA_CH_CS));
+    if (mmio_read(dma_reg(channel, DMA_CH_CBADDR)) != 0U || (cs & DMA_CS_ACTIVE)) {
+        mmio_write(dma_reg(channel, DMA_CH_CS), cs | DMA_CS_ABORT | DMA_CS_ACTIVE);
+        for (u32 spin = 0; spin < 100U; spin++) {
+            if (!(mmio_read(dma_reg(channel, DMA_CH_CS)) & DMA_CS_ABORT))
+                break;
+        }
+        mmio_write(dma_reg(channel, DMA_CH_CS), 0U);
+    }
     mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_RESET);
-    delay_cycles(1000);
-    mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_END | DMA_CS_INT | DMA_CS_ERROR);
+    dsb();
+    for (u32 spin = 0; spin < 1000U; spin++) {
+        if (!(mmio_read(dma_reg(channel, DMA_CH_CS)) &
+              (DMA_CS_ACTIVE | DMA_CS_WAITING_WRITES)) &&
+            mmio_read(dma_reg(channel, DMA_CH_CBADDR)) == 0U)
+            return;
+    }
+    dma_dump_channel(channel, "reset-fail");
+    watchdog_reboot_now(0x444D4101U);
 }
 
 bool dma_start(u32 channel, struct dma_cb *cb) {
+    if (!PIOS_HAS_DMA || core_id() != 0U) return false;
     if (channel >= DMA_NUM_CHANNELS) return false;
     if (!dma_channel_allowed(channel)) return false;
     if (dma_busy(channel)) return false;
+    if (!cb || ((u64)(usize)cb & 31U) != 0U ||
+        (u64)(usize)cb > 0x40000000ULL - sizeof(*cb) ||
+        cb->xfer_len == 0U || cb->xfer_len > DMA_MAX_CB_BYTES)
+        return false;
+    dma_abort(channel);
 
     /* Control blocks live in normal cacheable RAM. The DMA engine fetches
      * them directly, so clean the CB before handing its address to hardware. */
@@ -314,12 +336,14 @@ bool dma_start_chain(u32 channel, struct dma_cb *first_cb) {
 }
 
 static bool dma_memcpy_hw(u32 channel, void *dst, const void *src, u32 len) {
-    if (channel >= DMA_NUM_CHANNELS || len == 0) return false;
+    if (channel >= DMA_NUM_CHANNELS || len == 0 || len > DMA_MAX_CB_BYTES) return false;
     if (!dma_channel_allowed(channel)) return false;
     if (dma_busy(channel)) return false;
 
     /* BCM2712 dma32 uses the SoC DMA address; for low RAM this is PA. */
-    if ((u64)(usize)src >= 0x40000000ULL || (u64)(usize)dst >= 0x40000000ULL) {
+    if ((u64)(usize)src >= 0x40000000ULL || (u64)(usize)dst >= 0x40000000ULL ||
+        len > 0x40000000ULL - (u64)(usize)src ||
+        len > 0x40000000ULL - (u64)(usize)dst) {
         uart_puts("[dma] addr outside dma-ranges\n");
         dma_last_error = DMA_ERR_ADDR_RANGE;
         dma_last_channel = channel;
@@ -334,80 +358,101 @@ static bool dma_memcpy_hw(u32 channel, void *dst, const void *src, u32 len) {
 
     struct dma_cb *cb = &cb_pool[channel][0];
 
-    cb->ti       = DMA_TI_SRC_INC | DMA_TI_DEST_INC | DMA_TI_WAIT_RESP;
-    cb->src_addr = dma_ram_addr(src);
-    cb->dst_addr = dma_ram_addr(dst);
-    cb->xfer_len = len;
-    cb->stride   = 0;
-    cb->next_cb  = 0;  /* single transfer */
+    if (!dma_cb_encode(cb, (u64)(usize)src, (u64)(usize)dst, len, true, 0))
+        return false;
 
     dma_last_channel = channel;
     dma_last_len = len;
-    bool started = dma_direct_mode ?
-        dma_start_direct(channel, cb->ti, cb->src_addr, cb->dst_addr, cb->xfer_len) :
-        dma_start(channel, cb);
+    dma_last_error = DMA_ERR_NONE;
+    bool started = dma_start(channel, cb);
     if (!started) {
         dma_last_error = DMA_ERR_START;
         return false;
     }
 
-    dma_wait(channel);
-    if (mmio_read(dma_reg(channel, DMA_CH_CS)) & DMA_CS_ACTIVE) {
-        uart_puts("[dma] memcpy timeout\n");
-        dma_last_error = DMA_ERR_TIMEOUT;
-        dma_dump_channel(channel, "memcpy-timeout");
-        dma_abort(channel);
+    if (!dma_wait_complete(channel))
         return false;
-    }
 
     /* Invalidate destination so CPU sees DMA-written data */
     dcache_invalidate_range((u64)(usize)dst, len);
 
-    /* Check for errors */
-    u32 cs = mmio_read(dma_reg(channel, DMA_CH_CS));
-    if (cs & DMA_CS_ERROR) {
-        dma_last_error = DMA_ERR_HW_ERROR;
-        mmio_write(dma_reg(channel, DMA_CH_CS), DMA_CS_ERROR);
-        return false;
-    }
-
     dma_last_error = DMA_ERR_NONE;
+    dma_hw_copies++;
     return true;
 }
 
 bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len) {
+    if (!dst || !src || !len ||
+        (u64)(usize)dst > ~0ULL - len || (u64)(usize)src > ~0ULL - len) {
+        uart_puts("[dma] invalid copy span\n");
+        return false;
+    }
     /* Size fast-path: below the effective threshold, DMA setup + cache
      * maintenance + completion-wait costs more than a NEON copy, so go
      * straight to simd_memcpy and never touch the engine. Tuned empirically
      * by the IPC DMA-crossover benchmark. */
-    if (len < DMA_MIN_EFFECTIVE_BYTES) {
+    if (core_id() != 0U || len < DMA_MIN_EFFECTIVE_BYTES) {
         simd_memcpy(dst, src, len);
         return len != 0;
     }
-    if (dma_hw_memcpy_enabled && dma_memcpy_hw(channel, dst, src, len))
+    bool low_ram = (u64)(usize)src < 0x40000000ULL &&
+                   (u64)(usize)dst < 0x40000000ULL &&
+                   len <= 0x40000000ULL - (u64)(usize)src &&
+                   len <= 0x40000000ULL - (u64)(usize)dst;
+    if (dma_hw_memcpy_enabled && low_ram) {
+        for (u32 off = 0U; off < len;) {
+            u32 part = len - off;
+            if (part > 32768U) part = 32768U;
+            if (!dma_memcpy_hw(channel, (u8 *)dst + off, (const u8 *)src + off, part))
+                return false;
+            off += part;
+            if (off < len)
+                net_dispatch_yield();
+        }
         return true;
+    }
     simd_memcpy(dst, src, len);
     return len != 0;
 }
 
 bool dma_zero(u32 channel, void *dst, u32 len) {
+    if (!dst || !len || (u64)(usize)dst > ~0ULL - len) {
+        uart_puts("[dma] invalid zero span\n");
+        return false;
+    }
     /* Size fast-path: small fills are cheaper with NEON than DMA setup. */
-    if (len < DMA_MIN_EFFECTIVE_BYTES) {
+    if (core_id() != 0U || len < DMA_MIN_EFFECTIVE_BYTES) {
         (void)channel;
         simd_zero(dst, len);
         return len != 0;
     }
-    if (!dma_hw_memcpy_enabled) {
+    bool low_ram = (u64)(usize)dst < 0x40000000ULL &&
+                   len <= 0x40000000ULL - (u64)(usize)dst;
+    if (!dma_hw_memcpy_enabled || !low_ram) {
         (void)channel;
         simd_zero(dst, len);
         return len != 0;
     }
-    if (channel >= DMA_NUM_CHANNELS || len == 0) return false;
+    for (u32 off = 0U; off < len;) {
+        u32 part = len - off;
+        if (part > 32768U) part = 32768U;
+        if (!dma_zero_hw(channel, (u8 *)dst + off, part))
+            return false;
+        off += part;
+        if (off < len)
+            net_dispatch_yield();
+    }
+    return true;
+}
+
+static bool dma_zero_hw(u32 channel, void *dst, u32 len) {
+    if (channel >= DMA_NUM_CHANNELS || len == 0 || len > DMA_MAX_CB_BYTES) return false;
     if (!dma_channel_allowed(channel)) return false;
     if (dma_busy(channel)) return false;
 
     /* BCM2712 dma32 uses the SoC DMA address; for low RAM this is PA. */
-    if ((u64)(usize)dst >= 0x40000000ULL) {
+    if ((u64)(usize)dst >= 0x40000000ULL ||
+        len > 0x40000000ULL - (u64)(usize)dst) {
         uart_puts("[dma] addr outside dma-ranges\n");
         return false;
     }
@@ -419,32 +464,24 @@ bool dma_zero(u32 channel, void *dst, u32 len) {
 
     /* Source does NOT increment (reads 0 repeatedly from zero_word).
      * Destination increments normally. */
-    cb->ti       = DMA_TI_DEST_INC | DMA_TI_WAIT_RESP;
-    cb->src_addr = dma_ram_addr(&zero_word);
-    cb->dst_addr = dma_ram_addr(dst);
-    cb->xfer_len = len;
-    cb->stride   = 0;
-    cb->next_cb  = 0;
+    if (!dma_cb_encode(cb, (u64)(usize)&zero_word, (u64)(usize)dst, len, false, 0))
+        return false;
 
-    bool started = dma_direct_mode ?
-        dma_start_direct(channel, cb->ti, cb->src_addr, cb->dst_addr, cb->xfer_len) :
-        dma_start(channel, cb);
+    dma_last_error = DMA_ERR_NONE;
+    dma_last_channel = channel;
+    dma_last_len = len;
+    bool started = dma_start(channel, cb);
     if (!started)
         return false;
 
-    dma_wait(channel);
-    if (mmio_read(dma_reg(channel, DMA_CH_CS)) & DMA_CS_ACTIVE) {
-        uart_puts("[dma] zero timeout\n");
-        dma_dump_channel(channel, "zero-timeout");
-        dma_abort(channel);
+    if (!dma_wait_complete(channel))
         return false;
-    }
 
     /* Invalidate destination so CPU sees DMA-zeroed data */
     dcache_invalidate_range((u64)(usize)dst, len);
 
-    u32 cs = mmio_read(dma_reg(channel, DMA_CH_CS));
-    return !(cs & DMA_CS_ERROR);
+    dma_hw_zeroes++;
+    return true;
 }
 
 /* ---- Scatter-gather helpers ---- */
@@ -454,10 +491,16 @@ bool dma_zero(u32 channel, void *dst, u32 len) {
  * Returns pointer to first CB, or NULL if too many chunks. */
 struct dma_cb *dma_build_sg_memcpy(u32 channel, void *dst, const void *src,
                                     u32 len, u32 chunk_size) {
-    if (channel >= DMA_NUM_CHANNELS || len == 0) return NULL;
+    if (!PIOS_HAS_DMA || core_id() != 0U) return NULL;
+    if (channel >= DMA_NUM_CHANNELS || len == 0 ||
+        chunk_size == 0 || chunk_size > DMA_MAX_CB_BYTES) return NULL;
     if (!dma_channel_allowed(channel)) return NULL;
 
-    u32 num_chunks = (len + chunk_size - 1) / chunk_size;
+    if ((u64)(usize)src >= 0x40000000ULL || (u64)(usize)dst >= 0x40000000ULL ||
+        len > 0x40000000ULL - (u64)(usize)src ||
+        len > 0x40000000ULL - (u64)(usize)dst)
+        return NULL;
+    u32 num_chunks = len / chunk_size + (len % chunk_size != 0U);
     if (num_chunks > CBS_PER_CHAN) return NULL;
 
     u8 *d = (u8 *)dst;
@@ -468,16 +511,9 @@ struct dma_cb *dma_build_sg_memcpy(u32 channel, void *dst, const void *src,
         struct dma_cb *cb = &cb_pool[channel][i];
         u32 this_len = (remaining > chunk_size) ? chunk_size : remaining;
 
-        cb->ti       = DMA_TI_SRC_INC | DMA_TI_DEST_INC | DMA_TI_WAIT_RESP;
-        cb->src_addr = dma_ram_addr(s);
-        cb->dst_addr = dma_ram_addr(d);
-        cb->xfer_len = this_len;
-        cb->stride   = 0;
-
-        if (i < num_chunks - 1)
-            cb->next_cb = dma_cb_addr(&cb_pool[channel][i + 1]);
-        else
-            cb->next_cb = 0;
+        u64 next = i + 1U < num_chunks ? (u64)(usize)&cb_pool[channel][i + 1U] : 0U;
+        if (!dma_cb_encode(cb, (u64)(usize)s, (u64)(usize)d, this_len, true, next))
+            return NULL;
 
         d += this_len;
         s += this_len;

@@ -92,6 +92,35 @@ decision)
 | [045](#adr-045) | Pi 5 pcie1 FFC is a second RC; LevelZero stays fail-closed | Owner | Accepted |
 | [046](#adr-046) | LevelZero B→E path: compute-class, BAR0 only, no LMEM | Owner | Accepted |
 | [047](#adr-047) | Event-driven real TLS 1.3 client and server I/O | Owner | Accepted |
+| [048](#adr-048) | Gate SDIO1 high speed on Function-1 proof | Owner | Accepted |
+| [049](#adr-049) | Zero 2 W dual-preload firmware manifest | Owner | Accepted |
+| [050](#adr-050) | Pi5 editor assets ship in raw stage2 and install to WALFS | Owner | Accepted |
+| [051](#adr-051) | BCM2837 SDIO1 IRQ uses ARMCTRL → QA7 → AIRQ | Owner | Accepted |
+| [052](#adr-052) | Bluetooth H4 receive framing before hardware enablement | Owner | Accepted |
+| [053](#adr-053) | USB HCI boundary and offline DWC2 contract | Owner | Accepted |
+| [054](#adr-054) | Unified dedicated-media hardware bring-up scope | Owner | Accepted |
+| [055](#adr-055) | PiSP BE is the first dedicated-media implementation lane | Owner | Accepted |
+| [056](#adr-056) | HEVC uses PIOS-owned stateless controls before bitstream parsing | Owner | Accepted |
+| [057](#adr-057) | BCM2837 ARMCTRL uses a registered multi-source demultiplexer | Owner | Accepted |
+| [058](#adr-058) | Reserve a Normal-NC BCM2837 DWC2 DMA arena | Owner | Accepted |
+| [059](#adr-059) | BCM2837 USB VBUS remains externally attested and no-write | Owner | Accepted |
+| [061](#adr-061) | FAT-direct one-shot stage0 override O | Owner | Accepted |
+| [062](#adr-062) | PCIe1 MSI and inbound DMA remain capability-gated | Owner | Accepted |
+| [063](#adr-063) | PCIe1 endpoint BAR/MMIO requires one offline lease | Owner | Accepted |
+| [064](#adr-064) | Read-only bounded partition-table observation | Owner | Accepted |
+| [066](#adr-066) | Offline callback-backed NVMe block-provider foundation | Owner | Accepted |
+| [067](#adr-067) | Offline dedicated FAT32 exchange-partition policy | Owner | Superseded by ADR-078 |
+| [065](#adr-065) | Core-0-owned bounded NVMe namespace I/O contract | Owner | Accepted |
+| [068](#adr-068) | Bluetooth HCD/baud bootstrap remains offline-safe | Owner | Accepted |
+| [069](#adr-069) | Bluetooth HCI lifecycle; passive LE scan remains disabled | Owner | Accepted |
+| [070](ADR-070-gpu-fabric-control.md) | Offline GPU-fabric control-plane contract | Owner | Accepted |
+| [071](#adr-071) | Offline FAT32 exchange-volume mutation core | Owner | Accepted |
+| [073](ADR-073-qemu-storage-acceptance.md) | QEMU-only storage acceptance adapter | Owner | Accepted |
+| [074](ADR-074-precreated-three-partition-layout.md) | Pre-created three-primary storage layout | Owner | Accepted |
+| [075](ADR-075-exchange-partition-autosetup.md) | Automatic PIOSXFER attachment and raw-p3 autoformat | Owner | Superseded by ADR-076 |
+| [076](ADR-076-discovery-only-storage-layout.md) | Discovery-only storage layout | Owner | Superseded by ADR-078 |
+| [077](ADR-077-wifi-association-control.md) | Offline Wi-Fi association control contract | Owner | Accepted |
+| [078](ADR-078-storage-role-markers.md) | Explicit storage role markers | Owner | Accepted |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -265,6 +294,29 @@ beyond the one record that requires atomic RMWs.
 
 **Consequence.** AIRQ retains one global sequence and atomic diagnostics while
 the remaining kernel `.bss` stays Normal-NC.
+
+**Scheduler follow-up (2026-09-07, owner-authorized repair).** The Pi 5 saved a
+core-1 `ESR=0x96000410` at `LDAXR` on `procs[].owner_core`; user-core timer
+counters stopped while core 0 continued serving management. Apply the same
+WB-only atomic invariant to generation-tagged, cache-line-isolated scheduler
+ownership tokens. Allocate them once before SMP from already-WB core-0 RAM,
+past the linked image; verify WB/Inner-Shareable attributes before first use.
+Do not use another fixed slice of the first control page: the current Pi link
+places the fallback TCP array across that address. Core-0 bump allocation must
+skip the whole linked image as well as its control reservation.
+
+The process table stays NC, kernel/user TTBRs keep matching attributes, and no
+allocation occurs in the scheduler. The owner permitted justified scheduling
+policy changes; this repair does not require one. Claims reject a token already
+being claimed, and generation participates in CAS so a stale claimant cannot
+restore ownership over a reused slot.
+
+The same acceptance pass found that a trapped EL0 WFI returned to its own
+instruction because `proc_handle_wfx()` did not advance `ELR_EL1`. That produced
+hundreds of thousands of WFx traps, repeated timer preemption and 504s while the
+worker never rechecked its queue. The WFx handler now advances the A64 PC by four
+bytes before applying pctl. This is independent of cache coherency but amplified
+the apparent cross-core scheduler failure.
 
 ---
 
@@ -467,9 +519,10 @@ is one shared stack. WiFi is the same `nic_ops` vtable, loaded on demand.
   `nic_load(name, iface)` binds optional backends. WiFi is
   `nic_load("wifi-cyw43455", NIC_IFACE_WIFI)` — never boot-probed, because
   firmware upload must not own core 0.
-- PicoScript IDE blobs live once in the package as platform_id SHARED (16)
-  and are copied by stage0 to `PIOS_SHARED_ASSET_BASE`. Kernel payloads omit
-  `src/ide_assets.c`.
+- Non-Pi5 package flows may carry PicoScript IDE blobs once as platform_id
+  SHARED (16), copied by stage0 to `PIOS_SHARED_ASSET_BASE`. Pi5 supersedes
+  that path under ADR-050: its raw stage2 embeds the compressed source pack
+  and installs it to WALFS. Kernel payloads omit `src/ide_assets.c`.
 
 **Rejected.** Using GENET on Pi 5. Treating `PIOS_HAS_GENET` as “has Ethernet”.
 A second TCP/IP stack for Pi 4. Auto-probing WiFi at `nic_init()`.
@@ -566,6 +619,63 @@ the FFC to Arc Pro B50; any compute-class function is a candidate.
 
 **Rejected.** Auto-mapping BAR0 at boot. Mapping ReBAR LMEM to “have a
 heap”. `clCreateProgramWithSource` / IGC on the board. Porting xe/i915.
+
+---
+
+<a name="adr-048"></a>
+## ADR-048 — Gate SDIO1 high speed on Function-1 proof
+
+**Date:** 2026-09-09 · **Decider:** Owner · **Status:** Accepted
+
+**Context.** SDIO1 capability bits and the controller clock rate advertise
+possible high-speed operation but do not prove that the onboard radio can
+complete a multi-block CMD53 transfer at that rate. Enabling 50 MHz during
+host initialization made any later Function-1 probe incapable of gating the
+transition.
+
+**Decision.** Initialize every host at 25 MHz. After CYW Function 1 is
+enabled, run the bounded 64-block read/write proof, enable high speed only
+when the card and host support it, then run the proof again. Any requested
+transition or post-transition proof failure aborts firmware loading before a
+firmware transfer. A host/card without high-speed capability remains at the
+already-proven 25 MHz rate.
+
+**Rejected.** Trusting CAP0 or CCCR high-speed advertisement alone; enabling
+50 MHz before Function 1 exists; and disabling high speed permanently without
+testing its supported configuration.
+
+**Validation.** Host source contracts pin proof ordering; hardware validation
+must demonstrate the two successful Function-1 proofs on each SDIO1 platform.
+
+---
+
+<a name="adr-049"></a>
+## ADR-049 — Zero 2 W dual-preload firmware manifest
+
+**Date:** 2026-09-09 · **Decider:** Owner · **Status:** Accepted
+
+**Approved design: `dual-preload-manifest`.** SDIO1 setup can disturb access
+to the FAT volume that holds radio firmware, but the Zero 2 W radio variant
+cannot safely be inferred from its PCB/VideoCore board revision.
+
+**Decision.** Before initializing SDIO1, stage2 reads two immutable,
+version-1 manifest records from FAT and validates each artifact's exact length
+and SHA-256. The records are the pinned RPi-Distro `firmware-nonfree`
+`3bab0f823f5b53150b76aab77093adef6655b920` CYW43436 set (firmware, NVRAM,
+CLM) and CYW43436s set (firmware, NVRAM, explicitly no CLM). Their combined
+storage is 872,412 bytes. After SDIO exposes ChipCommon, only the raw word
+selects one record: `(raw & 0xffff) == 43430` decimal (`0xA9A6`) is required;
+`(raw >> 16) & 0x0f == 1` selects 43436s without a CLM; revisions 2–15 select
+43436 with its required CLM; revision zero and every other value fail closed.
+
+**Rejected.** Selecting by Zero 2 W PCB/VideoCore board revision, accepting a
+generic 43436 record after a validation failure, loading an optional CLM for
+43436s, or reopening FAT after SDIO initialization.
+
+**Safety.** Candidate buffers remain internal to the driver and become
+read-only-by-contract after validation. The selected firmware/NVRAM/CLM
+pointers never leave the driver, no heap is used, and manifest/hash, missing
+artifact, chip-id, and revision failures abort before firmware upload.
 
 ---
 
@@ -1532,6 +1642,15 @@ has capacity, else the least-loaded eligible core.
 - Per-core page tables are indexed `[uc][slot]`; a migrated process needs a valid
   table on its new core (build-on-demand, or make tables per-process).
 
+**Implementation guard (2026-09-07).** This ADR remains Proposed. The launcher
+must not make processes eligible on all user cores before the message-passing
+migration handoff above is implemented. Doing so exposed NC `state`/`ctx`
+directly to competing schedulers: a wake could move a service between cores
+without publishing a complete immutable migration descriptor. Until ADR-025 is
+accepted and implemented end-to-end, new processes are pinned to their launch
+core under accepted ADR-001. Explicit `proc_set_affinity()` remains the only
+migration surface and uses the existing target-core launch request.
+
 ---
 
 <a name="adr-026"></a>
@@ -1777,3 +1896,615 @@ it, otherwise supervision reports stale data, which is worse than no data.
 
 **Cost.** Small — one call site, one cache line, no hot-path work. The gating
 item is the publication contract above, not the logic.
+
+<a name="adr-050"></a>
+## ADR-050 — Pi5 editor assets ship in raw stage2 and install to WALFS
+
+**Date:** 2026-09-09 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Embed a Brotli-compressed PicoScript editor pack in the
+raw Pi5 stage2 payload, extract it only after WALFS mounts, and serve it from
+WALFS. Raw OTA must not depend on stage0 copying a FAT `PIOS_SHARED` payload.
+
+**Decision.** The deterministic offline packer emits a versioned `PBRP`
+envelope containing a Brotli-compressed, checksummed `PIAS` asset table. The
+Pi5 kernel verifies compressed CRC32C, bounded decompression, uncompressed
+CRC32C, and the complete asset table before any WALFS write. It writes and
+verifies each named asset in bounded WALFS chunks; an already matching install
+is a no-op. HTTP retains only inode IDs, lengths, and bounded WALFS reads.
+
+**Failure policy.** A bad/truncated pack, decode failure, or failed WALFS
+write leaves the editor unavailable and prevents the candidate boot from being
+marked healthy. It does not attempt repair from partially written data. QEMU's
+existing compiled-in direct-boot fallback is unchanged.
+
+<a name="adr-051"></a>
+## ADR-051 — BCM2837 SDIO1 IRQ uses ARMCTRL → QA7 → AIRQ
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Issue #134 uses the guarded, interrupt-driven route:
+ARMCTRL → QA7 → AIRQ. This is the most faithful BCM2837 design.
+
+**Decision.** SDIO1 is ARMCTRL bank-2 GPU IRQ62 (bit 30). Core 0 clears only
+`LOCAL_GPU_ROUTING[1:0]`, preserving its FIQ-routing bits, and verifies the
+readback before ARMCTRL EN2 is written. QA7 `LOCAL_IRQ_PENDING0.bit8`
+(`GPU_FAST` is only the hardware name for this normal cascade) gates the
+ARMCTRL `PENDING2.bit30` check. `irqc_legacy` maps that result to the private
+compatibility intid 62; it is neither a GIC SPI nor a Linux IRQ-domain number.
+
+The SDIO top half masks SDHCI and ARMCTRL, records and W1Cs SDHCI `INT_CARD`,
+then publishes exactly one `AIRQ_SRC_WIFI` record. It parses no packets and
+does no polling. A failed publication is counted and leaves both sources
+masked. Only the AIRQ bottom half re-enables ARMCTRL, then the SDHCI host
+signal. EOI is intentionally a no-op for this cascade.
+
+**Scope and failure policy.** The route is accepted only on core 0 after the
+IRQ callback is registered. A non-core-0 arm or failed QA7 readback remains
+masked and is recorded. Pi 5, Pi 4, and QEMU retain their existing GIC paths.
+
+<a name="adr-052"></a>
+## ADR-052 — Bluetooth H4 receive framing before hardware enablement
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Begin Bluetooth support with an offline-only HCI H4 parser
+and bounded queue. Defer all hardware activation until its board-specific
+transport, reset ownership, and firmware sequence have separately been proven.
+
+**Decision.** `bt_h4` accepts only controller-to-host H4 Event, ACL, SCO, and
+ISO frames. It reconstructs fragmented frames into a fixed 1 KiB packet,
+rejects an unsupported type or oversized declared payload before copying that
+payload, and queues at most eight immutable records. A full queue retains the
+complete frame and reports explicit backpressure until the consumer releases
+credit. Consumer access is a generation-checked dequeue/copy/release protocol;
+abort discards only incomplete producer state and reset requires both sides
+quiesced.
+
+**Scope and failure policy.** This module is pure framing and ownership logic:
+it has no UART, GPIO, pinmux, mailbox, power, firmware-download, controller
+command, scan, pairing, L2CAP, BLE, or user-interface dependency. In
+particular, it does not write BT_ON/BT_REG_ON and does not enable a transport.
+Later Pi 5, Pi 3/4, and Zero 2 W transport work must have a new approved
+board-specific decision.
+
+<a name="adr-053"></a>
+## ADR-053 — USB HCI boundary and offline DWC2 contract
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** Current xHCI becomes a thin adapter behind transport-neutral
+`usb_hci_ops`; USB enumeration and class drivers use only that boundary. The
+pure DWC2 contract records BCM2837 DMA and IRQ-route facts and host-tests
+bounded, generation-safe transfer ownership without enabling a controller.
+
+**Deferred.** Actual DWC2 MMIO, ARMCTRL routing/unmask, DMA allocations and
+cache policy, hub enumeration, and VBUS ownership require separate approval.
+This milestone neither selects DWC2 nor performs hardware initialization.
+
+<a name="adr-054"></a>
+## ADR-054 — Unified dedicated-media hardware bring-up scope
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Track BCM2712 HEVC, PiSP FE/BE, and HVS native-display
+work together in #169 rather than splitting camera and display ownership into
+separate issues.
+
+**Decision.** #169 owns the staged hardware bring-up of all four blocks. Each
+engine nevertheless retains a separate core-0-owned state machine, clock,
+IOMMU/DMA domain, IRQ source, cache-line-isolated ownership records, and
+failure/quarantine state. No engine may borrow another engine's MMIO, DMA
+mapping, clock, interrupt, or completion state. HVS/display takeover remains
+independent of the mailbox framebuffer until a bounded handoff and restoration
+protocol is implemented and proven.
+
+**Gates.** The initial work is host-testable resource and ownership contracts
+plus passive read-only identification. Any write-capable clock, reset, DMA,
+IOMMU, IRQ, PiSP tile, HEVC decode, camera, or display transition requires its
+own bounded implementation step, explicit diagnostics, and preserved fallback.
+An absent, unexpected, busy, faulted, or unowned engine stays disabled; it
+must never degrade the wired management path or existing framebuffer.
+
+<a name="adr-055"></a>
+## ADR-055 — PiSP BE is the first dedicated-media implementation lane
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Begin #169 with PiSP BE, the documented DRAM-to-DRAM ISP
+path, before HEVC, PiSP FE/camera ingress, or HVS native-display takeover.
+
+**Decision.** The first implementation is a bounded PiSP BE request,
+configuration, tile, DMA/IOMMU, completion, and quarantine foundation. It
+uses only specification- or independently verified `libpisp`-compatible
+configuration data; PIOS must not invent a guessed no-op tile descriptor.
+HEVC remains blocked on a stateless H.265 control/parser path, PiSP FE remains
+blocked on RP1/CSI/sensor ownership, and HVS remains passive-only until its
+framebuffer handoff/restoration protocol is proven.
+
+**Gates.** The initial code remains hardware-disabled until a later bounded
+clock/IOMMU/descriptor/IRQ transition is individually implemented and
+diagnosed. Each PiSP BE request has an exclusive IOMMU2 lease, explicit
+lengths and cache attributes, a deadline, and a deterministic quarantine path.
+
+<a name="adr-056"></a>
+## ADR-056 — HEVC uses PIOS-owned stateless controls before bitstream parsing
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Implement #172 as the next hardware-disabled media
+subtask.
+
+**Decision.** The initial HEVC path accepts only a PIOS-owned, versioned,
+fixed-capacity stateless control request. Encoded H.265 bytes remain opaque
+source-span contents: PIOS does not yet parse VPS/SPS/PPS RBSP, NAL units,
+Exp-Golomb values, or slice headers. The contract admits only a conservative
+4:2:0 8/10-bit metadata subset, bounded frames/references/slices, default
+scaling, explicit source/capture spans, and generation-safe frame identities.
+Unsupported syntax, control fields, layouts, and nonzero reserved fields
+reject before a request becomes visible to a future hardware backend.
+
+**Rationale and gates.** BCM2712's upstream stateless driver consumes
+caller-parsed controls; it does not manufacture them from the elementary
+stream. This boundary matches that ownership split without importing a
+GPL-family parser or creating a Linux V4L2 ABI in PIOS. It does not authorize
+HEVC MMIO, clock 11, IOMMU2, DMA, SPI 98, phase-1/phase-2 submission, or
+decode. Those require separate bounded hardware transitions and a live proof.
+
+<a name="adr-057"></a>
+## ADR-057 — BCM2837 ARMCTRL uses a registered multi-source demultiplexer
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Implement the planned USB and interrupt subtasks one by
+one, beginning with #175.
+
+**Decision.** The QA7 normal GPU cascade remains routed exclusively to core 0,
+but ARMCTRL peripheral sources are now selected through a fixed,
+generation-safe registry rather than a single hard-coded SDIO pending bit.
+Only a known source whose handler owner has registered it may be enabled or
+returned by controller acknowledgement. GPU IRQ62 (SDIO1, bank 2 bit 30)
+retains priority and its existing top-half/AIRQ rearm behavior. GPU IRQ41
+(DWC2, bank 1 bit 9) is a dormant known route only; no DWC2 driver registers
+or unmasks it in this decision.
+
+**Failure policy.** Unknown, duplicate, stale-generation, non-core-0, and
+unregistered operations fail closed. Removing a source masks it before
+releasing its generation. A simultaneous second registered source remains
+pending for the next acknowledgement; no polling fallback is introduced.
+
+<a name="adr-058"></a>
+## ADR-058 — Reserve a Normal-NC BCM2837 DWC2 DMA arena
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Implement #176 after the ARMCTRL demultiplexer.
+
+**Decision.** Pi 3 and Zero 2 W reserve physical
+`0x06400000–0x065FFFFF` for future DWC2 DMA. The existing stage0 shared-asset
+window remains unchanged at `0x06000000–0x063FFFFF`; the new arena occupies
+the next complete 2 MiB L2 block, remains below the `0x08000000` staging
+window and the BCM2837 DMA limit, and is Normal-NC from the first MMU enable.
+Eight fixed 256 KiB slots have cache-line-isolated controls, immutable numeric
+spans, full-generation handles, and explicit CPU/device ownership transitions.
+
+**Cache and failure policy.** Publication and consumption use system-scoped
+DMA barriers only: no cache maintenance is performed because every CPU alias
+must remain Normal-NC. Inner-shareable barriers continue to publish metadata
+between cores but are insufficient to order the external DWC2 master. A BCM
+bus alias is DMA authority, never a CPU mapping. Device-owned slots cannot be
+cancelled or released until a trusted completion/failure attestation returns
+ownership. Generation exhaustion permanently retires a slot. This decision
+reserves memory only; it does not register IRQ41, control VBUS, initialize
+DWC2, or submit a transfer.
+
+<a name="adr-059"></a>
+## ADR-059 — BCM2837 USB VBUS remains externally attested and no-write
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Implement #179 as a pure, hardware-disabled BCM2837 USB
+VBUS/current-limit ownership contract, one subtask at a time.
+
+**Decision.** Pi 3 B (LAN9514 topology), Pi 3 B+ (LAN7515 nested-hub topology),
+and Zero 2 W (separate OTG data connector) have no proven PIOS-controllable
+VBUS regulator, GPIO, current-limit, or overcurrent mechanism. Their USB power
+remains no-write and externally attested until a board-specific, independently
+verified electrical ownership path is accepted in a later ADR. The contract
+records only private copies of PIOS-owned numeric operator/backend evidence:
+an externally powered topology, independent current protection, verified
+port/cable, and no-backfeed evidence. Optional current/overcurrent
+observations are likewise evidence, not a PIOS hardware read.
+
+**Failure policy and gate.** External evidence may permit a later *passive*
+DWC2/controller probe only. It never authorizes sourcing or toggling VBUS;
+software enablement remains false with CONTROL, CURRENT_LIMIT, and OVERCURRENT
+proofs explicitly absent. Unknown, stale, mismatched, incomplete, or
+out-of-bound evidence fails closed. A positive overcurrent observation or
+current above its externally declared bound quarantines the record. Recovery
+requires release and a new generation with a fresh external attestation; fault
+state is never silently cleared. This ADR adds no MMIO, mailbox, GPIO, RP1,
+timer, watchdog, IRQ, DMA, controller initialization, role-switch, or power
+operation.
+
+<a name="adr-060"></a>
+## ADR-060 — Immutable Bluetooth topology facts; activation disabled
+
+**Date:** 2026-09-10 · **Decider:** Owner · **Status:** Accepted
+
+**Owner direction.** Implement #180 as a pure immutable board transport/reset
+profile catalogue from `raspberrypi/linux` commit
+`50f88724518d2eafe75bfae7923e90a8fe171c66`. Do not activate Bluetooth.
+
+**Decision.** `bluetooth_platform_contract` owns five catalogue identifiers
+that are explicitly separate from runtime board-detection identifiers: Pi 5,
+Pi 4 B, Pi 3 B, Pi 3 B+, and Zero 2 W. Each fixed record captures the
+upstream-DTS UART H4 topology, source bus range, CTS/RTS/TX/RX line numbers
+and mux evidence, shutdown-line topology/polarity, maximum baud, radio
+compatible, and console-conflict requirement. Pi 5 is BCM2712 SoC UARTA at
+`0x7d50c000` (not RP1); its separate `uart10` console is not a Bluetooth
+transport. The pinned source contains conflicting Pi 3/B+ board-description
+families for maximum baud and B+ CTS/RTS attachment. Those profiles retain
+the common physical signal/control facts but omit maximum-baud proof and
+cannot become transport candidates.
+
+**Failure policy.** The records intentionally declare no initial baud,
+reset/device/host-wake line, PIOS ownership, or activation proof. A direct
+DTS shutdown line is a topology fact only, never PIOS write authority.
+Candidate selection requires an exact catalogue record, complete immutable
+transport facts, the base overlay, and an identity distinct from the active
+console. mini-UART and disable-Bluetooth overlay changes are unsupported and
+reject. Activation is permanently false and reports the missing PIOS
+ownership, pinmux-control, reset/power, and firmware/baud proofs (plus the
+Pi 3 flow-control mux proof). This ADR adds no board discovery, UART, pin,
+firmware, reset, wake, mailbox, or hardware operation.
+
+<a name="adr-061"></a>
+## ADR-061 — FAT-direct one-shot stage0 override O
+
+**Date:** 2026-09-11 · **Decider:** Owner · **Status:** Accepted
+
+**Decision.** Issue #184 adds logical slot O as an armed, one-shot,
+FAT-direct stage0 override, not a third raw slot. Its boot-control v2 record
+stores mode, one attempt, and the exact whole-`PIOSSTG2.PKG` package identity
+without changing the 512-byte sector or any disk partition/layout.
+
+**Precedence and safety.** Stage0 selects valid O, then a validated pending
+A/B candidate, then a validated known-good active A/B slot, then imports a
+validated FAT package to raw slot A only if no raw choice is bootable. Shared
+FAT assets load independently. Before jumping O, stage0 atomically clears its
+fields, records `last_boot=O`, and increments generation; a failed control
+write refuses the O jump. Missing, invalid, or mismatched FAT packages also
+clear O and fall through to A/B. O never becomes active/good and never
+mutates A/B pending/active/good/tries fields.
+
+**Compatibility.** Version-1 control records are checksum-validated at their
+old offset, migrated in memory to v2 with O clear while preserving A/B fields,
+and written as v2 when safe. The old checksum bytes are never treated as O
+metadata.
+
+---
+
+<a name="adr-062"></a>
+## ADR-062 — PCIe1 MSI and inbound DMA remain capability-gated
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#189](https://github.com/WillEastbury/pios/issues/189))
+
+**Owner direction.** Start the offline-safe portion of #189 without the PCIe1
+endpoint hardware. Do not enable bus mastering, MSI, MMIO, or a device queue.
+
+**Decision.** `pcie1_containment` is the sole planned capability boundary
+between a future #188 endpoint lease and PCIe1 DMA/MSI hardware. One endpoint
+generation owns eight fixed 256 KiB slices of the existing 2 MiB Normal-NC
+inbound arena. Each slice reserves a 64-byte red zone at both ends and
+publishes an immutable numeric span carrying CPU PA, endpoint IOVA, explicit
+used/requested/capacity, direction, request id, endpoint generation, and slot
+generation. Mutable endpoint, MSI, and per-slot controls each own separate
+64-byte cache lines. Handles are generation-backed capabilities; release
+poisons the span and generation-bumps or permanently retires an exhausted
+slot.
+
+MSI remains masked until a future adapter has registered the dedicated core-0
+AIRQ source. The pure contract models the required top-half sequence:
+acknowledge and mask the line, create one sequence-backed ticket, retain that
+ticket while AIRQ lacks credit, queue it exactly once, then require an explicit
+scheduled-dispatch entry before accepting completion records. That entry
+performs the system acquire barrier before the handler may inspect device
+memory. Completion identity contains endpoint generation, slot generation,
+and a strictly increasing request id. Duplicate IRQs, unknown or malformed
+completion identity/length, red-zone damage, timeout, AER, endpoint removal,
+or generation exhaustion quarantine the endpoint and every live DMA
+capability. Every public state transition and snapshot masks local IRQs so a
+same-core top half cannot overwrite quarantine state. Normal-NC publication
+uses a system-scoped barrier because the endpoint is an external DMA master.
+
+**Activation boundary.** The module contains no MMIO, cache maintenance, IRQ
+registration, AIRQ post, endpoint command write, or bus-master transition.
+`pcie1_containment_hardware_enable_allowed()` deliberately returns false.
+Hardware authorization remains blocked on #188 plus the live #189 canary,
+MSI, AER, timeout, and serial-recovery brick test.
+
+---
+
+<a name="adr-063"></a>
+## ADR-063 — PCIe1 endpoint BAR/MMIO requires one offline lease
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#188](https://github.com/WillEastbury/pios/issues/188))
+
+**Decision.** The offline-safe #188 boundary is
+`pcie1_bar_lease`: one explicit core-0 endpoint lease, represented only by a
+generation-backed numeric handle. It validates saved configuration BAR
+encodings and all-ones probe masks before accepting a 32-bit or 64-bit memory
+BAR. I/O BARs, reserved encodings, prefetchable/LMEM windows, zero or
+non-power-of-two ranges, misalignment, malformed mask shape, and every
+overflow reject. The CPU aperture must exactly cover the decoded PCI BAR span,
+fit the dedicated PCIe1 aperture, explicitly declare Device-nGnRnE, and not
+overlap RP1 or any caller-supplied numeric reservation in either address
+space.
+
+The request descriptors are copied before publication; no raw CPU pointer is
+an endpoint capability. Mutable lease control, immutable mapping evidence, and
+each reservation have independent cache-line ownership. Release clears the
+mapping evidence then generation-bumps before reuse; generation exhaustion
+poisons and retires it. AER, removal, or any adapter-declared failure clears
+the mapping and permanently quarantines (or retires) the contract.
+
+**Activation boundary.** This module has no MMIO, cache maintenance, mapping,
+configuration write, interrupt/AIRQ, Memory Space, or Bus Master code.
+`pcie1_bar_lease_hardware_enable_allowed()` always returns false. Existing
+`pcie1` and `lzero` code is deliberately not integrated or changed. Hardware
+proof remains required: config readback/restore, Device mapping audit, command
+register proof that Memory Space and Bus Master remain clear, and an AER,
+removal, and clean-revocation test on the live FFC endpoint.
+
+---
+
+<a name="adr-064"></a>
+## ADR-064 — Read-only bounded partition-table observation
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#193](https://github.com/WillEastbury/pios/issues/193))
+
+**Owner direction.** Implement only the offline parser sub-milestone. Do not
+mount, modify, select, or otherwise grant authority over any partition.
+
+**Decision.** `partition_table` accepts an injected 512-byte read callback and
+an explicit device-block and GPT-entry bound, then produces a caller-owned,
+fixed-capacity immutable snapshot. It has no MMIO, SD, filesystem, WALFS,
+boot, allocation, global mutable state, or retained raw pointer. MBR primary
+entries and GPT entries are range-checked against the supplied capacity and
+reject overlaps. Extended MBR is an explicit unsupported observation, never a
+silently skipped chain. A protective MBR whose LBA1 header or entry table is
+not valid GPT is also explicit and produces no candidate entries.
+
+GPT uses little-endian fields and its actual reflected IEEE 802.3 CRC32
+contract (initial `0xffffffff`, polynomial `0xedb88320`, final xor
+`0xffffffff`); GUID type bytes remain in on-disk order. The parser validates
+header/table bounds and CRCs before reporting usable entries. Records retain
+numeric type/start/count/index evidence only. This is parser-format support,
+not a claim of Windows or Linux filesystem interoperability.
+
+**Authority boundary.** The snapshot is read-only observation, not a writable
+exchange-partition decision. Writable exchange-partition policy remains
+owner-gated and requires a later explicit decision plus separate storage,
+filesystem, ownership, and hardware proof.
+
+---
+
+<a name="adr-066"></a>
+## ADR-066 — Offline callback-backed NVMe block-provider foundation
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#192](https://github.com/WillEastbury/pios/issues/192))
+
+**Owner direction.** Implement only the host-testable, offline-safe foundation:
+one validated namespace exposed through bounded injected read/write callbacks.
+Do not integrate a filesystem, boot path, live controller, or storage driver.
+
+**Decision.** `nvme_block_provider` copies one immutable geometry carrying
+block size, logical block count, checked byte capacity, a maximum transfer
+bound, namespace generation, and an externally supplied never-reused instance
+epoch. Its cache-line-isolated
+control holds a distinct provider generation, fault state, and synchronous
+callback-active latch. Public handles carry the instance, namespace, and
+provider generations, so revocation makes every prior handle stale. A callback
+receives only an explicit pointer/length/capacity/used span, must report the
+exact requested transfer, and is never retained beyond that synchronous call.
+False or partial transfer quarantines the provider; timeout, AER, and removal
+also revoke it. Generation exhaustion permanently retires storage. Reuse needs
+fresh all-zero contract storage plus a unique external instance epoch, avoiding
+ABA across replacement instances.
+
+**Ownership boundary.** The contract is core-0-owned and caller-serialized:
+its callbacks are synchronous, no API is IRQ-safe, and callback reentry is
+refused. It has no hardware, queue, DMA, interrupt, filesystem, boot, or
+storage-driver integration. The accompanying fixed record/superblock model is
+test-only persistence coverage, not a PIOS filesystem format or implementation.
+
+**Blocked follow-up.** Live filesystem integration, SD boot preservation,
+concurrent load, and physical NVMe proof remain blocked pending their own
+reviewed, hardware-safe work.
+
+---
+
+<a name="adr-067"></a>
+## ADR-067 — Offline dedicated FAT32 exchange-partition policy
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#193](https://github.com/WillEastbury/pios/issues/193))
+
+**Owner direction.** Establish only an offline-safe policy contract.  No boot,
+WALFS, SD, partition-parser, FAT32, mount, formatting, read, or write path is
+changed or authorized.
+
+**Decision.** `exchange_volume_policy` receives independently enumerated,
+fixed-capacity immutable facts: explicit external partition identity, table
+index, start and count, MBR type or GPT type GUID, explicit-length filesystem
+label, and boot/PIOS-system flags.  The caller supplies total device blocks,
+one known table scheme, and a nonzero enumeration generation.  Geometry,
+overlap, identity/index duplication, reserved bytes, unsupported schemes, and
+overflow fail closed before selection.
+
+Exactly one candidate is required: it must be non-boot and non-PIOS-system,
+reported FAT32, and use MBR FAT32 type `0x0b` or `0x0c`, or the exact GPT
+Microsoft Basic Data GUID (UEFI on-disk order). The volume label is diagnostic
+rather than authorization under ADR-076. The operator must explicitly request
+that candidate's external identity; no label-only, first-match, positional,
+automatic selection, or fallback exists. Duplicate eligible candidates reject
+the whole attachment. The resulting handle binds the copied immutable fact to
+the policy instance epoch, enumeration generation, attachment generation, and
+full-fact fingerprint.
+
+**Ownership boundary.** This is fixed caller-owned storage, fresh-zeroed and
+one-shot initialized, with core-0 ownership checked against the actual core
+and local IRQ serialization for its small state transition.  It retains no
+input pointer and exports only selection/immutable-attachment inspection.
+It does not convey a block or filesystem capability.
+
+**Next future subtask (explicitly not implemented).** A separately approved
+work item must design and prove the actual FAT32 mount and any read/write
+authority, including live SD/boot/WALFS preservation, ownership, media-change,
+and hardware testing.  ADR-067 grants none of that authority.
+
+---
+
+<a name="adr-068"></a>
+## ADR-068 — Bluetooth HCD/baud bootstrap remains offline-safe
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#182](https://github.com/WillEastbury/pios/issues/182))
+
+**Decision.** `bluetooth_hcd_bootstrap` is an injected-evidence, asynchronous
+state machine only. It binds source, profile, controller, artifact, command,
+and acknowledgement facts to a caller-assigned instance epoch and monotonically
+increasing attempt generation. It permits only the bounded sequence safe-off
+evidence, HCD acknowledgement, baud-request publication, baud acknowledgement,
+and completion. Progress evidence is the sole watchdog input.
+
+**Failure and activation boundary.** Mismatched identity, digest, sequence,
+acknowledgement, deadline, or baud result enters permanent quarantine. The
+module contains no UART, GPIO, reset, firmware read/transfer, AIRQ, or kernel
+integration, and hardware enable always returns false pending #181 and guarded
+board proof.
+
+---
+
+<a name="adr-069"></a>
+## ADR-069 — Offline Bluetooth HCI lifecycle; passive LE scan remains disabled
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#183](https://github.com/WillEastbury/pios/issues/183))
+
+**Owner direction.** Build only an offline-safe HCI command/event lifecycle.
+Do not select or initialize a UART/transport, change GPIO/reset/wake lines,
+load an HCD, register AIRQ work, wire the kernel, or activate Bluetooth.
+
+**Decision.** `bt_hci_lifecycle` is a core-0-owned, fixed-capacity contract
+for explicit-length HCI command requests and full H4 Event spans. Commands
+are copied into four fixed slots with bounded payloads, deadlines, request
+IDs, per-slot generations, and an instance epoch. Handles carry all four
+identity values. The wire model permits only one transmitted command at once:
+HCI Command Complete and Command Status identify an opcode but carry no
+request ID, so the one live attempt is the required correlation authority.
+Reported command credits are copied from valid terminal events, clamped to
+the fixed slot maximum, and never create unbounded work.
+
+The IRQ-safe core-0 admission point parses only a complete H4 Event packet
+with exact header/parameter length. It recognizes only Command Complete
+(`0x0e`) and Command Status (`0x0f`), creates a copied immutable result, and
+never retains an untrusted transport pointer. Unknown well-formed events are
+ignored and counted. Malformed, duplicate, unsolicited, or mismatched command
+events fail closed by quarantining the contract. Queued cancellation produces
+a cancellation result; cancellation after transmission, deadline expiry,
+logical controller reset, and AER-like failure quarantine outstanding work.
+Controller reset bumps the instance epoch and invalidates every prior handle.
+This is a model of required lifecycle behavior only: it sends no reset command
+and performs no hardware operation.
+
+**Capability and acceptance gate.** Passive LE scanning is selected solely as
+the eventual first capability because it is observational; no scan opcode is
+implemented. `bt_hci_hardware_enable_allowed()` and every capability
+authorization return false, and implicit pairing is prohibited. Activation
+requires a later owner-approved ADR plus live hardware acceptance: proven
+board transport/pin/reset authority, controller/HCD compatibility, transport
+fragment and recovery proof, IRQ/AIRQ routing proof, reset/quarantine
+recovery, credit/completion stress, privacy/pairing review, and an explicit
+passive-scan acceptance test. Until then this contract remains pure and
+offline.
+
+---
+
+<a name="adr-070"></a>
+## ADR-070 — Offline GPU-fabric control-plane contract
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#97](https://github.com/WillEastbury/pios/issues/97))
+
+**Owner direction.** Add only an offline-safe, fixed-capacity GPU-fabric
+control contract. Do not modify GPU, PCIe, network, or DeveloperCLI runtime
+paths, and do not create an execution path.
+
+**Decision.** The contract models no more than eight node advertisements and
+accepts a node only when caller-supplied GPU validation is true, its immutable
+facts are internally consistent, and its health is OK. Exact model generation,
+shard size/kernel/affinity requirements, capacity reservations, and
+generation-backed placement handles make deterministic placement possible
+without payload or model data. Activations carry numeric spans, endpoint
+generations, monotonic sequence, and credit only. Backpressure retains its
+continuation; malformed, stale, duplicate, or out-of-order records fail
+closed. Node removal or failed health invalidates dependent placement and
+activation state. Reassignment is an explicit new request, never migration.
+
+**Authority boundary.** `gpu_fabric_hardware_enable_allowed()` returns false.
+This is simulation/control-plane logic only: it issues no GPU work, hardware
+access, PCIe operation, packet exchange, model interpretation, or runtime
+integration. Any future execution adapter requires a separately approved ADR
+and hardware proof. See [ADR-070](ADR-070-gpu-fabric-control.md) for the
+complete API and verification contract.
+
+---
+
+<a name="adr-071"></a>
+## ADR-071 — Offline FAT32 exchange-volume mutation core
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#193](https://github.com/WillEastbury/pios/issues/193))
+
+**Owner direction.** Implement a pure, host-testable FAT32 mechanics slice
+for the dedicated `PIOSXFER` exchange partition. It must not select a
+partition, attach live storage, or modify the existing FAT32/SD/WALFS/boot
+paths.
+
+**Decision.** The callback-backed `fat32_exchange_core` accepts only
+prevalidated attachment facts: identity, epoch, partition bounds, an optional
+exact eleven-byte expected volume label, and exact 512-byte callbacks. It supports bounded
+root-only uppercase ASCII 8.3 files and mirrors every FAT update to both FAT
+copies. Core-0/non-IRQ ownership and identity/epoch/generation-bound file
+capabilities are mandatory.
+
+**Failure boundary.** I/O failure or FAT-copy disagreement faults the mounted
+instance. This is not crash safe: no journal, atomic multi-sector protocol,
+recovery marker, host/PIOS shared ownership, LFN, directory, or live-mount
+claim is made. Future policy attachment and live wiring require a new owner
+decision and proof.
+
+---
+
+<a name="adr-065"></a>
+## ADR-065 — Core-0-owned bounded NVMe namespace I/O contract
+
+**Date:** 2026-09-12 · **Decider:** Owner · **Status:** Accepted
+([#191](https://github.com/WillEastbury/pios/issues/191))
+
+**Decision.** Offline NVMe I/O admits only a validated metadata-free namespace
+with 4 KiB MPS, bounded MDTS, strict thin-provisioning semantics, one/two-page
+DWORD-aligned PRPs, and fixed core-0-owned queues. Handles bind the caller's
+unique instance epoch, namespace generation, command, and request identity.
+Malformed/partial completion, deadline, cancellation, AER, or removal
+quarantines the contract.
+
+**Activation boundary.** This contract contains no PCIe/MMIO/DMA/AIRQ/block or
+WALFS wiring. Live I/O remains blocked on physical controller proof and the
+#188/#189 ownership boundaries.

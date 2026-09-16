@@ -137,10 +137,10 @@ static i32 ppos_read_source(void *opaque, u32 document_id,
         return n < 0 ? PPOS_NOT_FOUND : n;
     }
     struct walfs_inode stat;
-    if (!walfs_stat(inode, &stat) || stat.size > cap)
-        return stat.size > cap ? PPOS_BUFFER_TOO_SMALL : PPOS_IO_ERROR;
+    if (!walfs_stat(inode, &stat)) return PPOS_IO_ERROR;
+    if (stat.size > cap) return PPOS_BUFFER_TOO_SMALL;
     u32 n = walfs_read(inode, 0, out, cap);
-    return (i32)n;
+    return n == (u32)stat.size ? (i32)n : PPOS_IO_ERROR;
 }
 
 static i32 ppos_save_source(u16 pack, u16 field, u32 document,
@@ -257,7 +257,7 @@ i32 ppos_walfs_rebuild_if_stale(u16 pack, u16 field, u32 expected_generation)
     return ppos_walfs_rebuild(pack, field, expected_generation);
 }
 
-static i32 ppos_current_generation(u16 pack, u16 field)
+static u32 ppos_current_generation(u16 pack, u16 field)
 {
     u32 len = 0, generation = 0;
     i32 rc = ppos_walfs_load(pack, field, g_ppos_page,
@@ -277,26 +277,46 @@ static i32 ppos_ensure_page(u16 pack, u16 field)
 
 static bool ppos_span(pv_ctx *ctx, int handle, const u8 **ptr, u32 *len)
 {
-    if (!ctx || handle <= 0 || handle >= ctx->span_count ||
+    if (!ctx || ctx->span_count < 0 || ctx->span_count > PV_MAX_SPANS ||
+        handle <= 0 || handle >= ctx->span_count ||
         !ptr || !len || ctx->span_len[handle] < 0) return false;
     u64 p = ctx->span_ptr[handle];
     u64 n = (u32)ctx->span_len[handle];
-    if (!ctx->mem || p > (u64)ctx->mem_size || n > (u64)ctx->mem_size - p)
+    if (!ctx->mem || ctx->mem_size < 0 || p > (u64)ctx->mem_size ||
+        n > (u64)ctx->mem_size - p)
         return false;
     *ptr = ctx->mem + p;
     *len = (u32)n;
     return true;
 }
 
+static bool ppos_register_valid(int reg)
+{
+    return reg >= 0 && reg < PV_NUM_REGS;
+}
+
 int ppos_storage_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
 {
     if (!ctx) return 0;
+    if (hook != PV_HOOK_STORAGE_READY &&
+        hook != PV_HOOK_STORAGE_USEPACK &&
+        hook != PV_HOOK_STORAGE_FULLTEXTFIELD &&
+        hook != PV_HOOK_STORAGE_FULLTEXTMODE &&
+        (hook < PV_HOOK_STORAGE_FULLTEXTUPSERT ||
+         hook > PV_HOOK_STORAGE_FULLTEXTRESULT))
+        return 0;
+    if (!ppos_register_valid(rd)) {
+        ctx->host_status = PPOS_INVALID;
+        return 1;
+    }
+    if (hook == PV_HOOK_STORAGE_FULLTEXTFIND) g_ppos_result_count = 0;
     if (hook == PV_HOOK_STORAGE_READY) {
         ctx->regs[rd] = walfs_partition_lba() ? 1 : 0;
+        ctx->host_status = PPOS_OK;
         return 1;
     }
     if (hook == PV_HOOK_STORAGE_USEPACK) {
-        if (ctx->regs[rs1] < 0 ||
+        if (!ppos_register_valid(rs1) || ctx->regs[rs1] < 0 ||
             (u32)ctx->regs[rs1] > (u32)PICOWAL_CARD_MAX) {
             ctx->regs[rd] = 0;
             ctx->host_status = PPOS_INVALID;
@@ -304,28 +324,39 @@ int ppos_storage_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
         }
         g_ppos_pack = (u16)ctx->regs[rs1];
         ctx->regs[rd] = 1;
+        ctx->host_status = PPOS_OK;
         return 1;
     }
     if (hook == PV_HOOK_STORAGE_FULLTEXTFIELD) {
-        if (ctx->regs[rs1] < 0 || ctx->regs[rs1] > 0xFFFF) {
+        if (!ppos_register_valid(rs1) || ctx->regs[rs1] < 0 ||
+            ctx->regs[rs1] > 0xFFFF) {
             ctx->regs[rd] = 0;
             ctx->host_status = PPOS_INVALID;
             return 1;
         }
         g_ppos_field = (u16)ctx->regs[rs1];
         ctx->regs[rd] = g_ppos_field;
+        ctx->host_status = PPOS_OK;
         return 1;
     }
     if (hook == PV_HOOK_STORAGE_FULLTEXTMODE) {
+        if (!ppos_register_valid(rs1)) {
+            ctx->regs[rd] = 0;
+            ctx->host_status = PPOS_INVALID;
+            return 1;
+        }
         g_ppos_mode = (u32)ctx->regs[rs1];
         ctx->regs[rd] = g_ppos_mode <= PPOS_QUERY_NEAR ? 1 : 0;
         ctx->host_status = g_ppos_mode <= PPOS_QUERY_NEAR ? PPOS_OK : PPOS_UNSUPPORTED;
         return 1;
     }
-    if (hook < PV_HOOK_STORAGE_FULLTEXTUPSERT ||
-        hook > PV_HOOK_STORAGE_FULLTEXTRESULT) return 0;
 
     if (hook == PV_HOOK_STORAGE_FULLTEXTRESULT) {
+        if (!ppos_register_valid(rs1)) {
+            ctx->regs[rd] = -1;
+            ctx->host_status = PPOS_INVALID;
+            return 1;
+        }
         i32 index = ctx->regs[rs1];
         ctx->regs[rd] = index >= 0 && (u32)index < g_ppos_result_count ?
                         (i32)g_ppos_results[index] : -1;
@@ -333,14 +364,22 @@ int ppos_storage_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
                            PPOS_OK : PPOS_NOT_FOUND;
         return 1;
     }
-    if (ctx->regs[rs1] < 0 || (u32)ctx->regs[rs1] >= PPOS_MAX_DOCUMENTS) {
+    if (!ppos_register_valid(rs1) ||
+        (hook == PV_HOOK_STORAGE_FULLTEXTUPSERT &&
+         !ppos_register_valid(rs2))) {
         ctx->regs[rd] = 0;
         ctx->host_status = PPOS_INVALID;
         return 1;
     }
-    u32 document = (u32)ctx->regs[rs1];
     i32 rc;
     if (hook == PV_HOOK_STORAGE_FULLTEXTUPSERT) {
+        if (ctx->regs[rs1] < 0 ||
+            (u32)ctx->regs[rs1] >= PPOS_MAX_DOCUMENTS) {
+            ctx->regs[rd] = 0;
+            ctx->host_status = PPOS_INVALID;
+            return 1;
+        }
+        u32 document = (u32)ctx->regs[rs1];
         const u8 *text = 0;
         u32 text_len = 0;
         if (!ppos_span(ctx, ctx->regs[rs2], &text, &text_len)) {
@@ -359,6 +398,13 @@ int ppos_storage_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
         return 1;
     }
     if (hook == PV_HOOK_STORAGE_FULLTEXTDELETE) {
+        if (ctx->regs[rs1] < 0 ||
+            (u32)ctx->regs[rs1] >= PPOS_MAX_DOCUMENTS) {
+            ctx->regs[rd] = 0;
+            ctx->host_status = PPOS_INVALID;
+            return 1;
+        }
+        u32 document = (u32)ctx->regs[rs1];
         rc = ppos_delete_source(g_ppos_pack, g_ppos_field, document);
         if (rc == PPOS_NOT_FOUND) rc = PPOS_OK;
         if (rc == PPOS_OK)

@@ -21,7 +21,7 @@ in this document are real measurements, not estimates.
 | Cache coherency | All 4 cores are in the **Inner Shareable** domain, hardware-coherent | cross-core data sharing needs **barriers only**, never cache maintenance |
 | Cache line | 64 bytes | descriptor/ring structures are 64B aligned to avoid false sharing |
 | SIMD | NEON / ASIMD 128-bit, 32 vector regs; DotProd, FP16, crypto, CRC32 | the copy/accel engine; **no SVE** on A76 |
-| DMA | BCM2712 `dma32` engine, channels 0/2/4/5; 40-bit addressing | bulk async transfers; **not** I/O-coherent into cacheable RAM |
+| DMA | BCM2712 `dma32` LITE channels 0/2/4/5; 40-bit descriptor data addresses | 65,532 bytes per CB; **not** I/O-coherent into cacheable RAM |
 | Interrupts | GIC-400 (`GICD=0x107FFF9000`, `GICC=0x107FFFA000`); per-core CNTPNS PPI 30; RP1 peripherals via PCIe/MSI-X → GIC SPI | timer + device IRQ wake; RP1 routing is delicate |
 | System counter | `CNTPCT_EL0`, fixed frequency (`CNTFRQ_EL0`, tens of MHz on this SoC) | all bench "ticks" are CNTPCT counts; relative comparison is what matters |
 
@@ -67,12 +67,28 @@ bool dma_memcpy(u32 channel, void *dst, const void *src, u32 len) {
         simd_memcpy(dst, src, len);
         return len != 0;
     }
-    if (dma_hw_memcpy_enabled && dma_memcpy_hw(channel, dst, src, len))
-        return true;
+    /* The live implementation splits eligible core-0 low-RAM transfers
+     * into <=32 KiB DMA quanta and reports a hardware error explicitly. */
     simd_memcpy(dst, src, len);           /* fallback */
     return len != 0;
 }
 ```
+
+BCM2712 uses a fixed shifted CB pointer (`PA >> 5`), with source/destination
+high bytes in the stride word. It does not use DMA40 CS protection/error bits,
+raw CB-pointer guesses, or writes to the undocumented global `+0xff0` offset.
+The available channels report DEBUG.LITE, limiting each CB to 65,532 bytes.
+Bulk convenience copies use <=32 KiB quanta and dispatch posted network work
+between quanta, without NIC polling. Only core 0 programs hardware; other cores
+and spans outside the existing low-1-GiB convenience window use CPU copies.
+Completion waits stop at an error or a bounded deadline; reset must prove the
+channel and outstanding writes idle before memory can be reused. Boot performs
+real 16 KiB copy and zero-fill proofs before publishing hardware enablement.
+
+Reference: Raspberry Pi Linux
+[`bcm2835-dma.c`](https://github.com/raspberrypi/linux/blob/rpi-6.12.y/drivers/dma/bcm2835-dma.c)
+(`to_40bit_cbaddr`, `MAX_LITE_DMA_LEN`, `is_2712`, and `bcm2835_dma_abort`).
+Channels 6-11 belong to the different DMA40 register block and are not used here.
 
 The 4096 B threshold is a conservative initial value; the true cross-over point
 is being measured empirically (see §6, open item).
@@ -305,104 +321,42 @@ belong to the tensor path (`src/tensor.c`, `src/simd.c`), not the ring.
 
 ---
 
-## 8. Interrupt model & the IRQ-vs-poll trade-off
+## 8. Interrupt model
 
 ### RP1 Ethernet RX
 
-The NIC is a Cadence MACB/GEM behind the RP1 south bridge (PCIe). Reliable RX
-interrupt delivery to core 0 required:
+The NIC is a Cadence MACB/GEM behind the RP1 south bridge (PCIe). Its hardware
+IRQ is a trigger only:
 
-- **`macb_irq_ack_rx()` must write-1-to-clear `ISR.RCOMP`** — merely *reading*
-  the ISR does not re-arm repeated delivery.
-- RP1 → GIC routing via the MIP/MSI-X path: HOST6 / GIC SPI, with
-  `CFGL_HOST = 0` to route to the HOST (GIC) rather than VPU. Do **not**
-  auto-rearm by toggling `CFGL_HOST` + IACK — it can storm.
+- the top half captures MIP state and publishes `AIRQ_SRC_ETH_RX`;
+- the scheduled AIRQ handler clears GEM receive cause **before** its bounded
+  transport quantum, then publishes MAC/IP/TCP/service events through FIFOs;
+- the RP1 interrupt credit is returned once after the quantum, including when
+  the source has reasserted. Withholding IACK while asserted waits for an MSI
+  that RP1 is forbidden to send;
+- a full downstream queue retains the transport indication until credit
+  returns. It is never replaced by a timer poll.
 
-When it works, `core0_eth_irq_handler` sets `CORE0_IO_NET | CORE0_IO_TCP` and
-`SEV`s, so an inbound packet wakes core 0 immediately, and
-`core0_eth_irq_drain_and_quench()` drains RX (up to 8 `net_poll` passes) and
-quiesces the source.
-
-### Current state (measured)
-
-`rp1 irq` reports **`count=0`** — the ETH RX interrupt is **not presently
-delivering** to core 0 (`last_mip=0`, `quench_passes=0`). RX is therefore being
-serviced by the **31 Hz timer poll**, not the IRQ.
-
-> **Constraint this imposes.** We cannot drop the periodic NET/TCP poll for the
-> core-0 idle win (§9) until the ETH IRQ delivers reliably — otherwise inbound
-> request latency would balloon to the poll period. Re-arming/validating RP1 ETH
-> IRQ delivery is the prerequisite for the biggest idle reduction.
+See [`network_stack.md`](network_stack.md#fifo-backpressure-and-interrupt-re-arm-166)
+for the executable network contract and [`architecture_system.md`](architecture_system.md)
+for AIRQ priority and ownership rules.
 
 ### Timer
 
-Core 0 runs a 1000 Hz generic-timer tick (`timer_init(1000)`); user cores run at
-`PROC_PREEMPT_TIMER_HZ` for preemption. The per-core timer is independent, but
-the software watchdog currently measures liveness in `timer_ticks()` (tick
-count), which couples watchdog timing to the tick rate — so naïvely lowering
-core 0's timer rate to cut wakes would break the 5 s watchdog window. Decoupling
-the watchdog onto `timer_monotonic_ms` (CNTVCT-derived, rate-independent) is the
-clean enabler for a tickless/low-rate core 0.
+Core 0's timer may schedule timer expiry, bounded hardware recovery, dashboard
+work, and QEMU's virtio transport indication. It must not call MAC/IP/TCP
+protocol work to compensate for a missing Pi hardware IRQ or FIFO event.
+User-core timers provide mandatory preemption independently.
 
 ---
 
-## 9. Core-0 service loop and idle reduction
+## 9. Core-0 reactor
 
-`core0_main()` (`src/kernel.c`) is a wake-driven loop:
-
-```c
-for (;;) {
-    u32 flags = core0_io_take_flags();   // IRQ-masked read+clear of pending work
-    if (flags == 0) { wfi(); continue; } // sleep until next IRQ
-    if (flags & CORE0_IO_NET)  { net_poll(); dns_poll(); ... }
-    if (flags & CORE0_IO_TCP)  { echo_tcp_poll(); ksvc_run(debug); }
-    if (flags & (UART|USB))    { uart drain ×16; ui_handle_keys(); }
-    if (flags & CORE0_IO_MAINT){ arp_tick(); tcp_tick(); }
-    if (flags & CORE0_IO_DASH) { hdmi_dashboard_render(); }
-    watchdog_hw_pet();
-}
-```
-
-`core0_io_tick_hook` (the 1000 Hz tick) sets the work flags on a cadence:
-
-| Flag | Cadence | Work |
-|------|---------|------|
-| `NET`/`TCP`/`UART`/`USB` | every 32 ticks (~31 Hz) | `net_poll`,`dns_poll`,`echo_tcp_poll`, console |
-| `MAINT` | every 100 ticks (10 Hz) | `arp_tick`, `tcp_tick` (retransmit/timers) |
-| `DASH` | every 2000 ticks (0.5 Hz) | `hdmi_dashboard_render` (≈50 `fb_printf` to 1080p) |
-
-### Idle telemetry (measured, board idle)
-
-- **wake-rate ≈ 40/s** — matches the 31 Hz + 10 Hz cadence (the work wakes).
-- **wfi-rate ≈ 978/s** — core 0 is woken ~1000×/s by the **1000 Hz timer IRQ**,
-  finds no work flags ~938×/s, and immediately re-sleeps. (`SEV` from other
-  cores does *not* wake `WFI`; only interrupts do — so this floor is the timer.)
-- **Instantaneous idle busy ≈ 17‰ (1.7%)**, derived from the cumulative
-  `sched_busy_permille` delta over a 40 s idle window.
-
-### Cost breakdown (approx)
-
-| Source | Share of idle |
-|--------|--------------:|
-| 31 Hz NET/TCP poll (`net_poll`+`dns_poll`+`echo_tcp_poll`) | ~10‰ |
-| Empty timer-IRQ wakes (938/s × IRQ entry/exit) | ~1.5‰ |
-| 0.5 Hz dashboard render | ~2‰ |
-| 10 Hz MAINT | ~1‰ |
-| 31 Hz UART/USB poll (cheap) | ~1.5‰ |
-
-### Reduction plan (target < 10‰ / 1%)
-
-1. **Make ETH RX IRQ deliver reliably** (§8) — prerequisite.
-2. **Unbundle and lower the NET/TCP poll** from 31 Hz to ~8 Hz (a safety net
-   behind the IRQ), keeping UART/USB responsive at ~31 Hz. Projected NET/TCP
-   cost ~10‰ → ~2‰.
-3. **Optimise / rate-limit the dashboard** render (skip when unchanged; it
-   already self-gates to 1 Hz internally).
-4. **(Stretch) lower the core-0 timer base rate** once the watchdog is
-   decoupled from tick count — cuts the empty-wake floor.
-
-Projected result of steps 2–3 alone: ~17‰ → ~7–8‰, under the 1% target, without
-touching the timer/watchdog.
+Core 0 is wake-driven. AIRQ dispatches already-published work within its pass
+budget; `adrv_service()` runs admitted asynchronous driver steps; timer work
+performs only timer and bounded hardware-maintenance duties. The watchdog is
+fed only after demonstrated forward progress, never inside a credit wait or
+stall. NIC protocol progress has no periodic polling fallback.
 
 ---
 

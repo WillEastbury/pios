@@ -29,6 +29,7 @@
 #include "exception.h"
 #include "board_detect.h"
 #include "mailbox.h"
+#include "wifi_platform.h"
 
 /* ── Constants ── */
 
@@ -274,20 +275,49 @@ static u32 cyw43_board_model(void)
     return BOARD_MODEL_UNKNOWN;
 }
 
+static bool cyw43_firmware_paths(struct wifi_firmware_paths *paths)
+{
+    return wifi_firmware_paths_for(PIOS_PLATFORM, cyw43_board_model(), paths);
+}
+
 /* Pre-loaded blobs (loaded before cyw43_init disturbs SD) */
 #define CYW_FW_MAX_SIZE   (700 * 1024)
 #define CYW_NVRAM_MAX     4096
 #define CYW_CLM_MAX       16384
+
+#if PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+/* The two exact-size records total 872,412 bytes.  They are filled before
+ * SDIO1 changes the removable-storage controller and are never modified
+ * after their SHA-256 validation. */
+#define CYW_ZERO2W_43436_FW_BYTES   416101U
+#define CYW_ZERO2W_43436_NV_BYTES     1706U
+#define CYW_ZERO2W_43436_CLM_BYTES   11209U
+#define CYW_ZERO2W_43436S_FW_BYTES  442211U
+#define CYW_ZERO2W_43436S_NV_BYTES    1185U
+_Static_assert(CYW_ZERO2W_43436_FW_BYTES + CYW_ZERO2W_43436_NV_BYTES +
+               CYW_ZERO2W_43436_CLM_BYTES + CYW_ZERO2W_43436S_FW_BYTES +
+               CYW_ZERO2W_43436S_NV_BYTES == 872412U,
+               "Zero2W candidate storage must match the version-1 manifest");
+static u8 fw_buf[CYW_ZERO2W_43436S_FW_BYTES] ALIGNED(64);
+static u8 nvram_buf[CYW_ZERO2W_43436S_NV_BYTES];
+static u8 clm_buf[CYW_ZERO2W_43436_CLM_BYTES];
+static u8 zero2w_43436_fw[CYW_ZERO2W_43436_FW_BYTES] ALIGNED(64);
+static u8 zero2w_43436_nvram[CYW_ZERO2W_43436_NV_BYTES];
+#else
 static u8 fw_buf[CYW_FW_MAX_SIZE] ALIGNED(64);
+static u8 nvram_buf[CYW_NVRAM_MAX];
+static u8 clm_buf[CYW_CLM_MAX];
+#endif
 static u32 fw_buf_len;
 static const u8 *fw_data = fw_buf;
-static u8 nvram_buf[CYW_NVRAM_MAX];
 static u32 nvram_buf_len;
 static const u8 *nvram_data = nvram_buf;
-static u8 clm_buf[CYW_CLM_MAX];
 static u32 clm_buf_len;
 static const u8 *clm_data = clm_buf;
 static bool blobs_loaded;
+#if PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+static bool zero2w_candidates_loaded;
+#endif
 
 /* ── Backplane access ── */
 
@@ -339,6 +369,16 @@ bool cyw43_poll_busy(void)
 
 bool cyw43_install_blob(u32 kind, const u8 *data, u32 len)
 {
+#if PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    /*
+     * Zero 2 W accepts only the two FAT-preloaded, manifest-verified records.
+     * A streamed blob could otherwise replace one after the raw-chip choice.
+     */
+    (void)kind;
+    (void)data;
+    (void)len;
+    return false;
+#else
     if (!data || len == 0U)
         return false;
     if (kind == CYW_BLOB_FIRMWARE) {
@@ -368,6 +408,7 @@ bool cyw43_install_blob(u32 kind, const u8 *data, u32 len)
     cyw_diag.nvram_len = nvram_buf_len;
     cyw_diag.clm_len = clm_buf_len;
     return true;
+#endif
 }
 
 bool cyw43_blobs_ready(void)
@@ -674,14 +715,58 @@ static u32 cyw43_firmware_ramsize(void)
 
 /* ── Chip identification ── */
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+static bool cyw43_select_zero2w_candidate(u32 chipcommon_raw)
+{
+    const struct wifi_zero2w_firmware_manifest *manifest =
+        wifi_zero2w_firmware_manifest_for_chip(chipcommon_raw);
+
+    if (!zero2w_candidates_loaded || !manifest ||
+        !wifi_zero2w_firmware_manifest_valid(manifest))
+        return false;
+
+    if (manifest == wifi_zero2w_firmware_manifest_at(0U)) {
+        fw_data = fw_buf;
+        fw_buf_len = CYW_ZERO2W_43436S_FW_BYTES;
+        nvram_data = nvram_buf;
+        nvram_buf_len = CYW_ZERO2W_43436S_NV_BYTES;
+        clm_data = 0;
+        clm_buf_len = 0U;
+    } else if (manifest == wifi_zero2w_firmware_manifest_at(1U)) {
+        fw_data = zero2w_43436_fw;
+        fw_buf_len = CYW_ZERO2W_43436_FW_BYTES;
+        nvram_data = zero2w_43436_nvram;
+        nvram_buf_len = CYW_ZERO2W_43436_NV_BYTES;
+        clm_data = clm_buf;
+        clm_buf_len = CYW_ZERO2W_43436_CLM_BYTES;
+    } else {
+        return false;
+    }
+
+    if (!wifi_firmware_artifact_matches(&manifest->firmware, fw_data,
+                                        fw_buf_len) ||
+        !wifi_firmware_artifact_matches(&manifest->nvram, nvram_data,
+                                        nvram_buf_len) ||
+        !wifi_firmware_artifact_matches(&manifest->clm, clm_data,
+                                        clm_buf_len))
+        return false;
+
+    blobs_loaded = true;
+    cyw_diag.fw_len = fw_buf_len;
+    cyw_diag.nvram_len = nvram_buf_len;
+    cyw_diag.clm_len = clm_buf_len;
+    return true;
+}
+#endif
+
 static bool chip_identify(void)
 {
     u32 chip_id;
     if (!bp_read32(CYW_CHIPCOMMON_BASE, &chip_id))
         return false;
 
-    u16 id = (u16)(chip_id & 0xFFFF);
-    u16 rev = (u16)((chip_id >> 16) & 0xF);
+    u16 id = (u16)(chip_id & 0xFFFFU);
+    u16 rev = (u16)((chip_id >> 16U) & 0x0FU);
     cyw_chip_id = id;
 
     uart_puts("[cyw] chip=");
@@ -690,10 +775,24 @@ static bool chip_identify(void)
     uart_hex(rev);
     uart_puts("\n");
 
-    if (id != CYW43455_CHIP_ID && id != CYW43430_CHIP_ID) {
-        uart_puts("[cyw] bad chip ID\n");
+#if PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    if (!cyw43_select_zero2w_candidate(chip_id)) {
+        uart_puts("[cyw] zero2w manifest/chip mismatch\n");
         return false;
     }
+#else
+    {
+        struct wifi_firmware_paths paths;
+        if (!cyw43_firmware_paths(&paths)) {
+            uart_puts("[cyw] board profile unavailable\n");
+            return false;
+        }
+        if (id != paths.expected_chip_id) {
+            uart_puts("[cyw] chip/profile mismatch\n");
+            return false;
+        }
+    }
+#endif
     return true;
 }
 
@@ -2498,6 +2597,17 @@ bool cyw43_init(void)
 
     uart_puts("[cyw] init...\n");
 
+#if PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    /* FAT must have supplied both immutable candidates before SDIO1 changes
+     * the storage-controller ownership. Do not enter an unrecoverable state
+     * merely to discover that a required candidate is absent. */
+    if (!zero2w_candidates_loaded) {
+        cyw_diag.last_error = 10U;
+        uart_puts("[cyw] zero2w candidates not preloaded\n");
+        return false;
+    }
+#endif
+
     /* Initialize SDIO controller and enumerate card */
     if (!sdio_init()) {
         cyw_diag.last_error = 1U;
@@ -2545,8 +2655,107 @@ bool cyw43_init(void)
     return true;
 }
 
+static bool cyw43_preload_file(fat32_file_t *file, u8 *buffer,
+                               u32 capacity, u32 *loaded)
+{
+    if (!file || !buffer || !loaded || file->file_size > capacity)
+        return false;
+    u32 off = 0U;
+    while (off < file->file_size) {
+        u32 chunk = file->file_size - off;
+        if (chunk > 4096U)
+            chunk = 4096U;
+        u32 got = fat32_read(file, buffer + off, chunk);
+        if (got == 0U || got > chunk)
+            return false;
+        off += got;
+        /* A completed FAT read is forward progress; never feed the watchdog
+         * while the read itself is stalled. */
+        if (cyw_progress_hook)
+            cyw_progress_hook();
+    }
+    *loaded = off;
+    return true;
+}
+
+#if PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+static bool cyw43_preload_manifest_artifact(
+    const struct wifi_firmware_artifact *artifact, u8 *buffer, u32 capacity,
+    u32 *loaded)
+{
+    fat32_file_t file;
+
+    if (!artifact || !artifact->path || artifact->bytes == 0U ||
+        artifact->bytes > capacity || !buffer || !loaded ||
+        !fat32_open(artifact->path, &file))
+        return false;
+    if (file.file_size != artifact->bytes ||
+        !cyw43_preload_file(&file, buffer, capacity, loaded)) {
+        fat32_close(&file);
+        return false;
+    }
+    fat32_close(&file);
+    return wifi_firmware_artifact_matches(artifact, buffer, *loaded);
+}
+
+static bool cyw43_preload_zero2w_candidates(void)
+{
+    const struct wifi_zero2w_firmware_manifest *small =
+        wifi_zero2w_firmware_manifest_at(0U);
+    const struct wifi_zero2w_firmware_manifest *full =
+        wifi_zero2w_firmware_manifest_at(1U);
+
+    if (wifi_zero2w_firmware_manifest_count() != 2U ||
+        !wifi_zero2w_firmware_manifest_valid(small) ||
+        !wifi_zero2w_firmware_manifest_valid(full) ||
+        small->clm_required || !full->clm_required ||
+        !cyw43_preload_manifest_artifact(&small->firmware, fw_buf,
+                                         sizeof(fw_buf), &fw_buf_len) ||
+        !cyw43_preload_manifest_artifact(&small->nvram, nvram_buf,
+                                         sizeof(nvram_buf), &nvram_buf_len) ||
+        !wifi_firmware_artifact_matches(&small->clm, 0, 0U) ||
+        !cyw43_preload_manifest_artifact(&full->firmware, zero2w_43436_fw,
+                                         sizeof(zero2w_43436_fw), &fw_buf_len) ||
+        !cyw43_preload_manifest_artifact(&full->nvram, zero2w_43436_nvram,
+                                         sizeof(zero2w_43436_nvram),
+                                         &nvram_buf_len) ||
+        !cyw43_preload_manifest_artifact(&full->clm, clm_buf, sizeof(clm_buf),
+                                         &clm_buf_len))
+        return false;
+
+    /* The lengths above are only scratch values until raw ChipCommon selects
+     * one candidate; do not expose either as the active blob set yet. */
+    fw_buf_len = 0U;
+    nvram_buf_len = 0U;
+    clm_buf_len = 0U;
+    fw_data = 0;
+    nvram_data = 0;
+    clm_data = 0;
+    zero2w_candidates_loaded = true;
+    blobs_loaded = false;
+    cyw_diag.stage = 11U;
+    uart_puts("[cyw-pre] zero2w candidates verified\n");
+    return true;
+}
+#endif
+
 bool cyw43_preload_blobs(void)
 {
+#if PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+    if (blobs_loaded)
+        return true;
+    cyw_diag.stage = 10U;
+    if (!fat32_init()) {
+        uart_puts("[cyw-pre] FAT32 fail\n");
+        return false;
+    }
+    if (!cyw43_preload_zero2w_candidates()) {
+        cyw_diag.last_error = 10U;
+        uart_puts("[cyw-pre] zero2w candidate validation fail\n");
+        return false;
+    }
+    return true;
+#else
     if (blobs_loaded) {
         uart_puts("[cyw-pre] using installed blobs fw=");
         uart_hex(fw_buf_len);
@@ -2569,24 +2778,18 @@ bool cyw43_preload_blobs(void)
         return false;
     }
 
-    const char *fw_path = "/wifi/firmware.bin";
-    const char *nv_path = "/wifi/nvram.txt";
-    const char *clm_path = "/wifi/clm.bin";
-#if PIOS_PLATFORM == PIOS_PLATFORM_PI3
-    if (cyw43_board_model() == BOARD_MODEL_PI3_B_PLUS) {
-        fw_path = "/wifi/pi3bp/firmware.bin";
-        nv_path = "/wifi/pi3bp/nvram.txt";
-        clm_path = "/wifi/pi3bp/clm.bin";
-    } else {
-        fw_path = "/wifi/pi3b/firmware.bin";
-        nv_path = "/wifi/pi3b/nvram.txt";
-        clm_path = "/wifi/pi3b/clm.bin";
+    struct wifi_firmware_paths paths;
+    if (!cyw43_firmware_paths(&paths)) {
+        cyw_diag.last_error = 10U;
+        uart_puts("[cyw-pre] unsupported board profile\n");
+        return false;
     }
-#elif PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
-    fw_path = "/wifi/zero2w/firmware.bin";
-    nv_path = "/wifi/zero2w/nvram.txt";
-    clm_path = "/wifi/zero2w/clm.bin";
-#endif
+    const char *fw_path = paths.firmware;
+    const char *nv_path = paths.nvram;
+    const char *clm_path = paths.clm;
+    uart_puts("[cyw-pre] profile ");
+    uart_puts(paths.name);
+    uart_puts("\n");
 
     /* Firmware */
     {
@@ -2600,22 +2803,13 @@ bool cyw43_preload_blobs(void)
             fat32_close(&fw);
             return false;
         }
-        u32 off = 0;
-        while (off < fw.file_size) {
-            u32 chunk = fw.file_size - off;
-            if (chunk > 4096) chunk = 4096;
-            u32 got = fat32_read(&fw, fw_buf + off, chunk);
-            if (got == 0) {
-                uart_puts("[cyw-pre] fw read err @");
-                uart_hex(off);
-                uart_puts("\n");
-                fat32_close(&fw);
-                return false;
-            }
-            off += got;
+        if (!cyw43_preload_file(&fw, fw_buf, CYW_FW_MAX_SIZE,
+                                 &fw_buf_len)) {
+            uart_puts("[cyw-pre] fw read err\n");
+            fat32_close(&fw);
+            return false;
         }
         fat32_close(&fw);
-        fw_buf_len = off;
         uart_puts("[cyw-pre] fw loaded ");
         uart_hex(fw_buf_len);
         uart_puts("\n");
@@ -2626,7 +2820,12 @@ bool cyw43_preload_blobs(void)
         fat32_file_t nv;
         if (fat32_open(nv_path, &nv)) {
             if (nv.file_size <= CYW_NVRAM_MAX) {
-                nvram_buf_len = fat32_read(&nv, nvram_buf, nv.file_size);
+                if (!cyw43_preload_file(&nv, nvram_buf, CYW_NVRAM_MAX,
+                                         &nvram_buf_len)) {
+                    uart_puts("[cyw-pre] nvram read err\n");
+                    fat32_close(&nv);
+                    return false;
+                }
                 uart_puts("[cyw-pre] nvram loaded ");
                 uart_hex(nvram_buf_len);
                 uart_puts("\n");
@@ -2640,7 +2839,12 @@ bool cyw43_preload_blobs(void)
         fat32_file_t clm;
         if (fat32_open(clm_path, &clm)) {
             if (clm.file_size <= CYW_CLM_MAX) {
-                clm_buf_len = fat32_read(&clm, clm_buf, clm.file_size);
+                if (!cyw43_preload_file(&clm, clm_buf, CYW_CLM_MAX,
+                                         &clm_buf_len)) {
+                    uart_puts("[cyw-pre] clm read err\n");
+                    fat32_close(&clm);
+                    return false;
+                }
                 uart_puts("[cyw-pre] clm loaded ");
                 uart_hex(clm_buf_len);
                 uart_puts("\n");
@@ -2661,6 +2865,7 @@ bool cyw43_preload_blobs(void)
     }
     cyw_diag.stage = 11U;
     return true;
+#endif
 }
 
 bool cyw43_load_firmware(void)
@@ -2702,6 +2907,17 @@ bool cyw43_load_firmware(void)
     }
     cyw_diag.f1_batch_blocks = CYW_F1_BATCH_BLOCKS;
     uart_puts("[cyw] F1 multiblock verified\n");
+
+    /*
+     * SDIO1 must prove a complete Function-1 transaction before and after
+     * its optional 50MHz transition. This keeps CAP/CCCR advertisement from
+     * being mistaken for a usable high-speed transport.
+     */
+    if (!sdio_enable_high_speed() || !probe_f1_multiblock()) {
+        cyw_diag.last_error = 27U;
+        uart_puts("[cyw] F1 high-speed verify failed\n");
+        return false;
+    }
 
     /* Request ALP clock for backplane memory access */
     sdio_cmd52_write(SDIO_FUNC_BACKPLANE, SDIO_CLKCSR, CLKCSR_ReqALP);

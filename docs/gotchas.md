@@ -197,20 +197,21 @@ into a **permanent hang**. Strictly worse than not feeding it. Reverted.
 **Rule:** pet only on proven forward progress. Callers that must not block check
 credit *before* calling.
 
-### Any WiFi path that blocks core 0 must drive the liveness pairing
+### A blocking WiFi path is a defect, not a networking-poll exception
 
 **Tried:** `cyw43_join_key()` owning core 0 for up to 30 s in its association
 poll loop.
 
-**Result:** `net_poll()` never ran, the 896-descriptor GEM ring filled and
+**Result:** network protocol work did not run, the 896-descriptor GEM ring filled and
 latched **BNA** (`896/896`, `BNA=Y`). Once BNA is latched no further ETH IRQ can
 be raised, and `CORE0_IO_NET` is set only by that IRQ — so `macb_rx_recover()`
 never ran and the wedge was **permanent**. The board stayed alive with a dead
 management path and needed a power cycle.
 
-**Rule:** any path that blocks core 0 for more than a few milliseconds must
-drive `wifi_upload_progress()` (net_poll + MAC recovery + watchdog pet). Better:
-make it asynchronous via `adrv` so it never blocks at all.
+**Rule:** make WiFi work asynchronous through `adrv`; no legacy blocking path
+may call `net_poll()` or publish protocol work. The retained
+`wifi_upload_progress()` hook performs bounded MAC recovery plus its established
+watchdog liveness signal only; it does not execute network protocol stages.
 
 ### Measuring an overrun is admitting the schedule already failed
 

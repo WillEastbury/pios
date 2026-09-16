@@ -104,25 +104,33 @@ def validate(path: pathlib.Path, want_platform: int, rep: Report) -> None:
     stored_id, declared = struct.unpack_from("<QQ", data, 16)
 
     # ---- package_identity() gate ------------------------------------------
-    rep.check("PGS2 magic", magic == MANIFEST_MAGIC,
+    magic_ok = rep.check("PGS2 magic", magic == MANIFEST_MAGIC,
               f"0x{magic:08X} (want 0x{MANIFEST_MAGIC:08X})")
-    rep.check("manifest version", version == MANIFEST_VERSION, f"v{version}")
-    rep.check("PACKAGED flag set", bool(flags & FLAG_PACKAGED), f"flags=0x{flags:X}")
+    version_ok = rep.check("manifest version", version == MANIFEST_VERSION, f"v{version}")
+    packaged_ok = rep.check("PACKAGED flag set", bool(flags & FLAG_PACKAGED),
+                            f"flags=0x{flags:X}")
     rep.check("declared size == file size", declared == image_len,
               f"declared={declared} file={image_len}")
     rep.check("package id non-zero", stored_id != 0, f"id=0x{stored_id:016X}")
     computed = package_id(data)
     rep.check("FNV-1a package id matches", computed == stored_id,
               f"computed=0x{computed:016X} stored=0x{stored_id:016X}")
+    if not (magic_ok and version_ok and packaged_ok):
+        return
 
     # ---- header field sanity (select_stage2_image) ------------------------
-    rep.check("header_bytes >= 32", header_bytes >= HEADER_BYTES, f"{header_bytes}")
-    rep.check("entry_bytes >= packaged entry", entry_bytes >= PACKAGED_ENTRY_BYTES,
-              f"{entry_bytes} >= {PACKAGED_ENTRY_BYTES}")
-    rep.check("entry_count in 1..16", 1 <= entry_count <= 16, f"{entry_count}")
+    header_ok = rep.check("header_bytes >= 32", header_bytes >= HEADER_BYTES,
+                          f"{header_bytes}")
+    entry_bytes_ok = rep.check("entry_bytes >= packaged entry",
+                               entry_bytes >= PACKAGED_ENTRY_BYTES,
+                               f"{entry_bytes} >= {PACKAGED_ENTRY_BYTES}")
+    count_ok = rep.check("entry_count in 1..16", 1 <= entry_count <= 16,
+                         f"{entry_count}")
     table_bytes = header_bytes + entry_count * entry_bytes
-    rep.check("entry table within image", table_bytes <= image_len,
-              f"table={table_bytes} image={image_len}")
+    table_ok = rep.check("entry table within image", table_bytes <= image_len,
+                         f"table={table_bytes} image={image_len}")
+    if not (header_ok and entry_bytes_ok and count_ok and table_ok):
+        return
 
     # ---- whole FAT-resident package fits the staging/FAT-read cap ---------
     # (Not the raw-slot zone: only the per-platform payload extracted below

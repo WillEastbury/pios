@@ -50,6 +50,9 @@ struct usb_csw {
 #define USB_SUBCLASS_SCSI       0x06
 #define USB_PROTOCOL_BBB        0x50
 
+#define SCSI_READ_CAPACITY16_LEN    32U
+#define SCSI_LBA10_MAX              0xFFFFFFFFULL
+
 /* ---- Driver State ---- */
 
 static struct usb_device *stor_dev;
@@ -225,18 +228,34 @@ static bool scsi_geometry_valid(u32 block_size) {
 }
 
 #if PIOS_ENABLE_SCSI_CAPACITY16
+static bool scsi_capacity16_response_valid(const u8 *response) {
+    /*
+     * This driver does not implement SCSI protection information.  Reserved
+     * response fields must also be zero so an unknown response revision is
+     * never interpreted as an ordinary block device.
+     */
+    if (response[12] != 0U || (response[13] & 0x30U) != 0U)
+        return false;
+    for (u32 i = 16U; i < SCSI_READ_CAPACITY16_LEN; i++) {
+        if (response[i] != 0U)
+            return false;
+    }
+    return true;
+}
+
 static bool scsi_read_capacity16(void) {
     u8 cmd[16] = {
         0x9E, 0x10, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 32, 0, 0
+        0, 0, 0, 0, 0, SCSI_READ_CAPACITY16_LEN, 0, 0
     };
-    if (!bbb_transfer(cmd, 16, 0x80, scsi_buf, 32))
+    if (!bbb_transfer(cmd, 16, 0x80, scsi_buf, SCSI_READ_CAPACITY16_LEN))
         return false;
 
-    dcache_invalidate_range((u64)(usize)scsi_buf, 32);
+    dcache_invalidate_range((u64)(usize)scsi_buf, SCSI_READ_CAPACITY16_LEN);
     u64 last_lba = load_be64(scsi_buf);
     u32 block_size = load_be32(scsi_buf + 8);
-    if (last_lba == ~0ULL || !scsi_geometry_valid(block_size))
+    if (last_lba == ~0ULL || !scsi_geometry_valid(block_size) ||
+        !scsi_capacity16_response_valid(scsi_buf))
         return false;
     blk_size = block_size;
     num_blocks = last_lba + 1ULL;
@@ -297,6 +316,8 @@ static bool stor_probe(struct usb_device *dev) {
     stor_dev = dev;
     bulk_in_addr = 0;
     bulk_out_addr = 0;
+    blk_size = 0;
+    num_blocks = 0;
     stor_ready = false;
 
     /* Find bulk IN and bulk OUT endpoints */
@@ -341,6 +362,8 @@ static void stor_disconnect(struct usb_device *dev) {
     (void)dev;
     stor_ready = false;
     stor_dev = NULL;
+    blk_size = 0;
+    num_blocks = 0;
 }
 
 static struct usb_driver storage_driver = {
@@ -360,6 +383,11 @@ bool usb_storage_ready(void) { return stor_ready; }
 u32  usb_storage_block_size(void) { return blk_size; }
 u64  usb_storage_num_blocks(void) { return num_blocks; }
 
+static bool scsi_rw_needs_16(u64 lba, u32 count) {
+    return count == 0U || lba > SCSI_LBA10_MAX ||
+           (u64)(count - 1U) > SCSI_LBA10_MAX - lba;
+}
+
 bool usb_storage_read(u64 lba, u32 count, void *buf) {
     if (!stor_ready || !buf || count == 0U ||
         lba >= num_blocks || (u64)count > num_blocks - lba)
@@ -370,8 +398,7 @@ bool usb_storage_read(u64 lba, u32 count, void *buf) {
         u32 n = (count > 128) ? 128 : count; /* max 128 blocks per transfer */
         u32 len = n * blk_size;
 
-        bool use16 = lba > 0xFFFFFFFFULL ||
-                     (u64)(n - 1U) > 0xFFFFFFFFULL - lba;
+        bool use16 = scsi_rw_needs_16(lba, n);
         u8 cmd[16] = {0};
         u8 cmd_len;
         if (use16) {
@@ -415,8 +442,7 @@ bool usb_storage_write(u64 lba, u32 count, const void *buf) {
         u32 n = (count > 128) ? 128 : count;
         u32 len = n * blk_size;
 
-        bool use16 = lba > 0xFFFFFFFFULL ||
-                     (u64)(n - 1U) > 0xFFFFFFFFULL - lba;
+        bool use16 = scsi_rw_needs_16(lba, n);
         u8 cmd[16] = {0};
         u8 cmd_len;
         if (use16) {

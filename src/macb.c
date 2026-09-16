@@ -10,6 +10,7 @@
  */
 
 #include "macb.h"
+#include "nic.h"
 #include "macb_rx_engine.h"
 #include "mmio.h"
 #include "uart.h"
@@ -1107,7 +1108,7 @@ bool macb_rx_hole_snapshot(struct macb_hole_snapshot *out)
 }
 
 bool macb_recv(u8 *frame, u32 *len, bool *checksum_trusted) {
-    return macb_rx_engine_recv(frame, BUF_SIZE, len, checksum_trusted);
+    return macb_rx_engine_recv(frame, ETH_FRAME_MAX, len, checksum_trusted);
 }
 
 bool macb_rx_hole_recover(void) {

@@ -44,6 +44,7 @@ KERNEL = REPO / "build_qemu_full" / "PIOS_QEMU_FULL.BIN"
 HTTP = "http://127.0.0.1:8088"
 OTA_HOST, OTA_PORT = "127.0.0.1", 8082
 SERIAL_LOG = REPO / "qemu_smoke_serial.log"
+SMOKE_DISK = REPO / "qemu_smoke.img"
 
 GREEN, RED, DIM, RST = "\033[32m", "\033[31m", "\033[2m", "\033[0m"
 
@@ -54,8 +55,8 @@ def term(cmd: str, timeout: float = 8.0) -> str:
         return r.read().decode("utf-8", "replace")
 
 
-def get(path: str, timeout: float = 8.0):
-    with urllib.request.urlopen(f"{HTTP}{path}", timeout=timeout) as r:
+def get(path: str, timeout: float = 8.0, base: str = HTTP):
+    with urllib.request.urlopen(f"{base}{path}", timeout=timeout) as r:
         return r.status, r.read().decode("utf-8", "replace")
 
 
@@ -128,12 +129,27 @@ class Smoke:
         except Exception as e:
             self.check("picoscript WebIDE portal served", False, str(e))
 
+        # Exercise real EL0 workers, not just the core-0 listener/health path.
+        expected = {
+            8282: ("PicoScript", "PicoScript webserver"),
+            8283: ("native tiny fallback",),
+            8091: ('"ok":true', '"capsule":"picoscript"'),
+        }
+        for port, markers in expected.items():
+            try:
+                code, body = get("/hello/smoke", base=f"http://127.0.0.1:{port}")
+                self.check(f"EL0 capsule on host port {port}",
+                           code == 200 and all(marker in body for marker in markers),
+                           body[:100].replace("\n", " "))
+            except Exception as e:
+                self.check(f"EL0 capsule on host port {port}", False, str(e))
+
         # /picoscript/config JSON (endpoint prefixes + current hook table version)
         try:
             code, body = get("/picoscript/config")
             self.check("picoscript config JSON",
                        code == 200 and '"capsule_prefix":"/api/capsule"' in body
-                       and "0x9C1BBBA3" in body,
+                       and "0xE55B3B70" in body,
                        body.strip()[:80])
         except Exception as e:
             self.check("picoscript config JSON", False, str(e))
@@ -382,7 +398,8 @@ class Smoke:
         loadtest = REPO / "tools" / "qemu_loadtest.py"
         r = subprocess.run(
             [sys.executable, str(loadtest),
-             "--profile", "all", "--duration", "8", "--concurrency", "4"],
+             "--profile", "all", "--duration", "8", "--concurrency", "4",
+             "--no-retry"],
             capture_output=False
         )
         ok = r.returncode == 0
@@ -425,20 +442,48 @@ def main() -> int:
     if not pathlib.Path(args.kernel).exists():
         print(f"[smoke] kernel not found: {args.kernel} (use --build)")
         return 2
+    SMOKE_DISK.unlink(missing_ok=True)
+    built = subprocess.run(
+        [sys.executable, str(REPO / "tools" / "build_qemu_disk_image.py"),
+         "--pkg", args.kernel, "--out", str(SMOKE_DISK),
+         "--disk-id", "0x534D4F4B", "--exchange"],
+        cwd=REPO, capture_output=True, text=True,
+    )
+    if built.returncode != 0 or not SMOKE_DISK.exists():
+        print(built.stdout[-1000:])
+        print(built.stderr[-1000:])
+        print("[smoke] pre-created storage layout build FAILED")
+        return 2
 
     net = ("user,id=n0,net=192.168.0.0/24,host=192.168.0.1,"
            "hostfwd=tcp:127.0.0.1:8088-192.168.0.201:80,"
+           "hostfwd=tcp:127.0.0.1:8282-192.168.0.201:82,"
+           "hostfwd=tcp:127.0.0.1:8283-192.168.0.201:83,"
+           "hostfwd=tcp:127.0.0.1:8091-192.168.0.201:8090,"
            "hostfwd=tcp:127.0.0.1:8082-192.168.0.201:8082")
     qargs = [QEMU, "-M", "virt", "-cpu", "cortex-a76", "-smp", "4", "-m", "1G",
              "-display", "none", "-serial", f"file:{SERIAL_LOG}",
              "-kernel", args.kernel, "-netdev", net,
-             "-device", "virtio-net-device,netdev=n0"]
+             "-device", "virtio-net-device,netdev=n0",
+             "-drive", f"if=none,format=raw,file={SMOKE_DISK},id=hd0",
+             "-device", "virtio-blk-device,drive=hd0",
+             "-drive", f"if=none,format=raw,file={SMOKE_DISK},id=hd1",
+             "-device", "virtio-blk-device,drive=hd1"]
     print("[smoke] booting QEMU (headless)...")
     proc = subprocess.Popen(qargs)
     rc = 3
     try:
         if not wait_boot(proc):
             print(f"{RED}[smoke] board never reached /api/status (boot hang){RST}")
+            return 3
+        if "WALFS format OK" not in term("walfs format confirm", timeout=20):
+            print(f"{RED}[smoke] explicit WALFS initialization failed{RST}")
+            return 3
+        proc.terminate()
+        proc.wait(timeout=5)
+        proc = subprocess.Popen(qargs)
+        if not wait_boot(proc):
+            print(f"{RED}[smoke] board did not boot after explicit WALFS initialization{RST}")
             return 3
         print("[smoke] board up — running assertions:\n")
         smoke = Smoke()
@@ -454,8 +499,10 @@ def main() -> int:
             proc.kill()
         if rc == 0 and not args.keep_log:
             SERIAL_LOG.unlink(missing_ok=True)
+            SMOKE_DISK.unlink(missing_ok=True)
         elif rc != 0:
             print(f"[smoke] serial log: {SERIAL_LOG}")
+            print(f"[smoke] disk: {SMOKE_DISK}")
     return rc
 
 

@@ -108,12 +108,15 @@ def main() -> int:
     kern = KERNEL_C.read_bytes()
     contains_all(kern, [
         '#include "ide_assets.h"',
+        '#include "ide_asset_pack.h"',
         "/picoscript/config",
         "/picoscript/picowal.html",
         "/picoscript/pico_hooks.js",
         "/picoscript/baremetal-binary.js",
         "IDE_HTML", "IDE_PICOWAL_HTML",
         "IDE_PICO_HOOKS_JS", "IDE_BAREMETAL_BINARY_JS",
+        "ide_assets_walfs_file",
+        "http_build_picoscript_walfs_response",
         "\\\"capsule_prefix\\\":\\\"/api/capsule\\\"",
         "PV_HOOK_TABLE_VERSION",
     ], "kernel.c")

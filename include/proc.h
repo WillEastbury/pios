@@ -332,7 +332,7 @@ struct process {
     u32 state;
     u32 principal_id;
     u32 affinity_core;
-    volatile u32 owner_core;
+    u32 _owner_reserved; /* authoritative token is in the WB control page */
     u32 pinned_core;
     u32 eligible_core_mask;
     u32 last_core;
@@ -633,6 +633,7 @@ i32  proc_exec_from_mem(const char *name, const u8 *blob, u32 blob_len,
 i32  proc_exec_from_mem_el0(const char *name, const u8 *blob, u32 blob_len,
                             u64 linked_base, u64 physical_base,
                             u32 priority_class, u32 affinity_core);
+u32 proc_exit_snapshot(u32 *codes, u32 max);
 void proc_el0_diag_snapshot(i32 *launch_status, u32 *launch_pid, u32 *launch_slot,
                             u64 *launch_base, u32 *enter_count, u32 *enter_pid,
                             u64 *enter_pc, u64 *enter_sp, u32 *fault_pid,

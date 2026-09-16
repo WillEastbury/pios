@@ -11,6 +11,82 @@ import sys
 import time
 import urllib.parse
 
+RAW_SLOT_MAX_BYTES = 0x37FE00
+PGS2_MAGIC = b"PGS2"
+
+
+def validate_raw_slot_image(image: bytes, path: pathlib.Path) -> None:
+    """Reject files the raw-slot OTA endpoint cannot safely install.
+
+    `PIOSSTG2.PKG` is a FAT package. Stage0 extracts one payload from it before
+    writing a raw slot, but the HTTP updater receives no such package parser and
+    must never write the container as a bootable payload.
+    """
+    size = len(image)
+    if size == 0:
+        raise ValueError("image is empty")
+    if image.startswith(PGS2_MAGIC):
+        raise ValueError(
+            f"{path} is a PGS2 FAT package, not a raw platform payload; "
+            "pass build_pi5_stage2\\PIOS_PI5_STAGE2.BIN to this updater"
+        )
+    if size > RAW_SLOT_MAX_BYTES:
+        raise ValueError(
+            f"{path} is {size} bytes, exceeding the raw OTA slot capacity "
+            f"of {RAW_SLOT_MAX_BYTES}; pass a single platform payload, not "
+            "PIOSSTG2.PKG"
+        )
+
+
+def status_has_expected_version(body: str, expected_version: str) -> bool:
+    """Return true only for a successful status response from the candidate."""
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    return payload.get("ok") is True and payload.get("version") == expected_version
+
+
+def editor_is_available(host: str, editor_port: int) -> bool:
+    """Raw Pi5 OTA candidates are accepted only after WALFS editor extraction."""
+    try:
+        status, body = request(host, editor_port, "GET", "/picoscript", timeout=8)
+    except Exception:
+        return False
+    return status == 200 and "PicoScript" in body
+
+
+def wait_for_expected_version(host: str, status_port: int, expected_version: str,
+                              attempts: int, delay_seconds: float,
+                              editor_port: int = 80) -> bool:
+    """Wait for the requested candidate, not merely for any older image."""
+    last_status = ""
+    for _ in range(attempts):
+        try:
+            status, body = request(host, status_port, "GET", "/api/status", timeout=4)
+            if status == 200 and status_has_expected_version(body, expected_version):
+                if editor_is_available(host, editor_port):
+                    print(f"[ota] candidate online: version={expected_version}; editor ready")
+                    return True
+                last_status = f"{expected_version} (editor unavailable)"
+                time.sleep(delay_seconds)
+                continue
+            if status == 200:
+                try:
+                    last_status = str(json.loads(body).get("version", "missing version"))
+                except json.JSONDecodeError:
+                    last_status = "invalid JSON"
+        except Exception:
+            pass
+        time.sleep(delay_seconds)
+    if last_status:
+        print(f"[ota] board came online with {last_status}, expected {expected_version}",
+              file=sys.stderr)
+    else:
+        print(f"[ota] candidate {expected_version} did not answer within the timeout",
+              file=sys.stderr)
+    return False
+
 
 def stream_upload(host: str, update_port: int, image: bytes, reboot: bool,
                   send_chunk: int = 4096, timeout: float = 30.0) -> None:
@@ -158,11 +234,20 @@ def fetch_logs(host: str, port: int, since: int, timeout: float) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Upload a PIOS real_kernel.img to the OTA raw slot.")
-    ap.add_argument("image", type=pathlib.Path, nargs="?", default=pathlib.Path("real_kernel.img"))
+    ap = argparse.ArgumentParser(
+        description="Upload a single-platform PIOS stage2 payload to the raw OTA slot."
+    )
+    ap.add_argument(
+        "image", type=pathlib.Path, nargs="?",
+        default=pathlib.Path("build_pi5_stage2\\PIOS_PI5_STAGE2.BIN"),
+        help="raw single-platform stage2 payload (default: %(default)s); "
+             "PIOSSTG2.PKG is a FAT package and is rejected",
+    )
     ap.add_argument("--host", default="192.168.0.201")
     ap.add_argument("--update-port", type=int, default=8082)
     ap.add_argument("--status-port", type=int, default=8080)
+    ap.add_argument("--editor-port", type=int, default=80,
+                    help="HTTP port serving /picoscript for post-boot acceptance")
     ap.add_argument("--reboot-port", type=int, default=8081)
     ap.add_argument("--chunk-size", type=int, default=4096)
     ap.add_argument("--log-every", type=int, default=16)
@@ -174,6 +259,9 @@ def main() -> int:
                     help="seconds to sleep after each chunk (rarely needed now that chunks are "
                          "RAM-staged on the board and no longer block core0 on SD writes)")
     ap.add_argument("--reboot", action="store_true", help="Flash + reboot into the new image after upload.")
+    ap.add_argument("--expected-version",
+                    help="required with --reboot; exact /api/status version expected "
+                         "after boot (for example v20260909.115725)")
     ap.add_argument("--chunked", action="store_true",
                     help="use the legacy per-chunk protocol instead of the single-connection stream")
     ap.add_argument("--max-retries", type=int, default=40,
@@ -182,10 +270,14 @@ def main() -> int:
                     help="seconds to wait for the board's NIC to self-recover before resuming")
     args = ap.parse_args()
 
+    if args.reboot and not args.expected_version:
+        ap.error("--reboot requires --expected-version so rollback/wrong-image boots fail")
     image = args.image.read_bytes()
+    try:
+        validate_raw_slot_image(image, args.image)
+    except ValueError as exc:
+        raise SystemExit(f"[ota] refusing image: {exc}") from exc
     total = len(image)
-    if total == 0:
-        raise SystemExit("image is empty")
     if args.chunk_size <= 0 or args.chunk_size % 512 != 0:
         raise SystemExit("--chunk-size must be a positive multiple of 512")
 
@@ -196,19 +288,11 @@ def main() -> int:
         if not args.reboot:
             print("[ota] streamed (no reboot requested); call writeandreboot or pass --reboot")
             return 0
-        print("[ota] waiting for board to reboot into the new image...")
+        print(f"[ota] waiting for candidate {args.expected_version}...")
         time.sleep(8)
-        for _ in range(40):
-            try:
-                st, body = request(args.host, args.status_port, "GET", "/api/status", timeout=4)
-                if st == 200:
-                    print(f"[ota] board online: {body[:160]}")
-                    return 0
-            except Exception:
-                pass
-            time.sleep(4)
-        print("[ota] board did not respond after reboot within ~3min")
-        return 1
+        return 0 if wait_for_expected_version(args.host, args.status_port,
+                                              args.expected_version, 40, 4,
+                                              args.editor_port) else 1
 
     log_seq = fetch_logs(args.host, args.status_port, 0, args.timeout)
     begin = request_json(
@@ -293,19 +377,11 @@ def main() -> int:
             print(f"[ota] writeandreboot acked commits={wr.get('commits')}")
         except Exception as exc:
             print(f"[ota] writeandreboot connection dropped (board rebooting): {exc}")
-        print("[ota] waiting for board to reboot into the new image...")
+        print(f"[ota] waiting for candidate {args.expected_version}...")
         time.sleep(8)
-        for _ in range(30):
-            try:
-                st, body = request(args.host, args.status_port, "GET", "/api/status", timeout=4)
-                if st == 200:
-                    print(f"[ota] board is back online: {body[:160]}")
-                    return 0
-            except Exception:
-                pass
-            time.sleep(4)
-        print("[ota] board did not respond after reboot within ~2min")
-        return 1
+        return 0 if wait_for_expected_version(args.host, args.status_port,
+                                              args.expected_version, 30, 4,
+                                              args.editor_port) else 1
 
     commit = request_json(
         args.host,

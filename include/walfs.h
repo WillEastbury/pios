@@ -11,6 +11,7 @@
 
 #pragma once
 #include "types.h"
+#include "storage_layout.h"
 
 /* Superblock magic */
 #define WALFS_MAGIC         0x57414C46  /* 'WALF' */
@@ -83,11 +84,16 @@
 #define PIOS_BOOTCTRL_OFFSET            0x380000U  /* moved: was 0x200000 */
 #define PIOS_BOOT_SLOT_B_OFFSET         0x400000U  /* moved: was 0x300000 */
 #define PIOS_BOOTCTRL_MAGIC             0x50424330U  /* 'PBC0' */
-#define PIOS_BOOTCTRL_VERSION           1U
+#define PIOS_BOOTCTRL_VERSION_V1        1U
+#define PIOS_BOOTCTRL_VERSION           2U
 #define PIOS_BOOTCTRL_SLOT_A            0U
 #define PIOS_BOOTCTRL_SLOT_B            1U
+#define PIOS_BOOTCTRL_SLOT_O            2U
 #define PIOS_BOOTCTRL_SLOT_NONE         0xFFFFFFFFU
 #define PIOS_BOOTCTRL_TRIES_DEFAULT     1U
+#define PIOS_BOOTCTRL_OVERRIDE_NONE     0U
+#define PIOS_BOOTCTRL_OVERRIDE_O        1U
+#define PIOS_BOOTCTRL_OVERRIDE_TRIES_DEFAULT 1U
 #define PIOS_BOOTCTRL_MAGIC_OFF         0U
 #define PIOS_BOOTCTRL_VERSION_OFF       4U
 #define PIOS_BOOTCTRL_ACTIVE_SLOT_OFF   8U
@@ -96,7 +102,12 @@
 #define PIOS_BOOTCTRL_LAST_BOOT_OFF     20U
 #define PIOS_BOOTCTRL_GOOD_MASK_OFF     24U
 #define PIOS_BOOTCTRL_GENERATION_OFF    28U
-#define PIOS_BOOTCTRL_CHECKSUM_OFF      32U
+#define PIOS_BOOTCTRL_OVERRIDE_MODE_OFF 32U
+#define PIOS_BOOTCTRL_OVERRIDE_TRIES_OFF 36U
+#define PIOS_BOOTCTRL_OVERRIDE_PACKAGE_ID_OFF 40U
+#define PIOS_BOOTCTRL_V1_CHECKSUM_OFF   32U
+#define PIOS_BOOTCTRL_V2_CHECKSUM_OFF   48U
+#define PIOS_BOOTCTRL_CHECKSUM_OFF      PIOS_BOOTCTRL_V2_CHECKSUM_OFF
 #define PIOS_TCPIP_STACK_OFFSET         0x200000U
 #define PIOS_TCPIP_STACK_BYTES          0x0C8000U
 #define PIOS_FIREWALL_CFG_OFFSET        0x2C8000U
@@ -218,6 +229,9 @@ struct walfs_status_snapshot {
     bool legacy_present;
     bool root_ok;
     bool super_ok;
+    bool exchange_present;
+    u8 storage_layout_kind;
+    u8 _layout_pad[2];
     u32 partition_lba;
     u32 base_lba;
     u32 partition_blocks;
@@ -231,7 +245,7 @@ struct walfs_status_snapshot {
 
 /* ---- API ---- */
 
-/* Init/format filesystem on SD card. If not formatted, creates one. */
+/* Mount filesystem on validated p2. Blank media requires explicit format. */
 bool walfs_init(void);
 
 /* Create a file. Returns inode_id or 0 on error. */

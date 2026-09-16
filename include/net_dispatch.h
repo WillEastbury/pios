@@ -15,6 +15,8 @@
  * All queues are core-0-local SPSC queues with explicit release/acquire
  * publication.  The byte storage belongs to a slot until its consuming stage
  * advances the corresponding tail; no raw caller buffer crosses a stage.
+ * Timer/reactor publications serialize with local IRQ masking. AIRQs are
+ * coalesced doorbells; a failed wake never discards its queued descriptor.
  */
 
 #define NET_DISPATCH_HINT_CAPACITY 8U
@@ -64,6 +66,10 @@ struct net_dispatch_diag {
     u32 tx_published;
     u32 tx_dropped;
     u32 tx_handled;
+    u32 rx_backpressure;
+    u32 rx_resumed;
+    u32 wake_retries;
+    u32 transport_coalesced;
 } ALIGNED(64);
 
 void net_dispatch_diag_snapshot(struct net_dispatch_diag *out);

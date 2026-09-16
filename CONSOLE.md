@@ -321,7 +321,15 @@ dma status
 dma selftest
 ```
 
-On BCM2712, PIOS uses the `dma32` controller with physical low-RAM DMA addresses, not the old `0xC0000000` legacy alias. The working memcpy path uses the 32-byte control-block format with shifted CB address mode; startup keeps the NEON fallback disabled only after the DMA selftest passes.
+BCM2712 `dma32` uses legacy-register LITE channels 0/2/4/5, not the DMA40
+register map. Control-block addresses are always `PA >> 5`; direct/raw mode
+guessing is removed. Each descriptor is limited to 65,532 bytes. Boot enables
+hardware only after real 16 KiB copy and zero-fill proofs. `hw_copies` and
+`hw_zeroes` count hardware completions; saved error registers survive reset.
+`channel_mask` is the DT availability mask, not a read of undocumented `+0xff0`.
+Core 0 owns the channels; other cores and spans outside the current low-1-GiB
+convenience-copy window use NEON. A hardware failure is reported, not hidden by
+an immediate CPU retry.
 
 ## Kernel TLS diagnostics
 
