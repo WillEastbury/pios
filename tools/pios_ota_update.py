@@ -165,6 +165,7 @@ def request(host: str, port: int, method: str, path: str, body: bytes = b"", tim
         header_done = False
         body_start = 0
         saw_body = False
+        content_length: int | None = None
         while True:
             try:
                 chunk = sock.recv(4096)
@@ -179,11 +180,20 @@ def request(host: str, port: int, method: str, path: str, body: bytes = b"", tim
                     continue
                 header_done = True
                 body_start = marker + 4
+                for line in bytes(data[:marker]).split(b"\r\n")[1:]:
+                    name, separator, value = line.partition(b":")
+                    if separator and name.lower() == b"content-length":
+                        content_length = int(value.strip())
+                        if content_length < 0:
+                            raise RuntimeError("negative HTTP Content-Length")
             response_body = bytes(data[body_start:])
+            if content_length is not None and len(response_body) >= content_length:
+                break
             if response_body and not saw_body:
                 saw_body = True
-                sock.settimeout(min(timeout, 0.25))
-            if response_body.startswith(b"{") and response_body.endswith(b"\n"):
+                if content_length is None and response_body.startswith(b"PIOS log-stream"):
+                    sock.settimeout(min(timeout, 0.25))
+            if content_length is None and response_body.startswith(b"{") and response_body.endswith(b"\n"):
                 break
             if response_body.startswith(b"PIOS log-stream") and len(response_body) > 512:
                 break
@@ -192,10 +202,18 @@ def request(host: str, port: int, method: str, path: str, body: bytes = b"", tim
     marker = raw.find(b"\r\n\r\n")
     if marker < 0:
         raise RuntimeError(f"incomplete HTTP response from {port}{path}: {raw[:120]!r}")
+    body_bytes = raw[marker + 4:]
+    if content_length is not None:
+        if len(body_bytes) < content_length:
+            raise RuntimeError(
+                f"short HTTP body from {port}{path}: "
+                f"{len(body_bytes)}/{content_length} bytes"
+            )
+        body_bytes = body_bytes[:content_length]
     status_line = raw.split(b"\r\n", 1)[0].decode("ascii", "replace")
     parts = status_line.split()
     status = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
-    return status, raw[marker + 4 :].decode("utf-8", "replace")
+    return status, body_bytes.decode("utf-8", "replace")
 
 
 def request_json(host: str, port: int, method: str, path: str, body: bytes = b"", timeout: float = 5.0) -> dict:
@@ -245,7 +263,10 @@ def main() -> int:
     )
     ap.add_argument("--host", default="192.168.0.201")
     ap.add_argument("--update-port", type=int, default=8082)
-    ap.add_argument("--status-port", type=int, default=8080)
+    ap.add_argument("--status-port", type=int, default=80,
+                    help="complete /api/status endpoint for candidate verification")
+    ap.add_argument("--log-port", type=int, default=8080,
+                    help="admin log-stream endpoint, independent of status verification")
     ap.add_argument("--editor-port", type=int, default=80,
                     help="HTTP port serving /picoscript for post-boot acceptance")
     ap.add_argument("--reboot-port", type=int, default=8081)
@@ -294,7 +315,7 @@ def main() -> int:
                                               args.expected_version, 40, 4,
                                               args.editor_port) else 1
 
-    log_seq = fetch_logs(args.host, args.status_port, 0, args.timeout)
+    log_seq = fetch_logs(args.host, args.log_port, 0, args.timeout)
     begin = request_json(
         args.host,
         args.update_port,
@@ -349,7 +370,7 @@ def main() -> int:
         chunk_index = (offset + args.chunk_size - 1) // args.chunk_size
         if offset == total or (args.log_every > 0 and (chunk_index % args.log_every) == 0):
             print(f"[ota] {offset}/{total}")
-            log_seq = fetch_logs(args.host, args.status_port, log_seq, args.timeout)
+            log_seq = fetch_logs(args.host, args.log_port, log_seq, args.timeout)
         if args.delay > 0.0 and offset < total:
             time.sleep(args.delay)
 
@@ -391,7 +412,7 @@ def main() -> int:
         timeout=args.commit_timeout,
     )
     print(f"[ota] committed received={commit.get('received')} commits={commit.get('commits')}")
-    log_seq = fetch_logs(args.host, args.status_port, log_seq, args.timeout)
+    log_seq = fetch_logs(args.host, args.log_port, log_seq, args.timeout)
     return 0
 
 

@@ -42,6 +42,26 @@ MAC, so stage2 may auto-init Wi-Fi as the only path (ADR-041). MACB, GENET, and
 WiFi ingress are IRQ → FIFO (ADR-044); only QEMU virtio-net still uses a paced
 transport indication. See [`platforms.md`](platforms.md) and ADR-043.
 
+The WiFi transport handler must drain firmware control/events and EAPOL while
+the radio is initialized but the IP interface is still inactive. The
+`nic_iface_active()` gate applies only to ordinary Ethernet ingress: applying
+it before `cyw43_poll()` deadlocks authorization against activation.
+
+SDHCI Card Interrupt status is read-only, not W1C. Its top half snapshots the
+cause and masks both status and signal enables; the software transport
+completion re-arms both. Masking only the signal enable leaves a stale card
+status asserted and creates an empty-FIFO interrupt storm.
+
+The SDHCI response type is a two-bit field, not a flag: only R1b (`3 << 16`)
+waits for busy release. Testing it with a nonzero bitwise AND also matches R5
+(`2 << 16`), making every CMD53 spin on DAT_INHIBIT before its FIFO is serviced.
+Busy-wait expiry must not underflow and masquerade as success.
+
+WPA2 installs Broadcom's 164-byte `wsec_key` with a 32-byte key-data field.
+The host stays JOINING until both correlated PTK/GTK firmware responses
+succeed; an error or deadline expires the attempt without activation.
+Maintenance checks deadlines only and never polls the SDIO transport.
+
 Core 0 owns all of this. Other cores reach it through FIFO messages and capsule
 bridges, never by touching NIC, route or TCP state directly.
 
@@ -114,6 +134,11 @@ Checksum trust is **per backend and per packet**, never assumed. MACB derives it
 from the descriptor checksum status and trusts it only when the checked mask
 matches the expected L4 value. virtio-net and WiFi report
 `checksum_trusted = false`.
+
+The `nic_ops.recv` length is output-only and its destination has
+`ETH_FRAME_MAX` capacity. The WiFi adapter explicitly passes that capacity to
+the CYW bounded-span receive API; passing the initial zero length truncates
+every received Ethernet frame to zero bytes.
 
 `nic_init_wifi()` is `nic_load("wifi-cyw43455", NIC_IFACE_WIFI)`.
 `nic_activate_wifi_loaded()` marks the WiFi iface active after association

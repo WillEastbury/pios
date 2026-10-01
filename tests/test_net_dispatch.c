@@ -3,6 +3,7 @@
 #include "net_dispatch.h"
 #include "net.h"
 #include "airq.h"
+#include "platform.h"
 
 static u32 remaining[3], received[3], completed[3], receive_calls;
 static u32 services, sent, failures;
@@ -13,10 +14,17 @@ static u32 service_depth, max_service_depth;
     printf("FAIL line %u: %s\n", (unsigned)__LINE__, #c); failures++; \
 } } while (0)
 
+static bool wifi_active, wifi_ready;
+static u32 wifi_polls;
+
 bool nic_iface_active(nic_iface_t iface)
 {
-    return iface == NIC_IFACE_WIRED || iface == NIC_IFACE_WIFI;
+    return iface == NIC_IFACE_WIRED ||
+           (iface == NIC_IFACE_WIFI && wifi_active);
 }
+
+bool cyw43_runtime_ready(void) { return wifi_ready; }
+void cyw43_poll(void) { wifi_polls++; }
 
 bool net_ingress_receive(nic_iface_t iface, u8 *frame, u32 cap,
                          u32 *len, bool *trusted)
@@ -112,6 +120,9 @@ static void reset(void)
     services = sent = receive_calls = 0;
     reject_mac = reject_ip = invalid_frame = empty_frame = reenter_service = false;
     service_depth = max_service_depth = 0;
+    wifi_active = true;
+    wifi_ready = false;
+    wifi_polls = 0;
     net_dispatch_enable();
 }
 
@@ -125,6 +136,24 @@ static void drain(void)
 
 int main(void)
 {
+#if PIOS_HAS_WIFI_SDIO
+    reset();
+    wifi_active = false;
+    wifi_ready = true;
+    remaining[NIC_IFACE_WIFI] = 4;
+    CHECK(net_dispatch_publish_transport(NIC_IFACE_WIFI, NET_DISPATCH_CAUSE_IRQ));
+    drain();
+    CHECK(wifi_polls == 1);
+    CHECK(receive_calls == 0 && remaining[NIC_IFACE_WIFI] == 4);
+    CHECK(completed[NIC_IFACE_WIFI] == 0);
+    CHECK(net_dispatch_publish_service());
+    drain();
+    CHECK(wifi_polls == 1); /* No protocol polling from a timer/service pass. */
+    wifi_ready = false;
+    CHECK(net_dispatch_publish_transport(NIC_IFACE_WIFI, NET_DISPATCH_CAUSE_IRQ));
+    drain();
+    CHECK(wifi_polls == 1);
+#endif
     reset();
     remaining[NIC_IFACE_WIRED] = 96;
     CHECK(net_dispatch_publish_transport(NIC_IFACE_WIRED, NET_DISPATCH_CAUSE_IRQ));

@@ -61,6 +61,16 @@ bool usb_bulk_msg(struct usb_device *dev, u8 ep_addr,
     return xhci_bulk_transfer(dev->slot, ep_addr, data, len, actual);
 }
 
+bool usb_interrupt_submit(struct usb_device *dev, u8 ep_addr,
+                          void *data, u32 len) {
+    return xhci_interrupt_submit(dev->slot, ep_addr, data, len);
+}
+
+bool usb_interrupt_poll(struct usb_device *dev, u32 *actual, bool *complete) {
+    (void)dev;
+    return xhci_interrupt_poll(actual, complete);
+}
+
 struct usb_device *usb_get_device(void) {
     return device_valid ? &the_device : NULL;
 }

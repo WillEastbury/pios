@@ -72,6 +72,7 @@
 #define WLC_GET_RADIO           37
 #define WLC_SET_RADIO           38
 #define WLC_DISASSOC            52
+#define WLC_SET_COUNTRY         84
 #define WLC_SET_PASSIVE_SCAN    49
 #define WLC_SCAN                50
 #define WLC_SCAN_RESULTS        51
@@ -294,6 +295,8 @@ bool cyw43_preload_blobs(void);
 
 /* Phase 3: Runtime — called from poll loop */
 void cyw43_poll(void);
+/* Core-0 maintenance: deadlines only, no SDIO or protocol publication. */
+void cyw43_check_timeouts(void);
 
 /* Phase 4: FullMAC control */
 bool cyw43_scan_start(void);

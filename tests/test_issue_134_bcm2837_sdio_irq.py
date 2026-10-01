@@ -52,7 +52,7 @@ assert "disable_off" in disable
 assert "mmio_read(ARMCTRL" not in enable + disable
 
 top = body_after(sdio, "static void sdio_gic_irq_handler(void)\n")
-assert top.index("sdio_card_irq_mask();") < top.index("sr16(REG_INTERRUPT)")
+assert top.index("sr16(REG_INTERRUPT)") < top.index("sdio_card_irq_mask();")
 assert top.index("sr16(REG_INTERRUPT)") < top.index("sdio_card_irq_ack();")
 assert "if (!airq_post_from(CORE_NET, AIRQ_SRC_WIFI" in top
 assert "sdio_irq_diag.airq_post_failed++;" in top

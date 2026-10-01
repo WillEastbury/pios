@@ -250,10 +250,12 @@ static bool sdio_send_cmd(u32 cmd, u32 arg, u32 *resp)
     }
 
     /* For R1b (busy) responses, wait for DAT line to release */
-    if (cmd & RSP_48_BUSY) {
+    if ((cmd & (3U << 16)) == RSP_48_BUSY) {
         u32 busy_timeout = 1000000;
-        while ((sr(REG_STATUS) & SR_DAT_INHIBIT) && busy_timeout--)
+        while (busy_timeout != 0U && (sr(REG_STATUS) & SR_DAT_INHIBIT)) {
+            busy_timeout--;
             delay_cycles(10);
+        }
         if (!busy_timeout) {
             uart_puts("[sdio] busy timeout\n");
             return false;
@@ -1446,14 +1448,13 @@ bool sdio_card_irq_edge(void)
     return edge;
 }
 
-/* Acknowledge the latched card-interrupt status. SDHCI treats this bit as
- * level-sensitive against DAT1, so if the card is still asserting it will come
- * straight back -- which is the correct signal to keep draining. Without the
- * ack a single stale assertion pins the RX backoff at zero forever. */
+/* Card Interrupt is read-only, not W1C. Disable its status latch until the
+ * bottom half drains the card and re-arms both status and signal enables. */
 void sdio_card_irq_ack(void)
 {
 #if PIOS_HAS_WIFI_SDIO
-    sw16(REG_INTERRUPT, (u16)INT_CARD);
+    u16 status_enable = sr16(REG_IRPT_MASK);
+    sw16(REG_IRPT_MASK, (u16)(status_enable & ~(u16)INT_CARD));
 #endif
 }
 
@@ -1462,6 +1463,7 @@ void sdio_card_irq_mask(void)
 #if PIOS_HAS_WIFI_SDIO
     u16 signal = sr16(REG_IRPT_EN);
     sw16(REG_IRPT_EN, (u16)(signal & ~(u16)INT_CARD));
+    sdio_card_irq_ack();
 #if !PIOS_HAS_GIC && PIOS_WIFI_SDIO_IRQ != 0
     /* Keep ARMCTRL disabled until AIRQ's controlled drain re-arms us. */
     gic_disable_irq(PIOS_WIFI_SDIO_IRQ);
@@ -1472,6 +1474,8 @@ void sdio_card_irq_mask(void)
 static void sdio_card_irq_host_unmask(void)
 {
 #if PIOS_HAS_WIFI_SDIO
+    u16 status_enable = sr16(REG_IRPT_MASK);
+    sw16(REG_IRPT_MASK, (u16)(status_enable | INT_CARD));
     u16 signal = sr16(REG_IRPT_EN);
     sw16(REG_IRPT_EN, (u16)(signal | INT_CARD));
 #endif
@@ -1489,10 +1493,10 @@ void sdio_card_irq_unmask(void)
 static void sdio_gic_irq_handler(void)
 {
     /* Historical name retained for GIC callers. The legacy path is likewise a
-     * top half only: mask, record/W1C, AIRQ-publish, and return. */
+     * top half only: snapshot, mask, AIRQ-publish, and return. */
+    u16 status = sr16(REG_INTERRUPT);
     sdio_card_irq_mask();
 #if !PIOS_HAS_GIC
-    u16 status = sr16(REG_INTERRUPT);
     sdio_irq_diag.last_status = status;
     if (status & INT_CARD) {
         sdio_card_irq_latched = true;
@@ -1505,7 +1509,7 @@ static void sdio_gic_irq_handler(void)
         return;
     }
 #else
-    if (sdio_card_irq_pending()) {
+    if (status & INT_CARD) {
         sdio_card_irq_latched = true;
         sdio_card_irq_ack();
     }
@@ -1593,14 +1597,14 @@ void sdio_irq_snapshot(u32 *status, u32 *signal_enable, u32 *mask,
     if (signal_enable) *signal_enable = 0U;
     if (mask) *mask = 0U;
 #endif
-#if PIOS_HAS_WIFI_SDIO2
+#if PIOS_HAS_WIFI_SDIO && PIOS_HAS_GIC
     u64 gicd = gic_runtime_gicd_base();
     if (gic_enable)
-        *gic_enable = mmio_read(gicd + 0x100U + (274U / 32U) * 4U);
+        *gic_enable = mmio_read(gicd + 0x100U + (PIOS_WIFI_SDIO_IRQ / 32U) * 4U);
     if (gic_pending)
-        *gic_pending = mmio_read(gicd + 0x200U + (274U / 32U) * 4U);
+        *gic_pending = mmio_read(gicd + 0x200U + (PIOS_WIFI_SDIO_IRQ / 32U) * 4U);
     if (gic_target)
-        *gic_target = mmio_read(gicd + 0x800U + (274U / 4U) * 4U);
+        *gic_target = mmio_read(gicd + 0x800U + (PIOS_WIFI_SDIO_IRQ / 4U) * 4U);
 #else
     if (gic_enable) *gic_enable = 0U;
     if (gic_pending) *gic_pending = 0U;

@@ -83,7 +83,10 @@ def main() -> int:
     fixed_target = len(bssid) == 12 and chanspec != 0
     join_bssid = bssid
     join_chanspec = chanspec
-    print(terminal_command(host, "wifi init", args.timeout))
+    result = terminal_command(host, "wifi init", args.timeout)
+    print(result)
+    if result != "WiFi init OK":
+        return 1
     if not args.no_scan:
         print(terminal_command(host, "wifi scan", args.timeout))
         deadline = time.monotonic() + args.timeout
@@ -102,9 +105,6 @@ def main() -> int:
                 break
         else:
             raise SystemExit(f"SSID {ssid!r} not found before scan timeout")
-        # Reinitialize after scanning: this refreshes the SDPCM control window
-        # before the targeted join while preserving the completed scan cache.
-        print(terminal_command(host, "wifi init", args.timeout))
 
     try:
         if mode == "wpa3":
@@ -163,7 +163,7 @@ def main() -> int:
     if activate:
         result = terminal_command(host, "wifi activate", args.timeout)
         print(result)
-        if "WiFi activate OK" not in result:
+        if not result.startswith("WiFi active at "):
             return 1
     return 0
 

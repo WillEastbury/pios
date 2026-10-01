@@ -425,14 +425,15 @@ void net_dispatch_handle_transport(void)
         return;
     }
     dispatch_diag.transport_handled++;
+#if PIOS_HAS_WIFI_SDIO
+    /* Association/EAPOL must run before the IP interface can be activated. */
+    if (hint.iface == NIC_IFACE_WIFI && cyw43_runtime_ready())
+        cyw43_poll();
+#endif
     if (!nic_iface_active((nic_iface_t)hint.iface)) {
         stage_end(AIRQ_SRC_NET_TRANSPORT);
         return;
     }
-#if PIOS_HAS_WIFI_SDIO
-    if (hint.iface == NIC_IFACE_WIFI && cyw43_runtime_ready())
-        cyw43_poll();
-#endif
     u32 attempts = 0U;
     bool recheck = true;
     while (attempts < NET_DISPATCH_TRANSPORT_BURST) {

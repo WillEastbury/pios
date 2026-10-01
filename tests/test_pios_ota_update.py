@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+from unittest.mock import patch
 
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -62,3 +63,45 @@ finally:
     ota.time.sleep = original_sleep
 
 print("pios OTA updater: raw-image, candidate-version, and editor gates passed")
+
+
+class FragmentedSocket:
+    def __init__(self, chunks):
+        self.chunks = iter(chunks)
+        self.timeout = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def sendall(self, _):
+        pass
+
+    def recv(self, _):
+        if self.timeout < 1:
+            raise TimeoutError("response fragment takes more than 250 ms")
+        return next(self.chunks, b"")
+
+
+body = b'{"ok":true,"version":"candidate"}\n'
+header = b"HTTP/1.0 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n"
+with patch.object(ota.socket, "create_connection", return_value=FragmentedSocket(
+        [header + body[:10], body[10:]])):
+    assert ota.request("unused", 8080, "GET", "/api/status") == (200, body.decode())
+with patch.object(ota.socket, "create_connection", return_value=FragmentedSocket(
+        [b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n" + body[:10], body[10:]])):
+    assert ota.request("unused", 8080, "GET", "/api/status") == (200, body.decode())
+with patch.object(ota.socket, "create_connection", return_value=FragmentedSocket(
+        [header + body[:10]])):
+    try:
+        ota.request("unused", 8080, "GET", "/api/status")
+    except RuntimeError as exc:
+        assert "short HTTP body" in str(exc)
+    else:
+        raise AssertionError("truncated status body accepted")
+print("pios OTA updater: delayed fragments and explicit short-body rejection passed")

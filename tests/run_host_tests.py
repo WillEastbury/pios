@@ -269,6 +269,7 @@ TESTS_MANIFEST = {
     # deliberately test-only fixed persistence model. No live storage code.
     "test_nvme_block_provider.c": ["src/nvme_block_provider.c"],
     "test_net_dispatch.c": ["src/net_dispatch.c", "src/airq.c"],
+    "test_wifi_nic.c": ["src/wifi_nic.c"],
     "test_nic_receive.c": ["src/nic.c"],
     "test_tcp_pending.c": ["src/tcp.c"],
     "test_dma_logic.c": ["src/dma_logic.c"],
@@ -278,7 +279,7 @@ TESTS_MANIFEST = {
 
 TEST_CFLAGS = {
     "test_fat32_exchange_core.c": ["-DFAT32_EXCHANGE_ENABLE_TEST_FORMAT"],
-    "test_net_dispatch.c": ["-DPIOS_PLATFORM=2"],
+    "test_net_dispatch.c": ["-DPIOS_PLATFORM=1"],
     "test_nic_receive.c": ["-DPIOS_PLATFORM=2"],
     "test_crypto_soft.c": ["-DPIOS_PLATFORM=6"],
     "test_dwc2_dma_arena.c": ["-DPIOS_PLATFORM=6"],
@@ -373,6 +374,9 @@ def main() -> int:
                  "test_issue_106_zero2w_wifi_activation.py",
                  "test_issue_131_zero2w_wl_on.py",
                  "test_wifi_preload_progress.py",
+                 "test_wifi_transport_contract.py",
+                 "test_cyw_key_contract.py",
+                 "test_pios_wifi_join.py",
                  "test_issue_100_sdio_50mhz_strap.py",
                  "test_sdio_clock_contract.py",
                  "test_issue_120_sdio1_high_speed_probe.py",

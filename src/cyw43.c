@@ -183,6 +183,7 @@ static struct cyw_scan_result scan_results[CYW_MAX_SCAN_RESULTS];
 static u32 scan_count;
 static bool scan_in_progress;
 static bool scan_results_pending;
+static bool scan_event_results_seen;
 static u64 scan_ready_ms;
 static bool scan_result_request_pending;
 static u16 scan_result_request_id;
@@ -216,6 +217,10 @@ struct cyw_wpa_host {
     bool enabled;
     bool m2_sent;
     bool keys_installed;
+    bool keys_pending;
+    u8 key_ack_mask;
+    u16 key_request_id[2];
+    u64 key_deadline_ms;
     u8 pmk[32];
     u8 snonce[32];
     u8 anonce[32];
@@ -226,6 +231,7 @@ struct cyw_wpa_host {
     u64 replay;
 };
 static struct cyw_wpa_host wpa_host;
+static u64 join_deadline_ms;
 
 static void wpa_attempt_reset(void)
 {
@@ -238,6 +244,7 @@ static bool cyw_join_fail(void)
 {
     cyw_link = CYW_LINK_AUTH_FAIL;
     join_kicks_remaining = 0U;
+    wpa_attempt_reset();
     return false;
 }
 
@@ -804,8 +811,11 @@ static void handle_event(const u8 *data, u32 len);
 static void bcdc_cache_response(const u8 *frame, u32 len);
 static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len,
                            bool wait_response);
+static bool bcdc_set_iovar_request(const char *name, const void *data,
+                                   u32 data_len, bool wait_response,
+                                   u16 *request_id);
+static bool bcdc_take_response(u16 id, u8 *data, u32 *data_len, u32 *status);
 static u32 load_le32(const u8 *p);
-static void store_le32(u8 *p, u32 value);
 static bool scan_store_bss(const u8 *bss, u32 record_len);
 
 struct wpa_sha1 {
@@ -1007,33 +1017,70 @@ static bool wpa_aes_unwrap(const u8 *wrapped,u32 wrapped_len,u8 *plain,u32 *plai
     return ok;
 }
 
+struct cyw_wsec_key {
+    u32 index, len;
+    u8 data[32];
+    u32 pad1[18];
+    u32 algo, flags;
+    u32 pad2[3];
+    u32 iv_initialized, pad3;
+    u32 rxiv_hi;
+    u16 rxiv_lo, rxiv_pad;
+    u32 pad4[2];
+    u8 peer[CYW_MAC_LEN];
+    u8 tail_pad[2];
+};
+_Static_assert(sizeof(struct cyw_wsec_key) == 164U &&
+               __builtin_offsetof(struct cyw_wsec_key, algo) == 112U &&
+               __builtin_offsetof(struct cyw_wsec_key, peer) == 156U,
+               "Broadcom wsec_key uses a 32-byte key field");
+
 static bool wpa_install_key(u32 index,const u8 *key,u32 key_len,
-                            bool pairwise,const u8 *peer,u64 rsc)
+                            bool pairwise,const u8 *peer,u64 rsc,
+                            u16 *request_id)
 {
     if (!key || key_len==0U || key_len>32U)
         return false;
-    /*
-     * brcmf_wsec_key_le has a 64-byte data field and 18 u32 pad words
-     * before algo. The previous 164-byte hand-built buffer placed algo 32
-     * bytes too early, so the firmware read zero/garbage for the key
-     * metadata after M3.
-     */
-    u8 params[196];
-    memset(params,0,sizeof(params));
-    store_le32(params + 0U, pairwise ? 0U : index);
-    store_le32(params + 4U, key_len);
-    memcpy(params + 8U, key, key_len);
-    store_le32(params + 144U, 4U);             /* CRYPTO_ALGO_AES_CCM */
-    store_le32(params + 148U, pairwise ? 0U : 2U); /* PRIMARY_KEY for GTK */
-    store_le32(params + 164U, 0U);             /* IV not initialized */
-    store_le32(params + 172U, (u32)(rsc >> 16));
-    params[176U] = (u8)rsc;
-    params[177U] = (u8)(rsc >> 8);
+    struct cyw_wsec_key params;
+    memset(&params,0,sizeof(params));
+    params.index = pairwise ? 0U : index;
+    params.len = key_len;
+    memcpy(params.data, key, key_len);
+    params.algo = 4U; /* CRYPTO_ALGO_AES_CCM */
+    params.flags = pairwise ? 0U : 2U; /* PRIMARY_KEY for GTK */
+    params.iv_initialized = pairwise ? 0U : 1U;
+    params.rxiv_hi = (u32)(rsc >> 16);
+    params.rxiv_lo = (u16)rsc;
     if (pairwise && peer)
-        memcpy(params + 188U, peer, CYW_MAC_LEN);
-    bool ok=bcdc_set_iovar("wsec_key",params,sizeof(params),false);
-    memset(params,0,sizeof(params));
+        memcpy(params.peer, peer, CYW_MAC_LEN);
+    bool ok=bcdc_set_iovar_request("wsec_key",&params,sizeof(params),false,
+                                   request_id);
+    memset(&params,0,sizeof(params));
     return ok;
+}
+
+static void wpa_keys_poll(void)
+{
+    if (!wpa_host.keys_pending)
+        return;
+    for (u32 i = 0; i < 2U; i++) {
+        u32 status = 0U;
+        if ((wpa_host.key_ack_mask & (1U << i)) == 0U &&
+            bcdc_take_response(wpa_host.key_request_id[i], NULL, NULL, &status)) {
+            if (status != 0U) {
+                uart_puts("[cyw] key rejected\n");
+                (void)cyw_join_fail();
+                return;
+            }
+            wpa_host.key_ack_mask |= (u8)(1U << i);
+        }
+    }
+    if (wpa_host.key_ack_mask == 3U) {
+        wpa_host.keys_pending = false;
+        wpa_host.keys_installed = true;
+        cyw_link = CYW_LINK_UP;
+        uart_puts("[cyw] keys acknowledged\n");
+    }
 }
 
 static bool wpa_find_gtk(const u8 *data,u32 len,u8 *gtk,u32 *gtk_len,u32 *key_id)
@@ -1092,6 +1139,8 @@ static bool wpa_handle_m3(const u8 *frame,u32 frame_len)
                ((u64)frame[29]<<8)|frame[30];
     if(replay<wpa_host.replay)
         return false;
+    if (wpa_host.keys_installed || wpa_host.keys_pending)
+        return replay == wpa_host.replay && wpa_send_m4(frame, frame_len);
     u32 kd_len=((u32)frame[key+93U]<<8)|frame[key+94U];
     if(key+95U+kd_len>frame_len)
         return false;
@@ -1106,15 +1155,24 @@ static bool wpa_handle_m3(const u8 *frame,u32 frame_len)
     if(!wpa_find_gtk(kd,kd_len,gtk,&gtk_len,&key_id))
         return false;
     u64 rsc=0ULL;
-    for(u32 i=0U;i<8U;i++) rsc=(rsc<<8)|frame[key+61U+i];
+    for(u32 i=0U;i<6U;i++) rsc |= (u64)frame[key+61U+i] << (i*8U);
     /* Send msg 4/4 before installing keys, as wpa_supplicant does: once the
      * pairwise key is installed the firmware encrypts outbound frames, and the
      * authenticator has not yet keyed the link for our M4. */
     bool ok=wpa_send_m4(frame,frame_len)&&
-            wpa_install_key(0U,wpa_host.ptk+32U,16U,true,wpa_host.ap_mac,0ULL)&&
-            wpa_install_key(key_id,gtk,gtk_len,false,NULL,rsc);
+            wpa_install_key(0U,wpa_host.ptk+32U,16U,true,wpa_host.ap_mac,0ULL,
+                             &wpa_host.key_request_id[0])&&
+            wpa_install_key(key_id,gtk,gtk_len,false,NULL,rsc,
+                             &wpa_host.key_request_id[1]);
     memset(plain,0,sizeof(plain));memset(gtk,0,sizeof(gtk));
-    if(ok){wpa_host.keys_installed=true;cyw_link=CYW_LINK_UP;}
+    if(ok){
+        wpa_host.replay = replay;
+        wpa_host.keys_pending = true;
+        wpa_host.key_deadline_ms = timer_monotonic_ms() + 5000ULL;
+        join_kicks_remaining = 0U;
+    } else {
+        (void)cyw_join_fail();
+    }
     return ok;
 }
 
@@ -1567,6 +1625,10 @@ static bool bcdc_get_cmd(u32 cmd, u8 *data, u32 data_len, u32 *resp_len);
 
 static bool bcdc_response_ignored(u16 id)
 {
+    if (wpa_host.keys_pending &&
+        (id == wpa_host.key_request_id[0] ||
+         id == wpa_host.key_request_id[1]))
+        return false;
     return bcdc_ignore_through != 0U &&
            (u16)(bcdc_ignore_through - id) < 0x8000U;
 }
@@ -1631,8 +1693,9 @@ static bool bcdc_take_response(u16 id, u8 *data, u32 *data_len, u32 *status)
     return false;
 }
 
-static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len,
-                           bool wait_response)
+static bool bcdc_set_iovar_request(const char *name, const void *data,
+                                   u32 data_len, bool wait_response,
+                                   u16 *request_id)
 {
     cyw_diag.bcdc_calls++;
     u32 name_len = pios_strlen(name) + 1;
@@ -1677,7 +1740,10 @@ static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len,
         return false;
     }
     if (!wait_response) {
-        bcdc_ignore_through = id;
+        if (request_id)
+            *request_id = id;
+        else
+            bcdc_ignore_through = id;
         return true;
     }
 
@@ -1722,6 +1788,12 @@ static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len,
      * response may trail subsequent requests by tens of seconds; scan/join
      * success is authoritatively reported by firmware events instead. */
     return true;
+}
+
+static bool bcdc_set_iovar(const char *name, const void *data, u32 data_len,
+                           bool wait_response)
+{
+    return bcdc_set_iovar_request(name, data, data_len, wait_response, NULL);
 }
 
 static bool bcdc_get_iovar(const char *name, u8 *resp, u32 *resp_len)
@@ -2016,8 +2088,9 @@ static void handle_event(const u8 *data, u32 len)
             const u32 bss = event_base + 84U;
             if (bss + 8U <= len) {
                 u32 record_len = load_le32(data + bss + 4U);
-                if (record_len <= len - bss)
-                    (void)scan_store_bss(data + bss, record_len);
+                if (record_len <= len - bss &&
+                    scan_store_bss(data + bss, record_len))
+                    scan_event_results_seen = true;
             }
         } else if (status == CYW_E_STATUS_SUCCESS) {
             scan_in_progress = false;
@@ -2039,14 +2112,6 @@ static u32 load_le32(const u8 *p)
 {
     return (u32)p[0] | ((u32)p[1] << 8) |
            ((u32)p[2] << 16) | ((u32)p[3] << 24);
-}
-
-static void store_le32(u8 *p, u32 value)
-{
-    p[0]=(u8)value;
-    p[1]=(u8)(value>>8);
-    p[2]=(u8)(value>>16);
-    p[3]=(u8)(value>>24);
 }
 
 static bool scan_store_bss(const u8 *bss, u32 record_len)
@@ -2255,6 +2320,12 @@ static void scan_bus_kick(void)
 static void scan_result_poll(void)
 {
     if (scan_result_request_pending) {
+        if (scan_event_results_seen) {
+            (void)bcdc_take_response(scan_result_request_id, NULL, NULL, NULL);
+            bcdc_ignore_through = scan_result_request_id;
+            scan_result_request_pending = false;
+            return;
+        }
         u32 len = sizeof(scan_result_buf);
         u32 status = 0U;
         if (bcdc_take_response(scan_result_request_id, scan_result_buf,
@@ -3214,7 +3285,7 @@ bool cyw43_load_firmware(void)
         uart_hex(clm_buf_len);
         uart_puts(" bytes)...\n");
 
-        static u8 ALIGNED(4) clm_chunk[1024 + 16];
+        static u8 ALIGNED(4) clm_chunk[384 + 12];
         u32 offset = 0;
         bool clm_ok = true;
 
@@ -3222,7 +3293,8 @@ bool cyw43_load_firmware(void)
             u32 chunk = clm_buf_len - offset;
             /* Keep BCDC+SDPCM below 512 bytes: multi-block F2 transfers are
              * not reliable on BCM2712 SDIO2 during bring-up. */
-            if (chunk > 1400U) chunk = 1400U;
+            if (chunk > sizeof(clm_chunk) - 12U)
+                chunk = sizeof(clm_chunk) - 12U;
 
             u16 flag = 0x1000U;
             if (offset == 0U) flag |= 0x0002U;
@@ -3258,6 +3330,24 @@ bool cyw43_load_firmware(void)
     } else {
         uart_puts("[cyw] no CLM\n");
     }
+
+    struct {
+        char country_abbrev[4];
+        u32 rev;
+        char ccode[4];
+    } country = {
+        .country_abbrev = { 'G', 'B', '\0', '\0' },
+        .rev = 0U,
+        .ccode = { 'G', 'B', '\0', '\0' },
+    };
+    _Static_assert(sizeof(country) == 12U,
+                   "Broadcom country request layout must remain stable");
+    if (!bcdc_set_cmd(WLC_SET_COUNTRY, &country, sizeof(country), false)) {
+        cyw_diag.last_error = 29U;
+        uart_puts("[cyw] country GB fail\n");
+        return false;
+    }
+    uart_puts("[cyw] country GB\n");
 
     /* Use a stable locally-administered address. Leaving cyw_mac zero makes
      * WiFi activation build ARP/Ethernet frames with an invalid source MAC if
@@ -3312,6 +3402,7 @@ void cyw43_poll(void)
                 capture_eapol(cyw_rx_buf, len);
             else {
                 (void)cyw_data_queue_push(cyw_rx_buf, len);
+                wpa_keys_poll();
                 /*
                  * net_dispatch owns regular Ethernet delivery. Do not keep
                  * draining SDPCM data here or a burst fills the bounded queue
@@ -3329,7 +3420,20 @@ void cyw43_poll(void)
             break;
         }
     }
+    wpa_keys_poll();
     scan_result_poll();
+}
+
+void cyw43_check_timeouts(void)
+{
+    if (cyw_link != CYW_LINK_JOINING)
+        return;
+    u64 now = timer_monotonic_ms();
+    if (now >= join_deadline_ms ||
+        (wpa_host.keys_pending && now >= wpa_host.key_deadline_ms)) {
+        uart_puts("[cyw] authorization timeout\n");
+        (void)cyw_join_fail();
+    }
 }
 
 static bool cyw43_radio_enable(void)
@@ -3390,6 +3494,7 @@ bool cyw43_scan_start(void)
     scan_count = 0;
     scan_in_progress = true;
     scan_results_pending = true;
+    scan_event_results_seen = false;
     /* Keep result retrieval inside the 15-second bounded bus-kick window so
      * the firmware still has opportunities to publish a credit/response. */
     scan_ready_ms = timer_monotonic_ms() + 10000ULL;
@@ -3729,6 +3834,7 @@ static bool cyw43_join_key(const char *ssid, u32 ssid_len,
     if (!cyw43_radio_enable())
         return false;
     cyw_link = CYW_LINK_JOINING;
+    join_deadline_ms = timer_monotonic_ms() + 30000ULL;
 
     static const u8 wpa2_ccmp_psk_rsn[] = {
         0x30U, 0x14U,

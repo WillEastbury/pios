@@ -254,11 +254,10 @@ wifi results
 wifi status
 wifi fwlog
 
-# Join using the ignored local config and a host-derived PMK.
+# Scan for the current BSSID/channel, then join using a host-derived PMK.
 python tools\pios_wifi_join.py `
   --config tools\wifi_config.local.json `
-  --timeout 75 `
-  --no-scan
+  --timeout 75
 ```
 
 Do not request activation while diagnosing association:
@@ -268,6 +267,33 @@ wifi activate
 ```
 
 is the final explicit step, not part of firmware initialization or join.
+
+For an operational connection, `pios_wifi_join.py --activate` waits for
+`link=2` to remain stable for ten seconds before requesting activation.
+Verify HTTP and ping on `.202` as well as continued wired access on `.201`;
+a firmware `link up` log alone is not WPA authorization or a traffic proof.
+Use `--no-scan` only with a currently verified BSSID/chanspec. `wifi init`
+is idempotent after NIC loading, not a radio reset or a credit-window reset.
+
+`wifi irq` reports the platform INTID (306 on Pi 5, not SPI number 274).
+Compare `sched status` idle/total tick deltas to measure interval CPU load;
+its `busy_permille` and the dashboard include activity since boot.
+CLM upload chunks are bounded by their actual buffer capacity and kept below
+one 512-byte SDPCM function-2 transfer including all headers.
+
+Pi 5 acceptance on `v20261001.205208`: current-scan-target WPA2 association,
+both firmware key acknowledgements, HTTP on `.202` and wired `.201`, WiFi
+ping at 3 ms, and connected-idle core-0 load of 2.00% over ten seconds.
+The fixes remove the pre-activation control gate, CLM buffer overflow,
+output-length/capacity mismatch, stale SDHCI card latch, erroneous R5 busy
+wait, and incorrect 196-byte key-install layout. Credentials remain in the
+ignored host config; wired-first boot and explicit join/activation are unchanged.
+
+OTA verification defaults to the complete `/api/status` endpoint on port 80;
+logs remain on port 8080 (`--log-port`). Some images truncate an HTTP/1.0
+status response on the admin listener, so that is not a reliable candidate
+version check. The updater reads declared body lengths and does not treat a
+250 ms gap between ordinary response fragments as end-of-body.
 
 ### WiFi state separation
 

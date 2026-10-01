@@ -71,6 +71,9 @@ bool usb_control_msg(struct usb_device *dev, u8 bmReq, u8 bReq,
                      u16 wVal, u16 wIdx, u16 wLen, void *data, u32 *actual);
 bool usb_bulk_msg(struct usb_device *dev, u8 ep_addr,
                   void *data, u32 len, u32 *actual);
+bool usb_interrupt_submit(struct usb_device *dev, u8 ep_addr,
+                          void *data, u32 len);
+bool usb_interrupt_poll(struct usb_device *dev, u32 *actual, bool *complete);
 
 /* Get the currently enumerated device (NULL if none) */
 struct usb_device *usb_get_device(void);

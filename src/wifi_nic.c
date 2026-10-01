@@ -81,7 +81,10 @@ bool wifi_nic_recv(u8 *frame, u32 *len)
 {
     if (!wifi_nic_initialized)
         return false;
-    bool ok = cyw43_recv_frame(frame, len);
+    /* nic_ops supplies ETH_FRAME_MAX storage and an output-only length. */
+    u32 capacity = ETH_FRAME_MAX;
+    bool ok = cyw43_recv_frame(frame, &capacity);
+    *len = ok ? capacity : 0U;
     if (ok)
         wifi_rx_bytes += *len;
     return ok;

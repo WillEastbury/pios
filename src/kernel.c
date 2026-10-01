@@ -4209,7 +4209,9 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, enable);
         http_append(out, &len, max, " mask=");
         http_append_hex32(out, &len, max, mask);
-        http_append(out, &len, max, " gic=274 enable=");
+        http_append(out, &len, max, " intid=");
+        http_append_u64(out, &len, max, PIOS_WIFI_SDIO_IRQ);
+        http_append(out, &len, max, " enable=");
         http_append_hex32(out, &len, max, gic_enable);
         http_append(out, &len, max, " pending=");
         http_append_hex32(out, &len, max, gic_pending);
@@ -24704,6 +24706,9 @@ NORETURN void core0_main(void) {
 
         if (flags & CORE0_IO_MAINT) {
             ksvc_run(ksvc_timer_id);
+#if PIOS_HAS_WIFI_SDIO
+            cyw43_check_timeouts();
+#endif
             /* Once we have run cleanly for a while, declare the boot healthy so
              * crash-loop protection re-arms for the next genuine fault. */
             if (!crash_boot_marked_healthy && ide_assets_boot_ready() &&
