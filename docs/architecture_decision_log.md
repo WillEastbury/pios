@@ -589,6 +589,28 @@ Acceleration` in red until a verified proof exists.
 **Rejected.** Treating pcie1 as an alias of pcie2. Mapping GPU LMEM first.
 Enabling pcie1 MSI before a handler exists.
 
+**2026-10-02 bring-up correction (owner approved).** Restore BCM2712's
+54 MHz XOSC PLL setup after bridge reset/SerDes wake and before PERST release,
+following Raspberry Pi Linux `brcm_pcie_munge_pll()` at commit
+`bba53a117a4a5c29da892962332ff1605990e17a`. Each MDIO transaction is capped at
+100 us; all seven programmed values must read back exactly. Set PHY_CTL15's
+PM clock period to `0x12` (54 MHz), preserving other fields. A failure holds
+PERST and reports a failed PHY stage, not a successful empty enumeration.
+Program both Link Capability and Link Control 2 to Gen2; use a 16-bit control
+write to leave the adjacent status untouched. Respect the 100 ms post-PERST
+configuration-access delay within the existing 200 ms training bound.
+Shared RESCAL, RP1, endpoint mappings, DMA and MSI authority are unchanged.
+The optional Linux Tperst-clock override is not enabled without evidence it
+is needed. The prior target-only Gen1 experiment did not prove a physical
+hardware defect.
+
+Live acceptance `v20261002.180500` subsequently reached Gen2 x1 and found
+the K2000 VGA/audio functions (`10DE:0FFE` / `10DE:0E1B`) through the same
+passive riser that failed before this correction. All PLL readbacks and
+PHY_CTL15=`0x4DBC0012` passed; endpoint Command bits MEM/MASTER stayed clear,
+BAR0 remained unmapped, and RC AER was clear. This establishes the old host
+initialization as a blocker without attributing the fault to new hardware.
+
 ---
 
 <a name="adr-046"></a>

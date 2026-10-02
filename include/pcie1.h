@@ -45,6 +45,7 @@ struct pcie1_status {
     bool present;          /* PIOS_HAS_PCIE1 compile-time */
     bool inited;
     bool link_up;
+    bool phy_ready;        /* 54 MHz PLL and PHY clock-period readback passed */
     u32 rc_status;
     u16 link_status;
     u32 link_speed;        /* 1=2.5GT, 2=5.0GT, 3=8.0GT */

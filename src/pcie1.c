@@ -4,7 +4,7 @@
  * Brings up the x1 FFC root port. Must never touch pcie2/RP1 registers,
  * the RP1 outbound window, or RP1 inbound BAR1 (MIP0 MSI).
  *
- * Init mirrors src/pcie.c's BCM2712 sequence with:
+ * BCM2712 init includes the Raspberry Pi Linux 54 MHz PHY sequence:
  *   - RC base 0x1000110000 (not 0x1000120000)
  *   - reset id 43 (pcie2 is 44)
  *   - 32 MiB Device ATU at 0x1B00000000 (BAR0 MMIO; not LMEM, not RP1)
@@ -52,6 +52,17 @@ _Static_assert((PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE) <= PIOS_PROC_ARENA_BA
 
 #define PCIE1_RC_BASE               PIOS_PCIE1_RC_BASE
 
+#define RC_DL_MDIO_ADDR             0x1100
+#define RC_DL_MDIO_WR_DATA          0x1104
+#define RC_DL_MDIO_RD_DATA          0x1108
+#define RC_PL_PHY_CTL_15            0x184C
+#define MDIO_READ                   (1U << 20)
+#define MDIO_DONE                   (1U << 31)
+#define MDIO_BLOCK_SELECT           0x1FU
+#define MDIO_POLL_US                10U
+#define MDIO_TIMEOUT_US             100U
+#define PHY_PM_CLK_PERIOD_MASK      0xFFU
+#define PHY_PM_CLK_PERIOD_54MHZ     0x12U
 #define MISC_MISC_CTRL              0x4008
 #define MISC_CPU_2_PCIE_WIN0_LO     0x400C
 #define MISC_CPU_2_PCIE_WIN0_HI     0x4010
@@ -165,6 +176,80 @@ static bool rc_alive(void)
     return id != 0U && id != 0xFFFFFFFFU;
 }
 
+static bool mdio_wait(u32 offset, bool done_set, u32 *value)
+{
+    for (u32 elapsed = 0U; elapsed <= MDIO_TIMEOUT_US;
+         elapsed += MDIO_POLL_US) {
+        u32 data = pr(offset);
+        if (data != 0xFFFFFFFFU && ((data & MDIO_DONE) != 0U) == done_set) {
+            *value = data & ~MDIO_DONE;
+            return true;
+        }
+        if (elapsed < MDIO_TIMEOUT_US)
+            timer_delay_us(MDIO_POLL_US);
+    }
+    uart_puts("[pcie1] MDIO timeout\n");
+    return false;
+}
+
+static bool mdio_read(u8 reg, u32 *value)
+{
+    pw(RC_DL_MDIO_ADDR, MDIO_READ | reg);
+    (void)pr(RC_DL_MDIO_ADDR);
+    return mdio_wait(RC_DL_MDIO_RD_DATA, true, value);
+}
+
+static bool mdio_write(u8 reg, u16 value)
+{
+    u32 result;
+    pw(RC_DL_MDIO_ADDR, reg);
+    (void)pr(RC_DL_MDIO_ADDR);
+    pw(RC_DL_MDIO_WR_DATA, MDIO_DONE | value);
+    return mdio_wait(RC_DL_MDIO_WR_DATA, false, &result);
+}
+
+static bool setup_refclk_54mhz(void)
+{
+    /* Raspberry Pi Linux brcm_pcie_munge_pll(): BCM2712's 54 MHz XOSC.
+     * Program only this RC's PHY, with PERST held and shared RESCAL untouched. */
+    static const u8 regs[] = {0x16, 0x17, 0x18, 0x19, 0x1B, 0x1C, 0x1E};
+    static const u16 values[] = {
+        0x50B9, 0xBDA1, 0x0094, 0x97B4, 0x5030, 0x5030, 0x0007
+    };
+    if (!mdio_write(MDIO_BLOCK_SELECT, 0x1600U))
+        return false;
+    for (u32 i = 0U; i < sizeof(regs); i++) {
+        u32 before, after;
+        if (!mdio_read(regs[i], &before) ||
+            !mdio_write(regs[i], values[i]) ||
+            !mdio_read(regs[i], &after))
+            return false;
+        uart_puts("[pcie1] PLL ");
+        uart_hex(regs[i]);
+        uart_puts(" ");
+        uart_hex(before);
+        uart_puts(" -> ");
+        uart_hex(after);
+        uart_puts("\n");
+        if (after != values[i]) {
+            uart_puts("[pcie1] PLL readback mismatch\n");
+            return false;
+        }
+    }
+    timer_delay_us(100U);
+    u32 phy = pr(RC_PL_PHY_CTL_15);
+    if (phy == 0xFFFFFFFFU)
+        return false;
+    phy = (phy & ~PHY_PM_CLK_PERIOD_MASK) | PHY_PM_CLK_PERIOD_54MHZ;
+    pw(RC_PL_PHY_CTL_15, phy);
+    dsb();
+    if (pr(RC_PL_PHY_CTL_15) != phy) {
+        uart_puts("[pcie1] PHY clock readback mismatch\n");
+        return false;
+    }
+    return true;
+}
+
 static void program_inbound_arena(void)
 {
     u32 tmp;
@@ -256,22 +341,31 @@ bool pcie1_dma_complete_from_device(void *ptr, u64 len)
     return true;
 }
 
-static void cap_set_gen2(void)
+static bool cap_set_gen2(void)
 {
     u32 cap = pr(PCI_REG_CAP_PTR) & 0xFFU;
-    for (u32 i = 0; i < 48U && cap >= 0x40U; i++) {
+    for (u32 i = 0; i < 48U && cap >= 0x40U && cap <= 0xFCU &&
+         (cap & 3U) == 0U; i++) {
         u32 hdr = pr(cap);
         if ((hdr & 0xFFU) == PCIE1_LINK_CAP_ID) {
-            /* Link Control 2: target link speed = 2 (5.0 GT/s, official x1). */
-            u32 lc2 = pr(cap + 0x30U);
+            if (cap > 0xCCU)
+                return false;
+            /* Match Linux: limit both advertised and requested link speed. */
+            u32 lcap = pr(cap + 0x0CU);
+            lcap = (lcap & ~0xFU) | 2U;
+            pw(cap + 0x0CU, lcap);
+            u16 lc2 = mmio_read16(PCIE1_RC_BASE + cap + 0x30U);
             lc2 = (lc2 & ~0xFU) | 2U;
-            pw(cap + 0x30U, lc2);
-            return;
+            mmio_write16(PCIE1_RC_BASE + cap + 0x30U, lc2);
+            dsb();
+            return (pr(cap + 0x0CU) & 0xFU) == 2U &&
+                   (mmio_read16(PCIE1_RC_BASE + cap + 0x30U) & 0xFU) == 2U;
         }
         cap = (hdr >> 8) & 0xFFU;
         if (cap == 0U)
-            return;
+            break;
     }
+    return false;
 }
 
 static u16 cap_link_status(void)
@@ -432,6 +526,8 @@ bool pcie1_init(void)
 
     g_inited = false;
     g_link_up = false;
+    g_snap = (struct pcie1_status){0};
+    pcie1_aer_offset_rc = 0U;
     g_fail = "init";
 
     /* RESCAL is shared with pcie2/RP1 and already ran in pcie_init().
@@ -460,6 +556,14 @@ bool pcie1_init(void)
     pw(HARD_DEBUG, tmp);
     dmb();
     timer_delay_ms(1);
+
+    if (!setup_refclk_54mhz()) {
+        g_inited = true;
+        publish_link("54MHz PHY setup failed");
+        uart_puts("[pcie1] PHY setup failed; PERST held\n");
+        return false;
+    }
+    g_snap.phy_ready = true;
 
     tmp = pr(MISC_MISC_CTRL);
     tmp |= MCTRL_SCB_ACCESS_EN;
@@ -495,14 +599,21 @@ bool pcie1_init(void)
     pw(RC_CFG_VENDOR_SPECIFIC_REG1, tmp);
     dmb();
 
-    cap_set_gen2();
+    if (!cap_set_gen2()) {
+        g_inited = true;
+        publish_link("Gen2 capability setup failed");
+        uart_puts("[pcie1] Gen2 setup failed; PERST held\n");
+        return false;
+    }
     dmb();
 
     dsb();
     perst_set(false);
     dsb();
-    /* #144: 200 ms deadline, 1 ms polls. Do not pet the watchdog. */
-    g_link_up = wait_link_ms(200);
+    /* CEM requires 100 ms after PERST release before configuration access.
+     * Keep the existing 200 ms total bound, without watchdog pets. */
+    timer_delay_ms(100U);
+    g_link_up = wait_link_ms(100U);
     if (!g_link_up) {
         g_inited = true;
         publish_snap("no link (dtparam=pciex1 + powered FFC riser?)");

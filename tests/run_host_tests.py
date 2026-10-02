@@ -332,6 +332,8 @@ def main() -> int:
             total_fail += 1
 
     for test in ("test_network_dispatch.py", "test_net_fifo_contract.py",
+                 "test_pcie1_dashboard.py",
+                 "test_pcie1_phy.py",
                  "test_udp_iface_contract.py", "test_tcp_syn_cookie_contract.py",
                  "test_tcp_generation_contract.py",
                  "test_el0_idle_contract.py",                  "test_bootstrap_fat_import.py",

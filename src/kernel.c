@@ -6424,6 +6424,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, p1.present ? 1U : 0U);
         http_append(out, &len, max, " inited=");
         http_append_u64(out, &len, max, p1.inited ? 1U : 0U);
+        http_append(out, &len, max, " phy_ready=");
+        http_append_u64(out, &len, max, p1.phy_ready ? 1U : 0U);
         http_append(out, &len, max, " link=");
         http_append_u64(out, &len, max, p1.link_up ? 1U : 0U);
         http_append(out, &len, max, " sts=");
@@ -22877,6 +22879,72 @@ static void dash_hw_row_state(u32 row, u32 c_dev, u32 c_state, u32 c_load,
     dash_put_trunc(caps, 44U);
 }
 
+static void dash_pcie1_append_text(char *buf, u32 max, u32 *used,
+                                   const char *text)
+{
+    if (!buf || !used || max == 0U)
+        return;
+    while (text && *text && *used + 1U < max)
+        buf[(*used)++] = *text++;
+    buf[*used] = '\0';
+}
+
+static void dash_pcie1_append_u32(char *buf, u32 max, u32 *used, u32 value)
+{
+    char digits[10];
+    u32 count = 0U;
+    if (!buf || !used || max == 0U)
+        return;
+    do {
+        digits[count++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while (value != 0U && count < sizeof(digits));
+    while (count != 0U && *used + 1U < max)
+        buf[(*used)++] = digits[--count];
+    buf[*used] = '\0';
+}
+
+static u32 dash_pcie1_summary(char *buf, u32 max,
+                              const struct pcie1_status *status)
+{
+    u32 used = 0U;
+    if (!buf || max == 0U)
+        return 0U;
+    buf[0] = '\0';
+    if (!status || !status->present) {
+        dash_pcie1_append_text(buf, max, &used, "PCIe1 not present");
+        return used;
+    }
+    if (!status->link_up) {
+        dash_pcie1_append_text(buf, max, &used,
+                               "No link; check pciex1 + powered HAT");
+        return used;
+    }
+    dash_pcie1_append_text(buf, max, &used, "Gen");
+    if (status->link_speed > 0U && status->link_speed <= 4U) {
+        if (used + 1U < max)
+            buf[used++] = (char)('0' + status->link_speed);
+    } else if (used + 1U < max) {
+        buf[used++] = '?';
+    }
+    buf[used] = '\0';
+    dash_pcie1_append_text(buf, max, &used, " x");
+    dash_pcie1_append_u32(buf, max, &used, status->link_width);
+    dash_pcie1_append_text(buf, max, &used, "; ");
+    if (status->ep_count == 0U) {
+        dash_pcie1_append_text(buf, max, &used, "no endpoints");
+        return used;
+    }
+    dash_pcie1_append_u32(buf, max, &used, status->ep_count);
+    dash_pcie1_append_text(buf, max, &used,
+                           status->ep_count == 1U ? " function" : " functions");
+    if (status->scan_truncated)
+        dash_pcie1_append_text(buf, max, &used, " (+more)");
+    if (status->b50_found)
+        dash_pcie1_append_text(buf, max, &used, "; B50");
+    return used;
+}
+
 static void dash_hw_row_u64_hex(u32 row, u32 c_dev, u32 c_active, u32 c_load,
                                 u32 c_ram, u32 c_caps, const char *dev,
                                 bool active, const char *prefix, u64 addr,
@@ -23306,41 +23374,14 @@ static void hdmi_dashboard_render(void)
         u32 p1col = !p1.present ? 0x00AAAAAAU :
                     (p1.link_up ? 0x0000FF80U : 0x00FF4040U);
         char p1caps[48];
-        const char *p1sum;
-        if (!p1.present) {
-            p1sum = "pcie1 is Pi 5 only";
-        } else if (!p1.link_up) {
-            p1sum = p1.fail_reason ? p1.fail_reason : "no FFC link";
-        } else {
-            u32 pn = 0;
-            const char *s = "FFC ";
-            while (*s && pn + 1U < sizeof(p1caps))
-                p1caps[pn++] = *s++;
-            if (p1.ep_count >= 10U && pn + 1U < sizeof(p1caps))
-                p1caps[pn++] = (char)('0' + (p1.ep_count / 10U));
-            if (pn + 1U < sizeof(p1caps))
-                p1caps[pn++] = (char)('0' + (p1.ep_count % 10U));
-            s = p1.ep_count == 1U ? " func" : " funcs";
-            while (*s && pn + 1U < sizeof(p1caps))
-                p1caps[pn++] = *s++;
-            if (p1.ep_count > PCIE1_DASH_MAX) {
-                s = " (+more)";
-                while (*s && pn + 1U < sizeof(p1caps))
-                    p1caps[pn++] = *s++;
-            }
-            s = "; any device/switch";
-            while (*s && pn + 1U < sizeof(p1caps))
-                p1caps[pn++] = *s++;
-            p1caps[pn] = 0;
-            p1sum = p1caps;
-        }
+        (void)dash_pcie1_summary(p1caps, sizeof(p1caps), &p1);
         dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
                           "PCIe1 FFC",
-                          !p1.present ? "N/A" : (p1.link_up ? "LINK" : "DOWN"),
+                          !p1.present ? "N/A" : (p1.link_up ? "LINK" : "NO LINK"),
                           p1col,
                           p1.present ? "RC 0x1000110000" : "not present",
                           p1.link_up ? "32M ATU" : "0",
-                          p1sum);
+                          p1caps);
         if (p1.link_up) {
             u32 shown = p1.ep_count;
             if (shown > PCIE1_DASH_MAX)

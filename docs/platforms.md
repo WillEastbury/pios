@@ -25,6 +25,12 @@ Traps: [`gotchas.md`](gotchas.md).
 Additional compile targets (not SD-booted Raspberry boards): UEFI, Hyper-V
 ARM/x64, Arm FVP A76+GICv2. Same kernel contracts; different backends.
 
+**Pi 5 FFC PCIe1** is disabled by firmware unless the boot FAT `config.txt`
+contains a Pi 5-scoped `[pi5]` section with `dtparam=pciex1=on`. The tracked
+root `config.txt` provides this setting; editing the repository copy does not
+change an already-booted card. Reboot after installing the updated file. Keep
+the default Gen2 link setting; do not force Gen3 during basic enumeration.
+
 ---
 
 ## Stage0 vs stage2
@@ -84,6 +90,31 @@ into one payload.
 | Framebuffer | VideoCore mailbox | VideoCore mailbox | VideoCore IV mailbox | ramfb via `PIOS_BOOTINFO` |
 | V3D 7.1 | yes | no | no | no |
 | Mailbox | yes | yes | yes | `PIOS_MBOX_BASE=0` — never call `mbox_call()` |
+
+**Pi 5 FFC storage protocol.** The external FFC HAT exposes PCIe Gen 2 x1;
+an M.2-shaped card is not necessarily a PCIe endpoint. M.2 SATA SSDs (including
+the reported EDILOCA EN206) cannot enumerate through a passive PCIe HAT because
+they speak SATA, not PCIe/NVMe. Use a PCIe/NVMe SSD for basic FFC enumeration;
+a SATA device requires a separate SATA host/controller. Firmware must enable
+the connector with the Pi 5-only `dtparam=pciex1=on` in the FAT boot
+`config.txt`.
+
+**PCIe1 PHY bring-up.** Firmware enabling the connector is not a substitute
+for the kernel's post-reset PHY setup. PCIe1 programs the BCM2712 54 MHz XOSC
+PLL over port-0 MDIO and verifies every value before releasing PERST. Each
+transaction is bounded to 100 us; failure holds reset and reports
+`phy_ready=0`. The PHY PM-clock period is `0x12`; both advertised and target
+link speed are Gen2. Shared RESCAL and RP1's PCIe2 are not reset by this path.
+After PERST release, configuration access waits at least 100 ms.
+
+Live proof on `v20261002.180500`: Pi 5 FFC -> M.2 HAT -> passive externally
+powered M-key-to-x16 riser -> Quadro K2000 trains **Gen2 x1** and enumerates
+`01:00.0 10DE:0FFE` (VGA) and `01:00.1 10DE:0E1B` (HD audio).
+Both endpoint Command registers are zero (Memory Space and Bus Master off);
+AER corrected/uncorrected status is zero. Existing boot discovery sizes the
+GPU BARs (BAR0 16 MiB, prefetch aperture 256 MiB) but does not map them.
+Enumeration is not GPU execution, display output, or LevelZero support;
+the 256 MiB BAR aperture is not a measurement of installed VRAM.
 
 **Network (ADR-043 / ADR-044).** One TCP/IP stack. Wired `nic_ops`: MACB on
 Pi 5 (RP1 IRQ), GENET on Pi 4 (GIC SPI 157), virtio on QEMU (paced; no RX

@@ -11,6 +11,9 @@ hdmi_group=1
 hdmi_mode=16
 framebuffer_depth=32
 
+[pi5]
+dtparam=pciex1=on
+
 [pi3]
 dtoverlay=disable-bt
 

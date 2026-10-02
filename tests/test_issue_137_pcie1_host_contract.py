@@ -6,6 +6,7 @@ platform = (root / "include" / "platform.h").read_text(encoding="utf-8")
 pcie1 = (root / "src" / "pcie1.c").read_text(encoding="utf-8")
 mmu = (root / "src" / "mmu.c").read_text(encoding="utf-8")
 kernel = (root / "src" / "kernel.c").read_text(encoding="utf-8")
+config = (root / "config.txt").read_text(encoding="utf-8")
 
 
 def body_after(source: str, signature: str) -> str:
@@ -29,6 +30,8 @@ assert "#define PIOS_PCIE1_CPU_WIN_BASE     0x1B00000000UL" in platform
 assert "#define PIOS_RP1_BAR_BASE           0x1F00000000UL" in platform
 assert "#define PIOS_HAS_PCIE1              1" in platform
 assert "#define PIOS_HAS_PCIE1              0" in platform
+assert "[pi5]\ndtparam=pciex1=on\n" in config.replace("\r\n", "\n")
+assert "pciex1_gen=" not in config
 
 assert "l1[108] = ((u64)108U * L1_BLOCK_SIZE) | dev_attr;" in mmu
 assert "0x1800000000" in mmu
@@ -51,5 +54,11 @@ tick = body_after(kernel, "static void core0_io_tick_hook(u32 core, u64 tick)\n{
 assert "pcie1" not in tick
 assert "lzero" not in tick
 assert "pcie_cfg" not in tick
+
+dashboard = body_after(kernel, "static void hdmi_dashboard_render(void)\n{")
+assert "pcie1_status(&p1);" in dashboard
+assert "dash_pcie1_summary(p1caps" in dashboard
+assert "pcie1_rescan(" not in dashboard
+assert "pcie1_cfg_read(" not in dashboard and "pcie1_cfg_write(" not in dashboard
 
 print("issue #137: PCIe1 host separation and Milestone-A fail-closed wiring are gated")
