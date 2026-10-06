@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="PIOS is a deterministic bare-metal microkernel for Raspberry Pi, QEMU AArch64, and emerging x64 targets.">
+  <meta name="theme-color" content="#0f172a">
+  <meta property="og:title" content="PIOS — Bare Metal, Fully Visible">
+  <meta property="og:description" content="A deterministic microkernel, live PCIe GPU fabric, PicoScript runtime, networking, storage and observability—without Linux or libc.">
+  <meta property="og:image" content="https://willeastbury.github.io/pios/assets/pios-workbench-pi5.png">
+  <title>PIOS — Bare Metal, Fully Visible</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="PIOS home">
+      <span class="brand-mark" aria-hidden="true">P</span>
+      <span>PIOS</span>
+    </a>
+    <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav">
+      <span class="sr-only">Toggle navigation</span>
+      <span></span><span></span><span></span>
+    </button>
+    <nav id="site-nav" aria-label="Primary navigation">
+      <a href="#hardware">Hardware</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#platforms">Platforms</a>
+      <a href="#docs">Docs</a>
+      <a href="#roadmap">Roadmap</a>
+      <a class="nav-github" href="https://github.com/WillEastbury/pios">GitHub <span aria-hidden="true">↗</span></a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero-glow hero-glow-a"></div>
+      <div class="hero-glow hero-glow-b"></div>
+      <div class="container hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="pulse"></span> Running live on Raspberry Pi 5</p>
+          <h1>Bare metal.<br><span>Fully visible.</span></h1>
+          <p class="hero-lede">A deterministic microkernel with its own network stack, storage,
+            TLS, process runtime, PicoScript VM and accelerator paths. No Linux. No libc.
+            No hidden scheduler.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#architecture">Explore the system</a>
+            <a class="button button-ghost" href="https://github.com/WillEastbury/pios">View source</a>
+          </div>
+          <dl class="hero-stats">
+            <div><dt>4</dt><dd>dedicated cores</dd></div>
+            <div><dt>14/14</dt><dd>live selftests</dd></div>
+            <div><dt>32/32</dt><dd>QEMU smoke</dd></div>
+            <div><dt>3×</dt><dd>Arc Pro B50 proof</dd></div>
+          </dl>
+        </div>
+        <div class="hero-visual">
+          <div class="terminal-chrome">
+            <div class="terminal-bar">
+              <span></span><span></span><span></span>
+              <strong>PIOS // LIVE WORKBENCH</strong>
+            </div>
+            <img src="assets/pios-workbench-pi5.png"
+                 alt="Live PIOS 1920 by 1080 HDMI workbench showing hardware, PCIe, processes, networking, DMA and health telemetry"
+                 width="1920" height="1080">
+          </div>
+          <p class="visual-caption"><span>Live framebuffer</span> · Pi 5 · 1920×1080 · kernel-owned telemetry</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="proof-strip" aria-label="Project principles">
+      <div class="container proof-grid">
+        <div><span>01</span><strong>Bounded</strong><small>Every wait has a deadline</small></div>
+        <div><span>02</span><strong>Fail closed</strong><small>No success-shaped fallbacks</small></div>
+        <div><span>03</span><strong>Event driven</strong><small>IRQ → FIFO → software IRQ</small></div>
+        <div><span>04</span><strong>Observable</strong><small>Live state, not marketing state</small></div>
+      </div>
+    </section>
+
+    <section class="section" id="hardware">
+      <div class="container">
+        <div class="section-heading">
+          <p class="eyebrow">Hardware fabric</p>
+          <h2>A Pi 5 driving serious PCIe</h2>
+          <p>PIOS has proven a complete switch hierarchy from the BCM2712 PCIe1 root,
+            through a Broadcom/PLX PEX8748, to three Intel Arc Pro B50 GPUs.</p>
+        </div>
+        <div class="fabric">
+          <article class="fabric-node fabric-host">
+            <span class="node-kicker">HOST</span>
+            <h3>Raspberry Pi 5</h3>
+            <p>8 GB · quad-core Cortex-A76</p>
+            <code>BCM2712 PCIe1 · Gen2 x1</code>
+          </article>
+          <div class="fabric-link"><span></span><small>FFC</small></div>
+          <article class="fabric-node fabric-switch">
+            <span class="node-kicker">SWITCH</span>
+            <h3>PEX8748</h3>
+            <p>Broadcom / PLX PCIe Gen3</p>
+            <code>4 × downstream x8</code>
+          </article>
+          <div class="gpu-grid">
+            <article class="fabric-node gpu"><span>GPU 0</span><strong>Arc Pro B50</strong><small>Gen3 x8 proven</small></article>
+            <article class="fabric-node gpu"><span>GPU 1</span><strong>Arc Pro B50</strong><small>Gen3 x8 proven</small></article>
+            <article class="fabric-node gpu"><span>GPU 2</span><strong>Arc Pro B50</strong><small>Gen3 x8 proven</small></article>
+            <article class="fabric-node gpu gpu-alt"><span>TESTBED</span><strong>Quadro K2000</strong><small>Kepler bring-up path</small></article>
+          </div>
+        </div>
+        <div class="callout">
+          <p><strong>Evidence, not aspiration.</strong> Twenty PCIe functions across fifteen buses were enumerated,
+            BAR0 was sized and mapped, and an Intel Xe2 <code>GMD_ID</code> register was read repeatedly through
+            the full bridge chain with Bus Master disabled and AER clear.</p>
+          <a href="https://github.com/WillEastbury/pios/blob/main/docs/platforms.md">Read the platform evidence →</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="architecture">
+      <div class="container">
+        <div class="section-heading">
+          <p class="eyebrow">System architecture</p>
+          <h2>Small kernel. Explicit contracts.</h2>
+          <p>PIOS assigns each core a fixed role and moves work through bounded,
+            generation-checked ownership domains.</p>
+        </div>
+        <div class="architecture-grid">
+          <article class="core-card core-zero">
+            <span class="core-number">0</span>
+            <div><h3>Kernel reactor</h3><p>Network, disk, console and IRQ-driven services. Never blocks.</p></div>
+          </article>
+          <article class="core-card">
+            <span class="core-number">1</span>
+            <div><h3>User management</h3><p>Preemptive scheduler and FIFO doorbell processing.</p></div>
+          </article>
+          <article class="core-card">
+            <span class="core-number">2</span>
+            <div><h3>User execution</h3><p>Preemptive EL0 processes with isolated memory.</p></div>
+          </article>
+          <article class="core-card">
+            <span class="core-number">3</span>
+            <div><h3>User execution</h3><p>Application scheduler and capsule workloads.</p></div>
+          </article>
+        </div>
+        <div class="feature-grid">
+          <article><span class="feature-icon">↯</span><h3>IRQ cascades</h3><p>Hardware IRQs trigger bounded records. Software priority levels execute the work.</p></article>
+          <article><span class="feature-icon">⇄</span><h3>Lock-free IPC</h3><p>SPSC FIFO lanes, explicit publication barriers and sequence-backed wakes.</p></article>
+          <article><span class="feature-icon">◇</span><h3>Capability gates</h3><p>BARs, DMA spans, processes and storage use generation-backed authority.</p></article>
+          <article><span class="feature-icon">⌁</span><h3>Native services</h3><p>TCP/IP, TLS 1.3, WALFS, PicoScript and the web stack run without an underlying OS.</p></article>
+          <article><span class="feature-icon">▦</span><h3>Accelerators</h3><p>NEON, VideoCore QPU, Kepler and Intel Xe2 paths with deterministic fallbacks.</p></article>
+          <article><span class="feature-icon">◎</span><h3>Live diagnostics</h3><p>HDMI, UART, TCP and HTTP expose the same bounded operator surface.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="platforms">
+      <div class="container">
+        <div class="section-heading">
+          <p class="eyebrow">Platform matrix</p>
+          <h2>One set of contracts. Separate target images.</h2>
+          <p>Hardware capabilities vary; kernel invariants do not.</p>
+        </div>
+        <div class="platform-table" role="region" aria-label="Supported platforms" tabindex="0">
+          <table>
+            <thead><tr><th>Target</th><th>Architecture</th><th>Boot</th><th>Networking</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td>Raspberry Pi 5</td><td>AArch64 / Cortex-A76</td><td>Stage0 → verified A/B stage2</td><td>GEM + CYW43455</td><td><span class="status live">Live hardware</span></td></tr>
+              <tr><td>Pi 3 / Zero 2 W</td><td>AArch64 / Cortex-A53</td><td>Board-specific stage2</td><td>Native SDIO Wi-Fi</td><td><span class="status supported">Supported</span></td></tr>
+              <tr><td>QEMU virt</td><td>AArch64</td><td>Direct + stage0 chain</td><td>virtio-net</td><td><span class="status live">32/32 smoke</span></td></tr>
+              <tr><td>Hyper-V</td><td>x86_64</td><td>UEFI → PIOS handoff</td><td>VMBus / netvsc</td><td><span class="status building">Active bring-up</span></td></tr>
+              <tr><td>Ivy Bridge Xeon</td><td>x86_64</td><td>Native UEFI USB</td><td>Native PCIe</td><td><span class="status building">Boot services</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="docs">
+      <div class="container">
+        <div class="section-heading">
+          <p class="eyebrow">Documentation</p>
+          <h2>Read the system from first principles</h2>
+          <p>The repository documents current contracts, decisions, evidence and failed experiments.</p>
+        </div>
+        <div class="docs-grid">
+          <a href="https://github.com/WillEastbury/pios/blob/main/docs/architecture_system.md"><span>01</span><h3>System architecture</h3><p>Cores, schedulers, IRQs, FIFOs, EL levels and isolation.</p><b>Open guide →</b></a>
+          <a href="https://github.com/WillEastbury/pios/blob/main/docs/platforms.md"><span>02</span><h3>Platforms</h3><p>Pi hardware, QEMU, PCIe evidence and target differences.</p><b>Open guide →</b></a>
+          <a href="https://github.com/WillEastbury/pios/blob/main/docs/network_stack.md"><span>03</span><h3>Network stack</h3><p>NIC backends, ingress validation, TCP, TLS and capsules.</p><b>Open guide →</b></a>
+          <a href="https://github.com/WillEastbury/pios/blob/main/docs/boot_storage.md"><span>04</span><h3>Boot & storage</h3><p>A/B updates, WALFS, keystore and recovery behaviour.</p><b>Open guide →</b></a>
+          <a href="https://github.com/WillEastbury/pios/blob/main/docs/architecture_decision_log.md"><span>05</span><h3>Decision log</h3><p>Every significant architectural choice and its owner.</p><b>Open log →</b></a>
+          <a href="https://github.com/WillEastbury/pios/blob/main/docs/gotchas.md"><span>06</span><h3>Gotchas</h3><p>Failed probes, reversals and the traps worth remembering.</p><b>Open guide →</b></a>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="roadmap">
+      <div class="container roadmap-grid">
+        <div class="section-heading">
+          <p class="eyebrow">What comes next</p>
+          <h2>Make the GPUs earn their keep.</h2>
+          <p>Enumeration and Intel MMIO are proven. The next acceptance boundary is useful,
+            contained work—not a green status flag.</p>
+          <a class="button button-primary" href="https://github.com/WillEastbury/pios/issues">Track the work on GitHub</a>
+        </div>
+        <ol class="roadmap-list">
+          <li class="done"><span></span><div><small>PROVEN</small><strong>Enumerate three B50s through PEX8748</strong></div></li>
+          <li class="done"><span></span><div><small>PROVEN</small><strong>Assign BAR0 and read Intel Xe2 GMD_ID</strong></div></li>
+          <li class="active"><span></span><div><small>IN PROGRESS</small><strong>GuC, queues and contained DMA completion</strong></div></li>
+          <li><span></span><div><small>NEXT</small><strong>Known-answer compute dispatch</strong></div></li>
+          <li><span></span><div><small>GOAL</small><strong>PicoScript Tensor acceleration</strong></div></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="closing">
+      <div class="container">
+        <p class="script">No layers to hide behind.</p>
+        <h2>Build the whole machine.</h2>
+        <div class="hero-actions">
+          <a class="button button-light" href="https://github.com/WillEastbury/pios">Explore PIOS on GitHub</a>
+          <a class="button button-outline-light" href="https://github.com/WillEastbury/pios/blob/main/README.md#building">Build it yourself</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container footer-grid">
+      <div><strong>PIOS</strong><p>Bare metal, fully visible.</p></div>
+      <div><a href="https://github.com/WillEastbury/pios">Source</a><a href="#docs">Documentation</a><a href="https://github.com/WillEastbury/pios/issues">Issues</a></div>
+      <p>Wavefunction visual language from <a href="https://github.com/WillEastbury/BareMetalJsTools">BareMetalJSTools</a>.</p>
+    </div>
+  </footer>
+</body>
+</html>

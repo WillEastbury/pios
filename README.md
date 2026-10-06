@@ -16,6 +16,8 @@ PIOS also supports **QEMU AArch64** and is actively adding separately compiled
 **Hyper-V x64** and native **Ivy Bridge Xeon** boot-service targets, sharing
 portable kernel, PCIe-fabric and storage contracts across architectures.
 
+**Project site:** [willeastbury.github.io/pios](https://willeastbury.github.io/pios/)
+
 Platform matrix, memory maps, and QEMU boot paths:
 [docs/platforms.md](docs/platforms.md).
 
