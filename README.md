@@ -12,6 +12,10 @@ a Broadcom/PLX PEX8748 PCIe Gen3 switch to three Intel Arc Pro B50 GPUs and an
 NVIDIA Quadro K2000. The live 1920×1080 HDMI workbench exposes the PCIe fabric,
 accelerators, networking, processes, DMA, FIFOs and kernel health in real time.*
 
+PIOS also supports **QEMU AArch64** and is actively adding separately compiled
+**Hyper-V x64** and native **Ivy Bridge Xeon** boot-service targets, sharing
+portable kernel, PCIe-fabric and storage contracts across architectures.
+
 Platform matrix, memory maps, and QEMU boot paths:
 [docs/platforms.md](docs/platforms.md).
 
