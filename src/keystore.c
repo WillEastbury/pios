@@ -18,6 +18,7 @@
 #define KS_ERR_WRITE     3U
 #define KS_ERR_DECRYPT   4U
 #define KS_ERR_SERIAL    5U
+#define KS_ERR_RECORD    6U
 
 struct keystore_record {
     u32 magic;
@@ -121,12 +122,41 @@ static bool board_serial(u8 out[8])
  * explicit `mounted` flag as the only "is this valid" signal. */
 #define KEYSTORE_LBA_INVALID 0xFFFFFFFFU
 
-static u32 keystore_lba(void)
+static u32 keystore_offset_lba(u32 offset)
 {
     struct walfs_status_snapshot ws;
     walfs_status(&ws);
     if (!ws.mounted) return KEYSTORE_LBA_INVALID;
-    return ws.partition_lba + (PIOS_USER_RECORDS_OFFSET / SD_BLOCK_SIZE);
+    u32 blocks = offset / SD_BLOCK_SIZE;
+    if ((offset % SD_BLOCK_SIZE) != 0U || blocks >= ws.partition_blocks ||
+        ws.partition_lba >= KEYSTORE_LBA_INVALID - blocks)
+        return KEYSTORE_LBA_INVALID;
+    return ws.partition_lba + blocks;
+}
+
+static u32 keystore_lba(void)
+{
+    return keystore_offset_lba(PIOS_KEYSTORE_OFFSET);
+}
+
+static bool keystore_blank(const u8 *sector)
+{
+    bool zero = true, erased = true;
+    for (u32 i = 0; i < SD_BLOCK_SIZE; i++) {
+        zero = zero && sector[i] == 0U;
+        erased = erased && sector[i] == 0xFFU;
+    }
+    return zero || erased;
+}
+
+static bool keystore_write_verified(u32 lba, const struct keystore_record *rec)
+{
+    if (lba != keystore_lba())
+        return false;
+    simd_memcpy(ks_sector, rec, sizeof(*rec));
+    if (!sd_write_block(lba, ks_sector) || !sd_read_block(lba, ks_sector))
+        return false;
+    return memcmp(ks_sector, rec, sizeof(*rec)) == 0;
 }
 
 static void derive_wrap_key(u8 key[32], bool *serial_ok)
@@ -231,13 +261,50 @@ bool keystore_init(void)
 
     struct keystore_record rec;
     simd_memcpy(&rec, ks_sector, sizeof(rec));
+    bool migrate = false;
+    if (rec.magic != KEYSTORE_MAGIC) {
+        /* Unknown nonblank target data is not permission to replace a key.
+         * Offline recovery can preserve and explicitly initialize that sector. */
+        if (!keystore_blank(ks_sector)) {
+            secure_zero(wrap_key, sizeof(wrap_key));
+            secure_zero(&rec, sizeof(rec));
+            g_ks.last_error = KS_ERR_RECORD;
+            uart_puts("[key] unrecognized reserved record\n");
+            return false;
+        }
+        u32 legacy = keystore_offset_lba(PIOS_KEYSTORE_LEGACY_OFFSET);
+        if (legacy == KEYSTORE_LBA_INVALID || !sd_read_block(legacy, ks_sector)) {
+            secure_zero(wrap_key, sizeof(wrap_key));
+            secure_zero(&rec, sizeof(rec));
+            g_ks.last_error = KS_ERR_READ;
+            return false;
+        }
+        simd_memcpy(&rec, ks_sector, sizeof(rec));
+        migrate = rec.magic == KEYSTORE_MAGIC;
+    }
+    if (rec.magic == KEYSTORE_MAGIC && rec.version != KEYSTORE_VERSION) {
+        secure_zero(wrap_key, sizeof(wrap_key));
+        secure_zero(&rec, sizeof(rec));
+        g_ks.last_error = KS_ERR_RECORD;
+        uart_puts("[key] unsupported record version\n");
+        return false;
+    }
     bool need_seed = rec.magic != KEYSTORE_MAGIC || rec.version != KEYSTORE_VERSION;
     if (!need_seed) {
         u8 root[32];
         if (!decrypt_root(&rec, wrap_key, root)) {
             secure_zero(root, sizeof(root));
             secure_zero(wrap_key, sizeof(wrap_key));
+            secure_zero(&rec, sizeof(rec));
             g_ks.last_error = KS_ERR_DECRYPT;
+            return false;
+        }
+        if (migrate && !keystore_write_verified(lba, &rec)) {
+            secure_zero(root, sizeof(root));
+            secure_zero(wrap_key, sizeof(wrap_key));
+            secure_zero(&rec, sizeof(rec));
+            g_ks.last_error = KS_ERR_WRITE;
+            uart_puts("[key] migration readback failed\n");
             return false;
         }
         g_ks.fingerprint32 = fingerprint_root(root);
@@ -247,6 +314,9 @@ bool keystore_init(void)
         g_ks.last_error = KS_ERR_NONE;
         secure_zero(root, sizeof(root));
         secure_zero(wrap_key, sizeof(wrap_key));
+        secure_zero(&rec, sizeof(rec));
+        if (migrate)
+            uart_puts("[key] sealed record migrated\n");
         return true;
     }
 
@@ -258,13 +328,12 @@ bool keystore_init(void)
         g_ks.last_error = KS_ERR_DECRYPT;
         return false;
     }
-    simd_zero(ks_sector, sizeof(ks_sector));
-    simd_memcpy(ks_sector, &rec, sizeof(rec));
-    if (!sd_write_block(lba, ks_sector)) {
+    if (!keystore_write_verified(lba, &rec)) {
         secure_zero(root, sizeof(root));
         secure_zero(wrap_key, sizeof(wrap_key));
         secure_zero(&rec, sizeof(rec));
         g_ks.last_error = KS_ERR_WRITE;
+        uart_puts("[key] sealed record readback failed\n");
         return false;
     }
     g_ks.fingerprint32 = fingerprint_root(root);

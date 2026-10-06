@@ -17,7 +17,7 @@
  *   0x1_07C00000 - 0x1_07FFFFFF  4MB  BCM2712 ARM peripherals
  *   0x1_08000000 - 0x1_09FFFFFF  32MB GIC-400
  *   0x1_F0000000 - 0x1_F0FFFFFF  16MB RP1 BAR0 (via PCIe)
- *   0x1_B0000000 - 0x1_B1FFFFFF  pcie1 FFC 32 MiB Device ATU (BAR0, not LMEM)
+ *   0x1B80000000 - 0x1B81FFFFFF  pcie1 FFC 32 MiB Device ATU (BAR0, not LMEM)
  */
 
 #include "mmu.h"
@@ -50,6 +50,15 @@ u64 l2_table_boot[512] ALIGNED(4096);  /* start.S low-1GB split; never edited li
 static u64 l1_table_cached[512] ALIGNED(4096); /* BBM-safe target: fresh root for cache enable */
 static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
 static u64 l3_block0[512] ALIGNED(4096);     /* block 0 (0-2MB) split to 4KB pages */
+#if PIOS_HAS_PCIE1
+static u64 l2_table_pcie1[512] ALIGNED(4096);
+_Static_assert((PIOS_PCIE1_CPU_WIN_BASE & (L2_BLOCK_SIZE - 1U)) == 0U &&
+               (PIOS_PCIE1_CPU_WIN_SIZE & (L2_BLOCK_SIZE - 1U)) == 0U &&
+               PIOS_PCIE1_CPU_WIN_SIZE != 0U &&
+               (PIOS_PCIE1_CPU_WIN_BASE % L1_BLOCK_SIZE) +
+                   PIOS_PCIE1_CPU_WIN_SIZE <= L1_BLOCK_SIZE,
+               "PCIe1 Device aperture must fit one L1 with whole L2 blocks");
+#endif
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI4
 static u64 l2_table_pi4_high[512] ALIGNED(4096); /* L1[3]: RAM then 0xFC000000 Device */
 #endif
@@ -203,6 +212,27 @@ static inline u64 dev_block_2m(u64 addr) {
     return addr | PTE_VALID | PTE_BLOCK | PTE_AF |
            PTE_ATTR(MT_DEVICE_nGnRnE) |
            PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN;
+}
+
+/* Build on an unpublished root. start.S deliberately leaves this range
+ * unmapped; the cache-remap path must install it before PCIe initialization. */
+static void map_kernel_pcie1_window(volatile u64 *root)
+{
+#if PIOS_HAS_PCIE1
+    const u64 base = PIOS_PCIE1_CPU_WIN_BASE;
+    const u64 limit = base + PIOS_PCIE1_CPU_WIN_SIZE;
+    const u64 l1_base = base & ~(L1_BLOCK_SIZE - 1U);
+    for (u32 i = 0U; i < 512U; i++) {
+        u64 pa = l1_base + (u64)i * L2_BLOCK_SIZE;
+        l2_table_pcie1[i] = pa >= base && pa < limit ?
+            dev_block_2m(pa) : 0U;
+    }
+    dcache_clean_range((u64)(usize)l2_table_pcie1, sizeof(l2_table_pcie1));
+    root[base / L1_BLOCK_SIZE] =
+        (u64)(usize)l2_table_pcie1 | PTE_VALID | PTE_TABLE;
+#else
+    (void)root;
+#endif
 }
 
 static inline bool low_block_is_device(u64 addr)
@@ -637,13 +667,8 @@ void mmu_init(void) {
     /* RP1: indices 124-127 */
     for (u32 idx = 124; idx < 128; idx++)
         l1[idx] = ((u64)idx * L1_BLOCK_SIZE) | dev_attr;
-#if PIOS_PLATFORM == PIOS_PLATFORM_PI5
-    /* pcie1 FFC outbound window at 0x1B00000000 (L1[108]). One 1 GiB
-     * Device block covers the 32 MiB ATU. Do not map the 12 GiB prefetch
-     * range at 0x1800000000 — that is GPU LMEM territory. */
-    l1[108] = ((u64)108U * L1_BLOCK_SIZE) | dev_attr;
 #endif
-#endif
+    map_kernel_pcie1_window(l1);
 
     __asm__ volatile("dsb sy" ::: "memory");
     __asm__ volatile("isb" ::: "memory");
@@ -713,7 +738,7 @@ void mmu_init(void) {
  * the walker hold the old 1GB block and a freshly-walked table for the same VA
  * at once -> TLB conflict abort / PiSOD). The fine-grained hierarchy is built
  * off to the side in l1_table_cached (entry 0 -> L2 split; entries 1..511
- * copied verbatim) and installed with a single atomic TTBR0_EL1 swap + full
+ * copied verbatim except the new PCIe1 Device aperture) and installed with a single atomic TTBR0_EL1 swap + full
  * TLB flush; the new table is VA==PA identical for all executing kernel code
  * (attributes only tighten NC->WB), so there is no unmapped/conflicting window.
  *
@@ -800,6 +825,7 @@ void mmu_enable_caching(void) {
     l1_table_cached[0] = (u64)(usize)l2_table_low | PTE_VALID | PTE_TABLE;
     for (u32 i = 1; i < 512; i++)
         l1_table_cached[i] = l1_table[i];
+    map_kernel_pcie1_window(l1_table_cached);
 
     /* Push all three tables to PoC and drop any stray cached lines so the
      * cacheable table walker (TCR IRGN0/ORGN0=WB) reads the fresh descriptors. */
@@ -851,6 +877,41 @@ void mmu_invalidate_tlb(void) {
 
 u64 mmu_kernel_ttbr0(void) {
     return shared_ttbr0;
+}
+
+bool mmu_device_read32_valid(u64 addr)
+{
+    if ((addr & 3U) != 0U)
+        return false;
+    u64 sctlr, par;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    if ((sctlr & 1U) == 0U)
+        return false;
+    /* AT walks the active translation regime but never reads the target. */
+    __asm__ volatile("at s1e1r, %1\nisb\nmrs %0, par_el1"
+                     : "=r"(par) : "r"(addr) : "memory");
+    return (par & 1U) == 0U && (par >> 56) == 0U &&
+           (par & 0x0000FFFFFFFFF000ULL) ==
+               (addr & 0x0000FFFFFFFFF000ULL);
+}
+
+bool mmu_active_nc_range_valid(u64 start, u64 size)
+{
+    u64 sctlr;
+    if (!size || (start & 4095U) || (size & 4095U) ||
+        start > ~0ULL - size)
+        return false;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    if (!(sctlr & 1U))
+        return false;
+    for (u64 addr = start; addr < start + size; addr += 4096U) {
+        u64 par;
+        __asm__ volatile("at s1e1w, %1\nisb\nmrs %0, par_el1"
+                         : "=r"(par) : "r"(addr) : "memory");
+        if (!mmu_par_identity_nc_valid(addr, par))
+            return false;
+    }
+    return true;
 }
 
 bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size)

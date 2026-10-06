@@ -291,6 +291,11 @@ bearer on admin routes are all rejected; `sts users` supports cursor pagination.
   QEMU (no mailbox, `PIOS_MBOX_BASE = 0`) it uses the virtual disk's provisioned
   MBR identity. `crypto_random_*` stays fail-closed — the disk id is a stable
   public identity, not a CSPRNG.
+  The sealed record is at p2 + `0x900000`, outside both raw boot slots
+  (ADR-080). The legacy p2 + `0x500000` address overlapped slot B and is now
+  migration-read-only. Blank-destination migration authenticates the existing
+  root, preserves its record bytes, and verifies readback; no old-location
+  writes or silent replacement of malformed records are permitted.
 - `x509.c` — self-signed Ed25519 and P-256 certificates, CSRs, and
   `x509_p256_private_scalar()` for TLS CertificateVerify.
 - `acme.c` — derives its account key via
@@ -321,6 +326,32 @@ inbound descriptor ids, wake sequences, handler ids, binding ids.
 `coredump.c` keeps `g_dumps[COREDUMP_SLOTS]` snapshots and can format and diff
 them (`cdump`). `exception_crash_persist_sd()` writes a crash record to SD so a
 fault survives reboot.
+
+The persisted v3 record is at absolute SD **LBA 24**, outside the partitions.
+If a boot fault prevents the network consoles starting, first preserve the
+screen's `ec`, `pc`, `op`, `sp` and `lr` values. A valid return address and
+stack do not make the instruction at `pc` valid: compare the displayed `op`
+against the exact deployed ELF/payload before attributing the fault to the
+function whose address it occupies.
+
+`tools/pios_crash_inspect.py` opens an explicitly supplied disk/image **read-only**,
+decodes that sector, validates p2 and the A/B header/control geometry, and
+compares both raw payloads against an exact local Pi5 build. It records the
+slot hashes, first differing bytes and instruction word at the crash PC.
+It neither repairs the card nor clears crash/boot-control state:
+
+```powershell
+python tools\pios_crash_inspect.py C:\captures\pios-sd.img `
+  --expected-payload build_pi5_stage2\PIOS_PI5_STAGE2.BIN `
+  --pc 0x17fe0c --evidence C:\captures\pios-crash-new
+```
+
+Omit `--pc` to use the persisted record's PC. The evidence directory must not
+already exist. For a physical SD card, identify its disk number and USB reader
+first, then supply that disk's Windows device path explicitly; never guess a
+disk number. The inspector preserves only the crash sector and diagnostic
+report, not user storage. Matching SD bytes narrow the fault to loading/runtime
+state; differing bytes establish a stored-image difference, not its cause.
 
 ### 6.4 Consoles
 

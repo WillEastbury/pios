@@ -1,10 +1,11 @@
 /*
  * BOOTX64.EFI - PIOS Hyper-V amd64 probe.
  *
- * This is the first local Hyper-V test slice. It proves that a Gen2 Hyper-V
- * VM can execute PIOS-owned x86_64 UEFI code before we port the full kernel
- * entry/MMU/interrupt/timer/device layers from AArch64.
+ * This is a UEFI probe only. It proves that a Gen2 Hyper-V VM can execute
+ * PIOS-owned x86_64 UEFI code before the full kernel entry/MMU/interrupt/
+ * timer/VMBus/netvsc layers are ported. It is not PIOS OS boot or online.
  */
+#include "x86_kernel.h"
 typedef unsigned char      u8;
 typedef unsigned short     u16;
 typedef unsigned int       u32;
@@ -14,6 +15,9 @@ typedef u64                efi_status_t;
 typedef void              *efi_handle_t;
 
 #define EFI_SUCCESS 0ULL
+#define EFI_ERROR(code) (0x8000000000000000ULL | (code))
+#define EFI_INVALID_PARAMETER EFI_ERROR(2ULL)
+#define EFI_BUFFER_TOO_SMALL EFI_ERROR(5ULL)
 #define ALLOCATE_ANY_PAGES 0U
 #define EFI_LOADER_DATA 2U
 
@@ -34,6 +38,14 @@ struct efi_guid {
 
 typedef efi_status_t (*efi_text_string_fn)(void *self, const u16 *str);
 typedef efi_status_t (*efi_allocate_pages_fn)(u32 type, u32 memtype, usize pages, u64 *memory);
+typedef efi_status_t (*efi_allocate_pool_fn)(u32 memtype, usize size, void **buffer);
+typedef efi_status_t (*efi_get_memory_map_fn)(usize *size, void *map, usize *key,
+                                               usize *descriptor_size, u32 *descriptor_version);
+typedef efi_status_t (*efi_exit_boot_services_fn)(efi_handle_t image, usize key);
+typedef efi_status_t (*efi_stall_fn)(usize usec);
+typedef efi_status_t (*efi_locate_protocol_fn)(struct efi_guid *protocol,
+                                                void *registration,
+                                                void **interface);
 
 struct efi_simple_text_output {
     void *reset;
@@ -45,12 +57,77 @@ struct efi_boot_services {
     void *raise_tpl; void *restore_tpl;
     efi_allocate_pages_fn allocate_pages;
     void *free_pages;
-    void *get_memory_map;
+    efi_get_memory_map_fn get_memory_map;
+    efi_allocate_pool_fn allocate_pool;
+    void *free_pool;
+    void *create_event;
+    void *set_timer;
+    void *wait_for_event;
+    void *signal_event;
+    void *close_event;
+    void *check_event;
+    void *install_protocol_interface;
+    void *reinstall_protocol_interface;
+    void *uninstall_protocol_interface;
+    void *handle_protocol;
+    void *reserved;
+    void *register_protocol_notify;
+    void *locate_handle;
+    void *locate_device_path;
+    void *install_configuration_table;
+    void *load_image;
+    void *start_image;
+    void *exit;
+    void *unload_image;
+    efi_exit_boot_services_fn exit_boot_services;
+    void *get_next_monotonic_count;
+    efi_stall_fn stall;
+    void *set_watchdog_timer;
+    void *connect_controller;
+    void *disconnect_controller;
+    void *open_protocol;
+    void *close_protocol;
+    void *open_protocol_information;
+    void *protocols_per_handle;
+    void *locate_handle_buffer;
+    efi_locate_protocol_fn locate_protocol;
 };
 
 struct efi_configuration_table {
     struct efi_guid vendor_guid;
     void *vendor_table;
+};
+
+struct efi_pixel_bitmask {
+    u32 red_mask;
+    u32 green_mask;
+    u32 blue_mask;
+    u32 reserved_mask;
+};
+
+struct efi_gop_mode_info {
+    u32 version;
+    u32 horizontal_resolution;
+    u32 vertical_resolution;
+    u32 pixel_format;
+    struct efi_pixel_bitmask pixel_information;
+    u32 pixels_per_scan_line;
+};
+
+struct efi_gop_mode {
+    u32 max_mode;
+    u32 mode;
+    struct efi_gop_mode_info *info;
+    usize size_of_info;
+    u64 framebuffer_base;
+    usize framebuffer_size;
+};
+
+struct efi_graphics_output {
+    void *query_mode;
+    void *set_mode;
+    void *blt;
+    struct efi_gop_mode *mode;
 };
 
 struct efi_system_table {
@@ -108,6 +185,8 @@ struct hyperv_summary {
 };
 
 static struct hyperv_summary g_hv;
+static struct x86_uefi_handoff g_handoff;
+static struct efi_graphics_output *g_gop;
 
 static void outb(u16 port, u8 val)
 {
@@ -792,6 +871,7 @@ static void print_acpi_probe(struct efi_system_table *st)
             if (guid_eq(&t->vendor_guid, &acpi10))
                 rsdp10 = t->vendor_table;
         }
+
     }
 
     puts_ascii("[uefi] config_tables=");
@@ -803,6 +883,130 @@ static void print_acpi_probe(struct efi_system_table *st)
     puts_ascii("\n");
     parse_rsdp(rsdp20 ? rsdp20 : rsdp10);
     print_acpi_summary();
+}
+
+static void gop_probe(struct efi_system_table *st)
+{
+    static struct efi_guid gop_guid = {
+        0x9042A9DEU, 0x23DCU, 0x4A38U,
+        { 0x96U, 0xFBU, 0x7AU, 0xDEU, 0xD0U, 0x80U, 0x51U, 0x6AU }
+    };
+    if (!st || !st->boot_services || !st->boot_services->locate_protocol ||
+        st->boot_services->locate_protocol(&gop_guid, 0, (void **)&g_gop) != EFI_SUCCESS ||
+        !g_gop || !g_gop->mode || !g_gop->mode->info) {
+        puts_ascii("[gop] unavailable; x86 handoff has no visual marker\n");
+        g_gop = 0;
+        return;
+    }
+    puts_ascii("[gop] fb=");
+    put_hex64(g_gop->mode->framebuffer_base);
+    puts_ascii(" width=");
+    put_hex64(g_gop->mode->info->horizontal_resolution);
+    puts_ascii(" height=");
+    put_hex64(g_gop->mode->info->vertical_resolution);
+    puts_ascii("\n");
+}
+
+static void gop_marker(u32 bgr)
+{
+    if (!g_gop || !g_gop->mode || !g_gop->mode->info ||
+        g_gop->mode->framebuffer_base == 0U ||
+        g_gop->mode->info->horizontal_resolution < 64U ||
+        g_gop->mode->info->vertical_resolution < 64U ||
+        g_gop->mode->info->pixels_per_scan_line <
+            g_gop->mode->info->horizontal_resolution)
+        return;
+    volatile u32 *pixels = (volatile u32 *)(usize)g_gop->mode->framebuffer_base;
+    for (u32 y = 0; y < 64U; y++)
+        for (u32 x = 0; x < 64U; x++)
+            pixels[y * g_gop->mode->info->pixels_per_scan_line + x] = bgr;
+}
+
+static efi_status_t x86_exit_boot_services(efi_handle_t image,
+                                           struct efi_system_table *st)
+{
+    if (!st || !st->boot_services || !st->boot_services->get_memory_map ||
+        !st->boot_services->allocate_pool || !st->boot_services->exit_boot_services)
+        return EFI_INVALID_PARAMETER;
+    usize bytes = 0, key = 0, descriptor_bytes = 0;
+    u32 descriptor_version = 0;
+    efi_status_t status = st->boot_services->get_memory_map(
+        &bytes, 0, &key, &descriptor_bytes, &descriptor_version);
+    if (status != EFI_BUFFER_TOO_SMALL)
+        return status;
+    /* Hyper-V's first size-only query returns BUFFER_TOO_SMALL but may leave
+     * DescriptorSize zero. UEFI v2 descriptors are at least 48 bytes; use a
+     * bounded conservative fallback and let the second query be authoritative. */
+    if (descriptor_bytes == 0)
+        descriptor_bytes = 48U;
+    if (bytes < descriptor_bytes)
+        bytes = descriptor_bytes * 128U;
+    if (bytes > 16ULL * 1024ULL * 1024ULL - descriptor_bytes * 8ULL)
+        return EFI_BUFFER_TOO_SMALL;
+    void *map = 0;
+    bytes += descriptor_bytes * 8U;
+    status = st->boot_services->allocate_pool(EFI_LOADER_DATA, bytes, &map);
+    if (status != EFI_SUCCESS || !map)
+        return status;
+    g_handoff = (struct x86_uefi_handoff){
+        .memory_map = (u64)(usize)map,
+        .memory_map_bytes = 0U,
+        .memory_map_key = 0U,
+        .descriptor_bytes = descriptor_bytes,
+        .descriptor_version = descriptor_version,
+        .system_table = (u64)(usize)st,
+        .image_handle = (u64)(usize)image,
+        .framebuffer_base = g_gop ? g_gop->mode->framebuffer_base : 0U,
+        .framebuffer_bytes = g_gop ? g_gop->mode->framebuffer_size : 0U,
+        .framebuffer_width = g_gop ? g_gop->mode->info->horizontal_resolution : 0U,
+        .framebuffer_height = g_gop ? g_gop->mode->info->vertical_resolution : 0U,
+        .framebuffer_stride = g_gop ? g_gop->mode->info->pixels_per_scan_line : 0U,
+        .framebuffer_format = g_gop ? g_gop->mode->info->pixel_format : 0U,
+    };
+    /* All diagnostics and table construction must precede the final memory
+     * map query. UEFI output may allocate and invalidate its map key. */
+    x86_kernel_prepare(&g_handoff);
+    struct x86_kernel_boot_state state;
+    x86_kernel_boot_snapshot(&state);
+    puts_ascii("[handoff] cr3=");
+    put_hex64(state.cr3);
+    puts_ascii(" stack=");
+    put_hex64(state.stack_top);
+    puts_ascii(" map=");
+    put_hex64(state.mapped_bytes);
+    puts_ascii("\n");
+    for (u32 attempt = 0; attempt < 3U; attempt++) {
+        usize used = bytes;
+        status = st->boot_services->get_memory_map(
+            &used, map, &key, &descriptor_bytes, &descriptor_version);
+        if (status == EFI_BUFFER_TOO_SMALL) {
+            if (descriptor_bytes == 0)
+                descriptor_bytes = 48U;
+            if (used > 16ULL * 1024ULL * 1024ULL - descriptor_bytes * 8ULL)
+                return EFI_BUFFER_TOO_SMALL;
+            bytes = used + descriptor_bytes * 8U;
+            map = 0;
+            status = st->boot_services->allocate_pool(EFI_LOADER_DATA, bytes, &map);
+            if (status != EFI_SUCCESS || !map)
+                return status;
+            continue;
+        }
+        if (status != EFI_SUCCESS || descriptor_bytes == 0)
+            return status;
+        g_handoff.memory_map = (u64)(usize)map;
+        g_handoff.memory_map_bytes = used;
+        g_handoff.memory_map_key = key;
+        g_handoff.descriptor_bytes = descriptor_bytes;
+        g_handoff.descriptor_version = descriptor_version;
+        status = st->boot_services->exit_boot_services(image, key);
+        if (status == EFI_SUCCESS) {
+            gop_marker(0x00FFFFFFU); /* white: firmware returned after exit */
+            x86_kernel_jump(&g_handoff, state.cr3, state.stack_top);
+        }
+        if (status != EFI_INVALID_PARAMETER)
+            return status;
+    }
+    return EFI_INVALID_PARAMETER;
 }
 
 efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
@@ -820,14 +1024,20 @@ efi_status_t efi_main(efi_handle_t image, struct efi_system_table *st)
     print_hv_msr_probe();
     enable_hypercall_page(st);
     print_acpi_probe(st);
-    puts_ascii("[next] amd64 entry + GDT/IDT/page tables -> Hyper-V MSRs -> VMBus -> netvsc/storvsc\n");
-    puts_ascii("[status] probe complete; press reset/power off in Hyper-V when done\n");
-
+    gop_probe(st);
+    gop_marker(0x0000CCCCU); /* yellow: UEFI is about to prepare PIOS handoff */
+    puts_ascii("[handoff] ExitBootServices -> PIOS x86 kernel boundary\n");
+    efi_status_t handoff = x86_exit_boot_services(image, st);
+    gop_marker(0x00CC00CCU); /* magenta: boot services exit/handoff returned */
+    puts_ascii("[handoff] FAILED status=");
+    put_hex64(handoff);
+    puts_ascii("\n");
+    /* Preserve the failure screen; returning sends control to Boot Manager. */
     for (;;)
 #if defined(__x86_64__) || defined(_M_X64)
         __asm__ volatile("hlt");
 #else
         ;
 #endif
-    return EFI_SUCCESS;
+    return handoff;
 }

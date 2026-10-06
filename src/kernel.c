@@ -57,7 +57,9 @@
 #include "pix.h"
 #include "pcie.h"
 #include "pcie1.h"
+#include "b50_native.h"
 #include "lzero.h"
+#include "kepler.h"
 #include "rp1.h"
 #include "rp1_adc.h"
 #include "rp1_dma.h"
@@ -3234,10 +3236,18 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             http_append(out, &len, max, "abi status | abi selftest\n  Show kernel/user ABI transition stage, ksvc foundations, and pending EL0/SVC work.\n");
         } else if (http_streq(topic, "qpu") || http_streq(topic, "tensor")) {
             http_append(out, &len, max, "qpu status | tensor selftest\n  Show V3D/QPU tensor dispatch diagnostics and verify safe NEON fallback kernels.\n");
+        } else if (http_streq(topic, "kepler")) {
+            http_append(out, &len, max,
+                "kepler status | kepler probe | kepler rom <offset>\n"
+                "kepler i2c read <reg> | kepler i2c write <reg> <byte>\n"
+                "kepler vram read <generation> <offset>\n"
+                "kepler vram write <generation> <offset> <64 hex digits>\n"
+                "kepler vram zero <generation> <offset> <length>\n"
+                "  Decimal VRAM offsets; bring-up arena only; no compute or PCI DMA.\n");
         } else if (http_streq(topic, "pcie1") || http_streq(topic, "lzero")) {
             http_append(out, &len, max,
-                "pcie1 | pcie1 scan | pcie1 aer [clear] | lzero | lzero probe | lzero path | lzero map\n"
-                "  Pi 5 FFC/HAT root. Enum any device/switch. LevelZero B→E path; MSI masked.\n");
+                "pcie1 | pcie1 scan | pcie1 aer [clear] | lzero | lzero probe | lzero bars | lzero path | lzero map | lzero boot0\n"
+                "  Pi 5 FFC/HAT root. Scan/probe are passive; bars/map are explicit. MSI masked.\n");
         } else if (http_streq(topic, "walfs") || http_streq(topic, "disk")) {
             http_append(out, &len, max, "walfs verify | walfs compact | walfs status | walfs format confirm\n  Verify WAL metadata/record-chain integrity, compact the WAL (non-destructive), or status.\n");
         } else if (http_streq(topic, "exchange")) {
@@ -6392,6 +6402,17 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " ");
         http_append_hex32(out, &len, max, a.hdr3);
         http_append(out, &len, max, clear ? " cleared\n" : "\n");
+    } else if (http_streq(cmd, "b50 status") ||
+               http_streq(cmd, "b50 attach") ||
+               http_streq(cmd, "b50 preflight") ||
+               http_streq(cmd, "b50 revoke") ||
+               http_streq(cmd, "b50 canary")) {
+        u32 operation = B50_NATIVE_STATUS;
+        if (http_streq(cmd, "b50 attach")) operation = B50_NATIVE_ATTACH;
+        if (http_streq(cmd, "b50 preflight")) operation = B50_NATIVE_PREFLIGHT;
+        if (http_streq(cmd, "b50 revoke")) operation = B50_NATIVE_REVOKE;
+        if (http_streq(cmd, "b50 canary")) operation = B50_NATIVE_CANARY;
+        http_append(out, &len, max, b50_native_command(operation));
     } else if (http_streq(cmd, "pcie1 aer") ||
                http_streq(cmd, "pcie1 aer clear")) {
         struct pcie1_aer_snapshot a;
@@ -6443,6 +6464,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " fail=");
         http_append(out, &len, max, p1.fail_reason ? p1.fail_reason : "-");
         http_append(out, &len, max, "\n");
+        if (p1.malformed_topology)
+            http_append(out, &len, max, "  malformed bridge range: downstream scan limited\n");
         if (http_streq(cmd, "pcie1 scan") || p1.ep_count != 0) {
             for (u32 i = 0; i < p1.ep_count; i++) {
                 const struct pcie1_ep *e = &p1.eps[i];
@@ -6470,16 +6493,144 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
             if (p1.scan_truncated)
                 http_append(out, &len, max, "  (truncated)\n");
         }
+    } else if (http_streq(cmd, "kepler") || http_streq(cmd, "kepler status") ||
+               http_streq(cmd, "kepler probe")) {
+        if (http_streq(cmd, "kepler probe")) {
+            enum kepler_result result = kepler_probe();
+            http_append(out, &len, max, "kepler probe ");
+            http_append(out, &len, max, kepler_result_name(result));
+            http_append(out, &len, max, "\n");
+        }
+        struct kepler_status k;
+        kepler_snapshot(&k);
+        http_append(out, &len, max, "kepler probe_ok=");
+        http_append_u64(out, &len, max, k.probe_ok);
+        http_append(out, &len, max, " generation=");
+        http_append_u64(out, &len, max, k.generation);
+        http_append(out, &len, max, " boot0=");
+        http_append_hex32(out, &len, max, k.boot0);
+        http_append(out, &len, max, " post=");
+        http_append_hex32(out, &len, max, k.post);
+        http_append(out, &len, max, " posted=");
+        http_append_u64(out, &len, max, k.posted);
+        http_append(out, &len, max, " engines=");
+        http_append_hex32(out, &len, max, k.engines);
+        http_append(out, &len, max, " rom_available=");
+        http_append_u64(out, &len, max, k.rom_available);
+        http_append(out, &len, max, " command=");
+        http_append_hex32(out, &len, max, k.pci_command);
+        http_append(out, &len, max, " compute_ready=0\nnext=");
+        http_append(out, &len, max, !k.probe_ok ? "kepler probe" :
+                    (!k.posted ? "VBIOS cold POST required" :
+                                 "memory/channel/GR proof required"));
+        http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "kepler vram ")) {
+        char *argv[7];
+        u32 argc = http_split_args(cmd, argv, 7);
+        u32 generation = 0U, offset = 0U, bytes_count = KEPLER_VRAM_CHUNK;
+        u8 bytes[KEPLER_VRAM_CHUNK];
+        enum kepler_result result = KEPLER_RANGE;
+        bool read = argc == 5U && http_streq(argv[2], "read");
+        bool write = argc == 6U && http_streq(argv[2], "write");
+        bool zero = argc == 6U && http_streq(argv[2], "zero");
+        if ((read || write || zero) &&
+            http_parse_u32(argv[3], &generation) && http_parse_u32(argv[4], &offset)) {
+            bool valid = true;
+            if (write) {
+                bytes_count = 32U; /* Fits the HTTP terminal's 128-byte line. */
+                u32 hex_count = 0U;
+                while (hex_count < bytes_count * 2U && argv[5][hex_count])
+                    hex_count++;
+                valid = hex_count == bytes_count * 2U && argv[5][hex_count] == 0;
+                for (u32 i = 0; valid && i < bytes_count; i++)
+                    valid = pixe_parse_hex_byte_pair(argv[5] + 2U * i, &bytes[i]);
+            } else if (zero) {
+                valid = http_parse_u32(argv[5], &bytes_count);
+            }
+            if (valid)
+                result = kepler_vram(generation, read ? 0U : (write ? 1U : 2U),
+                                      offset, bytes, bytes_count);
+        }
+        if (result == KEPLER_OK) {
+            http_append(out, &len, max, "kepler vram ok");
+            if (read) {
+                http_append(out, &len, max, " ");
+                for (u32 i = 0; i < sizeof(bytes); i++)
+                    http_append_hex8(out, &len, max, bytes[i]);
+            }
+            http_append(out, &len, max, "\n");
+        } else {
+            http_append(out, &len, max, "ERR: kepler vram ");
+            http_append(out, &len, max, kepler_result_name(result));
+            http_append(out, &len, max, "\n");
+        }
+    } else if (http_starts_with(cmd, "kepler i2c ")) {
+        char *argv[6];
+        u32 argc = http_split_args(cmd, argv, 6);
+        u32 reg = 0U, value = 0U;
+        bool write = argc == 5U && http_streq(argv[2], "write");
+        enum kepler_result result = KEPLER_RANGE;
+        if ((write || (argc == 4U && http_streq(argv[2], "read"))) &&
+            http_parse_u32(argv[3], &reg) && reg <= 255U &&
+            (!write || (http_parse_u32(argv[4], &value) && value <= 255U))) {
+            u8 byte = (u8)value;
+            result = kepler_i2c_byte(write, (u8)reg, &byte);
+            value = byte;
+        }
+        http_append(out, &len, max, result == KEPLER_OK ?
+                    "kepler i2c ok value=" : "ERR: kepler i2c ");
+        if (result == KEPLER_OK)
+            http_append_u64(out, &len, max, value);
+        else
+            http_append(out, &len, max, kepler_result_name(result));
+        http_append(out, &len, max, "\n");
+    } else if (http_starts_with(cmd, "kepler rom ")) {
+        u32 offset = 0;
+        u8 bytes[KEPLER_ROM_CHUNK];
+        enum kepler_result result = KEPLER_RANGE;
+        if (http_parse_u32(cmd + 11, &offset))
+            result = kepler_rom_read(offset, bytes, sizeof(bytes));
+        if (result != KEPLER_OK) {
+            http_append(out, &len, max, "ERR: kepler rom ");
+            http_append(out, &len, max, kepler_result_name(result));
+            http_append(out, &len, max, "\n");
+        } else {
+            http_append(out, &len, max, "rom ");
+            http_append_hex32(out, &len, max, offset);
+            http_append(out, &len, max, " ");
+            for (u32 i = 0; i < sizeof(bytes); i++)
+                http_append_hex8(out, &len, max, bytes[i]);
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "lzero") || http_streq(cmd, "lzero status") ||
-               http_streq(cmd, "lzero probe") || http_streq(cmd, "lzero path") ||
-               http_streq(cmd, "lzero map")) {
+               http_streq(cmd, "lzero probe") || http_streq(cmd, "lzero bars") ||
+               http_streq(cmd, "lzero path") ||
+               http_streq(cmd, "lzero map") || http_streq(cmd, "lzero boot0")) {
         struct lzero_status lz;
-        if (http_streq(cmd, "lzero probe")) {
+        if (b50_native_blocks_legacy() &&
+            (http_streq(cmd, "lzero probe") || http_streq(cmd, "lzero bars") ||
+             http_streq(cmd, "lzero map") || http_streq(cmd, "lzero boot0"))) {
+            http_append(out, &len, max, "lzero mutation refused: native B50 lifecycle reserved; cold recovery required\n");
+        } else if (http_streq(cmd, "lzero probe")) {
             pcie1_rescan();
             lzero_probe();
+        } else if (http_streq(cmd, "lzero bars")) {
+            if (!lzero_probe_bars())
+                http_append(out, &len, max, "lzero bars refused (need passive GPU discovery)\n");
         } else if (http_streq(cmd, "lzero map")) {
             if (!lzero_map_bar0())
                 http_append(out, &len, max, "lzero map refused (need B bars + BAR0<=ATU)\n");
+        } else if (http_streq(cmd, "lzero boot0")) {
+            u32 boot0 = 0U;
+            if (!lzero_map_bar0() || !lzero_bar0_read32(0U, &boot0))
+                http_append(out, &len, max, "lzero boot0 FAILED\n");
+            else {
+                http_append(out, &len, max, "lzero boot0=");
+                http_append_hex32(out, &len, max, boot0);
+                http_append(out, &len, max, " chipset=");
+                http_append_hex32(out, &len, max, (boot0 >> 20U) & 0x1FFU);
+                http_append(out, &len, max, "\n");
+            }
         }
         lzero_status(&lz);
         http_append(out, &len, max, "lzero state=");
@@ -6515,10 +6666,15 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " mapped=");
         http_append_u64(out, &len, max, lz.bar0_mapped ? 1U : 0U);
         http_append(out, &len, max, "\n  next=");
-        http_append(out, &len, max, lz.next ? lz.next : "-");
-        http_append(out, &len, max, "\n  path B compute -> C BAR0 map -> D GuC -> E proof\n");
+        http_append(out, &len, max, lz.vendor_id == 0x10DEU ?
+                    "kepler probe (NVIDIA; no GuC/LevelZero)" :
+                    (lz.next ? lz.next : "-"));
+        http_append(out, &len, max, lz.vendor_id == 0x10DEU ?
+                    "\n  path identity -> VBIOS POST -> memory/channel -> compute proof\n" :
+                    "\n  path B compute -> C BAR0 map -> D GuC -> E proof\n");
         http_append(out, &len, max, "  caps=");
-        http_append(out, &len, max, LZERO_DASH_CAPS);
+        http_append(out, &len, max, lz.vendor_id == 0x10DEU ?
+                    "NVIDIA Kepler; tensor acceleration not enabled" : LZERO_DASH_CAPS);
         http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "ksvc") || http_streq(cmd, "ksvc status")) {
         struct ksvc_snapshot_entry ks[KSVC_MAX_SERVICES];
@@ -21249,7 +21405,7 @@ static bool ui_console_help_topic(const char *topic)
         ui_console_write("tensor selftest\n  Verify safe NEON fallback tensor kernels.\n");
     } else if (ui_streq(topic, "pcie1") || ui_streq(topic, "lzero")) {
         ui_console_write("pcie1 | pcie1 scan\n  Pi 5 FFC/HAT root. Enumerates any switch/device on the connector.\n");
-        ui_console_write("lzero | lzero probe | lzero path | lzero map\n  B compute-class + BAR sizes; C BAR0 map; D/E firmware/proof still blocked.\n");
+        ui_console_write("lzero | lzero probe | lzero bars | lzero path | lzero map\n  Probe is passive; bars sizes config explicitly; C maps BAR0. D/E blocked.\n");
     } else if (ui_streq(topic, "files") || ui_streq(topic, "fs")) {
         ui_console_write("pwd | cd <path> | lsdir [path]\n");
         ui_console_write("mkdir <path> | touch <path> | cat <path> | stat <path> | rm <path>\n");
@@ -23076,9 +23232,11 @@ static void hdmi_dashboard_render(void)
     u32 hw_col = 0U;
     u32 hw_row = header_row + header_h + 1U;
     u32 hw_w = wide ? header_w : compact_w;
-    u32 hw_h = 16U + PCIE1_DASH_MAX;
+    u32 hw_h = 16U;
+    u32 pcie_row = hw_row + hw_h + 1U;
+    u32 pcie_h = 11U;
     u32 tns_col = 0U;
-    u32 tns_row = hw_row + hw_h + 1U;
+    u32 tns_row = pcie_row + pcie_h + 1U;
     u32 tns_w = wide ? header_w : compact_w;
     u32 tns_h = 10U;    /* border + header + seven accelerator feature rows */
     u32 map_col = 0U;
@@ -23117,6 +23275,7 @@ static void hdmi_dashboard_render(void)
         fb_clear(0x00000000);
         dash_draw_window(header_col, header_row, header_w, header_h, "PIOS WORKBENCH", 0x0000FF80);
         dash_draw_window(hw_col, hw_row, hw_w, hw_h, "HARDWARE / CAPABILITIES", 0x0000CCFF);
+        dash_draw_window(0U, pcie_row, header_w, pcie_h, "PCIE1 ENUMERATION (CACHED)", 0x0000CCFF);
         dash_draw_window(tns_col, tns_row, tns_w, tns_h, "PARALLEL / VECTOR ACCELERATION", 0x00FF80FF);
         dash_draw_window(map_col, map_row, map_w, map_h, "NETWORK / PROCESS MAP", 0x00FFAA00);
         dash_draw_window(log_col, log_top, log_w, log_h, "WARNINGS / ERRORS", 0x00FF4040);
@@ -23382,30 +23541,6 @@ static void hdmi_dashboard_render(void)
                           p1.present ? "RC 0x1000110000" : "not present",
                           p1.link_up ? "32M ATU" : "0",
                           p1caps);
-        if (p1.link_up) {
-            u32 shown = p1.ep_count;
-            if (shown > PCIE1_DASH_MAX)
-                shown = PCIE1_DASH_MAX;
-            for (u32 ei = 0; ei < shown && hw_r < hw_end; ei++) {
-                const struct pcie1_ep *e = &p1.eps[ei];
-                char bdf[16], id[12], caps[48];
-                const char *vn = pcie1_vendor_name(e->vendor);
-                pcie1_fmt_bdf(bdf, sizeof(bdf), e->bus, e->dev, e->func);
-                pcie1_fmt_id(id, sizeof(id), e->vendor, e->device);
-                pcie1_fmt_caps(caps, sizeof(caps), e);
-                dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load,
-                                  hw_ram, hw_caps, bdf,
-                                  pcie1_hdr_kind(e->hdr_type),
-                                  0x0000FF80U, id,
-                                  vn ? vn : pcie1_hdr_kind(e->hdr_type),
-                                  caps);
-            }
-            if (p1.ep_count == 0 && hw_r < hw_end)
-                dash_hw_row_state(hw_r++, hw_dev, hw_active, hw_load, hw_ram,
-                                  hw_caps, "p1 empty", "NONE", 0x00FFAA00U,
-                                  "link up", "0",
-                                  "no functions on FFC (switch/endpoint)");
-        }
     }
     if (hw_r < hw_end)
         dash_hw_row_u64_hex(hw_r++, hw_dev, hw_active, hw_load, hw_ram, hw_caps,
@@ -23454,9 +23589,50 @@ static void hdmi_dashboard_render(void)
                     (PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB) ? "scanout+back" : "0",
                     (PIOS_HAS_MAILBOX_FB || PIOS_HAS_BOOTINFO_FB) ? "workbench dashboard" : "serial console only");
 
-    /* PARALLEL / VECTOR ACCELERATION: list only features that have passed their
-     * guarded runtime proof. CPU/NEON is always present; QPU feature state is
-     * read from each verified kernel rather than inferred from CSD availability. */
+    {
+        struct pcie1_status pcie;
+        pcie1_status(&pcie);
+        dash_clear_body(0U, pcie_row, header_w, pcie_h);
+        fb_set_color(0x00AAAAAA, 0);
+        fb_set_cursor(2U, pcie_row + 1U);
+        u32 count = pcie.ep_count < PCIE1_SCAN_MAX ? pcie.ep_count : PCIE1_SCAN_MAX;
+        u32 rows_per_column = pcie_h - 3U;
+        u32 columns = (header_w - 4U) / 76U;
+        if (columns == 0U) columns = 1U;
+        if (columns > 3U) columns = 3U;
+        u32 column_width = (header_w - 4U) / columns;
+        u32 per_page = rows_per_column * columns;
+        u32 pages = count ? (count + per_page - 1U) / per_page : 1U;
+        u32 page = (u32)((now_ms / 8000ULL) % pages);
+        fb_printf("%u functions | page %u/%u | %s%s",
+                  count, page + 1U, pages,
+                  pcie.link_up ? "link up" : "link down",
+                  pcie.scan_truncated ? " | scan truncated" : "");
+        if (!count) {
+            fb_set_cursor(2U, pcie_row + 2U);
+            dash_put_trunc(pcie.fail_reason ? pcie.fail_reason : "no cached devices",
+                           header_w - 4U);
+        }
+        for (u32 slot = 0; slot < per_page && page * per_page + slot < count; slot++) {
+            u32 row = slot % rows_per_column;
+            u32 left = 2U + (slot / rows_per_column) * column_width;
+            const struct pcie1_ep *ep = &pcie.eps[page * per_page + slot];
+            char bdf[16], identity[12], capability[48];
+            pcie1_fmt_bdf(bdf, sizeof(bdf), ep->bus, ep->dev, ep->func);
+            pcie1_fmt_id(identity, sizeof(identity), ep->vendor, ep->device);
+            pcie1_fmt_caps(capability, sizeof(capability), ep);
+            fb_set_color(pcie.link_up ? 0x00FFFFFF : 0x00AAAAAA, 0);
+            fb_set_cursor(left, pcie_row + 2U + row);
+            fb_puts(bdf);
+            fb_set_cursor(left + 12U, pcie_row + 2U + row);
+            fb_puts(identity);
+            fb_set_cursor(left + 23U, pcie_row + 2U + row);
+            fb_puts(pcie1_hdr_kind(ep->hdr_type));
+            fb_set_cursor(left + 27U, pcie_row + 2U + row);
+            dash_put_trunc(capability, column_width - 29U);
+        }
+    }
+    /* Accelerator rows report runtime proofs, not mere device discovery. */
     dash_clear_body(tns_col, tns_row, tns_w, tns_h);
     struct tensor_status tns;
     tensor_status(&tns);
@@ -23585,7 +23761,15 @@ static void hdmi_dashboard_render(void)
             fb_puts(lzero_dash_state_of(&lz));
             fb_set_color(0x00FFFFFF, 0x00000000);
             fb_set_cursor(t_detail, tns_r);
-            dash_put_trunc(LZERO_DASH_CAPS, t_detail_w);
+            if (lz.vendor_id == 0x10DEU) {
+                struct kepler_status k;
+                kepler_snapshot(&k);
+                dash_put_trunc(k.probe_ok && !k.posted ?
+                    "GK107: VBIOS POST required; compute off" :
+                    "NVIDIA Kepler: compute proof pending", t_detail_w);
+            } else {
+                dash_put_trunc(LZERO_DASH_CAPS, t_detail_w);
+            }
         }
     }
 
@@ -24673,6 +24857,7 @@ NORETURN void core0_main(void) {
         if (airq_pending(CORE_NET)) {
             u64 svc_fifo0 = ksvc_begin(ksvc_fifo0_id);
             u32 airq_done = airq_dispatch(CORE_NET, ADRV_PASS_BUDGET_MS);
+            b50_native_service();
             core0_airq_dispatch_passes++;
             if (airq_done == 0U)
                 core0_airq_empty_passes++;

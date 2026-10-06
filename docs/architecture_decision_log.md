@@ -121,6 +121,8 @@ decision)
 | [076](ADR-076-discovery-only-storage-layout.md) | Discovery-only storage layout | Owner | Superseded by ADR-078 |
 | [077](ADR-077-wifi-association-control.md) | Offline Wi-Fi association control contract | Owner | Accepted |
 | [078](ADR-078-storage-role-markers.md) | Explicit storage role markers | Owner | Accepted |
+| [079](#adr-079) | Native Kepler compute behind existing PicoScript hooks | Owner | Accepted; hardware execution pending |
+| [082](#adr-082) | Guarded native B50 DMA adapter and live canary | Owner | Accepted; activation not yet implemented |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -576,7 +578,8 @@ Acceleration` in red until a verified proof exists.
 
 - `pcie2` @ `0x1000120000` remains RP1 (`src/pcie.c`). `pcie1` @
   `0x1000110000` is a separate BCM2712 root complex (`src/pcie1.c`), reset
-  id 43, 8 MiB Device ATU at `0x1B00000000`. It must not steal the RP1
+  id 43, 32 MiB Device ATU at CPU `0x1B80000000` mapped to PCI
+  `0x80000000`. It must not steal the RP1
   window at `0x1F00000000` or assert reset id 44.
 - Milestone A is link-up + bounded config enum. MSI INTID 255/256 stay
   masked. Firmware still needs `dtparam=pciex1`. A 70 W GPU takes 12 V from
@@ -611,6 +614,34 @@ PHY_CTL15=`0x4DBC0012` passed; endpoint Command bits MEM/MASTER stayed clear,
 BAR0 remained unmapped, and RC AER was clear. This establishes the old host
 initialization as a blocker without attributing the fault to new hardware.
 
+**2026-10-02 BAR0 correction (owner approved).** The original BAR0-only map
+used a different range (CPU `0x1B00000000` -> PCI `0`) from Linux/Circle and
+did not program the root Type-1 Memory Base/Limit forwarding register. Those
+were corrected, but repeated watchdog reboots were not proof of missing
+PCIe completions: the live CPU mapping was absent throughout. Use the
+Pi 5 device-tree non-prefetchable range instead: CPU `0x1B80000000` ->
+PCI `0x80000000`. Assign BAR0 in that range and program the exact 1 MiB-granular
+root forwarding window before enabling endpoint Memory Space. Bus Master,
+BAR1/prefetch LMEM, DMA and MSI remain disabled.
+The CPU range falls in L1 index 110, not the old index 108. Pi stage2 enters
+through `start.S` and `mmu_enable_caching()` without calling `mmu_init()`;
+editing only `mmu_init()` never fixes the active root. Live RAM readback
+confirmed L1[110] was zero. Install an L2 table containing exactly sixteen
+2 MiB Device-nGnRnE, EL1-only, XN blocks on the unpublished cache-remap root
+before its TTBR switch, and reuse the builder in `mmu_init()`. Adjacent space
+remains invalid. `AT S1E1R`/`PAR_EL1` checks the active identity/Device
+translation before a BAR map/read; it never accesses the endpoint.
+
+Live `v20261002.205923` reads `BOOT0=0x0E73E0A2` repeatedly (GK107 / chipset
+`0xE7`), without reboot, with endpoint Command=`0x0002`, AER clear and wired
+management intact. No GPU engine, bus mastering, DMA or MSI was enabled.
+Circle reference: `rsta2/circle` commit
+`7a81e1b480fe7d19fc1fc695b89bff0a0848f44b`, `lib/bcmpciehostbridge.cpp`
+(`enable_bridge`, `enable_device`, `pcie_set_outbound_win`) and
+`include/circle/memorymap64.h`. Its generic `enable_device` assumes a 64-bit
+BAR and enables bus mastering; neither should be copied for our 32-bit
+K2000 BAR0 identity-only probe.
+
 ---
 
 <a name="adr-046"></a>
@@ -627,7 +658,7 @@ the FFC to Arc Pro B50; any compute-class function is a candidate.
   from the pcie1 snapshot. Size-probe BARs in config space and restore.
   LMEM size is recorded, never mapped.
 - **C** — `lzero map` programs **BAR0 only** into the pcie1 Device ATU
-  (32 MiB at `0x1B00000000`) if it fits. Memory decode on, Bus Master off.
+  (CPU `0x1B80000000` → PCI `0x80000000`, 32 MiB) if it fits. Memory decode on, Bus Master off.
   If BAR0 > ATU, stay blocked (`bar0>atu`); do not steal RP1 or grow into
   the 12 GiB prefetch window.
 - **Inbound DMA (#141)** — pcie1 RC BAR2 is **2 MiB** at PCIe
@@ -2530,3 +2561,305 @@ quarantines the contract.
 **Activation boundary.** This contract contains no PCIe/MMIO/DMA/AIRQ/block or
 WALFS wiring. Live I/O remains blocked on physical controller proof and the
 #188/#189 ownership boundaries.
+
+---
+
+<a name="adr-079"></a>
+## ADR-079 — Native Kepler compute behind existing PicoScript hooks
+
+**Date:** 2026-10-02 · **Decider:** Owner · **Status:** Accepted; implementation pending
+
+**Owner direction.** Reuse the pluggable QPU capabilities for K2000 vector and
+matrix acceleration. The owner approved a native Kepler backend behind the
+existing hooks and explicitly allowed Mesa-type accelerators rather than
+requiring the proprietary CUDA runtime.
+
+**Decision.**
+
+- Preserve `pv_tensor_hook` / `pv_compute_hook`, existing Tensor/Async semantics,
+  and the working CPU/NEON/QPU implementations. Applications get opaque jobs
+  and bounded spans, never GPU MMIO or DMA authority.
+- Retain the Intel LevelZero/B50 path alongside the separate NVIDIA backend.
+  Owner clarification: use the K2000 as the initial test card for PCIe, BAR
+  access, communications and guarded DMA; subsequently exercise the shared
+  infrastructure with the B50. NVIDIA-specific diagnostic labels must not
+  remove Intel functionality. Card replaceability never relaxes host-memory
+  containment, reset recovery or wired-management requirements.
+- Prefer Mesa Nouveau's Kepler compiler/compute definitions as the offline
+  kernel-production reference. Its `nvc0/nve4_compute.c` submission code still
+  assumes a Nouveau kernel driver; it is not a freestanding replacement for
+  GPU memory management, channel creation, engine initialization or completion.
+  The GK107 reference uses the GK104-family FIFO/GR implementations.
+- PIOS owns a bounded native backend: fixed reviewed kernels first, not
+  arbitrary CUDA/PTX/cubin execution, a CUDA runtime port, or a full Mesa/DRM
+  graphics stack. Preserve upstream licenses and pin provenance for any reused
+  source, firmware or generated kernel artifacts.
+- Keep PCIe at the proven Gen2 x1 during bring-up. Start with a guarded
+  known-answer hardware kernel, then the existing `Tensor.DotI8` and
+  `Tensor.MatVecI8` contracts. Keep their signed arithmetic, dimensions,
+  span layout and failure semantics identical across backends.
+- Activate hardware in stages: endpoint/BAR ownership (#188), bounded GPU
+  memory and channel setup plus DMA/MSI containment (#189), verified kernel
+  execution, and finally PicoVM dispatch. The existing offline contracts
+  remain disabled until an explicitly implemented and validated live adapter
+  supplies their hardware boundary; this decision alone changes no gate.
+- Jobs are kernel-owned and generation checked, with FIFO/AIRQ completion,
+  mandatory deadlines and fail-closed quarantine. Never spin core 0 waiting
+  for GPU completion. Advertise each operation only after its hardware proof;
+  select acceleration based on end-to-end measurements including transfers.
+
+**Not established yet.** PCIe enumeration proves no GPU compute capability.
+The current `lzero` discovery label is Intel-oriented; NVIDIA must not be
+reported as having GuC/LevelZero support. GK107 is not a tensor-core device,
+and the observed prefetch BAR size is not its installed VRAM capacity.
+
+**2026-10-02 diagnostic milestone.** The native `kepler` module supplies
+core-0-only, exact K2000/GK107 identity and cold-POST diagnostics. The explicit
+`kepler probe` reuses verified BAR0 mapping; no engine initialization or DMA
+occurs. `kepler rom <offset>` reads only 128 aligned bytes from the fixed
+1 MiB PROM aperture, with PCI identity, active translation, AER and Bus Master
+checks. It refuses a shadowed PROM instead of modifying the ROM selector.
+The register API's all-ones sentinel is not applied to ROM payloads because
+erased flash words may legitimately contain all-ones.
+
+`v20261002.214043` proves the card is not POSTed: register `0x2240c` is zero,
+and the display RAMIN BIOS shadow is disabled. A 132,096-byte local PROM capture
+contains matching `10DE:0FFE` legacy and EFI images; the legacy checksum and
+BIT directory bounds pass. Seven normal init scripts plus one extra script
+contain 584 distinct instruction addresses across 26 opcode forms and eight
+memory-configuration variants. The host inspector is a static inventory,
+not an execution trace or an approved MMIO-write list. Firmware bytes stay in
+the session workspace, not source control. `compute_ready` remains false:
+cold POST, VRAM, channel/GR setup, contained DMA and a tensor proof remain.
+
+**2026-10-02 POST and VRAM checkpoint.** `tools/kepler_post.py` executes the
+reviewed GK107 opcode subset with injected I/O, bounded recursion/repeats,
+predicate propagation, timed conditions and one cached RAM-strap selection.
+The operator adapter preflights the board tables and exact ROM digest; it
+uses individual scheduled terminal MMIO transactions so it never holds core 0
+across an entire script. This is a bring-up harness, not the final native
+tensor submission path. PCI bus mastering remains off. GPU I2C byte transfers
+are kernel-local and capped at 2 ms; no GPIO/I2C dependencies are skipped.
+
+On `v20261002.220506`, a single attempt completed 708 instruction steps and
+570 interpreter writes, and read back the actual POST marker as 2. A guarded,
+reversible 64-byte PRAMIN scratch proof then passed two patterns and 64 bytes
+of adjacent guards on the reported uniform 2 GiB VRAM layout. Original
+contents and selector were read back after restoration. These are POST and
+sampled-VRAM proofs only; PCI DMA, channels, GR and Tensor/BitNet execution
+still need their own independent hardware acceptance.
+Repeated on `v20261002.222000` after another OTA reboot: cold POST and the
+reversible VRAM proof both pass again with BME off and clear AER. The helper
+is still operator-triggered; no automatic cold POST or app-visible compute
+claim is made.
+
+On `v20261002.231552`, the bounded operator channel harness completed a
+64-byte known-answer VRAM-to-VRAM copy with the A0B5 copy class: channel 0,
+CE0/runlist 4/PBDMA 2, GPU-local instance/USERD/GPFIFO/pushbuffer/page tables.
+The hardware TOP table supplies CE0 reset bit 6. The completion semaphore
+changed to `0xc0010001`; destination bytes matched the source and both
+32-byte guards, while source bytes stayed unchanged. Stop/preempt, empty
+runlist, unbind and register restoration completed. PCI Command remained
+`0x0002` (Bus Master off), AER stayed clear, and Pi5 selftests passed 14/14.
+This proves GPU command fetch and CE execution without granting host DMA.
+It does not prove GR/SM execution, a Tensor provider, or accelerated BitNet.
+The HTTP terminal has a 128-byte command buffer (the console helper's 256
+bytes is not the HTTP limit); VRAM terminal writes are consequently 32 bytes,
+with production-parser regression coverage. Earlier oversized commands failed
+before channel activation. All unassigned GPU PTEs are verified zero, and the
+operator arena remains reserved until reboot rather than being reclaimed
+under a failed channel.
+
+Fixed SM30 kernels are now assembled with pinned envytools
+`f102b82381f3f11cee113d16374c87091db039d9` (`gf100:gk104`): one-word store,
+wrapping INT32 vector add, and signed-INT8 matvec (dot is its single-row
+profile). Conservative 64-byte scheduling blocks and exact code hashes are
+checked before upload. The bounded instruction model reproduces the existing
+64x64 BitNet Wq fixture (argmax 57, checksum 170896). All three code images
+were uploaded and read back byte-exactly on `v20261002.231552`, with GR and
+PBDMAs disabled and BME off. This is code preparation/upload only; it does
+not promote `compute_ready`, prove GPU arithmetic, or replace the pending
+GR/QMD and PicoScript-provider acceptance stages.
+
+**References.**
+
+- Mesa Nouveau compute: `src/gallium/drivers/nouveau/nvc0/nve4_compute.c`.
+- Linux Nouveau GK107 identification/setup:
+  `drivers/gpu/drm/nouveau/nvkm/engine/device/base.c` (`nve7_chipset`).
+- Existing PIOS provider seams: `include/picovm.h`,
+  `src/tensor.c:tensor_picovm_hook`, `tensor_picovm_compute_hook`, `tensor_init`.
+- Nouveau POST/GPIO/I2C reference semantics:
+  `nvkm/subdev/bios/init.c`, `bios/ramcfg.c`, `bios/M0203.c`,
+  `gpio/gf119.c`, `i2c/busgf119.c`, and `engine/disp/vga.c`.
+  Register/table layouts are reimplemented here; upstream license notices
+  must be preserved if upstream implementation or microcode is later vendored.
+
+---
+
+<a name="adr-080"></a>
+## ADR-080 — Keep the sealed keystore outside both raw boot slots
+
+**Date:** 2026-10-03 · **Decider:** Owner · **Status:** Accepted; hardware recovery verified
+
+**Evidence.** The live SD's active slot B differed from its deployed Pi5
+payload in exactly one 512-byte sector, at payload offset `0xFFE00`. That
+sector was byte-identical to the sealed `KSTR` record at p2 + `0x500000`.
+Slot B starts at `0x400000`; its header consumes 512 bytes, so this key sector
+lands inside executable code. Its flags word (`1`) replaced `tls_init`'s
+first instruction at `0x17FE0C`. The persisted crash reported EC=0 there.
+The OTA boot had already loaded the intact payload into RAM before keystore
+initialization wrote the disk; a later cold boot exposed the corruption.
+
+**Decision approved by the owner.** Reserve the sector at p2 + `0x900000`
+for the sealed record and move the future-reservation start to `0x900200`.
+Keep both A/B offsets, capacities, boot-control location, WALFS base and the
+authenticated record format unchanged. Header user-record metadata follows
+the new sector. Compile-time assertions exclude both boot slots and control;
+runtime checks prove partition bounds before computing either LBA.
+
+A blank new sector may import a recognized legacy record only after successful
+authentication; copy the complete record unchanged and verify its readback.
+Never write or clear the legacy sector, because it belongs to slot B. Unknown
+nonblank destination contents, unsupported record versions, authentication
+failure and failed readback are errors, not permission to regenerate a key.
+First-boot provisioning remains available when no key record exists.
+
+**Recovery.** Preserve the crash record, both original slots, boot control,
+sealed record and overwritten destination sector locally before changing the
+card. Explicit offline recovery copies the existing sealed record to its new
+sector and replaces both boot slots plus FAT recovery images with fixed
+builds; retaining an old slot-A writer would reintroduce corruption on rollback.
+The original reserved destination was nonblank and is backed up rather than
+silently discarded. No partition resize, WALFS format or key regeneration.
+
+The approved SD repair installed `v20261003.102838` in both slots and the
+corrected multiboard FAT recovery package. Full slot readbacks match the
+built payload (SHA-256
+`94110788c02ce2937ecdbb844097706188aef80682b9ee10f896e27015ea15c9`).
+The sealed record is byte-identical at its new location; MBR, boot control and
+persisted crash sector are unchanged. Host migration/bounds/failure tests and
+QEMU smoke pass. The repaired Pi5 booted `v20261003.102838` and then survived
+a second reboot into the same image. Both boots passed selftests 14/14;
+the keystore authenticated at LBA 1083392 with unchanged generation and
+fingerprint, and network error/wedge counts stayed zero.
+
+**Rejected.** Disabling TLS, patching only the overwritten instruction,
+reinstalling an unsafe slot B, or blaming GPU writes: none removes the raw-disk
+ownership collision. Removing A/B rollback is unnecessary.
+
+---
+
+<a name="adr-081"></a>
+## ADR-081 — Native x86_64 PIOS boots and stores on USB before SATA enablement
+
+**Date:** 2026-10-05 · **Decider:** Owner · **Status:** Accepted; implementation started
+
+**Owner direction.** The Ivy Bridge dual-Xeon host must initially boot PIOS
+from USB because it has no SD reader. That same USB device is its initial PIOS
+storage volume, in the same role that the SD card fills on Raspberry boards.
+The host may connect a PEX8749 and B50s directly, and the same fabric must be
+supportable behind Pi5 PCIe1 and native x86 root ports. Existing Hyper-V AMD64
+work is a stepping stone, not the production hardware target.
+
+**Decision.**
+
+- Native Dell boot is a signed-or-locally-authorized x86_64 UEFI application on
+  a USB FAT32 ESP. It captures the UEFI memory map and ACPI facts, then exits
+  boot services and transfers to PIOS-owned x86_64 kernel code. The USB device
+  remains the initial persistent PIOS store.
+- SATA is not a boot dependency. Native AHCI discovery, controller reset,
+  IOMMU/VT-d containment, DMA arenas and block I/O must be proven separately
+  before the Dell SSD is mounted or written. No firmware/UEFI SATA writes are
+  used as a shortcut.
+- A shared passive PCIe-fabric model records a bounded hierarchy of immutable
+  config-space observations. It recognizes bridge reachability and B50
+  functions but cannot configure bridges, BARs, Memory Space, Bus Master, MSI
+  or DMA. Pi5 and x86 backends must use it before later architecture-specific
+  configuration phases.
+- PEX8749 bridge/bus-number configuration is explicit and generation-owned,
+  not hidden inside discovery. It follows passive topology evidence and
+  precedes BAR leasing. Each B50 remains an independent endpoint lease.
+- Build one image per target: native x86_64 Dell, Hyper-V x86_64, QEMU
+  x86_64, Hyper-V ARM64 and QEMU ARM64. `BOOTX64.EFI`/`BOOTAA64.EFI` are
+  compiled and packaged with exactly one matching kernel target; normal boot
+  performs no environment-based payload selection. Shared code is limited to
+  architecture-neutral contracts, PCIe fabric semantics, USB disk layout,
+  storage formats, PicoScript bytecode/data and host-service APIs. Raspberry
+  Pi firmware boot remains the separate `kernel8.img` stage0/PGS2 path until
+  a Pi UEFI mode is explicitly enabled and proven.
+
+**Development proof and correction.** On 2026-10-05, the three-partition x64
+USB image booted the existing `BOOTX64.EFI` **probe** in a Hyper-V Generation 2
+VM. UEFI console output reported checksum-valid FACP, OEM0, WAET, APIC, SRAT
+and BGRT ACPI tables; MADT reported two LAPICs, one IOAPIC and one ISO. This
+proves only the UEFI entry, x86_64 probe and ACPI parsing foothold. It is **not
+PIOS OS boot**, does not enter a PIOS kernel, does not make PicoScript ready,
+and is not online. Hyper-V COM1 produced no captured pipe output, so the UEFI
+console frame is the probe evidence. Elevated DDA inventory returned no
+assignable device; no host GPU was detached or assigned.
+
+**Required Hyper-V OS acceptance.** A passing result must be PIOS-owned code
+after `ExitBootServices`, with x86_64 page tables/GDT/IDT, APIC timer and
+exception path live; USB block storage mounted through a PIOS backend;
+PicoScript VM/service initialized; and a PIOS Hyper-V VMBus/netvsc backend
+serving a real status/PicoScript endpoint. UEFI Simple Network Protocol alone
+is not an acceptable substitute because it cannot remain the PIOS networking
+backend after exit from boot services.
+
+**Rejected.** Booting the initial Dell implementation from SATA; making the
+Hyper-V probe a production bare-metal runtime; treating PEX8749 as a flat
+device list; implicit PCI bridge writes during passive scan; assigning GPU DMA
+authority before VT-d/IOMMU policy exists.
+
+---
+
+<a name="adr-082"></a>
+## ADR-082 — Guarded native B50 DMA adapter and live canary
+
+**Date:** 2026-10-06 · **Decider:** Owner · **Status:** Accepted; activation not yet implemented
+
+**Owner direction.** Following the live B50 BAR0/GMD_ID proof, the owner
+explicitly approved "Approve guarded native adapter and live canary".
+This authorizes implementation of the live adapter deferred by ADR-062/063,
+not unconditional hardware enablement or a claim that DMA is proven.
+
+**Decision.** One B50 is owned by a core-0, generation-backed BAR lease and
+DMA containment contract. Hardware activation is operator-triggered, never
+boot-time or a side effect of passive discovery. Before BME can be enabled,
+the adapter must validate identity, current BAR/path forwarding, exact root
+inbound aperture, every active CPU mapping of the arena, red zones, firmware
+and queue bounds, deadline, and a registered dedicated IRQ/AIRQ completion
+path. The canary is bounded to an owned span within the reserved Normal-NC
+arena. The hardware IRQ only quiesces/acknowledges and publishes bounded
+sequence-backed completion work; inspection runs through FIFO/AIRQ.
+
+AER, timeout, malformed completion, changed identity, removal, or red-zone
+damage quarantines the generation and explicitly revokes BME before any
+release/reuse. A register audit alone cannot prove hostile DMA isolation;
+the 2 MiB RC aperture is not a per-endpoint IOMMU. Other B50s/audio functions
+remain inactive, MSI stays disabled until its handler is installed, and
+general-purpose GPU queues/compute remain outside this canary acceptance.
+The existing pure contracts' always-false activation functions are not
+replaced by always-true functions or operator-supplied success flags.
+
+**Evidence so far.** On `v20261006.183632`, B50 05:00.0 returned
+`GMD_ID=0x05004000` three times (Xe2 HPG 20.1 revision 0), with MEM-only
+commands on its path and clear root AER. Read-only DMA preflight verified
+BAR2 size encoding 6, PCI base `0x1000000000`, CPU remap `0x04E00001`,
+disabled BAR1/BAR3 and MSI address decode, and BME off on all three GPUs.
+`tools/pios_b50_dma_preflight.py` makes that audit reproducible and fails
+closed on every tested aperture, identity, or command mismatch.
+Actual host DMA, IRQ delivery, active Normal-NC translation acceptance,
+native lease adoption, and clean revocation remain unproven.
+
+**Activation permission clarified.** The owner subsequently permitted BME,
+MSI address decode, and alternate inbound BARs if required. Each such
+activation must still have a specific bounded owner/transfer and a proven
+recovery path; this is not permission to open all host memory. The native
+adapter currently implements operator attach, a generation-backed BAR lease
+using real probe/readback/restoration, CPU-owned guarded DMA slice checking,
+page-by-page active EL1 writable Normal-NC identity checks, explicit BME
+revocation, and a masked dedicated IRQ with a sequence-backed AIRQ
+continuation. An unexpected IRQ quarantines rather than fabricating a
+completion. `b50 canary` explicitly rejects the missing firmware/queue/
+completion adapter, and never sets BME merely to make a status gate green.

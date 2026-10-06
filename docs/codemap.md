@@ -305,7 +305,8 @@ pios/
 - **API:** `pcie_init()` — brings up PCIe link to RP1
 
 ### `src/pcie1.c` — PCIe1 Root Complex (FFC / HAT)
-- **Role:** BCM2712 pcie1 RC, separate from RP1. 32 MiB Device ATU at `0x1B00000000` (BAR0, not LMEM).
+- **Role:** BCM2712 pcie1 RC, separate from RP1. 32 MiB Device ATU at CPU
+  `0x1B80000000` -> PCI `0x80000000` (BAR0, not LMEM).
 - **API:** `pcie1_init()`, `pcie1_status()`, bounded config enum. MSI masked.
 - **See:** ADR-045, issue #137
 

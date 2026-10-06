@@ -25,6 +25,36 @@ Traps: [`gotchas.md`](gotchas.md).
 Additional compile targets (not SD-booted Raspberry boards): UEFI, Hyper-V
 ARM/x64, Arm FVP A76+GICv2. Same kernel contracts; different backends.
 
+## Planned native x86_64 host
+
+The Ivy Bridge dual-Xeon/Dell target is a native UEFI x86_64 port, not the
+existing Hyper-V probe. Its first boot device is a USB FAT32 ESP, which remains
+the initial PIOS storage volume just as SD does on Pi boards. The directly
+attached SATA SSD is later AHCI storage only after native PCI/AHCI and VT-d
+containment acceptance; it is not an early boot shortcut.
+
+`build_hyperv_amd64.bat` emits a mandatory three-GPT-partition USB disk:
+index 0 FAT32 `PIOS USB ESP`, index 1 raw `PIOS WALFS`, index 2 FAT32
+`PIOSXFER`. The current `BOOTX64.EFI` is only an x86_64 UEFI probe that reports
+CPUID, ACPI and Hyper-V facts. It is not PIOS OS boot, PicoScript-ready or
+online. Native x86 must add `ExitBootServices` handoff, page tables, GDT/IDT,
+APIC/timer, USB storage, VMBus/netvsc and the PIOS service/PicoScript stack.
+
+Each USB image is built for one exact target: native x86_64 Dell, Hyper-V
+x86_64, QEMU x86_64, Hyper-V ARM64 or QEMU ARM64. It has its matching
+`BOOTX64.EFI` or `BOOTAA64.EFI` plus the common GPT
+ESP/WALFS/PIOSXFER layout. No normal boot selects between multiple processor
+architectures or environments at runtime. Shared code is deliberately limited
+to portable contracts and services; entry, MMU, interrupts, PCI/root-complex,
+storage transport and networking remain per target. Standard Raspberry Pi
+firmware continues to start `kernel8.img` and its Pi-specific PGS2 stage0
+path.
+
+The PEX8749 fabric is common policy across hosts: passive observation first,
+then an explicit bridge-configuration transaction, endpoint BAR leases, and
+only later MSI/DMA. `pcie_fabric` supplies the first shared bounded hierarchy
+model; its host test includes a PEX8749-style branch with three B50 functions.
+
 **Pi 5 FFC PCIe1** is disabled by firmware unless the boot FAT `config.txt`
 contains a Pi 5-scoped `[pi5]` section with `dtparam=pciex1=on`. The tracked
 root `config.txt` provides this setting; editing the repository copy does not
@@ -99,13 +129,22 @@ a SATA device requires a separate SATA host/controller. Firmware must enable
 the connector with the Pi 5-only `dtparam=pciex1=on` in the FAT boot
 `config.txt`.
 
-**PCIe1 PHY bring-up.** Firmware enabling the connector is not a substitute
+**PCIe1 aperture and PHY bring-up.** Firmware enabling the connector is not a substitute
 for the kernel's post-reset PHY setup. PCIe1 programs the BCM2712 54 MHz XOSC
 PLL over port-0 MDIO and verifies every value before releasing PERST. Each
 transaction is bounded to 100 us; failure holds reset and reports
 `phy_ready=0`. The PHY PM-clock period is `0x12`; both advertised and target
 link speed are Gen2. Shared RESCAL and RP1's PCIe2 are not reset by this path.
 After PERST release, configuration access waits at least 100 ms.
+The 32 MiB Device aperture is CPU `0x1B80000000` translated to PCI
+`0x80000000`, matching the Pi 5 device tree's non-prefetchable pcie1 range;
+BAR0 must be assigned inside that PCI range before CPU MMIO. PIOS installs
+exactly 32 MiB of Device-nGnRnE, kernel-only, execute-never mappings through
+an L2 table at L1[110]. Both `mmu_init()` and the actual Pi boot path
+(`start.S` -> `mmu_enable_caching()`) install this mapping. BAR operations
+validate the active translation with `AT S1E1R` before accessing hardware.
+The previous watchdog reboots were not evidence of endpoint non-completion:
+the active page-table entry was zero, even after `mmu_init()` was corrected.
 
 Live proof on `v20261002.180500`: Pi 5 FFC -> M.2 HAT -> passive externally
 powered M-key-to-x16 riser -> Quadro K2000 trains **Gen2 x1** and enumerates
@@ -115,6 +154,141 @@ AER corrected/uncorrected status is zero. Existing boot discovery sizes the
 GPU BARs (BAR0 16 MiB, prefetch aperture 256 MiB) but does not map them.
 Enumeration is not GPU execution, display output, or LevelZero support;
 the 256 MiB BAR aperture is not a measurement of installed VRAM.
+
+**Discovery contract (#187).** `pcie1 scan` and `lzero probe` are passive:
+they read only validated, aligned configuration dwords, retain existing bridge
+bus ranges, scan only buses reachable through those ranges, and never modify
+an endpoint Command register, BAR, bridge bus-number or bridge memory window.
+Malformed bridge ranges are recorded and their downstream buses are not
+visited. A lost link clears the cached endpoint snapshot rather than reporting
+old devices as live. `lzero bars` is separately named because standard BAR
+sizing temporarily writes all-ones masks; it is not part of read-only
+discovery. BAR mapping, Memory Space enablement, MSI, Bus Master and DMA remain
+later gated phases.
+
+The HDMI workbench has a dedicated `PCIE1 ENUMERATION (CACHED)` panel.
+It lists BDF, vendor/device ID, header type and class/vendor description,
+including bridge secondary/subordinate ranges. Eight rows per column are
+visible, with one to three columns depending on screen width (up to 24
+functions at once). B50/K2000 IDs receive explicit device names. Overflow
+pages rotate every eight seconds so all 64 cached functions remain
+visible. Rendering never scans/configures devices. `pcie1 scan` explicitly
+refreshes the snapshot (buses 1..63).
+
+For the observed PLX `10B5:8748` topology, `tools/pios_pcie_bus.py --execute`
+is the bounded operator bus-numbering harness. It requires a new `--log`,
+healthy management/AER and every visited function's decode/DMA disabled.
+Only Type-1 bus-number registers are changed; sibling routes are closed before
+depth-first assignment and tightened before the next branch is opened.
+Any failure quarantines changed routes rather than restoring unsafe overlapping
+ranges. Do not use the old firmware's mutating `pcie1 scan` after this harness.
+
+Live 2026-10-06 proof: with four-x8 board configuration, three ports trained
+Gen3 x8 and exposed three `8086:E212` B50s at 05:00.0, 09:00.0 and 0D:00.0.
+Each board contributes Intel bridges plus GPU/audio functions: 20 functions
+use 15 buses overall. Command registers stayed zero. This is enumeration,
+not BAR, DMA or compute acceptance.
+
+The subsequent B50 MMIO proof on `v20261006.183632` assigned the measured
+16 MiB BAR0 of 05:00.0 at PCI `0x80000000`, with exact forwarding windows
+on 01:00.0, 02:08.0, 03:00.0 and 04:01.0. After the kernel's active Device
+translation preflight, `tools/pios_b50_mmio.py` read Intel `GMD_ID` at
+BAR0+`0xD8C` three times as `0x05004000`: Xe2 HPG architecture 20, release 1,
+revision 0. Memory Space alone is enabled; Bus Master stays off.
+
+`python tools\pios_b50_dma_preflight.py --log NEW_LOG.jsonl` audits that
+fixed live topology without modifying configuration (apart from the config
+selector). It requires the 2 MiB inbound aperture at PCI `0x1000000000`
+to CPU `0x04E00000`, disabled BAR1/BAR3 and MSI address decode, clean root AER,
+and BME off on the target path and all three B50s. This proves register
+configuration only, not DMA isolation, transfer, MSI delivery, or active
+Normal-NC translations. ADR-062/063 hardware activation gates remain closed
+until an approved live lease/containment adapter and recovery proof exist.
+Do not rerun bus assignment or BAR sizing while the MMIO path is active.
+
+The native operator commands are `b50 attach`, `b50 preflight`, `b50 status`,
+`b50 revoke` and `b50 canary`, shared by HTTP/UART/TCP terminal dispatch.
+Attach adopts only the verified 05:00.0 topology, repeats BAR0 sizing with
+decode off and verified restore, and binds a native generation lease.
+Preflight validates all active arena pages as writable identity Normal-NC,
+then checks and poisons a CPU-owned 64-byte payload and its red zones.
+The dedicated masked IRQ retains a sequence-backed continuation under AIRQ
+backpressure; unexpected delivery quarantines and reports revocation status.
+These commands do not boot GuC or publish a hardware queue. `b50 canary`
+explicitly refuses that missing engine prerequisite: CPU red-zone testing
+is not host-DMA acceptance. A quarantined lease needs cold recovery.
+
+Live BAR0 identity proof on `v20261002.205923`: `lzero boot0` reads
+`0E73E0A2`, chipset `E7` (GK107), repeatedly with no reboot and clear AER.
+Endpoint Memory Space is enabled for this explicit probe, Bus Master is off,
+and no GPU execution is enabled. The historical command group's GuC/LevelZero
+labels are not NVIDIA capabilities. NVIDIA's K2000 datasheet specifies
+PCIe 2.0 x16, 2 GB GDDR5 and 51 W; Gen3 is not a K2000 requirement.
+
+**Kepler diagnostic stage.** `kepler probe` verifies `10DE:0FFE` / GK107 and
+reads the POST marker, engine enable mask and VBIOS availability. It does not
+run POST or enable compute. `kepler status` returns only the stored snapshot.
+`kepler rom <decimal-offset>` returns a bounded 128-byte flash-ROM chunk only
+after a successful probe, and refuses Bus Master, identity, mapping, or AER
+faults. The board currently requires cold VBIOS POST before VRAM/compute use.
+Read/validate a local-only capture with:
+
+```powershell
+python tools\pios_kepler_rom.py --out C:\temporary\k2000.rom
+python tools\pios_kepler_rom.py --inspect C:\temporary\k2000.rom --scripts
+```
+
+The output path must not exist. No firmware bytes or credentials are shipped
+in the repo; no x86/EFI image or init script is executed by these ROM commands.
+Intel LevelZero remains a separate retained backend for B50 bring-up.
+
+**K2000 cold POST.** The board-specific operator harness
+`tools/pios_kepler_post.py` structurally validates the entire script graph and
+GPIO/I2C/RAM-strap tables before any hardware operation. Default invocation is
+no-write preflight. `--execute` additionally requires the exact ROM SHA-256,
+a cold GK107 with BME off, a new local transaction-log path and healthy `.201`.
+It has fixed call-depth, instruction-count and wall-time limits. It never
+executes the ROM's x86/EFI code and never enables PCI bus mastering.
+The kernel `kepler i2c` helper supports only this POST profile's unshared
+drive-2/address-0x4c/register-9 access, with a 2 ms transaction deadline.
+Failure stops the attempt; do not blindly replay a partially completed POST.
+
+Live proof on `v20261002.220506`: 708 instruction steps / 570 interpreter
+register writes set the hardware POST marker from 0 to 2. The subsequent
+`tools/pios_kepler_vram.py` proof reports two active 1024 MiB memory partitions
+and verifies two 64-byte patterns plus adjacent guards through PRAMIN at
+VRAM offset 1 MiB, restoring both bytes and window selector. This proves
+only the sampled VRAM span, not an exhaustive memory test or DMA/compute.
+Both harnesses run locally; their ROM and logs are not release assets.
+Repeated after OTA to `v20261002.222000`: the device again began with POST=0,
+completed the same 708-step sequence to POST=2, and passed the reversible
+scratch proof with AER/NIC errors zero. Initialization is not automatic after
+reboot; no channel, PCI DMA or tensor capability is enabled by these proofs.
+
+`kepler vram read/write/zero` is a generation-checked, readback-verified
+operator interface to the reserved VRAM bring-up arena `[1 MiB,5 MiB)`.
+Terminal reads are 128 bytes and writes 32 bytes (64 hex digits), fitting
+the HTTP terminal's 128-byte command line; zeroing is at most 1024 bytes per request.
+All spans must be word-aligned and stay within one PRAMIN window; the selector
+is restored before returning, including readback failures. A fresh
+`kepler probe` invalidates earlier generation tokens.
+`tools/pios_kepler_channel.py` stages a single VRAM-only copy-channel experiment
+with PCI Bus Master off. Its default is offline layout inspection; `--execute`
+requires a posted card and a new `--log` file. It does not establish a runtime
+compute backend. The reserved arena is scratch, not restored by this experiment;
+reboot/POST before another attempt rather than reuse a failed GPU context.
+
+First copy-channel proof on `v20261002.231552`: CE0/runlist 4/PBDMA 2 copied
+64 bytes exactly and published its completion semaphore, with source and
+red zones intact. Channel stop/preempt/unbind and register restoration
+completed; BME stayed off, AER stayed zero, and management remained healthy.
+This is a GPU-local copy proof, not GR/SM compute or PicoScript acceleration.
+
+Fixed GK107 store, vector-add and signed-INT8 matvec/dot images are assembled
+and byte-verified in reserved VRAM on the same image. Their
+[build/ABI/upload documentation](../tools/kepler_kernels/README.md) distinguishes
+the binary instruction-model/BitNet-reference checks from the still-pending
+GR execution proof. The code-only loader never enables GR or PCI bus mastering.
 
 **Network (ADR-043 / ADR-044).** One TCP/IP stack. Wired `nic_ops`: MACB on
 Pi 5 (RP1 IRQ), GENET on Pi 4 (GIC SPI 157), virtio on QEMU (paced; no RX

@@ -1,0 +1,6 @@
+// One thread, one CTA. c0[0:8] is the GPU output address.
+mov b32 $r0 c0[0x0]
+mov b32 $r1 c0[0x4]
+mov b32 $r2 0x13579bdf
+st b32 wt g[$r0d] $r2
+exit

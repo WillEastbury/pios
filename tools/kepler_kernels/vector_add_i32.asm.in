@@ -1,0 +1,20 @@
+// c0: a:u64, b:u64, out:u64, count:u32. One CTA, at most 64 lanes.
+mov b32 $r8 $tidx
+mov b32 $r9 c0[0x18]
+set $p0 $p1 ge u32 $r8 $r9
+$p0 exit
+mov b32 $r0 c0[0x0]
+mov b32 $r1 c0[0x4]
+mov b32 $r2 c0[0x8]
+mov b32 $r3 c0[0xc]
+mov b32 $r4 c0[0x10]
+mov b32 $r5 c0[0x14]
+shl b32 $r8 $r8 clamp 0x2
+add b32 $r0 $r0 $r8
+add b32 $r2 $r2 $r8
+add b32 $r4 $r4 $r8
+ld b32 $r6 cg g[$r0d]
+ld b32 $r7 cg g[$r2d]
+add b32 $r6 $r6 $r7
+st b32 wt g[$r4d] $r6
+exit

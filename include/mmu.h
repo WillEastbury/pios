@@ -63,6 +63,16 @@ void mmu_invalidate_tlb(void);
 
 /* Kernel TTBR0 base used by service cores and scheduler context */
 u64 mmu_kernel_ttbr0(void);
+/* Validate active EL1 identity/Device-nGnRnE translation without touching MMIO. */
+bool mmu_device_read32_valid(u64 addr);
+/* Active EL1 read/write identity translation, Normal-NC, Outer Shareable. */
+bool mmu_active_nc_range_valid(u64 start, u64 size);
+static inline bool mmu_par_identity_nc_valid(u64 addr, u64 par)
+{
+    return (addr & 4095U) == 0U && (par & 1U) == 0U &&
+           (par >> 56) == 0x44U && ((par >> 7) & 3U) == 2U &&
+           (par & 0x0000FFFFFFFFF000ULL) == addr;
+}
 
 /* Build an isolated user table for a process slot on core 2 or 3 */
 bool mmu_user_table_build(u32 core, u32 slot, u64 slot_base, u64 slot_size);

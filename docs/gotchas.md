@@ -317,7 +317,7 @@ multi-gigabyte Device window that is not yet a programmed ATU. Finding
 `8086:E212` is also not LevelZero.
 
 **Rule:** pcie1 is a second BCM2712 RC (`0x1000110000`, reset 43, 32 MiB
-Device ATU at `0x1B00000000` for BAR0 only). Inbound DMA is a **2 MiB NC
+Device ATU at CPU `0x1B80000000` -> PCI `0x80000000` for BAR0 only). Inbound DMA is a **2 MiB NC
 arena** (`PIOS_DMA_PCIE1_BASE`), never 64 GiB → PA 0 (#141). Never map
 ReBAR LMEM to “have a heap”. MSI 255/256 stay masked until a handler
 exists. Firmware needs `dtparam=pciex1`; if the RC ID reads
@@ -325,6 +325,22 @@ exists. Firmware needs `dtparam=pciex1`; if the RC ID reads
 1 A; GPU 12 V comes from the powered riser. `lzero map` is opt-in and
 fail-closed if BAR0 > ATU. Dashboard LevelZero stays red until gate E.
 See ADR-045/046 / issue #137.
+
+### A BAR watchdog reboot is not proof of PCIe completion failure
+
+**Tried:** changing `mmu_init()` to map the corrected PCIe1 CPU aperture,
+then probing GPU BOOT0. The board still rebooted, initially blamed on BAR
+assignment, forwarding or endpoint completion.
+
+**Actual cause:** Pi stage2 uses `start.S` then `mmu_enable_caching()`, not
+`mmu_init()`. The latter's mapping code was never executed. The active
+TTBR0 root had zero in L1[110], confirmed by reading the table in RAM.
+
+**Rule:** prove the active translation before touching a new MMIO aperture.
+The shared builder now installs only the 32 MiB PCIe1 range on the unpublished
+cache-remap root. BAR map/read checks use `AT S1E1R`/`PAR_EL1` without touching
+the device, and reject invalid or non-Device translations. The subsequent
+K2000 BOOT0 read succeeded repeatedly; no Linux A/B or hardware swap was needed.
 
 ### Highmem probe must stay inside the identity map
 

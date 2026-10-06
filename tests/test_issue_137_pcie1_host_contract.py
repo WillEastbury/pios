@@ -26,21 +26,23 @@ def body_after(source: str, signature: str) -> str:
 assert "#define PIOS_PCIE1_RC_BASE          0x1000110000UL" in platform
 assert "#define PIOS_PCIE_RC_BASE           0x1000120000UL" in platform
 assert "#define PIOS_PCIE1_RESET_ID         43U" in platform
-assert "#define PIOS_PCIE1_CPU_WIN_BASE     0x1B00000000UL" in platform
+assert "#define PIOS_PCIE1_CPU_WIN_BASE     0x1B80000000UL" in platform
+assert "#define PIOS_PCIE1_PCI_WIN_BASE     0x80000000UL" in platform
 assert "#define PIOS_RP1_BAR_BASE           0x1F00000000UL" in platform
 assert "#define PIOS_HAS_PCIE1              1" in platform
 assert "#define PIOS_HAS_PCIE1              0" in platform
 assert "[pi5]\ndtparam=pciex1=on\n" in config.replace("\r\n", "\n")
 assert "pciex1_gen=" not in config
 
-assert "l1[108] = ((u64)108U * L1_BLOCK_SIZE) | dev_attr;" in mmu
-assert "0x1800000000" in mmu
-assert "12 GiB prefetch" in mmu
+assert "map_kernel_pcie1_window(l1);" in mmu
+assert "map_kernel_pcie1_window(l1_table_cached);" in mmu
+assert "root[base / L1_BLOCK_SIZE]" in mmu
 
 assert "PCIE_RC_BASE" not in pcie1
 assert "PCIE1_RC_BASE               PIOS_PCIE1_RC_BASE" in pcie1
 assert "PIOS_PCIE1_RESET_ID" in pcie1
 assert "PIOS_PCIE1_CPU_WIN_BASE" in pcie1
+assert "PIOS_PCIE1_PCI_WIN_BASE" in pcie1
 assert "PIOS_PCIE1_IRQ" not in pcie1
 assert "PIOS_PCIE1_MSI_IRQ" not in pcie1
 assert "gic_enable_irq" not in pcie1

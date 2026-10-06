@@ -20,13 +20,15 @@ def body_after(source: str, signature: str) -> str:
     raise AssertionError(f"unterminated {signature}")
 
 
-record = body_after(pcie1, "static void record_function(struct pcie1_status *s")
-assert "pcie1_cfg_read(bus, dev, func, PCI_REG_CMD)" in record
-assert "cmd &= ~(PCI_CMD_MEM | PCI_CMD_MASTER);" in record
-assert "pcie1_cfg_write(bus, dev, func, PCI_REG_CMD, cmd);" in record
+record = body_after(pcie1, "static bool record_function(struct pcie1_status *s")
+assert "pcie1_cfg_write(" not in record
+assert "PCI_REG_CMD" not in record
+assert "record_bridge_range(reachable, bus, e)" in record
 
 scan = body_after(pcie1, "static void scan_endpoints(struct pcie1_status *s)")
-assert "record_function(s, bus, dev, func);" in scan
+assert "reachable[PCIE1_SCAN_BUS_LO] = true;" in scan
+assert "if (!reachable[bus])" in scan
+assert "record_function(s, reachable, bus, dev, func);" in scan
 
 probe = body_after(lzero, "bool lzero_probe_bars(void)")
 assert "cmd & ~(PCI_CMD_MEM | PCI_CMD_MASTER)" in probe
@@ -37,6 +39,9 @@ assert "(cmd | PCI_CMD_MEM) & ~PCI_CMD_MASTER" in mapped
 assert "PCI_CMD_MASTER" in mapped
 
 assert "void pcie1_rescan(void)" in pcie1
-assert "publish_snap(g_link_up ? \"ok\" : (g_fail ? g_fail : \"no link\"));" in pcie1
+assert "publish_snap(g_link_up ? \"ok\" : \"link lost\");" in pcie1
+assert "if (g_lzero.gpu_found && p.link_up)" not in body_after(
+    lzero, "void lzero_probe(void)",
+)
 
-print("issue #143: PCIe1 enumeration and BAR probing keep endpoint DMA disabled")
+print("issue #143: passive enum is endpoint-write-free; explicit BAR probing keeps DMA disabled")

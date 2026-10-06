@@ -4,9 +4,18 @@ set CC=%LLVM%\clang.exe
 set LD=%LLVM%\lld-link.exe
 set CFLAGS=-Wall -Wextra -ffreestanding -fshort-wchar -fno-builtin -fno-stack-protector -mno-red-zone -target x86_64-unknown-windows -DPIOS_PLATFORM=PIOS_PLATFORM_HYPERV_AMD64 -Iinclude -O2
 
-if exist build_hyperv_amd64 rmdir /S /Q build_hyperv_amd64
+REM Keep build_hyperv_amd64\vm intact while a Hyper-V guest/VMConnect keeps
+REM its registration open. Rebuild only generated EFI/media artifacts.
+if exist build_hyperv_amd64\EFI rmdir /S /Q build_hyperv_amd64\EFI
+if exist build_hyperv_amd64\bootx64_hyperv.o del /Q build_hyperv_amd64\bootx64_hyperv.o
+if exist build_hyperv_amd64\x86_kernel.o del /Q build_hyperv_amd64\x86_kernel.o
+if exist build_hyperv_amd64\x86_kernel_entry.o del /Q build_hyperv_amd64\x86_kernel_entry.o
+if exist build_hyperv_amd64\hyperv_amd64_esp.raw del /Q build_hyperv_amd64\hyperv_amd64_esp.raw
+if exist build_hyperv_amd64\hyperv_amd64_esp.vhd del /Q build_hyperv_amd64\hyperv_amd64_esp.vhd
+if exist build_hyperv_amd64\hyperv_amd64_esp.vhdx del /Q build_hyperv_amd64\hyperv_amd64_esp.vhdx
+if exist build_hyperv_amd64\hyperv_amd64_boot.iso del /Q build_hyperv_amd64\hyperv_amd64_boot.iso
 if exist hyperv_amd64_esp rmdir /S /Q hyperv_amd64_esp
-mkdir build_hyperv_amd64
+if not exist build_hyperv_amd64 mkdir build_hyperv_amd64
 mkdir build_hyperv_amd64\EFI
 mkdir build_hyperv_amd64\EFI\BOOT
 mkdir hyperv_amd64_esp
@@ -16,7 +25,11 @@ mkdir hyperv_amd64_esp\EFI\BOOT
 echo Building Hyper-V amd64 BOOTX64.EFI probe...
 "%CC%" %CFLAGS% -c uefi\bootx64_hyperv.c -o build_hyperv_amd64\bootx64_hyperv.o
 if errorlevel 1 exit /b 1
-"%LD%" /subsystem:efi_application /entry:efi_main /machine:x64 /nodefaultlib /out:build_hyperv_amd64\EFI\BOOT\BOOTX64.EFI build_hyperv_amd64\bootx64_hyperv.o
+"%CC%" %CFLAGS% -c uefi\x86_kernel.c -o build_hyperv_amd64\x86_kernel.o
+if errorlevel 1 exit /b 1
+"%CC%" -c -target x86_64-unknown-windows uefi\x86_kernel_entry.S -o build_hyperv_amd64\x86_kernel_entry.o
+if errorlevel 1 exit /b 1
+"%LD%" /subsystem:efi_application /entry:efi_main /machine:x64 /nodefaultlib /out:build_hyperv_amd64\EFI\BOOT\BOOTX64.EFI build_hyperv_amd64\bootx64_hyperv.o build_hyperv_amd64\x86_kernel.o build_hyperv_amd64\x86_kernel_entry.o
 if errorlevel 1 exit /b 1
 
 copy /Y build_hyperv_amd64\EFI\BOOT\BOOTX64.EFI hyperv_amd64_esp\EFI\BOOT\BOOTX64.EFI >nul
@@ -39,6 +52,6 @@ for %%f in (build_hyperv_amd64\hyperv_amd64_esp.raw) do echo ESP raw image size:
 if exist build_hyperv_amd64\hyperv_amd64_esp.vhd for %%f in (build_hyperv_amd64\hyperv_amd64_esp.vhd) do echo ESP VHD size: %%~zf bytes
 if exist build_hyperv_amd64\hyperv_amd64_esp.vhdx for %%f in (build_hyperv_amd64\hyperv_amd64_esp.vhdx) do echo ESP VHDX size: %%~zf bytes
 for %%f in (build_hyperv_amd64\hyperv_amd64_boot.iso) do echo Boot ISO size: %%~zf bytes
-echo Hyper-V ESP staging dir: hyperv_amd64_esp\EFI\BOOT\BOOTX64.EFI
-echo Hyper-V Gen2 boot disk: build_hyperv_amd64\hyperv_amd64_esp.vhdx
+echo x64 USB ESP staging dir: hyperv_amd64_esp\EFI\BOOT\BOOTX64.EFI
+echo x64 mandatory ESP/WALFS/PIOSXFER disk: build_hyperv_amd64\hyperv_amd64_esp.vhdx
 echo Hyper-V Gen2 boot ISO:  build_hyperv_amd64\hyperv_amd64_boot.iso

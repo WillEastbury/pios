@@ -21,15 +21,15 @@ def body_after(source: str, signature: str) -> str:
     raise AssertionError(f"unterminated {signature}")
 
 
-bridge = body_after(pcie1, "static void program_bridge(u32 bus")
-assert "PCI_REG_BUS_NUM" in bridge
-assert "PCI_REG_MEM_BASE_LIMIT" in bridge
-assert "PCIE1_SCAN_BUS_HI" in bridge
-assert "0xFFF00000U" in bridge
+bridge = body_after(pcie1, "static bool record_bridge_range(")
+assert "pcie1_bridge_range_valid" in bridge
+assert "reachable[bus] = true;" in bridge
+assert "pcie1_cfg_write" not in bridge
 
 scan = body_after(pcie1, "static void scan_endpoints(struct pcie1_status *s)")
-assert "pcie1_next_bridge_bus = PCIE1_SCAN_BUS_LO + 1U;" in scan
-assert "record_function(s, bus, dev, func);" in scan
+assert "reachable[PCIE1_SCAN_BUS_LO] = true;" in scan
+assert "if (!reachable[bus])" in scan
+assert "record_function(s, reachable, bus, dev, func);" in scan
 
 init = body_after(pcie1, "bool pcie1_init(void)")
 assert init.index("perst_set(true);") < init.index("perst_set(false);")
@@ -40,7 +40,9 @@ window = body_after(pcie1, "bool pcie1_set_outbound_window(u64 size)")
 assert "size < 0x00100000ULL" in window
 assert "size > PIOS_PCIE1_CPU_WIN_SIZE" in window
 assert "(size & (size - 1ULL)) != 0ULL" in window
-assert "set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, 0, size);" in window
+assert "set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, PIOS_PCIE1_PCI_WIN_BASE, size);" in window
+assert "pcie1_bridge_mem_window(PIOS_PCIE1_PCI_WIN_BASE, size, &mem_window)" in window
+assert "pw(PCI_REG_MEM_BASE_LIMIT, mem_window);" in window
 
 probe = body_after(lzero, "static u64 probe_bar_size(")
 first_all_ones = probe.index("pcie1_cfg_write(bus, dev, fn, off, 0xFFFFFFFFU);")
@@ -53,6 +55,9 @@ assert first_all_ones < second_all_ones < mask_reads
 mapped = body_after(lzero, "bool lzero_map_bar0(void)")
 assert "pcie1_set_outbound_window(g_lzero.bar0_size)" in mapped
 assert "pcie1_enable_memory_path(g_lzero.gpu_bus)" in mapped
+assert "PIOS_PCIE1_PCI_WIN_BASE" in mapped
+assert "dsb();" in mapped and "timer_delay_us(100U);" in mapped
+assert "pcie1_cfg_read(bus, dev, fn, PCI_BAR0) != lo" in mapped
 assert "g_lzero.atu_size = g_lzero.bar0_size;" in mapped
 
 assert "static inline u32 lzero_compute_rank" in header

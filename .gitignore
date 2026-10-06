@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+build_kepler/
 build_boot/
 build_uefi/
 build_qemu_stage2/

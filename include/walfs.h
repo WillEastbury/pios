@@ -26,16 +26,13 @@
  *
  * Offsets are relative to the start of partition 2:
  *   0x000000..0x0001FF  reserved-area header / PIOS signature
- *   0x000200..0x1FFFFF  second-stage kernel image payload
- *   0x200000..0x2C7FFF  TCP/IP stack area (800 KiB):
- *                       MAC, ARP, DHCP, DNS, ICMP, UDP, TCP, streams clients
- *   0x2C8000..0x2FFFFF  firewall rules + static IP config area (200 KiB)
- *   0x300000..0x3FFFFF  Admin Console HTTP service area
- *   0x400000..0x4FFFFF  kernel debugger / dump / inspector area
- *   0x500000..0x5FFFFF  user records
- *   0x600000..0x7FFFFF  circular hot log buffer
+ *   0x000200..0x37FFFF  slot A stage-2 payload
+ *   0x380000..0x3801FF  boot-control sector
+ *   0x400000..0x77FFFF  slot B header + stage-2 payload
+ *   0x500000            legacy key sector (inside B; migration reads only)
  *   0x800000..0x8FFFFF  kernel state crashdump zone
- *   0x900000..0x9FFFFF  future reserved system service area
+ *   0x900000..0x9001FF  sealed keystore record
+ *   0x900200..0x9FFFFF  future reserved system service area
  *   0xA00000..end       WALFS packs/cards/storage
  */
 #define PIOS_RESERVED_BYTES             (10U * 1024U * 1024U)
@@ -115,12 +112,28 @@
 #define PIOS_TCPIP_FW_OFFSET            PIOS_TCPIP_STACK_OFFSET
 #define PIOS_ADMIN_HTTP_OFFSET          0x300000U
 #define PIOS_KERNEL_DEBUG_OFFSET        0x400000U
-#define PIOS_USER_RECORDS_OFFSET        0x500000U
+#define PIOS_USER_RECORDS_OFFSET        0x900000U
 #define PIOS_HOT_LOGS_OFFSET            0x600000U
 #define PIOS_HOT_LOGS_BYTES             0x200000U
 #define PIOS_CRASHDUMP_OFFSET           0x800000U
-#define PIOS_FUTURE_RESERVED_OFFSET     0x900000U
+#define PIOS_FUTURE_RESERVED_OFFSET     0x900200U
 #define PIOS_WALFS_OFFSET               0xA00000U
+
+/* The historical user-record sector lies inside expanded slot B. It is
+ * read-only migration input, never a destination for current keystore writes. */
+#define PIOS_KEYSTORE_LEGACY_OFFSET     0x500000U
+#define PIOS_KEYSTORE_OFFSET            PIOS_USER_RECORDS_OFFSET
+#define PIOS_KEYSTORE_BYTES             512U
+_Static_assert(PIOS_KEYSTORE_OFFSET >= PIOS_BOOT_SLOT_A_OFFSET + PIOS_BOOT_SLOT_BYTES,
+               "keystore must not overlap slot A");
+_Static_assert(PIOS_KEYSTORE_OFFSET >= PIOS_BOOT_SLOT_B_OFFSET + PIOS_BOOT_SLOT_BYTES,
+               "keystore must not overlap slot B");
+_Static_assert(PIOS_KEYSTORE_OFFSET >= PIOS_BOOTCTRL_OFFSET + 512U,
+               "keystore must not overlap boot control");
+_Static_assert(PIOS_KEYSTORE_OFFSET + PIOS_KEYSTORE_BYTES <= PIOS_WALFS_OFFSET,
+               "keystore must stay inside the reserved system area");
+_Static_assert(PIOS_KEYSTORE_OFFSET + PIOS_KEYSTORE_BYTES <= PIOS_FUTURE_RESERVED_OFFSET,
+               "future allocations must exclude the keystore sector");
 
 #define WALFS_BOOT_SLOT_BYTES  PIOS_RESERVED_BYTES
 #define WALFS_BOOT_SLOT_LBAS   PIOS_RESERVED_LBAS

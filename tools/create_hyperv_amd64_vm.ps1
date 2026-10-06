@@ -57,6 +57,16 @@ if ($UseIso) {
 } else {
   $vmDisk = Join-Path $VmRoot "$Name-boot.vhdx"
   Copy-Item -Force $SourceVhdx $vmDisk
+  # Copying can reintroduce NTFS sparse state even when the generated source
+  # was normalized. Build directories may also inherit NTFS compression.
+  # Hyper-V refuses sparse or compressed VHD/VHDX attachments (0xc03a001a).
+  fsutil sparse setflag $vmDisk 0 | Out-Null
+  compact.exe /U /I $vmDisk | Out-Null
+  $vmAttrs = (Get-Item $vmDisk).Attributes
+  if (($vmAttrs -band ([IO.FileAttributes]::SparseFile -bor
+                       [IO.FileAttributes]::Compressed)) -ne 0) {
+    throw "Copied VM disk remains sparse or compressed: $vmDisk"
+  }
   $vm = New-VM -Name $Name -Generation 2 -MemoryStartupBytes $MemoryStartupBytes -Path $VmRoot -VHDPath $vmDisk
   $disk = Get-VMHardDiskDrive -VMName $Name
   Set-VMFirmware -VMName $Name -EnableSecureBoot Off -FirstBootDevice $disk
@@ -66,7 +76,7 @@ Set-VMProcessor -VMName $Name -Count 2
 Set-VMComPort -VMName $Name -Number 1 -Path $pipePath
 Set-VM -Name $Name -AutomaticCheckpointsEnabled $false
 
-Write-Host "Created Hyper-V Gen2 VM: $Name"
+Write-Host "Created Hyper-V Gen2 UEFI probe VM: $Name (not full PIOS OS)"
 Write-Host "Secure Boot: disabled (BOOTX64.EFI is unsigned)"
 Write-Host "Console: use VMConnect for UEFI text output"
 Write-Host "COM1 pipe: $pipePath"

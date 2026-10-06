@@ -114,11 +114,12 @@ followed by persistent system records:
 |---|---|---|---|
 | `0x000000` | 3.5 MiB | **Boot slot A** (verified stage-2 package cache) | `PIOS_BOOT_SLOT_A_OFFSET` |
 | `0x380000` | 512 B | **Boot-control sector** (`PBC0`) | `PIOS_BOOTCTRL_OFFSET` |
-| `0x400000` | legacy | Legacy slot-B base; full packages are unsafe here | `PIOS_BOOT_SLOT_B_OFFSET` |
-| `0x500000` | 1 MiB | User records (keystore sealed root, §6) | `PIOS_USER_RECORDS_OFFSET` |
-| `0x600000` | 2 MiB | Circular hot-log buffer | `PIOS_HOT_LOGS_OFFSET` |
+| `0x400000` | 3.5 MiB | **Boot slot B** | `PIOS_BOOT_SLOT_B_OFFSET` |
+| `0x500000` | 512 B, legacy | Old keystore location inside slot B; migration reads only | `PIOS_KEYSTORE_LEGACY_OFFSET` |
+| `0x600000` | legacy | Obsolete hot-log reservation inside slot B; no raw writer | `PIOS_HOT_LOGS_OFFSET` |
 | `0x800000` | 1 MiB | Kernel-state crashdump zone | `PIOS_CRASHDUMP_OFFSET` |
-| `0x900000` | 1 MiB | Reserved for future services | `PIOS_FUTURE_RESERVED_OFFSET` |
+| `0x900000` | 512 B | Sealed keystore root (§6), outside both slots | `PIOS_KEYSTORE_OFFSET` |
+| `0x900200` | 1 MiB minus 512 B | Reserved for future services | `PIOS_FUTURE_RESERVED_OFFSET` |
 | `0xA00000` | — | WALFS base (§5) | `PIOS_WALFS_OFFSET` |
 
 (`include/walfs.h:64-98`)
@@ -128,10 +129,12 @@ followed by persistent system records:
   the stage-2 payload starts at `PIOS_STAGE2_OFFSET = 0x200`
   (`include/walfs.h:64-65`).
 
-> **Layout hazard.** The legacy slot-B base at `0x400000` plus a 3.5 MiB slot
-> overlaps user records (`0x500000`) and hot logs (`0x600000`). The FAT updater
-> therefore writes only slot A. The older TCP/IP/firewall/admin/debug header
-> offsets are vestigial while the expanded stage2 package occupies their range.
+> **ADR-080 correction.** Older images wrote the keystore at `0x500000`,
+> corrupting slot B after an apparently successful OTA boot. Current images use
+> `0x900000`; the record format and A/B geometry are unchanged. Never restore an
+> older writer as a rollback image. The TCP/IP/firewall/admin/debug/hot-log
+> offsets are vestigial inside the expanded slots and must not acquire raw
+> writers. Logs and user data use WALFS. FAT import still targets slot A.
 
 ### 2.1 Slot header (`PIOS`)
 
@@ -308,8 +311,14 @@ state (`include/walfs.h:192-216,254-260`); operator command `disk verify`.
 ## 6. Keystore / root of trust (`src/keystore.c`)
 
 A single sealed 512-byte record holds the wrapped root key. It lives in the
-user-records region: LBA = `walfs_partition_lba() + PIOS_USER_RECORDS_OFFSET/512`
-(offset `0x500000`) (`src/keystore.c:78-90`).
+dedicated reserved sector:
+LBA = `walfs_partition_lba() + PIOS_KEYSTORE_OFFSET/512` (offset `0x900000`).
+The old offset `0x500000` is read-only migration input, not a write destination.
+When the new sector is blank, a recognized legacy record must decrypt before
+it is copied unchanged and read back. Invalid authentication, unsupported
+record versions, unknown nonblank destination contents and read/write failures
+fail closed without reseeding. A genuinely blank store with no recognized
+legacy record retains normal first-boot provisioning.
 
 ```c
 #define KEYSTORE_MAGIC 0x5254534B  /* 'KSTR' */            // keystore.c:11
@@ -377,7 +386,7 @@ hashing (`src/principal.c:67-76`).
 | Boot-control checksum seed | `0xB007C0DE` | `kernel.c:3784` |
 | WALFS magic / base offset | `0x57414C46` `'WALF'` / `0xA00000` | `walfs.h:16,98` |
 | WALFS record magic | `0x5245434F` `'RECO'` | `walfs.h:109` |
-| Keystore magic / offset | `0x5254534B` `'KSTR'` / `0x500000` | `keystore.c:11`, `walfs.h:93` |
+| Keystore magic / offset | `0x5254534B` `'KSTR'` / `0x900000` | `keystore.c`, `walfs.h: PIOS_KEYSTORE_OFFSET` |
 | OTA TCP port | `8082` | `kernel.c:132` |
 | Per-platform raw-slot payload cap | `0x37FE00` (3.5 MiB) | `walfs.h: PIOS_STAGE2_ZONE_BYTES` |
 | Whole FAT package cap (may bundle multiple platforms) | `16 MiB` | `walfs.h: PIOS_FAT_PACKAGE_MAX_BYTES` |

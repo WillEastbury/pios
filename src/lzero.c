@@ -1,8 +1,8 @@
 /*
  * lzero.c - LevelZero path B→E (fail-closed)
  *
- * B: pick a compute-class function from the pcie1 snapshot, size-probe BARs
- *    in config space, restore the originals.
+ * B: pick a compute-class function from the passive pcie1 snapshot.
+ *    `lzero bars` separately performs the temporary config-space BAR probe.
  * C: optional `lzero map` programs BAR0 into the pcie1 Device ATU if it fits.
  *    Never maps LMEM. Never sets Bus Master.
  * D/E: firmware + proof are reported as blockers until those blobs exist.
@@ -12,6 +12,10 @@
 #include "lzero.h"
 #include "platform.h"
 #include "pcie1.h"
+#include "mmio.h"
+#include "mmu.h"
+#include "uart.h"
+#include "timer.h"
 
 #define PCI_REG_CMD         0x04U
 #define PCI_CMD_MEM         (1U << 1)
@@ -119,6 +123,12 @@ bool lzero_map_bar0(void)
         return false;
     if (!g_lzero.bar0_fits_atu || g_lzero.bar0_size == 0ULL)
         return false;
+    if (!mmu_device_read32_valid(PIOS_PCIE1_CPU_WIN_BASE) ||
+        !mmu_device_read32_valid(PIOS_PCIE1_CPU_WIN_BASE +
+                                 g_lzero.bar0_size - sizeof(u32))) {
+        uart_puts("[gpu] BAR0 Device translation missing; map refused\n");
+        return false;
+    }
     if (!pcie1_set_outbound_window(g_lzero.bar0_size))
         return false;
     if (!pcie1_enable_memory_path(g_lzero.gpu_bus))
@@ -128,9 +138,10 @@ bool lzero_map_bar0(void)
     dev = g_lzero.gpu_dev;
     fn = g_lzero.gpu_func;
     orig = pcie1_cfg_read(bus, dev, fn, PCI_BAR0);
-    /* PCIe address 0 in the pcie1 Device ATU → CPU PIOS_PCIE1_CPU_WIN_BASE.
+    /* Linux's PCIe1 non-prefetchable range starts at 0x80000000 and is
+     * translated to CPU PIOS_PCIE1_CPU_WIN_BASE. Never program LMEM.
      * Keep BAR type bits. Do not program LMEM. Do not set Bus Master. */
-    lo = (orig & 0xFU);
+    lo = (orig & 0xFU) | (u32)PIOS_PCIE1_PCI_WIN_BASE;
     pcie1_cfg_write(bus, dev, fn, PCI_BAR0, lo);
     if (((orig >> 1) & 3U) == 2U)
         pcie1_cfg_write(bus, dev, fn, PCI_BAR0 + 4U, 0);
@@ -138,17 +149,45 @@ bool lzero_map_bar0(void)
         u32 cmd = pcie1_cfg_read(bus, dev, fn, PCI_REG_CMD);
         cmd = (cmd | PCI_CMD_MEM) & ~PCI_CMD_MASTER;
         pcie1_cfg_write(bus, dev, fn, PCI_REG_CMD, cmd);
+        if (pcie1_cfg_read(bus, dev, fn, PCI_BAR0) != lo ||
+            (pcie1_cfg_read(bus, dev, fn, PCI_REG_CMD) & PCI_CMD_MASTER) != 0U ||
+            (pcie1_cfg_read(bus, dev, fn, PCI_REG_CMD) & PCI_CMD_MEM) == 0U)
+            return false;
     }
+    /* Ensure the endpoint has observed all configuration writes before the
+     * first BAR transaction. A device-memory access must never race them. */
+    dsb();
+    timer_delay_us(100U);
     g_lzero.atu_size = g_lzero.bar0_size;
     g_lzero.bar0_mapped = true;
     publish_gate();
     return true;
 }
 
+bool lzero_bar0_read32(u32 offset, u32 *value)
+{
+    if (!value || !g_lzero.bar0_mapped || g_lzero.bar0_size < sizeof(u32) ||
+        offset > g_lzero.bar0_size - sizeof(u32) || (offset & 3U) != 0U)
+        return false;
+    if (!mmu_device_read32_valid(PIOS_PCIE1_CPU_WIN_BASE + offset)) {
+        uart_puts("[gpu] BAR0 read refused: invalid Device translation\n");
+        return false;
+    }
+    *value = mmio_read(PIOS_PCIE1_CPU_WIN_BASE + offset);
+    return *value != 0xFFFFFFFFU;
+}
+
 #else
 
 bool lzero_probe_bars(void) { return false; }
 bool lzero_map_bar0(void) { return false; }
+bool lzero_bar0_read32(u32 offset, u32 *value)
+{
+    (void)offset;
+    if (value)
+        *value = 0U;
+    return false;
+}
 
 #endif
 
@@ -191,8 +230,6 @@ void lzero_probe(void)
     }
     g_lzero.state = lzero_classify_ex(p.present, p.link_up, p.ep_count != 0,
                                       g_lzero.gpu_found, g_lzero.b50_found);
-    if (g_lzero.gpu_found && p.link_up)
-        (void)lzero_probe_bars();
     publish_gate();
 }
 

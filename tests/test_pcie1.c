@@ -60,18 +60,35 @@ int main(void)
                pcie1_bar_size_from_mask(0x00000000U, 0xFFFFFFFCU, true),
                0x400000000ULL);
 
-    expect_true("8MiB @1B does not overlap RP1 8MiB @1F",
-                !pcie1_cpu_win_overlaps(0x1B00000000ULL, 0x00800000ULL,
+    expect_true("32MiB @1B8 does not overlap RP1 8MiB @1F",
+                !pcie1_cpu_win_overlaps(0x1B80000000ULL, 0x02000000ULL,
                                         0x1F00000000ULL, 0x00800000ULL));
     expect_true("stealing RP1 window is overlap",
                 pcie1_cpu_win_overlaps(0x1F00000000ULL, 0x00800000ULL,
                                        0x1F00000000ULL, 0x00800000ULL));
     expect_true("empty window fails closed",
-                pcie1_cpu_win_overlaps(0x1B00000000ULL, 0,
+                pcie1_cpu_win_overlaps(0x1B80000000ULL, 0,
                                        0x1F00000000ULL, 0x00800000ULL));
     expect_true("12GiB pref @18 would not overlap 8MiB @1F",
                 !pcie1_cpu_win_overlaps(0x1800000000ULL, 0x300000000ULL,
                                         0x1F00000000ULL, 0x00800000ULL));
+    {
+        u32 window = 0U;
+        expect_true("16MiB PCI 800 window",
+                    pcie1_bridge_mem_window(0x80000000ULL, 0x01000000ULL,
+                                            &window) && window == 0x80F08000U);
+        expect_true("32MiB PCI 800 window",
+                    pcie1_bridge_mem_window(0x80000000ULL, 0x02000000ULL,
+                                            &window) && window == 0x81F08000U);
+        expect_true("bridge window rejects sub-MiB",
+                    !pcie1_bridge_mem_window(0x80000000ULL, 0x1000U, &window));
+        expect_true("bridge window rejects unaligned base",
+                    !pcie1_bridge_mem_window(0x80001000ULL, 0x01000000ULL,
+                                             &window));
+        expect_true("bridge window rejects 64-bit address",
+                    !pcie1_bridge_mem_window(0x100000000ULL, 0x01000000ULL,
+                                             &window));
+    }
 
     {
         u64 out = 0xdeadULL;

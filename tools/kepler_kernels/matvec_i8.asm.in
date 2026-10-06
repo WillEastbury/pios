@@ -1,0 +1,31 @@
+// c0: matrix:u64, vector:u64, out:u64, rows:u32, cols:u32.
+// One lane per row, at most 64 rows and 1024 columns. Dot uses rows=1.
+mov b32 $r8 $tidx
+mov b32 $r9 c0[0x18]
+set $p0 $p1 ge u32 $r8 $r9
+$p0 exit
+mov b32 $r9 c0[0x1c]
+mov b32 $r0 c0[0x0]
+mov b32 $r1 c0[0x4]
+mov b32 $r2 c0[0x8]
+mov b32 $r3 c0[0xc]
+mov b32 $r4 c0[0x10]
+mov b32 $r5 c0[0x14]
+mul $r10 u32 $r8 u32 $r9
+add b32 $r0 $r0 $r10
+shl b32 $r8 $r8 clamp 0x2
+add b32 $r4 $r4 $r8
+mov b32 $r10 0
+mov b32 $r11 0
+loop:
+ld s8 $r6 cg g[$r0d]
+ld s8 $r7 cg g[$r2d]
+mul $r12 s32 $r6 s32 $r7
+add b32 $r11 $r11 $r12
+add b32 $r0 $r0 1
+add b32 $r2 $r2 1
+add b32 $r10 $r10 1
+set $p0 $p1 lt u32 $r10 $r9
+$p0 bra #loop
+st b32 wt g[$r4d] $r11
+exit

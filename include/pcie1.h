@@ -19,9 +19,9 @@
 #define PCIE1_DID_B50       0xE212U   /* Arc Pro B50 / Battlemage BMG-G21 */
 
 #define PCIE1_SCAN_BUS_LO   1U
-#define PCIE1_SCAN_BUS_HI   8U        /* riser switch + a few hops */
+#define PCIE1_SCAN_BUS_HI   63U       /* PLX fan-out plus per-GPU bridges */
 #define PCIE1_SCAN_DEV_HI   31U       /* full type-0/1 bus */
-#define PCIE1_SCAN_MAX      16U
+#define PCIE1_SCAN_MAX      64U
 #define PCIE1_DASH_MAX      4U        /* extra HARDWARE rows for enum */
 
 #define PCIE1_LINK_CAP_ID   0x10U     /* PCI Express capability */
@@ -57,6 +57,7 @@ struct pcie1_status {
     u16 b50_device;
     bool b50_found;
     bool scan_truncated;
+    bool malformed_topology;
     const char *fail_reason;
     struct pcie1_ep eps[PCIE1_SCAN_MAX];
 };
@@ -81,6 +82,19 @@ static inline bool pcie1_is_b50(u16 vendor, u16 device)
 static inline bool pcie1_id_valid(u32 cfg0)
 {
     return cfg0 != 0U && cfg0 != 0xFFFFFFFFU;
+}
+
+static inline bool pcie1_cfg_addr_valid(u32 bus, u32 dev, u32 func, u32 reg)
+{
+    return bus <= PCIE1_SCAN_BUS_HI && dev <= PCIE1_SCAN_DEV_HI &&
+           func < 8U && reg <= 0xFFCU && (reg & 3U) == 0U;
+}
+
+static inline bool pcie1_bridge_range_valid(u32 parent_bus, u8 secondary, u8 subordinate)
+{
+    return parent_bus >= PCIE1_SCAN_BUS_LO && parent_bus <= PCIE1_SCAN_BUS_HI &&
+           secondary > parent_bus && secondary <= subordinate &&
+           subordinate <= PCIE1_SCAN_BUS_HI;
 }
 
 static inline u16 pcie1_cfg_vendor(u32 cfg0)
@@ -278,7 +292,9 @@ static inline u32 pcie1_fmt_caps(char *buf, u32 max, const struct pcie1_ep *e)
     if (!buf || max == 0 || !e)
         return 0;
     vn = pcie1_vendor_name(e->vendor);
-    cl = pcie1_class_label(e->base_class, e->subclass);
+    cl = pcie1_is_b50(e->vendor, e->device) ? "Arc Pro B50" :
+         (e->vendor == 0x10DEU && e->device == 0x0FFEU ? "Quadro K2000" :
+          pcie1_class_label(e->base_class, e->subclass));
     if (vn) {
         while (*vn && n + 1U < max)
             buf[n++] = *vn++;
@@ -325,6 +341,23 @@ static inline bool pcie1_cpu_win_overlaps(u64 a_base, u64 a_size,
     if (a_end < a_base || b_end < b_base)
         return true;
     return a_base < b_end && b_base < a_end;
+}
+
+/* Type-1 bridge Memory Base/Limit register for a non-prefetchable PCI
+ * range. The bridge granularity is 1 MiB, so reject a range that cannot be
+ * represented exactly rather than forwarding a larger authority range. */
+static inline bool pcie1_bridge_mem_window(u64 pci_base, u64 size, u32 *out)
+{
+    u64 end;
+    if (!out || size == 0U || (pci_base & 0xFFFFFULL) != 0U ||
+        (size & 0xFFFFFULL) != 0U || pci_base > ~0ULL - (size - 1U))
+        return false;
+    end = pci_base + size - 1U;
+    if (pci_base > 0xFFFFFFFFULL || end > 0xFFFFFFFFULL)
+        return false;
+    *out = (u32)(((pci_base & 0xFFF00000ULL) >> 16) |
+                 (end & 0xFFF00000ULL));
+    return true;
 }
 
 /* pcie1 inbound DMA (#141): 2 MiB NC arena only.

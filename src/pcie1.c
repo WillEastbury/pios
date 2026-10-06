@@ -7,7 +7,7 @@
  * BCM2712 init includes the Raspberry Pi Linux 54 MHz PHY sequence:
  *   - RC base 0x1000110000 (not 0x1000120000)
  *   - reset id 43 (pcie2 is 44)
- *   - 32 MiB Device ATU at 0x1B00000000 (BAR0 MMIO; not LMEM, not RP1)
+ *   - 32 MiB Device ATU at CPU 0x1B80000000 -> PCIe 0x80000000
  *   - 2 MiB inbound NC arena only (#141); not 64 GiB -> PA 0
  *   - no BAR1 MIP0
  *   - MSI INTID 255/256 left masked (no handler yet)
@@ -131,7 +131,6 @@ static bool g_link_up;
 static const char *g_fail = "not inited";
 static struct pcie1_status g_snap;
 static u32 pcie1_aer_offset_rc;
-static u32 pcie1_next_bridge_bus;
 
 static void bridge_reset_brcm(bool assert)
 {
@@ -287,13 +286,16 @@ static void set_outbound_win(u64 cpu_addr, u64 pcie_addr, u64 size)
 
 bool pcie1_set_outbound_window(u64 size)
 {
+    u32 mem_window;
     if (!g_link_up || size < 0x00100000ULL ||
         size > PIOS_PCIE1_CPU_WIN_SIZE ||
-        (size & (size - 1ULL)) != 0ULL)
+        (size & (size - 1ULL)) != 0ULL ||
+        !pcie1_bridge_mem_window(PIOS_PCIE1_PCI_WIN_BASE, size, &mem_window))
         return false;
-    set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, 0, size);
+    set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, PIOS_PCIE1_PCI_WIN_BASE, size);
+    pw(PCI_REG_MEM_BASE_LIMIT, mem_window);
     dsb();
-    return true;
+    return pr(PCI_REG_MEM_BASE_LIMIT) == mem_window;
 }
 
 bool pcie1_enable_memory_path(u32 target_bus)
@@ -384,77 +386,71 @@ static u16 cap_link_status(void)
 
 u32 pcie1_cfg_read(u32 bus, u32 dev, u32 func, u32 reg)
 {
-    if (bus == 0 && dev == 0 && func == 0)
-        return pr(reg & 0xFFC);
-    if (!g_link_up)
+    if (bus == 0U && dev == 0U && func == 0U)
+        return reg <= 0xFFCU && (reg & 3U) == 0U ? pr(reg) : 0xFFFFFFFFU;
+    if (!g_link_up || !pcie1_cfg_addr_valid(bus, dev, func, reg))
         return 0xFFFFFFFFU;
     pw(EXT_CFG_INDEX, (bus << 20) | (dev << 15) | (func << 12));
     dmb();
-    return pr(EXT_CFG_DATA + (reg & 0xFFC));
+    return pr(EXT_CFG_DATA + reg);
 }
 
 void pcie1_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val)
 {
-    if (bus == 0 && dev == 0 && func == 0) {
-        pw(reg & 0xFFC, val);
+    if (bus == 0U && dev == 0U && func == 0U) {
+        if (reg > 0xFFCU || (reg & 3U) != 0U)
+            return;
+        pw(reg, val);
         dmb();
         return;
     }
-    if (!g_link_up)
+    if (!g_link_up || !pcie1_cfg_addr_valid(bus, dev, func, reg))
         return;
     pw(EXT_CFG_INDEX, (bus << 20) | (dev << 15) | (func << 12));
     dmb();
-    pw(EXT_CFG_DATA + (reg & 0xFFC), val);
+    pw(EXT_CFG_DATA + reg, val);
     dmb();
 }
 
 bool pcie1_link_up(void)
 {
     u32 st = pr(MISC_PCIE_STATUS);
-    return (st & STATUS_DL_ACTIVE) && (st & STATUS_PHYLINKUP);
+    return st != 0xFFFFFFFFU && (st & STATUS_DL_ACTIVE) &&
+           (st & STATUS_PHYLINKUP);
 }
 
-static void program_bridge(u32 bus, u32 dev, u32 func, struct pcie1_ep *e)
+static bool record_bridge_range(bool reachable[PCIE1_SCAN_BUS_HI + 1U],
+                                u32 parent_bus, const struct pcie1_ep *e)
 {
-    u32 secondary;
-    u32 bus_numbers;
-    if (!e || !pcie1_is_bridge(e->hdr_type) ||
-        pcie1_next_bridge_bus > PCIE1_SCAN_BUS_HI)
-        return;
-    secondary = pcie1_next_bridge_bus++;
-    bus_numbers = (bus & 0xFFU) | (secondary << 8) |
-                  ((PCIE1_SCAN_BUS_HI & 0xFFU) << 16);
-    pcie1_cfg_write(bus, dev, func, PCI_REG_BUS_NUM, bus_numbers);
-    /* Keep a broad 32-bit memory window; endpoint BAR0 mapping narrows the
-     * root ATU before Memory Space is enabled on the selected function. */
-    pcie1_cfg_write(bus, dev, func, PCI_REG_MEM_BASE_LIMIT, 0xFFF00000U);
-    dmb();
-    e->sec_bus = (u8)secondary;
-    e->sub_bus = (u8)PCIE1_SCAN_BUS_HI;
+    if (!e || !pcie1_is_bridge(e->hdr_type))
+        return true;
+    if (!pcie1_bridge_range_valid(parent_bus, e->sec_bus, e->sub_bus))
+        return false;
+    for (u32 bus = e->sec_bus; bus <= e->sub_bus; bus++)
+        reachable[bus] = true;
+    return true;
 }
 
-static void record_function(struct pcie1_status *s, u32 bus, u32 dev, u32 func)
+static bool record_function(struct pcie1_status *s,
+                            bool reachable[PCIE1_SCAN_BUS_HI + 1U],
+                            u32 bus, u32 dev, u32 func)
 {
     u32 cfg0, cfg8, cfgc, cfg18;
     struct pcie1_ep *e;
     if (s->ep_count >= PCIE1_SCAN_MAX) {
         s->scan_truncated = true;
-        return;
+        return false;
     }
     cfg0 = pcie1_cfg_read(bus, dev, func, 0x00);
     if (!pcie1_id_valid(cfg0))
-        return;
+        return true;
     cfg8 = pcie1_cfg_read(bus, dev, func, 0x08);
     cfgc = pcie1_cfg_read(bus, dev, func, 0x0C);
     cfg18 = pcie1_cfg_read(bus, dev, func, 0x18);
     e = &s->eps[s->ep_count];
     pcie1_fill_ep(e, (u8)bus, (u8)dev, (u8)func, cfg0, cfg8, cfgc, cfg18);
-    {
-        u32 cmd = pcie1_cfg_read(bus, dev, func, PCI_REG_CMD);
-        cmd &= ~(PCI_CMD_MEM | PCI_CMD_MASTER);
-        pcie1_cfg_write(bus, dev, func, PCI_REG_CMD, cmd);
-    }
-    program_bridge(bus, dev, func, e);
+    if (!record_bridge_range(reachable, bus, e))
+        s->malformed_topology = true;
     if (s->ep_count == 0) {
         s->first_vendor = e->vendor;
         s->first_device = e->device;
@@ -465,10 +461,12 @@ static void record_function(struct pcie1_status *s, u32 bus, u32 dev, u32 func)
         s->b50_device = e->device;
     }
     s->ep_count++;
+    return true;
 }
 
 static void scan_endpoints(struct pcie1_status *s)
 {
+    bool reachable[PCIE1_SCAN_BUS_HI + 1U] = {0};
     s->ep_count = 0;
     s->first_vendor = 0;
     s->first_device = 0;
@@ -476,8 +474,11 @@ static void scan_endpoints(struct pcie1_status *s)
     s->b50_vendor = 0;
     s->b50_device = 0;
     s->scan_truncated = false;
-    pcie1_next_bridge_bus = PCIE1_SCAN_BUS_LO + 1U;
+    s->malformed_topology = false;
+    reachable[PCIE1_SCAN_BUS_LO] = true;
     for (u32 bus = PCIE1_SCAN_BUS_LO; bus <= PCIE1_SCAN_BUS_HI; bus++) {
+        if (!reachable[bus])
+            continue;
         for (u32 dev = 0; dev <= PCIE1_SCAN_DEV_HI; dev++) {
             u32 cfg0 = pcie1_cfg_read(bus, dev, 0, 0);
             u32 cfgc;
@@ -493,7 +494,7 @@ static void scan_endpoints(struct pcie1_status *s)
                     s->scan_truncated = true;
                     return;
                 }
-                record_function(s, bus, dev, func);
+                (void)record_function(s, reachable, bus, dev, func);
             }
         }
     }
@@ -517,6 +518,16 @@ static void publish_snap(const char *fail)
     publish_link(fail);
     if (g_link_up)
         scan_endpoints(&g_snap);
+    else {
+        g_snap.ep_count = 0U;
+        g_snap.first_vendor = 0U;
+        g_snap.first_device = 0U;
+        g_snap.b50_found = false;
+        g_snap.b50_vendor = 0U;
+        g_snap.b50_device = 0U;
+        g_snap.scan_truncated = false;
+        g_snap.malformed_topology = false;
+    }
 }
 
 bool pcie1_init(void)
@@ -590,9 +601,20 @@ bool pcie1_init(void)
     pw(RC_CFG_PRIV1_ID_VAL3, tmp);
     dmb();
 
-    /* Device ATU: CPU 0x1B00000000, 32 MiB, PCIe 0. BAR0 only. Not RP1. */
-    set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, 0x00000000UL,
+    /* Linux's pcie1 non-prefetchable range: CPU 0x1B80000000 ->
+     * PCIe 0x80000000. BAR0 only; do not map the prefetch/LMEM range. */
+    set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, PIOS_PCIE1_PCI_WIN_BASE,
                      PIOS_PCIE1_CPU_WIN_SIZE);
+    {
+        u32 mem_window;
+        if (!pcie1_bridge_mem_window(PIOS_PCIE1_PCI_WIN_BASE,
+                                     PIOS_PCIE1_CPU_WIN_SIZE, &mem_window)) {
+            g_inited = true;
+            publish_link("root PCI memory window invalid");
+            return false;
+        }
+        pw(PCI_REG_MEM_BASE_LIMIT, mem_window);
+    }
 
     tmp = pr(RC_CFG_VENDOR_SPECIFIC_REG1);
     tmp &= ~VENDOR_SPECIFIC_REG1_ENDIAN_MODE_BAR2_MASK;
@@ -794,7 +816,7 @@ void pcie1_rescan(void)
     if (!g_inited)
         return;
     g_link_up = pcie1_link_up();
-    publish_snap(g_link_up ? "ok" : (g_fail ? g_fail : "no link"));
+    publish_snap(g_link_up ? "ok" : "link lost");
 }
 
 #else /* !PIOS_HAS_PCIE1 */

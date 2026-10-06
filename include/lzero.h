@@ -168,7 +168,7 @@ static inline const char *lzero_next_from_facts(const struct lzero_facts *f)
 {
     switch (lzero_block_from_facts(f)) {
     case LZERO_BLOCK_NO_GPU:    return "pcie1 scan: wait for class 03:02/12:00";
-    case LZERO_BLOCK_NO_BARS:   return "lzero probe (config BAR sizes)";
+    case LZERO_BLOCK_NO_BARS:   return "lzero bars (explicit config BAR sizes)";
     case LZERO_BLOCK_ATU:        return "lzero map: BAR0 must be aligned and fit ATU";
     case LZERO_BLOCK_NO_MAP:     return "lzero map (BAR0 into sized Device ATU)";
     case LZERO_BLOCK_NO_GUC_FW: return "WALFS guc blob + adrv load (not yet)";
@@ -257,3 +257,6 @@ void lzero_probe(void);
 void lzero_status(struct lzero_status *out);
 bool lzero_probe_bars(void);
 bool lzero_map_bar0(void);
+/* Read one aligned BAR0 register after active Device translation preflight.
+ * This prevents translation faults; hardware completion still uses RC timeouts. */
+bool lzero_bar0_read32(u32 offset, u32 *value);
