@@ -5,10 +5,12 @@ and **QEMU `virt`**. No Linux. No libc. Four dedicated CPU cores. A ~27 KiB
 multi-platform stage0 loader plus a ~3.5 MiB stage2 OS image (drivers +
 network/TLS stack + WALFS/picowal DB + web application stack + PicoScript VM).
 
-![PIOS live Pi 5 HDMI workbench](docs/images/pios-workbench-pi5.png)
+![PIOS on an 8 GB quad-core Pi 5 with a PEX8748 switch, three Intel Arc Pro B50 GPUs and NVIDIA Quadro K2000](docs/images/pios-workbench-pi5.png)
 
-*PIOS running live on Raspberry Pi 5: 1920×1080 HDMI workbench with hardware,
-PCIe fabric, acceleration, networking, processes, DMA, FIFO and health telemetry.*
+*PIOS running bare metal on an 8 GB quad-core Raspberry Pi 5, connected through
+a Broadcom/PLX PEX8748 PCIe Gen3 switch to three Intel Arc Pro B50 GPUs and an
+NVIDIA Quadro K2000. The live 1920×1080 HDMI workbench exposes the PCIe fabric,
+accelerators, networking, processes, DMA, FIFOs and kernel health in real time.*
 
 Platform matrix, memory maps, and QEMU boot paths:
 [docs/platforms.md](docs/platforms.md).
