@@ -1374,6 +1374,7 @@ uint32_t pv_hook_cap(int hook)
     if ((hook >= 0x2E0 && hook <= 0x2E6) || (hook >= 0x37E && hook <= 0x380)) return PV_CAP_NET; /* Net.* */
     if (hook >= 0x360 && hook <= 0x36A) return PV_CAP_DEVICE; /* Media.* */
     if (hook == 0x381) return PV_CAP_DEVICE; /* BitLinear.MatVecCatQ */
+    if (hook == 0x391) return PV_CAP_DEVICE; /* BitLinear.MatVecI2S */
     if (hook >= 0x382 && hook <= 0x386) return PV_CAP_DEVICE; /* Tensor F32 ops */
     if (hook >= 0x387 && hook <= 0x389) return PV_CAP_DEVICE; /* MoE.* */
     if (hook == 0x38A) return PV_CAP_DEVICE; /* CatQ.CalibrateTarget */
@@ -2738,7 +2739,8 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
     }
     if ((hook >= PV_HOOK_BITLINEAR_SETSHAPE &&
          hook <= PV_HOOK_BITLINEAR_HASFORMAT) ||
-        hook == PV_HOOK_BITLINEAR_MATMULBITMAPBATCH) {
+        hook == PV_HOOK_BITLINEAR_MATMULBITMAPBATCH ||
+        hook == PV_HOOK_BITLINEAR_MATVECI2S) {
         if (pv_bitlinear_hook &&
             pv_bitlinear_hook(ctx, hook, rd, rs1, rs2)) return;
         if (pv_bitlinear_default(ctx, hook, rd, rs1, rs2)) return;

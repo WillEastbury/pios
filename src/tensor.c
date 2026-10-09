@@ -1121,14 +1121,57 @@ static int tensor_picovm_compute_hook(pv_ctx *ctx, int hook,
 static int tensor_picovm_bitlinear_hook(pv_ctx *ctx, int hook,
                                         int rd, int rs1, int rs2)
 {
-    if (!ctx || hook != PV_HOOK_BITLINEAR_MATMULBITMAPBATCH ||
-        !prefer_qpu_ternary ||
-        ctx->bitlinear_rows != 64 || ctx->bitlinear_cols != 64)
+    if (!ctx)
         return 0;
     u32 wp = 0U, vp = 0U;
     i32 wn = 0, vn = 0;
     if (!tensor_picovm_span(ctx, ctx->regs[rs1], &wp, &wn) ||
-        !tensor_picovm_span(ctx, ctx->regs[rs2], &vp, &vn) ||
+        !tensor_picovm_span(ctx, ctx->regs[rs2], &vp, &vn))
+        return 0;
+    if (hook == PV_HOOK_BITLINEAR_MATVECI2S) {
+        u32 rows = ctx->bitlinear_rows > 0 ?
+            (u32)ctx->bitlinear_rows : 0U;
+        u32 cols = ctx->bitlinear_cols > 0 ?
+            (u32)ctx->bitlinear_cols : 0U;
+        u32 packed_bytes = 0U;
+        u64 output_bytes = (u64)rows * sizeof(i32);
+        if (!bitnet_i2s_packed_bytes(rows, cols, &packed_bytes) ||
+            packed_bytes > (u32)wn || cols > (u32)vn ||
+            ctx->no_alloc || ctx->span_count >= PV_MAX_SPANS ||
+            output_bytes > 0xFFFFFFFFULL ||
+            ctx->arena_top > (u32)ctx->mem_size ||
+            output_bytes > (u32)ctx->mem_size - ctx->arena_top) {
+            ctx->regs[rd] = 0;
+            return 1;
+        }
+        u32 base = ctx->arena_top;
+        u32 row_tile_bytes = cols * BITNET_I2S_TILE_ROWS / 4U;
+        i32 sums[BITNET_I2S_TILE_ROWS];
+        for (u32 row = 0U; row < rows; row += BITNET_I2S_TILE_ROWS) {
+            if (!bitnet_i2s_matvec_i32(
+                    ctx->mem + wp + (row / BITNET_I2S_TILE_ROWS) *
+                                    row_tile_bytes,
+                    row_tile_bytes, BITNET_I2S_TILE_ROWS, cols,
+                    (const i8 *)(ctx->mem + vp), (u32)vn,
+                    sums, BITNET_I2S_TILE_ROWS)) {
+                ctx->regs[rd] = 0;
+                return 1;
+            }
+            for (u32 lane = 0U; lane < BITNET_I2S_TILE_ROWS; lane++)
+                tensor_picovm_put_i32be(
+                    ctx->mem + base + (row + lane) * sizeof(i32),
+                    sums[lane]);
+        }
+        int handle = ctx->span_count++;
+        ctx->span_ptr[handle] = base;
+        ctx->span_len[handle] = (i32)output_bytes;
+        ctx->arena_top += (u32)output_bytes;
+        ctx->regs[rd] = handle;
+        return 1;
+    }
+    if (hook != PV_HOOK_BITLINEAR_MATMULBITMAPBATCH ||
+        !prefer_qpu_ternary ||
+        ctx->bitlinear_rows != 64 || ctx->bitlinear_cols != 64 ||
         wn < 64 * 16 || vn < 16 * 64 ||
         ctx->no_alloc || ctx->span_count >= PV_MAX_SPANS ||
         ctx->arena_top > (u32)ctx->mem_size ||

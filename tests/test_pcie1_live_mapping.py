@@ -34,6 +34,10 @@ check = function(mmu, "bool mmu_device_read32_valid(")
 assert "at s1e1r" in check and "(par >> 56) == 0U" in check
 assert "(par & 1U) == 0U" in check
 assert "mmio_read(" not in check
+nc_blocks = function(mmu, "bool mmu_active_nc_l2_range_valid(")
+assert "block += L2_BLOCK_SIZE" in nc_blocks
+assert "block + L2_BLOCK_SIZE - L3_PAGE_SIZE" in nc_blocks
+assert "mmu_par_identity_nc_valid" in nc_blocks
 mapped = function(lzero, "bool lzero_map_bar0(void)")
 assert mapped.index("mmu_device_read32_valid") < mapped.index(
     "pcie1_set_outbound_window")

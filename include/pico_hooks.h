@@ -621,6 +621,7 @@
 #define PV_HOOK_NET_DATAGRAMSETPEER              0x38E
 #define PV_HOOK_NET_DATAGRAMSEND                 0x38F
 #define PV_HOOK_NET_DATAGRAMCLOSE                0x390
+#define PV_HOOK_BITLINEAR_MATVECI2S              0x391
 #define PV_HOOK_BITLINEAR_MATVECCATQ             0x381
 #define PV_HOOK_TENSOR_ADD                       0x382
 #define PV_HOOK_TENSOR_MUL                       0x383

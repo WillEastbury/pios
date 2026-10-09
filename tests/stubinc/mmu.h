@@ -14,3 +14,4 @@ static inline void dcache_clean_range(u64 start, u64 size) { (void)start; (void)
 static inline void dcache_invalidate_range(u64 start, u64 size) { (void)start; (void)size; }
 bool mmu_device_read32_valid(u64 addr);
 bool mmu_active_nc_range_valid(u64 start, u64 size);
+bool mmu_active_nc_l2_range_valid(u64 start, u64 size);

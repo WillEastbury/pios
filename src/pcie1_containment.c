@@ -58,13 +58,13 @@ static bool contract_fresh(const struct pcie1_containment *contract)
 static bool layout_valid(void)
 {
     return PIOS_HAS_PCIE1 && PIOS_DMA_PCIE1_BASE != 0U &&
-           PIOS_DMA_PCIE1_SIZE ==
+           PIOS_DMA_PCIE1_CANARY_SIZE ==
                PCIE1_CONTAINMENT_DMA_SLOT_COUNT *
                PCIE1_CONTAINMENT_DMA_SLOT_BYTES &&
            PIOS_DMA_PCIE1_BASE <=
-               ~0ULL - PIOS_DMA_PCIE1_SIZE &&
+               ~0ULL - PIOS_DMA_PCIE1_CANARY_SIZE &&
            PCIE1_CONTAINMENT_IOVA_BASE <=
-               ~0ULL - PIOS_DMA_PCIE1_SIZE;
+               ~0ULL - PIOS_DMA_PCIE1_CANARY_SIZE;
 }
 
 bool pcie1_containment_bdf_valid(u32 bdf)

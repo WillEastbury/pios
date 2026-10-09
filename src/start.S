@@ -267,6 +267,7 @@ _start:
      *   blocks 4-35   per-core private RAM                        WB
      *   blocks 36-39  FIFO/DMA_NET/DMA_DISK/IPC                   NC
      *   blocks 40-47  HDMI back buffer                            WB
+     *   blocks 152-159 Pi5 GuC inbound arena (0x13000000)          NC
      *   remainder     high RAM/scanout                            NC
      * mmu_enable_caching() later builds its finer W^X table in a separate
      * l2_table_low, so the live boot table is never edited in place. */

@@ -50,6 +50,14 @@ u64 l2_table_boot[512] ALIGNED(4096);  /* start.S low-1GB split; never edited li
 static u64 l1_table_cached[512] ALIGNED(4096); /* BBM-safe target: fresh root for cache enable */
 static u64 l2_table_low[512] ALIGNED(4096);  /* first 1GB in 2MB blocks */
 static u64 l3_block0[512] ALIGNED(4096);     /* block 0 (0-2MB) split to 4KB pages */
+#if PIOS_HAS_HOT_MODULES
+static u64 l3_module_code[2][512] ALIGNED(4096);
+_Static_assert((PIOS_MODULE_CODE_BASE & (L2_BLOCK_SIZE - 1U)) == 0U &&
+               PIOS_MODULE_CODE_SIZE == 2U * L2_BLOCK_SIZE &&
+               (PIOS_MODULE_STATE_BASE & (L2_BLOCK_SIZE - 1U)) == 0U &&
+               PIOS_MODULE_STATE_SIZE == 2U * L2_BLOCK_SIZE,
+               "hot-module code/state regions must be two aligned L2 blocks");
+#endif
 #if PIOS_HAS_PCIE1
 static u64 l2_table_pcie1[512] ALIGNED(4096);
 _Static_assert((PIOS_PCIE1_CPU_WIN_BASE & (L2_BLOCK_SIZE - 1U)) == 0U &&
@@ -609,15 +617,41 @@ void mmu_init(void) {
             l2[i] = (u64)(usize)l3_block0 | PTE_VALID | PTE_TABLE;
             continue;
         }
-        bool cache = (addr >= CORE0_RAM_BASE && addr < SHARED_FIFO_BASE) ||
-                     (addr >= FB_BACK_BASE && addr < FB_BACK_BASE + FB_BACK_SIZE) ||
+#if PIOS_HAS_HOT_MODULES
+        if (addr >= PIOS_MODULE_CODE_BASE &&
+            addr < PIOS_MODULE_CODE_BASE + PIOS_MODULE_CODE_SIZE) {
+            u32 table = (u32)((addr - PIOS_MODULE_CODE_BASE) /
+                              L2_BLOCK_SIZE);
+            for (u32 p = 0U; p < 512U; p++) {
+                u64 page = addr + (u64)p * L3_PAGE_SIZE;
+                l3_module_code[table][p] =
+                    page | PTE_VALID | PTE_PAGE | PTE_AF |
+                    PTE_SH_INNER | PTE_ATTR(MT_NORMAL) |
+                    PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
+            }
+            l2[i] = (u64)(usize)l3_module_code[table] |
+                    PTE_VALID | PTE_TABLE;
+            continue;
+        }
+#endif
+        bool pcie1_nc = addr >= DMA_PCIE1_BASE &&
+                        addr < DMA_PCIE1_BASE + DMA_PCIE1_SIZE;
+        bool cache = !pcie1_nc &&
+                     ((addr >= CORE0_RAM_BASE && addr < SHARED_FIFO_BASE) ||
+                      (addr >= FB_BACK_BASE && addr < FB_BACK_BASE + FB_BACK_SIZE) ||
                      /* Global process arena (ADR-024). Given its FINAL Normal-WB
                       * attributes here, at the first MMU enable -- never mapped
                       * NC and tightened later. A boot-time WB<->NC transition on
                       * a live region is exactly what produced the RX
                       * descriptor-hole bug (docs/gotchas.md). */
-                     (addr >= PROC_ARENA_BASE &&
-                      addr < PROC_ARENA_BASE + PROC_ARENA_SIZE);
+                      (addr >= PROC_ARENA_BASE &&
+                       addr < PROC_ARENA_BASE + PROC_ARENA_SIZE)
+#if PIOS_HAS_HOT_MODULES
+                      || (addr >= PIOS_MODULE_STATE_BASE &&
+                          addr < PIOS_MODULE_STATE_BASE +
+                                 PIOS_MODULE_STATE_SIZE)
+#endif
+                     );
         if (low_block_is_device(addr))
             l2[i] = dev_block_2m(addr);
         else
@@ -808,12 +842,38 @@ void mmu_enable_caching(void) {
             continue;
         }
         u64 addr = (u64)i * L2_BLOCK_SIZE;
+#if PIOS_HAS_HOT_MODULES
+        if (addr >= PIOS_MODULE_CODE_BASE &&
+            addr < PIOS_MODULE_CODE_BASE + PIOS_MODULE_CODE_SIZE) {
+            u32 table = (u32)((addr - PIOS_MODULE_CODE_BASE) /
+                              L2_BLOCK_SIZE);
+            for (u32 p = 0U; p < 512U; p++) {
+                u64 page = addr + (u64)p * L3_PAGE_SIZE;
+                l3_module_code[table][p] =
+                    page | PTE_VALID | PTE_PAGE | PTE_AF |
+                    PTE_SH_INNER | PTE_ATTR(MT_NORMAL) |
+                    PTE_AP_RW_EL1 | PTE_PXN | PTE_UXN;
+            }
+            l2_table_low[i] = (u64)(usize)l3_module_code[table] |
+                              PTE_VALID | PTE_TABLE;
+            continue;
+        }
+#endif
         if (low_block_is_device(addr)) {
             l2_table_low[i] = dev_block_2m(addr);
             continue;
         }
-        bool cache = (addr >= cache_lo_base && addr < cache_lo_end) ||
-                     (addr >= cache_fb_base && addr < cache_fb_end);
+        bool pcie1_nc = addr >= DMA_PCIE1_BASE &&
+                        addr < DMA_PCIE1_BASE + DMA_PCIE1_SIZE;
+        bool cache = !pcie1_nc &&
+                     ((addr >= cache_lo_base && addr < cache_lo_end) ||
+                      (addr >= cache_fb_base && addr < cache_fb_end)
+#if PIOS_HAS_HOT_MODULES
+                      || (addr >= PIOS_MODULE_STATE_BASE &&
+                          addr < PIOS_MODULE_STATE_BASE +
+                                 PIOS_MODULE_STATE_SIZE)
+#endif
+                     );
         l2_table_low[i] = cache ? ram_block_2m(addr) : ram_block_2m_nc(addr);
     }
 
@@ -910,6 +970,30 @@ bool mmu_active_nc_range_valid(u64 start, u64 size)
                          : "=r"(par) : "r"(addr) : "memory");
         if (!mmu_par_identity_nc_valid(addr, par))
             return false;
+    }
+    return true;
+}
+
+bool mmu_active_nc_l2_range_valid(u64 start, u64 size)
+{
+    u64 sctlr;
+    if (!size || (start & (L2_BLOCK_SIZE - 1U)) != 0U ||
+        (size & (L2_BLOCK_SIZE - 1U)) != 0U ||
+        start > ~0ULL - size)
+        return false;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    if (!(sctlr & 1U))
+        return false;
+    for (u64 block = start; block < start + size;
+         block += L2_BLOCK_SIZE) {
+        u64 probes[2] = { block, block + L2_BLOCK_SIZE - L3_PAGE_SIZE };
+        for (u32 i = 0U; i < 2U; i++) {
+            u64 par;
+            __asm__ volatile("at s1e1w, %1\nisb\nmrs %0, par_el1"
+                             : "=r"(par) : "r"(probes[i]) : "memory");
+            if (!mmu_par_identity_nc_valid(probes[i], par))
+                return false;
+        }
     }
     return true;
 }
@@ -1211,6 +1295,64 @@ bool mmu_kernel_range_is_wb_is(u64 start, u64 size)
         page += L3_PAGE_SIZE;
     }
     return true;
+}
+
+bool mmu_module_code_set_rx(u64 start, u64 code_bytes, u64 slot_bytes,
+                            bool executable)
+{
+#if !PIOS_HAS_HOT_MODULES
+    (void)start;
+    (void)code_bytes;
+    (void)slot_bytes;
+    (void)executable;
+    return false;
+#else
+    if (core_id() != 0U || slot_bytes == 0U ||
+        (start & (L3_PAGE_SIZE - 1U)) != 0U ||
+        (slot_bytes & (L3_PAGE_SIZE - 1U)) != 0U ||
+        start < PIOS_MODULE_CODE_BASE ||
+        start > PIOS_MODULE_CODE_BASE + PIOS_MODULE_CODE_SIZE ||
+        slot_bytes > PIOS_MODULE_CODE_BASE + PIOS_MODULE_CODE_SIZE - start ||
+        code_bytes > slot_bytes)
+        return false;
+    u64 code_end = start + ((code_bytes + L3_PAGE_SIZE - 1U) &
+                            ~(L3_PAGE_SIZE - 1U));
+    u64 slot_end = start + slot_bytes;
+
+    /* Break-before-make across every core sharing the kernel TTBR. */
+    for (u64 page = start; page < slot_end; page += L3_PAGE_SIZE) {
+        u32 table = (u32)((page - PIOS_MODULE_CODE_BASE) /
+                          L2_BLOCK_SIZE);
+        u32 index = (u32)((page / L3_PAGE_SIZE) & 511U);
+        l3_module_code[table][index] = 0U;
+    }
+    dcache_clean_range((u64)(usize)l3_module_code,
+                       sizeof(l3_module_code));
+    dsb();
+    __asm__ volatile("tlbi vmalle1is; dsb sy; isb" ::: "memory");
+
+    for (u64 page = start; page < slot_end; page += L3_PAGE_SIZE) {
+        u32 table = (u32)((page - PIOS_MODULE_CODE_BASE) /
+                          L2_BLOCK_SIZE);
+        u32 index = (u32)((page / L3_PAGE_SIZE) & 511U);
+        u64 attrs = page | PTE_VALID | PTE_PAGE | PTE_AF |
+                    PTE_SH_INNER | PTE_ATTR(MT_NORMAL) | PTE_UXN;
+        if (executable && page < code_end)
+            attrs |= PTE_AP_RO_EL1;
+        else
+            attrs |= PTE_AP_RW_EL1 | PTE_PXN;
+        l3_module_code[table][index] = attrs;
+    }
+    dcache_clean_range((u64)(usize)l3_module_code,
+                       sizeof(l3_module_code));
+    dsb();
+    __asm__ volatile("tlbi vmalle1is; dsb sy; isb" ::: "memory");
+    if (executable) {
+        dcache_clean_range(start, code_bytes);
+        icache_invalidate_range(start, code_bytes);
+    }
+    return true;
+#endif
 }
 
 void dcache_clean_range(u64 start, u64 size) {

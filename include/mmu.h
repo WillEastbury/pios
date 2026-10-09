@@ -67,6 +67,9 @@ u64 mmu_kernel_ttbr0(void);
 bool mmu_device_read32_valid(u64 addr);
 /* Active EL1 read/write identity translation, Normal-NC, Outer Shareable. */
 bool mmu_active_nc_range_valid(u64 start, u64 size);
+/* Validate both boundary pages of every identity-mapped 2MiB Normal-NC block.
+ * Use only for ranges whose table builder contract guarantees L2 blocks. */
+bool mmu_active_nc_l2_range_valid(u64 start, u64 size);
 static inline bool mmu_par_identity_nc_valid(u64 addr, u64 par)
 {
     return (addr & 4095U) == 0U && (par & 1U) == 0U &&
@@ -95,6 +98,8 @@ bool mmu_user_pte_snapshot(u32 core, u32 slot, u64 va, u64 *l1e, u64 *l2e, u64 *
 /* Verify an identity-mapped kernel span is Normal-WB, Inner-Shareable in the
  * actual live low-memory tables. Intended for boot-time control allocation. */
 bool mmu_kernel_range_is_wb_is(u64 start, u64 size);
+bool mmu_module_code_set_rx(u64 start, u64 code_bytes, u64 slot_bytes,
+                            bool executable);
 
 /* Switch active TTBR0 back to the global kernel table */
 void mmu_switch_to_kernel(void);

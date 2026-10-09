@@ -73,12 +73,14 @@ static void test_layout_and_initialization(void)
     struct pcie1_containment_endpoint_handle endpoint;
 
     CHECK(PIOS_HAS_PCIE1 == 1);
-    CHECK(PIOS_DMA_PCIE1_SIZE == 0x00200000UL);
+    CHECK(PIOS_DMA_PCIE1_SIZE == 0x01000000UL);
+    CHECK(PIOS_DMA_PCIE1_CANARY_SIZE == 0x00200000UL);
     CHECK(PCIE1_CONTAINMENT_DMA_SLOT_COUNT == 8U);
     CHECK(PCIE1_CONTAINMENT_DMA_SLOT_BYTES == 0x00040000U);
     CHECK(PCIE1_CONTAINMENT_DMA_PAYLOAD_BYTES == 0x0003FF80U);
     CHECK(PCIE1_CONTAINMENT_DMA_SLOT_COUNT *
-          PCIE1_CONTAINMENT_DMA_SLOT_BYTES == PIOS_DMA_PCIE1_SIZE);
+          PCIE1_CONTAINMENT_DMA_SLOT_BYTES ==
+              PIOS_DMA_PCIE1_CANARY_SIZE);
     CHECK(sizeof(struct pcie1_containment_owner) == 64U);
     CHECK(sizeof(struct pcie1_containment_msi_control) == 64U);
     CHECK(sizeof(struct pcie1_containment_dma_control) == 64U);

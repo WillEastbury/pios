@@ -123,6 +123,17 @@ static void test_invalid_bars_and_apertures(void)
     REJECT("64-bit size/base alignment rejected",
            request = valid_64_request(); request.bar.config_hi = 1U;
            request.bar.config_lo = 0x00800004U);
+
+    lease = (struct pcie1_bar_lease){0};
+    request = valid_64_request();
+    request.bar.config_lo = 0xCU;
+    request.bar.probe_lo = 0xFF00000CU;
+    request.flags = PCIE1_BAR_LEASE_ALLOW_PREFETCHABLE;
+    request.aperture.pci_base = 0x100000000ULL;
+    expect_true("explicit prefetchable BAR0 accepted",
+                init_lease(&lease) &&
+                pcie1_bar_lease_acquire(&lease, 0x100U, 0U, &request,
+                                        &handle));
     REJECT("prefetch/LMEM attribute rejected",
            request.aperture.attribute = 2U);
     REJECT("missing Device attribute rejected",
@@ -132,7 +143,7 @@ static void test_invalid_bars_and_apertures(void)
     REJECT("aperture outside CPU window rejected",
            request.aperture.cpu_base = PIOS_PCIE1_CPU_WIN_BASE +
                                        PIOS_PCIE1_CPU_WIN_SIZE);
-    REJECT("request reserved field rejected", request._reserved = 1U);
+    REJECT("unknown request flag rejected", request.flags = 2U);
     REJECT("aperture reserved field rejected", request.aperture._reserved = 1U);
 
     reservations[0].base = PIOS_PCIE1_CPU_WIN_BASE + 0x1000U;

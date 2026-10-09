@@ -58,7 +58,17 @@ struct pcie1_status {
     bool b50_found;
     bool scan_truncated;
     bool malformed_topology;
+    u32 auto_attempts;
+    u32 auto_successes;
+    u32 auto_failures;
+    u32 auto_last_functions;
+    u32 auto_last_b50;
+    u32 root_recovery_attempts;
+    u32 root_recovery_successes;
+    u32 root_recovery_failures;
+    u64 auto_next_retry_ms;
     const char *fail_reason;
+    const char *auto_result;
     struct pcie1_ep eps[PCIE1_SCAN_MAX];
 };
 
@@ -360,11 +370,11 @@ static inline bool pcie1_bridge_mem_window(u64 pci_base, u64 size, u32 *out)
     return true;
 }
 
-/* pcie1 inbound DMA (#141): 2 MiB NC arena only.
+/* Pi5 PCIe1 inbound DMA (ADR-083): exact 16 MiB NC arena.
  * PCIe 0x10_00000000 + off -> CPU PIOS_DMA_PCIE1_BASE + off.
  * Rejects kernel, FIFO, DMA_NET/DISK, IPC, FB, process arena. */
 #define PCIE1_DMA_PCIE_BASE     0x1000000000ULL
-#define PCIE1_BAR2_SIZE_ENC     6U   /* ilog2(2 MiB) - 15 */
+#define PCIE1_BAR2_SIZE_ENC     9U   /* ilog2(16 MiB) - 15 */
 
 static inline bool pcie1_dma_addr_in(u64 pa, u64 n, u64 arena, u64 arena_sz,
                                      u64 pcie_base, u64 *out)
@@ -402,8 +412,11 @@ bool pcie1_dma_prepare_from_device(void *ptr, u64 len, u64 *pci_addr);
 bool pcie1_dma_complete_from_device(void *ptr, u64 len);
 void pcie1_status(struct pcie1_status *out);
 void pcie1_rescan(void);
+bool pcie1_auto_service(void);
 void pcie1_aer_init(void);
 void pcie1_aer_dump(const char *tag);
 void pcie1_aer_snapshot(struct pcie1_aer_snapshot *out, bool clear);
 u32  pcie1_cfg_read(u32 bus, u32 dev, u32 func, u32 reg);
 void pcie1_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val);
+bool pcie1_endpoint_gen3_capable(u32 bus, u32 dev, u32 func);
+bool pcie1_link_gen3_active(u32 bus, u32 dev, u32 func);

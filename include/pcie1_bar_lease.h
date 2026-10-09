@@ -14,6 +14,7 @@
 #define PCIE1_BAR_LEASE_RP1_BYTES           0x00800000ULL
 #define PCIE1_BAR_LEASE_TOKEN_MAGIC         0xB188ULL
 #define PCIE1_BAR_LEASE_TOKEN_SHIFT         48U
+#define PCIE1_BAR_LEASE_ALLOW_PREFETCHABLE  (1U << 0)
 
 enum pcie1_bar_lease_state {
     PCIE1_BAR_LEASE_FREE = 0U,
@@ -76,7 +77,7 @@ struct pcie1_bar_lease_request {
     struct pcie1_bar_lease_aperture aperture;
     const struct pcie1_bar_lease_reservation *reservations;
     u32 reservation_count;
-    u32 _reserved;
+    u32 flags;
 };
 
 /* Opaque generation capability, never a CPU or PCI pointer. */

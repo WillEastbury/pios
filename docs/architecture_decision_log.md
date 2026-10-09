@@ -123,6 +123,11 @@ decision)
 | [078](ADR-078-storage-role-markers.md) | Explicit storage role markers | Owner | Accepted |
 | [079](#adr-079) | Native Kepler compute behind existing PicoScript hooks | Owner | Accepted; hardware execution pending |
 | [082](#adr-082) | Guarded native B50 DMA adapter and live canary | Owner | Accepted; activation not yet implemented |
+| [083](#adr-083) | Pi5 16 MiB GuC inbound arena with Gen3 endpoint gate | Owner | Accepted; implementation in progress |
+| [084](#adr-084) | Forward-only A/B code roll-on over stable module arenas | Owner | Accepted; design logged |
+| [085](#adr-085) | Automatic bounded PCIe1 bus recovery across boot orders | Owner | Accepted; proven on Pi 5 |
+| [086](#adr-086) | PicoScript-owned BitNet runtime over native tensor primitives | Owner | Accepted; implementation in progress |
+| [087](#adr-087) | Six-node PIOS GPU/storage/control cluster topology | Owner | Planned |
 | [029](#adr-029) | EL0 scheduler commands over a shared SPSC ring | Owner | Accepted |
 | [030](#adr-030) | Generic xHCI core with RP1 and QEMU PCI backends | Owner | Accepted |
 | [031](#adr-031) | Pluggable auto-detected device driver backends | Owner | Accepted |
@@ -2312,6 +2317,15 @@ proof remains required: config readback/restore, Device mapping audit, command
 register proof that Memory Space and Bus Master remain clear, and an AER,
 removal, and clean-revocation test on the live FFC endpoint.
 
+**ADR-083 adapter refinement (2026-10-07).** Live B50 config-space evidence
+proved that its 16 MiB 64-bit BAR0 is marked prefetchable (`0x...0C`) even
+though it is the bounded GTT/MMIO control BAR; BAR2 is the distinct 256 MiB
+LMEM aperture. The lease therefore retains default rejection of prefetchable
+BARs but accepts one explicit `ALLOW_PREFETCHABLE` request flag. The B50
+adapter may set that flag only for BAR0 after exact size/base/probe readback
+and Device-nGnRnE CPU-aperture validation. LMEM remains rejected because it
+is a different BAR and cannot fit the dedicated aperture.
+
 ---
 
 <a name="adr-064"></a>
@@ -2863,3 +2877,420 @@ revocation, and a masked dedicated IRQ with a sequence-backed AIRQ
 continuation. An unexpected IRQ quarantines rather than fabricating a
 completion. `b50 canary` explicitly rejects the missing firmware/queue/
 completion adapter, and never sets BME merely to make a status gate green.
+
+---
+
+<a name="adr-083"></a>
+## ADR-083 — Pi5 16 MiB GuC inbound arena with Gen3 endpoint gate
+
+**Date:** 2026-10-06 · **Decider:** Owner · **Status:** Accepted; implementation in progress
+
+**Problem.** The authoritative unmodified Battlemage GuC `70.72.1` CSS
+metadata declares 9,441,280 bytes of private ADS data. Firmware, ADS
+structures, CT and queue buffers therefore cannot fit the existing 2 MiB
+PCIe1 inbound arena. A proposed base of `0x06400000` was rejected during
+implementation because a 16 MiB RC BAR2 window requires 16 MiB alignment;
+hardware masking would alias it onto the shared-asset window at `0x06000000`.
+
+**Owner decision.** Expand the Pi5 PCIe1 inbound authority to one exact 16 MiB
+Normal-NC window, provided it works on a 1 GB Pi and is disabled for nodes
+without PCIe Gen3 capability.
+
+**Decision.** Reserve physical `0x13000000–0x13FFFFFF` on Pi5. The range is
+16 MiB-aligned, ends at 320 MiB (inside a 1 GiB system), follows the 32 MiB
+process arena with a 16 MiB guard gap, and is disjoint from kernel/core RAM,
+FIFO, network/disk DMA, IPC, framebuffer, shared assets and stage0 staging.
+It is Normal-NC from first MMU enable and every active alias must prove the
+same writable identity attribute before hardware authorization.
+
+The first 2 MiB retain ADR-062's eight generation-backed canary slots. The
+remaining 14 MiB are fixed, generation-owned GuC regions: 1 MiB immutable
+firmware staging, 11 MiB ADS/private data, and 2 MiB CT/queue/completion
+state. Control descriptors remain cache-line isolated from payload. The RC
+exposes only this exact 16 MiB aperture; no second inbound BAR or broad host
+memory window is opened.
+
+GuC attach additionally requires the selected path's PEX8748 downstream port
+to advertise Gen3 or newer and currently report Gen3, non-zero width and an
+active DLL. This is an external attachment-path gate, not a root-link-speed or
+leaf-function gate: Pi5's upstream FFC remains Gen2 x1 and the B50 leaf's
+internal link advertises Gen1 x1, while the PEX8748-to-board links are Gen3 x8.
+Non-PCIe1 platforms and paths below Gen3 remain fail-closed. BME is still
+withheld until firmware upload,
+completion IRQ/AIRQ, timeout, red-zone and revocation paths are all live.
+
+---
+
+<a name="adr-084"></a>
+## ADR-084 — Forward-only A/B code roll-on over stable module arenas
+
+**Date:** 2026-10-07 · **Decider:** Owner · **Status:** Accepted; design logged
+
+**Owner direction.** Hot updates are forward-only roll-ons with A/B failover.
+New module code is loaded at a new address, calls are redirected atomically,
+and the old code is disposed after a nominal 30-second drain. Modules must
+remain binary/API/ABI compatible; incompatible changes use full OTA. Module
+state is not copied between module-owned allocations: code/instructions and
+the arena allocation are separate, and failover hot-transfers ownership of
+the stable arena while updating code only.
+
+**Decision.** The kernel owns one versioned, cache-line-isolated state arena
+per module identity. Code generations A and B are separate immutable RX
+allocations; neither contains mutable state or embeds raw pointers to its code
+slot. Every external reference is a kernel-owned stable handle into the arena
+or a versioned dispatch slot. Loading validates signature/hash, platform,
+code ABI, dispatch-table size, arena schema/version, capabilities, MMIO/IRQ/
+DMA declarations and W^X before the generation can be staged.
+
+Roll-on is:
+
+1. load and relocate the new code into the inactive slot;
+2. validate it against the existing arena without granting hardware authority;
+3. quiesce publication from the old generation and transfer kernel-owned
+   timers, IRQ bindings, AIRQ sources, queues, DMA descriptors and service
+   handles to the new generation;
+4. atomically publish the new immutable dispatch table;
+5. route every new call to the new code while already-running old calls finish
+   against the same stable arena;
+6. wait up to 30 seconds for old-generation call references and per-core
+   execution epochs to drain;
+7. unmap and poison the old RX slot only after no PC, return address, callback,
+   IRQ ticket or DMA completion can refer to it.
+
+The 30-second value is a drain target, never permission to free executable
+memory still on a core's stack. A non-draining generation remains resident
+and quarantines disposal while the new generation continues serving compatible
+calls; diagnostics identify the core/callsite that retained the old epoch.
+Forced reclamation of a live instruction frame is forbidden.
+
+**Compatibility boundary.** Hot roll-on permits implementation changes only.
+The dispatch ABI, arena schema and semantics visible to both A and B must
+remain compatible. A change to state layout, callback shape, ownership
+contract, cross-core format, MMIO authority or required kernel service ABI
+uses full A/B kernel OTA instead. Core MMU, exception vectors, scheduler,
+allocator, IRQ controller, boot/OTA and the module loader itself are not
+hot-reloadable in the first implementation.
+
+**Approved module classes (2026-10-09).** The loader is generic rather than
+B50-specific. Initial classes are B50/tensor backends, PicoScript capsule
+program generations, and the software MAC/IP/TCP FIFO stages. Kernel-owned
+FIFO storage, immutable descriptor/span ABIs, AIRQ source IDs, publication
+barriers, TCB/connection state and hardware descriptor ownership remain in
+stable arenas. A software stage may roll independently only when its manifest
+declares the same FIFO and arena schema.
+
+PicoScript capsules roll by staging new bytecode/program cards and rebinding
+the capsule service handle; existing process calls drain before the prior
+program is reclaimed. MAC/IP/TCP protocol code rolls behind stable dispatch
+slots while connections and queues remain resident. Hardware IRQ top halves,
+GIC routing and DMA ring ownership are static initially. A reloadable MAC
+bottom half must quiesce its IRQ, drain descriptors and generation-transfer
+the ring before publication. Any change to cross-stage message format,
+descriptor authority, TCP state layout or publication semantics requires a
+full kernel OTA.
+
+**Implemented module ABI and memory.** Pi 5 reserves
+`0x14000000–0x143FFFFF` for sixteen 256 KiB A/B native-code slots and
+`0x14400000–0x147FFFFF` for eight 512 KiB stable state arenas. Code pages are
+staged Normal-WB RW+XN, then changed with break-before-make and broadcast TLB
+invalidation to RO+RX; no page is writable and executable simultaneously.
+PMOD v1 manifests carry module identity, ABI, arena schema, capabilities,
+artifact generation, entry offset, code length and SHA-256. Core 0 alone may
+stage/publish/reclaim. Per-core cache-line records track active call epochs;
+old code remains RX for at least 30 seconds and until every old-epoch call
+drains, then cleanup runs and the slot is remapped RW+XN and poisoned.
+
+`/api/admin/module-update` implements `begin`, `chunk`, `commit`, `status`,
+`rollback` and `cancel` transactions in the existing bounded RAM staging
+buffer. Commit validates and atomically publishes one PMOD without touching
+kernel A/B storage or rebooting. `tools/build_pmod.py` packages artifacts and
+`tools/pios_module_update.py` performs module OTA/rollback. Kernel and module
+OTA transactions are mutually exclusive while staging. B50 command/service/
+legacy-ownership entry points now pass through module ID 0's dispatch slot,
+with the linked static implementation as generation-0 fail-safe fallback.
+
+**Live proof.** On Pi 5 image `v20261009.155856`, the built-in proof loaded
+generation A, rolled to B, preserved its stable-arena counter, rolled back to
+A, advanced dispatch epoch 1→4, and reclaimed B after the 30-second retention
+window. A separately compiled 56-byte position-independent module was then
+packaged as PMOD generation 3, uploaded through the module-update endpoint and
+published at epoch 5 without reboot. Kernel version stayed
+`v20261009.155856`, uptime advanced from 195 to 278 seconds, and management
+error/RX-wedge counters remained zero. Endpoint rollback restored generation
+1 at epoch 6, again without reboot.
+
+During the first network passthrough deployment, the PMOD wrapper failed to
+preserve LR across its fallback `BLR`, trapping core 0 in the module return.
+The hardware watchdog rebooted the same kernel image, discarded volatile
+module state, restored static network fallback, and returned with error/wedge
+zero. Passthrough modules now save/restore FP/LR around fallback calls. This
+is retained as a fail-safe proof: a bad volatile module cannot corrupt the
+kernel A/B slot and watchdog reboot restores generation 0.
+
+The linked static implementation is an explicit generation-0 rollback target,
+not merely a boot fallback. If the first PMOD has no retained A/B predecessor,
+rollback quiesces it, atomically clears the module dispatch entry, advances
+the epoch and retains the PMOD for 30 seconds while calls return to the static
+implementation. This permits MAC/IP/TCP/capsule rollback without reboot.
+
+**Network/capsule live proof.** On Pi 5 image `v20261009.170820`, PMOD
+generation 1 passthrough implementations were independently hot-loaded for
+MAC, IP, TCP/service and PicoScript capsule dispatch. After every publication,
+the main HTTP/PicoScript endpoint remained responsive; after capsule
+publication, `:8090/hello/module` returned the correct PicoScript-produced
+JSON. Each module was then rolled back through the module-update endpoint to
+linked static generation 0. Capsule `:8090/hello/static` remained correct.
+Dispatch epochs advanced 1→2 on activation and 2→3 on rollback. Kernel
+version remained unchanged, uptime advanced 180→187 seconds, and management
+error/RX-wedge counters stayed zero.
+
+The replaceable boundaries are software MAC descriptor consumption, IP
+descriptor consumption, TCP/L4 plus scheduled service dispatch, and capsule
+program preload/poll dispatch. Hardware transport IRQ/quiesce, egress
+ownership, FIFO/descriptor storage, AIRQ registrations, TCBs, capsule shared
+arena and publication barriers remain static kernel ownership.
+
+---
+
+<a name="adr-085"></a>
+## ADR-085 — Automatic bounded PCIe1 bus recovery across boot orders
+
+**Date:** 2026-10-08 · **Decider:** Owner · **Status:** Accepted; proven on Pi 5
+
+**Problem.** The Pi, PEX8748 switch/riser domain and GPU domain can become
+ready in different orders. The PEX bridge bus-number registers are cleared by
+cold power loss and Pi reboot, while downstream links can train after the
+kernel's initial passive scan. Requiring an operator to run the external bus
+allocator after every boot makes otherwise healthy hardware appear absent.
+
+**Owner decision.** Automatically perform bounded recovery for 60 seconds
+after PCIe1 initialization, then continue low-rate hotplug retries every 30
+seconds. After live evidence showed that powering Domain 2 after the Pi leaves
+the dedicated PCIe1 root link down, the owner also approved bounded
+asynchronous root reset/refclock/PERST recovery at the same 30-second steady
+cadence.
+
+**Decision.** Core 0 performs a passive topology refresh on the maintenance
+cadence. A malformed/cleared bridge hierarchy may enter a separate explicit
+bus-number assignment state. That state may write only Type-1 primary,
+secondary and subordinate bus-number register `0x18`; it closes sibling
+routes before opening one bounded temporary subordinate range, recurses to a
+maximum depth of eight, then tightens each range. It is capped at 64 functions,
+bus 63 and 20 milliseconds per attempt.
+
+Every reachable function must have PCI Command I/O, MEM and BME clear before
+the first topology write. Identity, command state and each bus-number
+readback are verified. Failure closes every route changed by the attempt and
+publishes a refused/quarantined diagnostic; it never restores potentially
+overlapping stale ranges. A stable valid topology is read-only. A later card
+appearing behind an already assigned empty PEX port exposes a new bridge with
+an invalid child range, which safely triggers another assignment attempt.
+
+This policy does not assign BARs, open Type-1 memory windows, enable endpoint
+MEM/BME, configure MSI, perform DMA, reset ports, or write undocumented PEX
+vendor registers. Once another owner activates any reachable PCI function,
+automatic topology mutation fails closed. BAR leases, GuC authority and DMA
+remain operator-triggered under ADR-062, ADR-063, ADR-082 and ADR-083.
+
+**Lost-root extension.** A lost FFC root link advances through timed reactor
+phases: assert the dedicated PCIe1 bridge reset, deassert and hold PERST,
+reapply the documented BCM2712 54 MHz PLL/root registers, release PERST after
+20 ms, then allow 100 ms CEM settle and at most another 100 ms for link
+training. No phase busy-waits for the switch or endpoint. The sequence never
+touches the separate RP1 PCIe root. Attempts, successes and failures are
+published in `pcie1 status`.
+
+The first successful outbound-window resize or bridge MEM-path activation
+sets a boot-lifetime latch that permanently inhibits automatic root reset.
+Thus a lost link after BAR/native authority was granted remains quarantined
+for explicit owner recovery; automatic reset can never resurrect hardware
+under stale DMA, IRQ, lease or GuC ownership.
+
+**Live proof.** Pi 5 image `v20261008.120815` was left running while the
+bridge/riser and GPU power domains were removed, then restored GPU-first and
+bridge-second. Without a manual scan, retrain or bus-allocation command, the
+kernel reported root recovery `1/1/0` (attempt/success/failure), automatic
+fabric assignment success, 20 functions and three B50 endpoints at 05:00.0,
+09:00.0 and 0E:00.0. Root AER remained clear, management error and RX-wedge
+counters remained zero, and LevelZero advanced to B50-seen while endpoint
+BME remained outside the recovery policy.
+
+---
+
+<a name="adr-086"></a>
+## ADR-086 — PicoScript-owned BitNet runtime over native tensor primitives
+
+**Date:** 2026-10-08 · **Decider:** Owner · **Status:** Accepted; implementation in progress
+
+**Owner direction.** Application and inference runtime code is PicoScript
+only. Native C is reserved for PIOS core components and hardware/tensor
+primitives.
+
+**Decision.** Model graph execution, layer scheduling, KV-cache policy, token
+iteration, sampling and service behavior remain PicoScript. Native C may
+implement bounded buffer ownership, quantization/packing primitives, B50 GuC
+and queue control, completion handling, and PicoScript hook adapters. It may
+not grow a second native model scheduler or inference engine.
+
+The first Intel acceptance primitive is Microsoft's public BitNet W2A8
+contract, pinned to `microsoft/BitNet` commit
+`0b341e582afbf9e1011f24744b554c96a3477eb5`: ternary weights in the published
+16x32 tiled/permuted int2 layout, int8 activations, int32 dot accumulation,
+and scaled output `acc / activation_scale * weight_scale`. PIOS extends its
+existing `bitnet_kernel.c` oracle and BitLinear hook surface rather than
+creating a parallel BitNet implementation. The packed-byte contract is
+cross-checked against Microsoft's `gpu/pack_weight.py`; CPU/NEON fallback
+remains authoritative until a B50 result is byte-for-byte proven.
+
+`BitLinear.MatVecI2S` returns explicit-length big-endian int32 output spans,
+matching existing PicoScript tensor conventions. The future B50 backend must
+consume the same immutable spans and may be selected only after deterministic
+known-answer parity, bounded completion IRQ/AIRQ, timeout and BME revocation
+are proven. Unsupported shapes and unavailable hardware fall back to the
+same core primitive; they never report accelerated success.
+
+**B50 operator-path refinement.** Native lifecycle validation incorporates
+the live-proven hotplug/link-training correctable AER mask `0x20C1`. At each
+operator-triggered lifecycle boundary it reads the selected path's AER
+capability, rejects every uncorrectable bit and every correctable bit outside
+that mask, writes back only the exact observed known correctable bits, and
+requires zero readback. Passive discovery and automatic boot recovery do not
+clear endpoint/path AER. This replaces brittle manual baseline clearing
+without converting unknown PCIe faults into success.
+
+**Measured preparation bound.** Live Normal-NC ADS/log preparation reached
+5,812,224 bytes before the original 10-second asynchronous deadline expired
+with framework reason `ADRV_REASON_DEADLINE`; no AER, guard, mapping or BME
+fault occurred. The hard operation deadline is therefore 30 seconds while
+each admitted step remains 1 ms and zeroes at most 4 KiB. This preserves
+reactor/network service between chunks and changes only the bounded number of
+turns available to initialize the GuC-required 9,441,280-byte private ADS plus
+log/control region.
+
+**WOPCM ordering correction.** A contained boot reached WOPCM state before
+BME and both `GUC_WOPCM_SIZE` and `DMA_GUC_WOPCM_OFFSET` remained zero after
+writes. Current upstream Xe programs WOPCM during GT hardware initialization,
+before GuC-domain reset. PIOS now follows that order: acquire GT forcewake,
+program/lock WOPCM, then issue `GDRST`, PAT/MOCS/TLB setup, parameters and
+finally contained BME/DMA. Register values and verification masks are
+unchanged; ignored WOPCM writes still fail closed before BME.
+
+**Hardware-selected WOPCM correction.** Live B50 hardware locked a larger
+GuC-size request to `0xD0000` bytes and changed the requested `0x4000` offset
+to `0x600003`: base `0x600000`, valid bit set, and GuC selected as the HuC
+loading agent. This matches upstream Xe's preprogrammed firmware/IFWI layout
+path, which validates against an 8 MiB maximum instead of recalculating the
+no-HuC layout. PIOS accepts a hardware-clamped locked GuC region only when it is
+4 KiB-aligned, contains no unknown bits, does not exceed the planned region,
+and still fits CSS+uCode plus the mandatory 16 KiB reserve and 8 KiB stack.
+The offset may contain only the 16 KiB-aligned base, valid and HuC-agent bits;
+the selected base plus actual GuC size must remain below the 8 MiB
+context-reserved top. The observed `0xD0001`/`0x600003` pair satisfies those
+proofs; undersized, unlocked, malformed or overlapping layouts abort before
+BME.
+
+**GuC READY proof.** On live Pi 5 image `v20261008.161223`, the selected B50
+accepted the hardware layout `GUC_WOPCM_SIZE=0x000D0001` and
+`DMA_GUC_WOPCM_OFFSET=0x00600003`, completed contained firmware DMA, and
+reported `GUC_STATUS=0x8002F034` / READY. BME remained generation-owned, root
+AER stayed zero, and management error/RX-wedge counters stayed zero.
+
+**CT follow-on.** Current Xe uses six `HOST2GUC_SELF_CFG` MMIO-HXG KLVs and
+`HOST2GUC_CONTROL_CTB`, not legacy action `0x4505`, to bootstrap CT. PIOS uses
+the exact 64-byte descriptor ABI, 2 KiB descriptor spacing, 4 KiB H2G ring and
+128 KiB G2H ring. `b50 ct` first proves transport with a deliberately
+CT-framed `GET_HWCONFIG` negative probe. Firmware 70.72.1 consumes the request
+and returns matching fence 1 with the deterministic GuC failure
+`0xE0000030`, confirming bidirectional CT while proving that GET_HWCONFIG is
+MMIO-only on this ABI. Any other result fails closed. H2G/G2H publication is
+DWORD-based with system barriers; malformed lengths, unknown response types,
+nonzero CT status or timeout reset GuC and revoke BME.
+
+**Width-1 CCS0 context path.** Current BMG native submission does not use a
+work-queue item or MMIO doorbell for width 1. PIOS uses CT action `0x4502`
+with KMD flag 1, GuC compute class 4, CCS0 submit mask 1, zero WQ fields and
+`hwlrca = PPHWSP_GGTT | 0x19`; scheduling later uses CT actions `0x1001`
+(enable) and `0x1000` (schedule). The first bootstrap context uses Linux Xe's
+software-synthesized empty Xe2 context, as Linux itself does before executing
+and context-switching its first two queues to capture a hardware golden
+context.
+
+The BMG CCS0 allocation is 36 KiB: 16 KiB ring, 4 KiB PPHWSP, 8 KiB context
+image, 4 KiB indirect-ring-state page and 4 KiB WA page. BMG does not need an
+indirect-context page. Live B50 PCI capability enumeration found MSI and PCIe
+capabilities but no MSI-X capability, so native `xe_device_uses_memirq()` is
+false and the optional context dwords 80-91 are not populated. `b50 context`
+builds this image and sends registration only; ring scheduling remains a
+separate operator phase after a matching CT success response.
+
+**ADS submission delta.** Live `REGISTER_CONTEXT` reached GuC and returned
+`0xE0000062` (`INVALID_CONTEXT_REGISTRATION`) while CT remained clean. PIOS
+was still using upstream Xe's minimal ADS shape, whose source explicitly says
+it does not support submissions: every engine mapping was the invalid
+sentinel 32. The submission ADS now maps GuC compute class 4/logical instance
+0 to physical CCS0, sets compute enabled mask 1, points compute golden LRC
+metadata at ADS offset `0x6000`, reports engine-state size `0x1E80`, and moves
+private data to `0xA000`. Golden bytes remain zero for bootstrap; Linux itself
+registers and executes its first two contexts before capturing and publishing
+hardware golden-LRC content.
+
+**Registration and first execution boundary.** With the CCS0 ADS mapping,
+live width-1 `REGISTER_CONTEXT` returned `0xF0000000` success for GuC ID 1.
+The first executable ring remains store-only: GGTT `MI_STORE_DATA_IMM` writes
+result 42 and completion `0xFEED0001`, then `MI_BATCH_BUFFER_END`. A separate
+`b50 submit` command sends CT `SCHED_CONTEXT_MODE_SET(1, ENABLE)` and requires
+both exact memory values within 500 ms. Any malformed CT state, nonzero
+unexpected completion or timeout resets GuC and revokes BME. No tensor kernel
+is selected until this command-stream execution proof passes.
+
+Live G2H evidence showed mode enable returns both direct success and
+`SCHED_CONTEXT_MODE_DONE (0x90001002, guc_id=1, runnable=1)` but does not
+consume the ring by itself. PIOS now validates that event, then sends the
+separate current-Xe `SCHED_CONTEXT (0x1000, guc_id=1)` action before waiting
+for the memory fence.
+
+After explicit scheduling, GuC returned success but the physical CCS ring
+head remained zero. The retained LRC audit proved context control, indirect
+page pointer, ring start/tail/control and commands were all exact. The missing
+Linux bootstrap write was the mandatory ring preamble
+`MI_ARB_ON_OFF | MI_ARB_ENABLE = 0x04000001` at offset zero. PIOS now emits
+that preamble before the two store commands; total published tail remains
+40 bytes and qword-aligned.
+
+The preamble alone did not advance CCS0. The final missing full-ADS engine
+state was `reg_state_list[compute][0]`: upstream always publishes two
+mandatory restore entries even when no platform WA registers exist.
+PIOS now places `{offset=0x1A080,value=0,flags=0,mask=0}` for CCS0
+`RING_HWS_PGA` and `{offset=0x1A0A8,...}` for `RING_IMR` at ADS offset
+`0x553C`, and advertises that GGTT address with count 2. BMG dGPU leaves
+`generic_gt_sysinfo[]` zero, matching current Xe.
+
+---
+
+<a name="adr-087"></a>
+## ADR-087 — Six-node PIOS GPU/storage/control cluster topology
+
+**Date:** 2026-10-08 · **Decider:** Owner · **Status:** Planned
+
+**Decision.** The target cluster contains six PIOS nodes connected through an
+8-port 10/100/1000 Ethernet switch:
+
+1. One GPU controller: Raspberry Pi 5, 8 GiB RAM, 256 GiB SD, PEX switch,
+   three 16 GiB Intel Arc Pro B50 GPUs, one 24 GiB Intel Arc Pro B60 GPU, and
+   a 128 GiB USB SATA M.2 SSD for model weights.
+2. Two hyperconverged storage/compute controllers: each a Raspberry Pi 5 with
+   8 GiB RAM, 256 GiB SD, a 512 GiB HAT NVMe device, and a USB SSD.
+3. Two wireless cluster controllers: each a Pi Zero 2 W with 512 MiB RAM,
+   32 GiB SD, Wi-Fi, and a 100 Mbit/s USB NIC.
+4. One RP2350/Waveshare relay controller connected over Wi-Fi, responsible
+   for power-domain cycling when OTA recovery requires physical sequencing.
+
+**Design consequences.** GPU execution and weight-locality policy must treat
+the B60's 24 GiB capacity separately from the three 16 GiB B50s. Storage and
+compute placement may use the two hyperconverged Pi 5 nodes, but the Pi Zero
+controllers remain control-plane nodes with explicit memory/network bounds.
+Power recovery is a first-class remote operation owned by the relay
+controller; GPU-node software must request bounded domain sequencing rather
+than assuming a human operator. The one-gigabit switch is the initial
+east-west bandwidth ceiling for scheduling, sharding, replication and model
+distribution.

@@ -34,12 +34,27 @@ _Static_assert(PIOS_PCIE1_CPU_WIN_SIZE == 0x02000000UL,
                "pcie1 ATU is 32 MiB for BAR0 MMIO; LMEM stays unmapped");
 _Static_assert(PIOS_PCIE1_RESET_ID != 44U,
                "pcie1 must not assert pcie2/RP1 reset id 44");
-_Static_assert(PIOS_DMA_PCIE1_SIZE == 0x00200000UL,
-               "pcie1 inbound arena is 2 MiB");
-_Static_assert(PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE == PIOS_FB_BACK_BASE,
-               "pcie1 DMA arena sits in the NC hole before FB_BACK");
-_Static_assert(PIOS_IPC_SHM_BASE + PIOS_IPC_SHM_SIZE == PIOS_DMA_PCIE1_BASE,
-               "pcie1 DMA arena follows IPC");
+_Static_assert(PIOS_DMA_PCIE1_SIZE == 0x01000000UL,
+               "Pi5 GuC inbound arena is exactly 16 MiB");
+_Static_assert((PIOS_DMA_PCIE1_BASE & (PIOS_DMA_PCIE1_SIZE - 1U)) == 0U,
+               "Pi5 GuC inbound arena must be size-aligned");
+_Static_assert(PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE <= 0x40000000UL,
+               "Pi5 GuC inbound arena must fit a 1 GiB board");
+_Static_assert(PIOS_DMA_PCIE1_BASE >=
+               PIOS_PROC_ARENA_BASE + PIOS_PROC_ARENA_SIZE,
+               "Pi5 GuC inbound arena follows the process arena");
+_Static_assert(PIOS_DMA_PCIE1_GUC_FW_BASE ==
+               PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_CANARY_SIZE,
+               "GuC firmware follows the retained canary region");
+_Static_assert(PIOS_DMA_PCIE1_GUC_ADS_BASE ==
+               PIOS_DMA_PCIE1_GUC_FW_BASE + PIOS_DMA_PCIE1_GUC_FW_SIZE,
+               "GuC ADS follows immutable firmware staging");
+_Static_assert(PIOS_DMA_PCIE1_GUC_Q_BASE ==
+               PIOS_DMA_PCIE1_GUC_ADS_BASE + PIOS_DMA_PCIE1_GUC_ADS_SIZE,
+               "GuC queues follow ADS/private data");
+_Static_assert(PIOS_DMA_PCIE1_GUC_Q_BASE + PIOS_DMA_PCIE1_GUC_Q_SIZE ==
+               PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE,
+               "GuC fixed regions consume the exact inbound arena");
 _Static_assert((PIOS_DMA_PCIE1_BASE + PIOS_DMA_PCIE1_SIZE) <= PIOS_DMA_NET_BASE ||
                PIOS_DMA_PCIE1_BASE >= (PIOS_DMA_NET_BASE + PIOS_DMA_NET_SIZE),
                "pcie1 DMA arena must not overlap DMA_NET");
@@ -131,6 +146,179 @@ static bool g_link_up;
 static const char *g_fail = "not inited";
 static struct pcie1_status g_snap;
 static u32 pcie1_aer_offset_rc;
+static bool g_path_activated;
+
+#define PCIE1_AUTO_FAST_WINDOW_MS 60000ULL
+#define PCIE1_AUTO_FAST_RETRY_MS   1000ULL
+#define PCIE1_AUTO_STEADY_RETRY_MS 30000ULL
+#define PCIE1_AUTO_BUDGET_MS       20ULL
+#define PCIE1_AUTO_MAX_DEPTH       8U
+#define PCIE1_PLX_8748_ID          0x874810B5U
+
+struct pcie1_auto_record {
+    u8 bus;
+    u8 dev;
+    u8 func;
+    bool bridge;
+    u32 identity;
+    u32 old_buses;
+};
+
+static struct {
+    struct pcie1_auto_record records[PCIE1_SCAN_MAX];
+    u32 count;
+    u32 changed[PCIE1_SCAN_MAX];
+    u32 changed_count;
+    u32 next_bus;
+    u32 b50_count;
+    u64 deadline_ms;
+} g_auto;
+static u64 g_auto_fast_until_ms;
+static u64 g_auto_next_ms;
+static const char *g_auto_result = "not started";
+
+enum pcie1_root_recovery_state {
+    PCIE1_ROOT_RECOVERY_IDLE = 0,
+    PCIE1_ROOT_RECOVERY_RESET_ASSERTED,
+    PCIE1_ROOT_RECOVERY_PERST_ASSERTED,
+    PCIE1_ROOT_RECOVERY_WAIT_LINK
+};
+
+static struct {
+    enum pcie1_root_recovery_state state;
+    u64 due_ms;
+    u64 deadline_ms;
+} g_root_recovery;
+
+static bool auto_deadline_ok(void)
+{
+    return timer_monotonic_ms() <= g_auto.deadline_ms;
+}
+
+static bool auto_write_buses(const struct pcie1_auto_record *record, u32 value,
+                              bool enforce_deadline)
+{
+    if (!record || !record->bridge ||
+        (enforce_deadline && !auto_deadline_ok()))
+        return false;
+    pcie1_cfg_write(record->bus, record->dev, record->func, 0x18U, value);
+    dsb();
+    return pcie1_cfg_read(record->bus, record->dev, record->func,
+                          0x18U) == value;
+}
+
+static bool auto_walk(u32 bus, u32 depth)
+{
+    u32 first = g_auto.count;
+    if (depth > PCIE1_AUTO_MAX_DEPTH || !auto_deadline_ok())
+        return false;
+    for (u32 dev = 0U; dev <= PCIE1_SCAN_DEV_HI; dev++) {
+        u32 identity = pcie1_cfg_read(bus, dev, 0U, 0U);
+        u32 functions;
+        if (!pcie1_id_valid(identity))
+            continue;
+        u32 header0 = pcie1_cfg_read(bus, dev, 0U, 0x0CU);
+        if (header0 == 0xFFFFFFFFU)
+            return false;
+        functions = pcie1_hdr_multifunction((u8)(header0 >> 16)) ? 8U : 1U;
+        for (u32 func = 0U; func < functions; func++) {
+            struct pcie1_auto_record *record;
+            u32 command;
+            u32 classrev;
+            u32 header;
+            u32 kind;
+            bool bridge;
+            identity = pcie1_cfg_read(bus, dev, func, 0U);
+            if (!pcie1_id_valid(identity))
+                continue;
+            if (g_auto.count >= PCIE1_SCAN_MAX || !auto_deadline_ok())
+                return false;
+            command = pcie1_cfg_read(bus, dev, func, 4U);
+            classrev = pcie1_cfg_read(bus, dev, func, 8U);
+            header = pcie1_cfg_read(bus, dev, func, 0x0CU);
+            if (command == 0xFFFFFFFFU || classrev == 0xFFFFFFFFU ||
+                header == 0xFFFFFFFFU || (command & 7U))
+                return false;
+            kind = (header >> 16) & 0x7FU;
+            bridge = kind == 1U && (classrev >> 16) == 0x0604U;
+            if (kind > 1U || (kind == 1U && !bridge))
+                return false;
+            record = &g_auto.records[g_auto.count++];
+            *record = (struct pcie1_auto_record){
+                .bus = (u8)bus,
+                .dev = (u8)dev,
+                .func = (u8)func,
+                .bridge = bridge,
+                .identity = identity,
+                .old_buses = bridge ?
+                    pcie1_cfg_read(bus, dev, func, 0x18U) : 0U
+            };
+            if (bridge && record->old_buses == 0xFFFFFFFFU)
+                return false;
+            if (identity == 0xE2128086U)
+                g_auto.b50_count++;
+        }
+    }
+    for (u32 i = first; i < g_auto.count; i++) {
+        struct pcie1_auto_record *record = &g_auto.records[i];
+        if (!record->bridge)
+            continue;
+        if (g_auto.changed_count >= PCIE1_SCAN_MAX)
+            return false;
+        g_auto.changed[g_auto.changed_count++] = i;
+        if (!auto_write_buses(record, record->old_buses & 0xFF000000U, true))
+            return false;
+    }
+    u32 last = g_auto.count;
+    for (u32 i = first; i < last; i++) {
+        struct pcie1_auto_record *record = &g_auto.records[i];
+        u32 secondary;
+        u32 upper;
+        if (!record->bridge)
+            continue;
+        if (g_auto.next_bus > PCIE1_SCAN_BUS_HI)
+            return false;
+        secondary = g_auto.next_bus++;
+        upper = record->old_buses & 0xFF000000U;
+        if (!auto_write_buses(record, upper | bus | (secondary << 8) |
+                                      (PCIE1_SCAN_BUS_HI << 16), true))
+            return false;
+        if (!auto_walk(secondary, depth + 1U))
+            return false;
+        if (!auto_write_buses(record, upper | bus | (secondary << 8) |
+                                      ((g_auto.next_bus - 1U) << 16), true))
+            return false;
+    }
+    return true;
+}
+
+static bool auto_configure(void)
+{
+    g_auto = (typeof(g_auto)){0};
+    g_auto.next_bus = 2U;
+    g_auto.deadline_ms = timer_monotonic_ms() + PCIE1_AUTO_BUDGET_MS;
+    if (pcie1_cfg_read(1U, 0U, 0U, 0U) != PCIE1_PLX_8748_ID ||
+        !auto_walk(1U, 0U))
+        goto fail;
+    for (u32 i = 0U; i < g_auto.count; i++) {
+        const struct pcie1_auto_record *record = &g_auto.records[i];
+        if (pcie1_cfg_read(record->bus, record->dev, record->func, 0U) !=
+                record->identity ||
+            (pcie1_cfg_read(record->bus, record->dev, record->func, 4U) & 7U))
+            goto fail;
+    }
+    g_auto_result = "configured; BME off";
+    return true;
+fail:
+    while (g_auto.changed_count) {
+        const struct pcie1_auto_record *record =
+            &g_auto.records[g_auto.changed[--g_auto.changed_count]];
+        (void)auto_write_buses(record, record->old_buses & 0xFF000000U,
+                               false);
+    }
+    g_auto_result = "refused/quarantined";
+    return false;
+}
 
 static void bridge_reset_brcm(bool assert)
 {
@@ -207,7 +395,7 @@ static bool mdio_write(u8 reg, u16 value)
     return mdio_wait(RC_DL_MDIO_WR_DATA, false, &result);
 }
 
-static bool setup_refclk_54mhz(void)
+static bool setup_refclk_54mhz(bool verbose)
 {
     /* Raspberry Pi Linux brcm_pcie_munge_pll(): BCM2712's 54 MHz XOSC.
      * Program only this RC's PHY, with PERST held and shared RESCAL untouched. */
@@ -223,13 +411,15 @@ static bool setup_refclk_54mhz(void)
             !mdio_write(regs[i], values[i]) ||
             !mdio_read(regs[i], &after))
             return false;
-        uart_puts("[pcie1] PLL ");
-        uart_hex(regs[i]);
-        uart_puts(" ");
-        uart_hex(before);
-        uart_puts(" -> ");
-        uart_hex(after);
-        uart_puts("\n");
+        if (verbose) {
+            uart_puts("[pcie1] PLL ");
+            uart_hex(regs[i]);
+            uart_puts(" ");
+            uart_hex(before);
+            uart_puts(" -> ");
+            uart_hex(after);
+            uart_puts("\n");
+        }
         if (after != values[i]) {
             uart_puts("[pcie1] PLL readback mismatch\n");
             return false;
@@ -252,7 +442,7 @@ static bool setup_refclk_54mhz(void)
 static void program_inbound_arena(void)
 {
     u32 tmp;
-    /* 2 MiB at PCIe 0x10_00000000 -> CPU DMA_PCIE1. Not 64 GiB -> PA 0. */
+    /* 16 MiB at PCIe 0x10_00000000 -> CPU DMA_PCIE1. Not broad host RAM. */
     pw(MISC_RC_BAR2_CONFIG_LO, PCIE1_BAR2_SIZE_ENC);
     pw(MISC_RC_BAR2_CONFIG_HI, (u32)(PCIE1_DMA_PCIE_BASE >> 32));
     dmb();
@@ -292,6 +482,7 @@ bool pcie1_set_outbound_window(u64 size)
         (size & (size - 1ULL)) != 0ULL ||
         !pcie1_bridge_mem_window(PIOS_PCIE1_PCI_WIN_BASE, size, &mem_window))
         return false;
+    g_path_activated = true;
     set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, PIOS_PCIE1_PCI_WIN_BASE, size);
     pw(PCI_REG_MEM_BASE_LIMIT, mem_window);
     dsb();
@@ -302,6 +493,7 @@ bool pcie1_enable_memory_path(u32 target_bus)
 {
     if (!g_link_up)
         return false;
+    g_path_activated = true;
     for (u32 i = 0; i < g_snap.ep_count; i++) {
         const struct pcie1_ep *e = &g_snap.eps[i];
         if (!pcie1_is_bridge(e->hdr_type) ||
@@ -370,6 +562,59 @@ static bool cap_set_gen2(void)
     return false;
 }
 
+static bool program_root_link_registers(bool verbose)
+{
+    u32 tmp;
+    u32 mem_window;
+
+    tmp = pr(HARD_DEBUG);
+    tmp &= ~SERDES_IDDQ;
+    pw(HARD_DEBUG, tmp);
+    dmb();
+    timer_delay_us(1000U);
+
+    if (!setup_refclk_54mhz(verbose))
+        return false;
+
+    tmp = pr(MISC_MISC_CTRL);
+    tmp |= MCTRL_SCB_ACCESS_EN;
+    tmp |= MCTRL_CFG_READ_UR;
+    tmp &= ~MCTRL_MAX_BURST_MASK;
+    tmp |= (1U << 20);
+    tmp |= MCTRL_RCB_MPS;
+    tmp |= MCTRL_RCB_64B;
+    pw(MISC_MISC_CTRL, tmp);
+    dmb();
+
+    program_inbound_arena();
+
+    tmp = pr(MISC_UBUS_CTRL);
+    tmp |= UBUS_REPLY_ERR_DIS | UBUS_REPLY_DECERR_DIS;
+    pw(MISC_UBUS_CTRL, tmp);
+    pw(MISC_AXI_READ_ERROR_DATA, 0xFFFFFFFFU);
+    pw(MISC_UBUS_TIMEOUT, 0x0B2D0000U);
+    pw(MISC_RC_CFG_RETRY_TIMEOUT, 0x0ABA0000U);
+
+    tmp = pr(RC_CFG_PRIV1_ID_VAL3);
+    tmp &= ~0xFFFFFFU;
+    tmp |= 0x060400U;
+    pw(RC_CFG_PRIV1_ID_VAL3, tmp);
+    dmb();
+
+    set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, PIOS_PCIE1_PCI_WIN_BASE,
+                     PIOS_PCIE1_CPU_WIN_SIZE);
+    if (!pcie1_bridge_mem_window(PIOS_PCIE1_PCI_WIN_BASE,
+                                 PIOS_PCIE1_CPU_WIN_SIZE, &mem_window))
+        return false;
+    pw(PCI_REG_MEM_BASE_LIMIT, mem_window);
+
+    tmp = pr(RC_CFG_VENDOR_SPECIFIC_REG1);
+    tmp &= ~VENDOR_SPECIFIC_REG1_ENDIAN_MODE_BAR2_MASK;
+    pw(RC_CFG_VENDOR_SPECIFIC_REG1, tmp);
+    dmb();
+    return cap_set_gen2();
+}
+
 static u16 cap_link_status(void)
 {
     u32 cap = pr(PCI_REG_CAP_PTR) & 0xFFU;
@@ -404,12 +649,63 @@ void pcie1_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val)
         dmb();
         return;
     }
+
     if (!g_link_up || !pcie1_cfg_addr_valid(bus, dev, func, reg))
         return;
     pw(EXT_CFG_INDEX, (bus << 20) | (dev << 15) | (func << 12));
     dmb();
     pw(EXT_CFG_DATA + reg, val);
     dmb();
+}
+
+bool pcie1_endpoint_gen3_capable(u32 bus, u32 dev, u32 func)
+{
+    u32 cap;
+    if (bus == 0U || !pcie1_cfg_addr_valid(bus, dev, func,
+                                            PCI_REG_CAP_PTR))
+        return false;
+    cap = pcie1_cfg_read(bus, dev, func, PCI_REG_CAP_PTR) & 0xFFU;
+    for (u32 i = 0U; i < 48U && cap >= 0x40U && cap <= 0xFCU &&
+         (cap & 3U) == 0U; i++) {
+        u32 header = pcie1_cfg_read(bus, dev, func, cap);
+        if (header == 0U || header == 0xFFFFFFFFU)
+            return false;
+        if ((header & 0xFFU) == PCIE1_LINK_CAP_ID) {
+            if (cap > 0xF0U)
+                return false;
+            return (pcie1_cfg_read(bus, dev, func, cap + 0x0CU) & 0xFU) >= 3U;
+        }
+        cap = (header >> 8) & 0xFFU;
+    }
+    return false;
+}
+
+bool pcie1_link_gen3_active(u32 bus, u32 dev, u32 func)
+{
+    u32 cap;
+    if (bus == 0U || !pcie1_cfg_addr_valid(bus, dev, func,
+                                            PCI_REG_CAP_PTR))
+        return false;
+    cap = pcie1_cfg_read(bus, dev, func, PCI_REG_CAP_PTR) & 0xFFU;
+    for (u32 i = 0U; i < 48U && cap >= 0x40U && cap <= 0xFCU &&
+         (cap & 3U) == 0U; i++) {
+        u32 header = pcie1_cfg_read(bus, dev, func, cap);
+        if (header == 0U || header == 0xFFFFFFFFU)
+            return false;
+        if ((header & 0xFFU) == PCIE1_LINK_CAP_ID) {
+            u16 status;
+            if (cap > 0xECU ||
+                (pcie1_cfg_read(bus, dev, func, cap + 0x0CU) & 0xFU) < 3U)
+                return false;
+            status = (u16)(pcie1_cfg_read(bus, dev, func,
+                                          cap + 0x10U) >> 16);
+            return pcie1_link_speed(status) >= 3U &&
+                   pcie1_link_width(status) != 0U &&
+                   (status & (1U << 13)) != 0U;
+        }
+        cap = (header >> 8) & 0xFFU;
+    }
+    return false;
 }
 
 bool pcie1_link_up(void)
@@ -540,6 +836,11 @@ bool pcie1_init(void)
     g_snap = (struct pcie1_status){0};
     pcie1_aer_offset_rc = 0U;
     g_fail = "init";
+    g_auto_fast_until_ms = timer_monotonic_ms() + PCIE1_AUTO_FAST_WINDOW_MS;
+    g_auto_next_ms = timer_monotonic_ms();
+    g_auto_result = "waiting";
+    g_path_activated = false;
+    g_root_recovery = (typeof(g_root_recovery)){0};
 
     /* RESCAL is shared with pcie2/RP1 and already ran in pcie_init().
      * Do not re-assert it while the RP1 link is live. */
@@ -562,72 +863,13 @@ bool pcie1_init(void)
     dsb();
     timer_delay_ms(20);
 
-    tmp = pr(HARD_DEBUG);
-    tmp &= ~SERDES_IDDQ;
-    pw(HARD_DEBUG, tmp);
-    dmb();
-    timer_delay_ms(1);
-
-    if (!setup_refclk_54mhz()) {
+    if (!program_root_link_registers(true)) {
         g_inited = true;
-        publish_link("54MHz PHY setup failed");
-        uart_puts("[pcie1] PHY setup failed; PERST held\n");
+        publish_link("root link register setup failed");
+        uart_puts("[pcie1] root setup failed; PERST held\n");
         return false;
     }
     g_snap.phy_ready = true;
-
-    tmp = pr(MISC_MISC_CTRL);
-    tmp |= MCTRL_SCB_ACCESS_EN;
-    tmp |= MCTRL_CFG_READ_UR;
-    tmp &= ~MCTRL_MAX_BURST_MASK;
-    tmp |= (1U << 20);
-    tmp |= MCTRL_RCB_MPS;
-    tmp |= MCTRL_RCB_64B;
-    pw(MISC_MISC_CTRL, tmp);
-    dmb();
-
-    program_inbound_arena();
-
-    tmp = pr(MISC_UBUS_CTRL);
-    tmp |= UBUS_REPLY_ERR_DIS | UBUS_REPLY_DECERR_DIS;
-    pw(MISC_UBUS_CTRL, tmp);
-    pw(MISC_AXI_READ_ERROR_DATA, 0xFFFFFFFF);
-    pw(MISC_UBUS_TIMEOUT, 0x0B2D0000);
-    pw(MISC_RC_CFG_RETRY_TIMEOUT, 0x0ABA0000);
-
-    tmp = pr(RC_CFG_PRIV1_ID_VAL3);
-    tmp &= ~0xFFFFFF;
-    tmp |= 0x060400;
-    pw(RC_CFG_PRIV1_ID_VAL3, tmp);
-    dmb();
-
-    /* Linux's pcie1 non-prefetchable range: CPU 0x1B80000000 ->
-     * PCIe 0x80000000. BAR0 only; do not map the prefetch/LMEM range. */
-    set_outbound_win(PIOS_PCIE1_CPU_WIN_BASE, PIOS_PCIE1_PCI_WIN_BASE,
-                     PIOS_PCIE1_CPU_WIN_SIZE);
-    {
-        u32 mem_window;
-        if (!pcie1_bridge_mem_window(PIOS_PCIE1_PCI_WIN_BASE,
-                                     PIOS_PCIE1_CPU_WIN_SIZE, &mem_window)) {
-            g_inited = true;
-            publish_link("root PCI memory window invalid");
-            return false;
-        }
-        pw(PCI_REG_MEM_BASE_LIMIT, mem_window);
-    }
-
-    tmp = pr(RC_CFG_VENDOR_SPECIFIC_REG1);
-    tmp &= ~VENDOR_SPECIFIC_REG1_ENDIAN_MODE_BAR2_MASK;
-    pw(RC_CFG_VENDOR_SPECIFIC_REG1, tmp);
-    dmb();
-
-    if (!cap_set_gen2()) {
-        g_inited = true;
-        publish_link("Gen2 capability setup failed");
-        uart_puts("[pcie1] Gen2 setup failed; PERST held\n");
-        return false;
-    }
-    dmb();
 
     dsb();
     perst_set(false);
@@ -797,7 +1039,8 @@ void pcie1_status(struct pcie1_status *out)
         return;
     /* Cached snapshot only. Config enum is MMIO; do not rescan from the
      * dashboard refresh. `pcie1 scan` calls pcie1_rescan(). */
-    if (g_inited) {
+    if (g_inited &&
+        g_root_recovery.state != PCIE1_ROOT_RECOVERY_RESET_ASSERTED) {
         u32 st = pr(MISC_PCIE_STATUS);
         g_snap.rc_status = st;
         g_link_up = (st & STATUS_DL_ACTIVE) && (st & STATUS_PHYLINKUP);
@@ -806,6 +1049,8 @@ void pcie1_status(struct pcie1_status *out)
         g_snap.present = true;
     }
     *out = g_snap;
+    out->auto_next_retry_ms = g_auto_next_ms;
+    out->auto_result = g_auto_result;
     out->present = true;
     if (!out->fail_reason)
         out->fail_reason = g_fail ? g_fail : "not inited";
@@ -817,6 +1062,128 @@ void pcie1_rescan(void)
         return;
     g_link_up = pcie1_link_up();
     publish_snap(g_link_up ? "ok" : "link lost");
+}
+
+static void root_recovery_fail(const char *reason)
+{
+    g_root_recovery.state = PCIE1_ROOT_RECOVERY_IDLE;
+    g_link_up = false;
+    g_snap.root_recovery_failures++;
+    g_auto_result = reason;
+    publish_snap("root recovery failed");
+}
+
+static bool root_recovery_step(u64 now)
+{
+    u32 command;
+    switch (g_root_recovery.state) {
+    case PCIE1_ROOT_RECOVERY_RESET_ASSERTED:
+        if (now < g_root_recovery.due_ms)
+            return false;
+        bridge_reset_brcm(false);
+        if (!rc_alive()) {
+            root_recovery_fail("root recovery: RC absent");
+            return false;
+        }
+        perst_set(true);
+        dsb();
+        g_root_recovery.state = PCIE1_ROOT_RECOVERY_PERST_ASSERTED;
+        g_root_recovery.due_ms = now + 20ULL;
+        g_auto_result = "root recovery: PERST asserted";
+        return false;
+    case PCIE1_ROOT_RECOVERY_PERST_ASSERTED:
+        if (now < g_root_recovery.due_ms)
+            return false;
+        if (!program_root_link_registers(false)) {
+            root_recovery_fail("root recovery: register setup failed");
+            return false;
+        }
+        g_snap.phy_ready = true;
+        perst_set(false);
+        dsb();
+        g_root_recovery.state = PCIE1_ROOT_RECOVERY_WAIT_LINK;
+        g_root_recovery.due_ms = now + 100ULL;
+        g_root_recovery.deadline_ms = now + 200ULL;
+        g_auto_result = "root recovery: link training";
+        return false;
+    case PCIE1_ROOT_RECOVERY_WAIT_LINK:
+        if (now < g_root_recovery.due_ms)
+            return false;
+        if (!pcie1_link_up()) {
+            if (now >= g_root_recovery.deadline_ms)
+                root_recovery_fail("root recovery: link timeout");
+            return false;
+        }
+        g_link_up = true;
+        pw(PCI_REG_BUS_NUM, 0x00FF0100U);
+        dmb();
+        command = pr(PCI_REG_CMD);
+        command |= PCI_CMD_MEM | PCI_CMD_MASTER;
+        pw(PCI_REG_CMD, command);
+        dmb();
+        pcie1_aer_init();
+        g_root_recovery.state = PCIE1_ROOT_RECOVERY_IDLE;
+        g_snap.root_recovery_successes++;
+        g_auto_result = "root recovered; enumeration pending";
+        g_auto_next_ms = now;
+        publish_snap("ok");
+        return false;
+    default:
+        return false;
+    }
+}
+
+bool pcie1_auto_service(void)
+{
+    u64 now;
+    if (!g_inited)
+        return false;
+    now = timer_monotonic_ms();
+    if (g_root_recovery.state != PCIE1_ROOT_RECOVERY_IDLE)
+        return root_recovery_step(now);
+    if (now < g_auto_next_ms)
+        return false;
+    g_auto_next_ms = now + (now < g_auto_fast_until_ms ?
+                           PCIE1_AUTO_FAST_RETRY_MS :
+                           PCIE1_AUTO_STEADY_RETRY_MS);
+    g_snap.auto_attempts++;
+    g_link_up = pcie1_link_up();
+    if (!g_link_up) {
+        if (g_path_activated) {
+            g_auto_result = "root recovery inhibited: path activated";
+            publish_snap("link lost");
+            return false;
+        }
+        publish_snap("link lost");
+        bridge_reset_brcm(true);
+        g_root_recovery.state = PCIE1_ROOT_RECOVERY_RESET_ASSERTED;
+        g_root_recovery.due_ms = now + 1ULL;
+        g_snap.root_recovery_attempts++;
+        g_auto_result = "root recovery: reset asserted";
+        return false;
+    }
+    publish_snap("ok");
+    if (!g_snap.malformed_topology) {
+        g_auto_result = "topology stable";
+        return false;
+    }
+    for (u32 i = 0U; i < g_snap.ep_count; i++) {
+        const struct pcie1_ep *ep = &g_snap.eps[i];
+        if (pcie1_cfg_read(ep->bus, ep->dev, ep->func, 4U) & 7U) {
+            g_auto_result = "active owner; retry deferred";
+            return false;
+        }
+    }
+    if (!auto_configure()) {
+        g_snap.auto_failures++;
+        publish_snap("auto bus assignment refused");
+        return false;
+    }
+    g_snap.auto_successes++;
+    g_snap.auto_last_functions = g_auto.count;
+    g_snap.auto_last_b50 = g_auto.b50_count;
+    publish_snap("ok");
+    return true;
 }
 
 #else /* !PIOS_HAS_PCIE1 */
@@ -832,6 +1199,16 @@ void pcie1_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 val)
 {
     (void)bus; (void)dev; (void)func; (void)reg; (void)val;
 }
+bool pcie1_endpoint_gen3_capable(u32 bus, u32 dev, u32 func)
+{
+    (void)bus; (void)dev; (void)func;
+    return false;
+}
+bool pcie1_link_gen3_active(u32 bus, u32 dev, u32 func)
+{
+    (void)bus; (void)dev; (void)func;
+    return false;
+}
 void pcie1_status(struct pcie1_status *out)
 {
     if (!out)
@@ -841,6 +1218,7 @@ void pcie1_status(struct pcie1_status *out)
 }
 
 void pcie1_rescan(void) {}
+bool pcie1_auto_service(void) { return false; }
 bool pcie1_set_outbound_window(u64 size)
 {
     (void)size;

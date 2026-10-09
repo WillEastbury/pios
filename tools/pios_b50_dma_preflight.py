@@ -11,11 +11,11 @@ from pios_b50_mmio import Board, GPU, PATH
 ROOT = 0x1000110000
 EXPECTED = {
     0x402C: 0, 0x4030: 0,
-    0x4034: 6, 0x4038: 0x10,
+    0x4034: 9, 0x4038: 0x10,
     0x403C: 0, 0x4040: 0,
     0x4044: 0, 0x4048: 0,
     0x40AC: 0, 0x40B0: 0,
-    0x40B4: 0x04E00001, 0x40B8: 0,
+    0x40B4: 0x13000001, 0x40B8: 0,
     0x40BC: 0, 0x40C0: 0,
 }
 
@@ -28,8 +28,8 @@ def inspect(io):
             raise RuntimeError(
                 f"root {offset:#x}: expected {expected:#x}, got {root[offset]:#x}")
     control = io.peek(ROOT + 0x4008)
-    if (control >> 27) & 31 != 6:
-        raise RuntimeError("SCB0 size does not match the 2MiB arena")
+    if (control >> 27) & 31 != 9:
+        raise RuntimeError("SCB0 size does not match the 16MiB arena")
     commands = {}
     for bdf, identity in PATH + ((GPU, 0xE2128086),
                                  ((9, 0, 0), 0xE2128086),
@@ -46,8 +46,8 @@ def inspect(io):
         "root_registers": {hex(k): hex(v) for k, v in root.items()},
         "command_registers": commands,
         "inbound_pci_base": "0x1000000000",
-        "inbound_cpu_base": "0x04e00000",
-        "inbound_bytes": 0x200000,
+        "inbound_cpu_base": "0x13000000",
+        "inbound_bytes": 0x1000000,
         "bus_master": False,
         "hardware_activation_allowed": False,
         "dma_transfer_proven": False,

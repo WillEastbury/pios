@@ -32,8 +32,9 @@
 #define PCIE1_CONTAINMENT_MSI_SHIFT           48U
 
 _Static_assert(PCIE1_CONTAINMENT_DMA_SLOT_COUNT *
-               PCIE1_CONTAINMENT_DMA_SLOT_BYTES == PIOS_DMA_PCIE1_SIZE,
-               "PCIe1 containment slots must consume the exact DMA arena");
+               PCIE1_CONTAINMENT_DMA_SLOT_BYTES ==
+               PIOS_DMA_PCIE1_CANARY_SIZE,
+               "PCIe1 canary slots must consume the exact canary region");
 _Static_assert(PCIE1_CONTAINMENT_DMA_PAYLOAD_BYTES > 0U,
                "PCIe1 DMA slots must retain guarded payload space");
 

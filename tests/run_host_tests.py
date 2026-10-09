@@ -56,6 +56,9 @@ TESTS_MANIFEST = {
     # logic, no asm/MMIO. See src/board_detect.c, include/board_detect.h.
     "test_board_detect.c": ["src/board_detect.c"],
     "test_pcie_fabric.c": ["src/pcie_fabric.c"],
+    "test_intel_guc_fw.c": ["src/intel_guc_fw.c"],
+    "test_intel_xe2_guc.c": ["src/intel_xe2_guc.c"],
+    "test_intel_guc_boot.c": ["src/intel_guc_boot.c"],
     # ADR-061 boot-control v1->v2 migration/checksum and exhaustive pure
     # O -> pending -> active -> FAT recovery precedence matrix.
     "test_boot_precedence.c": ["src/boot_precedence.c"],
@@ -242,7 +245,13 @@ TESTS_MANIFEST = {
     # endpoint lease, and remains hardware-disabled pending live proof.
     "test_pcie1_bar_lease.c": ["src/pcie1_bar_lease.c"],
     "test_b50_native.c": ["src/b50_native.c", "src/pcie1_bar_lease.c",
-                          "src/pcie1_containment.c"],
+                          "src/pcie1_containment.c",
+                          "src/intel_xe2_guc.c",
+                          "src/intel_guc_boot.c",
+                          "src/intel_guc_ct.c",
+                          "src/intel_bmg_submit.c"],
+    "test_intel_guc_ct.c": ["src/intel_guc_ct.c"],
+    "test_intel_bmg_submit.c": ["src/intel_bmg_submit.c"],
     # #97 fixed-size GPU-fabric control plane. This contract models verified
     # node facts, placement and activation credits only; it has no GPU, PCIe,
     # network, packet, model-data, or runtime integration.
@@ -282,6 +291,7 @@ TESTS_MANIFEST = {
 
 TEST_CFLAGS = {
     "test_b50_native.c": ["-DB50_NATIVE_HOST_TEST", "-DPIOS_HOST_CORE_ID_FN"],
+    "test_intel_guc_ct.c": ["-DINTEL_GUC_CT_HOST_TEST"],
     "test_fat32_exchange_core.c": ["-DFAT32_EXCHANGE_ENABLE_TEST_FORMAT"],
     "test_net_dispatch.c": ["-DPIOS_PLATFORM=1"],
     "test_nic_receive.c": ["-DPIOS_PLATFORM=2"],
@@ -337,11 +347,17 @@ def main() -> int:
 
     for test in ("test_network_dispatch.py", "test_net_fifo_contract.py",
                  "test_pcie1_dashboard.py",
+                 "test_framebuffer_snapshot_endpoint.py",
                  "test_pcie1_panel.py", "test_pios_pcie_bus.py",
                  "test_pcie1_phy.py",
                  "test_issue_187_passive_discovery.py",
                  "test_pcie1_live_mapping.py",
+                 "test_pcie1_auto_recovery.py",
+                 "test_module_loader_contract.py",
+                 "test_reloadable_stage_contract.py",
                  "test_mmu_nc_translation.py",
+                 "test_bmg_guc_artifact.py",
+                 "test_b50_guc_layout.py",
                  "test_kepler.py", "test_pios_kepler_rom.py",
                  "test_kepler_post.py",
                  "test_pios_kepler_post.py",

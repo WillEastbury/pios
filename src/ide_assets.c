@@ -1161,6 +1161,7 @@ const u8 IDE_HTML_EMBED[] =
     "int out = BitLinear.MatVecTernary(packedTritRows, activationI8);\r\n"
     "int out2 = BitLinear.MatVecBitmap(bitmapRows, activationI8);\r\n"
     "int out3 = BitLinear.MatVecBase3(base3Rows, activationI8);\r\n"
+    "int out4 = BitLinear.MatVecI2S(microsoftPackedRows, activationI8);\r\n"
     "</code></pre>\r\n"
     "<p>The reference VM implements deterministic scalar versions. A production host can\r\n"
     "bind the same hooks to M33 DSP, AVX2, V3D/QPU, or another accelerator.</p>\r\n"
@@ -27129,6 +27130,7 @@ const u8 IDE_PICO_HOOKS_JS_EMBED[] =
     "      0x38E: \"Net.DatagramSetPeer\",\r\n"
     "      0x38F: \"Net.DatagramSend\",\r\n"
     "      0x390: \"Net.DatagramClose\",\r\n"
+    "      0x391: \"BitLinear.MatVecI2S\",\r\n"
     "      0x3D0: \"Block.Ready\",\r\n"
     "      0x3D1: \"Block.BlockSize\",\r\n"
     "      0x3D2: \"Block.SizeLow\",\r\n"
@@ -27784,4 +27786,3 @@ const u8 IDE_BAREMETAL_BINARY_JS_EMBED[] =
     "if (typeof module !== 'undefined' && module.exports) module.exports = BareMetal.Binary;\r\n"
 ;
 const u32 IDE_BAREMETAL_BINARY_JS_EMBED_LEN = (u32)(sizeof(IDE_BAREMETAL_BINARY_JS_EMBED) - 1);
-

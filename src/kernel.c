@@ -58,6 +58,7 @@
 #include "pcie.h"
 #include "pcie1.h"
 #include "b50_native.h"
+#include "module.h"
 #include "lzero.h"
 #include "kepler.h"
 #include "rp1.h"
@@ -489,6 +490,17 @@ struct ota_update_state {
     const char *last_error;
 };
 static struct ota_update_state ota_update;
+struct module_update_state {
+    bool active;
+    u32 total;
+    u32 received;
+    u32 chunks;
+    u32 commits;
+    u32 errors;
+    u32 module_id;
+    const char *last_error;
+};
+static struct module_update_state module_update;
 /* OTA RAM staging: chunks land in this highmem buffer (fast memcpy) instead of
  * doing per-chunk blocking SD writes on core0 (which stall the polling NIC and
  * wedge the upload). The full image flushes to the SD slot once, at commit.
@@ -3246,7 +3258,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                 "  Decimal VRAM offsets; bring-up arena only; no compute or PCI DMA.\n");
         } else if (http_streq(topic, "pcie1") || http_streq(topic, "lzero")) {
             http_append(out, &len, max,
-                "pcie1 | pcie1 scan | pcie1 aer [clear] | lzero | lzero probe | lzero bars | lzero path | lzero map | lzero boot0\n"
+                "pcie1 | pcie1 scan | pcie1 aer [clear] | lzero | lzero probe | lzero bars | lzero path | lzero map | lzero boot0 | b50 ct\n"
                 "  Pi 5 FFC/HAT root. Scan/probe are passive; bars/map are explicit. MSI masked.\n");
         } else if (http_streq(topic, "walfs") || http_streq(topic, "disk")) {
             http_append(out, &len, max, "walfs verify | walfs compact | walfs status | walfs format confirm\n  Verify WAL metadata/record-chain integrity, compact the WAL (non-destructive), or status.\n");
@@ -6402,16 +6414,192 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " ");
         http_append_hex32(out, &len, max, a.hdr3);
         http_append(out, &len, max, clear ? " cleared\n" : "\n");
+    } else if (http_streq(cmd, "b50 diag")) {
+        struct b50_native_diag d;
+        struct b50_native_boot_diag bd;
+        struct b50_native_ct_diag cd;
+        struct b50_native_submit_diag sd;
+        b50_native_diag(&d);
+        b50_native_boot_diag(&bd);
+        b50_native_ct_diag(&cd);
+        b50_native_submit_diag(&sd);
+        http_append(out, &len, max, "b50 diag attached=");
+        http_append_u64(out, &len, max, d.attached);
+        http_append(out, &len, max, " state=");
+        http_append_u64(out, &len, max, d.ggtt_state);
+        http_append(out, &len, max, " page=");
+        http_append_u64(out, &len, max, d.ggtt_page);
+        http_append(out, &len, max, " offset=");
+        http_append_hex32(out, &len, max, d.ggtt_offset);
+        http_append(out, &len, max, " detail=");
+        http_append_u64(out, &len, max, d.ggtt_detail);
+        http_append(out, &len, max, " framework=");
+        http_append_u64(out, &len, max, d.ggtt_framework_reason);
+        http_append(out, &len, max, " expected=");
+        http_append_hex64(out, &len, max, d.ggtt_expected);
+        http_append(out, &len, max, " actual=");
+        http_append_hex64(out, &len, max, d.ggtt_actual);
+        http_append(out, &len, max, " prep=");
+        http_append_u64(out, &len, max, d.prep_state);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, d.prep_offset);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, d.prep_detail);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, d.prep_framework_reason);
+        http_append(out, &len, max, " boot=");
+        http_append_u64(out, &len, max, d.boot_state);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, d.boot_framework_reason);
+        http_append(out, &len, max, "\n");
+        http_append(out, &len, max, "  submit state=");
+        http_append_u64(out, &len, max, sd.state);
+        http_append(out, &len, max, " response=");
+        http_append_hex32(out, &len, max, sd.response);
+        http_append(out, &len, max, " failure=");
+        http_append_u64(out, &len, max, sd.failure);
+        http_append(out, &len, max, " result=");
+        http_append_hex32(out, &len, max, sd.result);
+        http_append(out, &len, max, " completion=");
+        http_append_hex32(out, &len, max, sd.completion);
+        http_append(out, &len, max, " g2h=");
+        http_append_u64(out, &len, max, sd.g2h_head);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, sd.g2h_tail);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, sd.g2h_status);
+        http_append(out, &len, max, "\n");
+        http_append(out, &len, max, "    engine head=");
+        http_append_hex32(out, &len, max, sd.engine_head);
+        http_append(out, &len, max, " tail=");
+        http_append_hex32(out, &len, max, sd.engine_tail);
+        http_append(out, &len, max, " start=");
+        http_append_hex32(out, &len, max, sd.engine_start);
+        http_append(out, &len, max, " ctl=");
+        http_append_hex32(out, &len, max, sd.engine_control);
+        http_append(out, &len, max, " hws=");
+        http_append_hex32(out, &len, max, sd.engine_hws_pga);
+        http_append(out, &len, max, " ctx=");
+        http_append_hex32(out, &len, max, sd.engine_context_control);
+        http_append(out, &len, max, " acthd=");
+        http_append_hex32(out, &len, max, sd.engine_acthd);
+        http_append(out, &len, max, " ipehr=");
+        http_append_hex32(out, &len, max, sd.engine_ipehr);
+        http_append(out, &len, max, "\n");
+        http_append(out, &len, max, "  boot state=");
+        http_append_u64(out, &len, max, bd.state);
+        http_append(out, &len, max, " framework=");
+        http_append_u64(out, &len, max, bd.framework_reason);
+        http_append(out, &len, max, " failure=");
+        http_append_u64(out, &len, max, bd.failure);
+        http_append(out, &len, max, " ready=");
+        http_append_u64(out, &len, max, bd.ready);
+        http_append(out, &len, max, " status=");
+        http_append_hex32(out, &len, max, bd.last_status);
+        http_append(out, &len, max, " dma=");
+        http_append_hex32(out, &len, max, bd.dma_ctrl);
+        http_append(out, &len, max, " wsize=");
+        http_append_hex32(out, &len, max, bd.wopcm_size_raw);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, bd.wopcm_size_expected);
+        http_append(out, &len, max, " woff=");
+        http_append_hex32(out, &len, max, bd.wopcm_offset_raw);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, bd.wopcm_offset_expected);
+        http_append(out, &len, max, "\n");
+        http_append(out, &len, max, "  ct state=");
+        http_append_u64(out, &len, max, cd.state);
+        http_append(out, &len, max, " cfg=");
+        http_append_u64(out, &len, max, cd.index);
+        http_append(out, &len, max, " retry=");
+        http_append_u64(out, &len, max, cd.retries);
+        http_append(out, &len, max, " response=");
+        http_append_hex32(out, &len, max, cd.response);
+        http_append(out, &len, max, " failure=");
+        http_append_u64(out, &len, max, cd.failure);
+        http_append(out, &len, max, " h2g=");
+        http_append_u64(out, &len, max, cd.h2g_head);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, cd.h2g_tail);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, cd.h2g_status);
+        http_append(out, &len, max, " g2h=");
+        http_append_u64(out, &len, max, cd.g2h_head);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, cd.g2h_tail);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, cd.g2h_status);
+        http_append(out, &len, max, " hwcfg=");
+        http_append_hex32(out, &len, max, cd.hwconfig0);
+        http_append(out, &len, max, " context=");
+        http_append_u64(out, &len, max, cd.context_state);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, cd.context_response);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, cd.context_failure);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, cd.context_ring_tail);
+        http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "module status") ||
+               http_streq(cmd, "module proof") ||
+               http_streq(cmd, "module rollback")) {
+        u32 operation = MODULE_COMMAND_STATUS;
+        if (http_streq(cmd, "module proof"))
+            operation = MODULE_COMMAND_PROOF;
+        if (http_streq(cmd, "module rollback"))
+            operation = MODULE_COMMAND_ROLLBACK;
+        http_append(out, &len, max, module_command(operation));
+        struct module_status ms;
+        module_status_get(MODULE_ID_PROOF, &ms);
+        http_append(out, &len, max, "  proof active=");
+        http_append_u64(out, &len, max, ms.active_slot);
+        http_append(out, &len, max, " retained=");
+        http_append_u64(out, &len, max, ms.retained_slot);
+        http_append(out, &len, max, " staged=");
+        http_append_u64(out, &len, max, ms.staged_slot);
+        http_append(out, &len, max, " artifact=");
+        http_append_u64(out, &len, max, ms.artifact_generation);
+        http_append(out, &len, max, " epoch=");
+        http_append_u64(out, &len, max, ms.dispatch_epoch);
+        http_append(out, &len, max, " calls=");
+        http_append_u64(out, &len, max, ms.active_calls);
+        http_append(out, &len, max, " rolls=");
+        http_append_u64(out, &len, max, ms.roll_count);
+        http_append(out, &len, max, " rollback=");
+        http_append_u64(out, &len, max, ms.rollback_count);
+        http_append(out, &len, max, " reclaimed=");
+        http_append_u64(out, &len, max, ms.reclaim_count);
+        http_append(out, &len, max, "\n");
     } else if (http_streq(cmd, "b50 status") ||
                http_streq(cmd, "b50 attach") ||
                http_streq(cmd, "b50 preflight") ||
                http_streq(cmd, "b50 revoke") ||
-               http_streq(cmd, "b50 canary")) {
+               http_streq(cmd, "b50 canary") ||
+               http_streq(cmd, "b50 firmware") ||
+               http_streq(cmd, "b50 stage") ||
+               http_streq(cmd, "b50 forcewake") ||
+               http_streq(cmd, "b50 ggtt") ||
+               http_streq(cmd, "b50 prepare") ||
+               http_streq(cmd, "b50 boot") ||
+               http_streq(cmd, "b50 ct") ||
+               http_streq(cmd, "b50 context") ||
+               http_streq(cmd, "b50 submit") ||
+               http_streq(cmd, "b50 validate")) {
         u32 operation = B50_NATIVE_STATUS;
         if (http_streq(cmd, "b50 attach")) operation = B50_NATIVE_ATTACH;
         if (http_streq(cmd, "b50 preflight")) operation = B50_NATIVE_PREFLIGHT;
         if (http_streq(cmd, "b50 revoke")) operation = B50_NATIVE_REVOKE;
         if (http_streq(cmd, "b50 canary")) operation = B50_NATIVE_CANARY;
+        if (http_streq(cmd, "b50 firmware")) operation = B50_NATIVE_FIRMWARE;
+        if (http_streq(cmd, "b50 stage")) operation = B50_NATIVE_STAGE;
+        if (http_streq(cmd, "b50 forcewake")) operation = B50_NATIVE_FORCEWAKE;
+        if (http_streq(cmd, "b50 ggtt")) operation = B50_NATIVE_GGTT;
+        if (http_streq(cmd, "b50 prepare")) operation = B50_NATIVE_PREPARE;
+        if (http_streq(cmd, "b50 boot")) operation = B50_NATIVE_BOOT;
+        if (http_streq(cmd, "b50 ct")) operation = B50_NATIVE_CT;
+        if (http_streq(cmd, "b50 context")) operation = B50_NATIVE_CONTEXT;
+        if (http_streq(cmd, "b50 submit")) operation = B50_NATIVE_SUBMIT;
+        if (http_streq(cmd, "b50 validate")) operation = B50_NATIVE_VALIDATE;
         http_append(out, &len, max, b50_native_command(operation));
     } else if (http_streq(cmd, "pcie1 aer") ||
                http_streq(cmd, "pcie1 aer clear")) {
@@ -6463,6 +6651,25 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, lzero_state_name(lz.state));
         http_append(out, &len, max, " fail=");
         http_append(out, &len, max, p1.fail_reason ? p1.fail_reason : "-");
+        http_append(out, &len, max, "\n");
+        http_append(out, &len, max, "  auto=");
+        http_append(out, &len, max, p1.auto_result ? p1.auto_result : "-");
+        http_append(out, &len, max, " attempts=");
+        http_append_u64(out, &len, max, p1.auto_attempts);
+        http_append(out, &len, max, " success=");
+        http_append_u64(out, &len, max, p1.auto_successes);
+        http_append(out, &len, max, " failed=");
+        http_append_u64(out, &len, max, p1.auto_failures);
+        http_append(out, &len, max, " last=");
+        http_append_u64(out, &len, max, p1.auto_last_functions);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, p1.auto_last_b50);
+        http_append(out, &len, max, " root=");
+        http_append_u64(out, &len, max, p1.root_recovery_attempts);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, p1.root_recovery_successes);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, p1.root_recovery_failures);
         http_append(out, &len, max, "\n");
         if (p1.malformed_topology)
             http_append(out, &len, max, "  malformed bridge range: downstream scan limited\n");
@@ -10090,7 +10297,8 @@ static u32 http_query_u32_default(const u8 *req, u32 req_len, const char *path,
 static bool http_update_query_value(const u8 *req, u32 req_len, const char *key,
                                     char *out, u32 out_max)
 {
-    return http_query_value(req, req_len, "/api/admin/kernel-update", key, out, out_max) ||
+    return http_query_value(req, req_len, "/api/admin/module-update", key, out, out_max) ||
+           http_query_value(req, req_len, "/api/admin/kernel-update", key, out, out_max) ||
            http_query_value(req, req_len, "/api/admin/kernel-stream", key, out, out_max) ||
            http_query_value(req, req_len, "/api/admin/wifi-stream", key, out, out_max) ||
            http_query_value(req, req_len, "/", key, out, out_max);
@@ -11014,6 +11222,151 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
         return len;
     }
 
+    #if 0
+    static u32 http_build_module_update_response(char *out, u32 max,
+                                                 const u8 *req, u32 req_len)
+    {
+        u32 len = 0U;
+        u32 body_off = http_header_body_offset(req, req_len);
+        u32 body_len = body_off && body_off <= req_len ?
+            req_len - body_off : 0U;
+        u32 content_len = 0U;
+        bool has_content_len =
+            body_off && http_content_length(req, body_off, &content_len);
+        u32 offset = http_update_query_u32_default(req, req_len, "offset", 0U);
+        u32 total = http_update_query_u32_default(req, req_len, "total", 0U);
+        u32 module_id =
+            http_update_query_u32_default(req, req_len, "module", ~0U);
+        char action[16] = {0};
+        bool ok = false;
+        const char *error = NULL;
+        (void)http_update_query_value(req, req_len, "action",
+                                      action, sizeof(action));
+        http_append(out, &len, max,
+            "HTTP/1.0 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n");
+        if (!http_update_confirmed(req, req_len)) {
+            error = "requires confirm=1";
+        } else if (action[0] == 0U || http_streq(action, "status")) {
+            ok = true;
+        } else if (http_streq(action, "begin")) {
+            if (total < sizeof(struct module_image_header) ||
+                total > sizeof(struct module_image_header) + MODULE_SLOT_BYTES)
+                error = "invalid module total";
+            else if (!ota_stage_buf || total > ota_stage_cap)
+                error = "module staging unavailable";
+            else if (ota_update.active || static_upload.pending ||
+                     static_upload.active || module_update.active)
+                error = "another update is active";
+            else {
+                module_update.active = true;
+                module_update.total = total;
+                module_update.received = 0U;
+                module_update.chunks = 0U;
+                module_update.module_id = ~0U;
+                module_update.last_error = NULL;
+                ok = true;
+                http_log_event("module-begin", total, 0U);
+            }
+        } else if (http_streq(action, "chunk")) {
+            if (!module_update.active)
+                error = "no module update active";
+            else if (total && total != module_update.total)
+                error = "total mismatch";
+            else if (!has_content_len || body_len != content_len)
+                error = "incomplete module chunk";
+            else if (!body_len || body_len > ADMIN_HTTP_REQ_MAX - 512U)
+                error = "invalid module chunk";
+            else if (offset > module_update.received)
+                error = "module offset ahead";
+            else if (offset > module_update.total ||
+                     body_len > module_update.total - offset)
+                error = "module chunk exceeds total";
+            else {
+                u32 skip = module_update.received - offset;
+                if (skip < body_len) {
+                    u32 bytes = body_len - skip;
+                    memcpy(ota_stage_buf + module_update.received,
+                           req + body_off + skip, bytes);
+                    module_update.received += bytes;
+                }
+                module_update.chunks++;
+                ok = true;
+            }
+        } else if (http_streq(action, "commit")) {
+            if (!module_update.active)
+                error = "no module update active";
+            else if (module_update.received != module_update.total)
+                error = "module image incomplete";
+            else {
+                const struct module_image_header *header =
+                    (const struct module_image_header *)(const void *)
+                    ota_stage_buf;
+                module_update.module_id = header->module_id;
+                if (!module_stage_image(ota_stage_buf, module_update.total))
+                    error = "module validation/staging failed";
+                else if (!module_activate(header->module_id))
+                    error = "module activation failed";
+                else {
+                    module_update.active = false;
+                    module_update.commits++;
+                    ok = true;
+                    http_log_event("module-commit", header->module_id,
+                                   header->artifact_generation);
+                }
+            }
+        } else if (http_streq(action, "rollback")) {
+            if (module_id >= MODULE_MAX_IDENTITIES)
+                error = "invalid rollback module";
+            else if (!module_rollback(module_id))
+                error = "rollback unavailable";
+            else {
+                ok = true;
+                http_log_event("module-rollback", module_id, 0U);
+            }
+        } else if (http_streq(action, "cancel")) {
+            module_update.active = false;
+            module_update.last_error = "cancelled";
+            ok = true;
+        } else {
+            error = "unknown module update action";
+        }
+        if (error) {
+            module_update.errors++;
+            module_update.last_error = error;
+        }
+        struct module_status status;
+        module_status_get(module_update.module_id < MODULE_MAX_IDENTITIES ?
+                          module_update.module_id : MODULE_ID_PROOF, &status);
+        http_append(out, &len, max, "{\"ok\":");
+        http_append(out, &len, max, ok ? "true" : "false");
+        http_append(out, &len, max, ",\"active\":");
+        http_append(out, &len, max, module_update.active ? "true" : "false");
+        http_append(out, &len, max, ",\"total\":");
+        http_append_u64(out, &len, max, module_update.total);
+        http_append(out, &len, max, ",\"received\":");
+        http_append_u64(out, &len, max, module_update.received);
+        http_append(out, &len, max, ",\"module\":");
+        http_append_u64(out, &len, max, module_update.module_id);
+        http_append(out, &len, max, ",\"artifactGeneration\":");
+        http_append_u64(out, &len, max, status.artifact_generation);
+        http_append(out, &len, max, ",\"dispatchEpoch\":");
+        http_append_u64(out, &len, max, status.dispatch_epoch);
+        http_append(out, &len, max, ",\"commits\":");
+        http_append_u64(out, &len, max, module_update.commits);
+        http_append(out, &len, max, ",\"errors\":");
+        http_append_u64(out, &len, max, module_update.errors);
+        if (error) {
+            http_append(out, &len, max, ",\"error\":");
+            http_append_json_string(out, &len, max, error);
+        }
+        http_append(out, &len, max, "}\n");
+        return len;
+    }
+    #endif
+
     if (action[0] == 0 && body_len > 0) {
         action[0] = 'c';
         action[1] = 'h';
@@ -11038,7 +11391,9 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
             ota_update.received = image_len;
         }
     } else if (http_streq(action, "begin")) {
-        if (total == 0 || total > capacity) {
+        if (module_update.active) {
+            error = "module update active";
+        } else if (total == 0 || total > capacity) {
             error = "invalid total; must fit raw payload slot";
         } else {
             ota_update.target_slot = pios_bootctrl_target_slot();
@@ -11216,6 +11571,145 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
     } else if (ota_update.last_error) {
         http_append(out, &len, max, ",\"lastError\":");
         http_append_json_string(out, &len, max, ota_update.last_error);
+    }
+    http_append(out, &len, max, "}\n");
+    return len;
+}
+
+static u32 http_build_module_update_response(char *out, u32 max,
+                                             const u8 *req, u32 req_len)
+{
+    u32 len = 0U;
+    u32 body = http_header_body_offset(req, req_len);
+    u32 body_len = body && body <= req_len ? req_len - body : 0U;
+    u32 content_len = 0U;
+    bool has_len = body && http_content_length(req, body, &content_len);
+    u32 offset = http_update_query_u32_default(req, req_len, "offset", 0U);
+    u32 total = http_update_query_u32_default(req, req_len, "total", 0U);
+    u32 requested_id =
+        http_update_query_u32_default(req, req_len, "module", ~0U);
+    char action[16] = {0};
+    bool ok = false;
+    const char *error = NULL;
+    (void)http_update_query_value(req, req_len, "action",
+                                  action, sizeof(action));
+    http_append(out, &len, max,
+        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+        "Cache-Control: no-store\r\nConnection: close\r\n\r\n");
+    if (!http_update_confirmed(req, req_len))
+        error = "requires confirm=1";
+    else if (!action[0] || http_streq(action, "status"))
+        ok = true;
+    else if (http_streq(action, "begin")) {
+        if (total < sizeof(struct module_image_header) ||
+            total > sizeof(struct module_image_header) + MODULE_SLOT_BYTES)
+            error = "invalid module total";
+        else if (!ota_stage_buf || total > ota_stage_cap)
+            error = "module staging unavailable";
+        else if (ota_update.active || static_upload.pending ||
+                 static_upload.active || module_update.active)
+            error = "another update is active";
+        else {
+            module_update.active = true;
+            module_update.total = total;
+            module_update.received = 0U;
+            module_update.chunks = 0U;
+            module_update.module_id = ~0U;
+            module_update.last_error = NULL;
+            ok = true;
+            http_log_event("module-begin", total, 0U);
+        }
+    } else if (http_streq(action, "chunk")) {
+        if (!module_update.active)
+            error = "no module update active";
+        else if (total && total != module_update.total)
+            error = "total mismatch";
+        else if (!has_len || body_len != content_len || !body_len)
+            error = "incomplete module chunk";
+        else if (body_len > ADMIN_HTTP_REQ_MAX - 512U)
+            error = "module chunk too large";
+        else if (offset > module_update.received)
+            error = "module offset ahead";
+        else if (offset > module_update.total ||
+                 body_len > module_update.total - offset)
+            error = "module chunk exceeds total";
+        else {
+            u32 skip = module_update.received - offset;
+            if (skip < body_len) {
+                u32 bytes = body_len - skip;
+                memcpy(ota_stage_buf + module_update.received,
+                       req + body + skip, bytes);
+                module_update.received += bytes;
+            }
+            module_update.chunks++;
+            ok = true;
+        }
+    } else if (http_streq(action, "commit")) {
+        if (!module_update.active)
+            error = "no module update active";
+        else if (module_update.received != module_update.total)
+            error = "module image incomplete";
+        else {
+            const struct module_image_header *header =
+                (const struct module_image_header *)(const void *)ota_stage_buf;
+            module_update.module_id = header->module_id;
+            if (!module_stage_image(ota_stage_buf, module_update.total))
+                error = "module validation/staging failed";
+            else if (!module_activate(header->module_id))
+                error = "module activation failed";
+            else {
+                module_update.active = false;
+                module_update.commits++;
+                ok = true;
+                http_log_event("module-commit", header->module_id,
+                               header->artifact_generation);
+            }
+        }
+    } else if (http_streq(action, "rollback")) {
+        if (requested_id >= MODULE_MAX_IDENTITIES)
+            error = "invalid rollback module";
+        else if (!module_rollback(requested_id))
+            error = "rollback unavailable";
+        else {
+            module_update.module_id = requested_id;
+            ok = true;
+            http_log_event("module-rollback", requested_id, 0U);
+        }
+    } else if (http_streq(action, "cancel")) {
+        module_update.active = false;
+        module_update.last_error = "cancelled";
+        ok = true;
+    } else {
+        error = "unknown module update action";
+    }
+    if (error) {
+        module_update.errors++;
+        module_update.last_error = error;
+    }
+    struct module_status status;
+    module_status_get(module_update.module_id < MODULE_MAX_IDENTITIES ?
+                      module_update.module_id : MODULE_ID_PROOF, &status);
+    http_append(out, &len, max, "{\"ok\":");
+    http_append(out, &len, max, ok ? "true" : "false");
+    http_append(out, &len, max, ",\"active\":");
+    http_append(out, &len, max, module_update.active ? "true" : "false");
+    http_append(out, &len, max, ",\"total\":");
+    http_append_u64(out, &len, max, module_update.total);
+    http_append(out, &len, max, ",\"received\":");
+    http_append_u64(out, &len, max, module_update.received);
+    http_append(out, &len, max, ",\"module\":");
+    http_append_u64(out, &len, max, module_update.module_id);
+    http_append(out, &len, max, ",\"artifactGeneration\":");
+    http_append_u64(out, &len, max, status.artifact_generation);
+    http_append(out, &len, max, ",\"dispatchEpoch\":");
+    http_append_u64(out, &len, max, status.dispatch_epoch);
+    http_append(out, &len, max, ",\"commits\":");
+    http_append_u64(out, &len, max, module_update.commits);
+    http_append(out, &len, max, ",\"errors\":");
+    http_append_u64(out, &len, max, module_update.errors);
+    if (error) {
+        http_append(out, &len, max, ",\"error\":");
+        http_append_json_string(out, &len, max, error);
     }
     http_append(out, &len, max, "}\n");
     return len;
@@ -11686,6 +12180,40 @@ static u32 http_build_stats_response(char *out, u32 max, const u8 *req, u32 req_
         len = http_build_unauthorized(out, max);
         http_diag.build_len = len;
         http_trace(HTTP_EVT_BUILD_EXIT, route, len, 401);
+        return len;
+    }
+
+    if (http_request_path_is(req, req_len, "/api/framebuffer.raw")) {
+        u64 base = 0;
+        u32 width = 0, height = 0, pitch = 0, size = 0;
+        u64 bytes;
+        fb_display_info(&base, &width, &height, &pitch, &size);
+        bytes = (u64)pitch * height;
+        if (!base || !width || !height || pitch < width * 4U ||
+            bytes > size || bytes > PIOS_FB_BACK_SIZE) {
+            len = http_build_safe_placeholder_response(out, max,
+                                                       "framebuffer unavailable");
+        } else {
+            http_static_body = (const u8 *)(usize)base;
+            http_static_len = (u32)bytes;
+            http_static_off = 0U;
+            http_append(out, &len, max,
+                "HTTP/1.0 200 OK\r\n"
+                "Content-Type: application/octet-stream\r\n"
+                "Cache-Control: no-store\r\n"
+                "X-PIOS-Pixel-Format: BGRX8888\r\n"
+                "X-PIOS-Width: ");
+            http_append_u64(out, &len, max, width);
+            http_append(out, &len, max, "\r\nX-PIOS-Height: ");
+            http_append_u64(out, &len, max, height);
+            http_append(out, &len, max, "\r\nX-PIOS-Pitch: ");
+            http_append_u64(out, &len, max, pitch);
+            http_append(out, &len, max, "\r\nContent-Length: ");
+            http_append_u64(out, &len, max, bytes);
+            http_append(out, &len, max, "\r\nConnection: close\r\n\r\n");
+        }
+        http_diag.build_len = len;
+        http_trace(HTTP_EVT_BUILD_EXIT, route, len, 200);
         return len;
     }
 
@@ -12569,7 +13097,9 @@ static u32 http_build_static_upload_response(char *out, u32 max, const u8 *req, 
     else if (!has_content_len || body_len != content_len) error = "incomplete body";
     else if (body_len == 0U || body_len > STATIC_UPLOAD_STAGE_MAX) error = "chunk too large";
     else if (total != 0 && (offset > total || body_len > total - offset)) error = "chunk exceeds total";
-    else if (static_upload.pending || static_upload.active || ota_update.active) error = "previous upload still pending";
+    else if (static_upload.pending || static_upload.active ||
+             ota_update.active || module_update.active)
+        error = "previous upload still pending";
     else if (!ota_stage_buf || ota_stage_cap < STATIC_UPLOAD_STAGE_MAX) error = "upload staging unavailable";
     else {
         static_upload.offset = offset;
@@ -12781,6 +13311,8 @@ static u32 admin_build_update_response(char *out, u32 max, const u8 *req, u32 re
 {
     if (http_request_path_is(req, req_len, "/api/admin/static-put"))
         return http_build_static_upload_response(out, max, req, req_len);
+    if (http_request_path_is(req, req_len, "/api/admin/module-update"))
+        return http_build_module_update_response(out, max, req, req_len);
     return http_build_kernel_update_response(out, max, req, req_len);
 }
 
@@ -24535,32 +25067,65 @@ static void airq_net_transport_handler(const struct airq_record *rec, void *ctx)
 #endif
 }
 
+static u64 module_mac_fallback(u32 op, u64 a0, u64 a1)
+{
+    (void)op; (void)a0; (void)a1;
+    net_dispatch_handle_mac();
+    return 0U;
+}
+
+static u64 module_ip_fallback(u32 op, u64 a0, u64 a1)
+{
+    (void)op; (void)a0; (void)a1;
+    net_dispatch_handle_ip();
+    return 0U;
+}
+
+static u64 module_tcp_fallback(u32 op, u64 a0, u64 a1)
+{
+    (void)op; (void)a0; (void)a1;
+    net_dispatch_handle_tcp();
+    return 0U;
+}
+
+static u64 module_service_fallback(u32 op, u64 a0, u64 a1)
+{
+    (void)op; (void)a0; (void)a1;
+    net_dispatch_handle_service(core0_network_service_step);
+    return 0U;
+}
+
 static void airq_net_mac_handler(const struct airq_record *rec, void *ctx)
 {
-    (void)rec;
     (void)ctx;
-    net_dispatch_handle_mac();
+    (void)module_dispatch_call(MODULE_ID_MAC, MODULE_OP_CALL,
+                               (u64)(usize)module_mac_fallback,
+                               (u64)(usize)rec, module_mac_fallback);
 }
 
 static void airq_net_ip_handler(const struct airq_record *rec, void *ctx)
 {
-    (void)rec;
     (void)ctx;
-    net_dispatch_handle_ip();
+    (void)module_dispatch_call(MODULE_ID_IP, MODULE_OP_CALL,
+                               (u64)(usize)module_ip_fallback,
+                               (u64)(usize)rec, module_ip_fallback);
 }
 
 static void airq_net_tcp_handler(const struct airq_record *rec, void *ctx)
 {
-    (void)rec;
     (void)ctx;
-    net_dispatch_handle_tcp();
+    (void)module_dispatch_call(MODULE_ID_TCP, MODULE_OP_CALL,
+                               (u64)(usize)module_tcp_fallback,
+                               (u64)(usize)rec, module_tcp_fallback);
 }
 
 static void airq_net_service_handler(const struct airq_record *rec, void *ctx)
 {
-    (void)rec;
     (void)ctx;
-    net_dispatch_handle_service(core0_network_service_step);
+    (void)module_dispatch_call(MODULE_ID_TCP, MODULE_OP_CALL + 1U,
+                               (u64)(usize)module_service_fallback,
+                               (u64)(usize)rec,
+                               module_service_fallback);
 }
 
 static void airq_net_egress_handler(const struct airq_record *rec, void *ctx)
@@ -24857,7 +25422,6 @@ NORETURN void core0_main(void) {
         if (airq_pending(CORE_NET)) {
             u64 svc_fifo0 = ksvc_begin(ksvc_fifo0_id);
             u32 airq_done = airq_dispatch(CORE_NET, ADRV_PASS_BUDGET_MS);
-            b50_native_service();
             core0_airq_dispatch_passes++;
             if (airq_done == 0U)
                 core0_airq_empty_passes++;
@@ -24874,6 +25438,8 @@ NORETURN void core0_main(void) {
 
         /* Scheduled asynchronous driver work (bounded, admission-controlled). */
         adrv_service();
+        b50_native_service();
+        module_service();
 
         if (flags & (CORE0_IO_UART | CORE0_IO_USB)) {
             u64 svc_start = ksvc_begin(ksvc_ui_id);
@@ -24932,6 +25498,10 @@ NORETURN void core0_main(void) {
 
         if (flags & CORE0_IO_MAINT) {
             ksvc_run(ksvc_timer_id);
+#if PIOS_HAS_PCIE1
+            if (pcie1_auto_service())
+                lzero_probe();
+#endif
 #if PIOS_HAS_WIFI_SDIO
             cyw43_check_timeouts();
 #endif

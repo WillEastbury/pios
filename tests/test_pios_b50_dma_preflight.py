@@ -10,7 +10,7 @@ import pios_b50_dma_preflight as p
 class Board:
     def __init__(self):
         self.root = dict(p.EXPECTED)
-        self.root[0x4008] = 0x30163480
+        self.root[0x4008] = 0x48163480
         self.identities = dict(p.PATH + ((p.GPU, 0xE2128086),
                                        ((9, 0, 0), 0xE2128086),
                                        ((13, 0, 0), 0xE2128086)))

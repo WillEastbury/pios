@@ -19,6 +19,7 @@
  * and timing state never cross into shared memory.
  */
 #include "capsvc.h"
+#include "module.h"
 #include "core.h"
 #include "tcp.h"
 #include "timer.h"
@@ -147,7 +148,8 @@ static bool capsvc_streq(const char *a, const char *b)
  * compiled-in default program) if no manifest/process/port match is found --
  * this is the expected, non-error state until an operator installs a card
  * via the WALFS terminal ops (tracked separately). */
-static void capsvc_preload_program(struct capsvc_registration *s, struct capsvc_program *prog)
+static void capsvc_preload_program_impl(struct capsvc_registration *s,
+                                        struct capsvc_program *prog)
 {
     prog->len = 0;
     struct capsule_manifest m;
@@ -167,6 +169,44 @@ static void capsvc_preload_program(struct capsvc_registration *s, struct capsvc_
             prog->len = (u32)n;
         return;
     }
+}
+
+#define CAPSVC_MODULE_OP_PRELOAD (MODULE_OP_CALL)
+#define CAPSVC_MODULE_OP_POLL    (MODULE_OP_CALL + 1U)
+
+struct capsvc_module_call {
+    u64 fallback;
+    u64 arg0;
+    u64 arg1;
+};
+
+static u64 capsvc_module_fallback(u32 op, u64 a0, u64 a1)
+{
+    (void)a1;
+    const struct capsvc_module_call *call =
+        (const struct capsvc_module_call *)(usize)a0;
+    if (!call)
+        return 0U;
+    if (op == CAPSVC_MODULE_OP_PRELOAD) {
+        capsvc_preload_program_impl(
+            (struct capsvc_registration *)(usize)call->arg0,
+            (struct capsvc_program *)(usize)call->arg1);
+        return 0U;
+    }
+    return 0U;
+}
+
+static void capsvc_preload_program(struct capsvc_registration *s,
+                                   struct capsvc_program *prog)
+{
+    struct capsvc_module_call call = {
+        .fallback = (u64)(usize)capsvc_module_fallback,
+        .arg0 = (u64)(usize)s,
+        .arg1 = (u64)(usize)prog
+    };
+    (void)module_dispatch_call(
+        MODULE_ID_CAPSULE, CAPSVC_MODULE_OP_PRELOAD,
+        (u64)(usize)&call, 0U, capsvc_module_fallback);
 }
 
 void capsvc_init(void)
@@ -433,7 +473,7 @@ void capsvc_external_cancel(u64 token)
         capsvc_slot_release((i32)idx);
 }
 
-void capsvc_poll(void)
+static void capsvc_poll_impl(void)
 {
     g_dbg_poll_calls++;
     capsvc_poll_attach();
@@ -456,6 +496,23 @@ void capsvc_poll(void)
         if (g_rt[i].inuse)
             capsvc_poll_slot((i32)i);
     }
+}
+
+static u64 capsvc_poll_fallback(u32 op, u64 a0, u64 a1)
+{
+    (void)op; (void)a0; (void)a1;
+    capsvc_poll_impl();
+    return 0U;
+}
+
+void capsvc_poll(void)
+{
+    struct capsvc_module_call call = {
+        .fallback = (u64)(usize)capsvc_poll_fallback
+    };
+    (void)module_dispatch_call(
+        MODULE_ID_CAPSULE, CAPSVC_MODULE_OP_POLL,
+        (u64)(usize)&call, 0U, capsvc_poll_fallback);
 }
 
 static void dbg_append(char *dst, u32 *off, u32 cap, const char *src)

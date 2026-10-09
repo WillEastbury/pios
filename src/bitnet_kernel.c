@@ -180,3 +180,184 @@ void bitnet_bitmap_matvec(const u8 *matrix, u32 rows, u32 cols,
             ? bitnet_bitmap_row_dot_neon(matrix + row * stride, cols, act)
             : bitnet_bitmap_row_dot_scalar(matrix + row * stride, cols, act);
 }
+
+bool bitnet_i2s_packed_bytes(u32 rows, u32 cols, u32 *bytes_out)
+{
+    u64 elements;
+    if (!bytes_out || rows == 0U || cols == 0U ||
+        (rows % BITNET_I2S_TILE_ROWS) != 0U ||
+        (cols % BITNET_I2S_TILE_COLS) != 0U)
+        return false;
+    elements = (u64)rows * cols;
+    if (elements > 0xFFFFFFFFULL || (elements & 3ULL) != 0ULL)
+        return false;
+    *bytes_out = (u32)(elements / 4ULL);
+    return true;
+}
+
+static u32 load_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) |
+           ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static void store_le32(u8 *p, u32 value)
+{
+    p[0] = (u8)value;
+    p[1] = (u8)(value >> 8);
+    p[2] = (u8)(value >> 16);
+    p[3] = (u8)(value >> 24);
+}
+
+static u32 bitnet_i2s_interleave_word(u32 value)
+{
+    u32 out = 0U;
+    for (u32 offset = 0U; offset < 16U; offset++) {
+        u32 code = (value >> (2U * offset)) & 3U;
+        u32 shift = (offset % 4U) * 8U + (offset / 4U) * 2U;
+        out |= code << shift;
+    }
+    return out;
+}
+
+static i32 bitnet_i2s_decode(const u8 *tile, u32 perm_row, u32 perm_col)
+{
+    u32 word = load_le32(tile + perm_row * 8U + (perm_col / 16U) * 4U);
+    u32 offset = perm_col & 15U;
+    u32 shift = (offset % 4U) * 8U + (offset / 4U) * 2U;
+    return (i32)((word >> shift) & 3U) - 2;
+}
+
+static void bitnet_i2s_source_position(u32 perm_row, u32 perm_col,
+                                       u32 *row_out, u32 *col_out)
+{
+    u32 thread = perm_row * 2U + perm_col / 16U;
+    *row_out = (thread / 16U) * 8U + (thread % 8U);
+    *col_out = (perm_col % 16U) + 16U * ((thread % 16U) / 8U);
+}
+
+bool bitnet_i2s_pack_microsoft(const i8 *weights, u32 weight_count,
+                               u32 rows, u32 cols,
+                               u8 *packed, u32 packed_capacity)
+{
+    u32 required;
+    if (!weights || !packed ||
+        !bitnet_i2s_packed_bytes(rows, cols, &required) ||
+        weight_count < rows * cols || packed_capacity < required)
+        return false;
+    u32 row_tiles = rows / BITNET_I2S_TILE_ROWS;
+    u32 col_tiles = cols / BITNET_I2S_TILE_COLS;
+    for (u32 rt = 0U; rt < row_tiles; rt++) {
+        for (u32 ct = 0U; ct < col_tiles; ct++) {
+            u8 *tile = packed +
+                (rt * col_tiles + ct) *
+                (BITNET_I2S_TILE_ROWS * BITNET_I2S_TILE_COLS / 4U);
+            for (u32 pr = 0U; pr < BITNET_I2S_TILE_ROWS; pr++) {
+                u8 compressed[8] = {0};
+                for (u32 pc = 0U; pc < BITNET_I2S_TILE_COLS; pc++) {
+                    u32 sr, sc;
+                    bitnet_i2s_source_position(pr, pc, &sr, &sc);
+                    i32 weight = weights[(rt * 16U + sr) * cols +
+                                         ct * 32U + sc];
+                    if (weight < -1 || weight > 1)
+                        return false;
+                    compressed[pc / 4U] |=
+                        (u8)((u32)(weight + 2) << (2U * (pc & 3U)));
+                }
+                for (u32 word = 0U; word < 2U; word++)
+                    store_le32(tile + pr * 8U + word * 4U,
+                               bitnet_i2s_interleave_word(
+                                   load_le32(compressed + word * 4U)));
+            }
+        }
+    }
+    return true;
+}
+
+bool bitnet_i2s_matvec_i32(const u8 *packed, u32 packed_bytes,
+                           u32 rows, u32 cols,
+                           const i8 *activation, u32 activation_count,
+                           i32 *output, u32 output_count)
+{
+    u32 required;
+    if (!packed || !activation || !output ||
+        !bitnet_i2s_packed_bytes(rows, cols, &required) ||
+        packed_bytes < required || activation_count < cols ||
+        output_count < rows)
+        return false;
+    for (u32 row = 0U; row < rows; row++)
+        output[row] = 0;
+    u32 row_tiles = rows / BITNET_I2S_TILE_ROWS;
+    u32 col_tiles = cols / BITNET_I2S_TILE_COLS;
+    for (u32 rt = 0U; rt < row_tiles; rt++) {
+        for (u32 ct = 0U; ct < col_tiles; ct++) {
+            const u8 *tile = packed +
+                (rt * col_tiles + ct) *
+                (BITNET_I2S_TILE_ROWS * BITNET_I2S_TILE_COLS / 4U);
+            for (u32 pr = 0U; pr < BITNET_I2S_TILE_ROWS; pr++) {
+                for (u32 pc = 0U; pc < BITNET_I2S_TILE_COLS; pc++) {
+                    u32 sr, sc;
+                    bitnet_i2s_source_position(pr, pc, &sr, &sc);
+                    output[rt * 16U + sr] +=
+                        bitnet_i2s_decode(tile, pr, pc) *
+                        activation[ct * 32U + sc];
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool bitnet_i2s_quantize_activation(const float *input, u32 count,
+                                    i8 *output, u32 output_count,
+                                    float *scale_out)
+{
+    float max_abs = 0.0f;
+    if (!input || !output || !scale_out || count == 0U ||
+        output_count < count)
+        return false;
+    for (u32 i = 0U; i < count; i++) {
+        float value = input[i] < 0.0f ? -input[i] : input[i];
+        if (value > max_abs)
+            max_abs = value;
+    }
+    if (max_abs < 0.00001f)
+        max_abs = 0.00001f;
+    float scale = 127.0f / max_abs;
+    for (u32 i = 0U; i < count; i++) {
+        float scaled = input[i] * scale;
+        i32 quantized = scaled >= 0.0f ?
+            (i32)(scaled + 0.5f) : (i32)(scaled - 0.5f);
+        if (quantized < -128)
+            quantized = -128;
+        if (quantized > 127)
+            quantized = 127;
+        output[i] = (i8)quantized;
+    }
+    *scale_out = scale;
+    return true;
+}
+
+bool bitnet_i2s_matvec_f32(const u8 *packed, u32 packed_bytes,
+                           u32 rows, u32 cols,
+                           const i8 *activation, u32 activation_count,
+                           float activation_scale,
+                           const float *weight_scales, u32 scale_count,
+                           float *output, u32 output_count)
+{
+    i32 sums[BITNET_I2S_TILE_ROWS];
+    if (!packed || !activation || !weight_scales || !output ||
+        activation_scale <= 0.0f || scale_count == 0U ||
+        rows > BITNET_I2S_TILE_ROWS || output_count < rows ||
+        rows % scale_count != 0U)
+        return false;
+    if (!bitnet_i2s_matvec_i32(packed, packed_bytes, rows, cols,
+                               activation, activation_count,
+                               sums, BITNET_I2S_TILE_ROWS))
+        return false;
+    u32 rows_per_scale = rows / scale_count;
+    for (u32 row = 0U; row < rows; row++)
+        output[row] = ((float)sums[row] / activation_scale) *
+                      weight_scales[row / rows_per_scale];
+    return true;
+}

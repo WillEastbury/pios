@@ -147,6 +147,7 @@ static bool handle_active(const struct pcie1_bar_lease *lease,
 }
 
 static bool bar_decode(const struct pcie1_bar_lease_bar *bar,
+                       bool allow_prefetchable,
                        u64 *base_out, u64 *size_out, bool *is_64_out)
 {
     u32 type;
@@ -158,7 +159,7 @@ static bool bar_decode(const struct pcie1_bar_lease_bar *bar,
 
     if (!bar || !base_out || !size_out || !is_64_out ||
         (bar->config_lo & 1U) != 0U ||
-        (bar->config_lo & 8U) != 0U)
+        (!allow_prefetchable && (bar->config_lo & 8U) != 0U))
         return false;
     type = (bar->config_lo >> 1) & 3U;
     if (type != 0U && type != 2U)
@@ -236,10 +237,14 @@ static bool request_valid(const struct pcie1_bar_lease_request *request,
     u64 bar_size;
     bool is_64;
 
-    if (!request || request->_reserved != 0U ||
+    if (!request ||
+        (request->flags & ~PCIE1_BAR_LEASE_ALLOW_PREFETCHABLE) != 0U ||
         request->aperture._reserved != 0U ||
         request->aperture.attribute != PCIE1_BAR_LEASE_ATTR_DEVICE_nGnRnE ||
-        !bar_decode(&request->bar, &bar_base, &bar_size, &is_64) ||
+        !bar_decode(&request->bar,
+                    (request->flags &
+                     PCIE1_BAR_LEASE_ALLOW_PREFETCHABLE) != 0U,
+                    &bar_base, &bar_size, &is_64) ||
         request->aperture.length != bar_size ||
         request->aperture.pci_base != bar_base ||
         !range_valid(request->aperture.cpu_base, request->aperture.length,
