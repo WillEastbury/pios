@@ -28,6 +28,7 @@ OUT = TESTS / "_build"
 
 # test file -> kernel source files it links against
 TESTS_MANIFEST = {
+    "test_tensor_broker.c": ["src/tensor_broker.c", "src/lease.c"],
     "test_tensor_service.c": ["src/tensor_service.c", "src/picovm.c"],
     "test_ipc_model_broker.c": ["src/ipc_model.c", "src/ipc_model_vm.c",
                               "src/ipc_model_broker.c"],

@@ -42,10 +42,40 @@ or buffer reuse while a device could still write: quiescence and successful
 access revocation must precede reuse, poisoning and generation advance.
 Failed revocation retains authority and reports failure.
 
-Production endpoint admission, EL0 arena grants, cross-core scheduler wake
-integration and accelerator-module dispatch remain incomplete. The ABI and
-state names above are design requirements, not a claim of an implemented
-production request layout.
+The native `tensor_broker` substrate now implements the first canonical
+request layout and admission layer. Production endpoint admission, EL0 arena
+allocation/grants, cross-core scheduler wake integration and accelerator
+driver submission remain incomplete.
+
+### Canonical native descriptor v1
+
+`include/tensor_broker.h` defines a 128-byte, cache-line-strided immutable
+`tensor_descriptor`. Version 1 admits signed-i8 row-major MatVec with signed-i32
+output. It carries dimensions, owner capsule, placement policy and three
+generation-checked `lease_handle` values for matrix, vector and output.
+No pointer or device address crosses the interface.
+
+The input leases must be READY, read-only, capsule-owned and large enough for
+the complete matrix/vector range. The output must be WRITING, read-write,
+capsule-owned and large enough for every i32 result. All three generations,
+owners, ranges and lifecycle states are validated before queue publication.
+Execution consumes the two linear input leases and publishes the output lease
+only after the selected implementation succeeds.
+
+Backend registrations are generation-owned capability records, not ambient
+function selection. A record states operation, dtype, layout, shape limits,
+column multiple, priority, backend kind and concrete device generation. AUTO
+chooses the highest-priority compatible live record. EXACT requires both the
+backend kind and device generation, so a pin names a concrete accelerator
+generation rather than merely “Xe2.” Retirement invalidates queued work whose
+captured backend generation no longer matches.
+
+The queue is fixed-capacity and allocation-free. It never retries another
+backend after execution starts. Current callbacks are synchronous native
+providers; Intel command submission, DMA mapping, completion IRQs and
+sequence-backed process wake publication still belong to the pending driver
+integration. The older `tensor_service` TSM1/TSR1 adapter below remains intact
+for existing trusted same-core PicoScript tests.
 
 ## Harmonized model and current boundary
 
