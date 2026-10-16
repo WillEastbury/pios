@@ -6666,6 +6666,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, p1.ep_count);
         http_append(out, &len, max, " b50=");
         http_append_u64(out, &len, max, p1.b50_found ? 1U : 0U);
+        http_append(out, &len, max, " b60=");
+        http_append_u64(out, &len, max, p1.b60_found ? 1U : 0U);
         http_append(out, &len, max, " lzero=");
         http_append(out, &len, max, lzero_state_name(lz.state));
         http_append(out, &len, max, " fail=");
@@ -23658,6 +23660,8 @@ static u32 dash_pcie1_summary(char *buf, u32 max,
         dash_pcie1_append_text(buf, max, &used, " (+more)");
     if (status->b50_found)
         dash_pcie1_append_text(buf, max, &used, "; B50");
+    if (status->b60_found)
+        dash_pcie1_append_text(buf, max, &used, "; B60");
     return used;
 }
 

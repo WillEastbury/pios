@@ -17,6 +17,7 @@
 
 #define PCIE1_VID_INTEL     0x8086U
 #define PCIE1_DID_B50       0xE212U   /* Arc Pro B50 / Battlemage BMG-G21 */
+#define PCIE1_DID_B60       0xE211U   /* Arc Pro B60 / Battlemage */
 
 #define PCIE1_SCAN_BUS_LO   1U
 #define PCIE1_SCAN_BUS_HI   63U       /* PLX fan-out plus per-GPU bridges */
@@ -56,6 +57,9 @@ struct pcie1_status {
     u16 b50_vendor;
     u16 b50_device;
     bool b50_found;
+    u16 b60_vendor;
+    u16 b60_device;
+    bool b60_found;
     bool scan_truncated;
     bool malformed_topology;
     u32 auto_attempts;
@@ -87,6 +91,20 @@ struct pcie1_aer_snapshot {
 static inline bool pcie1_is_b50(u16 vendor, u16 device)
 {
     return vendor == PCIE1_VID_INTEL && device == PCIE1_DID_B50;
+}
+
+static inline bool pcie1_is_b60(u16 vendor, u16 device)
+{
+    return vendor == PCIE1_VID_INTEL && device == PCIE1_DID_B60;
+}
+
+static inline const char *pcie1_device_name(u16 vendor, u16 device)
+{
+    if (pcie1_is_b50(vendor, device))
+        return "Arc Pro B50";
+    if (pcie1_is_b60(vendor, device))
+        return "Arc Pro B60";
+    return NULL;
 }
 
 static inline bool pcie1_id_valid(u32 cfg0)
@@ -143,7 +161,7 @@ static inline bool pcie1_is_bridge(u8 hdr_type)
 }
 
 /* Display/3D/processing-accelerator — any of these is a compute candidate.
- * B50 DID counts even if class bytes were not filled. */
+ * Known Arc Pro DIDs count even if class bytes were not filled. */
 static inline bool pcie1_is_compute_class(u8 base, u8 sub)
 {
     if (base == 0x03U && (sub == 0x00U || sub == 0x02U))
@@ -157,7 +175,7 @@ static inline bool pcie1_is_compute_ep(const struct pcie1_ep *e)
 {
     if (!e)
         return false;
-    if (pcie1_is_b50(e->vendor, e->device))
+    if (pcie1_device_name(e->vendor, e->device))
         return true;
     return pcie1_is_compute_class(e->base_class, e->subclass);
 }
@@ -302,9 +320,10 @@ static inline u32 pcie1_fmt_caps(char *buf, u32 max, const struct pcie1_ep *e)
     if (!buf || max == 0 || !e)
         return 0;
     vn = pcie1_vendor_name(e->vendor);
-    cl = pcie1_is_b50(e->vendor, e->device) ? "Arc Pro B50" :
-         (e->vendor == 0x10DEU && e->device == 0x0FFEU ? "Quadro K2000" :
-          pcie1_class_label(e->base_class, e->subclass));
+    cl = pcie1_device_name(e->vendor, e->device);
+    if (!cl)
+        cl = e->vendor == 0x10DEU && e->device == 0x0FFEU ? "Quadro K2000" :
+             pcie1_class_label(e->base_class, e->subclass);
     if (vn) {
         while (*vn && n + 1U < max)
             buf[n++] = *vn++;

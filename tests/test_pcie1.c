@@ -38,6 +38,8 @@ static void expect_u64(const char *what, u64 got, u64 want)
 int main(void)
 {
     expect_true("B50 8086:E212", pcie1_is_b50(0x8086, 0xE212));
+    expect_true("B60 8086:E211", pcie1_is_b60(0x8086, 0xE211));
+    expect_true("B60 is not B50", !pcie1_is_b50(0x8086, 0xE211));
     expect_true("not B50 1de4:0001 (RP1)", !pcie1_is_b50(0x1de4, 0x0001));
     expect_true("not B50 8086:56a0 (other Arc)", !pcie1_is_b50(0x8086, 0x56a0));
     expect_true("id 0xffffffff invalid", !pcie1_id_valid(0xFFFFFFFFU));
@@ -137,6 +139,8 @@ int main(void)
                lzero_classify(true, true, true, 0x1de4, 0x0001), LZERO_NOT_B50);
     expect_u32("B50 seen is not verified",
                lzero_classify(true, true, true, 0x8086, 0xE212), LZERO_B50_SEEN);
+    expect_u32("B60 seen is generic GPU until independently proven",
+               lzero_classify(true, true, true, 0x8086, 0xE211), LZERO_GPU_SEEN);
     expect_u32("any 3D GPU is B (not only B50)",
                lzero_classify_ex(true, true, true, true, false), LZERO_GPU_SEEN);
     expect_u32("switch-only is not compute",
@@ -205,6 +209,14 @@ int main(void)
         expect_true("gpu caps 3D",
                     caps[0] == 'I'); /* Intel 3D GPU */
         expect_true("gpu is compute", pcie1_is_compute_ep(&gpu));
+        pcie1_fill_ep(&gpu, 2, 0, 0, 0xE2118086U, 0, 0, 0);
+        expect_true("B60 DID is compute without class bytes",
+                    pcie1_is_compute_ep(&gpu));
+        expect_true("B60 has explicit product name",
+                    pcie1_device_name(gpu.vendor, gpu.device)[9] == '6');
+        pcie1_fmt_caps(caps, sizeof(caps), &gpu);
+        expect_true("B60 caps retain Intel product label",
+                    caps[0] == 'I' && caps[14] == 'B' && caps[15] == '6');
         expect_true("bridge is not compute", !pcie1_is_compute_ep(&br));
         {
             struct pcie1_ep list[2];

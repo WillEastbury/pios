@@ -27,15 +27,17 @@ int main(void)
         fn(4, 0, 0, 0x8086, 0xE212, 0x03, 0x02, 0, 0, 0),
         fn(5, 0, 1, 0x10DE, 0x0E1B, 0x04, 0x03, 0, 0, 0),
         fn(6, 0, 0, 0x8086, 0xE212, 0x03, 0x02, 0, 0, 0),
+        fn(5, 1, 0, 0x8086, 0xE211, 0x00, 0x00, 0, 0, 0),
     };
     struct pcie_fabric_snapshot snapshot;
-    CHECK(pcie_fabric_observe(1, fabric, 6, &snapshot));
-    CHECK(snapshot.function_count == 6U && snapshot.compute_count == 3U &&
+    CHECK(pcie_fabric_observe(1, fabric, 7, &snapshot));
+    CHECK(snapshot.function_count == 7U && snapshot.compute_count == 4U &&
           snapshot.b50_count == 3U);
     CHECK(snapshot.functions[0].reachable && snapshot.functions[4].reachable);
     CHECK(!snapshot.functions[5].reachable);
     CHECK(pcie_fabric_is_bridge(&snapshot.functions[0]));
     CHECK(pcie_fabric_is_b50(&snapshot.functions[2]));
+    CHECK(pcie_fabric_is_b60(&snapshot.functions[6]));
 
     fabric[0].secondary_bus = 1;
     CHECK(pcie_fabric_observe(1, fabric, 6, &snapshot));

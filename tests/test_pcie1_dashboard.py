@@ -37,7 +37,7 @@ harness = r"""
 struct pcie1_status {
     bool present, inited, link_up;
     u32 link_speed, link_width, ep_count;
-    bool b50_found, scan_truncated;
+    bool b50_found, b60_found, scan_truncated;
 };
 """ + "\n".join(function(signature) for signature in (
     "static void dash_pcie1_append_text(",
@@ -63,6 +63,9 @@ int main(void) {
     status.scan_truncated = true;
     status.b50_found = true;
     expect("Gen2 x1; 2 functions (+more); B50", &status);
+    status.b60_found = true;
+    expect("Gen2 x1; 2 functions (+more); B50; B60", &status);
+    status.b60_found = false;
     status.link_speed = 7;
     expect("Gen? x1; 2 functions (+more); B50", &status);
     char tiny[8];

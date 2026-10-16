@@ -102,7 +102,8 @@ static inline u32 lzero_classify(bool has_pcie1, bool link_up, bool any_ep,
                                  u16 vendor, u16 device)
 {
     bool b50 = pcie1_is_b50(vendor, device);
-    return lzero_classify_ex(has_pcie1, link_up, any_ep, b50, b50);
+    bool compute = b50 || pcie1_is_b60(vendor, device);
+    return lzero_classify_ex(has_pcie1, link_up, any_ep, compute, b50);
 }
 
 static inline u32 lzero_gate_from_facts(const struct lzero_facts *f)

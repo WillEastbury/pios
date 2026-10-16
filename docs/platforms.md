@@ -170,10 +170,17 @@ The HDMI workbench has a dedicated `PCIE1 ENUMERATION (CACHED)` panel.
 It lists BDF, vendor/device ID, header type and class/vendor description,
 including bridge secondary/subordinate ranges. Eight rows per column are
 visible, with one to three columns depending on screen width (up to 24
-functions at once). B50/K2000 IDs receive explicit device names. Overflow
+functions at once). B50/B60/K2000 IDs receive explicit device names. Overflow
 pages rotate every eight seconds so all 64 cached functions remain
 visible. Rendering never scans/configures devices. `pcie1 scan` explicitly
 refreshes the snapshot (buses 1..63).
+
+Intel `8086:E211` is identified and displayed as **Arc Pro B60**, including
+when its class bytes are generic or absent. Cached `pcie1 status` and the HDMI
+workbench expose B60 presence separately from the existing B50 count. This is
+identity/enumeration only: E211 is not accepted by B50-specific BAR, GuC,
+PPGTT, Xe2/XMX or tensor-execution gates until the B60 hardware path is
+independently capability-checked and proven.
 
 For the observed PLX `10B5:8748` topology, `tools/pios_pcie_bus.py --execute`
 is the bounded operator bus-numbering harness. It requires a new `--log`,

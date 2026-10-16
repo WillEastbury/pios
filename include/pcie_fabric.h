@@ -12,6 +12,7 @@
 
 #define PCIE_FABRIC_VENDOR_INTEL  0x8086U
 #define PCIE_FABRIC_DEVICE_B50    0xE212U
+#define PCIE_FABRIC_DEVICE_B60    0xE211U
 
 struct pcie_fabric_function {
     u8 bus;
@@ -58,9 +59,15 @@ static inline bool pcie_fabric_is_b50(const struct pcie_fabric_function *fn)
            fn->device == PCIE_FABRIC_DEVICE_B50;
 }
 
+static inline bool pcie_fabric_is_b60(const struct pcie_fabric_function *fn)
+{
+    return fn && fn->vendor == PCIE_FABRIC_VENDOR_INTEL &&
+           fn->device == PCIE_FABRIC_DEVICE_B60;
+}
+
 static inline bool pcie_fabric_is_compute(const struct pcie_fabric_function *fn)
 {
-    return fn && (pcie_fabric_is_b50(fn) ||
+    return fn && (pcie_fabric_is_b50(fn) || pcie_fabric_is_b60(fn) ||
                   (fn->base_class == 0x03U &&
                    (fn->subclass == 0x00U || fn->subclass == 0x02U)) ||
                   fn->base_class == 0x12U);

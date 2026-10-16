@@ -756,6 +756,11 @@ static bool record_function(struct pcie1_status *s,
         s->b50_vendor = e->vendor;
         s->b50_device = e->device;
     }
+    if (pcie1_is_b60(e->vendor, e->device)) {
+        s->b60_found = true;
+        s->b60_vendor = e->vendor;
+        s->b60_device = e->device;
+    }
     s->ep_count++;
     return true;
 }
@@ -769,6 +774,9 @@ static void scan_endpoints(struct pcie1_status *s)
     s->b50_found = false;
     s->b50_vendor = 0;
     s->b50_device = 0;
+    s->b60_found = false;
+    s->b60_vendor = 0;
+    s->b60_device = 0;
     s->scan_truncated = false;
     s->malformed_topology = false;
     reachable[PCIE1_SCAN_BUS_LO] = true;
@@ -821,6 +829,9 @@ static void publish_snap(const char *fail)
         g_snap.b50_found = false;
         g_snap.b50_vendor = 0U;
         g_snap.b50_device = 0U;
+        g_snap.b60_found = false;
+        g_snap.b60_vendor = 0U;
+        g_snap.b60_device = 0U;
         g_snap.scan_truncated = false;
         g_snap.malformed_topology = false;
     }
