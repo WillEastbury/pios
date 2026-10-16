@@ -1,0 +1,30 @@
+// TSM1 request: BE32 magic, rows, cols, matrix span, vector span.
+void word(int p, int v) {
+    Memory.Set(p, Bits.And(Bits.Shr(v, 24), 255));
+    Memory.Set(p + 1, Bits.And(Bits.Shr(v, 16), 255));
+    Memory.Set(p + 2, Bits.And(Bits.Shr(v, 8), 255));
+    Memory.Set(p + 3, Bits.And(v, 255));
+}
+Memory.Set(4096, 1);
+Memory.Set(4097, 254);
+Memory.Set(4098, 3);
+Memory.Set(4099, 4);
+Memory.Set(4100, 5);
+Memory.Set(4101, 6);
+int matrix = Span.Make(4096, 4);
+int vector = Span.Make(4100, 2);
+word(4200, 1414745393);
+word(4204, 2);
+word(4208, 2);
+word(4212, matrix);
+word(4216, vector);
+int request = Span.Make(4200, 20);
+int pinned = Tensor.MatVecPinned(request, 1);
+Io.WriteByte(Tensor.SelectedBackend(pinned));
+Io.Write(pinned);
+int automatic = Tensor.MatVecPinned(request, 0);
+Io.WriteByte(Tensor.SelectedBackend(automatic));
+Io.Write(automatic);
+// QPU is an exact pin, not permission to fall back. No B50/B60 IDs.
+Io.WriteByte(Tensor.MatVecPinned(request, 2) + 128);
+Io.WriteByte(Tensor.MatVecPinned(request, 50) + 128);

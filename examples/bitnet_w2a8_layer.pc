@@ -1,0 +1,29 @@
+// Offline 4x8 BitNet-style layer: ternary W2 bitmap, signed A8, scale 1.
+// Each row stores a zero bitmap followed by a minus bitmap (LSB first).
+Memory.Set(4096, 36);
+Memory.Set(4097, 146);
+Memory.Set(4098, 0);
+Memory.Set(4099, 255);
+Memory.Set(4100, 255);
+Memory.Set(4101, 0);
+Memory.Set(4102, 66);
+Memory.Set(4103, 40);
+int weights = Span.Make(4096, 8);
+
+Memory.Set(4128, 128);
+Memory.Set(4129, 127);
+Memory.Set(4130, 253);
+Memory.Set(4131, 4);
+Memory.Set(4132, 251);
+Memory.Set(4133, 6);
+Memory.Set(4134, 0);
+Memory.Set(4135, 249);
+int activation = Span.Make(4128, 8);
+
+BitLinear.SetShape(4, 8);
+int projection = BitLinear.MatVecBitmap(weights, activation);
+int activated = Tensor.ReLUI32(projection);
+int winner = Tensor.ArgMaxI32(activated);
+Io.Write(projection);
+Io.Write(activated);
+Io.WriteByte(winner);
