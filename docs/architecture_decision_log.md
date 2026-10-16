@@ -2,6 +2,21 @@
 
 Every significant architectural decision in PIOS is recorded here.
 
+## 2026-10-16 — Owner-ordered FIFO/tensor-before-quiesce sequencing
+
+The owner directed that the production OS-owned FIFO driver and tensor
+accelerator execution path are completed before GPU/module quiesce and hot
+replacement. This ordering makes quiesce a state transition on an existing
+admission boundary: first stop new queue admission, then drain published work,
+prove accelerator completion and revoke mappings, and only then transfer or
+retire the module/device generation.
+
+Queue pause is not itself quiescence. Already-admitted descriptors retain
+their owner, pins and device generation until completion or proven device
+revocation. A timeout does not permit replay, reuse or forced module reclaim.
+The later PMOD handoff must consume the FIFO/tensor drain protocol rather than
+inventing a second driver-specific queue or scanning mutable scheduler state.
+
 ## 2026-10-16 — Owner-requested narrow ModelFifo process identity admission
 
 The owner requested a core-0 trusted process-generation broker, with safe
@@ -3745,3 +3760,11 @@ writes may still occur.
 
 See [tensor_selection.md](tensor_selection.md) for lifecycle requirements,
 current hook formats, statuses and outstanding production work.
+
+**Owner sequencing refinement (2026-10-16).** Production FIFO admission,
+pause/drain and tensor accelerator execution precede B50/B60 module quiesce.
+Once admission and completion are sequence-backed, hot replacement quiesces by
+closing admission, draining the bounded queues, proving that the selected
+accelerator generation can no longer write, and revoking its mappings before
+epoch transfer. Quiesce must reuse this path; it may not bypass descriptor
+ownership or infer safety from an empty instantaneous queue snapshot.
