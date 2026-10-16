@@ -1,0 +1,18 @@
+// DRAFT, unactivated: scalar control-state illustration, no transport/job hooks.
+// Proposed adapter must validate the complete manifest before calling prepare.
+// Each owner must reserve against its exact host/GPU generation and plan digest.
+// A failed prepare aborts every prepared owner; no layer may run before commit.
+int placement_prepare_draft(int expectedGeneration, int observedGeneration,
+                            int wholePlanValidated, int allOwnersReserved) {
+    if (expectedGeneration <= 0 || expectedGeneration != observedGeneration) {
+        return -1;
+    }
+    if (wholePlanValidated != 1 || allOwnersReserved != 1) { return -1; }
+    return 0;
+}
+int placement_next_layer_draft(int committed, int previousComplete,
+                               int transferComplete, int ownerGenerationValid) {
+    if (committed != 1 || previousComplete != 1 || transferComplete != 1 ||
+        ownerGenerationValid != 1) { return -1; }
+    return 0;
+}
