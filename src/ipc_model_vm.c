@@ -113,6 +113,22 @@ i32 ipc_model_vm_service(struct ipc_model_vm_host *h)
             if (rc && !result) result = rc;
         }
     }
+    const struct ipc_model_admission *a =
+        &h->registry->admission[h->identity.slot];
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (a->generation == h->identity.generation &&
+        a->state == IPC_MODEL_ADMISSION_PAUSING &&
+        !h->outstanding && !h->batch_count && !h->cleanup_pending) {
+        bool pending = false;
+        for (u32 i = 0; i < h->grant_count && !pending; ++i)
+            pending = h->wake_pending[h->grants[i].slot][0] ||
+                      h->wake_pending[h->grants[i].slot][1];
+        if (!pending) {
+            i32 rc = ipc_model_drain_ack(h->registry, h->identity,
+                                         a->sequence);
+            if (rc && rc != IPC_MODEL_ERR_PHASE && !result) result = rc;
+        }
+    }
     return result;
 }
 

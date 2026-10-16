@@ -32,6 +32,13 @@ int main(void)
     assert(ipc_model_lane_open(r, a, (struct ipc_model_id){2,7}, 11, &ad) == IPC_OK);
     assert(ab.slot != cb.slot && ab.slot != ad.slot);
     struct ipc_model_request m = metadata(a, b, 10);
+    u32 pause_sequence;
+    assert(ipc_model_pause(r, b, &pause_sequence) == IPC_OK);
+    assert(ipc_model_request_create(r, a, &m, &extra) == IPC_MODEL_ERR_PAUSED);
+    assert(ipc_model_pause_complete(r, b, pause_sequence) == IPC_MODEL_ERR_PHASE);
+    assert(ipc_model_drain_ack(r, b, pause_sequence) == IPC_OK);
+    assert(ipc_model_pause_complete(r, b, pause_sequence) == IPC_OK);
+    assert(ipc_model_resume(r, b, pause_sequence) == IPC_OK);
     for (u32 i = 0; i < 8; ++i) {
         m.tag = i;
         assert(ipc_model_request_create(r, a, &m, &ids[i]) == IPC_OK);
@@ -67,6 +74,18 @@ int main(void)
     for (u32 i=0; i<count; ++i) assert(ipc_model_release(r,b,recv[i]) == IPC_OK);
     assert(ipc_model_release(r,b,ids[1]) == IPC_OK);
     assert(ipc_model_release(r,b,ids[2]) == IPC_OK);
+    m = metadata(c,b,10);
+    assert(ipc_model_request_create(r,c,&m,&extra) == IPC_OK);
+    assert(ipc_model_publish(r,c,cb,extra,&seq) == IPC_OK);
+    assert(ipc_model_pause(r,b,&pause_sequence) == IPC_OK);
+    assert(ipc_model_drain_ack(r,b,pause_sequence) == IPC_MODEL_ERR_PHASE);
+    assert(ipc_model_request_create(r,c,&m,&held[0]) == IPC_MODEL_ERR_PAUSED);
+    assert(ipc_model_receive(r,b,cb,recv,1,&count,&rejected) == IPC_OK &&
+           count == 1);
+    assert(ipc_model_release(r,b,recv[0]) == IPC_OK);
+    assert(ipc_model_drain_ack(r,b,pause_sequence) == IPC_OK);
+    assert(ipc_model_pause_complete(r,b,pause_sequence) == IPC_OK);
+    assert(ipc_model_resume(r,b,pause_sequence) == IPC_OK);
     /* Malformed spans fail before any descriptor allocation. */
     m = metadata(a,b,10); m.offset = ~0U;
     assert(ipc_model_request_create(r,a,&m,&extra) == IPC_ERR_TOOLONG);

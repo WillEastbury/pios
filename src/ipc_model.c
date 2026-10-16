@@ -11,6 +11,8 @@ _Static_assert(sizeof(struct ipc_model_lane_config) == 64, "lane identity line")
 _Static_assert(sizeof(struct ipc_model_lane) % 64 == 0, "lane stride");
 _Static_assert(sizeof(struct ipc_model_slot) == 128, "isolated descriptor stride");
 _Static_assert(sizeof(struct ipc_model_vm_record) == 64, "VM stride");
+_Static_assert(sizeof(struct ipc_model_admission) == 64, "admission owner line");
+_Static_assert(sizeof(struct ipc_model_drain_ack) == 64, "drain ack owner line");
 _Static_assert(sizeof(struct ipc_model_route) == 64, "route stride");
 
 static u32 next_generation(u32 g) { return g + 1U; }
@@ -22,6 +24,15 @@ static bool live_vm(const struct ipc_model_registry *r, struct ipc_model_vm v)
 {
     return v.slot < IPC_MODEL_VMS && v.generation != 0 &&
         r->vms[v.slot].live && r->vms[v.slot].generation == v.generation;
+}
+static bool admission_open(const struct ipc_model_registry *r,
+                           struct ipc_model_vm v)
+{
+    if (!live_vm(r, v)) return false;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    const struct ipc_model_admission *a = &r->admission[v.slot];
+    return a->generation == v.generation &&
+        a->state == IPC_MODEL_ADMISSION_OPEN;
 }
 static struct ipc_model_route *route(struct ipc_model_registry *r,
                                      struct ipc_model_id model, u32 shard)
@@ -68,7 +79,98 @@ i32 ipc_model_vm_start(struct ipc_model_registry *r, u32 slot, struct ipc_model_
     if (!g) return IPC_ERR_NOSPC;
     r->vms[slot].generation = g;
     r->vms[slot].live = 1;
+    r->admission[slot] = (struct ipc_model_admission){
+        .generation=g, .state=IPC_MODEL_ADMISSION_OPEN, .sequence=1U};
+    r->drain_ack[slot] = (struct ipc_model_drain_ack){.generation=g};
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     *out = (struct ipc_model_vm){slot, g};
+    return IPC_OK;
+}
+i32 ipc_model_pause(struct ipc_model_registry *r, struct ipc_model_vm vm,
+                    u32 *sequence)
+{
+    if (!r || !sequence || !live_vm(r, vm)) return IPC_MODEL_ERR_STALE;
+    struct ipc_model_admission *a = &r->admission[vm.slot];
+    if (a->generation != vm.generation ||
+        a->state != IPC_MODEL_ADMISSION_OPEN)
+        return IPC_MODEL_ERR_PHASE;
+    u32 next = next_generation(a->sequence);
+    if (!next) return IPC_ERR_NOSPC;
+    a->sequence = next;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    a->state = IPC_MODEL_ADMISSION_PAUSING;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *sequence = next;
+    return IPC_OK;
+}
+static bool vm_drained(const struct ipc_model_registry *r,
+                       struct ipc_model_vm vm)
+{
+    if (r->vms[vm.slot].cleanup_pending) return false;
+    for (u32 i = 0; i < IPC_MODEL_LANES; ++i) {
+        const struct ipc_model_lane *l = &r->lanes[i];
+        if (!l->config.live ||
+            (!same_vm(l->config.source, vm) &&
+             !same_vm(l->config.target, vm)))
+            continue;
+        u32 produced = __atomic_load_n(&l->producer.sequence, __ATOMIC_ACQUIRE);
+        u32 consumed = __atomic_load_n(&l->consumer.sequence, __ATOMIC_ACQUIRE);
+        if (produced != consumed) return false;
+    }
+    for (u32 i = 0; i < IPC_MODEL_REQUESTS; ++i) {
+        const struct ipc_model_slot *s = &r->requests[i];
+        if (__atomic_load_n(&s->control.phase, __ATOMIC_ACQUIRE) != FREE &&
+            (same_vm(s->request.source, vm) ||
+             same_vm(s->request.target, vm)))
+            return false;
+    }
+    return true;
+}
+i32 ipc_model_drain_ack(struct ipc_model_registry *r, struct ipc_model_vm vm,
+                        u32 sequence)
+{
+    if (!r || !live_vm(r, vm)) return IPC_MODEL_ERR_STALE;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    const struct ipc_model_admission *a = &r->admission[vm.slot];
+    if (!sequence || a->generation != vm.generation ||
+        a->sequence != sequence ||
+        a->state != IPC_MODEL_ADMISSION_PAUSING)
+        return IPC_MODEL_ERR_PHASE;
+    if (!vm_drained(r, vm)) return IPC_MODEL_ERR_PHASE;
+    struct ipc_model_drain_ack *ack = &r->drain_ack[vm.slot];
+    ack->generation = vm.generation;
+    ack->sequence = sequence;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return IPC_OK;
+}
+i32 ipc_model_pause_complete(struct ipc_model_registry *r,
+                             struct ipc_model_vm vm, u32 sequence)
+{
+    if (!r || !live_vm(r, vm)) return IPC_MODEL_ERR_STALE;
+    struct ipc_model_admission *a = &r->admission[vm.slot];
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    const struct ipc_model_drain_ack *ack = &r->drain_ack[vm.slot];
+    if (!sequence || a->generation != vm.generation ||
+        a->sequence != sequence ||
+        a->state != IPC_MODEL_ADMISSION_PAUSING ||
+        ack->generation != vm.generation || ack->sequence != sequence ||
+        !vm_drained(r, vm))
+        return IPC_MODEL_ERR_PHASE;
+    a->state = IPC_MODEL_ADMISSION_PAUSED;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return IPC_OK;
+}
+i32 ipc_model_resume(struct ipc_model_registry *r, struct ipc_model_vm vm,
+                     u32 sequence)
+{
+    if (!r || !live_vm(r, vm)) return IPC_MODEL_ERR_STALE;
+    struct ipc_model_admission *a = &r->admission[vm.slot];
+    if (!sequence || a->generation != vm.generation ||
+        a->sequence != sequence ||
+        a->state != IPC_MODEL_ADMISSION_PAUSED)
+        return IPC_MODEL_ERR_PHASE;
+    a->state = IPC_MODEL_ADMISSION_OPEN;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     return IPC_OK;
 }
 i32 ipc_model_vm_retire(struct ipc_model_registry *r, struct ipc_model_vm vm)
@@ -93,6 +195,8 @@ i32 ipc_model_vm_retire(struct ipc_model_registry *r, struct ipc_model_vm vm)
     }
     r->vms[vm.slot].live = 0;
     r->vms[vm.slot].attached = 0;
+    r->admission[vm.slot].state = IPC_MODEL_ADMISSION_CLOSED;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     for (u32 i = 0; i < IPC_MODEL_ROUTES; ++i)
         if (same_vm(r->routes[i].target, vm)) r->routes[i].live = 0;
     for (u32 i = 0; i < IPC_MODEL_LANES; ++i) {
@@ -169,6 +273,8 @@ i32 ipc_model_request_create(struct ipc_model_registry *r, struct ipc_model_vm c
     struct ipc_model_route *dst = route(r, m->model, m->shard);
     if (!dst || !live_vm(r, m->target) || !same_vm(dst->target, m->target))
         return IPC_MODEL_ERR_STALE;
+    if (!admission_open(r, caller) || !admission_open(r, m->target))
+        return IPC_MODEL_ERR_PAUSED;
     if (!m->span_generation || !m->length || m->offset > m->capacity ||
         m->length > m->capacity - m->offset) return IPC_ERR_TOOLONG;
     /* Fixed partitions avoid multi-producer allocation from a shared free pool. */
@@ -194,6 +300,9 @@ i32 ipc_model_publish(struct ipc_model_registry *r, struct ipc_model_vm caller,
     struct ipc_model_lane *l = lane(r, id);
     struct ipc_model_slot *s = request(r, req);
     if (!l || !s || !live_vm(r, l->config.target)) return IPC_MODEL_ERR_STALE;
+    if (!admission_open(r, caller) ||
+        !admission_open(r, l->config.target))
+        return IPC_MODEL_ERR_PAUSED;
     if (!same_vm(caller, l->config.source)) return IPC_MODEL_ERR_OWNER;
     if (__atomic_load_n(&s->control.phase, __ATOMIC_ACQUIRE) != OWNED)
         return IPC_MODEL_ERR_PHASE;

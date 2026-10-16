@@ -13,6 +13,12 @@
 #define IPC_MODEL_ERR_STALE -9
 #define IPC_MODEL_ERR_OWNER -10
 #define IPC_MODEL_ERR_PHASE -11
+#define IPC_MODEL_ERR_PAUSED -12
+
+#define IPC_MODEL_ADMISSION_CLOSED 0U
+#define IPC_MODEL_ADMISSION_OPEN 1U
+#define IPC_MODEL_ADMISSION_PAUSING 2U
+#define IPC_MODEL_ADMISSION_PAUSED 3U
 
 struct ipc_model_id { u32 slot, generation; };
 struct ipc_model_vm { u32 slot, generation; };
@@ -43,6 +49,16 @@ struct ipc_model_vm_record {
     u32 generation, live, attached, cleanup_pending;
     u32 reserved[12];
 } ALIGNED(64);
+/* Manager and endpoint own separate cache lines. The manager is the sole
+ * writer of admission; the endpoint is the sole writer of drain_ack. */
+struct ipc_model_admission {
+    u32 generation, state, sequence;
+    u32 reserved[13];
+} ALIGNED(64);
+struct ipc_model_drain_ack {
+    u32 generation, sequence;
+    u32 reserved[14];
+} ALIGNED(64);
 struct ipc_model_route {
     struct ipc_model_id model;
     u32 shard, live;
@@ -70,6 +86,8 @@ struct ipc_model_lane {
 } ALIGNED(64);
 struct ipc_model_registry {
     struct ipc_model_vm_record vms[IPC_MODEL_VMS];
+    struct ipc_model_admission admission[IPC_MODEL_VMS];
+    struct ipc_model_drain_ack drain_ack[IPC_MODEL_VMS];
     struct ipc_model_cursor model_generations[IPC_MODEL_ROUTES];
     struct ipc_model_route routes[IPC_MODEL_ROUTES];
     struct ipc_model_lane lanes[IPC_MODEL_LANES];
@@ -79,6 +97,13 @@ struct ipc_model_registry {
 void ipc_model_init(struct ipc_model_registry *r);
 i32 ipc_model_vm_start(struct ipc_model_registry *r, u32 slot, struct ipc_model_vm *out);
 i32 ipc_model_vm_retire(struct ipc_model_registry *r, struct ipc_model_vm vm);
+/* Core-0 manager closes admission; the owning endpoint drains already-published
+ * work and acknowledges the exact pause sequence. An empty queue snapshot is
+ * insufficient without this sequence handshake. */
+i32 ipc_model_pause(struct ipc_model_registry *, struct ipc_model_vm, u32 *);
+i32 ipc_model_drain_ack(struct ipc_model_registry *, struct ipc_model_vm, u32);
+i32 ipc_model_pause_complete(struct ipc_model_registry *, struct ipc_model_vm, u32);
+i32 ipc_model_resume(struct ipc_model_registry *, struct ipc_model_vm, u32);
 i32 ipc_model_bind(struct ipc_model_registry *r, struct ipc_model_id model,
                    u32 shard, struct ipc_model_vm target);
 i32 ipc_model_lane_open(struct ipc_model_registry *r, struct ipc_model_vm source,

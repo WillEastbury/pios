@@ -73,6 +73,16 @@ i32 ipc_model_broker_retire(struct ipc_model_broker *b,
     if (rc) return rc;
     struct ipc_model_binding *v = binding(b, vm, p);
     if (!v) return IPC_MODEL_ERR_OWNER;
+    const struct ipc_model_admission *admission =
+        &b->registry.admission[vm.slot];
+    const struct ipc_model_drain_ack *ack =
+        &b->registry.drain_ack[vm.slot];
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (admission->generation != vm.generation ||
+        admission->state != IPC_MODEL_ADMISSION_PAUSED ||
+        ack->generation != vm.generation ||
+        ack->sequence != admission->sequence)
+        return IPC_MODEL_ERR_PHASE;
     bool attached = b->registry.vms[vm.slot].attached != 0;
     if (attached && (!host || host->registry != &b->registry ||
         host->identity.slot != vm.slot || host->identity.generation != vm.generation))

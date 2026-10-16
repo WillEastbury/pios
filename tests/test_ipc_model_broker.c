@@ -74,6 +74,10 @@ int main(void)
     assert(ipc_model_broker_retire(&broker, &ops, NULL, vm, &expected, &host)
            == IPC_MODEL_ERR_PHASE);
     host.wake_pending[0][0] = false;
+    u32 pause_sequence;
+    assert(!ipc_model_pause(&broker.registry, vm, &pause_sequence));
+    assert(!ipc_model_vm_service(&host));
+    assert(!ipc_model_pause_complete(&broker.registry, vm, pause_sequence));
     assert(!ipc_model_broker_retire(&broker, &ops, NULL, vm, &expected, &host));
     assert(!ctx.instance_host && !broker.bindings[0].live);
     current = child;
