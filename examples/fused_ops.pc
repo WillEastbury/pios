@@ -1,0 +1,157 @@
+// Reusable source prefix for the shipped C frontend (no include mechanism).
+// Private byte spans, signed Q8.8 biased-u16 big endian. See docs/fused_ops.md.
+int fused_read(int frp) {
+    return Memory.Get(frp) * 256 + Memory.Get(frp + 1) - 16384;
+}
+int fused_write(int fwp, int fwv) {
+    fwv = fwv + 16384;
+    Memory.Set(fwp, fwv / 256);
+    Memory.Set(fwp + 1, fwv % 256);
+    return 0;
+}
+int fused_span(int fsp, int fsn, int fsneed) {
+    if (fsp < 4096 || fsn < fsneed || fsn > 61440 ||
+        fsp > 65536 - fsn) { return 0; }
+    return 1;
+}
+int fused_overlap(int foa, int fon, int fob, int fom) {
+    if (foa < fob + fom && fob < foa + fon) { return 1; }
+    return 0;
+}
+int fused_values(int fvp, int fvn) {
+    int fvi = 0;
+    while (fvi < fvn) {
+        int fvv = fused_read(fvp + fvi * 2);
+        if (fvv < -512 || fvv > 512) { return 0; }
+        fvi = fvi + 1;
+    }
+    return 1;
+}
+// A[B,M,K] * W[N,K]^T; output[B,M,N]. Scale numerator / 256.
+int fused_matmul(int ma, int mal, int mw, int mwl, int mo, int mol,
+    int mb, int mm, int mn, int mk, int ms, int budget) {
+    if (mb < 1 || mb > 8 || mm < 1 || mm > 8 || mn < 1 || mn > 8 ||
+        mk < 1 || mk > 8 || ms < 0 || ms > 256) { return -1; }
+    int mac = mb * mm * mk;
+    int mwc = mn * mk;
+    int moc = mb * mm * mn;
+    if (!fused_span(ma, mal, mac * 2) || !fused_span(mw, mwl, mwc * 2) ||
+        !fused_span(mo, mol, moc * 2)) { return -2; }
+    if (fused_overlap(mo, mol, ma, mal) ||
+        fused_overlap(mo, mol, mw, mwl)) { return -3; }
+    if (budget < moc * mk) { return -4; }
+    if (!fused_values(ma, mac) || !fused_values(mw, mwc)) { return -5; }
+    int mr = 0;
+    while (mr < mb * mm) {
+        int mc = 0;
+        while (mc < mn) {
+            int mt = 0;
+            int msum = 0;
+            while (mt < mk) {
+                int mleft = fused_read(ma + (mr * mk + mt) * 2);
+                int mright = fused_read(mw + (mc * mk + mt) * 2);
+                msum = msum + mleft * mright;
+                mt = mt + 1;
+            }
+            fused_write(mo + (mr * mn + mc) * 2, (msum / 256) * ms / 256);
+            mc = mc + 1;
+        }
+        mr = mr + 1;
+    }
+    return 0;
+}
+int fused_matvec(int va, int val, int vw, int vwl, int vo, int vol,
+    int vn, int vk, int vbudget) {
+    return fused_matmul(va, val, vw, vwl, vo, vol, 1, 1, vn, vk, 256, vbudget);
+}
+int fused_lmhead(int la, int lal, int lw, int lwl, int lo, int lol,
+    int ln, int lk, int ls, int lbudget) {
+    return fused_matmul(la, lal, lw, lwl, lo, lol, 1, 1, ln, lk, ls, lbudget);
+}
+// Output k pairs (score Q8.8, token index biased-u16). No sampling.
+int fused_topk(int ta, int tal, int to, int tol, int tn, int tk, int tbudget) {
+    if (tn < 1 || tn > 64 || tk < 0 || tk > tn) { return -1; }
+    if (!fused_span(ta, tal, tn * 2) || !fused_span(to, tol, tk * 4)) { return -2; }
+    if (fused_overlap(ta, tal, to, tol)) { return -3; }
+    if (tbudget < tn * tk) { return -4; }
+    int tv = 0;
+    while (tv < tn) {
+        if (fused_read(ta + tv * 2) > 16383) { return -5; }
+        tv = tv + 1;
+    }
+    int tr = 0;
+    int tlast = 16383;
+    int tindex = -1;
+    while (tr < tk) {
+        int ti = 0;
+        int tbest = -16384;
+        int tchosen = -1;
+        while (ti < tn) {
+            int ts = fused_read(ta + ti * 2);
+            if (tr == 0 || ts < tlast || (ts == tlast && ti > tindex)) {
+                if (tchosen < 0 || ts > tbest) { tbest = ts; tchosen = ti; }
+            }
+            ti = ti + 1;
+        }
+        fused_write(to + tr * 4, tbest);
+        fused_write(to + tr * 4 + 2, tchosen);
+        tlast = tbest;
+        tindex = tchosen;
+        tr = tr + 1;
+    }
+    return 0;
+}
+// Single head, Q[T,D], K[S,D], V[S,E], output[T,E].
+// Query row i sees keys j <= offset+i. Scratch holds S Q8.8 scores.
+int fused_attention(int aq, int aql, int ak, int akl, int av, int avl,
+    int ao, int aol, int ax, int axl, int at, int an, int ad, int ae,
+    int offset, int divisor, int abudget) {
+    if (at < 1 || at > 8 || an < 1 || an > 8 || ad < 1 || ad > 8 ||
+        ae < 1 || ae > 8 || offset < 0 || offset > an || offset + at > an ||
+        divisor < 256 || divisor > 4096) { return -1; }
+    if (!fused_span(aq, aql, at * ad * 2) || !fused_span(ak, akl, an * ad * 2) ||
+        !fused_span(av, avl, an * ae * 2) || !fused_span(ao, aol, at * ae * 2) ||
+        !fused_span(ax, axl, an * 2)) { return -2; }
+    if (fused_overlap(ao, aol, aq, aql) || fused_overlap(ao, aol, ak, akl) ||
+        fused_overlap(ao, aol, av, avl) || fused_overlap(ax, axl, aq, aql) ||
+        fused_overlap(ax, axl, ak, akl) || fused_overlap(ax, axl, av, avl) ||
+        fused_overlap(ao, aol, ax, axl)) { return -3; }
+    if (abudget < at * an * (ad + ae + 1)) { return -4; }
+    if (!fused_values(aq, at * ad) || !fused_values(ak, an * ad) ||
+        !fused_values(av, an * ae)) { return -5; }
+    int ai = 0;
+    while (ai < at) {
+        int aj = 0;
+        int apeak = -16384;
+        while (aj <= offset + ai) {
+            int ac = 0;
+            int adot = 0;
+            while (ac < ad) {
+                int aleft = fused_read(aq + (ai * ad + ac) * 2);
+                int aright = fused_read(ak + (aj * ad + ac) * 2);
+                adot = adot + aleft * aright;
+                ac = ac + 1;
+            }
+            int ascore = adot / divisor;
+            fused_write(ax + aj * 2, ascore);
+            if (ascore > apeak) { apeak = ascore; }
+            aj = aj + 1;
+        }
+        int acol = 0;
+        while (acol < ae) {
+            int asum = 0;
+            int aden = 0;
+            aj = 0;
+            while (aj <= offset + ai) {
+                int aw = Maths.Exp((fused_read(ax + aj * 2) - apeak) * 256) / 256;
+                aden = aden + aw;
+                asum = asum + aw * fused_read(av + (aj * ae + acol) * 2);
+                aj = aj + 1;
+            }
+            fused_write(ao + (ai * ae + acol) * 2, asum / aden);
+            acol = acol + 1;
+        }
+        ai = ai + 1;
+    }
+    return 0;
+}

@@ -1,0 +1,135 @@
+// Offline synthetic one-block decoder. Q8.8 activations; Q16.16 math hooks.
+// Scratch/cache are private VM memory, not shared descriptors or native jobs.
+// Helpers deliberately use distinct bindings in the shipped C frontend.
+int load32(int lp) {
+    return Memory.Get(lp) * 256 + Memory.Get(lp + 1) - 16384;
+}
+int store32(int sp, int sv) {
+    // Signed values biased by 16384 in four-byte cache slots (two bytes used).
+    sv = sv + 16384;
+    Memory.Set(sp, sv / 256);
+    Memory.Set(sp + 1, sv % 256);
+    return 0;
+}
+int emit32(int ex) {
+    if (ex < 0) {
+        Io.WriteByte(255); Io.WriteByte(255);
+        ex = ex + 65536;
+    } else {
+        Io.WriteByte(0); Io.WriteByte(0);
+    }
+    Io.WriteByte(ex / 256);
+    Io.WriteByte(ex % 256);
+    return 0;
+}
+int norm(int nx, int ny) {
+    // Unit RMS gain, epsilon = 1/65536; integer sqrt of Q16.16 energy.
+    return nx * 256 / Maths.Sqrt((nx * nx + ny * ny) / 2 + 1);
+}
+int decode(int pos, int token) {
+    if (pos < 0 || pos >= 8 || token < 0 || token >= 4) {
+        return -1;
+    }
+    if (pos != Memory.Get(8480)) {
+        return -1;
+    }
+    // Four embeddings: (1,.5), (-.5,1), (.75,-1), (-1,-.75).
+    int x = 256;
+    int y = 128;
+    if (token == 1) { x = -128; y = 256; }
+    if (token == 2) { x = 192; y = -256; }
+    if (token == 3) { x = -256; y = -192; }
+    int a = norm(x, y);
+    int b = norm(y, x);
+    // Ternary BitLinear Q=(a,b), K=(b,a), V=(a-b,a+b)/2.
+    // RoPE one pair, angular frequency .5 radians per position.
+    int c = Maths.Cos(pos * 16384 * 2);
+    int s = Maths.Sin(pos * 16384 * 2);
+    int q0 = (a * c - b * s) / 65536;
+    int q1 = (a * s + b * c) / 65536;
+    int k0 = (b * c - a * s) / 65536;
+    int k1 = (b * s + a * c) / 65536;
+    int v0 = (a - b) / 2;
+    int v1 = (a + b) / 2;
+    store32(8192 + pos * 16, k0);
+    store32(8196 + pos * 16, k1);
+    store32(8200 + pos * 16, v0);
+    store32(8204 + pos * 16, v1);
+    // Gather the interleaved persistent cache into bounded private spans.
+    // Prefix examples/fused_ops.pc before compiling with the shipped frontend.
+    int j = 0;
+    while (j <= pos) {
+        int dk0 = load32(8192 + j * 16);
+        int dk1 = load32(8196 + j * 16);
+        int dv0 = load32(8200 + j * 16);
+        int dv1 = load32(8204 + j * 16);
+        fused_write(8500 + j * 4, dk0);
+        fused_write(8502 + j * 4, dk1);
+        fused_write(8532 + j * 4, dv0);
+        fused_write(8534 + j * 4, dv1);
+        j = j + 1;
+    }
+    fused_write(8564, q0);
+    fused_write(8566, q1);
+    int attentionStatus = fused_attention(8564, 4, 8500, 32, 8532, 32,
+        8568, 4, 8600, 16, 1, pos + 1, 2, 2, pos, 362, 40);
+    if (attentionStatus != 0) { return attentionStatus; }
+    int att0 = fused_read(8568);
+    int att1 = fused_read(8570);
+    // Identity output projection and residual, pre-norm ternary FFN + ReLU.
+    x = x + att0;
+    y = y + att1;
+    a = norm(x, y);
+    b = norm(y, x);
+    int f0 = a + b;
+    int f1 = a - b;
+    if (f0 < 0) { f0 = 0; }
+    if (f1 < 0) { f1 = 0; }
+    // Down BitLinear = [[1,-1],[0,1]], scale 1/2.
+    x = x + (f0 - f1) / 2;
+    y = y + f1 / 2;
+    a = norm(x, y);
+    b = norm(y, x);
+    // Ternary LM head, first-index greedy ties.
+    int l0 = a + b;
+    int l1 = a - b;
+    int l2 = -a + b;
+    int l3 = -a - b;
+    int best = l0;
+    int next = 0;
+    if (l1 > best) { best = l1; next = 1; }
+    if (l2 > best) { best = l2; next = 2; }
+    if (l3 > best) { next = 3; }
+    Io.WriteByte(pos);
+    Io.WriteByte(token);
+    emit32(k0); emit32(k1); emit32(v0); emit32(v1);
+    emit32(att0); emit32(att1);
+    emit32(l0); emit32(l1); emit32(l2); emit32(l3);
+    Io.WriteByte(next);
+    Memory.Set(8480, pos + 1);
+    return next;
+}
+
+// A two-token prompt is prefetched causally, then greedy decoding to the cap.
+// Each session resets position to zero; old cache entries are never consumed.
+int prompt0 = 0;
+int prompt1 = 1;
+int tokenBudget = 8;
+int sessions = 1;
+if (tokenBudget < 0 || tokenBudget > 8 || sessions < 1 || sessions > 2 ||
+    prompt0 < 0 || prompt0 > 3 || prompt1 < 0 || prompt1 > 3) {
+    Io.WriteByte(255);
+} else {
+    int run = 0;
+    while (run < sessions) {
+        Memory.Set(8480, 0);
+        int pos = 0;
+        int token = prompt0;
+        while (pos < tokenBudget) {
+            if (pos == 1) { token = prompt1; }
+            token = decode(pos, token);
+            pos = pos + 1;
+        }
+        run = run + 1;
+    }
+}

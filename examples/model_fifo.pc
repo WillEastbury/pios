@@ -1,0 +1,6 @@
+// Host admits the current model generation, shard and lease grant.
+// No VM identity, pointer, GPU selection or inference result is script-supplied.
+int route = ModelFifo.Route(2, 7);
+int submitted = ModelFifo.Submit(route, 1);
+int status = ModelFifo.Status();
+int sequence = ModelFifo.Published(route);
