@@ -1340,6 +1340,7 @@ static int pv_textio(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
  * with the Python/JS classifiers so a denied hook faults identically on every path. */
 uint32_t pv_hook_cap(int hook)
 {
+    if (hook >= 0x3E0 && hook <= 0x3E9) return PV_CAP_QUEUE;
     /* mixed-namespace exceptions first */
     if (hook == PV_HOOK_MATHS_RANDOM || hook == PV_HOOK_MATHS_RANDOMRANGE) return PV_CAP_RANDOM;
     if (hook == PV_HOOK_CRYPTO_RANDOMBYTES) return PV_CAP_RANDOM;
@@ -2694,6 +2695,13 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
     /* INV-17: bindings are not ambient -- deny the hook unless its class is granted. */
     uint32_t need = pv_hook_cap(hook);
     if (need && !(ctx->caps & need)) { pv_set_fault(ctx, PV_FAULT_CAPABILITY, ctx->cur_pc, hook); return; }
+    if (hook >= 0x3E0 && hook <= 0x3E9) {
+        if (ctx->instance_host &&
+            ctx->instance_host(ctx, hook, rd, rs1, rs2)) return;
+        ctx->host_status = -10; /* no admitted instance authority */
+        ctx->regs[rd] = -10;
+        return;
+    }
     /* Multi-target host provider (Time / Random / Environment). Optional;
      * freestanding builds leave the hook NULL and fall through to stubs. */
     if (pv_host_provider_dispatch_hook &&
@@ -2728,6 +2736,12 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
     }
     if (pv_block_hook && hook >= PV_HOOK_BLOCK_READY && hook <= PV_HOOK_BLOCK_STATUS) {
         if (pv_block_hook(ctx, hook, rd, rs1, rs2)) return;
+    }
+    if (hook == PV_HOOK_TENSOR_MATVECPINNED ||
+        hook == PV_HOOK_TENSOR_SELECTEDBACKEND) {
+        if (pv_tensor_hook && pv_tensor_hook(ctx, hook, rd, rs1, rs2)) return;
+        ctx->regs[rd] = -4; /* explicit selection requires an admitted native host */
+        return;
     }
     if (hook >= PV_HOOK_TENSOR_SETSHAPE && hook <= PV_HOOK_TENSOR_HASACCEL) {
         if (pv_tensor_hook && pv_tensor_hook(ctx, hook, rd, rs1, rs2)) return;

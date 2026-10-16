@@ -18,6 +18,7 @@ struct b50_native_diag {
     u32 prep_framework_reason;
     u32 boot_state;
     u32 boot_framework_reason;
+    u32 validation_failure_stage;
     u64 ggtt_expected;
     u64 ggtt_actual;
 };
@@ -33,7 +34,10 @@ struct b50_native_boot_diag {
     u32 wopcm_size_expected;
     u32 wopcm_offset_raw;
     u32 wopcm_offset_expected;
-    u32 reserved[6];
+    u32 reset_raw;
+    u32 reset_status;
+    u32 reset_lateness_ms;
+    u32 reserved[3];
 };
 void b50_native_boot_diag(struct b50_native_boot_diag *out);
 struct b50_native_ct_diag {
@@ -72,6 +76,8 @@ struct b50_native_submit_diag {
     u32 engine_context_control;
     u32 engine_acthd;
     u32 engine_ipehr;
+    u32 engine_ptbp_lo;
+    u32 engine_ptbp_hi;
 };
 void b50_native_submit_diag(struct b50_native_submit_diag *out);
 
@@ -103,3 +109,4 @@ void b50_native_submit_diag(struct b50_native_submit_diag *out);
 #define B50_NATIVE_CT        12U
 #define B50_NATIVE_CONTEXT   13U
 #define B50_NATIVE_SUBMIT    14U
+#define B50_NATIVE_VM_CONTEXT 15U

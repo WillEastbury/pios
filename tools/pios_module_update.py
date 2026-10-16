@@ -47,8 +47,10 @@ def main() -> int:
     if len(image) < HEADER.size:
         raise SystemExit("short PMOD image")
     fields = HEADER.unpack_from(image)
-    if fields[0] != MAGIC or fields[2] != HEADER.size:
+    if fields[0] != MAGIC or fields[1] != 2 or fields[2] != HEADER.size:
         raise SystemExit("invalid PMOD header")
+    if len(image) != HEADER.size + fields[8] + 64:
+        raise SystemExit("invalid signed PMOD length")
     total = len(image)
     print(request(args.host, args.port, "begin", total=total))
     offset = 0

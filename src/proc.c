@@ -1,6 +1,7 @@
 /* proc.c - Cooperative process manager for user cores (2-3) */
 
 #include "proc.h"
+#include "ipc_model_broker.h"
 #include "core.h"
 #include "core_env.h"
 #include "walfs.h"
@@ -3958,6 +3959,14 @@ static bool proc_buffer_range_in_slot(u32 slot, u64 ptr, u32 len)
     return ptr >= base && end >= ptr && end <= base + PROC_SLOT_SIZE;
 }
 
+/* Kernel-only .bss: map_user_kernel_low mirrors this NC, EL1-only mapping.
+ * Do not move into an EL0 heap or the WB process-owner control allocation. */
+static struct {
+    struct ipc_model_broker broker;
+    struct ipc_model_cursor initialized; /* Core 0 control context only. */
+} process_models ALIGNED(64);
+_Static_assert(__alignof__(process_models) >= 64, "model broker isolation");
+
 static void proc_buffer_ref_refresh(volatile void *p, u64 len)
 {
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
@@ -3967,6 +3976,65 @@ static void proc_buffer_ref_refresh(volatile void *p, u64 len)
     (void)len;
     dmb_ish();
 #endif
+}
+
+static u32 model_broker_core(void *opaque)
+{
+    (void)opaque;
+    return core_id();
+}
+
+static bool model_process_snapshot(void *opaque, u32 slot,
+                                   struct ipc_model_process *out)
+{
+    (void)opaque;
+    if (!initialized || !proc_owners || slot >= MAX_PROCS_PER_CORE)
+        return false;
+    proc_diag_refresh_slot(slot);
+    const struct process *p = &procs[slot];
+    u64 token = __atomic_load_n(&proc_owner_record(p)->token, __ATOMIC_ACQUIRE);
+    u32 owner = (u32)token;
+    if (owner < CORE_USERM || owner > CORE_USER1)
+        return false; /* Includes migration's locked owner token. */
+    struct ipc_model_process snap = {
+        .slot=slot, .pid=p->pid, .generation=p->generation, .core=owner,
+        .live=p->state == PROC_READY || p->state == PROC_RUNNING ||
+              p->state == PROC_BLOCKED,
+        /* No owner-routed stop/ack command exists for model admission yet.
+         * BLOCKED can wake concurrently; DEAD can already be recycling. */
+        .quiescent=false};
+    dmb_ish();
+    proc_diag_refresh_slot(slot);
+    if ((u32)(token >> 32) != snap.generation ||
+        __atomic_load_n(&proc_owner_record(p)->token, __ATOMIC_ACQUIRE) != token ||
+        p->pid != snap.pid || p->generation != snap.generation)
+        return false;
+    *out = snap;
+    return true;
+}
+
+i32 ipc_model_process_start(u32 vm_slot, u32 process_slot, u32 pid,
+                           u32 generation, u32 owner_core,
+                           struct ipc_model_vm *out)
+{
+    if (core_id() != CORE_NET) return IPC_MODEL_ERR_OWNER;
+    extern char __bss_start[], __bss_end[];
+    u64 address = (u64)(usize)&process_models;
+    if (address < (u64)(usize)__bss_start ||
+        address > (u64)(usize)__bss_end ||
+        sizeof(process_models) > (u64)(usize)__bss_end - address ||
+        !mmu_active_nc_range_valid(address, sizeof(process_models)))
+        return IPC_MODEL_ERR_PHASE;
+    if (!process_models.initialized.sequence) {
+        ipc_model_init(&process_models.broker.registry);
+        process_models.initialized.sequence = 1;
+    }
+    const struct ipc_model_broker_ops ops = {
+        .core=model_broker_core, .snapshot=model_process_snapshot};
+    const struct ipc_model_process process = {
+        .slot=process_slot, .pid=pid, .generation=generation, .core=owner_core};
+    return ipc_model_broker_start(&process_models.broker, &ops, NULL, vm_slot,
+                                  &process, out);
 }
 
 bool proc_buffer_ref_acquire(u32 core, u64 ptr, u32 len,

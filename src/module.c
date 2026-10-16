@@ -9,6 +9,8 @@
 #include "simd.h"
 #include "timer.h"
 #include "core.h"
+#include "ed25519.h"
+#include "module_trust.h"
 
 extern const u8 module_proof_v1_start[];
 extern const u8 module_proof_v1_end[];
@@ -176,11 +178,13 @@ void module_init(void)
 #endif
 }
 
-bool module_stage_image(const u8 *image, u32 image_bytes)
+static bool module_stage_image_checked(const u8 *image, u32 image_bytes,
+                                        bool built_in)
 {
 #if !PIOS_HAS_HOT_MODULES
     (void)image;
     (void)image_bytes;
+    (void)built_in;
     return false;
 #else
     if (core_id() != CORE_NET || !image ||
@@ -196,9 +200,29 @@ bool module_stage_image(const u8 *image, u32 image_bytes)
         header->code_bytes == 0U ||
         header->code_bytes > MODULE_SLOT_BYTES ||
         header->entry_offset >= header->code_bytes ||
+        (header->entry_offset & 3U) != 0U ||
+        header->arena_schema == 0U ||
+        header->artifact_generation == 0U ||
         header->header_bytes > image_bytes ||
         header->code_bytes > image_bytes - header->header_bytes ||
         (header->capabilities & ~allowed_caps[header->module_id]))
+        return false;
+    u32 signed_bytes = header->header_bytes + header->code_bytes;
+    if (built_in) {
+        if (image_bytes != signed_bytes ||
+            header->module_id != MODULE_ID_PROOF)
+            return false;
+    } else {
+        if (image_bytes - signed_bytes != MODULE_SIGNATURE_BYTES ||
+            !ed25519_verify(image + signed_bytes, image, signed_bytes,
+                            module_signing_public_key))
+            return false;
+    }
+    /* These implementations still hold state/callbacks in linked storage.
+     * Do not grant replacement authority until their arena handoff exists. */
+    if (header->module_id == MODULE_ID_B50 ||
+        (header->module_id == MODULE_ID_TENSOR &&
+         (header->arena_schema != 2U || header->capabilities != 0U)))
         return false;
     u8 digest[32];
     sha256(image + header->header_bytes, header->code_bytes, digest);
@@ -231,6 +255,7 @@ bool module_stage_image(const u8 *image, u32 image_bytes)
         slot_poison(header->module_id, slot);
         return false;
     }
+
     struct module_slot *record = &module_slots[header->module_id][slot];
     record->state = MODULE_SLOT_STAGED;
     record->artifact_generation = header->artifact_generation;
@@ -242,6 +267,11 @@ bool module_stage_image(const u8 *image, u32 image_bytes)
     control->staged_slot = slot;
     return true;
 #endif
+}
+
+bool module_stage_image(const u8 *image, u32 image_bytes)
+{
+    return module_stage_image_checked(image, image_bytes, false);
 }
 
 static bool publish_slot(u32 module_id, u32 slot, bool rollback)
@@ -260,12 +290,20 @@ static bool publish_slot(u32 module_id, u32 slot, bool rollback)
     control->switching = 1U;
     dmb();
     u32 old_slot = control->active_slot;
+    if (old_slot < 2U &&
+        slot_has_callers(module_id,
+                         module_slots[module_id][old_slot].dispatch_epoch)) {
+        control->switching = 0U;
+        return false;
+    }
     if (old_slot < 2U) {
         module_entry_fn old =
             (module_entry_fn)(usize)module_slots[module_id][old_slot].entry;
-        if (old)
-            (void)old(MODULE_OP_QUIESCE, 0U, 0U, arena_base(module_id),
-                      &services);
+        if (old && old(MODULE_OP_QUIESCE, 0U, 0U, arena_base(module_id),
+                       &services) != 0U) {
+            control->switching = 0U;
+            return false;
+        }
     }
     module_entry_fn entry = (module_entry_fn)(usize)next->entry;
     if (entry(MODULE_OP_ADOPT, 0U, 0U, arena_base(module_id), &services) !=
@@ -326,10 +364,16 @@ bool module_rollback(u32 module_id)
     dmb();
     u32 active = control->active_slot;
     struct module_slot *record = &module_slots[module_id][active];
+    if (slot_has_callers(module_id, record->dispatch_epoch)) {
+        control->switching = 0U;
+        return false;
+    }
     module_entry_fn entry = (module_entry_fn)(usize)record->entry;
-    if (entry)
-        (void)entry(MODULE_OP_QUIESCE, 0U, 0U, arena_base(module_id),
-                    &services);
+    if (entry && entry(MODULE_OP_QUIESCE, 0U, 0U, arena_base(module_id),
+                       &services) != 0U) {
+        control->switching = 0U;
+        return false;
+    }
     u64 epoch = control->dispatch_epoch + 1U;
     if (!epoch)
         epoch = 1U;
@@ -475,14 +519,14 @@ static bool run_proof(void)
     u32 bytes;
     if (!proof_image(module_proof_v1_start, module_proof_v1_end,
                      1U, image, sizeof(image), &bytes) ||
-        !module_stage_image(image, bytes) ||
+        !module_stage_image_checked(image, bytes, true) ||
         !module_activate(MODULE_ID_PROOF) ||
         module_dispatch_call(MODULE_ID_PROOF, MODULE_OP_CALL,
                              10U, 0U, NULL) != 11U)
         return false;
     if (!proof_image(module_proof_v2_start, module_proof_v2_end,
                      2U, image, sizeof(image), &bytes) ||
-        !module_stage_image(image, bytes) ||
+        !module_stage_image_checked(image, bytes, true) ||
         !module_activate(MODULE_ID_PROOF) ||
         module_dispatch_call(MODULE_ID_PROOF, MODULE_OP_CALL,
                              10U, 0U, NULL) != 1012U)

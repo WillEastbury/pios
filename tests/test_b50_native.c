@@ -3,6 +3,14 @@
 #include <string.h>
 #include "types.h"
 #include "b50_native.h"
+#include "module.h"
+
+u64 module_dispatch_call(u32 module_id, u32 op, u64 a0, u64 a1,
+                         module_fallback_fn fallback)
+{
+    assert(module_id == MODULE_ID_B50);
+    return fallback(op, a0, a1);
+}
 #include "pcie1.h"
 #include "lzero.h"
 #include "airq.h"
@@ -274,10 +282,15 @@ int main(void) {
     gmd_reads = 0U;
     gen3 = false;
     contains(B50_NATIVE_ATTACH, "quarantined");
+    struct b50_native_diag validation_snapshot;
+    b50_native_diag(&validation_snapshot);
+    assert(validation_snapshot.validation_failure_stage == 40U);
     assert(!(commands[5][0] & 4U));
     gen3 = true;
     nc = false;
     contains(B50_NATIVE_ATTACH, "quarantined");
+    b50_native_diag(&validation_snapshot);
+    assert(validation_snapshot.validation_failure_stage == 80U);
     assert(!gmd_reads);
     assert(!b50_native_blocks_legacy());
     nc = true;
@@ -374,7 +387,14 @@ int main(void) {
     submitted_done = false;
     contains(B50_NATIVE_BOOT, "reset+DMA+ready proof scheduled");
     assert(submitted_step);
+    bool delayed_reset_observation = false;
     for (;;) {
+        struct b50_native_boot_diag boot_snapshot;
+        b50_native_boot_diag(&boot_snapshot);
+        if (!delayed_reset_observation && boot_snapshot.state == 3U) {
+            clock_ms += 8U;
+            delayed_reset_observation = true;
+        }
         u32 result = submitted_step(submitted_ctx, clock_ms + 1U);
         clock_ms++;
         if (result == ADRV_STEP_PROGRESS || result == ADRV_STEP_IDLE)
@@ -385,6 +405,7 @@ int main(void) {
     submitted_reason = ADRV_REASON_DONE;
     submitted_done = true;
     b50_native_service();
+    assert(delayed_reset_observation);
     contains(B50_NATIVE_STATUS, "GuC v70.72.1 READY");
     contains(B50_NATIVE_CANARY, "CT/submission queue");
     assert(bme_writes == 5U);

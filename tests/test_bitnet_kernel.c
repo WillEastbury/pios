@@ -1,4 +1,8 @@
 #include "bitnet_kernel.h"
+#ifdef TEST_TENSOR_PMOD
+#include "tensor_module.h"
+u64 module_entry(u32, u64, u64, void *, const struct module_services *);
+#endif
 
 #include <stdio.h>
 
@@ -86,6 +90,27 @@ int main(void)
                 return 1;
             }
         }
+#ifdef TEST_TENSOR_PMOD
+        struct module_services services = {.abi_version = MODULE_ABI_VERSION};
+        struct tensor_module_matvec call = {
+            .packed = packed, .activation = i2_activation, .output = got,
+            .packed_bytes = sizeof(packed), .rows = I2_ROWS, .cols = I2_COLS,
+            .activation_count = I2_COLS, .output_count = I2_ROWS
+        };
+        if (module_entry(MODULE_OP_VALIDATE, 0U, 0U, NULL, &services) !=
+                MODULE_VALIDATE_TOKEN ||
+            module_entry(TENSOR_MODULE_MATVEC_I2S, (u64)(usize)&call,
+                         0U, NULL, &services) != 1U)
+            return 1;
+        for (u32 row = 0U; row < I2_ROWS; row++) {
+            i32 expected = 0;
+            for (u32 col = 0U; col < I2_COLS; col++)
+                expected += i2_weights[row * I2_COLS + col] *
+                            i2_activation[col];
+            if (got[row] != expected)
+                return 1;
+        }
+#endif
         float input[4] = {-2.0f, -0.5f, 0.5f, 2.0f};
         i8 quantized[4];
         float scale = 0.0f;

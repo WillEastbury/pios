@@ -42,6 +42,8 @@ import re
 import sys
 import textwrap
 from pathlib import Path
+from pios_model_hooks import extend as extend_model_hooks
+from pios_tensor_hooks import extend as extend_tensor_hooks
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -139,10 +141,10 @@ def inject_before_body_close(html: bytes, snippet: bytes) -> bytes:
 
 
 def main() -> int:
-    portal_html = read_required(PICOSCRIPT_DOCS / "index.html")
+    portal_html = extend_tensor_hooks(extend_model_hooks(read_required(PICOSCRIPT_DOCS / "index.html")))
     bridge_js = read_required(SCRIPT_DIR / "ide_server_bridge.js")
     picowal_html = read_required(SCRIPT_DIR / "ide_picowal_workspace.html")
-    pico_hooks_js = read_required(PICOSCRIPT_VM / "pico_hooks.js")
+    pico_hooks_js = extend_tensor_hooks(extend_model_hooks(read_required(PICOSCRIPT_VM / "pico_hooks.js")))
     baremetal_binary_js = read_required(BAREMETALJSTOOLS_SRC / "BareMetal.Binary.js")
 
     ide_html = inject_before_body_close(

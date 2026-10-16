@@ -9,8 +9,10 @@
  */
 
 #include "tensor.h"
+#include "tensor_service.h"
 #include "bitnet_pi5_fixture.h"
 #include "bitnet_kernel.h"
+#include "tensor_module.h"
 #include "core.h"
 #include "gpu.h"
 #include "v3d.h"
@@ -448,8 +450,8 @@ done:
     return ok;
 }
 
-static bool tensor_qpu_matvec_i8_batch(const u8 *matrix, const u8 *vector,
-                                       u32 rows, u32 cols, i32 *out)
+static bool tensor_qpu_matvec_i8_batch_mode(const u8 *matrix, const u8 *vector,
+                                       u32 rows, u32 cols, i32 *out, bool strict)
 {
     tensor_t tile = {0};
     tensor_t vec = {0};
@@ -459,7 +461,7 @@ static bool tensor_qpu_matvec_i8_batch(const u8 *matrix, const u8 *vector,
     if (!matrix || !vector || !out || rows == 0U || rows > 64U ||
         cols == 0U || cols > TENSOR_V3D_VEC_MAX_ELEMS || (cols & 15U) != 0U)
         return false;
-    if ((cols & 63U) == 0U &&
+    if (!strict && (cols & 63U) == 0U &&
         tensor_qpu_matvec_i8_fused64(matrix, vector, rows, cols, out))
         return true;
     if (!tensor_alloc(&tile, rows, 16U, sizeof(float)) ||
@@ -501,7 +503,7 @@ static bool tensor_qpu_matvec_i8_batch(const u8 *matrix, const u8 *vector,
         }
         bool tile_ok = false;
         bool dispatched = false;
-        for (u32 attempt = 0; attempt < 8U; attempt++) {
+        for (u32 attempt = 0; attempt < (strict ? 1U : 8U); attempt++) {
             simd_zero(pf, partial.total_bytes);
             for (u32 row = 0; row < rows; row++)
                 pf[row] = -123.5f;
@@ -560,6 +562,12 @@ done:
     tensor_free(&vec);
     tensor_free(&partial);
     return ok;
+}
+
+static bool tensor_qpu_matvec_i8_batch(const u8 *matrix, const u8 *vector,
+                                       u32 rows, u32 cols, i32 *out)
+{
+    return tensor_qpu_matvec_i8_batch_mode(matrix, vector, rows, cols, out, false);
 }
 
 static bool tensor_qpu_gray_xor(const u8 *src, const u8 *pred, u8 *dst, u32 bytes)
@@ -752,6 +760,26 @@ bool tensor_matvec_batch_selftest(u32 rows)
     return true;
 }
 
+static struct tensor_service kernel_tensor_service ALIGNED(64);
+
+static bool tensor_service_cpu(const i8 *a, const i8 *x,
+                               u32 rows, u32 cols, i32 *out)
+{
+    for (u32 r = 0; r < rows; r++)
+        out[r] = tensor_neon_dot_i8(a + r * cols, x, cols);
+    return true;
+}
+
+static bool tensor_service_qpu(const i8 *a, const i8 *x,
+                               u32 rows, u32 cols, i32 *out)
+{
+    bool ok = tensor_qpu_matvec_i8_batch_mode((const u8 *)a, (const u8 *)x,
+                                             rows, cols, out, true);
+    if (ok)
+        picovm_qpu_ops++;
+    return ok;
+}
+
 static int tensor_picovm_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
 {
     if (!ctx || rd < 0 || rd >= PV_NUM_REGS ||
@@ -759,6 +787,39 @@ static int tensor_picovm_hook(pv_ctx *ctx, int hook, int rd, int rs1, int rs2)
         return 0;
     if (hook == PV_HOOK_TENSOR_HASACCEL) {
         ctx->regs[rd] = picovm_qpu_ready ? 1 : 0;
+        return 1;
+    }
+    if (hook == PV_HOOK_TENSOR_SELECTEDBACKEND) {
+        ctx->regs[rd] = ts_vm_selected(ctx, ctx->regs[rs1]);
+        return 1;
+    }
+    if (hook == PV_HOOK_TENSOR_MATVECPINNED ||
+        (hook == PV_HOOK_TENSOR_MATVECI8 &&
+        ctx->tensor_rows > 0 && ctx->tensor_rows <= (i32)TS_ROWS &&
+        ctx->tensor_cols > 0 && ctx->tensor_cols <= (i32)TS_COLS)) {
+        /* The global kernel hook is not installed in EL0 VM hosts.
+         * No cross-core queue or lease authority is inferred from a VM span. */
+        if (core_id() != CORE_NET) {
+            ctx->regs[rd] = TS_OWNER;
+            return 1;
+        }
+        struct tensor_service *s = &kernel_tensor_service;
+        if (!s->backends[TS_CPU - 1U].live)
+            ts_register(s, TS_CPU, tensor_service_cpu, TS_I8_I32,
+                        TS_ROWS, TS_COLS, 1U);
+        const struct v3d_kernel_desc *desc =
+            v3d_kernel_desc_get(V3D_KERNEL_MATVEC16);
+        bool ready = picovm_qpu_ready && desc && desc->verified;
+        if (ready && !s->backends[TS_QPU - 1U].live)
+            ts_register(s, TS_QPU, tensor_service_qpu, TS_I8_I32,
+                        TS_ROWS, 16U, 16U);
+        if (!ready && s->backends[TS_QPU - 1U].live)
+            ts_retire(s, TS_QPU);
+        u32 pin = picovm_force_qpu_int8 ? TS_QPU :
+            (picovm_prefer_qpu_int8 ? TS_AUTO : TS_CPU);
+        ctx->regs[rd] = hook == PV_HOOK_TENSOR_MATVECPINNED
+            ? ts_vm_pinned(s, ctx, ctx->regs[rs1], (u32)ctx->regs[rs2])
+            : ts_vm_matvec(s, ctx, pin, ctx->regs[rs1], ctx->regs[rs2]);
         return 1;
     }
     if (!picovm_qpu_ready ||
@@ -1148,12 +1209,18 @@ static int tensor_picovm_bitlinear_hook(pv_ctx *ctx, int hook,
         u32 row_tile_bytes = cols * BITNET_I2S_TILE_ROWS / 4U;
         i32 sums[BITNET_I2S_TILE_ROWS];
         for (u32 row = 0U; row < rows; row += BITNET_I2S_TILE_ROWS) {
-            if (!bitnet_i2s_matvec_i32(
-                    ctx->mem + wp + (row / BITNET_I2S_TILE_ROWS) *
-                                    row_tile_bytes,
-                    row_tile_bytes, BITNET_I2S_TILE_ROWS, cols,
-                    (const i8 *)(ctx->mem + vp), (u32)vn,
-                    sums, BITNET_I2S_TILE_ROWS)) {
+            struct tensor_module_matvec call = {
+                .packed = ctx->mem + wp +
+                    (row / BITNET_I2S_TILE_ROWS) * row_tile_bytes,
+                .activation = (const i8 *)(ctx->mem + vp),
+                .output = sums,
+                .packed_bytes = row_tile_bytes,
+                .rows = BITNET_I2S_TILE_ROWS,
+                .cols = cols,
+                .activation_count = (u32)vn,
+                .output_count = BITNET_I2S_TILE_ROWS
+            };
+            if (!tensor_module_matvec_i2s(&call)) {
                 ctx->regs[rd] = 0;
                 return 1;
             }

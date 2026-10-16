@@ -8,7 +8,7 @@ import pathlib
 import struct
 
 MAGIC = 0x504D4F44
-VERSION = 1
+VERSION = 2
 ABI = 1
 HEADER = struct.Struct("<IHH7I32s")
 SLOT_BYTES = 0x40000
@@ -23,6 +23,7 @@ def main() -> int:
     ap.add_argument("--arena-schema", type=int, required=True)
     ap.add_argument("--capabilities", type=lambda x: int(x, 0), default=0)
     ap.add_argument("--entry-offset", type=lambda x: int(x, 0), default=0)
+    ap.add_argument("--signing-key", type=pathlib.Path, required=True)
     args = ap.parse_args()
     code = args.code.read_bytes()
     if not code or len(code) > SLOT_BYTES:
@@ -38,7 +39,14 @@ def main() -> int:
         args.arena_schema, args.capabilities, args.generation,
         len(code), args.entry_offset, hashlib.sha256(code).digest()
     )
-    args.out.write_bytes(header + code)
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    key = serialization.load_pem_private_key(
+        args.signing_key.read_bytes(), password=None)
+    if not isinstance(key, Ed25519PrivateKey):
+        raise SystemExit("signing-key must be an Ed25519 private key")
+    signed = header + code
+    args.out.write_bytes(signed + key.sign(signed))
     print(f"PMOD module={args.module_id} generation={args.generation} "
           f"schema={args.arena_schema} code={len(code)} bytes "
           f"sha256={hashlib.sha256(code).hexdigest()}")

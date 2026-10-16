@@ -2,6 +2,13 @@
 
 ## Overview
 
+For the approved OS-managed PicoScript offload design and the current
+request-scoped CPU/QPU adapter, see [tensor selection](tensor_selection.md)
+and [ADR-089](architecture_decision_log.md#adr-089--harmonized-picoscript-tensor-offload).
+The native APIs and legacy V3D paths described below are distinct from that
+production descriptor lifecycle; they do not establish EL0 DMA authority or
+Intel Xe2/XMX readiness.
+
 PIOS provides NEON-accelerated tensor operations with a V3D/QPU dispatch framework.
 
 By default, operations run on the ARM Cortex-A76 using 128-bit NEON SIMD (4 floats per instruction, dual-issue capable). Tensor ops only attempt V3D dispatch when a kernel descriptor is bound and marked ready; otherwise they stay on deterministic NEON fallback paths.

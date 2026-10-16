@@ -2,6 +2,34 @@
 
 Every significant architectural decision in PIOS is recorded here.
 
+## 2026-10-16 — Owner-requested narrow ModelFifo process identity admission
+
+The owner requested a core-0 trusted process-generation broker, with safe
+fail-closed helpers preferred over speculative lifecycle wiring. Added exact
+VM-to-process slot/PID/generation/owner validation, quiescent attach and
+busy-preserving retirement. Kernel-private `.bss` storage is checked against
+existing Normal-NC mappings; no EL0 registry mapping or new cross-core format
+is introduced. Production admission reports PHASE until an owner-routed
+stop/ack-before-recycle protocol exists. Rejected: treating BLOCKED/DEAD as
+quiescence, invoking the core-0 manager from user-core exit, and attaching
+kernel callbacks to an EL0 scratch VM. Existing process lifecycle is unchanged.
+See `docs/internal_model_fifos.md` for exact remaining limitations.
+
+## 2026-10-11 — Owner-approved internal model FIFO VM binding
+
+The owner explicitly approved callable internal batched model/shard routing
+across VMs and compiler lowering. `ModelFifo.*` extends the shipped compiler and
+real C VM via a per-instance trusted host adapter over the existing `ipc_model`
+engine, preserving admitted VM/model/lane generations, SPSC producer provenance,
+immutable span authority, bounded prefix batches, explicit status/ack and
+sequence-backed publication/credit notifications. Local integer `Queue.*` and
+`Fifo.*` defaults are unchanged. Rejected: raw pointer handoff, shared global VM
+identity, multi-producer SPSC reuse, and fabricated CPU/GPU inference success.
+The verified host adapter uses the existing lease registry; live all-process
+admission, MMU grant/revoke and scheduler wake attachment remain inactive.
+See `docs/internal_model_fifos.md` for the exact callable API and remaining
+production boundary.
+
 ## Governance
 
 > **The repository owner decides architecture. An agent MUST ASK before making
@@ -3019,6 +3047,243 @@ published at epoch 5 without reboot. Kernel version stayed
 error/RX-wedge counters remained zero. Endpoint rollback restored generation
 1 at epoch 6, again without reboot.
 
+**Real B50/tensor extraction gate (2026-10-09).** The owner approved fixing
+loader contracts before extracting these implementations, with initial
+replacement restricted to detached/BME-off devices. The initial B50 dispatch
+operations 1/2/3 collided with ADOPT/QUIESCE/CLEANUP; they now use application
+operations 16/17/18. Publication refuses outstanding calls or a failed
+quiesce. Manifest lengths must match exactly, entry offsets must be
+instruction-aligned, and schema/generation must be nonzero.
+
+**Bounded CCS proof harness (2026-10-10).** After guarded native setup and
+successful context registration, run
+`python tools\pios_b50_submit_probe.py --log <new-jsonl-path>`.
+The harness refuses absent GPUs, unhealthy management, and previously submitted
+contexts. It issues one submission, checks exact result `42` and completion
+`FEED0001` within five seconds, preserves the engine diagnostics in JSONL, and
+revokes native authority on exit after a submission attempt. A timeout or accepted
+GuC request alone is never reported as GPU execution. The callback/snapshot kernel
+`v20261010.105052` passed live selftests and QEMU regression, but its OTA reboot
+left only the PEX switch functions visible; external-domain recovery is required
+before the live CCS proof can proceed.
+
+**Store-probe command separation (2026-10-10).** The next probe follows the
+pinned Xe ring/batch distinction: the ring issues a GGTT
+`MI_BATCH_BUFFER_START`, a separate batch writes `42` and ends with
+`MI_BATCH_BUFFER_END`, and the resumed ring writes `FEED0001` then performs an
+arbitration check. Previously the batch-end instruction was placed directly
+in the ring. A dedicated probe page at LRC allocation offset `0x9000` extends
+the allocation to `0xA000`, still below the separate result page at queue
+offset `0x170000`. Bounds reject GGTT wrap, unaligned backing memory, and
+outputs overlapping the allocation or each other. This is a narrow
+command-streamer probe, not the full Xe compute prologue or an EU shader.
+Physical execution remains unproven.
+
+**GuC reset deadline/cadence correction (2026-10-10).** Live reset evidence
+on `v20261010.110559` showed `GDRST=0`, `GUC_STATUS=1` (reset completed),
+but the first scheduled observation was three milliseconds past the former
+five-millisecond deadline. The asynchronous reset timeout is now 50 ms,
+matching the existing forcewake wait envelope and leaving the 1 ms per-step
+budget and 5 s total boot budget unchanged. This permits scheduled observation
+without blocking core 0; expiry still fails closed. This restores the intended
+bounded asynchronous boot, not tolerance of an overrunning step.
+
+**Forcewake-scoped CCS probe (2026-10-10).** The corrected reset reached
+GuC READY live, and context registration succeeded, but the ring/batch probe
+returned no stores with eight zero engine-register samples. Those samples
+were taken after the earlier forcewake proof had released its domains.
+The next probe asynchronously acquires and acknowledges GT plus Render
+forcewake before enabling submission and retains them through the timeout
+snapshot. Acquisition remains bounded at 50 ms with no busy wait. Success
+releases both domains; failure uses the existing abort/quarantine release.
+Zero unacknowledged engine reads are not evidence that a context never ran.
+
+**Retained validation failure (2026-10-10).** An external-domain recovery
+restored three GPUs and passed native attachment, GGTT and ADS preparation,
+but a later command-time validation retired the lifecycle before GuC boot.
+A subsequent read-only validation passed, while discovery showed only two
+GPUs, so that later pass cannot explain the transient refusal. Native
+diagnostics now retain the failing validation stage when revoking authority.
+This telemetry does not relax any identity, link, AER or memory-attribute gate.
+
+The owner clarified that external rails were being reset in the background.
+Disappearing devices and transient validation/AER failures in that window
+cannot be attributed to spontaneous fabric instability. Hardware probes need
+a stable interval after the operator reports recovery complete.
+
+**CCS bootstrap engine enablement (2026-10-10).** A stable-window probe with
+acknowledged GT/Render forcewake still produced no stores and zero sampled
+engine state. Pinned Xe `xe_hw_engine.c` programs `RCU_MODE.CCS_ENABLE`,
+`GFX_MODE.DISABLE_LEGACY_MODE`, disables legacy HW status interrupt updates,
+and installs an engine HWS page. The next operator-only submission probe
+applies those controls under acknowledged forcewake, using the existing
+generation-owned LRC PPHWSP as its status page, and requires enable/HWS readback
+before any scheduling request. No boot-time GPU activation, IRQ enablement,
+or EU execution is introduced.
+
+**Live CCS execution proof (2026-10-10).** On `v20261010.144426`, after the
+owner's full power recovery, the selected B50 `05:00.0` passed mapping,
+GuC boot, CT and context registration. With guarded CCS engine enablement,
+the batch wrote `42` and the resumed ring wrote `FEED0001`; submission
+diagnostics reported state 5 and failure 0. The harness saved the complete
+trace to session artifact `b50-engine-enable-proof-20261010.jsonl`, revoked
+native authority, and confirmed detached status, root AER zero and live
+selftests 14/14. This proves physical command-streamer batch execution and
+return, not EU shader execution, W2A8 acceleration or PicoScript inference.
+The earlier all-zero engine snapshot is not a remaining execution blocker;
+it is only populated on failing submissions.
+
+**First compiled B50 W2A8 shader (2026-10-10).** `modules/b50_w2a8.cl`
+implements integer matvec directly over the existing Microsoft-layout packed
+weights, with one output row per work item. `build_shader_b50.bat` uses the
+installed Intel ocloc to compile specifically for PCI device `0xE212`
+(detected as `bmg-g21`), producing a Zebin and decoded ISA/dispatch metadata.
+Host execution of the same source matches the existing CPU oracle for
+16/32 rows and 32/64/128 columns, including signed activation extremes.
+This is not live GPU parity: the compiled kernel still needs reviewed
+stateless GPU address mappings, relocation handling, cross-thread/local-ID
+payload construction and Xe2 compute-walker/state programming. It must not
+be installed as an active tensor backend until those contracts are proven.
+
+`tools/extract_b50_shader.py` extracts 1280 bytes of native ISA and retains
+the two Intel cross-thread-offset relocations at code offsets `0x4C` and
+`0xE4`. It bounds ELF tables/sections/symbol references and refuses unknown
+relocation kinds/symbols instead of copying a Zebin container as executable
+code. Its manifest explicitly records `dispatch_ready=false`: relocation
+values depend on the still-unimplemented hardware payload layout.
+
+**Contained B50 PPGTT approved (2026-10-10).** The owner answered "DO IT"
+to the proposed dedicated generation-owned GPU address space. It may map
+only bounded shader/argument/weight/activation/output buffers in the existing
+contained DMA arena; other addresses fail closed, and quarantine destroys
+the address space after revoking DMA. CPU fallback and PicoScript-only model
+orchestration remain unchanged.
+
+`intel_bmg_vm` implements the initial four-level, 4 KiB system-memory table
+builder with a fixed 2 MiB GPU VA window. Its owner record is one aligned
+cache line. It validates entire ranges before writes, leaves unmapped entries
+invalid, uses PAT index 2 for contained NC payloads, rejects duplicate PA
+aliases/table-payload overlap, and requires matching owner/generation plus
+revoked DMA before poisoning tables and bumping generation. The builder is
+not yet connected to hardware: callers must prepare/map only while detached,
+publish with the driver barrier/TLB contract, and never mutate visible tables.
+GPU walker/context programming and live GPU mapping proof remain required.
+
+The detached LRC builder now supports binding an aligned system-memory
+root in Xe2 PTBP upper/lower fields (context DWORDs 49/51) and setting
+descriptor bit 8, which pinned Xe defines as PPGTT mode rather than a
+privilege grant. Binding refuses malformed templates or a previously bound
+root. Registration permits only the existing GGTT flags or those flags plus
+PPGTT mode; all other low descriptor bits remain rejected. This helper does
+not edit an active registered context or itself publish GPU page tables.
+
+Pinned Xe `xe_vm_pdp4_descriptor()` returns an encoded PDE, not a raw root
+address. Both intermediate table links and the PTBP root therefore carry
+present/RW plus PAT index 2 (`0x13`) for the contained NC table storage.
+Raw root addresses or default PAT-zero links do not meet this table-walk
+cacheability contract.
+
+The detached probe builder can replace the batch's result store with a
+bounded PPGTT virtual-address store while preserving the resumed ring's
+independent GGTT completion. This gives the next hardware test two distinct
+proofs: result `42` demonstrates GPU page-table translation, and
+`FEED0001` demonstrates batch return. It refuses an unbound root or output
+outside the fixed GPU VA window. Driver ownership checks must also prove the
+selected output page is writable and mapped before this probe is published.
+
+`b50 vmcontext` now selects the translation probe in place of `b50 context`
+for a fresh native lifecycle. It builds four table pages at queue offset
+`0x180000`, maps only the result page at GPU VA `0x10000000`, seals the VM,
+binds the root into the unregistered LRC and publishes after `dsb`.
+The ordinary `b50 context` GGTT proof is unchanged. Address-space mode cannot
+change after context construction starts; no active context/table editing is
+permitted. Quarantine resets GuC and revokes BME before poisoning tables,
+and explicitly reports unconfirmed retirement. This integration is pending
+cross-build and live translation proof.
+
+**First live PPGTT probe (2026-10-10).** `v20261010.151625` built and
+deployed, with QEMU 32/32 and live selftests 14/14. In a recovered stable
+rail window, GuC/context registration accepted the PPGTT descriptor. The
+resumed ring wrote `FEED0001`, but the PPGTT result remained zero rather
+than `42`. Thus command execution/return remains proven while translation
+is not. The bounded harness rejected the mismatch and revoked authority;
+post-probe detached status, root AER zero and selftests 14/14 were confirmed.
+Session artifact `b50-ppgtt-proof-20261010.jsonl` preserves the evidence.
+Do not activate the stateless tensor shader based on this partial result.
+
+The result-mismatch branch previously returned before capturing engine
+registers, so its zero snapshot fields were unpopulated rather than actual
+reads. Mismatch now uses the same pre-reset capture path as timeout and
+also retains PTBP upper/lower registers. The next live probe must use this
+capture before attributing the translation failure to root restoration.
+
+**BMG table-depth correction (2026-10-10).** The retained snapshot confirmed
+the expected root `0x1000F80013` was restored, ring head/tail reached 40
+bytes, and GGTT completion succeeded. Pinned Xe `bmg_desc` specifies
+`va_bits=48` but `vm_max_level=4`: BMG still requires five table levels,
+not the four assumed by the first builder. The builder now includes the
+extra root level and reserves five 4 KiB pages (`0x5000`), preserving the
+same bounded VA window and NC PAT class. Host traversal/layout tests pass;
+live translation must be re-proven before tensor dispatch.
+
+**Offline tensor dispatch preparation (2026-10-10).** With the boards
+offline during area power cuts, the owner requested advance development
+using explicit assumptions. `intel_bmg_tensor_plan` prepares page-separated
+packed weights, signed activations, int32 outputs and cross-thread payload
+within the existing 2 MiB GPU VA window. Shapes must be multiples of 16 rows
+and 32 columns, with at most 16384 columns; larger matrices need bounded
+tiles rather than wider mappings. That column bound keeps even decoded code
+zero (`-2`) times signed INT8 within int32 accumulation bounds.
+
+The payload builder emits exact little-endian argument offsets from the
+current compiled kernel metadata, uses zero global offsets/private base,
+and rejects altered plans before touching output. Assumptions: 16 work items
+per group, SIMD32, no private storage requirement, and a separate payload
+page. These are offline preparation only: the compiler metadata must be
+revalidated if the kernel is rebuilt with different options; inline payload
+splitting, local IDs, relocations, instruction/state heaps, compute walker,
+cache flush and completion still require implementation and live proof.
+The planner neither maps DMA nor advertises an active GPU backend.
+
+The shader build now checks the compiled metadata against the planner's
+reviewed GRF/SIMD, inline-data, group-size, argument-offset and local-ID
+contracts. Compiler output drift fails the build instead of silently
+generating payload bytes for a different ABI. This check does not set
+`dispatch_ready` or substitute for live dispatch verification.
+
+B50 and tensor PMOD activation is temporarily refused: their implementation
+state and asynchronous/IRQ callbacks still reside in linked storage, not a
+transferable stable module arena. Passthrough deployment did not prove actual
+implementation replacement. Full extraction and callback trampolines are
+required before lifting this gate. No live GuC/CT handoff is implied.
+
+The owner approved a new local Ed25519 module-signing key. Only its public
+trust root belongs in `include/module_trust.h`; the private key is stored
+outside the repository and is never sent to the board. Signature verification
+and authenticated PMOD packaging remain pending: existing PMOD SHA-256 checks
+prove integrity only, not publisher authorization.
+
+**Authenticated PMOD v2 and first real tensor module.** PMOD v2 appends a
+64-byte Ed25519 signature over the complete header and code. The kernel pins
+the owner's public key and verifies it before copying or executing uploaded
+code. Built-in proof blobs alone use a private trusted path. Live signed
+generation 3 activation and tampered-manifest rejection were proven on
+`v20261009.182155`.
+
+The stateless schema-2 tensor PMOD contains the actual Microsoft-compatible
+W2A8 integer matvec implementation from `bitnet_kernel.c`. It has no writable
+data, GOT or relocations. `BitLinear.MatVecI2S` dispatches this primitive
+through module ID 1 with the existing static implementation as fallback.
+This remains CPU tensor computation, not a claim of B50 inference; GPU
+selection is withheld until CCS command execution is proven.
+
+All eight B50 asynchronous phases now register static `adrv` trampolines,
+and AIRQ bottom-half registration uses a static dispatch trampoline. These
+enter module application operations 19-27; the hardware IRQ top half remains
+static and trigger-only. This removes persistent direct callback pointers
+from the operation/interrupt registries, but does not yet extract the linked
+implementation state or authorize B50 PMOD activation.
+
 During the first network passthrough deployment, the PMOD wrapper failed to
 preserve LR across its fallback `BLR`, trapping core 0 in the module return.
 The hardware watchdog rebooted the same kernel image, discarded volatile
@@ -3294,3 +3559,189 @@ controller; GPU-node software must request bounded domain sequencing rather
 than assuming a human operator. The one-gigabit switch is the initial
 east-west bandwidth ceiling for scheduling, sharding, replication and model
 distribution.
+
+### Offline B50 tensor PPGTT preparation (2026-10-10)
+
+Owner-requested implementation within the contained five-level BMG VM and
+existing tensor planner: canonical tensor plans can prepare and seal explicitly
+owned kernel-private core-0 Normal-NC tables against separate Normal-NC DMA
+backing. Packed weights/activation/arguments are RO and output alone is RW;
+unmapped entries remain invalid. Full validation precedes mutation; retirement
+requires matching owner/generation and proven DMA revocation. This is offline
+table preparation only, not GPU upload, submission, completion, or a new
+PicoScript hook. Hardware execution remains unproven and gated.
+
+### Offline fused PicoScript semantic reference (2026-10-11)
+
+Owner-requested runtime-first lowering contract: reusable private-span
+PicoScript functions implement bounded dense batched matmul, matvec, scaled
+LM head, stable top-k and causal QK/softmax/V attention. The tiny decoder
+composes the same attention source. `docs/fused_ops.md` specifies integer
+encoding, dimensions, ownership, operation budgets, statuses and future
+Xe2/XMX mapping. There is no new hook, activated backend, DMA contract or
+hardware claim. Float/NaN inputs, packed weights and production model
+execution remain outside this integer semantic reference.
+
+### ModelFifo host lifetime and failure ownership (2026-10-16)
+
+Owner explicitly approved fixing the production FIFO attachment contracts
+within the existing architecture. Implemented subset: a quiescent one-executor
+claim per VM generation; trusted persistent host admission separate from
+request scratch context; explicit unbind/rebind around scratch initialization;
+fallible finish/wake callbacks; bounded owner-side wake and export-cleanup
+continuations; descriptor retention until revocation succeeds; and refusal to
+retire attached endpoint authorities while descriptors or export cleanup remain.
+Native lease revocation now propagates actual MMU unmap failure.
+
+This does not authorize sharing writable EL0 admission metadata or treating
+VM-local Lease handles as kernel capabilities. No new aliases, memory
+attributes, scheduler ownership, timer ingress, GPU execution, or hardware
+enablement are introduced. Production process-generation admission, Normal-NC
+reservation, real page-table grant/revoke and EL0/owner command transport are
+still required; the offline adapter tests do not prove those integrations.
+
+## ADR-088 — OS-owned descriptor queues and arena IPC authority
+
+**Date:** 2026-10-16. **Decision:** repository owner.
+**Status:** approved direction; production integration pending.
+
+Implementation boundary (2026-10-16): `tensor_service` implements a trusted,
+same-core bounded I8-to-I32 matvec queue, invoked by the kernel PicoScript
+Tensor.MatVecI8 hook for explicit shapes up to 16x256. Input admission copies
+bounded local spans into private service storage; it does not mint arena lease
+authority. Backend registration records precision, dimensions, column alignment
+and generation. Exact pin rejects an absent/incompatible backend; auto chooses
+a compatible registered QPU or CPU/NEON before execution. Retirement invalidates
+queued backend generations. An execution failure is final, never retried on CPU
+after possible device effects. Completion storage remains owned until release.
+The production adapter admits QPU only after the existing MATVEC16 proof; Intel
+GPU compute is not registered (CCS store proof is not EU tensor validation).
+QPU admission is restricted to one 16-column tile, one dispatch with the
+existing 25ms hardware timeout, CPU-oracle checked. It bypasses the legacy fused
+attempt and cold retries; other compatible shapes select CPU under auto, or
+reject an exact QPU pin. This does not provide reactor millisecond admission.
+
+The live hook owns its private queue on core 0 and services at most four entries
+in its existing scheduled host call, not IRQ or scheduler context. This is a
+synchronous bounded superinstruction, not an asynchronous reactor job provider.
+Other-core use of this bounded kernel hook returns an explicit owner error.
+EL0 hosts do not receive this kernel hook; their existing local VM arithmetic
+is not an OS accelerator bridge. No cross-core commands, process endpoint
+stop/ack, exportable arena allocation, sticky-wake delivery, driver DMA grant or
+lease teardown is claimed by this subset. Those ADR-088 production integrations
+remain pending; the existing broker tests alone do not establish them.
+
+The OS substrate owns process IPC endpoint admission, FIFO allocation,
+process-generation binding, routing, wake/credit continuations and teardown.
+PicoScript request-context reset does not create or retire an OS endpoint.
+An EL0 capsule consumes and posts through OS-provided queues; it does not
+create a parallel cross-process transport or directly mutate queue authority.
+
+PicoScript uses OS-backed arena allocation/lease authority for exportable
+payloads. Reuse the existing lease/MMU and descriptor mechanisms rather than
+invent a second VM-private capability system. A VM-local span or integer
+handle is not itself cross-process authority: trusted admission resolves it
+to a live owner/generation, arena, offset, length, capacity and permissions.
+Only validated immutable descriptors cross the IPC boundary, never sender
+virtual pointers. The kernel validates the complete range and pins the
+allocation before publication. Receiver read access is bounded by the grant;
+the sender may not modify or recycle an in-flight immutable payload.
+
+OS-provided descriptor queues are the only capsule-facing IPC/device-I/O
+submission mechanism. DMA remains a privileged driver operation: a queued
+request does not grant EL0 bus-master, MMIO or unrestricted DMA authority.
+Drivers validate device capabilities and generation-owned DMA mappings before
+execution, and return explicit completions through the descriptor protocol.
+
+One producer owns each SPSC lane. Shared mappings retain identical attributes
+across aliases, with isolated control/payload cache lines. Publication and
+credit return carry sequences; a full notification path retains a bounded
+continuation, and the receiver's park protocol rechecks the sticky sequence.
+Remote scheduler changes remain owner-routed messages, not remote field writes.
+
+The OS retires endpoints before process-slot reuse: owner-core stop/ack,
+outstanding descriptor resolution, successful grant revocation, then poison
+and generation advance. Failed revocation retains authority and reports the
+failure. Exact arena allocation API, mapping granularity, queue ABI and
+stop/ack messages must be specified during implementation; this decision
+does not claim those production paths already exist.
+
+**Rejected:** per-request IPC identity, independent PicoScript-owned
+cross-process registries, raw pointer handoffs, arbitrary EL0 shared mappings,
+direct capsule DMA and freeing payloads after failed revocation.
+
+### 2026-10-16 — Request-scoped explicit tensor backend selection
+
+**Authority:** owner's explicit request for callable PicoScript pin/AUTO
+selection and selected-backend query, without shared selection state.
+The owner's clarification keeps placement as descriptor policy on a canonical
+tensor operation; backend modules do not define separate mathematical opcodes.
+
+`Tensor.MatVecPinned(request, policy)` uses a typed, bounded local VM TSM1
+request and returns a TSR1 result envelope queried by
+`Tensor.SelectedBackend(result)`. Native C owns computation and admission;
+PicoScript owns orchestration. Exact pins fail if unavailable; no retry after
+provider execution. Only existing CPU and verified QPU providers are eligible.
+Unsupported hosts deny rather than silently executing a CPU fallback.
+
+**Rejected:** global backend policy, extending the portable VM context ABI,
+changing the legacy two-operand MatVec or Async contracts, and advertising
+unproven B50/B60 readiness. This is a trusted same-core kernel service, not an
+EL0 or cross-core queue. See `tensor_selection.md` for the scoped format,
+statuses, and real compiler/VM fixture.
+The harmonized target is a defined acceleration module requesting PIOS GPU
+scheduling; PIOS retains location/capability/activity, DMA authority, EL0 arena
+access and transfer ownership. This local adapter does not implement that
+production broker or authorize Xe2/XMX module execution.
+
+## ADR-089 — Harmonized PicoScript tensor offload
+
+**Date:** 2026-10-16. **Decision:** repository owner.
+**Status:** approved design; production integration pending.
+
+**Context.** The owner requested one path from a PicoScript tensor operation
+on a span/descriptor to a defined Xe2 or XMX acceleration module, with PIOS
+owning location, capabilities, scheduling/activity, arena access and DMA.
+This extends ADR-088 rather than establishing a second IPC transport.
+
+**Decision.** Tensor operations retain canonical versioned semantics across
+backends. Requests specify shape, layout, dtype/quantization, numerical
+requirements and request-scoped placement. PIOS resolves VM-local references
+to OS-backed arena authority and validates generations, full ranges,
+permissions, aliasing, output exclusivity and budgets before admission.
+No cross-domain raw pointer or untrusted module selection grants authority.
+
+The OS owns queues, allocation pins, scheduling, accelerator identity and
+generation, transfers, DMA mappings and completion. Acceleration modules
+supply reviewed kernel implementations and execution requirements, not the
+right to grant device or memory access. Discovery and a generic Intel VGA
+label are not execution-readiness proofs.
+
+Automatic placement chooses only compatible verified implementations; QPU
+and CPU SIMD are valid alternatives only when they satisfy the same numerical
+contract. Exact pins fail explicitly if unavailable or incompatible.
+Preferred placement may permit admission-time fallback when explicitly
+requested; it is not implemented by the current local policy enum.
+
+The driver establishes bounded access and cache visibility before submission.
+Completion is accepted only for the matching request/accelerator generation;
+PIOS publishes output after visibility is proven and wakes the process through
+the owner-routed sequence protocol. Timeout/cancellation must not cause replay
+or output reuse until the device can no longer write. Failed revocation retains
+authority. Remote-host execution requires authorized transfers rather than
+sharing local DMA addresses; cluster protocol details remain unspecified.
+
+**Implementation boundary.** `tensor_service` and the TSM1/TSR1
+`Tensor.MatVecPinned` adapter currently provide a trusted same-core signed-I8
+MatVec subset with CPU/verified-QPU selection. They are not the production
+EL0 descriptor ABI, all-VM broker, distributed scheduler or Xe2/XMX execution
+path. The existing compiled Intel kernels and offline tests do not close the
+live GPU translation/dispatch/parity gates.
+
+**Rejected:** accelerator-specific mathematical APIs, global selection state,
+precision-changing silent fallback, arbitrary capsule DMA/MMIO, treating
+enumeration as readiness, and retrying on another backend while prior device
+writes may still occur.
+
+See [tensor_selection.md](tensor_selection.md) for lifecycle requirements,
+current hook formats, statuses and outstanding production work.

@@ -472,8 +472,15 @@ i32 lease_revoke(const struct lease_descriptor *d, u32 capsule)
     const struct lease_mmu_ops *ops = g_mmu_ops;
     kspin_unlock(lk);
 
-    if (ops && ops->unmap)
-        (void)ops->unmap(capsule, pa, length);
+    if (ops && ops->unmap) {
+        rc = ops->unmap(capsule, pa, length);
+        if (rc != LEASE_OK) {
+            kspin_lock(lk);
+            g_stats.mmu_rejects++;
+            kspin_unlock(lk);
+            return rc;
+        }
+    }
 
     kspin_lock(lk);
     g_stats.revokes++;

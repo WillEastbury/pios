@@ -2,7 +2,8 @@
 #include "types.h"
 
 #define MODULE_IMAGE_MAGIC          0x504D4F44U /* PMOD */
-#define MODULE_IMAGE_VERSION        1U
+#define MODULE_IMAGE_VERSION        2U
+#define MODULE_SIGNATURE_BYTES      64U
 #define MODULE_ABI_VERSION          1U
 #define MODULE_VALIDATE_TOKEN       0x4D4FU
 #define MODULE_MAX_IDENTITIES       8U

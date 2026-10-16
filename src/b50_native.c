@@ -29,11 +29,14 @@ void *b50_native_test_pointer(u64 addr);
 #include "intel_guc_ct.h"
 #include "intel_bmg_submit.h"
 #include "module.h"
+#include "intel_bmg_vm.h"
 
 /* All lifecycle mutation is core-0 scheduled context, never IRQ context. */
 #if PIOS_HAS_PCIE1
 static struct pcie1_bar_lease lease;
 static struct pcie1_containment containment;
+static struct intel_bmg_vm probe_vm ALIGNED(64);
+static u32 probe_vm_requested;
 static struct {
     struct pcie1_bar_lease_handle bar;
     struct pcie1_containment_endpoint_handle endpoint;
@@ -106,7 +109,7 @@ static struct {
     u32 mode_done;
     u8 _pad[24];
 } ALIGNED(64) submit_boot;
-static u32 submit_engine_diag[8] ALIGNED(64);
+static u32 submit_engine_diag[10] ALIGNED(64);
 static struct {
     u64 deadline;
     u32 handle;
@@ -136,6 +139,7 @@ static struct {
 #define B50_FORCEWAKE_RELEASE    0x00010000U
 #define B50_FORCEWAKE_ACK        0x00000001U
 #define B50_FORCEWAKE_TIMEOUT_MS 50U
+#define B50_GUC_RESET_TIMEOUT_MS 50U
 
 #define B50_FWK_IDLE             0U
 #define B50_FWK_WAIT_GT          1U
@@ -239,12 +243,16 @@ static struct {
 #define B50_CONTEXT_RESULT_OFFSET 0x00170000U
 #define B50_CONTEXT_COMPLETION_OFFSET 0x00170004U
 #define B50_CONTEXT_TIMEOUT_MS   500U
+#define B50_VM_TABLE_OFFSET      0x00180000U
 #define B50_SUBMIT_IDLE          0U
 #define B50_SUBMIT_ENABLE_SEND   1U
 #define B50_SUBMIT_ENABLE_WAIT   2U
 #define B50_SUBMIT_SCHED_SEND    3U
 #define B50_SUBMIT_WAIT          4U
 #define B50_SUBMIT_DONE          5U
+#define B50_SUBMIT_WAKE_REQUEST  6U
+#define B50_SUBMIT_WAKE_WAIT     7U
+#define B50_SUBMIT_ENGINE_INIT   8U
 #define B50_SUBMIT_TIMEOUT_MS    500U
 #define B50_GUC_SCHED_MODE_DONE  0x90001002U
 #define B50_CCS0_RING_TAIL       0x001A030U
@@ -255,6 +263,9 @@ static struct {
 #define B50_CCS0_ACTHD           0x001A074U
 #define B50_CCS0_HWS_PGA         0x001A080U
 #define B50_CCS0_CONTEXT_CONTROL 0x001A244U
+#define B50_CCS0_GFX_MODE        0x001A29CU
+#define B50_CCS0_HWSTAM          0x001A098U
+#define B50_RCU_MODE             0x0014800U
 
 #define B50_ROOT_MSI_INTID 256U
 static struct {
@@ -792,8 +803,34 @@ static u32 context_step(void *ctx, u64 deadline_ms)
                 PIOS_DMA_PCIE1_GUC_Q_SIZE - B50_CONTEXT_LRC_OFFSET,
                 lrc_ggtt, result_ggtt, completion_ggtt,
                 &context_boot.ring_tail) ||
-            !intel_bmg_lrc_descriptor(lrc_ggtt, &descriptor) ||
-            !intel_bmg_register_context_action(
+            !intel_bmg_lrc_descriptor(lrc_ggtt, &descriptor))
+            return ADRV_STEP_FAILED;
+        if (probe_vm_requested) {
+            u64 root;
+            u64 queue_dma = 0x1000000000ULL +
+                (PIOS_DMA_PCIE1_GUC_Q_BASE - PIOS_DMA_PCIE1_BASE);
+            if (!intel_bmg_vm_prepare(
+                    &probe_vm, (u64 *)(void *)(queue + B50_VM_TABLE_OFFSET),
+                    INTEL_BMG_VM_TABLE_BYTES,
+                    queue_dma + B50_VM_TABLE_OFFSET,
+                    queue_dma + B50_CONTEXT_RESULT_OFFSET, 4096U,
+                    82U, authority.bar.generation) ||
+                !intel_bmg_vm_map(&probe_vm, 82U, authority.bar.generation,
+                    INTEL_BMG_VM_WINDOW_BASE,
+                    queue_dma + B50_CONTEXT_RESULT_OFFSET, 4096U, true) ||
+                !intel_bmg_vm_seal(&probe_vm, 82U, authority.bar.generation,
+                                   &root) ||
+                !intel_bmg_lrc_bind_ppgtt(queue + B50_CONTEXT_LRC_OFFSET,
+                    PIOS_DMA_PCIE1_GUC_Q_SIZE - B50_CONTEXT_LRC_OFFSET,
+                    root, &descriptor) ||
+                !intel_bmg_lrc_ppgtt_store_probe(
+                    queue + B50_CONTEXT_LRC_OFFSET,
+                    PIOS_DMA_PCIE1_GUC_Q_SIZE - B50_CONTEXT_LRC_OFFSET,
+                    INTEL_BMG_VM_WINDOW_BASE))
+                return ADRV_STEP_FAILED;
+            dsb();
+        }
+        if (!intel_bmg_register_context_action(
                 B50_CONTEXT_GUC_ID, descriptor, action))
             return ADRV_STEP_FAILED;
         *(u32 *)(void *)(queue + B50_CONTEXT_RESULT_OFFSET) = 0U;
@@ -862,6 +899,38 @@ static u32 submit_step(void *ctx, u64 deadline_ms)
         context_boot.state != B50_CONTEXT_DONE || now > deadline_ms)
         return ADRV_STEP_FAILED;
     switch (submit_boot.state) {
+    case B50_SUBMIT_WAKE_REQUEST:
+        mmio_write(b50_mmio_addr(B50_FORCEWAKE_GT), B50_FORCEWAKE_REQUEST);
+        mmio_write(b50_mmio_addr(B50_FORCEWAKE_RENDER), B50_FORCEWAKE_REQUEST);
+        dsb();
+        submit_boot.deadline = now + B50_FORCEWAKE_TIMEOUT_MS;
+        submit_boot.state = B50_SUBMIT_WAKE_WAIT;
+        return ADRV_STEP_PROGRESS;
+    case B50_SUBMIT_WAKE_WAIT: {
+        u32 gt = mmio_read(b50_mmio_addr(B50_FORCEWAKE_ACK_GT));
+        u32 render = mmio_read(b50_mmio_addr(B50_FORCEWAKE_ACK_RENDER));
+        if (gt == ~0U || render == ~0U || now >= submit_boot.deadline)
+            return ADRV_STEP_FAILED;
+        if (!(gt & B50_FORCEWAKE_ACK) || !(render & B50_FORCEWAKE_ACK))
+            return ADRV_STEP_IDLE;
+        submit_boot.state = B50_SUBMIT_ENGINE_INIT;
+        return ADRV_STEP_PROGRESS;
+    }
+    case B50_SUBMIT_ENGINE_INIT: {
+        u32 hws = ct_ggtt(B50_CONTEXT_LRC_OFFSET) +
+                  INTEL_BMG_LRC_PPHWSP_OFFSET;
+        mmio_write(b50_mmio_addr(B50_RCU_MODE), 0x00010001U);
+        mmio_write(b50_mmio_addr(B50_CCS0_GFX_MODE), 0x00080008U);
+        mmio_write(b50_mmio_addr(B50_CCS0_HWSTAM), ~0U);
+        mmio_write(b50_mmio_addr(B50_CCS0_HWS_PGA), hws);
+        dsb();
+        if (!(mmio_read(b50_mmio_addr(B50_RCU_MODE)) & 1U) ||
+            !(mmio_read(b50_mmio_addr(B50_CCS0_GFX_MODE)) & 8U) ||
+            mmio_read(b50_mmio_addr(B50_CCS0_HWS_PGA)) != hws)
+            return ADRV_STEP_FAILED;
+        submit_boot.state = B50_SUBMIT_ENABLE_SEND;
+        return ADRV_STEP_PROGRESS;
+    }
     case B50_SUBMIT_ENABLE_SEND: {
         u32 action[3];
         intel_bmg_sched_enable_action(B50_CONTEXT_GUC_ID, action);
@@ -933,10 +1002,10 @@ static u32 submit_step(void *ctx, u64 deadline_ms)
         dmb();
         submit_boot.result = *result;
         submit_boot.completion = *completion;
-        if (submit_boot.completion == INTEL_BMG_STORE_COMPLETION_VALUE) {
-            if (submit_boot.result != INTEL_BMG_STORE_RESULT_VALUE)
-                return ADRV_STEP_FAILED;
+        if (submit_boot.completion == INTEL_BMG_STORE_COMPLETION_VALUE &&
+            submit_boot.result == INTEL_BMG_STORE_RESULT_VALUE) {
             submit_boot.state = B50_SUBMIT_DONE;
+            forcewake_drop();
             return ADRV_STEP_DONE;
         }
         if (submit_boot.completion != 0U ||
@@ -957,6 +1026,8 @@ static u32 submit_step(void *ctx, u64 deadline_ms)
                 mmio_read(b50_mmio_addr(B50_CCS0_ACTHD));
             submit_engine_diag[7] =
                 mmio_read(b50_mmio_addr(B50_CCS0_IPEHR));
+            submit_engine_diag[8] = mmio_read(b50_mmio_addr(0x001A270U));
+            submit_engine_diag[9] = mmio_read(b50_mmio_addr(0x001A274U));
             return ADRV_STEP_FAILED;
         }
         return ADRV_STEP_IDLE;
@@ -1159,8 +1230,10 @@ static u32 guc_boot_step(void *ctx, u64 deadline_ms)
         now > deadline_ms)
         return ADRV_STEP_FAILED;
     boot_diag.state = guc_boot.state;
-    boot_diag.wopcm_size_expected = wopcm.size_readback;
-    boot_diag.wopcm_offset_expected = wopcm.offset_readback;
+    if (!boot_diag.wopcm_size_expected)
+        boot_diag.wopcm_size_expected = wopcm.size_readback;
+    if (!boot_diag.wopcm_offset_expected)
+        boot_diag.wopcm_offset_expected = wopcm.offset_readback;
     switch (guc_boot.state) {
     case B50_BOOT_ACQUIRE_GT:
         mmio_write(b50_mmio_addr(B50_FORCEWAKE_GT), B50_FORCEWAKE_REQUEST);
@@ -1179,16 +1252,23 @@ static u32 guc_boot_step(void *ctx, u64 deadline_ms)
     case B50_BOOT_RESET:
         mmio_write(b50_mmio_addr(B50_GDRST), B50_GUC_RESET_BIT);
         dsb();
-        guc_boot.deadline = now + 5U;
+        guc_boot.deadline = now + B50_GUC_RESET_TIMEOUT_MS;
         guc_boot.state = B50_BOOT_WAIT_RESET;
         return ADRV_STEP_PROGRESS;
     case B50_BOOT_WAIT_RESET:
         value = mmio_read(b50_mmio_addr(B50_GDRST));
+        boot_diag.reset_raw = value;
+        boot_diag.reset_status = mmio_read(b50_mmio_addr(B50_GUC_STATUS));
+        if (now >= guc_boot.deadline) {
+            u64 lateness = now - guc_boot.deadline;
+            boot_diag.reset_lateness_ms =
+                lateness > ~0U ? ~0U : (u32)lateness;
+        }
         if (value == 0xFFFFFFFFU || now >= guc_boot.deadline)
             return ADRV_STEP_FAILED;
         if (value & B50_GUC_RESET_BIT)
             return ADRV_STEP_IDLE;
-        value = mmio_read(b50_mmio_addr(B50_GUC_STATUS));
+        value = boot_diag.reset_status;
         if (!(value & B50_GUC_MIA_RESET))
             return ADRV_STEP_FAILED;
         guc_boot.index = 0U;
@@ -1554,6 +1634,9 @@ static const char *quarantine(void)
     guc_boot_abort();
     forcewake_drop();
     bool revoked = revoke_bme();
+    bool vm_retired = !probe_vm.live ||
+        (revoked && intel_bmg_vm_retire(
+            &probe_vm, 82U, authority.bar.generation, true));
     if (native.attached) {
         (void)pcie1_containment_quarantine(&containment, &authority.endpoint, 0U,
                                           PCIE1_CONTAINMENT_FAULT_AER);
@@ -1561,6 +1644,8 @@ static const char *quarantine(void)
                                     PCIE1_BAR_LEASE_FAULT_FAILURE);
         native.attached = 0U;
     }
+    if (!vm_retired)
+        return "b50 quarantined; GPU VM retirement UNCONFIRMED; cold recovery required\n";
     return revoked ? "b50 quarantined; BME revoked; cold recovery required\n" :
                      "b50 quarantined; BME revocation UNCONFIRMED; cold recovery required\n";
 }
@@ -1708,6 +1793,46 @@ static bool b50_native_blocks_legacy_impl(void)
 #endif
 }
 
+#if PIOS_HAS_PCIE1
+#define B50_STEP_TRAMPOLINE(name, operation) \
+    static u64 name##_fallback(u32 op, u64 ctx, u64 deadline) \
+    { \
+        (void)op; \
+        return name((void *)(usize)ctx, deadline); \
+    } \
+    static u32 name##_trampoline(void *ctx, u64 deadline) \
+    { \
+        return (u32)module_dispatch_call( \
+            MODULE_ID_B50, operation, (u64)(usize)ctx, deadline, \
+            name##_fallback); \
+    }
+
+B50_STEP_TRAMPOLINE(firmware_stage_step, MODULE_OP_CALL + 3U)
+B50_STEP_TRAMPOLINE(forcewake_step, MODULE_OP_CALL + 4U)
+B50_STEP_TRAMPOLINE(ggtt_step, MODULE_OP_CALL + 5U)
+B50_STEP_TRAMPOLINE(boot_prepare_step, MODULE_OP_CALL + 6U)
+B50_STEP_TRAMPOLINE(guc_boot_step, MODULE_OP_CALL + 7U)
+B50_STEP_TRAMPOLINE(ct_step, MODULE_OP_CALL + 8U)
+B50_STEP_TRAMPOLINE(context_step, MODULE_OP_CALL + 9U)
+B50_STEP_TRAMPOLINE(submit_step, MODULE_OP_CALL + 10U)
+#undef B50_STEP_TRAMPOLINE
+
+static u64 b50_bottom_fallback(u32 op, u64 record, u64 ctx)
+{
+    (void)op;
+    native_bottom((const struct airq_record *)(usize)record,
+                  (void *)(usize)ctx);
+    return 0U;
+}
+
+static void b50_bottom_trampoline(const struct airq_record *record, void *ctx)
+{
+    (void)module_dispatch_call(
+        MODULE_ID_B50, MODULE_OP_CALL + 11U,
+        (u64)(usize)record, (u64)(usize)ctx, b50_bottom_fallback);
+}
+#endif
+
 static const char *b50_native_command_impl(u32 operation)
 {
     if (core_id() != 0U)
@@ -1761,8 +1886,10 @@ static const char *b50_native_command_impl(u32 operation)
             "b50 detached; no hardware authority; DMA unproven\n";
     if (operation == B50_NATIVE_REVOKE)
         return quarantine();
-    if (!live_valid())
+    if (!live_valid()) {
+        ggtt_diag.validation_failure_stage = validation_stage;
         return quarantine();
+    }
     if (operation == B50_NATIVE_ATTACH) {
         struct pcie1_bar_lease_request request = {0};
         if (native.attached)
@@ -1772,7 +1899,7 @@ static const char *b50_native_command_impl(u32 operation)
         native.initialized = 1U;
         gic_disable_irq(B50_ROOT_MSI_INTID);
         if (!airq_register(AIRQ_SRC_PCIE1_MSI, AIRQ_PRIO_NORMAL, 0U,
-                            native_bottom, NULL))
+                            b50_bottom_trampoline, NULL))
             return quarantine();
         irq_register(B50_ROOT_MSI_INTID, native_irq);
         if (!probe_bar(&request.bar))
@@ -1811,7 +1938,7 @@ static const char *b50_native_command_impl(u32 operation)
         native.firmware_state = B50_FW_STATE_COPY;
         native.firmware_failure = 0U;
         native.firmware_handle = adrv_submit(
-            "b50-guc-stage", firmware_stage_step, NULL, 1U, 5000U,
+            "b50-guc-stage", firmware_stage_step_trampoline, NULL, 1U, 5000U,
             ADRV_CADENCE_FAST);
         if (native.firmware_handle == ADRV_HANDLE_INVALID) {
             native.firmware_state = B50_FW_STATE_IDLE;
@@ -1828,7 +1955,7 @@ static const char *b50_native_command_impl(u32 operation)
         native.forcewake_gmd_id = 0U;
         native.forcewake_failure = 0U;
         native.forcewake_handle = adrv_submit(
-            "b50-forcewake", forcewake_step, NULL, 1U, 500U,
+            "b50-forcewake", forcewake_step_trampoline, NULL, 1U, 500U,
             ADRV_CADENCE_FAST);
         if (native.forcewake_handle == ADRV_HANDLE_INVALID)
             return quarantine();
@@ -1847,7 +1974,7 @@ static const char *b50_native_command_impl(u32 operation)
         native.ggtt_failure = 0U;
         ggtt_diag = (struct b50_native_diag){.attached = 1U};
         native.ggtt_handle = adrv_submit(
-            "b50-ggtt", ggtt_step, NULL, 1U, 10000U, ADRV_CADENCE_FAST);
+            "b50-ggtt", ggtt_step_trampoline, NULL, 1U, 10000U, ADRV_CADENCE_FAST);
         if (native.ggtt_handle == ADRV_HANDLE_INVALID) {
             native.ggtt_state = B50_GGTT_IDLE;
             return quarantine();
@@ -1871,7 +1998,7 @@ static const char *b50_native_command_impl(u32 operation)
         ggtt_diag.prep_framework_reason = ADRV_REASON_NONE;
         boot_prep.revision = pcie1_cfg_read(5U, 0U, 0U, 8U) & 0xFFU;
         boot_prep.handle = adrv_submit(
-            "b50-guc-prep", boot_prepare_step, NULL, 1U, 30000U,
+            "b50-guc-prep", boot_prepare_step_trampoline, NULL, 1U, 30000U,
             ADRV_CADENCE_FAST);
         if (boot_prep.handle == ADRV_HANDLE_INVALID) {
             boot_prep.state = B50_PREP_IDLE;
@@ -1892,7 +2019,7 @@ static const char *b50_native_command_impl(u32 operation)
         ggtt_diag.boot_state = B50_BOOT_ACQUIRE_GT;
         ggtt_diag.boot_framework_reason = ADRV_REASON_NONE;
         guc_boot.handle = adrv_submit(
-            "b50-guc-boot", guc_boot_step, NULL, 1U, 5000U,
+            "b50-guc-boot", guc_boot_step_trampoline, NULL, 1U, 5000U,
             ADRV_CADENCE_FAST);
         if (guc_boot.handle == ADRV_HANDLE_INVALID) {
             guc_boot.state = B50_BOOT_IDLE;
@@ -1910,7 +2037,7 @@ static const char *b50_native_command_impl(u32 operation)
         ct_boot = (typeof(ct_boot)){0};
         ct_boot.state = B50_CT_ZERO;
         ct_boot.handle = adrv_submit(
-            "b50-guc-ct", ct_step, NULL, 1U, 5000U,
+            "b50-guc-ct", ct_step_trampoline, NULL, 1U, 5000U,
             ADRV_CADENCE_FAST);
         if (ct_boot.handle == ADRV_HANDLE_INVALID) {
             ct_boot.state = B50_CT_IDLE;
@@ -1918,7 +2045,11 @@ static const char *b50_native_command_impl(u32 operation)
         }
         return "b50 bounded GuC CT bidirectional negative probe scheduled\n";
     }
-    if (operation == B50_NATIVE_CONTEXT) {
+    if (operation == B50_NATIVE_CONTEXT || operation == B50_NATIVE_VM_CONTEXT) {
+        bool requested = operation == B50_NATIVE_VM_CONTEXT;
+        if (context_boot.state != B50_CONTEXT_IDLE &&
+            requested != (probe_vm_requested != 0U))
+            return "b50 context rejected: address-space mode already selected\n";
         if (context_boot.handle != ADRV_HANDLE_INVALID)
             return "b50 GuC CCS0 context registration already active\n";
         if (context_boot.state == B50_CONTEXT_DONE)
@@ -1926,9 +2057,10 @@ static const char *b50_native_command_impl(u32 operation)
         if (!guc_boot.ready || ct_boot.state != B50_CT_DONE)
             return "b50 context rejected: GuC READY + CT proof required\n";
         context_boot = (typeof(context_boot)){0};
+        probe_vm_requested = requested;
         context_boot.state = B50_CONTEXT_BUILD;
         context_boot.handle = adrv_submit(
-            "b50-guc-context", context_step, NULL, 1U, 2000U,
+            "b50-guc-context", context_step_trampoline, NULL, 1U, 2000U,
             ADRV_CADENCE_FAST);
         if (context_boot.handle == ADRV_HANDLE_INVALID) {
             context_boot.state = B50_CONTEXT_IDLE;
@@ -1945,9 +2077,9 @@ static const char *b50_native_command_impl(u32 operation)
             return "b50 submit rejected: registered context required\n";
         submit_boot = (typeof(submit_boot)){0};
         memset(submit_engine_diag, 0, sizeof(submit_engine_diag));
-        submit_boot.state = B50_SUBMIT_ENABLE_SEND;
+        submit_boot.state = B50_SUBMIT_WAKE_REQUEST;
         submit_boot.handle = adrv_submit(
-            "b50-guc-submit", submit_step, NULL, 1U, 2000U,
+            "b50-guc-submit", submit_step_trampoline, NULL, 1U, 2000U,
             ADRV_CADENCE_FAST);
         if (submit_boot.handle == ADRV_HANDLE_INVALID) {
             submit_boot.state = B50_SUBMIT_IDLE;
@@ -1963,9 +2095,9 @@ static const char *b50_native_command_impl(u32 operation)
 #endif
 }
 
-#define B50_MODULE_OP_COMMAND 1U
-#define B50_MODULE_OP_SERVICE 2U
-#define B50_MODULE_OP_BLOCKS  3U
+#define B50_MODULE_OP_COMMAND MODULE_OP_CALL
+#define B50_MODULE_OP_SERVICE (MODULE_OP_CALL + 1U)
+#define B50_MODULE_OP_BLOCKS  (MODULE_OP_CALL + 2U)
 
 static u64 b50_static_dispatch(u32 op, u64 a0, u64 a1)
 {
@@ -2101,7 +2233,9 @@ void b50_native_submit_diag(struct b50_native_submit_diag *out)
         .engine_hws_pga = submit_engine_diag[4],
         .engine_context_control = submit_engine_diag[5],
         .engine_acthd = submit_engine_diag[6],
-        .engine_ipehr = submit_engine_diag[7]
+        .engine_ipehr = submit_engine_diag[7],
+        .engine_ptbp_lo = submit_engine_diag[8],
+        .engine_ptbp_hi = submit_engine_diag[9]
     };
 #else
     *out = (struct b50_native_submit_diag){0};

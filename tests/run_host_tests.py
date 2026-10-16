@@ -28,6 +28,33 @@ OUT = TESTS / "_build"
 
 # test file -> kernel source files it links against
 TESTS_MANIFEST = {
+    "test_tensor_service.c": ["src/tensor_service.c", "src/picovm.c"],
+    "test_ipc_model_broker.c": ["src/ipc_model.c", "src/ipc_model_vm.c",
+                              "src/ipc_model_broker.c"],
+    "test_ipc_model.c": ["src/ipc_model.c"],
+    "test_tensor_format.c": ["src/tensor_format.c"],
+    "test_b50_fused_topk.c": [],
+    "test_b50_fused_matmul.c": [],
+    "test_intel_bmg_batch.c": ["src/intel_bmg_batch.c", "src/intel_bmg_state.c",
+                             "src/intel_bmg_walker.c", "src/intel_bmg_tensor_plan.c",
+                             "src/intel_bmg_vm.c"],
+    "test_intel_bmg_state.c": ["src/intel_bmg_state.c"],
+    "test_intel_bmg_walker.c": ["src/intel_bmg_walker.c"],
+    "test_intel_bmg_dispatch_prep.c": ["src/intel_bmg_dispatch_prep.c",
+                                      "src/intel_bmg_tensor_plan.c",
+                                      "src/intel_bmg_vm.c",
+                                      "src/sha256_hkdf.c"],
+    "test_intel_bmg_tensor_job.c": ["src/intel_bmg_tensor_job.c",
+                                  "src/intel_bmg_weights.c",
+                                  "src/intel_bmg_tensor_plan.c",
+                                  "src/intel_bmg_vm.c"],
+    "test_intel_bmg_weights.c": ["src/intel_bmg_weights.c"],
+    "test_b50_w2a8.c": ["src/bitnet_kernel.c"],
+    "test_b50_w2a8_matmul.c": ["src/bitnet_kernel.c"],
+    "test_b50_w2a8_xmx_layout.c": ["src/bitnet_kernel.c"],
+    "test_intel_bmg_vm.c": ["src/intel_bmg_vm.c"],
+    "test_intel_bmg_tensor_plan.c": ["src/intel_bmg_tensor_plan.c", "src/intel_bmg_vm.c"],
+    "test_intel_bmg_tensor_plan_vm.c": ["src/intel_bmg_tensor_plan.c", "src/intel_bmg_vm.c"],
     "test_picocompress.c": ["src/picocompress.c"],
     # The Pi5 editor PBRP envelope is made by tools/pios_brotli.py. This test
     # proves that it is accepted by the in-kernel decoder, validates both
@@ -249,7 +276,7 @@ TESTS_MANIFEST = {
                           "src/intel_xe2_guc.c",
                           "src/intel_guc_boot.c",
                           "src/intel_guc_ct.c",
-                          "src/intel_bmg_submit.c"],
+                          "src/intel_bmg_submit.c", "src/intel_bmg_vm.c"],
     "test_intel_guc_ct.c": ["src/intel_guc_ct.c"],
     "test_intel_bmg_submit.c": ["src/intel_bmg_submit.c"],
     # #97 fixed-size GPU-fabric control plane. This contract models verified
@@ -290,7 +317,9 @@ TESTS_MANIFEST = {
 }
 
 TEST_CFLAGS = {
-    "test_b50_native.c": ["-DB50_NATIVE_HOST_TEST", "-DPIOS_HOST_CORE_ID_FN"],
+    "test_tensor_service.c": ["-ffreestanding", "-Wno-comment", "-Wno-unused-function"],
+    "test_b50_native.c": ["-DB50_NATIVE_HOST_TEST", "-DPIOS_HOST_CORE_ID_FN",
+                          "-DINTEL_GUC_CT_HOST_TEST"],
     "test_intel_guc_ct.c": ["-DINTEL_GUC_CT_HOST_TEST"],
     "test_fat32_exchange_core.c": ["-DFAT32_EXCHANGE_ENABLE_TEST_FORMAT"],
     "test_net_dispatch.c": ["-DPIOS_PLATFORM=1"],
@@ -354,6 +383,9 @@ def main() -> int:
                  "test_pcie1_live_mapping.py",
                  "test_pcie1_auto_recovery.py",
                  "test_module_loader_contract.py",
+                 "test_b50_module_callbacks.py",
+                 "test_b50_submit_probe.py",
+                 "test_b50_shader_extract.py",
                  "test_reloadable_stage_contract.py",
                  "test_mmu_nc_translation.py",
                  "test_bmg_guc_artifact.py",
@@ -403,6 +435,9 @@ def main() -> int:
                  "test_x86_kernel_handoff.py",
                  "test_issue_137_pcie1_host_contract.py",
                  "test_picoscript_datagram_contract.py",
+                 "test_bitnet_picoscript.py",
+                 "test_ipc_model_picoscript.py",
+                 "test_tensor_pinned_picoscript.py",
                  "test_dma_boot_contract.py",
                  "test_issue_166_ota_transport_budget.py",
                  "test_pios_ota_update.py",

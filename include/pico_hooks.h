@@ -403,6 +403,8 @@
 #define PV_HOOK_TENSOR_SOFTMAXI32                0x1E9
 #define PV_HOOK_TENSOR_ARGMAXI32                 0x1EA
 #define PV_HOOK_TENSOR_HASACCEL                  0x1EB
+#define PV_HOOK_TENSOR_MATVECPINNED              0x3EA
+#define PV_HOOK_TENSOR_SELECTEDBACKEND           0x3EB
 #define PV_HOOK_BITLINEAR_SETSHAPE               0x1F0
 #define PV_HOOK_BITLINEAR_MATVECTERNARY          0x1F1
 #define PV_HOOK_BITLINEAR_MATVECBITMAP           0x1F2

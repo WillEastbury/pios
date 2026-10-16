@@ -59,6 +59,7 @@
 #include "pcie1.h"
 #include "b50_native.h"
 #include "module.h"
+#include "tensor_module.h"
 #include "lzero.h"
 #include "kepler.h"
 #include "rp1.h"
@@ -6451,6 +6452,8 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_u64(out, &len, max, d.boot_state);
         http_append(out, &len, max, "/");
         http_append_u64(out, &len, max, d.boot_framework_reason);
+        http_append(out, &len, max, " validation_failure=");
+        http_append_u64(out, &len, max, d.validation_failure_stage);
         http_append(out, &len, max, "\n");
         http_append(out, &len, max, "  submit state=");
         http_append_u64(out, &len, max, sd.state);
@@ -6485,6 +6488,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, sd.engine_acthd);
         http_append(out, &len, max, " ipehr=");
         http_append_hex32(out, &len, max, sd.engine_ipehr);
+        http_append(out, &len, max, " ptbp=");
+        http_append_hex32(out, &len, max, sd.engine_ptbp_hi);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, sd.engine_ptbp_lo);
         http_append(out, &len, max, "\n");
         http_append(out, &len, max, "  boot state=");
         http_append_u64(out, &len, max, bd.state);
@@ -6506,6 +6513,12 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append_hex32(out, &len, max, bd.wopcm_offset_raw);
         http_append(out, &len, max, "/");
         http_append_hex32(out, &len, max, bd.wopcm_offset_expected);
+        http_append(out, &len, max, " reset=");
+        http_append_hex32(out, &len, max, bd.reset_raw);
+        http_append(out, &len, max, "/");
+        http_append_hex32(out, &len, max, bd.reset_status);
+        http_append(out, &len, max, " late_ms=");
+        http_append_u64(out, &len, max, bd.reset_lateness_ms);
         http_append(out, &len, max, "\n");
         http_append(out, &len, max, "  ct state=");
         http_append_u64(out, &len, max, cd.state);
@@ -6540,6 +6553,10 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, "/");
         http_append_u64(out, &len, max, cd.context_ring_tail);
         http_append(out, &len, max, "\n");
+    } else if (http_streq(cmd, "tensor module proof")) {
+        http_append(out, &len, max, tensor_module_selftest() ?
+            "tensor W2A8 module parity PASS; CPU primitive, not B50 acceleration\n" :
+            "tensor W2A8 module parity FAILED\n");
     } else if (http_streq(cmd, "module status") ||
                http_streq(cmd, "module proof") ||
                http_streq(cmd, "module rollback")) {
@@ -6583,6 +6600,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
                http_streq(cmd, "b50 boot") ||
                http_streq(cmd, "b50 ct") ||
                http_streq(cmd, "b50 context") ||
+               http_streq(cmd, "b50 vmcontext") ||
                http_streq(cmd, "b50 submit") ||
                http_streq(cmd, "b50 validate")) {
         u32 operation = B50_NATIVE_STATUS;
@@ -6598,6 +6616,7 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         if (http_streq(cmd, "b50 boot")) operation = B50_NATIVE_BOOT;
         if (http_streq(cmd, "b50 ct")) operation = B50_NATIVE_CT;
         if (http_streq(cmd, "b50 context")) operation = B50_NATIVE_CONTEXT;
+        if (http_streq(cmd, "b50 vmcontext")) operation = B50_NATIVE_VM_CONTEXT;
         if (http_streq(cmd, "b50 submit")) operation = B50_NATIVE_SUBMIT;
         if (http_streq(cmd, "b50 validate")) operation = B50_NATIVE_VALIDATE;
         http_append(out, &len, max, b50_native_command(operation));
@@ -11253,7 +11272,8 @@ static u32 http_build_kernel_update_response(char *out, u32 max, const u8 *req, 
             ok = true;
         } else if (http_streq(action, "begin")) {
             if (total < sizeof(struct module_image_header) ||
-                total > sizeof(struct module_image_header) + MODULE_SLOT_BYTES)
+                total > sizeof(struct module_image_header) + MODULE_SLOT_BYTES +
+                        MODULE_SIGNATURE_BYTES)
                 error = "invalid module total";
             else if (!ota_stage_buf || total > ota_stage_cap)
                 error = "module staging unavailable";
@@ -11602,7 +11622,8 @@ static u32 http_build_module_update_response(char *out, u32 max,
         ok = true;
     else if (http_streq(action, "begin")) {
         if (total < sizeof(struct module_image_header) ||
-            total > sizeof(struct module_image_header) + MODULE_SLOT_BYTES)
+            total > sizeof(struct module_image_header) + MODULE_SLOT_BYTES +
+                    MODULE_SIGNATURE_BYTES)
             error = "invalid module total";
         else if (!ota_stage_buf || total > ota_stage_cap)
             error = "module staging unavailable";
@@ -17641,6 +17662,13 @@ static void ui_print_tensor_walfs_dashboard(void)
 
 static void ui_cmd_tensor(u32 argc, char **argv)
 {
+    if (argc == 3U && ui_streq(argv[1], "module") &&
+        ui_streq(argv[2], "proof")) {
+        ui_console_write(tensor_module_selftest() ?
+            "tensor W2A8 module parity PASS; CPU primitive, not B50 acceleration\n" :
+            "tensor W2A8 module parity FAILED\n");
+        return;
+    }
     if (argc >= 2 && ui_streq(argv[1], "walfs")) {
         ui_print_tensor_walfs_dashboard();
         return;

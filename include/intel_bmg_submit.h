@@ -22,7 +22,8 @@
 #define INTEL_BMG_LRC_REGS_BYTES           0x180U
 #define INTEL_BMG_LRC_INDIRECT_RING_OFFSET 0x7000U
 #define INTEL_BMG_LRC_WA_BB_OFFSET         0x8000U
-#define INTEL_BMG_LRC_TOTAL_BYTES          0x9000U
+#define INTEL_BMG_LRC_PROBE_BATCH_OFFSET   0x9000U
+#define INTEL_BMG_LRC_TOTAL_BYTES          0xA000U
 
 #define INTEL_BMG_LRC_DESC_VALID           0x001U
 #define INTEL_BMG_LRC_DESC_LEGACY64        0x018U
@@ -39,7 +40,9 @@
 #define INTEL_BMG_RING_CTL_VALUE           0x00003001U
 #define INTEL_BMG_MI_STORE_DATA_IMM        0x10400002U
 #define INTEL_BMG_MI_BATCH_BUFFER_END      0x05000000U
+#define INTEL_BMG_MI_BATCH_BUFFER_START    0x18800001U
 #define INTEL_BMG_MI_ARB_ENABLE            0x04000001U
+#define INTEL_BMG_MI_ARB_CHECK             0x02800000U
 #define INTEL_BMG_STORE_RESULT_VALUE       42U
 #define INTEL_BMG_STORE_COMPLETION_VALUE   0xFEED0001U
 
@@ -58,3 +61,7 @@ bool intel_bmg_lrc_build(u8 *memory, u32 memory_bytes,
                          u32 lrc_ggtt_base,
                          u32 result_ggtt, u32 completion_ggtt,
                          u32 *ring_tail_bytes_out);
+bool intel_bmg_lrc_bind_ppgtt(u8 *memory, u32 memory_bytes, u64 root_dma,
+                             u64 *descriptor);
+bool intel_bmg_lrc_ppgtt_store_probe(u8 *memory, u32 memory_bytes,
+                                    u64 output_va);

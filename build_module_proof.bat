@@ -6,6 +6,6 @@ if not exist build_module mkdir build_module
 if errorlevel 1 exit /b 1
 "%TC%\aarch64-none-elf-objcopy.exe" -O binary -j .text build_module\proof_v3.o build_module\proof_v3.bin
 if errorlevel 1 exit /b 1
-python tools\build_pmod.py build_module\proof_v3.bin --out build_module\proof_v3.pmod --module-id 7 --generation 3 --arena-schema 1
+python tools\build_pmod.py build_module\proof_v3.bin --out build_module\proof_v3.pmod --module-id 7 --generation 3 --arena-schema 1 --signing-key "%USERPROFILE%\.pios\signing\module-ed25519.pem"
 if errorlevel 1 exit /b 1
 echo Module artifact: build_module\proof_v3.pmod

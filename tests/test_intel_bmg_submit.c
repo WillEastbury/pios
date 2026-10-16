@@ -22,7 +22,7 @@ int main(void)
     intel_bmg_sched_context_action(1U, action);
     assert(action[0] == 0x1000U && action[1] == 1U);
     assert(INTEL_BMG_LRC_RING_BYTES == 0x4000U);
-    assert(INTEL_BMG_LRC_TOTAL_BYTES == 0x9000U);
+    assert(INTEL_BMG_LRC_TOTAL_BYTES == 0xA000U);
     assert(INTEL_BMG_CTX_CONTROL_VALUE == 0x00190019U);
     assert(INTEL_BMG_RING_CTL_VALUE == 0x3001U);
     u8 lrc[INTEL_BMG_LRC_TOTAL_BYTES];
@@ -36,10 +36,24 @@ int main(void)
     const u32 *indirect = (const u32 *)(const void *)
         (lrc + INTEL_BMG_LRC_INDIRECT_RING_OFFSET);
     assert(ring[0] == 0x04000001U);
-    assert(ring[1] == 0x10400002U && ring[2] == 0x03160000U);
-    assert(ring[4] == 42U && ring[5] == 0x10400002U);
-    assert(ring[6] == 0x03160004U && ring[8] == 0xFEED0001U);
-    assert(ring[9] == 0x05000000U);
+    const u32 *batch = (const u32 *)(const void *)
+        (lrc + INTEL_BMG_LRC_PROBE_BATCH_OFFSET);
+    assert(ring[1] == 0x18800001U && ring[2] == 0x03209000U);
+    assert(ring[3] == 0U && ring[4] == 0x10400002U);
+    assert(ring[5] == 0x03160004U && ring[7] == 0xFEED0001U);
+    assert(ring[8] == 0x02800000U && ring[9] == 0U);
+    assert(batch[0] == 0x10400002U && batch[1] == 0x03160000U);
+    assert(batch[2] == 0U && batch[3] == 42U && batch[4] == 0x05000000U);
+    assert(!intel_bmg_lrc_build(lrc, sizeof(lrc), 0xFFFF7000U,
+                               0x03160000U, 0x03160004U, &tail));
+    assert(!intel_bmg_lrc_build(lrc + 1, sizeof(lrc) - 1, 0x03200000U,
+                               0x03160000U, 0x03160004U, &tail));
+    assert(!intel_bmg_lrc_build(lrc, sizeof(lrc), 0x03200000U,
+                               0x03209000U, 0x03160004U, &tail));
+    assert(!intel_bmg_lrc_build(lrc, sizeof(lrc), 0x03200000U,
+                               0x03160000U, 0x03209004U, &tail));
+    assert(!intel_bmg_lrc_build(lrc, sizeof(lrc), 0x03200000U,
+                               0x03160000U, 0x03160000U, &tail));
     assert(regs[1] == 0x1108101DU);
     assert(regs[3] == 0x00190019U);
     assert(regs[39] == 0x03207000U);
@@ -48,6 +62,25 @@ int main(void)
     assert(indirect[7] == 0x03200000U);
     assert(indirect[11] == 0x3001U);
     assert(indirect[5] == 40U);
+    descriptor = 0x03204019ULL;
+    assert(!intel_bmg_lrc_bind_ppgtt(lrc, sizeof(lrc), 0x1000180001ULL,
+                                    &descriptor));
+    assert(!regs[49] && !regs[51] && descriptor == 0x03204019ULL);
+    assert(intel_bmg_lrc_bind_ppgtt(lrc, sizeof(lrc), 0x1000180000ULL,
+                                   &descriptor));
+    assert(regs[49] == 0x10U && regs[51] == 0x00180013U);
+    assert(descriptor == 0x03204119ULL);
+    assert(intel_bmg_register_context_action(1U, descriptor, action));
+    assert(action[10] == 0x03204119U);
+    assert(!intel_bmg_register_context_action(1U, descriptor | 0x200U, action));
+    assert(!intel_bmg_lrc_ppgtt_store_probe(lrc, sizeof(lrc), 0x10200000U));
+    assert(batch[0] == 0x10400002U);
+    assert(intel_bmg_lrc_ppgtt_store_probe(lrc, sizeof(lrc), 0x10002000U));
+    assert(batch[0] == 0x10000002U && batch[1] == 0x10002000U);
+    assert(batch[2] == 0U && batch[3] == 42U);
+    assert(ring[4] == 0x10400002U && ring[5] == 0x03160004U);
+    assert(!intel_bmg_lrc_bind_ppgtt(lrc, sizeof(lrc), 0x1000190000ULL,
+                                    &descriptor));
     puts("intel BMG width-1 submission plan: PASS");
     return 0;
 }
