@@ -67,12 +67,23 @@ for stage, handler in (
     stage_handler = body_after(
         f"static void airq_net_{stage}_handler(const struct airq_record *rec, void *ctx)\n{{"
     )
-    assert handler in stage_handler
+    fallback = body_after(
+        f"static u64 module_{stage}_fallback(u32 op, u64 a0, u64 a1)\n{{"
+    )
+    assert handler in fallback
+    assert f"module_dispatch_call(MODULE_ID_{stage.upper()}" in stage_handler
+    assert f"(u64)(usize)module_{stage}_fallback" in stage_handler
+    assert f", module_{stage}_fallback)" in stage_handler
 
 service_handler = body_after(
     "static void airq_net_service_handler(const struct airq_record *rec, void *ctx)\n{"
 )
-assert "net_dispatch_handle_service(core0_network_service_step)" in service_handler
+service_fallback = body_after(
+    "static u64 module_service_fallback(u32 op, u64 a0, u64 a1)\n{"
+)
+assert "net_dispatch_handle_service(core0_network_service_step)" in service_fallback
+assert "module_dispatch_call(MODULE_ID_TCP, MODULE_OP_CALL + 1U" in service_handler
+assert "module_service_fallback" in service_handler
 
 egress_handler = body_after(
     "static void airq_net_egress_handler(const struct airq_record *rec, void *ctx)\n{"

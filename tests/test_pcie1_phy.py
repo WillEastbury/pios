@@ -24,9 +24,10 @@ def function(signature):
 
 
 init = function("bool pcie1_init(void)")
-assert init.index("perst_set(true)") < init.index("setup_refclk_54mhz()")
-assert init.index("setup_refclk_54mhz()") < init.index("cap_set_gen2()")
-assert init.index("cap_set_gen2()") < init.index("perst_set(false)")
+root_setup = function("static bool program_root_link_registers(bool verbose)")
+assert init.index("perst_set(true)") < init.index("program_root_link_registers(true)")
+assert init.index("program_root_link_registers(true)") < init.index("perst_set(false)")
+assert root_setup.index("setup_refclk_54mhz(verbose)") < root_setup.index("cap_set_gen2()")
 assert init.index("timer_delay_ms(100U)") < init.index("wait_link_ms(100U)")
 assert "rescal_deassert(" not in source
 assert "gic_enable_irq(" not in source
@@ -100,7 +101,7 @@ static void reset(void) {
 }
 int main(void) {
     reset();
-    assert(setup_refclk_54mhz());
+    assert(setup_refclk_54mhz(false));
     assert(writes==8 && delay_us==100);
     assert(registers[RC_PL_PHY_CTL_15/4]==0x4dbc0012);
     assert(cap_set_gen2());
@@ -108,21 +109,21 @@ int main(void) {
     assert(registers[0xdc/4]==0x12340002); /* Upper status half untouched. */
     for (u32 n=0;n<sizeof(expected_regs);n++) {
         reset(); write_timeout=true; timeout_reg=expected_regs[n];
-        assert(!setup_refclk_54mhz());
+        assert(!setup_refclk_54mhz(false));
         assert(writes==n+1 && delay_us==100);
         assert(registers[RC_PL_PHY_CTL_15/4]==0x4dbc0014);
     }
     for (u32 n=1;n<sizeof(expected_regs);n++) {
         reset(); read_timeout=true; timeout_reg=expected_regs[n];
-        assert(!setup_refclk_54mhz() && delay_us==100);
+        assert(!setup_refclk_54mhz(false) && delay_us==100);
         reset(); mismatch_reg=expected_regs[n];
-        assert(!setup_refclk_54mhz());
+        assert(!setup_refclk_54mhz(false));
         assert(writes==n+1);
         reset(); dead_reg=expected_regs[n];
-        assert(!setup_refclk_54mhz() && delay_us==100);
+        assert(!setup_refclk_54mhz(false) && delay_us==100);
     }
     reset(); registers[RC_PL_PHY_CTL_15/4]=0xffffffff;
-    assert(!setup_refclk_54mhz());
+    assert(!setup_refclk_54mhz(false));
     reset(); drop_lcap=true; assert(!cap_set_gen2());
     reset(); drop_lc2=true; assert(!cap_set_gen2());
     reset(); registers[0x48/4]=0x4801; assert(!cap_set_gen2()); /* cycle */

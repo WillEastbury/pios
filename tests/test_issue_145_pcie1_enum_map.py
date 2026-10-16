@@ -34,7 +34,11 @@ assert "record_function(s, reachable, bus, dev, func);" in scan
 init = body_after(pcie1, "bool pcie1_init(void)")
 assert init.index("perst_set(true);") < init.index("perst_set(false);")
 assert "dsb();\n    perst_set(false);" in init
-assert "pw(RC_CFG_PRIV1_ID_VAL3, tmp);\n    dmb();" in init
+assert "program_root_link_registers(true)" in init
+
+root_setup = body_after(pcie1, "static bool program_root_link_registers(bool verbose)")
+assert "pw(RC_CFG_PRIV1_ID_VAL3, tmp);\n    dmb();" in root_setup
+assert root_setup.index("setup_refclk_54mhz(verbose)") < root_setup.index("cap_set_gen2()")
 
 window = body_after(pcie1, "bool pcie1_set_outbound_window(u64 size)")
 assert "size < 0x00100000ULL" in window
