@@ -1108,8 +1108,8 @@ static void native_bottom(const struct airq_record *record, void *ctx)
     continuation.acknowledged = sequence;
 }
 
-static const u32 buses[] = {1U, 2U, 3U, 4U, 5U};
-static const u32 devices[] = {0U, 8U, 0U, 1U, 0U};
+static u32 buses[] = {1U, 2U, 3U, 4U, 5U};
+static u32 devices[] = {0U, 8U, 0U, 1U, 0U};
 static const u32 identities[] = {
     0x874810B5U, 0x874810B5U, 0xE2FF8086U, 0xE2F08086U,
     0xE2128086U
@@ -1118,6 +1118,48 @@ static const u32 aer_offsets[] = {
     0xFB4U, 0xFB4U, 0x100U, 0x100U, 0U
 };
 #define B50_PATH_KNOWN_CORR_MASK 0x000020C1U
+
+static bool select_path(void)
+{
+    struct lzero_status selected;
+    struct pcie1_status topology;
+    u32 next_buses[5], next_devices[5];
+    lzero_status(&selected);
+    pcie1_status(&topology);
+    if (!selected.bars_probed || !selected.bar0_mapped ||
+        selected.gpu_dev || selected.gpu_func ||
+        topology.scan_truncated || topology.malformed_topology ||
+        topology.ep_count > PCIE1_SCAN_MAX ||
+        pcie1_cfg_read(selected.gpu_bus, 0U, 0U, 0U) != identities[4])
+        return false;
+    next_buses[4] = selected.gpu_bus;
+    next_devices[4] = 0U;
+    for (u32 depth = 4U; depth > 0U; depth--) {
+        const struct pcie1_ep *parent = NULL;
+        for (u32 i = 0U; i < topology.ep_count; i++) {
+            const struct pcie1_ep *ep = &topology.eps[i];
+            if ((ep->hdr_type & 0x7FU) != 1U ||
+                ep->sec_bus != next_buses[depth])
+                continue;
+            if (parent || ep->func ||
+                !pcie1_bridge_range_valid(ep->bus, ep->sec_bus, ep->sub_bus) ||
+                ep->sub_bus < selected.gpu_bus ||
+                ((u32)ep->device << 16 | ep->vendor) != identities[depth - 1U])
+                return false;
+            parent = ep;
+        }
+        if (!parent) return false;
+        next_buses[depth - 1U] = parent->bus;
+        next_devices[depth - 1U] = parent->dev;
+    }
+    if (next_buses[0] != 1U || next_devices[0] != 0U)
+        return false;
+    for (u32 i = 0U; i < 5U; i++) {
+        buses[i] = next_buses[i];
+        devices[i] = next_devices[i];
+    }
+    return true;
+}
 
 static bool path_aer_clean(u32 index)
 {
@@ -1498,15 +1540,16 @@ static bool live_valid(void)
             return false;
         if (i < 4U) {
             u32 range = pcie1_cfg_read(buses[i], devices[i], 0U, 0x18U);
-            if (((range >> 8) & 255U) > 5U ||
-                ((range >> 16) & 255U) < 5U ||
+            if (((range >> 8) & 255U) > buses[4] ||
+                ((range >> 16) & 255U) < buses[4] ||
                 pcie1_cfg_read(buses[i], devices[i], 0U, 0x20U) != 0x80F08000U)
                 return false;
         }
         for (u32 i = 0U; i < topology.ep_count; i++) {
             const struct pcie1_ep *ep = &topology.eps[i];
-            if (!pcie1_is_b50(ep->vendor, ep->device) ||
-                (ep->bus == 5U && ep->dev == 0U && ep->func == 0U))
+            if ((!pcie1_is_b50(ep->vendor, ep->device) &&
+                 !pcie1_is_b60(ep->vendor, ep->device)) ||
+                (ep->bus == buses[4] && ep->dev == 0U && ep->func == 0U))
                 continue;
             if (pcie1_cfg_read(ep->bus, ep->dev, ep->func, 4U) & 4U)
                 return false;
@@ -1515,15 +1558,15 @@ static bool live_valid(void)
             return false;
     }
     validation_stage = 40U;
-    if (!pcie1_link_gen3_active(2U, 8U, 0U))
+    if (!pcie1_link_gen3_active(buses[1], devices[1], 0U))
         return false;
     lzero_status(&status);
     validation_stage = 50U;
     if (!status.bars_probed || !status.bar0_mapped ||
-        status.gpu_bus != 5U || status.gpu_dev || status.gpu_func ||
+        status.gpu_bus != buses[4] || status.gpu_dev || status.gpu_func ||
         status.bar0_size != 0x1000000ULL ||
-        (pcie1_cfg_read(5U, 0U, 0U, 0x10U) & ~8U) != 0x80000004U ||
-        pcie1_cfg_read(5U, 0U, 0U, 0x14U) != 0U)
+        (pcie1_cfg_read(buses[4], 0U, 0U, 0x10U) & ~8U) != 0x80000004U ||
+        pcie1_cfg_read(buses[4], 0U, 0U, 0x14U) != 0U)
         return false;
     validation_stage = 60U;
     for (u32 i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
@@ -1568,13 +1611,14 @@ static bool owned_slice_check(void)
             PCIE1_CONTAINMENT_FROM_DEVICE, now, 50U, &handle))
         return false;
     if (!pcie1_containment_dma_span_get(&containment, &handle, 0U, &span) ||
-        span.payload_cpu_phys < PIOS_DMA_PCIE1_BASE + 64U ||
+        span.payload_cpu_phys < PIOS_DMA_PCIE1_BASE +
+                                PCIE1_CONTAINMENT_DMA_HEAD_BYTES ||
         span.capacity != PCIE1_CONTAINMENT_DMA_PAYLOAD_BYTES ||
         span.payload_cpu_phys > PIOS_DMA_PCIE1_BASE +
                                PIOS_DMA_PCIE1_CANARY_SIZE -
                                span.capacity - 64U)
         return false;
-    u64 base = span.payload_cpu_phys - 64U;
+    u64 base = span.payload_cpu_phys - PCIE1_CONTAINMENT_DMA_HEAD_BYTES;
 #ifndef B50_NATIVE_HOST_TEST
     volatile u8 *bytes = (volatile u8 *)(usize)base;
 #else
@@ -1582,19 +1626,21 @@ static bool owned_slice_check(void)
 #endif
     for (u32 i = 0; i < 64U; i++) {
         bytes[i] = 0xA5U;
-        bytes[64U + span.capacity + i] = 0x5AU;
-        bytes[64U + i] = (u8)(i ^ handle.generation);
+        bytes[PCIE1_CONTAINMENT_DMA_HEAD_BYTES + span.capacity + i] = 0x5AU;
+        bytes[PCIE1_CONTAINMENT_DMA_HEAD_BYTES + i] = (u8)(i ^ handle.generation);
     }
     dsb();
     bool intact = true;
     for (u32 i = 0; i < 64U; i++)
-        if (bytes[i] != 0xA5U || bytes[64U + span.capacity + i] != 0x5AU ||
-            bytes[64U + i] != (u8)(i ^ handle.generation))
+        if (bytes[i] != 0xA5U ||
+            bytes[PCIE1_CONTAINMENT_DMA_HEAD_BYTES + span.capacity + i] != 0x5AU ||
+            bytes[PCIE1_CONTAINMENT_DMA_HEAD_BYTES + i] !=
+                (u8)(i ^ handle.generation))
             intact = false;
     /* Only the requested payload and its guards were touched. */
     for (u32 i = 0; i < 64U; i++) {
-        bytes[i] = bytes[64U + i] = 0xDDU;
-        bytes[64U + span.capacity + i] = 0xDDU;
+        bytes[i] = bytes[PCIE1_CONTAINMENT_DMA_HEAD_BYTES + i] = 0xDDU;
+        bytes[PCIE1_CONTAINMENT_DMA_HEAD_BYTES + span.capacity + i] = 0xDDU;
     }
     dsb();
     return intact &&
@@ -1604,28 +1650,28 @@ static bool owned_slice_check(void)
 
 static bool probe_bar(struct pcie1_bar_lease_bar *bar)
 {
-    u32 command = pcie1_cfg_read(5U, 0U, 0U, 4U);
-    bar->config_lo = pcie1_cfg_read(5U, 0U, 0U, 0x10U);
-    bar->config_hi = pcie1_cfg_read(5U, 0U, 0U, 0x14U);
+    u32 command = pcie1_cfg_read(buses[4], 0U, 0U, 4U);
+    bar->config_lo = pcie1_cfg_read(buses[4], 0U, 0U, 0x10U);
+    bar->config_hi = pcie1_cfg_read(buses[4], 0U, 0U, 0x14U);
     if ((command & 7U) != 2U ||
         (bar->config_lo & ~8U) != 0x80000004U ||
         bar->config_hi != 0U)
         return false;
-    pcie1_cfg_write(5U, 0U, 0U, 4U, (command & 0xFFFFU) & ~7U);
-    if (pcie1_cfg_read(5U, 0U, 0U, 4U) & 7U)
+    pcie1_cfg_write(buses[4], 0U, 0U, 4U, (command & 0xFFFFU) & ~7U);
+    if (pcie1_cfg_read(buses[4], 0U, 0U, 4U) & 7U)
         return false;
-    pcie1_cfg_write(5U, 0U, 0U, 0x10U, ~0U);
-    pcie1_cfg_write(5U, 0U, 0U, 0x14U, ~0U);
-    bar->probe_lo = pcie1_cfg_read(5U, 0U, 0U, 0x10U);
-    bar->probe_hi = pcie1_cfg_read(5U, 0U, 0U, 0x14U);
-    pcie1_cfg_write(5U, 0U, 0U, 0x14U, bar->config_hi);
-    pcie1_cfg_write(5U, 0U, 0U, 0x10U, bar->config_lo);
+    pcie1_cfg_write(buses[4], 0U, 0U, 0x10U, ~0U);
+    pcie1_cfg_write(buses[4], 0U, 0U, 0x14U, ~0U);
+    bar->probe_lo = pcie1_cfg_read(buses[4], 0U, 0U, 0x10U);
+    bar->probe_hi = pcie1_cfg_read(buses[4], 0U, 0U, 0x14U);
+    pcie1_cfg_write(buses[4], 0U, 0U, 0x14U, bar->config_hi);
+    pcie1_cfg_write(buses[4], 0U, 0U, 0x10U, bar->config_lo);
     dsb();
-    if (pcie1_cfg_read(5U, 0U, 0U, 0x10U) != bar->config_lo ||
-        pcie1_cfg_read(5U, 0U, 0U, 0x14U) != bar->config_hi)
+    if (pcie1_cfg_read(buses[4], 0U, 0U, 0x10U) != bar->config_lo ||
+        pcie1_cfg_read(buses[4], 0U, 0U, 0x14U) != bar->config_hi)
         return false;
-    pcie1_cfg_write(5U, 0U, 0U, 4U, command & 0xFFFFU);
-    return (pcie1_cfg_read(5U, 0U, 0U, 4U) & 7U) == 2U;
+    pcie1_cfg_write(buses[4], 0U, 0U, 4U, command & 0xFFFFU);
+    return (pcie1_cfg_read(buses[4], 0U, 0U, 4U) & 7U) == 2U;
 }
 
 static const char *quarantine(void)
@@ -1841,6 +1887,10 @@ static const char *b50_native_command_impl(u32 operation)
     (void)operation;
     return "b50 rejected: platform has no PCIe1\n";
 #else
+    if (!native.initialized &&
+        (operation == B50_NATIVE_VALIDATE || operation == B50_NATIVE_ATTACH) &&
+        !select_path())
+        return "b50 rejected: selected B50 path identity/topology not proven; BME off\n";
     if (operation == B50_NATIVE_VALIDATE) {
         bool valid = live_valid();
         if (valid)
@@ -1911,10 +1961,10 @@ static const char *b50_native_command_impl(u32 operation)
         request.flags = (request.bar.config_lo & 8U) ?
             PCIE1_BAR_LEASE_ALLOW_PREFETCHABLE : 0U;
         if (!pcie1_bar_lease_init(&lease, 82U, 0U) ||
-            !pcie1_bar_lease_acquire(&lease, 0x500U, 0U, &request, &authority.bar))
+            !pcie1_bar_lease_acquire(&lease, buses[4] << 8, 0U, &request, &authority.bar))
             return quarantine();
         native.attached = 1U;
-        if (!pcie1_containment_init(&containment, 82U, 0x500U,
+        if (!pcie1_containment_init(&containment, 82U, buses[4] << 8,
                                     authority.bar.generation, 0U, &authority.endpoint))
             return quarantine();
         return "b50 native generation lease attached; BME remains off\n";
@@ -1996,7 +2046,7 @@ static const char *b50_native_command_impl(u32 operation)
         ggtt_diag.prep_offset = 0U;
         ggtt_diag.prep_detail = B50_PREP_DIAG_NONE;
         ggtt_diag.prep_framework_reason = ADRV_REASON_NONE;
-        boot_prep.revision = pcie1_cfg_read(5U, 0U, 0U, 8U) & 0xFFU;
+        boot_prep.revision = pcie1_cfg_read(buses[4], 0U, 0U, 8U) & 0xFFU;
         boot_prep.handle = adrv_submit(
             "b50-guc-prep", boot_prepare_step_trampoline, NULL, 1U, 30000U,
             ADRV_CADENCE_FAST);

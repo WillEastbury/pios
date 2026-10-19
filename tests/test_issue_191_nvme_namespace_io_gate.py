@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Issue #191 remains a pure, offline NVMe namespace/I/O contract."""
+"""NVMe protocol logic stays hardware-free; live diagnostics use the adapter."""
 from pathlib import Path
 import sys
 
@@ -39,7 +39,7 @@ for token in ('"mmio.h"', '"platform.h"', '"airq.h"', '"walfs.h"'):
     if token in header:
         print(f"FAIL forbidden hardware/integration header dependency: {token}")
         sys.exit(1)
-for production in ("kernel.c", "pcie1.c", "sd.c", "walfs.c"):
+for production in ("pcie1.c", "sd.c", "walfs.c"):
     path = ROOT / "src" / production
     if path.exists() and "nvme" in path.read_text(encoding="utf-8").lower():
         print(f"FAIL #191 production wiring found in {production}")
@@ -56,4 +56,9 @@ for token in (
         print(f"FAIL missing #191 core-0 ownership token: {token}")
         sys.exit(1)
 
-print("issue #191: core-0-owned NVMe contract remains offline and un-wired")
+kernel = (ROOT / "src" / "kernel.c").read_text(encoding="utf-8")
+if '#include "nvme_pcie.h"' not in kernel or "nvme_pcie_identify()" not in kernel:
+    print("FAIL live NVMe diagnostics must use the guarded PCIe adapter")
+    sys.exit(1)
+
+print("issue #191: hardware-free NVMe protocol and guarded diagnostic adapter")

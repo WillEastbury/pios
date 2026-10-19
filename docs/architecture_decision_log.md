@@ -2,6 +2,27 @@
 
 Every significant architectural decision in PIOS is recorded here.
 
+## 2026-10-16 — Owner-approved live NVMe WALFS data volume
+
+The owner authorized destructive formatting of the currently enumerated
+`F1AB:025E` NVMe namespace and selected a GPT with one aligned WALFS data
+partition beginning at LBA 2048, mounted separately as `nvme0`. The SD remains
+the boot device and its existing boot-control, slots, keystore and root WALFS
+are not modified.
+
+Activation is phased and fail-closed: exact NVMe class/BDF selection; BAR
+probe and Device mapping with Bus Master off; CAP/VS validation; contained
+Normal-NC admin queues; Identify Controller/Namespace; bounded read and
+scratch-LBA write/readback proof; only then GPT and WALFS formatting after
+revalidating the operator authorization. Any timeout, malformed completion,
+AER, removal, red-zone failure or generation mismatch disables BME, revokes
+the provider and preserves the namespace without further writes.
+
+The `nvme0` mount is an additional provider-backed WALFS instance, not an
+alias for the SD global and not a boot source. Namespace addresses never become
+capsule pointers. The controller, queues, PRPs, block provider and filesystem
+retain core-0 ownership until a later asynchronous storage design is approved.
+
 ## 2026-10-16 — Owner-ordered FIFO/tensor-before-quiesce sequencing
 
 The owner directed that the production OS-owned FIFO driver and tensor

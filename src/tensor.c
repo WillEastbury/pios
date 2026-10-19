@@ -22,6 +22,7 @@
 #include "mmu.h"
 #include "pico_hooks.h"
 #include "picovm.h"
+#include "pios_exec_sched.h"
 #include "qpu_async_media_fixture.h"
 #include "timer.h"
 #include "uart.h"
@@ -4009,6 +4010,7 @@ bool qpu_dispatch(const qpu_program_t *prog, struct qpu_job *jobs,
 
 void tensor_init(void) {
     pv_tensor_hook = tensor_picovm_hook;
+    pios_exec_sched_install();
     pv_media_hook = tensor_picovm_media_hook;
     pv_bitlinear_hook = tensor_picovm_bitlinear_hook;
     pv_compute_hook = tensor_picovm_compute_hook;

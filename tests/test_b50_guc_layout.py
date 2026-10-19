@@ -29,7 +29,10 @@ assert ads_size == 0x00B00000
 assert queue_size == 0x00200000
 assert canary + fw_size + ads_size + queue_size == size
 assert "PIOS_DMA_PCIE1_CANARY_SIZE" in b50
-assert "pcie1_link_gen3_active(2U, 8U, 0U)" in b50
+assert "pcie1_link_gen3_active(buses[1], devices[1], 0U)" in b50
+assert "static bool select_path(void)" in b50
+assert "ep->sec_bus != next_buses[depth]" in b50
+assert "parent || ep->func" in b50
 assert "PCIE1_BAR2_SIZE_ENC     9U" in (root / "include" / "pcie1.h").read_text()
 assert "must fit a 1 GiB board" in pcie1
 print("B50 GuC layout: aligned 16MiB, 1GiB-safe split and Gen3 gate passed")

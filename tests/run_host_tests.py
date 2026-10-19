@@ -84,6 +84,7 @@ TESTS_MANIFEST = {
     # logic, no asm/MMIO. See src/board_detect.c, include/board_detect.h.
     "test_board_detect.c": ["src/board_detect.c"],
     "test_pcie_fabric.c": ["src/pcie_fabric.c"],
+    "test_pios_exec_sched.c": ["src/pios_exec_sched.c", "src/pcie_fabric.c"],
     "test_intel_guc_fw.c": ["src/intel_guc_fw.c"],
     "test_intel_xe2_guc.c": ["src/intel_xe2_guc.c"],
     "test_intel_guc_boot.c": ["src/intel_guc_boot.c"],
@@ -439,6 +440,7 @@ def main() -> int:
                  "test_bitnet_picoscript.py",
                  "test_ipc_model_picoscript.py",
                  "test_tensor_pinned_picoscript.py",
+                 "test_exec_sched_picoscript.py",
                  "test_dma_boot_contract.py",
                  "test_issue_166_ota_transport_budget.py",
                  "test_pios_ota_update.py",

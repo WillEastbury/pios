@@ -12,6 +12,7 @@ u64 module_dispatch_call(u32 module_id, u32 op, u64 a0, u64 a1,
     return fallback(op, a0, a1);
 }
 #include "pcie1.h"
+#include "pcie1_containment.h"
 #include "lzero.h"
 #include "airq.h"
 #include "exception.h"
@@ -24,8 +25,10 @@ static bool nc = true, device = true, post_ok = true, gen3 = true;
 static u64 clock_ms;
 static u32 topology_count = 10U;
 static u32 commands[64][32];
-static const u32 path_buses[] = {1U, 2U, 3U, 4U, 5U};
-static const u32 path_devices[] = {0U, 8U, 0U, 1U, 0U};
+static const u32 path_buses[] = {1U, 2U, 7U, 8U, 9U};
+static const u32 path_devices[] = {0U, 9U, 0U, 1U, 0U};
+static u16 selected_device = PCIE1_DID_B50;
+static bool duplicate_parent;
 static u32 bar_lo = 0x8000000CU, bar_hi;
 static u8 arena[0x40000];
 static u8 firmware_region[PIOS_DMA_PCIE1_GUC_FW_SIZE];
@@ -70,26 +73,33 @@ bool pcie1_endpoint_gen3_capable(u32 bus, u32 dev, u32 func) {
     return gen3;
 }
 bool pcie1_link_gen3_active(u32 bus, u32 dev, u32 func) {
-    assert(bus == 2U && dev == 8U && func == 0U);
+    assert(bus == 2U && dev == 9U && func == 0U);
     return gen3;
 }
 void pcie1_status(struct pcie1_status *out) {
     *out = (struct pcie1_status){.ep_count = topology_count};
+    for (u32 i = 0U; i < 4U; i++)
+        out->eps[i] = (struct pcie1_ep){
+            .bus=path_buses[i], .dev=path_devices[i],
+            .vendor=i < 2U ? 0x10B5U : 0x8086U,
+            .device=i < 2U ? 0x8748U : (i == 2U ? 0xE2FFU : 0xE2F0U),
+            .hdr_type=1U, .sec_bus=path_buses[i + 1U], .sub_bus=9U};
+    if (duplicate_parent) out->eps[4] = out->eps[3];
 }
 u32 pcie1_cfg_read(u32 bus, u32 dev, u32 func, u32 reg) {
     (void)func;
     if (reg == 4U) return commands[bus][dev];
     if (reg == 0xFB4U && (bus == 1U || bus == 2U))
         return 1U;
-    if (reg == 0x100U && (bus == 3U || bus == 4U))
+    if (reg == 0x100U && (bus == 7U || bus == 8U))
         return 1U;
     if (reg == 0U) {
         if (bus == 1U || bus == 2U) return 0x874810B5U;
-        if (bus == 3U) return 0xE2FF8086U;
-        if (bus == 4U) return 0xE2F08086U;
-        return 0xE2128086U;
+        if (bus == 7U) return 0xE2FF8086U;
+        if (bus == 8U) return 0xE2F08086U;
+        return (u32)selected_device << 16 | 0x8086U;
     }
-    if (reg == 0x18U) return 0x00050500U;
+    if (reg == 0x18U) return 0x00090900U;
     if (reg == 0x20U) return 0x80F08000U;
     if (reg == 0x10U) return bar_lo == ~0U ? 0xFF00000CU : bar_lo;
     if (reg == 0x14U) return bar_hi;
@@ -103,7 +113,7 @@ void pcie1_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 value) {
             bme_writes++;
         commands[bus][dev] = value;
     } else {
-        assert(bus == 5U && dev == 0U && !(commands[bus][dev] & 7U));
+        assert(bus == 9U && dev == 0U && !(commands[bus][dev] & 7U));
         assert(reg == 0x10U || reg == 0x14U);
         if (reg == 0x10U) bar_lo = value;
         else bar_hi = value;
@@ -112,7 +122,7 @@ void pcie1_cfg_write(u32 bus, u32 dev, u32 func, u32 reg, u32 value) {
 }
 void lzero_status(struct lzero_status *out) {
     *out = (struct lzero_status){
-        .bars_probed = true, .bar0_mapped = true, .gpu_bus = 5U,
+        .bars_probed = true, .bar0_mapped = true, .gpu_bus = 9U,
         .bar0_size = 0x1000000ULL
     };
 }
@@ -267,12 +277,19 @@ static void contains(u32 op, const char *text) {
 int main(void) {
     for (u32 i = 0U; i < sizeof(firmware_blob); i++)
         firmware_blob[i] = (u8)(i * 17U + 3U);
-    commands[1][0] = commands[2][8] = commands[3][0] =
-        commands[4][1] = commands[5][0] = 2U;
+    for (u32 i = 0U; i < 5U; i++)
+        commands[path_buses[i]][path_devices[i]] = 2U;
     core = 1U;
     contains(B50_NATIVE_ATTACH, "core-0");
     assert(!writes);
     core = 0U;
+    selected_device = PCIE1_DID_B60;
+    contains(B50_NATIVE_ATTACH, "path identity/topology not proven");
+    selected_device = PCIE1_DID_B50;
+    duplicate_parent = true;
+    contains(B50_NATIVE_ATTACH, "path identity/topology not proven");
+    duplicate_parent = false;
+    assert(!writes);
     contains(B50_NATIVE_VALIDATE, "validation PASS");
     bar_lo = 0x80000004U;
     contains(B50_NATIVE_VALIDATE, "validation PASS");
@@ -285,7 +302,7 @@ int main(void) {
     struct b50_native_diag validation_snapshot;
     b50_native_diag(&validation_snapshot);
     assert(validation_snapshot.validation_failure_stage == 40U);
-    assert(!(commands[5][0] & 4U));
+    assert(!(commands[9][0] & 4U));
     gen3 = true;
     nc = false;
     contains(B50_NATIVE_ATTACH, "quarantined");
@@ -301,7 +318,10 @@ int main(void) {
     assert(b50_native_blocks_legacy());
     assert(top && bottom);
     contains(B50_NATIVE_PREFLIGHT, "CPU-owned redzones passed");
-    for (u32 i = 0; i < 128U; i++) assert(arena[i] == 0xDDU);
+    for (u32 i = 0; i < 64U; i++) {
+        assert(arena[i] == 0xDDU);
+        assert(arena[PCIE1_CONTAINMENT_DMA_HEAD_BYTES + i] == 0xDDU);
+    }
     for (u32 i = sizeof(arena) - 64U; i < sizeof(arena); i++)
         assert(arena[i] == 0xDDU);
     contains(B50_NATIVE_STAGE, "staging scheduled");

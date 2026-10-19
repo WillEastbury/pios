@@ -193,6 +193,7 @@ static uint8_t pv_arena_get(pv_ctx *ctx, uint32_t a)
 pv_storage_fn pv_storage_hook = 0;
 pv_block_fn pv_block_hook = 0;
 pv_tensor_fn pv_tensor_hook = 0;
+pv_execsched_fn pv_execsched_hook = 0;
 pv_compute_fn pv_compute_hook = 0;
 pv_net_fn pv_net_hook = 0;
 pv_media_fn pv_media_hook = 0;
@@ -2741,6 +2742,11 @@ void pv_default_host(pv_ctx *ctx, int hook, int rd, int rs1, int rs2, int imm16)
         hook == PV_HOOK_TENSOR_SELECTEDBACKEND) {
         if (pv_tensor_hook && pv_tensor_hook(ctx, hook, rd, rs1, rs2)) return;
         ctx->regs[rd] = -4; /* explicit selection requires an admitted native host */
+        return;
+    }
+    if (hook >= PV_HOOK_EXECSCHED_SUBMIT && hook <= PV_HOOK_EXECSCHED_REUSE) {
+        if (pv_execsched_hook && pv_execsched_hook(ctx, hook, rd, rs1, rs2)) return;
+        ctx->regs[rd] = -4;
         return;
     }
     if (hook >= PV_HOOK_TENSOR_SETSHAPE && hook <= PV_HOOK_TENSOR_HASACCEL) {

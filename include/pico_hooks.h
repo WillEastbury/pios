@@ -405,6 +405,10 @@
 #define PV_HOOK_TENSOR_HASACCEL                  0x1EB
 #define PV_HOOK_TENSOR_MATVECPINNED              0x3EA
 #define PV_HOOK_TENSOR_SELECTEDBACKEND           0x3EB
+#define PV_HOOK_EXECSCHED_SUBMIT                 0x3EC
+#define PV_HOOK_EXECSCHED_REPLY                  0x3ED
+#define PV_HOOK_EXECSCHED_WHERE                  0x3EE
+#define PV_HOOK_EXECSCHED_REUSE                  0x3EF
 #define PV_HOOK_BITLINEAR_SETSHAPE               0x1F0
 #define PV_HOOK_BITLINEAR_MATVECTERNARY          0x1F1
 #define PV_HOOK_BITLINEAR_MATVECBITMAP           0x1F2

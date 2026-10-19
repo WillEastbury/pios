@@ -159,7 +159,9 @@ extern pv_block_fn pv_block_hook;
 /* Optional native tensor accelerator. Return non-zero when handled; returning
  * zero falls through to the deterministic pure-C Tensor.* implementation. */
 typedef int (*pv_tensor_fn)(pv_ctx *ctx, int hook, int rd, int rs1, int rs2);
+typedef pv_tensor_fn pv_execsched_fn;
 extern pv_tensor_fn pv_tensor_hook;
+extern pv_execsched_fn pv_execsched_hook;
 
 /* Optional coarse compute provider for mapped tensors, CAT-Q transforms,
  * asynchronous jobs, and model-shard I/O. The provider owns all opaque handles

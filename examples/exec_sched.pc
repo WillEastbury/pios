@@ -1,0 +1,15 @@
+// Host admits the fabric, the current model, and which tensors are resident.
+// The script asks where a layer lives, submits one request, and reads the
+// oldest FIFO reply. It does not name a BDF, claim a shard, or copy bytes.
+int where = ExecSched.Where(3, 7);
+int request = Bits.Or(Bits.Shl(3, 16), 7);
+int handle = ExecSched.Submit(request, 0);
+int reply = ExecSched.Reply();
+Io.WriteByte(where);
+Io.WriteByte(Bits.And(handle, 255));
+Io.WriteByte(Bits.And(Bits.Shr(reply, 25), 1));
+Io.WriteByte(Bits.And(Bits.Shr(reply, 24), 1));
+Io.WriteByte(Bits.And(Bits.Shr(reply, 16), 255));
+Io.WriteByte(Bits.And(Bits.Shr(reply, 8), 255));
+Io.WriteByte(Bits.And(reply, 255));
+Io.WriteByte(ExecSched.Reuse());

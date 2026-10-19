@@ -16,9 +16,11 @@
 #define PCIE1_CONTAINMENT_DMA_SLOT_COUNT      8U
 #define PCIE1_CONTAINMENT_DMA_SLOT_BYTES      0x00040000U
 #define PCIE1_CONTAINMENT_DMA_GUARD_BYTES     64U
+#define PCIE1_CONTAINMENT_DMA_HEAD_BYTES      4096U
 #define PCIE1_CONTAINMENT_DMA_PAYLOAD_BYTES   \
     (PCIE1_CONTAINMENT_DMA_SLOT_BYTES -       \
-     2U * PCIE1_CONTAINMENT_DMA_GUARD_BYTES)
+     PCIE1_CONTAINMENT_DMA_HEAD_BYTES -       \
+     PCIE1_CONTAINMENT_DMA_GUARD_BYTES)
 #define PCIE1_CONTAINMENT_DMA_ALIGNMENT       64U
 #define PCIE1_CONTAINMENT_IOVA_BASE           0x1000000000ULL
 #define PCIE1_CONTAINMENT_TIMEOUT_MAX_MS      60000ULL
@@ -37,6 +39,8 @@ _Static_assert(PCIE1_CONTAINMENT_DMA_SLOT_COUNT *
                "PCIe1 canary slots must consume the exact canary region");
 _Static_assert(PCIE1_CONTAINMENT_DMA_PAYLOAD_BYTES > 0U,
                "PCIe1 DMA slots must retain guarded payload space");
+_Static_assert((PCIE1_CONTAINMENT_DMA_HEAD_BYTES & 4095U) == 0U,
+               "PCIe1 DMA payloads must begin on a 4 KiB boundary");
 
 enum pcie1_containment_endpoint_state {
     PCIE1_CONTAINMENT_ENDPOINT_FREE = 0U,
@@ -261,6 +265,18 @@ bool pcie1_containment_dma_publish(
     struct pcie1_containment *contract,
     const struct pcie1_containment_endpoint_handle *endpoint,
     const struct pcie1_containment_dma_handle *handle, u32 caller_core);
+/* Bounded scheduled-context polling path for bootstrap/admin commands. It is
+ * mutually exclusive with an armed MSI lifecycle and never runs in IRQ. */
+bool pcie1_containment_dma_publish_polled(
+    struct pcie1_containment *contract,
+    const struct pcie1_containment_endpoint_handle *endpoint,
+    const struct pcie1_containment_dma_handle *handle, u32 caller_core);
+bool pcie1_containment_dma_complete_polled(
+    struct pcie1_containment *contract,
+    const struct pcie1_containment_endpoint_handle *endpoint,
+    const struct pcie1_containment_dma_handle *handle, u32 caller_core,
+    const struct pcie1_containment_completion *completion,
+    bool guards_intact);
 bool pcie1_containment_completion_submit(
     struct pcie1_containment *contract,
     const struct pcie1_containment_endpoint_handle *endpoint,

@@ -57,6 +57,7 @@
 #include "pix.h"
 #include "pcie.h"
 #include "pcie1.h"
+#include "nvme_pcie.h"
 #include "b50_native.h"
 #include "module.h"
 #include "tensor_module.h"
@@ -6640,6 +6641,83 @@ static void http_exec_terminal_command(char *out, u32 *len_ptr, u32 max, char *c
         http_append(out, &len, max, " ");
         http_append_hex32(out, &len, max, a.hdr3);
         http_append(out, &len, max, clear ? " cleared\n" : "\n");
+    } else if (http_streq(cmd, "nvme") || http_streq(cmd, "nvme status") ||
+               http_streq(cmd, "nvme probe") ||
+               http_streq(cmd, "nvme identify") ||
+               http_streq(cmd, "nvme revoke")) {
+        if (http_streq(cmd, "nvme probe"))
+            (void)nvme_pcie_probe();
+        else if (http_streq(cmd, "nvme identify"))
+            (void)nvme_pcie_identify();
+        else if (http_streq(cmd, "nvme revoke"))
+            nvme_pcie_revoke();
+        struct nvme_pcie_status nv;
+        nvme_pcie_status_get(&nv);
+        http_append(out, &len, max, "nvme state=");
+        http_append_u64(out, &len, max, nv.state);
+        http_append(out, &len, max, " fault=");
+        http_append_u64(out, &len, max, nv.fault);
+        http_append(out, &len, max, " bdf=");
+        http_append_hex32(out, &len, max, nv.bdf);
+        http_append(out, &len, max, " id=");
+        http_append_hex32(out, &len, max, nv.identity);
+        http_append(out, &len, max, " cmd=");
+        http_append_hex32(out, &len, max, nv.command);
+        http_append(out, &len, max, " bar=");
+        http_append_u64(out, &len, max, nv.bar_size);
+        http_append(out, &len, max, " cap=");
+        http_append_hex64(out, &len, max, nv.cap);
+        http_append(out, &len, max, " vs=");
+        http_append_hex32(out, &len, max, nv.version);
+        http_append(out, &len, max, " q=");
+        http_append_u64(out, &len, max, nv.queue_entries);
+        http_append(out, &len, max, " db=");
+        http_append_u64(out, &len, max, nv.doorbell_stride);
+        http_append(out, &len, max, " timeout=");
+        http_append_u64(out, &len, max, nv.timeout_ms);
+        http_append(out, &len, max, " mps=");
+        http_append_u64(out, &len, max, nv.mpsmin);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, nv.mpsmax);
+        http_append(out, &len, max, " nvm=");
+        http_append_u64(out, &len, max, nv.nvm_command_set);
+        http_append(out, &len, max, " identify=");
+        http_append_u64(out, &len, max, nv.identify_ok);
+        http_append(out, &len, max, " ns=");
+        http_append_u64(out, &len, max, nv.namespace_count);
+        http_append(out, &len, max, " stage=");
+        http_append_u64(out, &len, max, nv.identify_stage);
+        http_append(out, &len, max, " csts=");
+        http_append_hex32(out, &len, max, nv.controller_status);
+        http_append(out, &len, max, " cqe=");
+        http_append_hex32(out, &len, max, nv.completion_status);
+        http_append(out, &len, max, "/");
+        http_append_u64(out, &len, max, nv.completion_cid);
+        http_append(out, &len, max, " nsid=");
+        http_append_u64(out, &len, max, nv.namespace_identify_ok);
+        http_append(out, &len, max, " io=");
+        http_append_u64(out, &len, max, nv.io_ready);
+        http_append(out, &len, max, "\n");
+        if (nv.identify_ok) {
+            http_append(out, &len, max, "  model=");
+            http_append(out, &len, max, (const char *)nv.model);
+            http_append(out, &len, max, " serial=");
+            http_append(out, &len, max, (const char *)nv.serial);
+            http_append(out, &len, max, " fw=");
+            http_append(out, &len, max, (const char *)nv.firmware);
+            http_append(out, &len, max, "\n");
+        }
+        if (nv.namespace_identify_ok) {
+            http_append(out, &len, max, "  blocks=");
+            http_append_u64(out, &len, max, nv.namespace_blocks);
+            http_append(out, &len, max, " block_bytes=");
+            http_append_u64(out, &len, max, nv.block_bytes);
+            http_append(out, &len, max, " capacity=");
+            http_append_u64(out, &len, max, nv.namespace_bytes);
+            http_append(out, &len, max, " max_transfer=");
+            http_append_u64(out, &len, max, nv.max_transfer_bytes);
+            http_append(out, &len, max, "\n");
+        }
     } else if (http_streq(cmd, "pcie1") || http_streq(cmd, "pcie1 status") ||
                http_streq(cmd, "pcie1 scan")) {
         struct pcie1_status p1;

@@ -1,0 +1,11 @@
+// Two submits share one resident tensor. The first names another online
+// device, so it waits on fabric DMA. The second names that same other device.
+// Reply must stay on the older job even after the newer one completes.
+int request = Bits.Or(Bits.Shl(3, 16), 7);
+int first = ExecSched.Submit(request, 4);
+int second = ExecSched.Submit(request, 4);
+int reply = ExecSched.Reply();
+Io.WriteByte(Bits.And(first, 255));
+Io.WriteByte(Bits.And(second, 255));
+Io.WriteByte(reply + 128);
+Io.WriteByte(ExecSched.Reuse());

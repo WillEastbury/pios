@@ -13,6 +13,8 @@
 #define NVME_PCI_PROGIF_NVME         0x02U
 
 #define NVME_ADMIN_IDENTIFY          0x06U
+#define NVME_ADMIN_CREATE_IO_SQ      0x01U
+#define NVME_ADMIN_CREATE_IO_CQ      0x05U
 #define NVME_IDENTIFY_CONTROLLER     0x01U
 #define NVME_IDENTIFY_BYTES          4096U
 #define NVME_IDENTIFY_NAMESPACE       0x00U
@@ -334,6 +336,13 @@ static inline bool nvme_status_success(u16 status)
 bool nvme_identify_buffer_valid(u64 address, u32 length);
 bool nvme_build_identify_controller(struct nvme_admin_cmd *cmd,
                                     u64 data_address, u32 data_length);
+bool nvme_build_identify_namespace(struct nvme_admin_cmd *cmd, u32 namespace_id,
+                                   u64 data_address, u32 data_length);
+bool nvme_build_create_io_cq(struct nvme_admin_cmd *, u16 queue_id,
+                             u16 depth, u64 queue_address);
+bool nvme_build_create_io_sq(struct nvme_admin_cmd *, u16 queue_id,
+                             u16 completion_queue_id, u16 depth,
+                             u64 queue_address);
 bool nvme_identify_parse(const u8 *data, u32 length,
                          struct nvme_identify_info *out);
 /* Queue initialization is one-shot over fresh all-zero storage. */

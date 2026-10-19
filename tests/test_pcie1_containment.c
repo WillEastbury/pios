@@ -77,7 +77,8 @@ static void test_layout_and_initialization(void)
     CHECK(PIOS_DMA_PCIE1_CANARY_SIZE == 0x00200000UL);
     CHECK(PCIE1_CONTAINMENT_DMA_SLOT_COUNT == 8U);
     CHECK(PCIE1_CONTAINMENT_DMA_SLOT_BYTES == 0x00040000U);
-    CHECK(PCIE1_CONTAINMENT_DMA_PAYLOAD_BYTES == 0x0003FF80U);
+    CHECK(PCIE1_CONTAINMENT_DMA_HEAD_BYTES == 0x00001000U);
+    CHECK(PCIE1_CONTAINMENT_DMA_PAYLOAD_BYTES == 0x0003EFC0U);
     CHECK(PCIE1_CONTAINMENT_DMA_SLOT_COUNT *
           PCIE1_CONTAINMENT_DMA_SLOT_BYTES ==
               PIOS_DMA_PCIE1_CANARY_SIZE);
@@ -161,9 +162,9 @@ static void test_dma_slots_and_saturation(void)
         CHECK(pcie1_containment_dma_span_get(
             &contract, &handles[i], 0U, &span));
         CHECK(span.payload_cpu_phys == allocation_cpu +
-              PCIE1_CONTAINMENT_DMA_GUARD_BYTES);
+              PCIE1_CONTAINMENT_DMA_HEAD_BYTES);
         CHECK(span.payload_iova == allocation_iova +
-              PCIE1_CONTAINMENT_DMA_GUARD_BYTES);
+              PCIE1_CONTAINMENT_DMA_HEAD_BYTES);
         CHECK(span.endpoint_generation == ENDPOINT_GENERATION);
         CHECK(span.slot_generation == handles[i].generation);
         CHECK(span.request_id == 100U + i);
@@ -500,6 +501,30 @@ static void test_generation_exhaustion(void)
     CHECK(contract.msi.exhausted == 1U);
 }
 
+static void test_polled_admin_completion(void)
+{
+    struct pcie1_containment contract;
+    struct pcie1_containment_endpoint_handle endpoint;
+    struct pcie1_containment_dma_handle handle;
+    struct pcie1_containment_completion completion;
+    enum pcie1_containment_dma_state state;
+
+    init_contract(&contract, &endpoint);
+    CHECK(pcie1_containment_dma_acquire(
+        &contract, &endpoint, 0U, 1U, 4096U,
+        PCIE1_CONTAINMENT_FROM_DEVICE, 0U, 100U, &handle));
+    CHECK(pcie1_containment_dma_publish_polled(
+        &contract, &endpoint, &handle, 0U));
+    completion = make_completion(&handle, 4096U, true);
+    CHECK(pcie1_containment_dma_complete_polled(
+        &contract, &endpoint, &handle, 0U, &completion, true));
+    CHECK(pcie1_containment_dma_state_get(
+        &contract, &handle, 0U, &state));
+    CHECK(state == PCIE1_CONTAINMENT_DMA_CPU_COMPLETE);
+    CHECK(pcie1_containment_dma_release(
+        &contract, &endpoint, &handle, 0U));
+}
+
 int main(void)
 {
     test_layout_and_initialization();
@@ -507,6 +532,7 @@ int main(void)
     test_validation_and_msi_continuation();
     test_fault_containment();
     test_generation_exhaustion();
+    test_polled_admin_completion();
 
     CHECK(checks > 250);
     if (failures) {

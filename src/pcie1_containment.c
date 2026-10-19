@@ -348,9 +348,9 @@ static bool dma_acquire_locked(
         allocation_iova = PCIE1_CONTAINMENT_IOVA_BASE +
                           (u64)i * PCIE1_CONTAINMENT_DMA_SLOT_BYTES;
         span->payload_cpu_phys =
-            allocation_cpu + PCIE1_CONTAINMENT_DMA_GUARD_BYTES;
+            allocation_cpu + PCIE1_CONTAINMENT_DMA_HEAD_BYTES;
         span->payload_iova =
-            allocation_iova + PCIE1_CONTAINMENT_DMA_GUARD_BYTES;
+            allocation_iova + PCIE1_CONTAINMENT_DMA_HEAD_BYTES;
         span->endpoint_generation = endpoint->generation;
         span->slot_generation = control->generation;
         span->request_id = request_id;
@@ -871,6 +871,65 @@ bool pcie1_containment_dma_publish(
     bool result = dma_publish_locked(
         contract, endpoint, handle, caller_core);
     containment_irq_restore(irq_state);
+    return result;
+}
+
+bool pcie1_containment_dma_publish_polled(
+    struct pcie1_containment *contract,
+    const struct pcie1_containment_endpoint_handle *endpoint,
+    const struct pcie1_containment_dma_handle *handle, u32 caller_core)
+{
+    u64 daif = containment_irq_save();
+    struct pcie1_containment_dma_control *control;
+    bool result = endpoint_active(contract, endpoint, caller_core) &&
+        dma_handle_control(contract, handle, caller_core, &control, NULL) &&
+        control->state == PCIE1_CONTAINMENT_DMA_CPU_OWNED &&
+        contract->msi.state == PCIE1_CONTAINMENT_MSI_UNBOUND;
+    if (result) {
+        dmb();
+        publish_dma_state(control, PCIE1_CONTAINMENT_DMA_DEVICE_OWNED);
+    }
+    containment_irq_restore(daif);
+    return result;
+}
+
+bool pcie1_containment_dma_complete_polled(
+    struct pcie1_containment *contract,
+    const struct pcie1_containment_endpoint_handle *endpoint,
+    const struct pcie1_containment_dma_handle *handle, u32 caller_core,
+    const struct pcie1_containment_completion *completion,
+    bool guards_intact)
+{
+    u64 daif = containment_irq_save();
+    struct pcie1_containment_dma_control *control;
+    u32 slot;
+    bool result = endpoint_active(contract, endpoint, caller_core) &&
+        completion && dma_handle_control(contract, handle, caller_core,
+                                          &control, &slot) &&
+        control->state == PCIE1_CONTAINMENT_DMA_DEVICE_OWNED &&
+        contract->msi.state == PCIE1_CONTAINMENT_MSI_UNBOUND;
+    if (result &&
+        (completion->endpoint_generation != endpoint->generation ||
+         completion->slot_generation != handle->generation ||
+         completion->slot_generation !=
+             contract->spans[slot].slot_generation ||
+         completion->request_id != handle->request_id ||
+         completion->request_id != control->request_id ||
+         completion->actual > contract->spans[slot].requested ||
+         completion->success > 1U || !guards_intact)) {
+        quarantine_internal(contract, guards_intact ?
+            PCIE1_CONTAINMENT_FAULT_COMPLETION :
+            PCIE1_CONTAINMENT_FAULT_RED_ZONE);
+        result = false;
+    }
+    if (result) {
+        dmb();
+        control->actual = completion->actual;
+        publish_dma_state(control, completion->success ?
+            PCIE1_CONTAINMENT_DMA_CPU_COMPLETE :
+            PCIE1_CONTAINMENT_DMA_FAILED);
+    }
+    containment_irq_restore(daif);
     return result;
 }
 

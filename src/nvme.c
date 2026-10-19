@@ -68,6 +68,50 @@ bool nvme_build_identify_controller(struct nvme_admin_cmd *cmd,
     return true;
 }
 
+bool nvme_build_identify_namespace(struct nvme_admin_cmd *cmd, u32 namespace_id,
+                                   u64 data_address, u32 data_length)
+{
+    if (!cmd || !namespace_id ||
+        !nvme_identify_buffer_valid(data_address, data_length))
+        return false;
+    *cmd = (struct nvme_admin_cmd){0};
+    cmd->cdw0 = NVME_ADMIN_IDENTIFY;
+    cmd->nsid = namespace_id;
+    cmd->prp1 = data_address;
+    cmd->cdw10 = NVME_IDENTIFY_NAMESPACE;
+    return true;
+}
+
+bool nvme_build_create_io_cq(struct nvme_admin_cmd *cmd, u16 queue_id,
+                             u16 depth, u64 queue_address)
+{
+    if (!cmd || !queue_id || !nvme_queue_depth_valid(depth) ||
+        !queue_address || (queue_address & 0xFFFULL))
+        return false;
+    *cmd = (struct nvme_admin_cmd){0};
+    cmd->cdw0 = NVME_ADMIN_CREATE_IO_CQ;
+    cmd->prp1 = queue_address;
+    cmd->cdw10 = ((u32)(depth - 1U) << 16) | queue_id;
+    cmd->cdw11 = 1U; /* Physically contiguous, interrupts disabled. */
+    return true;
+}
+
+bool nvme_build_create_io_sq(struct nvme_admin_cmd *cmd, u16 queue_id,
+                             u16 completion_queue_id, u16 depth,
+                             u64 queue_address)
+{
+    if (!cmd || !queue_id || !completion_queue_id ||
+        !nvme_queue_depth_valid(depth) || !queue_address ||
+        (queue_address & 0xFFFULL))
+        return false;
+    *cmd = (struct nvme_admin_cmd){0};
+    cmd->cdw0 = NVME_ADMIN_CREATE_IO_SQ;
+    cmd->prp1 = queue_address;
+    cmd->cdw10 = ((u32)(depth - 1U) << 16) | queue_id;
+    cmd->cdw11 = ((u32)completion_queue_id << 16) | 1U;
+    return true;
+}
+
 bool nvme_identify_parse(const u8 *data, u32 length,
                          struct nvme_identify_info *out)
 {
