@@ -59,3 +59,35 @@ assert builder.PART1_START == 2048
 assert part3_start == builder.PART1_START + builder.PART1_SECTORS + builder.PART2_SECTORS
 assert builder.PART3_SECTORS >= 65525
 print("qemu disk image optional PIOSXFER layout: PASS")
+
+payload = b"stage2" * 100
+config = b"# boot fixture\n" * 50
+part1 = builder.build_fat32_partition(
+    payload, builder.PART1_SECTORS, builder.PART1_START, b"PIOS BOOT  ",
+    boot_config=config,
+)
+data_start = builder.RESERVED + builder.FATS * le32(part1, 36)
+root_offset = data_start * builder.SECTOR
+assert part1[root_offset:root_offset + 11] == b"PIOSSTG2PKG"
+entry = part1[root_offset + 32:root_offset + 64]
+assert entry[:11] == b"PIOS    INI" and le32(entry, 28) == len(config)
+first = le16(entry, 26) | (le16(entry, 20) << 16)
+assert first == 5  # stage2 occupies clusters 3 and 4
+offset = (data_start + first - 2) * builder.SECTOR
+assert part1[offset:offset + len(config)] == config
+fat_start = builder.RESERVED * builder.SECTOR
+assert le32(part1, fat_start + first * 4) == first + 1
+assert le32(part1, fat_start + (first + 1) * 4) == builder.EOC
+assert part1[(data_start + 1) * builder.SECTOR:
+             (data_start + 1) * builder.SECTOR + len(payload)] == payload
+for invalid_config in (b"", b"x" * 4097):
+    try:
+        builder.build_fat32_partition(
+            payload, builder.PART1_SECTORS, builder.PART1_START, b"PIOS BOOT  ",
+            boot_config=invalid_config,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid bootstrap file size accepted")
+print("qemu disk image FAT-root pios.ini: PASS")

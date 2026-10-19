@@ -1,0 +1,25 @@
+# Copy to pios.ini at the FAT boot partition root, not beside the WALFS image.
+# Provision a fresh random 32-byte enrollment key as 64 hex digits.
+# The placeholder below is deliberately invalid. Never commit a real key.
+[network]
+ip=192.168.0.201
+mask=255.255.0.0
+gateway=192.168.0.1
+dns=192.168.0.1
+
+# Omit this entire section for standalone network configuration.
+[cluster]
+name=lab
+# Stable 16-byte cluster identity (32 hex digits).
+cluster_id=REPLACE_WITH_32_HEX_DIGITS
+# Fresh 32-byte enrollment secret (64 hex digits).
+root_bootstrap_key=REPLACE_WITH_64_HEX_DIGITS
+seed1=192.168.0.201
+seed2=192.168.0.203
+seed3=192.168.0.204
+
+# Both server roles are denied by default. PIOS records these intent flags but
+# will not open a listener until the corresponding PicoScript service exists.
+[services]
+dns_service=off
+dhcp_service=off

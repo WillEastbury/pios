@@ -93,6 +93,77 @@ enabled and pending firmware interrupts would storm `irq_handler` before
 `gic_init()`), EL2→EL1, SCTLR, NEON, SP/SP_EL1, `VBAR_EL1`, BSS clear,
 `kernel_main()`.
 
+### 1.7 Node bootstrap configuration
+
+Copy `pios.ini.example` to **`/pios.ini` at the FAT boot partition root**.
+This is separate from Raspberry firmware `config.txt` and the WALFS root.
+Stage2 reads it after block-storage initialization and before NIC/IP stack
+initialization. A missing/unavailable file selects the non-blocking DHCP
+client; no kernel service listener is enabled until it receives a valid lease.
+When a valid `[network]` section is present, its static configuration is used
+instead and DHCP is not started. A file may intentionally omit `[network]`
+(for example, to provision only cluster identity or service roles), which also
+selects the DHCP client. Read errors, oversized files and malformed
+configuration reject the entire configuration, including cluster material; the
+existing recovery static defaults remain in force rather than treating a
+malformed file as a request to trust DHCP. The boot file is read-only from
+PIOS.
+
+`[network]`, when present, requires `ip`, `mask`, `gateway` and `dns` as
+dotted decimal IPv4.
+Use `gateway=0.0.0.0` for an on-link-only node. Masks must be contiguous
+(`/1` through `/32`); ordinary subnet network/broadcast node addresses,
+multicast, unspecified and loopback addresses are rejected. A nonzero gateway
+must be a different host on the node's subnet. Configured addresses replace
+the compiled defaults on the boot NIC, including BCM2837-family Wi-Fi.
+Unconfigured Pi5 secondary Wi-Fi settings are unchanged.
+
+`[cluster]` is optional. If present it requires:
+
+- `name`: one DNS label, 1–63 ASCII letters/digits/hyphens, no edge hyphens;
+  normalized to lowercase. The approved zone is `<name>.pios.home.arpa`;
+  services will use `<service>.<tenant>.<name>.pios.home.arpa`.
+- `cluster_id`: a stable nonzero 16-byte cluster identity encoded as 32 hex
+  digits. It is distinct from the human-readable DNS label and prevents
+  accidental federation of clusters with the same name.
+- `root_bootstrap_key`: a fresh, nonzero 32-byte secret encoded as 64 hex digits.
+  The shipped placeholder is intentionally invalid. Provision the same
+  enrollment key to the initial nodes using a trusted offline path, never
+  commit it, and protect physical access to the FAT boot medium: FAT has no
+  meaningful per-file permissions.
+- `seed1` through `seedN`: 3–8 distinct unicast IPv4 addresses, numbered
+  contiguously. A seed may include this node. Off-subnet seeds require a
+  nonzero gateway. Seeds are discovery hints, not voting membership.
+
+`[services]` is optional. `dns_service` and `dhcp_service` accept only `on`
+or `off` and default to `off`. They are retained as explicit provisioning
+intent, but currently fail closed: PIOS logs an enabled request and opens no
+DNS or DHCP server listener until the corresponding authenticated PicoScript
+service is implemented. These flags never alter the DHCP *client* selection.
+
+The parser accepts LF/CRLF, blank lines, leading/trailing spaces and full-line
+`#`/`;` comments. Section/key names are case-sensitive. Duplicate sections,
+duplicate/unknown keys, inline comments, embedded NUL/control bytes, lines
+over 256 bytes and files over 4096 bytes are rejected. Source text and
+temporary decoded key copies are explicitly wiped after loading. Accepted
+cluster bootstrap material remains kernel-private, immutable after boot and
+excluded from status/console output; ordinary network settings remain visible.
+
+**Current milestone:** static-or-DHCP client networking and bootstrap
+configuration loading only. No enrollment, sealed node identity, cluster DNS
+listener, replicated storage, SMB listener or cross-node FIFO endpoint is
+activated by this file.
+Those depend on the approved PicoScript service/capability work recorded in
+the architecture decision log. The existing development TLS certificate is
+not an enrolled cluster identity.
+
+The QEMU disk builder accepts `--boot-config <path>` to copy a provisioned file
+to FAT p1. Treat the resulting disk image as secret-bearing. Run
+`python tools\qemu_boot_config.py` after building the full QEMU kernel to prove
+missing-file standalone boot, configured network and cluster provisioning,
+whole-file rejection, actual HTTP reachability at the changed IP, and absence
+of the fixture key from boot/status/network diagnostics.
+
 ---
 
 ## 2. A/B slots and OTA
@@ -207,7 +278,8 @@ p2, while retaining an invalid p3 only as a diagnostic. The strict
 three-partition `storage_layout_validate_exchange()` gate alone authorizes p3
 for exchange attachment. The active bit is diagnostic only, not storage
 authority. The volume label is descriptive only and is not inferred from the
-MBR.
+
+The volume label is descriptive only and is not inferred from the MBR.
 
 Two-partition p1/p2 cards remain `legacy-2` compatible for WALFS mounting and
 report a missing exchange volume. At boot, any mountable FAT32 p3 attaches

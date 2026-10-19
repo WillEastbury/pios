@@ -286,6 +286,24 @@ void net_firewall_install_defaults(void) {
     nic_filter_clear();
     nic_filter_set_default(false, true);
 
+    /*
+     * DHCP starts before an interface owns an address. Allow only RFC 2131
+     * broadcast replies to UDP/68 through the otherwise deny-by-default
+     * ingress firewall; the DHCP state machine still validates XID, cookie,
+     * server identity and lease bounds before accepting anything.
+     */
+    simd_zero(&rule, sizeof(rule));
+    rule.direction = NIC_FILTER_DIR_IN;
+    rule.action = NIC_FILTER_ALLOW;
+    rule.iface = NIC_IFACE_ANY;
+    rule.flags = NIC_FILTER_ETHERTYPE | NIC_FILTER_IP_TO |
+                 NIC_FILTER_IP_PROTO | NIC_FILTER_UDP_PORT_TO;
+    rule.ethertype = ETH_P_IP;
+    rule.ip_to = 0xFFFFFFFFU;
+    rule.ip_proto = IP_PROTO_UDP;
+    rule.udp_port_to = 68U;
+    (void)nic_filter_add(&rule);
+
     for (u32 fi = NIC_IFACE_WIRED; fi <= NIC_IFACE_WIFI; fi++) {
         if (!net_ifaces[fi].configured)
             continue;
@@ -1180,7 +1198,9 @@ bool net_ingress_receive(nic_iface_t iface, u8 *frame, u32 frame_max,
                          u32 *len, bool *checksum_trusted)
 {
     if (!frame || !len || frame_max < ETH_FRAME_MAX ||
-        !net_interface_configured(iface) || !nic_iface_active(iface))
+        !nic_iface_active(iface) ||
+        (!net_interface_configured(iface) &&
+         !(iface == net_current_iface && our_ip == 0U)))
         return false;
     *len = 0U;
     if (checksum_trusted)
@@ -1190,7 +1210,9 @@ bool net_ingress_receive(nic_iface_t iface, u8 *frame, u32 frame_max,
 
 static bool net_ingress_select_iface(nic_iface_t iface, nic_iface_t *previous_out)
 {
-    if (!net_interface_configured(iface) || !nic_iface_active(iface))
+    if (!nic_iface_active(iface) ||
+        (!net_interface_configured(iface) &&
+         !(iface == net_current_iface && our_ip == 0U)))
         return false;
     nic_iface_t previous = net_current_iface;
     if (previous != iface) {
@@ -1486,10 +1508,12 @@ void net_init_on(nic_iface_t iface, u32 ip, u32 gateway, u32 netmask,
     uart_hex(gateway);
     uart_puts(" (ARP+TCP/UDP)\n");
 
-    /* Announce our presence on the network */
-    pcie_aer_dump("pre-ARP");
-    arp_announce();
-    pcie_aer_dump("post-ARP");
+    /* An addressless DHCP bootstrap has nothing valid to announce. */
+    if (ip != 0U) {
+        pcie_aer_dump("pre-ARP");
+        arp_announce();
+        pcie_aer_dump("post-ARP");
+    }
 
     uart_puts("[net] post-announce:\n");
     uart_puts("[net] link="); uart_hex(nic_link_up() ? 1 : 0); uart_puts("\n");

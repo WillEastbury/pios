@@ -58,6 +58,9 @@ core.*
 wifi_config.h
 tools/wifi_config.local.json
 
+# Node provisioning contains the cluster enrollment key.
+pios.ini
+
 # WiFi firmware blobs (binary, not for source repo)
 /wifi/
 /wifi_fw_staging/

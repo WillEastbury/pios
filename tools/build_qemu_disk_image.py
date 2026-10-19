@@ -53,12 +53,15 @@ def short_entry(name: bytes, ext: bytes, attr: int, cluster: int, size: int = 0)
 
 
 def build_fat32_partition(payload: bytes, part_sectors: int, start_lba: int,
-                          label: bytes, oem: bytes = b"PIOSFAT ") -> bytearray:
+                          label: bytes, oem: bytes = b"PIOSFAT ",
+                          boot_config: bytes | None = None) -> bytearray:
     """Builds one FAT32 partition image (relative sector 0 == partition start)."""
     if len(label) != 11:
         raise ValueError("FAT32 label must be exactly 11 bytes")
     if len(oem) != 8:
         raise ValueError("FAT32 OEM field must be exactly 8 bytes")
+    if boot_config is not None and not 0 < len(boot_config) <= 4096:
+        raise ValueError("pios.ini must contain 1..4096 bytes")
     fat_sectors = math.ceil((((part_sectors - RESERVED) // SPC) + 2) * 4 / SECTOR)
     while True:
         data_sectors = part_sectors - RESERVED - (FATS * fat_sectors)
@@ -110,15 +113,32 @@ def build_fat32_partition(payload: bytes, part_sectors: int, start_lba: int,
     # FAT32's BPB backup boot sector is at 6; keep its matching FSInfo at 7.
     part[7 * SECTOR:8 * SECTOR] = fsinfo
 
-    file_clusters = math.ceil(len(payload) / (SPC * SECTOR))
-    file_start = 3
     fat_entries = [0] * (clusters + 2)
     fat_entries[0] = 0x0FFFFFF8
     fat_entries[1] = 0xFFFFFFFF
     fat_entries[2] = EOC  # root dir
-    for i in range(file_clusters):
-        c = file_start + i
-        fat_entries[c] = EOC if i + 1 == file_clusters else c + 1
+    root = bytearray(SPC * SECTOR)
+    files = [(FAT_NAME, payload)]
+    if boot_config is not None:
+        files.append((b"PIOS    INI", boot_config))
+    file_start = 3
+    entry_offset = 0
+    for name, content in files:
+        if not content:
+            continue
+        file_clusters = math.ceil(len(content) / (SPC * SECTOR))
+        if file_start + file_clusters > clusters + 2:
+            raise ValueError("boot files exceed FAT32 partition capacity")
+        root[entry_offset:entry_offset + 32] = short_entry(
+            name[:8], name[8:11], 0x20, file_start, len(content))
+        entry_offset += 32
+        for i in range(file_clusters):
+            c = file_start + i
+            fat_entries[c] = EOC if i + 1 == file_clusters else c + 1
+            chunk = content[i * SPC * SECTOR:(i + 1) * SPC * SECTOR]
+            off = cluster_lba(c) * SECTOR
+            part[off:off + len(chunk)] = chunk
+        file_start += file_clusters
 
     fat = bytearray(fat_sectors * SECTOR)
     for i, v in enumerate(fat_entries):
@@ -127,16 +147,7 @@ def build_fat32_partition(payload: bytes, part_sectors: int, start_lba: int,
         start = (RESERVED + (f * fat_sectors)) * SECTOR
         part[start:start + len(fat)] = fat
 
-    root = bytearray(SPC * SECTOR)
-    if payload:
-        root[0:32] = short_entry(FAT_NAME[:8], FAT_NAME[8:11], 0x20,
-                                 file_start, len(payload))
     part[cluster_lba(2) * SECTOR:(cluster_lba(2) * SECTOR) + len(root)] = root
-
-    for i in range(file_clusters):
-        chunk = payload[i * SPC * SECTOR:(i + 1) * SPC * SECTOR]
-        off = cluster_lba(file_start + i) * SECTOR
-        part[off:off + len(chunk)] = chunk
 
     return part
 
@@ -169,9 +180,9 @@ def build_mbr(disk_id: int, exchange: bool) -> bytearray:
 
 
 def build_image(pkg: bytes, out_path: pathlib.Path, disk_id: int,
-                exchange: bool = False) -> None:
+                exchange: bool = False, boot_config: bytes | None = None) -> None:
     part1 = build_fat32_partition(pkg, PART1_SECTORS, PART1_START,
-                                  b"PIOS BOOT  ")
+                                  b"PIOS BOOT  ", boot_config=boot_config)
     part2_start = PART1_START + PART1_SECTORS
     part3_start = part2_start + PART2_SECTORS
     total_sectors = part3_start + (PART3_SECTORS if exchange else 0)
@@ -208,6 +219,8 @@ def main() -> int:
                     help="nonzero 32-bit MBR disk identity (default: generated)")
     ap.add_argument("--exchange", action="store_true",
                        help="add valid FAT32 p3 labelled PIOSXFER")
+    ap.add_argument("--boot-config", type=pathlib.Path,
+                    help="copy node pios.ini to the FAT boot root (contains secrets)")
     args = ap.parse_args()
     pkg = args.pkg.read_bytes()
     if not pkg:
@@ -216,7 +229,8 @@ def main() -> int:
     disk_id &= 0xFFFFFFFF
     if disk_id == 0:
         disk_id = 1
-    build_image(pkg, args.out, disk_id, args.exchange)
+    boot_config = args.boot_config.read_bytes() if args.boot_config else None
+    build_image(pkg, args.out, disk_id, args.exchange, boot_config)
     return 0
 
 

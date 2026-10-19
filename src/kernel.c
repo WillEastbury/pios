@@ -34,6 +34,7 @@
 #include "core_env.h"
 #include "stage0_diag.h"
 #include "boot_precedence.h"
+#include "boot_config.h"
 #include "simd.h"
 #include "mmu.h"
 #include "gic.h"
@@ -169,7 +170,7 @@ u32 pios_strlen(const char *s) {
     return n;
 }
 
-/* ---- Version + network configuration (static - no ARP/DHCP) ---- */
+/* ---- Version + network configuration ---- */
 
 #define MY_IP       IP4(192, 168, 0, 201)
 #define MY_GW       IP4(192, 168, 0, 1)
@@ -177,6 +178,10 @@ u32 pios_strlen(const char *s) {
 
 /* Gateway MAC - MUST be configured (no ARP to discover it) */
 static const u8 MY_GW_MAC[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+static struct boot_config boot_cfg;
+static bool boot_cfg_loaded;
+static bool boot_network_dhcp;
+static bool boot_dhcp_pending;
 
 /* Static neighbor: the dev host PC. Pre-populates the ARP/neighbor table
  * so the Pi can reply to and originate frames to this peer even when
@@ -23950,9 +23955,9 @@ static void hdmi_dashboard_render(void)
     fb_set_color(0x0000CCFF, 0x00000000);
     fb_puts("WIRED IP: ");
     fb_set_color(0x00FFFFFF, 0x00000000);
-    dash_ip(MY_IP);
+    dash_ip(net_get_our_ip_for(NIC_IFACE_WIRED));
     fb_puts("/");
-    fb_printf("%u", dash_prefix_len_from_mask(MY_MASK));
+    fb_printf("%u", dash_prefix_len_from_mask(net_get_netmask_for(NIC_IFACE_WIRED)));
 
     fb_set_cursor(h0, header_row + 2);
     fb_set_color(0x0000CCFF, 0x00000000);
@@ -25367,6 +25372,21 @@ static bool ksvc_timer_poll(void *ctx)
     if (net_interface_configured(NIC_IFACE_WIFI))
         arp_tick_iface(NIC_IFACE_WIFI);
     tcp_tick();
+    if (boot_dhcp_pending) {
+        dhcp_poll();
+        const dhcp_lease_t *lease = dhcp_get_lease();
+        if (lease) {
+            ui_cfg_ip = lease->ip;
+            ui_cfg_mask = lease->mask;
+            ui_cfg_gw = lease->gateway;
+            ui_cfg_dns = lease->dns;
+            ui_cfg_dhcp = true;
+            dns_init(ui_cfg_dns);
+            net_services_listen();
+            boot_dhcp_pending = false;
+            uart_puts("[cfg] DHCP lease applied; network services enabled\n");
+        }
+    }
 #if PIOS_HAS_MACB
     /* Guaranteed-cadence hardware-wedge safety net, independent of RX IRQ
      * activity. CORE0_IO_NET (which also runs these two checks inline) is now
@@ -25825,11 +25845,11 @@ static void boot_diag(bool sd_ok, bool walfs_ok, bool nic_ok, bool usb_ok) {
         nic_get_mac(mac);
         fb_printf("NET:  Cadence MACB/GEM\n");
         fb_printf("  IP:   ");
-        print_ip(MY_IP);
+        print_ip(ui_cfg_ip);
         fb_printf(" / ");
-        print_ip(MY_MASK);
+        print_ip(ui_cfg_mask);
         fb_printf("\n  GW:   ");
-        print_ip(MY_GW);
+        print_ip(ui_cfg_gw);
         fb_printf("\n  PHY:  %s\n", nic_link_up() ? "Link UP" : "Link DOWN");
         fb_printf("  MAC:  %x:%x:%x:%x:%x:%x\n",
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -26738,6 +26758,25 @@ void kernel_main(void) {
     }
     watchdog_hw_pet();
 
+    if (sd_ok) {
+        enum boot_config_status cfg_status = boot_config_load(&boot_cfg);
+        boot_cfg_loaded = cfg_status == BOOT_CONFIG_OK;
+        boot_network_dhcp = cfg_status == BOOT_CONFIG_UNAVAILABLE ||
+                            (boot_cfg_loaded && !boot_cfg.network_configured);
+        if (boot_cfg_loaded) {
+            bp_ok("[cfg] pios.ini accepted");
+            if (boot_cfg.cluster_configured)
+                bp_warn("[cfg] cluster provisioned; enrollment service not yet available");
+        } else if (cfg_status == BOOT_CONFIG_UNAVAILABLE) {
+            bp_log("[cfg] pios.ini unavailable; DHCP client selected");
+        } else {
+            bp_warn("[cfg] pios.ini rejected; retaining recovery static defaults, cluster disabled");
+            uart_puts("[cfg] error=");
+            uart_hex((u32)cfg_status);
+            uart_puts("\n");
+        }
+    }
+
     /* ── Phase 5: NIC (boot-probe macb/genet/virtio; WiFi is nic_load) ── */
     bp_active(5);
     bp_log("[nic] nic_init (probe backends)...");
@@ -26772,29 +26811,50 @@ void kernel_main(void) {
 
     /* Init network stack — only if a NIC was activated. */
     if (nic_ok) {
-        bp_log("[net] net_init (static IP)...");
-#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
-    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
-        if (wifi_boot_ready) {
-            net_init_on(NIC_IFACE_WIFI, WIFI_STATIC_IP, WIFI_STATIC_GW,
-                        WIFI_STATIC_MASK, NULL);
-            ui_cfg_ip = WIFI_STATIC_IP;
-            ui_cfg_mask = WIFI_STATIC_MASK;
-            ui_cfg_gw = WIFI_STATIC_GW;
-            ui_cfg_dns = WIFI_STATIC_GW;
-        } else
-#endif
-        {
-        net_init(MY_IP, MY_GW, MY_MASK, MY_GW_MAC);
-        /* Pin the dev host PC as a static neighbor so we never need ARP
-         * resolution to talk back to it, and unsolicited replies are valid. */
-        net_add_neighbor(HOST_PC_IP, HOST_PC_MAC);
-        (void)net_route_add(HOST_PC_IP, 0xFFFFFFFFU, 0, NET_ROUTE_F_CONNECTED);
-        uart_puts("[net] static neighbor 192.168.218.9 -> 04:bf:1b:e1:d7:78\n");
         ui_cfg_ip = MY_IP;
         ui_cfg_mask = MY_MASK;
         ui_cfg_gw = MY_GW;
         ui_cfg_dns = MY_GW;
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+        if (wifi_boot_ready) {
+            ui_cfg_ip = WIFI_STATIC_IP;
+            ui_cfg_mask = WIFI_STATIC_MASK;
+            ui_cfg_gw = WIFI_STATIC_GW;
+            ui_cfg_dns = WIFI_STATIC_GW;
+        }
+#endif
+        if (boot_cfg_loaded && boot_cfg.network_configured) {
+            ui_cfg_ip = boot_cfg.ip;
+            ui_cfg_mask = boot_cfg.mask;
+            ui_cfg_gw = boot_cfg.gateway;
+            ui_cfg_dns = boot_cfg.dns;
+        }
+        if (boot_network_dhcp) {
+            ui_cfg_ip = 0;
+            ui_cfg_mask = 0;
+            ui_cfg_gw = 0;
+            ui_cfg_dns = 0;
+        }
+        bp_log(boot_network_dhcp ?
+               "[net] net_init (DHCP client)..." : "[net] net_init (static IP)...");
+#if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
+    PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
+        if (wifi_boot_ready) {
+            net_init_on(NIC_IFACE_WIFI, ui_cfg_ip, ui_cfg_gw,
+                        ui_cfg_mask, NULL);
+        } else
+#endif
+        {
+        net_init(ui_cfg_ip, ui_cfg_gw, ui_cfg_mask,
+                 (boot_cfg_loaded || boot_network_dhcp) ? NULL : MY_GW_MAC);
+        /* Pin the dev host PC as a static neighbor so we never need ARP
+         * resolution to talk back to it, and unsolicited replies are valid. */
+        if (!boot_cfg_loaded && !boot_network_dhcp) {
+            net_add_neighbor(HOST_PC_IP, HOST_PC_MAC);
+            (void)net_route_add(HOST_PC_IP, 0xFFFFFFFFU, 0, NET_ROUTE_F_CONNECTED);
+            uart_puts("[net] static neighbor 192.168.218.9 -> 04:bf:1b:e1:d7:78\n");
+        }
         }
 #if PIOS_PLATFORM == PIOS_PLATFORM_QEMU_VIRT
         /* QEMU user-mode (SLIRP) assigns its gateway a deterministic MAC of
@@ -26804,18 +26864,30 @@ void kernel_main(void) {
          * requirement (arp.c ARP_CONSISTENCY_COUNT) and the SYN-retransmit/curl
          * timeout, so inbound connections never get a SYN-ACK. This is a QEMU
          * test-harness convenience; real hardware resolves the gateway via ARP. */
-        {
+        if (ui_cfg_gw) {
             u8 gwmac[6] = { 0x52, 0x55,
-                            (u8)(MY_GW >> 24), (u8)(MY_GW >> 16),
-                            (u8)(MY_GW >> 8),  (u8)MY_GW };
-            net_add_neighbor(MY_GW, gwmac);
+                            (u8)(ui_cfg_gw >> 24), (u8)(ui_cfg_gw >> 16),
+                            (u8)(ui_cfg_gw >> 8), (u8)ui_cfg_gw };
+            net_add_neighbor(ui_cfg_gw, gwmac);
             uart_puts("[net] QEMU SLIRP gateway MAC pinned\n");
         }
 #endif
         ui_cfg_dhcp = false;
-        dns_init(ui_cfg_dns);
-        net_services_listen();
-        uart_puts("[net] HTTP:80 HTTPS:443 DBG:2323\n");
+        if (boot_network_dhcp) {
+            boot_dhcp_pending = dhcp_begin();
+            if (!boot_dhcp_pending)
+                bp_warn("[net] DHCP client could not subscribe; network services disabled");
+            else
+                uart_puts("[net] DHCP client started; waiting for lease\n");
+        } else {
+            dns_init(ui_cfg_dns);
+            net_services_listen();
+            uart_puts("[net] HTTP:80 HTTPS:443 DBG:2323\n");
+        }
+        if (boot_cfg_loaded && boot_cfg.dns_service)
+            bp_warn("[cfg] DNS service requested but not implemented; listener remains disabled");
+        if (boot_cfg_loaded && boot_cfg.dhcp_service)
+            bp_warn("[cfg] DHCP service requested but not implemented; listener remains disabled");
         bp_ok("[net] IP stack ready");
     } else {
         uart_puts("[net] no NIC detected — network disabled\n");

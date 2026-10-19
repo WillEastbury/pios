@@ -36,7 +36,12 @@ typedef struct {
     u32 t2;             /* rebind time (seconds from bind) */
 } dhcp_lease_t;
 
-/* Start DHCP on the current interface. Blocks until BOUND or timeout. */
+/* Begin DHCP on the current interface. The caller must arrange dhcp_poll()
+ * in scheduled core-0 context; this never blocks the reactor. */
+bool dhcp_begin(void);
+
+/* Compatibility helper for the interactive console only. It blocks until
+ * BOUND or timeout; boot must use dhcp_begin(). */
 bool dhcp_start(u32 timeout_ms);
 
 /* Poll DHCP state machine (timer / command wait; does not drain a NIC). */

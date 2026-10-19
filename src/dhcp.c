@@ -198,9 +198,12 @@ static void send_discover(void) {
     if (off + 1 <= cap)
         msg.options[off++] = OPT_END;
 
-    /* Message size: fixed header (236) + cookie (4) + options */
-    u32 msg_len = 240 + off;
-    dhcp_send_raw(&msg, msg_len, 0);
+    /*
+     * RFC 2131 clients transmit at least the BOOTP minimum payload. Several
+     * servers, including QEMU's SLIRP DHCP implementation, reject an
+     * otherwise-valid short options-only Discover before parsing it.
+     */
+    dhcp_send_raw(&msg, sizeof(msg), 0);
     uart_puts("[dhcp] DISCOVER sent\n");
 }
 
@@ -226,8 +229,7 @@ static void send_request(u32 requested_ip, u32 server_id) {
     if (off + 1 <= cap)
         msg.options[off++] = OPT_END;
 
-    u32 msg_len = 240 + off;
-    dhcp_send_raw(&msg, msg_len, 0);
+    dhcp_send_raw(&msg, sizeof(msg), 0);
     uart_puts("[dhcp] REQUEST sent\n");
 }
 
@@ -385,15 +387,18 @@ static void dhcp_udp_handler(nic_iface_t iface, u32 dst_ip,
 
 /* ---- Public API ---- */
 
-bool dhcp_start(u32 timeout_ms) {
+bool dhcp_begin(void) {
     nic_get_mac(our_mac);
     xid = gen_xid();
     dhcp_state = DHCP_INIT;
     retries = 0;
+    state_time = timer_ticks();
+    return net_udp_subscribe(dhcp_udp_handler);
+}
 
-    /* Register as UDP listener on port 68 */
-    net_set_udp_callback(dhcp_udp_handler);
-
+bool dhcp_start(u32 timeout_ms) {
+    if (!dhcp_begin())
+        return false;
     u64 deadline = timer_ticks() + timeout_ms;
 
     while (timer_ticks() < deadline) {
@@ -410,6 +415,10 @@ bool dhcp_start(u32 timeout_ms) {
 }
 
 void dhcp_poll(void) {
+    /* net_init() on a completed lease clears subscriptions. Re-register from
+     * scheduled context so renewals retain their bounded receive path. */
+    if (!net_udp_subscribe(dhcp_udp_handler))
+        return;
     u64 now = timer_ticks();
     u64 elapsed = now - state_time;
 
