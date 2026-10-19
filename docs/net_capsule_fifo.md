@@ -27,6 +27,14 @@ and privileged operations such as raw-slot writes. Capsules receive opaque,
 generation-checked request/response handoffs and have no raw MMIO, socket, or
 flash-write authority.
 
+A document WAL example lives in [`examples/docwal.pc`](../examples/docwal.pc).
+It is a PicoScript picoweb handler that stores BareMetal.DocumentWAL ops on
+PicoWAL cards (pack 1 meta, pack 2 op log, pack 3 compacted snapshots) using
+the same `GET /list/{pack}` and `GET|PUT|POST|DELETE /{pack}/{record}` surface
+as the picowal app host. Bind it as process `web`, `io = tcp/82`, `entry = http`.
+The bytecode image is larger than the 4096-byte EL0 cap, so the reference VM is
+the current run path.
+
 ## Contracts
 
 - FIFO/control ownership is single-writer and cache-line isolated.

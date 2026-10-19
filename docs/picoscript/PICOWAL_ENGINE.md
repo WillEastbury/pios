@@ -51,6 +51,12 @@ semantics native to PicoScript. The portable PicoWAL implementation remains the
 behavioural oracle for durable providers; the VM does not duplicate its on-disk
 format.
 
+An application-level document change log is [`examples/docwal.pc`](../../examples/docwal.pc):
+JSON ops and compacted snapshots stored as PicoWAL cards, consumed by
+BareMetal.DocumentWAL. That program uses `Storage.UsePack` / `PutCard` /
+`ReadExact` through the picoweb worker, not the typed `Wal.*` systems
+intrinsics above.
+
 ## Transaction and recovery contract
 
 One `Wal.Put`, `Wal.Create`, or `Wal.Delete` is one atomic append unit at the
