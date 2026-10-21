@@ -11,6 +11,7 @@
 
 #include "types.h"
 #include "nic.h"
+#include "arp.h"
 #include "macb.h"
 #include "genet.h"
 #include "virtio_net.h"
@@ -476,6 +477,8 @@ static bool filter_rule_matches(const nic_filter_rule_t *rule, const struct filt
 
 static bool nic_filter_allows(u8 direction, const u8 *frame, u32 len,
                               nic_iface_t iface) {
+    if (direction == NIC_FILTER_DIR_IN && arp_claim_accepts(iface, frame, len))
+        return true;
     struct filter_packet pkt;
     filter_parse_packet(frame, len, &pkt);
 
@@ -978,6 +981,8 @@ static void nic_count_packet(bool tx, const u8 *frame, u32 len)
 
 static bool nic_drop_arp_broadcast_not_for_us(nic_iface_t iface,
                                               const u8 *frame, u32 len) {
+    if (arp_claim_accepts(iface, frame, len))
+        return false;
     if (iface >= NIC_IFACE_MAX || !local_ipv4[iface] || len < 42)
         return false;
     if (!mac_is_broadcast(frame) || be16(frame + 12) != 0x0806)

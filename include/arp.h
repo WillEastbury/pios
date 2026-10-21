@@ -76,6 +76,29 @@ void arp_announce_iface(nic_iface_t iface);
 void arp_probe(void);
 void arp_probe_iface(nic_iface_t iface);
 
+/* Core-0 scheduled context only. One generation-bound session per interface.
+ * A range census probes every address (including reserved selection targets);
+ * conflicts are retained independently of the neighbor cache until cancel.
+ * poll sends at most eight frames, never waits, and fails closed on TX/timeout.
+ */
+#define ARP_CLAIM_MAX_HOSTS 256U
+enum arp_claim_result {
+    ARP_CLAIM_ERROR = 0,
+    ARP_CLAIM_PENDING,
+    ARP_CLAIM_AVAILABLE,
+    ARP_CLAIM_CONFLICT
+};
+struct arp_claim_handle {
+    u32 generation;
+    nic_iface_t iface;
+};
+bool arp_claim_begin(nic_iface_t iface, u32 first, u32 last,
+                     struct arp_claim_handle *out);
+enum arp_claim_result arp_claim_poll(struct arp_claim_handle handle);
+bool arp_claim_conflicted(struct arp_claim_handle handle, u32 ip);
+void arp_claim_cancel(struct arp_claim_handle handle);
+bool arp_claim_accepts(nic_iface_t iface, const u8 *frame, u32 len);
+
 /* Age out stale entries (call periodically, e.g. once per second) */
 void arp_tick(void);
 void arp_tick_iface(nic_iface_t iface);

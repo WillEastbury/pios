@@ -1,8 +1,9 @@
 #include "boot_config.h"
+#include "cluster_claim.h"
 
 #define LINE_MAX 256U
 #define NETWORK_FIELDS 15U
-#define CLUSTER_FIELDS 7U
+#define CLUSTER_FIELDS 31U
 #define SERVICE_FIELDS 3U
 
 static void clear_bytes(void *data, u32 length)
@@ -232,6 +233,16 @@ enum boot_config_status boot_config_parse(const u8 *data, u32 length,
                     !key_parse(value, value_len, parsed.root_bootstrap_key))
                     goto done;
                 cluster |= 4U;
+            } else if (MATCH(key, key_len, "range_start")) {
+                if ((cluster & 8U) ||
+                    !ipv4(value, value_len, &parsed.cluster_range_start))
+                    goto done;
+                cluster |= 8U;
+            } else if (MATCH(key, key_len, "range_end")) {
+                if ((cluster & 16U) ||
+                    !ipv4(value, value_len, &parsed.cluster_range_end))
+                    goto done;
+                cluster |= 16U;
             } else if (key_len == 5U && key[0] == 's' && key[1] == 'e' &&
                        key[2] == 'e' && key[3] == 'd' &&
                        key[4] >= '1' && key[4] <= '8') {
@@ -282,8 +293,26 @@ enum boot_config_status boot_config_parse(const u8 *data, u32 length,
         goto done;
     parsed.network_configured = (sections & 1U) != 0U;
     if (sections & 2U) {
-        if (cluster != CLUSTER_FIELDS || parsed.seed_count < 3U ||
+        if (!parsed.network_configured || cluster != CLUSTER_FIELDS ||
+            parsed.seed_count < 3U ||
             seeds != ((1U << parsed.seed_count) - 1U))
+            goto done;
+        if (!host_address(parsed.cluster_range_start, parsed.mask) ||
+            !host_address(parsed.cluster_range_end, parsed.mask) ||
+            parsed.cluster_range_start > parsed.cluster_range_end ||
+            parsed.cluster_range_end - parsed.cluster_range_start >=
+                CLUSTER_CLAIM_MAX_HOSTS ||
+            (parsed.cluster_range_start & parsed.mask) !=
+                (parsed.ip & parsed.mask) ||
+            (parsed.cluster_range_end & parsed.mask) !=
+                (parsed.ip & parsed.mask) ||
+            parsed.gateway == parsed.cluster_range_start ||
+            parsed.gateway == parsed.cluster_range_end ||
+            parsed.dns == parsed.cluster_range_start ||
+            parsed.dns == parsed.cluster_range_end)
+            goto done;
+        if (parsed.ip < parsed.cluster_range_start ||
+            parsed.ip > parsed.cluster_range_end)
             goto done;
         for (u32 i = 0; i < parsed.seed_count; i++) {
             if ((parsed.seeds[i] & parsed.mask) == (parsed.ip & parsed.mask) &&

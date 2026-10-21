@@ -2,7 +2,7 @@
 # Provision a fresh random 32-byte enrollment key as 64 hex digits.
 # The placeholder below is deliberately invalid. Never commit a real key.
 [network]
-ip=192.168.0.201
+ip=192.168.77.4
 mask=255.255.0.0
 gateway=192.168.0.1
 dns=192.168.0.1
@@ -14,9 +14,13 @@ name=lab
 cluster_id=REPLACE_WITH_32_HEX_DIGITS
 # Fresh 32-byte enrollment secret (64 hex digits).
 root_bootstrap_key=REPLACE_WITH_64_HEX_DIGITS
-seed1=192.168.0.201
-seed2=192.168.0.203
-seed3=192.168.0.204
+# Explicit static bootstrap pool, reserved outside DHCP. The configured IP
+# must be in this range; collision handling probes only this range.
+range_start=192.168.77.1
+range_end=192.168.77.253
+seed1=192.168.77.1
+seed2=192.168.77.2
+seed3=192.168.77.3
 
 # Both server roles are denied by default. PIOS records these intent flags but
 # will not open a listener until the corresponding PicoScript service exists.

@@ -268,6 +268,8 @@ static u16 l4_checksum(u32 src_ip, u32 dst_ip, u8 proto,
 }
 
 static bool net_drop_arp_not_for_us(const u8 *frame, u32 len) {
+    if (arp_claim_accepts(net_current_iface, frame, len))
+        return false;
     if (len < sizeof(struct eth_hdr) + 28)
         return false;
     const struct eth_hdr *eth = (const struct eth_hdr *)frame;

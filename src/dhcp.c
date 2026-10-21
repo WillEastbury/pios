@@ -52,6 +52,7 @@
 #define MIN_LEASE_SEC   60
 #define MAX_LEASE_SEC   (30 * 24 * 3600)  /* 30 days */
 #define DISCOVER_INTERVAL_MS  5000
+#define DHCP_DECLINE_BACKOFF_MS 10000U
 #define MAX_RETRIES     5
 
 /* ---- DHCP message structure (bootp) ---- */
@@ -84,6 +85,9 @@ static u8  our_mac[6];
 static u64 state_time;      /* ms when we entered current state */
 static u64 bound_time;      /* ms when we became BOUND */
 static u32 retries;
+static nic_iface_t dhcp_iface;
+static struct arp_claim_handle dhcp_claim;
+static u64 restart_at_ms;
 
 /* Frame buffer for DHCP TX */
 static u8 dhcp_frame[600] ALIGNED(64);
@@ -142,7 +146,7 @@ static void dhcp_send_raw(const struct dhcp_msg *msg, u32 msg_len, u32 src_ip) {
     u32 frame_len = pay_off + msg_len;
     if (frame_len < 60) frame_len = 60;
 
-    nic_send(f, frame_len);
+    nic_send_on(dhcp_iface, f, frame_len);
 }
 
 /* ---- DHCP message construction ---- */
@@ -233,6 +237,27 @@ static void send_request(u32 requested_ip, u32 server_id) {
     uart_puts("[dhcp] REQUEST sent\n");
 }
 
+static void send_decline(u32 requested_ip, u32 server_id) {
+    struct dhcp_msg msg;
+    build_base_msg(&msg);
+    u32 cap = sizeof(msg.options);
+    u32 off = 0;
+    off = add_opt_byte(msg.options, cap, off, OPT_MSG_TYPE, DHCPDECLINE);
+    off = add_opt_u32(msg.options, cap, off, OPT_SERVER_ID, server_id);
+    if (off + 6 <= cap) {
+        msg.options[off++] = 50;
+        msg.options[off++] = 4;
+        msg.options[off++] = (u8)(requested_ip >> 24);
+        msg.options[off++] = (u8)(requested_ip >> 16);
+        msg.options[off++] = (u8)(requested_ip >> 8);
+        msg.options[off++] = (u8)requested_ip;
+    }
+    if (off + 1 <= cap)
+        msg.options[off++] = OPT_END;
+    dhcp_send_raw(&msg, sizeof(msg), 0);
+    uart_puts("[dhcp] DECLINE sent for conflicting address\n");
+}
+
 /* ---- Option parsing ---- */
 
 struct dhcp_parsed {
@@ -269,11 +294,11 @@ static bool parse_dhcp_options(const u8 *opts, u32 opts_len, struct dhcp_parsed 
 static void dhcp_udp_handler(nic_iface_t iface, u32 dst_ip,
                              u32 src_ip, u16 src_port, u16 dst_port,
                              const u8 *data, u16 len) {
-    (void)iface;
     (void)dst_ip;
     (void)src_ip;
     (void)src_port;
-    if (dst_port != DHCP_CLIENT_PORT) return;
+    if (iface != dhcp_iface || src_port != DHCP_SERVER_PORT ||
+        dst_port != DHCP_CLIENT_PORT) return;
     if (len < 240) return; /* minimum bootp + cookie */
 
     const struct dhcp_msg *msg = (const struct dhcp_msg *)data;
@@ -338,30 +363,17 @@ static void dhcp_udp_handler(nic_iface_t iface, u32 dst_ip,
         lease.t1 = parsed.t1 ? parsed.t1 : lease.lease_time / 2;
         lease.t2 = parsed.t2 ? parsed.t2 : (lease.lease_time * 7) / 8;
 
-        /* ARP conflict detection: probe the offered IP */
-        const u8 *conflict = arp_resolve(lease.ip);
-        if (conflict) {
-            uart_puts("[dhcp] CONFLICT detected, declining\n");
+        if (!arp_claim_begin(dhcp_iface, lease.ip, lease.ip, &dhcp_claim)) {
+            uart_puts("[dhcp] ARP claim unavailable; lease not applied\n");
             dhcp_state = DHCP_INIT;
+            restart_at_ms = timer_monotonic_ms() + DHCP_DECLINE_BACKOFF_MS;
+            state_time = timer_ticks();
             return;
         }
-
-        /* BOUND! Apply configuration. */
-        uart_puts("[dhcp] BOUND: IP=");
-        uart_hex(lease.ip);
-        uart_puts(" mask=");
-        uart_hex(lease.mask);
-        uart_puts(" gw=");
-        uart_hex(lease.gateway);
-        uart_puts(" lease=");
-        uart_hex(lease.lease_time);
-        uart_puts("s\n");
-
-        /* Reconfigure network stack */
-        net_init(lease.ip, lease.gateway, lease.mask, NULL);
-
-        dhcp_state = DHCP_BOUND;
-        bound_time = timer_ticks();
+        dhcp_state = DHCP_PROBING;
+        state_time = timer_ticks();
+        retries = 0;
+        uart_puts("[dhcp] ARP conflict probe started\n");
         break;
 
     case DHCP_RENEWING:
@@ -388,11 +400,14 @@ static void dhcp_udp_handler(nic_iface_t iface, u32 dst_ip,
 /* ---- Public API ---- */
 
 bool dhcp_begin(void) {
-    nic_get_mac(our_mac);
+    arp_claim_cancel(dhcp_claim);
+    dhcp_iface = nic_default_iface();
+    nic_get_mac_for(dhcp_iface, our_mac);
     xid = gen_xid();
     dhcp_state = DHCP_INIT;
     retries = 0;
     state_time = timer_ticks();
+    restart_at_ms = 0U;
     return net_udp_subscribe(dhcp_udp_handler);
 }
 
@@ -415,8 +430,6 @@ bool dhcp_start(u32 timeout_ms) {
 }
 
 void dhcp_poll(void) {
-    /* net_init() on a completed lease clears subscriptions. Re-register from
-     * scheduled context so renewals retain their bounded receive path. */
     if (!net_udp_subscribe(dhcp_udp_handler))
         return;
     u64 now = timer_ticks();
@@ -424,6 +437,8 @@ void dhcp_poll(void) {
 
     switch (dhcp_state) {
     case DHCP_INIT:
+        if (timer_monotonic_ms() < restart_at_ms)
+            break;
         send_discover();
         dhcp_state = DHCP_SELECTING;
         state_time = now;
@@ -455,6 +470,44 @@ void dhcp_poll(void) {
             state_time = now;
         }
         break;
+
+    case DHCP_PROBING: {
+        enum arp_claim_result claim = arp_claim_poll(dhcp_claim);
+        if (claim == ARP_CLAIM_PENDING)
+            break;
+        arp_claim_cancel(dhcp_claim);
+        if (claim != ARP_CLAIM_AVAILABLE) {
+            if (claim == ARP_CLAIM_CONFLICT) {
+                uart_puts("[dhcp] CONFLICT detected, declining lease\n");
+                send_decline(lease.ip, lease.server_id);
+            } else {
+                uart_puts("[dhcp] ARP claim failed; lease not applied\n");
+            }
+            dhcp_state = DHCP_INIT;
+            state_time = now;
+            restart_at_ms = timer_monotonic_ms() + DHCP_DECLINE_BACKOFF_MS;
+            break;
+        }
+        if (!net_add_interface(dhcp_iface, lease.ip, lease.gateway,
+                               lease.mask, NULL)) {
+            uart_puts("[dhcp] interface configuration failed\n");
+            dhcp_state = DHCP_INIT;
+            restart_at_ms = timer_monotonic_ms() + DHCP_DECLINE_BACKOFF_MS;
+            break;
+        }
+        uart_puts("[dhcp] BOUND: IP=");
+        uart_hex(lease.ip);
+        uart_puts(" mask=");
+        uart_hex(lease.mask);
+        uart_puts(" gw=");
+        uart_hex(lease.gateway);
+        uart_puts(" lease=");
+        uart_hex(lease.lease_time);
+        uart_puts("s\n");
+        dhcp_state = DHCP_BOUND;
+        bound_time = now;
+        break;
+    }
 
     case DHCP_BOUND:
         /* Check T1 (renew) */
@@ -496,7 +549,8 @@ void dhcp_poll(void) {
 }
 
 const dhcp_lease_t *dhcp_get_lease(void) {
-    return (dhcp_state >= DHCP_BOUND) ? &lease : NULL;
+    return (dhcp_state == DHCP_BOUND || dhcp_state == DHCP_RENEWING ||
+            dhcp_state == DHCP_REBINDING) ? &lease : NULL;
 }
 
 u32 dhcp_get_state(void) {

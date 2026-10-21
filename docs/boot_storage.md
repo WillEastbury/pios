@@ -99,10 +99,12 @@ Copy `pios.ini.example` to **`/pios.ini` at the FAT boot partition root**.
 This is separate from Raspberry firmware `config.txt` and the WALFS root.
 Stage2 reads it after block-storage initialization and before NIC/IP stack
 initialization. A missing/unavailable file selects the non-blocking DHCP
-client; no kernel service listener is enabled until it receives a valid lease.
+client; IP services are unreachable until it receives a conflict-checked lease.
+Capsule bridge arenas/listeners are initialized before secondary-core launch;
+binding an address does not reset TCP or erase the workers' attach records.
 When a valid `[network]` section is present, its static configuration is used
 instead and DHCP is not started. A file may intentionally omit `[network]`
-(for example, to provision only cluster identity or service roles), which also
+(for example, to provision only service roles), which also
 selects the DHCP client. Read errors, oversized files and malformed
 configuration reject the entire configuration, including cluster material; the
 existing recovery static defaults remain in force rather than treating a
@@ -126,6 +128,16 @@ Unconfigured Pi5 secondary Wi-Fi settings are unchanged.
 - `cluster_id`: a stable nonzero 16-byte cluster identity encoded as 32 hex
   digits. It is distinct from the human-readable DNS label and prevents
   accidental federation of clusters with the same name.
+- `range_start` and `range_end`: an explicit static, non-DHCP host pool on
+  the configured subnet (at most 256 addresses). The deployment pool is
+  `192.168.77.1` through `192.168.77.253`; `ip` is a preference within it.
+  Cluster configuration requires a `[network]` section. Before binding any
+  address, stage2 runs an addressless ARP census of the entire pool, then
+  confirms its selected candidate with another addressless probe session.
+  Gateway, DNS and seed addresses are excluded from selection, not the census.
+  Conflicts try the next candidate; exhaustion, TX rejection or deadline
+  expiry leaves the interface addressless. Selection is boot-only and never
+  writes an address back to FAT.
 - `root_bootstrap_key`: a fresh, nonzero 32-byte secret encoded as 64 hex digits.
   The shipped placeholder is intentionally invalid. Provision the same
   enrollment key to the initial nodes using a trusted offline path, never
@@ -149,9 +161,16 @@ temporary decoded key copies are explicitly wiped after loading. Accepted
 cluster bootstrap material remains kernel-private, immutable after boot and
 excluded from status/console output; ordinary network settings remain visible.
 
-**Current milestone:** static-or-DHCP client networking and bootstrap
-configuration loading only. No enrollment, sealed node identity, cluster DNS
-listener, replicated storage, SMB listener or cross-node FIFO endpoint is
+DHCP and cluster census share an interface-scoped, generation-checked ARP
+claim API. Scheduled core-0 polls send at most eight frames, with three probe
+rounds and a final reply window. Owner announcements and simultaneous
+sender-IP-zero probes count as conflicts, independently of neighbor learning.
+DHCP sends DECLINE on conflict and waits at least ten seconds before restarting.
+No probe loop blocks core 0 or drains a NIC outside the FIFO ingress path.
+
+**Current milestone:** static-or-DHCP client networking, full-pool cluster
+address claiming and bootstrap configuration loading only. No enrollment,
+sealed node identity, cluster DNS listener, replicated storage, SMB listener or cross-node FIFO endpoint is
 activated by this file.
 Those depend on the approved PicoScript service/capability work recorded in
 the architecture decision log. The existing development TLS certificate is

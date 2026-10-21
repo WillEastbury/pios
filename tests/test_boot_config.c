@@ -10,6 +10,7 @@
 #define CLUSTER_ID "00112233445566778899aabbccddeeff"
 #define CLUSTER \
     "[cluster]\nname=Lab-One\ncluster_id=" CLUSTER_ID "\nroot_bootstrap_key=" KEY "\n" \
+    "range_start=192.168.0.201\nrange_end=192.168.0.253\n" \
     "seed1=192.168.0.201\nseed2=192.168.0.202\nseed3=192.168.0.203\n"
 #define SERVICES "[services]\ndns_service=off\ndhcp_service=off\n"
 
@@ -96,6 +97,8 @@ int main(void)
     CHECK(cfg.seeds[0] == cfg.ip && cfg.seeds[2] == 0xc0a800cbU);
     CHECK(strcmp(cfg.cluster_name, "lab-one") == 0);
     CHECK(cfg.cluster_id[0] == 0U && cfg.cluster_id[15] == 0xffU);
+    CHECK(cfg.cluster_range_start == 0xc0a800c9U &&
+          cfg.cluster_range_end == 0xc0a800fdU);
     CHECK(cfg.root_bootstrap_key[0] == 1U && cfg.root_bootstrap_key[31] == 0xefU);
     CHECK(!cfg.dns_service && !cfg.dhcp_service);
 
@@ -105,11 +108,6 @@ int main(void)
     CHECK(cfg.network_configured);
     for (u32 i = 0; i < BOOT_CONFIG_KEY_BYTES; i++)
         CHECK(cfg.root_bootstrap_key[i] == 0);
-
-    CHECK(boot_config_parse((const u8 *)CLUSTER SERVICES,
-                            sizeof(CLUSTER SERVICES) - 1U, &cfg) ==
-          BOOT_CONFIG_OK);
-    CHECK(!cfg.network_configured && cfg.cluster_configured);
 
     CHECK(boot_config_parse((const u8 *)"[services]\ndns_service=on\ndhcp_service=on\n",
                             sizeof("[services]\ndns_service=on\ndhcp_service=on\n") - 1U,
@@ -150,6 +148,13 @@ int main(void)
     replace_invalid(KEY, "012345");
     replace_invalid(KEY, "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     replace_invalid(KEY, "0000000000000000000000000000000000000000000000000000000000000000");
+    replace_invalid("range_start=192.168.0.201", "range_start=192.168.1.1");
+    replace_invalid("range_end=192.168.0.253", "range_end=192.168.0.200");
+    invalid("[network]\nip=192.168.0.201\nmask=255.255.0.0\n"
+            "gateway=192.168.0.1\ndns=192.168.0.53\n"
+            "[cluster]\nname=lab\ncluster_id=" CLUSTER_ID "\nroot_bootstrap_key=" KEY "\n"
+            "range_start=192.168.0.201\nrange_end=192.168.2.1\n"
+            "seed1=192.168.0.201\nseed2=192.168.0.202\nseed3=192.168.0.203\n");
     replace_invalid("seed2=192.168.0.202", "seed2=192.168.0.201");
     replace_invalid("seed3=192.168.0.203", "seed4=192.168.0.203");
     replace_invalid("seed3=192.168.0.203\n", "");

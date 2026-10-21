@@ -456,11 +456,11 @@ def main() -> int:
         return 2
 
     net = ("user,id=n0,net=192.168.0.0/24,host=192.168.0.1,"
-           "hostfwd=tcp:127.0.0.1:8088-192.168.0.201:80,"
-           "hostfwd=tcp:127.0.0.1:8282-192.168.0.201:82,"
-           "hostfwd=tcp:127.0.0.1:8283-192.168.0.201:83,"
-           "hostfwd=tcp:127.0.0.1:8091-192.168.0.201:8090,"
-           "hostfwd=tcp:127.0.0.1:8082-192.168.0.201:8082")
+           "hostfwd=tcp:127.0.0.1:8088-192.168.0.15:80,"
+           "hostfwd=tcp:127.0.0.1:8282-192.168.0.15:82,"
+           "hostfwd=tcp:127.0.0.1:8283-192.168.0.15:83,"
+           "hostfwd=tcp:127.0.0.1:8091-192.168.0.15:8090,"
+           "hostfwd=tcp:127.0.0.1:8082-192.168.0.15:8082")
     qargs = [QEMU, "-M", "virt", "-cpu", "cortex-a76", "-smp", "4", "-m", "1G",
              "-display", "none", "-serial", f"file:{SERIAL_LOG}",
              "-kernel", args.kernel, "-netdev", net,

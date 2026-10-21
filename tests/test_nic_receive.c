@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "types.h"
 #include "nic.h"
+#include "arp.h"
 #include "macb.h"
 #include "virtio_net.h"
 #include "fb.h"
@@ -9,6 +10,8 @@
 
 static u32 remaining, received, captured, failures;
 static bool malformed;
+bool arp_claim_accepts(nic_iface_t iface, const u8 *frame, u32 len)
+{ (void)iface; (void)frame; (void)len; return false; }
 #define CHECK(c) do { if (!(c)) { \
     printf("FAIL line %u: %s\n", (unsigned)__LINE__, #c); failures++; \
 } } while (0)

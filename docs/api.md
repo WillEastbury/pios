@@ -553,8 +553,12 @@ credentials or a known secret.
   the password uses the `X-PIOS-Password` header and tokens use `Authorization:
   Bearer`.
 - No CSPRNG on current hardware: secrets/salts require explicit provisioning.
-- OIDC/SSO federation (`wave_sts/oidc.py`, RS256/ES256, external IdP) is out of
-  scope.
+- Google OpenID Connect federation is approved but not implemented or enabled.
+  New interactive identities will register as pending, with no resource access
+  until explicit administrator approval and grants. There is no automatic
+  email-based account linking or role assignment. See the
+  [Google federation decision](architecture_decision_log.md#2026-10-20---owner-approved-google-federation-for-interactive-users)
+  for the security contract and outstanding transport/capability dependencies.
 - The `:443` kernel TLS server is a minimal single-connection, non-browser TLS
   wrapper; it is the TLS transport for `/api/sts/*` but is not a full concurrent
   HTTPS pool and does not yet secure the IDE/admin surfaces.

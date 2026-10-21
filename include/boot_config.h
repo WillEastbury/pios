@@ -22,6 +22,8 @@ struct boot_config {
     u32 mask;
     u32 gateway;
     u32 dns;
+    u32 cluster_range_start;
+    u32 cluster_range_end;
     u32 seed_count;
     u32 seeds[BOOT_CONFIG_MAX_SEEDS];
     char cluster_name[BOOT_CONFIG_NAME_MAX + 1U];

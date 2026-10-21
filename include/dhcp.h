@@ -2,7 +2,7 @@
  * dhcp.h - Hardened DHCP client
  *
  * Full DHCP state machine with anti-rogue-server hardening.
- * On success, reconfigures the network stack via net_init().
+ * On success, applies the interface address without resetting TCP or workers.
  *
  * Hardening:
  *   - XID randomized via hardware CRC32
@@ -20,9 +20,10 @@
 #define DHCP_INIT       0
 #define DHCP_SELECTING  1
 #define DHCP_REQUESTING 2
-#define DHCP_BOUND      3
-#define DHCP_RENEWING   4
-#define DHCP_REBINDING  5
+#define DHCP_PROBING    3
+#define DHCP_BOUND      4
+#define DHCP_RENEWING   5
+#define DHCP_REBINDING  6
 
 /* Obtained configuration */
 typedef struct {
@@ -36,7 +37,7 @@ typedef struct {
     u32 t2;             /* rebind time (seconds from bind) */
 } dhcp_lease_t;
 
-/* Begin DHCP on the current interface. The caller must arrange dhcp_poll()
+/* Begin DHCP on the default NIC. The caller must arrange dhcp_poll()
  * in scheduled core-0 context; this never blocks the reactor. */
 bool dhcp_begin(void);
 

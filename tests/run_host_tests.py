@@ -29,6 +29,8 @@ OUT = TESTS / "_build"
 # test file -> kernel source files it links against
 TESTS_MANIFEST = {
     "test_boot_config.c": ["src/boot_config_parse.c", "src/boot_config.c"],
+    "test_cluster_claim.c": ["src/cluster_claim.c"],
+    "test_arp_claim.c": ["src/arp.c", "src/lru.c", "src/dhcp.c", "src/dhcp_options.c"],
     "test_tensor_broker.c": ["src/tensor_broker.c", "src/lease.c"],
     "test_tensor_service.c": ["src/tensor_service.c", "src/picovm.c"],
     "test_ipc_model_broker.c": ["src/ipc_model.c", "src/ipc_model_vm.c",

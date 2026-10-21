@@ -2,6 +2,307 @@
 
 Every significant architectural decision in PIOS is recorded here.
 
+## 2026-10-20 - Owner-approved Google federation for interactive users
+
+The owner requested Google-federated interactive sign-in through PicoSTS and
+selected: "Allow registration, but grant no resource access until administrator
+approval". This extends the existing PicoSTS authority decision; Google proves
+an external user's identity but does not become a cluster authorization source.
+
+- Accept Google OpenID Connect authentication for interactive users only.
+  Node enrollment, capsule/service workload identities, bootstrap credentials
+  and kernel mutation authority retain their separate existing contracts.
+- A first successful, verified Google authentication may create a durable
+  pending identity, with no tenant membership, groups, roles, audience grants,
+  scopes or resource capabilities. Pending users may see their own pending
+  status, but receive no resource-access token. Registration and login must
+  never make the first user an administrator or cluster root.
+- An authorized cluster administrator must explicitly approve the identity
+  and assign its tenant/resource grants. Approval alone supplies no default
+  access. Subsequent local token issuance remains constrained by current
+  approval, disabled state and explicit grants; possession of a Google token
+  alone never authorizes a PIOS resource.
+- Key external identities by the verified Google issuer and case-sensitive
+  subject, normalizing Google's two documented issuer spellings to the same
+  provider. Email/profile claims are display metadata, not account keys or
+  grants. Never merge with an existing local account merely because emails
+  match; explicit account linking requires a separately authorized operation.
+- Use the server-side authorization-code flow with a configured, exact
+  HTTPS redirect URI, browser-session-bound state, nonce and PKCE S256.
+  Login attempts are bounded, expire and are single-use. Reject callback
+  replay, state/nonce mismatch and unregistered redirects. Request only
+  authentication scopes, not Google API access or offline refresh tokens.
+- Verify the ID-token signature using Google's trusted, rotating signing
+  keys and an explicit algorithm allowlist. Validate issuer, client audience,
+  authorized presenter where required, expiry, issue time and nonce before
+  creating or looking up an identity. Unknown keys, malformed/oversized
+  responses, unset time and provider failures fail closed. Metadata/key
+  refresh is bounded and respects cache expiry; token-supplied URLs are
+  never authority for fetching verification keys.
+- Google HTTPS connections require authenticated CA-chain and hostname
+  verification. SNI or proof of possession of an untrusted leaf key is not
+  server authentication. Missing trust material or trusted entropy leaves
+  federation unavailable; never bypass certificate checks for bring-up.
+- Implement federation flow, registration and approval policy in the
+  PicoScript STS service. Native PIOS supplies bounded process-scoped
+  transport, cryptographic verification, entropy and durable-storage
+  capabilities, not a parallel C federation service. Persist identities and
+  approval/grants in WALFS and protect provider secrets with sealed storage;
+  do not put OAuth secrets in FAT configuration, source, logs or URLs.
+- Bound login/session tables and registrations, rate-limit unauthenticated
+  attempts and fail explicitly on capacity exhaustion. Record registration,
+  approval and denial events without credentials or raw provider tokens.
+
+Rejected: email-based automatic account linking, automatic role/tenant
+assignment at registration, trusting decoded but unverified JWT claims,
+using Google tokens directly as cluster capabilities, and implementing
+application policy in the kernel.
+
+**Implementation status:** approved contract, not an operational sign-in
+feature. On 2026-10-21 the owner approved implementing the shared prerequisites
+before federation: the process-scoped capability host, then trusted outbound
+HTTPS and the Google service. This work remains pending; the subsequent wrap-up
+request does not mark any of it implemented. The current `include/tls.h` client
+API explicitly has no CA root
+store and its optional P-256 leaf pin is not general Google endpoint trust.
+The process-scoped EL0 capability host remains a prerequisite from the
+PicoSuite decision below. Google client registration, an authorized HTTPS
+callback, trusted provider transport/key validation and the PicoScript
+registration/approval service still need implementation and end-to-end
+proof. Existing password-login endpoints are unchanged; no Google route is
+advertised or enabled by this decision.
+
+Protocol reference:
+[Google OpenID Connect](https://developers.google.com/identity/openid-connect/openid-connect).
+
+## 2026-10-20 — Bootstrap address-claim integration (existing approval)
+
+Implemented the owner-approved full-pool census using one core-0-owned,
+interface-scoped, generation-checked ARP claim API shared with DHCP. Claims
+publish sender-IP-zero probes through the existing egress FIFO; owner
+announcements and simultaneous probes arrive through IRQ/FIFO/software IRQ,
+not timer-driven ingress. Three paced rounds cover every configured address
+before selection. Gateway/DNS/seeds are excluded only from selection; the
+chosen candidate is confirmed again, with conflicts advancing to another
+candidate. Queue admission failure, deadline expiry or exhaustion leaves the
+interface addressless. There is no FAT persistence, genesis or enrollment.
+
+This restores the already-approved boot contract rather than introducing a
+new authority or networking architecture. Deferred DHCP/cluster binding uses
+`net_add_interface()` rather than blocking/reinitializing the entire stack.
+Capsule bridge initialization precedes secondary launch so later address
+selection cannot erase the workers' one-time attach records.
+
+## 2026-10-19 — Owner-approved PicoSuite services on PIOS
+
+The owner approved staged native PIOS hosting of PicoScript cluster services:
+FAT-root `/pios.ini` provisioning first; authenticated transport and discovery;
+replicated storage; then the public FIFO proxy/load balancer, admitted only
+while its discovery, identity and storage dependencies are healthy. Application
+protocols, routing, DNS registration, replication policy and file-sharing
+service logic remain PicoScript. Native code supplies bounded OS capabilities
+for sockets, crypto, FIFO/span ownership and durable storage, not Linux
+processes, POSIX compatibility or a second C service implementation.
+
+Approved decisions:
+
+- Provision static IPv4, subnet mask, gateway and DNS, cluster name, a 256-bit
+  enrollment key and at least three distinct seed addresses from the FAT boot
+  root. Missing configuration preserves standalone boot. Invalid configuration
+  is reported and rejected as a whole; existing standalone management remains
+  available. Never log or return key material in status responses.
+- The shared bootstrap key authorizes enrollment only. Enrolled per-node
+  identities must be sealed using the existing keystore, and operational
+  cross-node connections use mutual TLS with tenant/service authorization.
+  A seed is a discovery hint, not a voter or trusted enrolled identity.
+- Replicated datasets use three durable replicas and majority commit (2/3).
+  No quorum means rejected writes, not successful local-only writes. Membership,
+  terms/votes, ordered commit, replay, fencing and snapshots must survive
+  restart. Discovery/gossip alone never grants write authority.
+- Serve real SMB 3.1.1 to Windows/Linux clients alongside REST over the same
+  file namespace; authenticated and signed, no SMB1. SMB compatibility,
+  locking and failover need actual client interoperability evidence.
+- Use `service.tenant.clustername.pios.home.arpa`, not `.local`. Persist
+  tenant zones and registrations in PicoWAL/WALFS. Virtual service RRsets have
+  multiple A records; DNS discovery does not itself perform load balancing.
+- Cross-node FIFO/virtual-socket frames carry identity, generation, sequence,
+  bounded length and explicit credit. Never serialize local pointers or expose
+  FIFO memory remotely. Local delivery retains IRQ -> FIFO -> software IRQ
+  publication and ownership contracts.
+
+The owner directed examination of `WillEastbury/picosuite` and the
+`picocluster`, `picoreplicate` and `picodns` source repositories. PicoSuite is
+the component map, not an executable service host. The inspected implementations
+are C/POSIX, not directly runnable PIOS/PicoScript services:
+
+- `picocluster/picoproxy/src/main.c`: state-backed Host/SNI and TCP/UDP routing,
+  placement and data-group primary selection; Linux sockets/splice are not
+  portable FIFO capabilities.
+- `picocluster/picowald/src/raft.c` and `docs/control-replication.md`: durable
+  terms/votes, majority ordered commit, learners, snapshots and fencing.
+  Its single-voter bootstrap is not permission to serve three-replica storage
+  before the required replica set exists.
+- `picoreplicate/src/picoreplicate.{c,h}`: authenticated PRL1 events,
+  `(node-id, sequence)` deduplication and explicit receipt-versus-durable-commit
+  policies. These are useful contracts, not a replacement for consensus.
+- `picodns/src/dns_cluster.{c,h}`: durable tombstones, owner-scoped records,
+  Lamport replay and authenticated anti-entropy. Its missed-quorum result can
+  follow a durable local mutation; that multi-writer behavior does not satisfy
+  the approved reject-without-quorum storage contract. Its single-value
+  name/type/view model also needs adaptation for multi-A service RRsets.
+
+Implementation status: the first milestone is provisioning and static network
+application only. Configuration is not enrollment: loading a key/seed list
+does not activate a cluster endpoint, mint an identity, establish quorum or
+make DNS/storage/proxy/SMB available. Those services remain pending until
+their real capability providers and end-to-end proofs exist.
+
+The owner subsequently expanded the request to the full PicoSuite application
+set and a shared HA, low-latency broker for PicoScript/PicoWeb applications.
+The umbrella README is a component map, not current implementation evidence.
+Source inspection found implementation source trees for PicoCluster/PicoProxy,
+PicoReplicate, PicoDNS, PicoDHCP, PicoPXE and PicoPod. PicoBlob contains
+`src/picoblob.c`, a content-addressed PUT/GET/HAS/DEL TCP service, not SMB or a
+replicated filesystem. At inspection the `picolog`, `picowatch` and `picoai`
+GitHub repositories were empty; there is no application implementation there
+to port. PIOS already embeds PicoWAL, PicoScript VM and PicoWeb/capsule
+components, but that is not evidence that all their upstream features work
+inside PIOS.
+
+For the expanded scope, the owner explicitly approved:
+
+- Map PicoPod deployment, isolation and lifecycle to native PIOS EL0
+  PicoScript capsules with capability-restricted manifests. Do not introduce
+  Linux binary compatibility, namespaces or a container runtime.
+- Place services by node role rather than running every service on every
+  node. DHCP/PXE remain disabled until explicitly assigned a provisioning
+  node, interface and pool. Preserve the existing stage0/A-B boot chain.
+- Implement the missing applications: PicoLog provides tenant-scoped durable
+  append/read/tail; PicoWatch provides health reporting and policy-controlled
+  service reconciliation without changing the kernel watchdog; PicoAI is an
+  OpenAI-compatible PicoScript adapter over existing inference primitives.
+  Unsupported models report unsupported, never fabricated inference.
+- The shared broker uses persistent multiplexed mTLS tunnels, bounded
+  batching/credit and direct local FIFO delivery. Separate fast, non-WAL-synced
+  frames/streams from explicitly durable jobs backed by quorum logging and
+  idempotency IDs. Retry only when replay is authorized and safe. Node failure
+  resets affected streams for reconnect; no claim of transparent TCP migration
+  or exactly-once arbitrary side effects. Measure latency distributions and
+  throughput on the actual cluster before making performance claims.
+
+These are approved implementation contracts, not implemented service claims.
+The shared process-scoped capability host is the next dependency. The existing
+per-core/blocking socket API is not yet a safe per-process EL0 VM provider;
+its existence cannot be used to advertise operational cluster connectivity.
+
+**2026-10-19 — Boot-volume OTA transactions.** The owner selected signed,
+bounded PicoScript transactions for FAT32 boot-volume updates. Native PIOS
+must restrict the script to p1-scoped filesystem operations with explicit
+path, size, allocation and operation budgets; mirror every FAT update; stage
+content before publishing metadata; read back and verify every committed
+write; and retain a journal/recovery record for interrupted transactions.
+Stage0 and the known-good recovery package remain immutable to these scripts.
+This is not authorization for arbitrary raw-sector writes or a host-style
+shell. The existing p1 overwrite helper and QEMU-only p3 exchange core do not
+yet implement this decision.
+
+**Pre-STS OTA authority.** Until STS is enabled, update requests are
+authorized only by the locally sealed `pios-ota` Ed25519 service-principal
+public key. Its signed envelopes bind the specific `kernel-ota` or
+`boot-fat-transaction` capability, target node/cluster identity, monotonic
+generation, expiry and SHA-256 payload. Wrong-target, expired, stale, replayed
+or capability-mismatched envelopes fail closed. STS may later delegate these
+capabilities but is not an unauthenticated fallback or prerequisite for the
+sealed verifier.
+
+**PicoSTS authority integration.** The owner selected existing PicoSTS as the
+durable provider/login authority, backed by WALFS. The STS service must be
+reached by capsules through a loopback-only FIFO/capability endpoint rather
+than a network socket or ambient kernel identity. STS issues each capsule a
+scoped workload identity; downstream services—including kernel OTA and boot
+FAT transactions—authorize the resulting scope. The sealed keystore remains
+the root protection for STS authority material, not a second user/provider
+database.
+
+**Cluster authority and resource ACLs.** The FAT-root bootstrap key authorizes
+only one-time node enrollment into a named cluster; it is never an ongoing
+user, capsule, service or OTA authority. The cluster is the root of all
+authority within its own identity boundary and has no authority outside that
+cluster. PicoSTS issues identities for users, capsule instances and services.
+Identities may be assigned to groups and roles; identities, groups and roles
+may receive grants on explicitly typed resources, including files, hardware
+resources, WAL streams and network sockets.
+
+Every non-kernel resource is accessed through a kernel-validated,
+generation-bound capability handle that carries the resource type, allowed
+operations and expiry. A resource owned by the kernel has immutable mutation
+ACL `cluster-root`; no user, group, role, capsule or service can alter it.
+The kernel may issue explicitly read-only grants for kernel-owned diagnostics
+or data. Direct path, pointer, inode, FIFO, socket or MMIO access is not an
+authorization mechanism.
+
+**Bootstrap address claim.** The static IPv4 address in `pios.ini` is a
+cluster-bootstrap preference, not a permanently owned address before
+enrollment. PIOS sends the normal bounded ARP conflict probe for that address;
+before address selection or node-zero genesis it ARP-censuses the entire
+explicit static cluster pool to discover existing nodes. It then selects a
+usable preferred/sequential host from that pool, skipping network/broadcast
+addresses, configured gateway/DNS addresses and cluster seeds. Before
+enrollment the successful address applies only to the current boot and is
+never written back to FAT. Enrollment is responsible for confirming and
+persisting any authoritative cluster address assignment.
+
+**Bootstrap intent, node assignment and enrollment identity.** Operator-owned
+`pios.ini` contains only non-secret bootstrap intent: cluster name/identity,
+static address pool, seeds and preferred address. A separate cluster-signed
+`pios.node` assignment fixes an enrolled node's address; only a signed
+decommission/replacement record may revoke or change it.
+
+A master image may carry a one-time join credential, but never in `pios.ini`.
+That credential authorizes exactly one enrollment exchange. Cluster STS returns
+a node-specific credential, encrypted/authenticated in WALFS using
+device-sealed material, which becomes the node identity. The bootstrap
+credential is wiped after success and is never an ongoing cluster, user,
+capsule or service authority.
+
+**Genesis and workload identity delegation.** A master image carries a
+one-time signed genesis authorization naming the cluster identity and the
+node-zero role. Node zero may create the initial STS root only when the ARP
+census and durable state show no valid existing cluster. After enrollment, a
+node may issue only its STS-delegated, short-lived pod/service workload
+identities and scopes. It may never issue users, node identities,
+`cluster-root`, membership changes, KeyVault mutation authority or
+unbounded/ambient delegation.
+
+**Cluster KeyVault.** The kernel owns a KeyVault scoped to one enrolled
+cluster. Cluster KeyVault records are encrypted/authenticated under keys
+derived from sealed keystore material and cluster identity; WALFS may hold
+ciphertext records but is never a plaintext-secret authority. PicoSTS grants
+authorize a named KeyVault operation on a named secret. The kernel returns
+plaintext only to an internal kernel primitive or an explicitly authorized,
+recipient-bound envelope; capsules and general WALFS callers never receive
+ambient raw secret access. KeyVault mutation remains `cluster-root` only.
+
+Inspected upstream revisions:
+`picosuite` `4fd00dcbe11a43d7d1680e29f998aac9b155e19c`,
+`picocluster` `82635e9b18902d39ee394529f99283141f974115`,
+`picoreplicate` `ea1918b9b55d9dfd3a96a3073f2594d231f827a0`,
+`picodns` `9cf850ed3711075bd872eff4c5572d3feb5c6653`,
+`picoblob` `22154a618239221270421fb6683f15cb88495f80`.
+
+Provisioning milestone evidence: the parser/FAT adapter tests pass, including
+short-read rejection and key-buffer wiping. Changed sources compile for Pi5
+and A53 platform flags with warnings treated as errors (pre-existing unused
+kernel functions excluded). `tools/qemu_boot_config.py` proves four actual
+boots: missing file, standalone configured IP, cluster provisioning and
+invalid-cluster whole-file rejection; HTTP and TCP console observe the
+expected address/mask/gateway/DNS without disclosing the fixture key. The
+existing QEMU smoke passes 32/32. The full-image build still has unrelated
+existing warnings. A portable libFuzzer entry is supplied and compiles, but
+the installed MinGW clang does not support `-fsanitize=fuzzer`, so no
+sanitizer fuzz-run is claimed. No live board enrollment or cluster service
+availability is claimed by this milestone.
+
 ## 2026-10-16 — Owner-approved live NVMe WALFS data volume
 
 The owner authorized destructive formatting of the currently enumerated

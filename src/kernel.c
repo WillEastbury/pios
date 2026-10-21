@@ -35,6 +35,7 @@
 #include "stage0_diag.h"
 #include "boot_precedence.h"
 #include "boot_config.h"
+#include "cluster_claim.h"
 #include "simd.h"
 #include "mmu.h"
 #include "gic.h"
@@ -182,6 +183,11 @@ static struct boot_config boot_cfg;
 static bool boot_cfg_loaded;
 static bool boot_network_dhcp;
 static bool boot_dhcp_pending;
+static bool boot_cluster_pending;
+static bool boot_cluster_selecting;
+static u64 boot_cluster_deadline_ms;
+static struct cluster_claim boot_cluster_claim;
+static struct arp_claim_handle boot_cluster_arp;
 
 /* Static neighbor: the dev host PC. Pre-populates the ARP/neighbor table
  * so the Pi can reply to and originate frames to this peer even when
@@ -25365,6 +25371,60 @@ static bool ksvc_dashboard_poll(void *ctx)
     return true;
 }
 
+static void boot_cluster_poll(void)
+{
+    if (!boot_cluster_pending)
+        return;
+    enum arp_claim_result result = arp_claim_poll(boot_cluster_arp);
+    if (result == ARP_CLAIM_ERROR ||
+        timer_monotonic_ms() >= boot_cluster_deadline_ms) {
+        arp_claim_cancel(boot_cluster_arp);
+        boot_cluster_pending = false;
+        uart_puts("[cfg] cluster claim failed; interface remains addressless\n");
+        return;
+    }
+    if (result == ARP_CLAIM_PENDING)
+        return;
+    if (!boot_cluster_selecting) {
+        u32 ip;
+        while (cluster_claim_next_probe(&boot_cluster_claim, &ip)) {
+            if (arp_claim_conflicted(boot_cluster_arp, ip) ||
+                ip == boot_cfg.gateway || ip == boot_cfg.dns)
+                cluster_claim_note_conflict(&boot_cluster_claim, ip);
+            for (u32 i = 0; i < boot_cfg.seed_count; i++)
+                if (ip == boot_cfg.seeds[i])
+                    cluster_claim_note_conflict(&boot_cluster_claim, ip);
+        }
+        uart_puts("[cfg] full cluster pool census complete\n");
+        boot_cluster_selecting = true;
+    } else if (result == ARP_CLAIM_AVAILABLE) {
+        arp_claim_cancel(boot_cluster_arp);
+        boot_cluster_pending = false;
+        u32 ip = boot_cluster_claim.candidate;
+        if (!net_add_interface(nic_default_iface(), ip, boot_cfg.gateway,
+                               boot_cfg.mask, NULL)) {
+            uart_puts("[cfg] cluster address apply failed; interface remains addressless\n");
+            return;
+        }
+        ui_cfg_ip = ip;
+        ui_cfg_mask = boot_cfg.mask;
+        ui_cfg_gw = boot_cfg.gateway;
+        ui_cfg_dns = boot_cfg.dns;
+        dns_init(ui_cfg_dns);
+        uart_puts("[cfg] cluster address claimed (boot only); enrollment pending\n");
+        return;
+    } else {
+        cluster_claim_note_conflict(&boot_cluster_claim, boot_cluster_claim.candidate);
+    }
+    arp_claim_cancel(boot_cluster_arp);
+    if (cluster_claim_finish(&boot_cluster_claim) != CLUSTER_CLAIM_READY ||
+        !arp_claim_begin(nic_default_iface(), boot_cluster_claim.candidate,
+                         boot_cluster_claim.candidate, &boot_cluster_arp)) {
+        boot_cluster_pending = false;
+        uart_puts("[cfg] cluster pool exhausted or claim unavailable; interface remains addressless\n");
+    }
+}
+
 static bool ksvc_timer_poll(void *ctx)
 {
     (void)ctx;
@@ -25372,6 +25432,7 @@ static bool ksvc_timer_poll(void *ctx)
     if (net_interface_configured(NIC_IFACE_WIFI))
         arp_tick_iface(NIC_IFACE_WIFI);
     tcp_tick();
+    boot_cluster_poll();
     if (boot_dhcp_pending) {
         dhcp_poll();
         const dhcp_lease_t *lease = dhcp_get_lease();
@@ -25382,7 +25443,6 @@ static bool ksvc_timer_poll(void *ctx)
             ui_cfg_dns = lease->dns;
             ui_cfg_dhcp = true;
             dns_init(ui_cfg_dns);
-            net_services_listen();
             boot_dhcp_pending = false;
             uart_puts("[cfg] DHCP lease applied; network services enabled\n");
         }
@@ -26830,14 +26890,15 @@ void kernel_main(void) {
             ui_cfg_gw = boot_cfg.gateway;
             ui_cfg_dns = boot_cfg.dns;
         }
-        if (boot_network_dhcp) {
+        bool cluster_boot = boot_cfg_loaded && boot_cfg.cluster_configured;
+        if (boot_network_dhcp || cluster_boot) {
             ui_cfg_ip = 0;
             ui_cfg_mask = 0;
             ui_cfg_gw = 0;
             ui_cfg_dns = 0;
         }
-        bp_log(boot_network_dhcp ?
-               "[net] net_init (DHCP client)..." : "[net] net_init (static IP)...");
+        bp_log((boot_network_dhcp || cluster_boot) ?
+               "[net] net_init (addressless bootstrap)..." : "[net] net_init (static IP)...");
 #if PIOS_PLATFORM == PIOS_PLATFORM_PI3 || \
     PIOS_PLATFORM == PIOS_PLATFORM_PIZERO2W
         if (wifi_boot_ready) {
@@ -26873,15 +26934,29 @@ void kernel_main(void) {
         }
 #endif
         ui_cfg_dhcp = false;
+        /* Workers publish their attach records once. Initialize these arenas
+         * before secondary launch, never after asynchronous address selection. */
+        net_services_listen();
         if (boot_network_dhcp) {
             boot_dhcp_pending = dhcp_begin();
             if (!boot_dhcp_pending)
                 bp_warn("[net] DHCP client could not subscribe; network services disabled");
             else
                 uart_puts("[net] DHCP client started; waiting for lease\n");
+        } else if (cluster_boot) {
+            boot_cluster_selecting = false;
+            boot_cluster_pending =
+                cluster_claim_begin(&boot_cluster_claim, boot_cfg.cluster_range_start,
+                                     boot_cfg.cluster_range_end, boot_cfg.ip) &&
+                arp_claim_begin(nic_default_iface(), boot_cfg.cluster_range_start,
+                                 boot_cfg.cluster_range_end, &boot_cluster_arp);
+            boot_cluster_deadline_ms = timer_monotonic_ms() + 120000U;
+            if (boot_cluster_pending)
+                uart_puts("[cfg] cluster pool census started; interface addressless\n");
+            else
+                bp_warn("[cfg] cluster census unavailable; interface remains addressless");
         } else {
             dns_init(ui_cfg_dns);
-            net_services_listen();
             uart_puts("[net] HTTP:80 HTTPS:443 DBG:2323\n");
         }
         if (boot_cfg_loaded && boot_cfg.dns_service)

@@ -85,6 +85,19 @@ static u32 arp_current_iface = NIC_IFACE_WIRED;
 
 static u8 arp_tx[60] ALIGNED(64);  /* min Ethernet frame */
 
+/* Only core 0 mutates these sessions; IRQs only publish ingress descriptors. */
+struct arp_claim_session {
+    u64 next_send_ms;
+    u64 deadline_ms;
+    u32 first, last, cursor, generation, round;
+    enum arp_claim_result result;
+    u8 occupied[ARP_CLAIM_MAX_HOSTS / 8U];
+    bool active;
+    bool conflict;
+} ALIGNED(64);
+static struct arp_claim_session claims[NIC_IFACE_MAX];
+_Static_assert(sizeof(struct arp_claim_session) % 64U == 0U, "claim stride");
+
 static struct arp_context *arp_current(void)
 {
     return &arp_contexts[arp_current_iface < 3U ? arp_current_iface : 0U];
@@ -106,10 +119,6 @@ static u64 now_ms(void) {
 
 static bool mac_is_zero(const u8 *m) {
     return m[0]==0 && m[1]==0 && m[2]==0 && m[3]==0 && m[4]==0 && m[5]==0;
-}
-
-static bool mac_is_broadcast(const u8 *m) {
-    return m[0]==0xFF && m[1]==0xFF && m[2]==0xFF && m[3]==0xFF && m[4]==0xFF && m[5]==0xFF;
 }
 
 static bool mac_eq(const u8 *a, const u8 *b) {
@@ -186,7 +195,8 @@ static struct arp_entry *alloc_entry(void) {
 
 /* ---- ARP frame construction ---- */
 
-static void send_arp(u16 opcode, const u8 *target_mac, u32 target_ip) {
+static bool send_arp_from(u16 opcode, const u8 *target_mac, u32 target_ip,
+                          u32 source_ip) {
     struct eth_hdr *eth = (struct eth_hdr *)arp_tx;
 
     if (opcode == ARP_OP_REQUEST) {
@@ -207,7 +217,7 @@ static void send_arp(u16 opcode, const u8 *target_mac, u32 target_ip) {
     arp[ARP_OPCODE]      = 0; arp[ARP_OPCODE+1] = (u8)opcode;
 
     simd_memcpy(arp + ARP_SENDER_MAC, my_mac, 6);
-    write_ip(arp + ARP_SENDER_IP, my_ip);
+    write_ip(arp + ARP_SENDER_IP, source_ip);
 
     if (opcode == ARP_OP_REQUEST) {
         u8 zeros[6] = {0,0,0,0,0,0};
@@ -225,8 +235,9 @@ static void send_arp(u16 opcode, const u8 *target_mac, u32 target_ip) {
      * exactly what we put on the wire. Catches malformed replies that the
      * host's NIC would silently filter. */
     static u32 send_count;
-    send_count++;
-    if (send_count <= 10 || (send_count & 0x1F) == 0) {
+    if (source_ip != 0U)
+        send_count++;
+    if (source_ip != 0U && (send_count <= 10 || (send_count & 0x1F) == 0)) {
         uart_puts("[arp] tx#");
         uart_hex(send_count);
         uart_puts(" op=");
@@ -240,10 +251,130 @@ static void send_arp(u16 opcode, const u8 *target_mac, u32 target_ip) {
         uart_puts("\n");
     }
 
-    (void)nic_send_on((nic_iface_t)arp_current_iface, arp_tx, 60);
+    return nic_send_on((nic_iface_t)arp_current_iface, arp_tx, 60);
+}
+
+static void send_arp(u16 opcode, const u8 *target_mac, u32 target_ip)
+{
+    (void)send_arp_from(opcode, target_mac, target_ip, my_ip);
 }
 
 /* ---- Public API ---- */
+
+static struct arp_claim_session *claim_session(struct arp_claim_handle handle)
+{
+    if (handle.iface != NIC_IFACE_WIRED && handle.iface != NIC_IFACE_WIFI)
+        return NULL;
+    struct arp_claim_session *s = &claims[handle.iface];
+    return s->active && s->generation == handle.generation ? s : NULL;
+}
+
+static bool claim_contains(const struct arp_claim_session *s, u32 ip)
+{
+    return ip >= s->first && ip <= s->last;
+}
+
+bool arp_claim_begin(nic_iface_t iface, u32 first, u32 last,
+                     struct arp_claim_handle *out)
+{
+    if (!out || (iface != NIC_IFACE_WIRED && iface != NIC_IFACE_WIFI) ||
+        !nic_iface_active(iface) || first == 0U || first > last ||
+        last - first >= ARP_CLAIM_MAX_HOSTS || (first >> 28) >= 14U ||
+        (last >> 28) >= 14U || (first >> 24) == 0U ||
+        (last >> 24) == 0U || (first >> 24) == 127U ||
+        (last >> 24) == 127U || claims[iface].active)
+        return false;
+    struct arp_claim_session *s = &claims[iface];
+    u32 generation = s->generation + 1U;
+    if (!generation)
+        generation = 1U;
+    simd_zero(s, sizeof(*s));
+    s->generation = generation;
+    s->first = first;
+    s->last = last;
+    s->cursor = first;
+    s->deadline_ms = now_ms() + 120000U;
+    s->result = ARP_CLAIM_PENDING;
+    s->active = true;
+    *out = (struct arp_claim_handle){ .generation = generation, .iface = iface };
+    return true;
+}
+
+enum arp_claim_result arp_claim_poll(struct arp_claim_handle handle)
+{
+    struct arp_claim_session *s = claim_session(handle);
+    if (!s)
+        return ARP_CLAIM_ERROR;
+    if (s->result != ARP_CLAIM_PENDING)
+        return s->conflict && s->result == ARP_CLAIM_AVAILABLE ?
+               ARP_CLAIM_CONFLICT : s->result;
+    u64 now = now_ms();
+    if (now >= s->deadline_ms) {
+        uart_puts("[arp] claim deadline expired\n");
+        return s->result = ARP_CLAIM_ERROR;
+    }
+    if (now < s->next_send_ms)
+        return ARP_CLAIM_PENDING;
+    if (s->round == 3U)
+        return s->result = s->conflict ? ARP_CLAIM_CONFLICT : ARP_CLAIM_AVAILABLE;
+    u32 previous = arp_current_iface;
+    arp_set_interface(handle.iface);
+    for (u32 budget = 0; budget < 8U; budget++) {
+        if (!send_arp_from(ARP_OP_REQUEST, NULL, s->cursor, 0U)) {
+            uart_puts("[arp] claim TX rejected\n");
+            s->result = ARP_CLAIM_ERROR;
+            break;
+        }
+        arp_stats.requests_sent++;
+        if (s->cursor == s->last) {
+            s->cursor = s->first;
+            s->round++;
+            s->next_send_ms = now + 1000U;
+            break;
+        }
+        s->cursor++;
+        s->next_send_ms = now + 100U;
+    }
+    arp_current_iface = previous;
+    return s->result;
+}
+
+bool arp_claim_conflicted(struct arp_claim_handle handle, u32 ip)
+{
+    struct arp_claim_session *s = claim_session(handle);
+    if (!s || s->result == ARP_CLAIM_ERROR || !claim_contains(s, ip))
+        return true;
+    u32 index = ip - s->first;
+    return (s->occupied[index >> 3] & (1U << (index & 7U))) != 0U;
+}
+
+void arp_claim_cancel(struct arp_claim_handle handle)
+{
+    struct arp_claim_session *s = claim_session(handle);
+    if (s) {
+        s->active = false;
+        s->generation++;
+        if (!s->generation)
+            s->generation = 1U;
+        s->first = s->last = s->cursor = 0U;
+        s->result = ARP_CLAIM_ERROR;
+        simd_memset(s->occupied, 0xff, sizeof(s->occupied));
+    }
+}
+
+bool arp_claim_accepts(nic_iface_t iface, const u8 *frame, u32 len)
+{
+    if ((iface != NIC_IFACE_WIRED && iface != NIC_IFACE_WIFI) ||
+        !frame || len < sizeof(struct eth_hdr) + ARP_FRAME_LEN ||
+        frame[12] != 0x08U || frame[13] != 0x06U)
+        return false;
+    const struct arp_claim_session *s = &claims[iface];
+    const u8 *arp = frame + sizeof(struct eth_hdr);
+    return s->active && s->result != ARP_CLAIM_ERROR &&
+           (claim_contains(s, read_ip(arp + ARP_SENDER_IP)) ||
+            (read_ip(arp + ARP_SENDER_IP) == 0U &&
+             claim_contains(s, read_ip(arp + ARP_TARGET_IP))));
+}
 
 void arp_set_interface(nic_iface_t iface)
 {
@@ -253,6 +384,8 @@ void arp_set_interface(nic_iface_t iface)
 
 void arp_init_iface(nic_iface_t iface, u32 ip, u32 mask, const u8 *mac) {
     arp_set_interface(iface);
+    arp_claim_cancel((struct arp_claim_handle){
+        .iface = iface, .generation = claims[arp_current_iface].generation });
     my_ip = ip;
     my_mask = mask;
     simd_memcpy(my_mac, mac, 6);
@@ -348,21 +481,36 @@ void arp_input(const u8 *frame, u32 len) {
     u32 sender_ip = read_ip(arp + ARP_SENDER_IP);
     u32 target_ip = read_ip(arp + ARP_TARGET_IP);
 
+    if (opcode != ARP_OP_REQUEST && opcode != ARP_OP_REPLY)
+        return;
+
     /* ---- Validate sender MAC ---- */
-    if (mac_is_zero(sender_mac) || mac_is_broadcast(sender_mac)) {
+    if (mac_is_zero(sender_mac) || (sender_mac[0] & 1U) ||
+        !mac_eq(sender_mac, frame + 6)) {
         arp_stats.drop_spoof++;
         return;
     }
 
+    if (!mac_eq(sender_mac, my_mac) &&
+        arp_claim_accepts((nic_iface_t)arp_current_iface, frame, len) &&
+        (sender_ip != 0U || opcode == ARP_OP_REQUEST)) {
+        struct arp_claim_session *s = &claims[arp_current_iface];
+        u32 ip = sender_ip ? sender_ip : target_ip;
+        u32 index = ip - s->first;
+        s->occupied[index >> 3] |= (u8)(1U << (index & 7U));
+        s->conflict = true;
+    }
+
     /* ---- Conflict detection: someone else claims our IP ---- */
-    if (sender_ip == my_ip && !mac_eq(sender_mac, my_mac)) {
+    if (my_ip != 0U && sender_ip == my_ip && !mac_eq(sender_mac, my_mac)) {
         arp_stats.conflicts++;
         uart_puts("[arp] CONFLICT: our IP from different MAC!\n");
         return;
     }
 
     /* ---- Validate sender IP ---- */
-    if (!ip_valid_sender(sender_ip)) {
+    bool address_probe = sender_ip == 0U && opcode == ARP_OP_REQUEST;
+    if (!address_probe && !ip_valid_sender(sender_ip)) {
         arp_stats.drop_spoof++;
         return;
     }
@@ -371,7 +519,7 @@ void arp_input(const u8 *frame, u32 len) {
 
     if (opcode == ARP_OP_REQUEST) {
         /* Someone is asking for our MAC */
-        if (target_ip != my_ip)
+        if (my_ip == 0U || target_ip != my_ip)
             return; /* not for us */
 
         /* Rate-limit replies */
@@ -384,8 +532,10 @@ void arp_input(const u8 *frame, u32 len) {
         last_reply_time = now;
 
         /* Learn sender (they're talking to us, so they're real) */
-        struct arp_entry *e = find_entry(sender_ip);
-        if (!e) {
+        struct arp_entry *e = address_probe ? NULL : find_entry(sender_ip);
+        if (address_probe) {
+            /* RFC 5227 probes get a reply, but never a zero-IP neighbor. */
+        } else if (!e) {
             e = alloc_entry();
             if (e) {
                 e->ip = sender_ip;
