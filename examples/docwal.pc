@@ -1,0 +1,285 @@
+/* docwal.pc -- PicoScript document WAL server (picoweb EL0 handler).
+
+   Records BareMetal.DocumentWAL change ops into PicoWAL cards and stores
+   compacted snapshots. Undo/redo are ops in the log (kind undo/set).
+
+   Packs: 1 document meta, 2 op log, 3 compacted snapshots.
+   Record 0 is the next-id watermark. Payload <= 4096 bytes.
+
+   Routes match the picowal app host: GET /list/{pack}, POST /{pack},
+   GET|PUT|DELETE /{pack}/{record}. Bind as process web, io=tcp/82,
+   entry=http, capsule pack 1024. Loopback-only on the reference VM.
+*/
+
+int pw_open() {
+    if (Storage.Ready()) { return 0; }
+    return 4;
+}
+
+int pw_close() {
+    return Storage.Sync();
+}
+
+int pw_put(int pack, int record, int data, int create_only) {
+    if (pack < 0 || pack > 1023 || record < 0 || record > 4194303) { return 1; }
+    Storage.UsePack(pack);
+    if (create_only && Storage.Exists(record)) { return 3; }
+    return Storage.PutCard(record, data);
+}
+
+int pw_get(int pack, int record) {
+    if (pack < 0 || pack > 1023 || record < 0 || record > 4194303) { return 0; }
+    Storage.UsePack(pack);
+    return Storage.ReadExact(record);
+}
+
+int pw_delete(int pack, int record) {
+    if (pack < 0 || pack > 1023 || record < 0 || record > 4194303) { return 1; }
+    Storage.UsePack(pack);
+    if (Storage.DeleteExact(record)) { return 0; }
+    return 2;
+}
+
+int pw_exists(int pack, int record) {
+    if (pack < 0 || pack > 1023 || record < 0 || record > 4194303) { return 0; }
+    Storage.UsePack(pack);
+    return Storage.Exists(record);
+}
+
+int pw_scan(int pack, int after) {
+    if (pack < 0 || pack > 1023) { return -1; }
+    Storage.UsePack(pack);
+    return Storage.ScanNext(after);
+}
+
+int g_pack;
+int g_record;
+int g_id;
+int g_next;
+int g_n;
+int g_body;
+int g_method;
+int g_p0;
+int g_p1;
+int g_card;
+int g_st;
+int g_peer;
+
+void cors() {
+    Resp.Header("access-control-allow-origin", "*");
+    Resp.Header("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS");
+    Resp.Header("access-control-allow-headers", "content-type");
+}
+
+void fail(int code, int msg) {
+    Resp.Status(code);
+    cors();
+    Resp.Header("content-type", "application/json");
+    Resp.Write(msg);
+    Resp.End();
+}
+
+int peer_ok() {
+    g_peer = Req.Principal();
+    if (String.Eq(g_peer, "127.0.0.1")) { return 1; }
+    if (String.Eq(g_peer, "::1")) { return 1; }
+    if (String.Eq(g_peer, "::ffff:127.0.0.1")) { return 1; }
+    return 0;
+}
+
+int body_ok() {
+    g_body = Req.BodySpan(0);
+    if (g_body == 0) { return 0; }
+    if (String.Length(g_body) > 4096) { return 0; }
+    if (String.StartsWith(g_body, "{") == 0) { return 0; }
+    return 1;
+}
+
+void read_watermark() {
+    g_card = pw_get(g_pack, 0);
+    if (g_card == 0) {
+        g_next = 1;
+    } else {
+        g_next = Number.Parse(g_card);
+    }
+    if (g_next < 1) { g_next = 1; }
+}
+
+void write_watermark() {
+    g_st = pw_put(g_pack, 0, Number.ToString(g_next), 0);
+}
+
+void list_pack() {
+    Resp.Status(200);
+    cors();
+    Resp.Header("content-type", "application/json");
+    Resp.Write("{\"pack\":");
+    Resp.Write(Number.ToString(g_pack));
+    Resp.Write(",\"records\":[");
+    g_n = 0;
+    g_id = pw_scan(g_pack, -1);
+    while (g_id != -1) {
+        if (g_id != 0) {
+            if (g_n > 0) { Resp.Write(","); }
+            g_card = pw_get(g_pack, g_id);
+            Resp.Write("{\"record\":");
+            Resp.Write(Number.ToString(g_id));
+            Resp.Write(",\"data\":");
+            if (g_card == 0) {
+                Resp.Write("null");
+            } else {
+                Resp.Write(g_card);
+            }
+            Resp.Write("}");
+            g_n = g_n + 1;
+        }
+        g_id = pw_scan(g_pack, g_id);
+    }
+    Resp.Write("],\"count\":");
+    Resp.Write(Number.ToString(g_n));
+    Resp.Write("}");
+    Resp.End();
+}
+
+void read_card() {
+    if (g_record < 1) {
+        fail(404, "{\"error\":\"not_found\"}");
+        return;
+    }
+    g_card = pw_get(g_pack, g_record);
+    if (g_card == 0) {
+        fail(404, "{\"error\":\"not_found\"}");
+        return;
+    }
+    Resp.Status(200);
+    cors();
+    Resp.Header("content-type", "application/json");
+    Resp.Write(g_card);
+    Resp.End();
+}
+
+void create_card() {
+    if (body_ok() == 0) {
+        fail(400, "{\"error\":\"json_object\"}");
+        return;
+    }
+    read_watermark();
+    g_record = g_next;
+    g_next = g_record + 1;
+    write_watermark();
+    g_st = pw_put(g_pack, g_record, g_body, 1);
+    if (g_st != 0) {
+        fail(500, "{\"error\":\"store\"}");
+        return;
+    }
+    Resp.Status(201);
+    cors();
+    Resp.Header("content-type", "application/json");
+    Resp.Write("{\"record\":");
+    Resp.Write(Number.ToString(g_record));
+    Resp.Write("}");
+    Resp.End();
+}
+
+void write_card() {
+    if (g_record < 1) {
+        fail(404, "{\"error\":\"not_found\"}");
+        return;
+    }
+    if (body_ok() == 0) {
+        fail(400, "{\"error\":\"json_object\"}");
+        return;
+    }
+    g_st = pw_put(g_pack, g_record, g_body, 0);
+    if (g_st != 0) {
+        fail(500, "{\"error\":\"store\"}");
+        return;
+    }
+    read_watermark();
+    if (g_record + 1 > g_next) {
+        g_next = g_record + 1;
+        write_watermark();
+    }
+    Resp.Status(204);
+    cors();
+    Resp.End();
+}
+
+void remove_card() {
+    if (g_record < 1) {
+        fail(404, "{\"error\":\"not_found\"}");
+        return;
+    }
+    g_st = pw_delete(g_pack, g_record);
+    if (g_st != 0) {
+        fail(404, "{\"error\":\"not_found\"}");
+        return;
+    }
+    Resp.Status(204);
+    cors();
+    Resp.End();
+}
+
+Server.Main {
+    g_method = Req.Method();
+    if (peer_ok() == 0) {
+        fail(403, "{\"error\":\"loopback_only\"}");
+        return;
+    }
+    if (String.StartsWith(g_method, "OPTIONS")) {
+        Resp.Status(204);
+        cors();
+        Resp.End();
+        return;
+    }
+    g_p0 = Req.Param(0);
+    if (String.Length(g_p0) == 0) {
+        Resp.Status(200);
+        cors();
+        Resp.Header("content-type", "application/json");
+        Resp.Write("{\"ok\":true}");
+        Resp.End();
+        return;
+    }
+    g_p1 = Req.Param(1);
+    if (String.Eq(g_p0, "list")) {
+        if (String.StartsWith(g_method, "GET") == 0) {
+            fail(405, "{\"error\":\"method\"}");
+            return;
+        }
+        g_pack = Number.Parse(g_p1);
+        if (g_pack < 1 || g_pack > 1023) {
+            fail(404, "{\"error\":\"not_found\"}");
+            return;
+        }
+        list_pack();
+        return;
+    }
+    g_pack = Number.Parse(g_p0);
+    if (g_pack < 1 || g_pack > 1023) {
+        fail(404, "{\"error\":\"not_found\"}");
+        return;
+    }
+    if (String.Length(g_p1) == 0) {
+        if (String.StartsWith(g_method, "POST")) {
+            create_card();
+            return;
+        }
+        fail(405, "{\"error\":\"method\"}");
+        return;
+    }
+    g_record = Number.Parse(g_p1);
+    if (String.StartsWith(g_method, "GET")) {
+        read_card();
+        return;
+    }
+    if (String.StartsWith(g_method, "PUT")) {
+        write_card();
+        return;
+    }
+    if (String.StartsWith(g_method, "DELETE")) {
+        remove_card();
+        return;
+    }
+    fail(405, "{\"error\":\"method\"}");
+}
