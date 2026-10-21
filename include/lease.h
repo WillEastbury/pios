@@ -78,6 +78,9 @@
 #define LEASE_F_KERNEL             0x0010U
 #define LEASE_F_CAPSULE            0x0020U
 #define LEASE_F_SHARED             0x0040U
+#define LEASE_F_EXPORTABLE         0x0080U
+#define LEASE_EXPORT_PAGE          4096ULL
+#define LEASE_EXPORT_MAX           65536ULL
 
 /* Source type (consumers must not assume origin). */
 #define LEASE_SRC_KERNEL_MEM       1U
@@ -103,6 +106,11 @@
 #define LEASE_ERR_STALE           -3   /* generation mismatch (poisoned). */
 #define LEASE_ERR_STATE           -4   /* illegal lifecycle transition. */
 #define LEASE_ERR_NOENT           -5
+#define LEASE_ERR_BUSY            -6
+#define LEASE_ERR_MMU             -7
+#define LEASE_ERR_AUTHORITY       -8
+#define LEASE_ERR_REVOKE          -9
+#define LEASE_ERR_EXHAUSTED       -10
 
 #define LEASE_ARENA_NONE           0xFFFFFFFFU
 #define LEASE_OWNER_KERNEL         0U   /* capsule 0 == kernel. */
@@ -162,12 +170,73 @@ struct lease_handle {
     u32 generation;
 };
 
+/* Immutable authority sent over a descriptor transport, never a pointer.
+ * capacity is the logical allocation bound, not its padded MMU page extent. */
+struct lease_ticket {
+    struct lease_handle lease;
+    u32 recipient_pid;
+    u32 recipient_incarnation;
+    u32 access;
+    u32 reserved;
+    u64 grant_id;
+    u64 offset;
+    u64 length;
+    u64 capacity;
+} ALIGNED(64);
+
+/* Kernel-only owner-routed MMU request. Never deliver physical addresses to
+ * EL0. A successful acknowledgment proves the page attributes, permissions,
+ * producer quiescence and target-core TLB completion, not merely PTE stores. */
+struct lease_mapping {
+    struct lease_handle lease;
+    u64 grant_id;
+    u64 pa;
+    u64 extent;
+    u32 recipient_pid;
+    u32 recipient_incarnation;
+    u32 access;
+    u32 cache_policy;
+    u64 reserved;
+} ALIGNED(64);
+
+/*
+ * Nonblocking process grants for kernel-produced EXPORTABLE handoff leases
+ * in capsule-kind arenas whose registered owner is LEASE_OWNER_KERNEL.
+ * All calls are trusted control-path APIs; caller/ack identity comes from the
+ * endpoint, never from EL0-supplied PID fields. Preparation pins bytes but
+ * grants no access. Redeem consumes the ticket exactly once, only after the
+ * owner-routed map ACK. A full command queue retains the immutable mapping
+ * request for retry; beginning a map is not proof of queue publication.
+ * DMA/device exports are refused until a fencing protocol is installed.
+ *
+ * Exactly one recipient/grant may exist per lease. Failed map/revoke ACKs
+ * quarantine it; only a successful revoke ACK clears authority. Cancel is
+ * valid only before map_begin, when no MMU command can be in flight. Preparing
+ * scrubs all bytes after used, including page padding; the producer must have
+ * relinquished every previously obtained pointer before preparation.
+ */
+i32 lease_ticket_prepare(const struct lease_descriptor *d, u32 pid, u32 incarnation,
+                           u32 access, u64 used, struct lease_ticket *out);
+i32 lease_ticket_map_begin(const struct lease_ticket *ticket, struct lease_mapping *out);
+i32 lease_ticket_map_complete(const struct lease_ticket *ticket, u32 pid, u32 incarnation,
+                              i32 status);
+i32 lease_ticket_redeem(const struct lease_ticket *ticket, u32 pid, u32 incarnation,
+                        u32 access, struct lease_ticket *out);
+i32 lease_ticket_revoke_begin(const struct lease_ticket *ticket, struct lease_mapping *out);
+i32 lease_ticket_revoke_complete(const struct lease_ticket *ticket, u32 pid, u32 incarnation,
+                                 i32 status);
+i32 lease_ticket_cancel(const struct lease_ticket *ticket);
+
 /*
  * MMU-enforcement seam. The MMU layer installs these so lease_grant/revoke map
  * and unmap a span's PA into a capsule's stage-2 / user table. Kept as a hook
  * so this module compiles and self-tests standalone; real enforcement plugs in.
  *   access is LEASE_F_READONLY or LEASE_F_READWRITE.
  *   return 0 on success, negative on failure.
+ *   unmap must also prove absence after a partially failed map and be
+ *   idempotent for an already-absent mapping. Success includes required TLB
+ *   invalidation; DMA/device leases are refused without a fencing contract.
+ *   Installed callback code must remain executable until its grants retire.
  */
 struct lease_mmu_ops {
     i32 (*map)(u32 capsule, u64 pa, u64 length, u32 access);
@@ -201,12 +270,13 @@ const struct lease_arena *lease_arena_get(u32 arena_id);
  * lock). Returns true if the arena exists. Prefer this over lease_arena_get()
  * whenever the mutable cursor/generation fields matter. */
 bool lease_arena_snapshot(u32 arena_id, struct lease_arena *out);
-void lease_arena_reset(u32 arena_id);   /* bump cursor=0, generation++ */
+i32 lease_arena_reset(u32 arena_id);   /* refuses live allocations or grants */
 
 /*
  * Acquire a fresh lease: bump-allocate `length` bytes in `arena_id`, grab a
  * FREE descriptor slot, set state=WRITING, assign owner/flags/source.
- * On success fills *out and returns LEASE_OK.
+ * EXPORTABLE reserves exclusive, zero-initialized 4 KiB pages (up to 64 KiB)
+ * in a page-aligned capsule arena. On success fills *out and returns LEASE_OK.
  */
 i32  lease_acquire(u32 arena_id, u64 length, u32 flags, u32 source_type,
                    u32 owner_capsule, struct lease_descriptor *out);
@@ -224,7 +294,9 @@ i32  lease_transfer(const struct lease_descriptor *d, u32 new_owner_capsule);
  * MMU-enforced grant/revoke. lease_grant maps the span's PA into `capsule`'s
  * address space with `access` (LEASE_F_READONLY|READWRITE) via the installed
  * MMU ops; it REFUSES kernel arenas (those stay EL1-only). lease_revoke
- * unmaps it. These are the hardware half of isolation.
+ * unmaps it. Missing MMU callbacks fail closed. A descriptor stays pinned
+ * through map/unmap callbacks, active grants and failed revocation; release,
+ * transfer and arena reset cannot recycle its bytes.
  */
 i32  lease_grant(const struct lease_descriptor *d, u32 capsule, u32 access);
 i32  lease_revoke(const struct lease_descriptor *d, u32 capsule);
@@ -244,7 +316,8 @@ i32  lease_copy_into(const struct lease_descriptor *src, u32 dst_arena,
 /* Kernel gatekeeper validation: bounds + slot + generation + (optional) owner. */
 i32  lease_validate(const struct lease_descriptor *d, u32 expect_owner /* or LEASE_ARENA_NONE */);
 
-/* Resolve a live lease to a kernel-side pointer (NULL if invalid).
+/* Resolve a live lease to a kernel-side pointer (NULL if invalid or reserved
+ * for a process grant).
  * CONTRACT: the returned PA is stable while the arena exists and the descriptor
  * offset is immutable while the lease is live, so the pointer never dangles. The
  * BYTES it addresses are governed by the lease lifecycle -- the caller must hold

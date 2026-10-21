@@ -38,12 +38,10 @@
  *     self-deadlock.
  *   - MMU map/unmap callbacks may block or call back into the kernel, so they
  *     are NEVER invoked while the registry lock is held. lease_grant/lease_revoke
- *     snapshot the validated PA/length (and the mmu-ops pointer) under the lock,
- *     drop the lock, invoke the callback, then reacquire the lock only to
- *     revalidate the descriptor generation and update stats. A grant is
- *     linearized at the successful MMU map; if the descriptor was released/
- *     recycled while the lock was dropped, the just-installed mapping is rolled
- *     back (unmap) and the grant fails STALE.
+ *     reserve a pinned grant under the lock, then drop it for the callback.
+ *     Release/transfer/reset cannot recycle pinned bytes. The grant captures
+ *     its original unmap operation; backend replacement cannot lose revocation
+ *     authority. Failed unmap retains the pin.
  *
  * Initialization:
  *   lease_init() runs once before the secondary cores start, so by the time any
@@ -63,23 +61,55 @@ static inline struct kspinlock *lease_lock(void)
 
 static struct lease_arena      g_arenas[LEASE_ARENA_MAX];
 static struct lease_descriptor g_pool[LEASE_POOL_MAX];
+enum lease_grant_phase {
+    GRANT_NONE,
+    GRANT_MAPPING,
+    GRANT_ACTIVE,
+    GRANT_REVOKING,
+    GRANT_QUARANTINED,
+    GRANT_PREPARED
+};
+
+enum lease_grant_kind { GRANT_CAPSULE = 1U, GRANT_PROCESS };
+
+struct lease_grant_record {
+    u64 epoch;
+    u64 capacity;
+    u32 phase;
+    u32 kind;
+    u32 recipient;
+    u32 incarnation;
+    u32 access;
+    u32 redeemed;
+    i32 (*unmap)(u32 capsule, u64 pa, u64 length);
+    u64 used;
+    u64 _pad;
+} ALIGNED(64);
+
+/* Protected by the existing lease registry lock, not a parallel authority pool. */
+static struct lease_grant_record g_grants[LEASE_POOL_MAX];
+static u64 g_next_grant_id;
 _Static_assert(sizeof(struct lease_arena) == 64,
                "lease arenas must have cache-line stride");
 _Static_assert(sizeof(struct lease_descriptor) == 64,
                "lease descriptors must have cache-line stride");
+_Static_assert(sizeof(struct lease_grant_record) == 64,
+               "lease grant records must have cache-line stride");
+_Static_assert(sizeof(struct lease_ticket) == 64, "lease ticket descriptor size");
+_Static_assert(sizeof(struct lease_mapping) == 64, "lease mapping request size");
 static u64  g_next_lease_id;
 static u32  g_next_arena_id;
 static bool g_inited;
 static bool g_lock_initialized;
 
 static struct lease_stats g_stats;
-static const struct lease_mmu_ops *g_mmu_ops;
+static struct lease_mmu_ops g_mmu_ops;
 
 void lease_set_mmu_ops(const struct lease_mmu_ops *ops)
 {
     struct kspinlock *lk = lease_lock();
     kspin_lock(lk);
-    g_mmu_ops = ops;
+    g_mmu_ops = ops ? *ops : (struct lease_mmu_ops){0};
     kspin_unlock(lk);
 }
 
@@ -116,6 +146,7 @@ static void lease_init_data(void)
 {
     lease_zero(g_arenas, sizeof(g_arenas));
     lease_zero(g_pool, sizeof(g_pool));
+    lease_zero(g_grants, sizeof(g_grants));
     lease_zero(&g_stats, sizeof(g_stats));
     for (u32 i = 0; i < LEASE_POOL_MAX; i++) {
         g_pool[i].slot_id = i;
@@ -124,6 +155,7 @@ static void lease_init_data(void)
         g_pool[i].arena_id = LEASE_ARENA_NONE;
     }
     g_next_lease_id = 1;
+    g_next_grant_id = 1;
     g_next_arena_id = 1;
     g_stats.slots_total = LEASE_POOL_MAX;
     g_inited = true;
@@ -156,12 +188,18 @@ static u32 lease_arena_register_locked(u32 kind, u32 cache_policy, u32 owner_cap
                                        u64 base, u64 size)
 {
     if (!g_inited) lease_init_data();
-    if (size == 0 || base == 0)
+    if (size == 0 || base == 0 || base > ~(u64)0 - size ||
+        !g_next_arena_id || g_next_arena_id == LEASE_ARENA_NONE)
         return LEASE_ARENA_NONE;
     if (kind != LEASE_ARENA_KIND_KERNEL && kind != LEASE_ARENA_KIND_CAPSULE)
         return LEASE_ARENA_NONE;
     if (cache_policy != LEASE_CACHE_WBC_OFF && cache_policy != LEASE_CACHE_WBC_ON)
         return LEASE_ARENA_NONE;
+    for (u32 i = 0; i < LEASE_ARENA_MAX; i++) {
+        const struct lease_arena *a = &g_arenas[i];
+        if (a->in_use && base < a->base + a->size && a->base < base + size)
+            return LEASE_ARENA_NONE;
+    }
     for (u32 i = 0; i < LEASE_ARENA_MAX; i++) {
         if (!g_arenas[i].in_use) {
             struct lease_arena *a = &g_arenas[i];
@@ -223,16 +261,29 @@ bool lease_arena_snapshot(u32 arena_id, struct lease_arena *out)
     return found;
 }
 
-void lease_arena_reset(u32 arena_id)
+i32 lease_arena_reset(u32 arena_id)
 {
     struct kspinlock *lk = lease_lock();
     kspin_lock(lk);
     struct lease_arena *a = arena_lookup(arena_id);
-    if (a) {
-        a->cursor = 0;
-        a->generation++;
+    if (!a) {
+        kspin_unlock(lk);
+        return LEASE_ERR_NOENT;
     }
+    for (u32 i = 0; i < LEASE_POOL_MAX; i++) {
+        if (g_pool[i].state != LEASE_STATE_FREE && g_pool[i].arena_id == arena_id) {
+            kspin_unlock(lk);
+            return LEASE_ERR_BUSY;
+        }
+    }
+    if (a->generation == 0xFFFFFFFFU) {
+        kspin_unlock(lk);
+        return LEASE_ERR_EXHAUSTED;
+    }
+    a->cursor = 0;
+    a->generation++;
     kspin_unlock(lk);
+    return LEASE_OK;
 }
 
 /* Validate a descriptor against the live pool slot it claims. */
@@ -260,16 +311,28 @@ static i32 lease_acquire_locked(u32 arena_id, u64 length, u32 flags, u32 source_
     if (!a)
         return LEASE_ERR_NOENT;
 
-    u64 off = lease_align_up(a->cursor, LEASE_ALIGN);
-    u64 take = lease_align_up(length, LEASE_ALIGN);
-    if (off + take > a->size)
+    bool exported = (flags & LEASE_F_EXPORTABLE) != 0U;
+    if (exported && (a->kind != LEASE_ARENA_KIND_CAPSULE ||
+        (a->base & (LEASE_EXPORT_PAGE - 1U)) || length > LEASE_EXPORT_MAX))
+        return LEASE_ERR_INVAL;
+    u64 align = exported ? LEASE_EXPORT_PAGE : LEASE_ALIGN;
+    if (a->cursor > ~(u64)0 - (align - 1U) || length > ~(u64)0 - (align - 1U))
+        return LEASE_ERR_INVAL;
+    u64 off = lease_align_up(a->cursor, align);
+    u64 take = lease_align_up(length, align);
+    if (off > a->size || take > a->size - off)
         return LEASE_ERR_NOSPC;
+    if (!g_next_lease_id)
+        return LEASE_ERR_EXHAUSTED;
 
     for (u32 i = 0; i < LEASE_POOL_MAX; i++) {
         struct lease_descriptor *s = &g_pool[i];
-        if (s->state != LEASE_STATE_FREE)
+        if (s->state != LEASE_STATE_FREE || s->generation == 0xFFFFFFFFU)
             continue;
+        if (exported)
+            lease_zero((void *)(usize)(a->base + off), (u32)take);
         a->cursor = off + take;
+        g_grants[i] = (struct lease_grant_record){.capacity = take};
         s->arena_id = arena_id;
         s->source_type = source_type;
         s->offset = off;
@@ -305,6 +368,8 @@ static i32 lease_publish_locked(const struct lease_descriptor *d)
     struct lease_descriptor *s;
     i32 rc = lease_check(d, &s);
     if (rc != LEASE_OK) return rc;
+    if (g_grants[s->slot_id].phase != GRANT_NONE)
+        return LEASE_ERR_BUSY;
     if (s->state != LEASE_STATE_WRITING) {
         g_stats.state_rejects++;
         return LEASE_ERR_STATE;
@@ -332,6 +397,10 @@ i32 lease_begin_read(const struct lease_descriptor *d)
     struct lease_descriptor *s;
     i32 rc = lease_check(d, &s);
     if (rc != LEASE_OK) { kspin_unlock(lk); return rc; }
+    if (g_grants[s->slot_id].phase != GRANT_NONE) {
+        kspin_unlock(lk);
+        return LEASE_ERR_BUSY;
+    }
     if (s->state != LEASE_STATE_READY) {
         g_stats.state_rejects++;
         kspin_unlock(lk);
@@ -352,6 +421,10 @@ i32 lease_end_read(const struct lease_descriptor *d)
     struct lease_descriptor *s;
     i32 rc = lease_check(d, &s);
     if (rc != LEASE_OK) { kspin_unlock(lk); return rc; }
+    if (g_grants[s->slot_id].phase != GRANT_NONE) {
+        kspin_unlock(lk);
+        return LEASE_ERR_BUSY;
+    }
     if (s->state != LEASE_STATE_READING) {
         g_stats.state_rejects++;
         kspin_unlock(lk);
@@ -369,10 +442,17 @@ i32 lease_release(const struct lease_descriptor *d)
     struct lease_descriptor *s;
     i32 rc = lease_check(d, &s);
     if (rc != LEASE_OK) { kspin_unlock(lk); return rc; }
+    if (g_grants[s->slot_id].phase != GRANT_NONE) {
+        kspin_unlock(lk);
+        return LEASE_ERR_BUSY;
+    }
+    if (s->generation == 0xFFFFFFFFU) {
+        kspin_unlock(lk);
+        return LEASE_ERR_EXHAUSTED;
+    }
     /* RELEASE then poison: bump generation so any stale copy is rejected. */
     s->state = LEASE_STATE_RELEASE;
     s->generation++;
-    if (s->generation == 0) s->generation = 1;
     s->lease_id = 0;
     s->arena_id = LEASE_ARENA_NONE;
     s->offset = 0;
@@ -381,6 +461,7 @@ i32 lease_release(const struct lease_descriptor *d)
     s->flags = 0;
     s->source_type = 0;
     s->state = LEASE_STATE_FREE;
+    g_grants[s->slot_id] = (struct lease_grant_record){0};
     if (g_stats.slots_live) g_stats.slots_live--;
     g_stats.releases++;
     kspin_unlock(lk);
@@ -394,64 +475,320 @@ i32 lease_transfer(const struct lease_descriptor *d, u32 new_owner_capsule)
     struct lease_descriptor *s;
     i32 rc = lease_check(d, &s);
     if (rc != LEASE_OK) { kspin_unlock(lk); return rc; }
+    if (g_grants[s->slot_id].phase != GRANT_NONE) {
+        kspin_unlock(lk);
+        return LEASE_ERR_BUSY;
+    }
     s->owner_capsule = new_owner_capsule;
     g_stats.transfers++;
     kspin_unlock(lk);
     return LEASE_OK;
 }
 
+static void grant_clear(struct lease_grant_record *grant)
+{
+    u64 capacity = grant->capacity;
+    *grant = (struct lease_grant_record){.capacity = capacity};
+}
+
+static i32 grant_reserve(struct lease_descriptor *s, u32 kind, u32 recipient,
+                          u32 incarnation, u32 access, u64 used)
+{
+    if (!recipient || (access != LEASE_F_READONLY && access != LEASE_F_READWRITE))
+        return LEASE_ERR_INVAL;
+    struct lease_arena *a = arena_lookup(s->arena_id);
+    if (!a)
+        return LEASE_ERR_NOENT;
+    if (a->kind != LEASE_ARENA_KIND_CAPSULE) {
+        g_stats.mmu_rejects++;
+        return LEASE_ERR_INVAL;
+    }
+    struct lease_grant_record *grant = &g_grants[s->slot_id];
+    if (grant->phase != GRANT_NONE)
+        return LEASE_ERR_BUSY;
+    if ((s->flags & (LEASE_F_DMA | LEASE_F_DEVICE | LEASE_F_KERNEL)) ||
+        !(s->flags & (LEASE_F_READONLY | LEASE_F_READWRITE)) ||
+        (access == LEASE_F_READWRITE && !(s->flags & LEASE_F_READWRITE)))
+        return LEASE_ERR_AUTHORITY;
+    if (s->offset > a->size || grant->capacity > a->size - s->offset ||
+        (access == LEASE_F_READONLY && !used) ||
+        used > s->length || s->length > grant->capacity)
+        return LEASE_ERR_INVAL;
+    if (access == LEASE_F_READWRITE ? s->state != LEASE_STATE_WRITING :
+        (s->state != LEASE_STATE_READY && s->state != LEASE_STATE_READING &&
+         s->state != LEASE_STATE_EMPTY))
+        return LEASE_ERR_STATE;
+    if (!g_next_grant_id)
+        return LEASE_ERR_EXHAUSTED;
+    grant->epoch = g_next_grant_id++;
+    grant->phase = GRANT_MAPPING;
+    grant->kind = kind;
+    grant->recipient = recipient;
+    grant->incarnation = incarnation;
+    grant->access = access;
+    grant->redeemed = 0;
+    grant->used = used;
+    return LEASE_OK;
+}
+
+static void ticket_of(const struct lease_descriptor *s, struct lease_ticket *out)
+{
+    struct lease_grant_record *grant = &g_grants[s->slot_id];
+    *out = (struct lease_ticket) {
+        .lease = {s->lease_id, s->slot_id, s->generation},
+        .recipient_pid = grant->recipient,
+        .recipient_incarnation = grant->incarnation,
+        .access = grant->access,
+        .grant_id = grant->epoch,
+        .offset = s->offset,
+        .length = grant->used,
+        .capacity = s->length
+    };
+}
+
+static i32 ticket_check(const struct lease_ticket *ticket, struct lease_descriptor **out)
+{
+    if (!ticket || ticket->lease.slot_id >= LEASE_POOL_MAX)
+        return LEASE_ERR_INVAL;
+    struct lease_descriptor *s = &g_pool[ticket->lease.slot_id];
+    if (s->state == LEASE_STATE_FREE || s->lease_id != ticket->lease.lease_id ||
+        s->generation != ticket->lease.generation)
+        return LEASE_ERR_STALE;
+    struct lease_grant_record *grant = &g_grants[s->slot_id];
+    if (grant->phase == GRANT_NONE || grant->epoch != ticket->grant_id)
+        return LEASE_ERR_STALE;
+    if (grant->kind != GRANT_PROCESS || ticket->recipient_pid != grant->recipient ||
+        ticket->recipient_incarnation != grant->incarnation ||
+        ticket->access != grant->access || ticket->offset != s->offset ||
+        ticket->length != grant->used || ticket->capacity != s->length || ticket->reserved)
+        return LEASE_ERR_AUTHORITY;
+    *out = s;
+    return LEASE_OK;
+}
+
+static void mapping_of(const struct lease_descriptor *s, struct lease_mapping *out)
+{
+    const struct lease_grant_record *grant = &g_grants[s->slot_id];
+    const struct lease_arena *arena = arena_lookup(s->arena_id);
+    *out = (struct lease_mapping) {
+        .lease = {s->lease_id, s->slot_id, s->generation},
+        .grant_id = grant->epoch,
+        .pa = arena->base + s->offset,
+        .extent = grant->capacity,
+        .recipient_pid = grant->recipient,
+        .recipient_incarnation = grant->incarnation,
+        .access = grant->access,
+        .cache_policy = arena->cache_policy
+    };
+}
+
+i32 lease_ticket_prepare(const struct lease_descriptor *d, u32 pid, u32 incarnation,
+                           u32 access, u64 used, struct lease_ticket *out)
+{
+    if (!out || !incarnation)
+        return LEASE_ERR_INVAL;
+    struct kspinlock *lk = lease_lock();
+    kspin_lock(lk);
+    struct lease_descriptor *s;
+    i32 rc = lease_check(d, &s);
+    const struct lease_arena *arena = rc == LEASE_OK ? arena_lookup(s->arena_id) : 0;
+    if (rc == LEASE_OK && !arena)
+        rc = LEASE_ERR_NOENT;
+    if (rc == LEASE_OK &&
+        (!(s->flags & LEASE_F_EXPORTABLE) || s->owner_capsule != LEASE_OWNER_KERNEL ||
+         arena->owner_capsule != LEASE_OWNER_KERNEL))
+        rc = LEASE_ERR_AUTHORITY;
+    if (rc == LEASE_OK && access == LEASE_F_READONLY && s->state != LEASE_STATE_READY)
+        rc = LEASE_ERR_STATE;
+    if (rc == LEASE_OK)
+        rc = grant_reserve(s, GRANT_PROCESS, pid, incarnation, access, used);
+    if (rc == LEASE_OK) {
+        struct lease_grant_record *grant = &g_grants[s->slot_id];
+        /* Padding and unadvertised bytes may become page-readable. They must
+         * not disclose data left outside the published logical span. */
+        lease_zero((void *)(usize)(arena->base + s->offset + used),
+                   (u32)(grant->capacity - used));
+        if (arena->cache_policy == LEASE_CACHE_WBC_ON)
+            dcache_clean_range(arena->base + s->offset, grant->capacity);
+        grant->phase = GRANT_PREPARED;
+        ticket_of(s, out);
+    }
+    kspin_unlock(lk);
+    return rc;
+}
+
+i32 lease_ticket_map_begin(const struct lease_ticket *ticket, struct lease_mapping *out)
+{
+    if (!out) return LEASE_ERR_INVAL;
+    struct kspinlock *lk = lease_lock();
+    kspin_lock(lk);
+    struct lease_descriptor *s;
+    i32 rc = ticket_check(ticket, &s);
+    if (rc == LEASE_OK) {
+        struct lease_grant_record *grant = &g_grants[s->slot_id];
+        if (grant->phase != GRANT_PREPARED)
+            rc = LEASE_ERR_STATE;
+        else {
+            grant->phase = GRANT_MAPPING;
+            mapping_of(s, out);
+        }
+    }
+    kspin_unlock(lk);
+    return rc;
+}
+
+static i32 ticket_complete(const struct lease_ticket *ticket, u32 pid, u32 incarnation,
+                            i32 status, bool revoke)
+{
+    struct kspinlock *lk = lease_lock();
+    kspin_lock(lk);
+    struct lease_descriptor *s;
+    i32 rc = ticket_check(ticket, &s);
+    if (rc == LEASE_OK) {
+        struct lease_grant_record *grant = &g_grants[s->slot_id];
+        if (grant->recipient != pid || grant->incarnation != incarnation)
+            rc = LEASE_ERR_AUTHORITY;
+        else if (grant->phase != (revoke ? GRANT_REVOKING : GRANT_MAPPING))
+            rc = LEASE_ERR_STATE;
+        else if (status != LEASE_OK) {
+            grant->phase = GRANT_QUARANTINED;
+            g_stats.mmu_rejects++;
+            rc = status < 0 ? status : LEASE_ERR_MMU;
+        } else if (revoke) {
+            const struct lease_arena *arena = arena_lookup(s->arena_id);
+            if (grant->access == LEASE_F_READWRITE && arena->cache_policy == LEASE_CACHE_WBC_ON)
+                dcache_invalidate_range(arena->base + s->offset, grant->capacity);
+            grant_clear(grant);
+            g_stats.revokes++;
+        } else {
+            grant->phase = GRANT_ACTIVE;
+            g_stats.grants++;
+        }
+    }
+    kspin_unlock(lk);
+    return rc;
+}
+
+i32 lease_ticket_map_complete(const struct lease_ticket *ticket, u32 pid, u32 incarnation,
+                              i32 status)
+{
+    return ticket_complete(ticket, pid, incarnation, status, false);
+}
+
+i32 lease_ticket_redeem(const struct lease_ticket *ticket, u32 pid, u32 incarnation,
+                        u32 access, struct lease_ticket *out)
+{
+    if (!out || (access != LEASE_F_READONLY && access != LEASE_F_READWRITE))
+        return LEASE_ERR_INVAL;
+    struct kspinlock *lk = lease_lock();
+    kspin_lock(lk);
+    struct lease_descriptor *s;
+    i32 rc = ticket_check(ticket, &s);
+    if (rc == LEASE_OK) {
+        struct lease_grant_record *grant = &g_grants[s->slot_id];
+        if (grant->recipient != pid || grant->incarnation != incarnation ||
+            (access == LEASE_F_READWRITE && grant->access != access))
+            rc = LEASE_ERR_AUTHORITY;
+        else if (grant->phase != GRANT_ACTIVE)
+            rc = LEASE_ERR_STATE;
+        else if (grant->redeemed)
+            rc = LEASE_ERR_STALE;
+        else {
+            ticket_of(s, out);
+            grant->redeemed = 1;
+        }
+    }
+    kspin_unlock(lk);
+    return rc;
+}
+
+i32 lease_ticket_revoke_begin(const struct lease_ticket *ticket, struct lease_mapping *out)
+{
+    if (!out) return LEASE_ERR_INVAL;
+    struct kspinlock *lk = lease_lock();
+    kspin_lock(lk);
+    struct lease_descriptor *s;
+    i32 rc = ticket_check(ticket, &s);
+    if (rc == LEASE_OK) {
+        struct lease_grant_record *grant = &g_grants[s->slot_id];
+        if (grant->phase != GRANT_ACTIVE && grant->phase != GRANT_QUARANTINED)
+            rc = LEASE_ERR_STATE;
+        else {
+            grant->phase = GRANT_REVOKING;
+            mapping_of(s, out);
+        }
+    }
+    kspin_unlock(lk);
+    return rc;
+}
+
+i32 lease_ticket_revoke_complete(const struct lease_ticket *ticket, u32 pid, u32 incarnation,
+                                 i32 status)
+{
+    return ticket_complete(ticket, pid, incarnation, status, true);
+}
+
+i32 lease_ticket_cancel(const struct lease_ticket *ticket)
+{
+    struct kspinlock *lk = lease_lock();
+    kspin_lock(lk);
+    struct lease_descriptor *s;
+    i32 rc = ticket_check(ticket, &s);
+    if (rc == LEASE_OK) {
+        struct lease_grant_record *grant = &g_grants[s->slot_id];
+        if (grant->phase != GRANT_PREPARED)
+            rc = LEASE_ERR_BUSY;
+        else
+            grant_clear(grant);
+    }
+    kspin_unlock(lk);
+    return rc;
+}
+
 i32 lease_grant(const struct lease_descriptor *d, u32 capsule, u32 access)
 {
-    if (access != LEASE_F_READONLY && access != LEASE_F_READWRITE)
+    if (!capsule || (access != LEASE_F_READONLY && access != LEASE_F_READWRITE))
         return LEASE_ERR_INVAL;
-
     struct kspinlock *lk = lease_lock();
     kspin_lock(lk);
     struct lease_descriptor *s;
     i32 rc = lease_check(d, &s);
     if (rc != LEASE_OK) { kspin_unlock(lk); return rc; }
+    /* Preserve kernel-arena denial even when no MMU backend is installed. */
     struct lease_arena *a = arena_lookup(s->arena_id);
-    if (!a) { kspin_unlock(lk); return LEASE_ERR_NOENT; }
-    /* Hardware invariant: kernel arenas (DMA/FIFO/NIC-RX/device) are never
-     * exposed to a capsule. Only the kernel (EL1) may touch them. */
-    if (a->kind == LEASE_ARENA_KIND_KERNEL) {
+    if (!a || a->kind == LEASE_ARENA_KIND_KERNEL) {
+        if (a) g_stats.mmu_rejects++;
+        kspin_unlock(lk);
+        return a ? LEASE_ERR_INVAL : LEASE_ERR_NOENT;
+    }
+    if (!g_mmu_ops.map || !g_mmu_ops.unmap) {
         g_stats.mmu_rejects++;
         kspin_unlock(lk);
-        return LEASE_ERR_INVAL;
+        return LEASE_ERR_MMU;
     }
-    /* Snapshot the validated span + identity, then drop the lock before the MMU
-     * callback (which may block or re-enter the kernel). */
-    u64 pa = a->base + s->offset;
-    u64 length = s->length;
-    u32 slot = s->slot_id;
-    u32 gen = s->generation;
-    u64 lid = s->lease_id;
-    const struct lease_mmu_ops *ops = g_mmu_ops;
+    rc = grant_reserve(s, GRANT_CAPSULE, capsule, 0, access, s->length);
+    if (rc != LEASE_OK) { kspin_unlock(lk); return rc; }
+    struct lease_grant_record *grant = &g_grants[s->slot_id];
+    struct lease_mmu_ops ops = g_mmu_ops;
+    grant->unmap = ops.unmap;
+    u64 pa = a->base + s->offset, length = s->length;
     kspin_unlock(lk);
 
-    if (ops && ops->map) {
-        rc = ops->map(capsule, pa, length, access);
-        if (rc != LEASE_OK) {
-            kspin_lock(lk);
-            g_stats.mmu_rejects++;
-            kspin_unlock(lk);
-            return rc;
-        }
-    }
-
-    /* Reacquire only to revalidate the descriptor and update stats. Grant is
-     * linearized at the successful map above. */
+    rc = ops.map(capsule, pa, length, access);
+    /* A failed map may have installed partial authority. Absence must be
+     * proved by the original backend before the reservation can be cleared. */
+    i32 rollback = rc == LEASE_OK ? LEASE_OK : ops.unmap(capsule, pa, length);
     kspin_lock(lk);
-    struct lease_descriptor *s2 = &g_pool[slot];
-    if (s2->state == LEASE_STATE_FREE || s2->generation != gen || s2->lease_id != lid) {
-        /* Released/recycled while unlocked: roll back the mapping we installed. */
-        g_stats.stale_rejects++;
-        const struct lease_mmu_ops *ops2 = g_mmu_ops;
+    if (rc != LEASE_OK) {
+        g_stats.mmu_rejects++;
+        if (rollback == LEASE_OK)
+            grant_clear(grant);
+        else
+            grant->phase = GRANT_QUARANTINED;
         kspin_unlock(lk);
-        if (ops2 && ops2->unmap)
-            (void)ops2->unmap(capsule, pa, length);
-        return LEASE_ERR_STALE;
+        return rollback == LEASE_OK ? (rc < 0 ? rc : LEASE_ERR_MMU) : LEASE_ERR_REVOKE;
     }
+    grant->phase = GRANT_ACTIVE;
     g_stats.grants++;
     kspin_unlock(lk);
     return LEASE_OK;
@@ -466,23 +803,31 @@ i32 lease_revoke(const struct lease_descriptor *d, u32 capsule)
     if (rc != LEASE_OK) { kspin_unlock(lk); return rc; }
     struct lease_arena *a = arena_lookup(s->arena_id);
     if (!a) { kspin_unlock(lk); return LEASE_ERR_NOENT; }
-    /* Snapshot span, drop lock before the (possibly blocking) unmap callback. */
+    struct lease_grant_record *grant = &g_grants[s->slot_id];
+    if (grant->phase == GRANT_NONE) { kspin_unlock(lk); return LEASE_ERR_STATE; }
+    if (grant->kind != GRANT_CAPSULE || grant->recipient != capsule) {
+        kspin_unlock(lk);
+        return LEASE_ERR_AUTHORITY;
+    }
+    if (grant->phase != GRANT_ACTIVE && grant->phase != GRANT_QUARANTINED) {
+        kspin_unlock(lk);
+        return LEASE_ERR_BUSY;
+    }
+    grant->phase = GRANT_REVOKING;
     u64 pa = a->base + s->offset;
     u64 length = s->length;
-    const struct lease_mmu_ops *ops = g_mmu_ops;
+    i32 (*unmap)(u32, u64, u64) = grant->unmap;
     kspin_unlock(lk);
 
-    if (ops && ops->unmap) {
-        rc = ops->unmap(capsule, pa, length);
-        if (rc != LEASE_OK) {
-            kspin_lock(lk);
-            g_stats.mmu_rejects++;
-            kspin_unlock(lk);
-            return rc;
-        }
-    }
-
+    rc = unmap(capsule, pa, length);
     kspin_lock(lk);
+    if (rc != LEASE_OK) {
+        grant->phase = GRANT_QUARANTINED;
+        g_stats.mmu_rejects++;
+        kspin_unlock(lk);
+        return rc < 0 ? rc : LEASE_ERR_MMU;
+    }
+    grant_clear(grant);
     g_stats.revokes++;
     kspin_unlock(lk);
     return LEASE_OK;
@@ -530,6 +875,10 @@ static i32 lease_copy_into_locked(const struct lease_descriptor *src, u32 dst_ar
     if (rc != LEASE_OK) return rc;
     if (!out_dst)
         return LEASE_ERR_INVAL;
+    const struct lease_grant_record *grant = &g_grants[s->slot_id];
+    if (grant->phase != GRANT_NONE &&
+        (grant->kind == GRANT_PROCESS || grant->access == LEASE_F_READWRITE))
+        return LEASE_ERR_BUSY;
     struct lease_arena *sa = arena_lookup(s->arena_id);
     if (!sa)
         return LEASE_ERR_NOENT;
@@ -575,7 +924,10 @@ i32 lease_validate(const struct lease_descriptor *d, u32 expect_owner)
     if (rc != LEASE_OK) { kspin_unlock(lk); return rc; }
     struct lease_arena *a = arena_lookup(s->arena_id);
     if (!a) { kspin_unlock(lk); return LEASE_ERR_NOENT; }
-    if (s->offset + s->length > a->size) { kspin_unlock(lk); return LEASE_ERR_INVAL; }
+    if (s->offset > a->size || s->length > a->size - s->offset) {
+        kspin_unlock(lk);
+        return LEASE_ERR_INVAL;
+    }
     if (expect_owner != LEASE_ARENA_NONE && s->owner_capsule != expect_owner) {
         kspin_unlock(lk);
         return LEASE_ERR_INVAL;
@@ -600,6 +952,11 @@ void *lease_ptr(const struct lease_descriptor *d)
     kspin_lock(lk);
     struct lease_descriptor *s;
     if (lease_check(d, &s) != LEASE_OK) { kspin_unlock(lk); return 0; }
+    if (g_grants[s->slot_id].kind == GRANT_PROCESS &&
+        g_grants[s->slot_id].phase != GRANT_NONE) {
+        kspin_unlock(lk);
+        return 0;
+    }
     struct lease_arena *a = arena_lookup(s->arena_id);
     if (!a) { kspin_unlock(lk); return 0; }
     void *p = (void *)(usize)(a->base + s->offset);
@@ -631,6 +988,8 @@ static void lease_selftest_cleanup(u32 karena, u32 carena)
                          (carena != LEASE_ARENA_NONE && s->arena_id == carena);
         if (!test_slot)
             continue;
+        if (g_grants[i].phase != GRANT_NONE || s->generation == 0xFFFFFFFFU)
+            continue;
         if (s->state != LEASE_STATE_FREE && g_stats.slots_live)
             g_stats.slots_live--;
         s->generation++;
@@ -643,6 +1002,7 @@ static void lease_selftest_cleanup(u32 karena, u32 carena)
         s->flags = 0;
         s->source_type = 0;
         s->state = LEASE_STATE_FREE;
+        g_grants[i] = (struct lease_grant_record){0};
     }
     for (u32 i = 0; i < LEASE_ARENA_MAX; i++) {
         if (!g_arenas[i].in_use)
@@ -650,6 +1010,13 @@ static void lease_selftest_cleanup(u32 karena, u32 carena)
         bool test_arena = (karena != LEASE_ARENA_NONE && g_arenas[i].arena_id == karena) ||
                           (carena != LEASE_ARENA_NONE && g_arenas[i].arena_id == carena);
         if (!test_arena)
+            continue;
+        bool pinned = false;
+        for (u32 j = 0; j < LEASE_POOL_MAX; j++)
+            if (g_pool[j].state != LEASE_STATE_FREE &&
+                g_pool[j].arena_id == g_arenas[i].arena_id)
+                pinned = true;
+        if (pinned)
             continue;
         lease_zero(&g_arenas[i], sizeof(g_arenas[i]));
         if (g_stats.arenas)
@@ -692,7 +1059,7 @@ bool lease_selftest(void)
     {
         struct kspinlock *lk = lease_lock();
         kspin_lock(lk);
-        test_mmu_safe = (g_mmu_ops == 0);
+        test_mmu_safe = !g_mmu_ops.map || !g_mmu_ops.unmap;
         kspin_unlock(lk);
     }
 
@@ -750,11 +1117,10 @@ bool lease_selftest(void)
     if (lease_transfer(&dst, 9) != LEASE_OK) goto done;
     if (lease_validate(&dst, 9) != LEASE_OK) goto done;
 
-    /* 5) MMU enforcement: granting a CAPSULE arena maps; granting a KERNEL
-     *    arena is refused (kernel buffers never reach a capsule). */
-    if (test_mmu_safe && lease_grant(&dst, 9, LEASE_F_READONLY) != LEASE_OK) goto done;
+    /* A diagnostic must not invent a successful mapping without a backend or
+     * exercise a real backend with its fake capsule and private test arena. */
+    if (test_mmu_safe && lease_grant(&dst, 9, LEASE_F_READONLY) != LEASE_ERR_MMU) goto done;
     if (lease_grant(&src, 9, LEASE_F_READWRITE) != LEASE_ERR_INVAL) goto done; /* kernel arena */
-    if (test_mmu_safe && lease_revoke(&dst, 9) != LEASE_OK) goto done;
 
     /* 6) Zero-copy handle round-trip (the FIFO message-passing unit). */
     struct lease_handle h;
@@ -838,10 +1204,7 @@ bool lease_selftest(void)
         (u32)(st.copies - before.copies) < 1U ||
         (u32)(st.transfers - before.transfers) < 1U ||
         (u32)(st.stale_rejects - before.stale_rejects) < 1U ||
-        (u32)(st.mmu_rejects - before.mmu_rejects) < 1U ||
-        (test_mmu_safe &&
-         ((u32)(st.grants - before.grants) < 1U ||
-          (u32)(st.revokes - before.revokes) < 1U)))
+        (u32)(st.mmu_rejects - before.mmu_rejects) < 1U)
         goto done;
 
     ok = true;

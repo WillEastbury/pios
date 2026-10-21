@@ -2,6 +2,34 @@
 
 Every significant architectural decision in PIOS is recorded here.
 
+## 2026-10-21 - Lease grant pinning and recipient-ticket control foundation
+
+This implements the fail-closed lifetime and authority prerequisites of
+ADR-088/#212 inside the existing lease registry, not a parallel capability pool.
+Legacy MMU grants require both callbacks, pin the allocation before invoking
+unlocked MMU work, retain the original revocation callback and quarantine failed
+revocation. Callback code must remain executable until its grants retire.
+Arena reset refuses every live allocation; counters and range arithmetic must
+not wrap into reused authority.
+
+Kernel-produced handoff leases may reserve exclusive, zeroed 4 KiB pages in
+kernel-owned capsule-kind arenas, with a 64 KiB export ceiling. Their immutable
+64-byte tickets bind lease identity/generation, recipient PID/incarnation, rights,
+grant epoch and canonical logical bounds. Preparation scrubs unadvertised bytes
+and pins the allocation; it does not authorize access. Only a trusted owner-core
+map/TLB acknowledgment activates redemption, which consumes a ticket once.
+Revocation disables redemption immediately and retains storage until a successful
+owner-core acknowledgment. Failed map/revoke acknowledgments quarantine authority.
+DMA/device exports remain refused without an actual fencing protocol.
+
+These are kernel control APIs, not an installed process MMU backend or an EL0
+syscall. Identity arguments must come from trusted endpoint ownership, never
+sender-selected PID fields. Full command queues must retain their immutable
+mapping continuation for retry. Live queued owner-core map/revoke/stop routing,
+service payload integration, acknowledged endpoint retirement, alternate-path
+closure and hardware acceptance remain outstanding. This foundation does not
+complete #212 or replace static payload mappings with exclusive mutable loans.
+
 ## 2026-10-20 - Owner-approved Google federation for interactive users
 
 The owner requested Google-federated interactive sign-in through PicoSTS and
