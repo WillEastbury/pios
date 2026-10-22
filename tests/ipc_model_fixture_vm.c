@@ -13,28 +13,48 @@ static u8 memories[3][65536];
 static struct ipc_model_vm_host hosts[3];
 static struct ipc_model_vm vms[3];
 static struct ipc_model_lane_id lanes[3];
-static u8 payload[2][64] ALIGNED(64);
+static u8 payload[2][4096] ALIGNED(64);
+static u32 arenas[2];
 static struct lease_descriptor leases[2];
 static u32 pins[2], wakes[3], last_sequence[3];
 static bool fail_map, fail_unmap, fail_wake;
 static u32 mappings, map_calls, unmap_calls, import_calls;
+static bool mapped[2 * (sizeof(payload[0]) / 64)];
+
+static u32 mapping_index(u64 pa)
+{
+    for (u32 i = 0; i < 2; i++) {
+        u64 base = (u64)(usize)payload[i];
+        if (pa >= base && pa - base <= sizeof(payload[i]) - 4) {
+            assert((pa - base) % 64 == 0);
+            return i * (sizeof(payload[i]) / 64) + (u32)((pa - base) / 64);
+        }
+    }
+    assert(!"mapping outside test arenas");
+    return 0;
+}
 
 static i32 map_span(u32 capsule, u64 pa, u64 length, u32 access)
 {
     assert(capsule == 3 && length == 4 && access == LEASE_F_READONLY);
-    assert(pa == (u64)(usize)payload[0] || pa == (u64)(usize)payload[1]);
+    u32 slot = mapping_index(pa);
     ++map_calls;
     if (fail_map) return LEASE_ERR_STATE;
+    assert(!mapped[slot]);
+    mapped[slot] = true;
     ++mappings;
     return LEASE_OK;
 }
 static i32 unmap_span(u32 capsule, u64 pa, u64 length)
 {
-    assert(capsule == 3 && length == 4 && mappings);
-    assert(pa == (u64)(usize)payload[0] || pa == (u64)(usize)payload[1]);
+    assert(capsule == 3 && length == 4);
+    u32 slot = mapping_index(pa);
     ++unmap_calls;
     if (fail_unmap) return LEASE_ERR_STATE;
-    --mappings;
+    if (mapped[slot]) {
+        mapped[slot] = false;
+        --mappings;
+    }
     return LEASE_OK;
 }
 
@@ -59,12 +79,22 @@ static i32 export_span(void *opaque, struct ipc_model_vm src,
     if (lease_resolve(&handle, &d) || d.state != LEASE_STATE_READY ||
         d.owner_capsule != src.slot + 1 || !(d.flags & LEASE_F_READONLY) ||
         d.length != 4) return IPC_MODEL_ERR_STALE;
-    i32 rc = lease_grant(&d, dst.slot + 1, LEASE_F_READONLY);
+    /* Each request owns a distinct immutable loan, not another live grant on
+     * the template lease. The fixture's bounded tag carries its lease ID. */
+    struct lease_descriptor loan;
+    i32 rc = lease_copy_into(&d, arenas[src.slot], src.slot + 1,
+                            LEASE_F_READONLY | LEASE_F_CAPSULE, &loan);
     if (rc) return rc;
+    assert(loan.lease_id <= 0xFFFFFFFFU);
+    rc = lease_grant(&loan, dst.slot + 1, LEASE_F_READONLY);
+    if (rc) {
+        assert(!lease_release(&loan));
+        return rc;
+    }
     ++pins[src.slot];
-    m->span_id = d.slot_id; m->span_generation = d.generation;
-    m->offset = 0; m->length = (u32)d.length; m->capacity = (u32)d.length;
-    m->tag = src.slot + 10;
+    m->span_id = loan.slot_id; m->span_generation = loan.generation;
+    m->offset = 0; m->length = (u32)loan.length; m->capacity = (u32)loan.length;
+    m->tag = (u32)loan.lease_id;
     return IPC_OK;
 }
 static i32 import_span(void *opaque, pv_ctx *ctx,
@@ -74,8 +104,7 @@ static i32 import_span(void *opaque, pv_ctx *ctx,
     ++import_calls;
     if (m->source.slot >= 2) return IPC_MODEL_ERR_OWNER;
     struct lease_descriptor d;
-    struct lease_handle h = {leases[m->source.slot].lease_id,
-                            m->span_id, m->span_generation};
+    struct lease_handle h = {m->tag, m->span_id, m->span_generation};
     if (lease_resolve(&h, &d) || !pins[m->source.slot] ||
         d.owner_capsule != m->source.slot + 1 || d.state != LEASE_STATE_READY ||
         m->target.slot != 2 || ctx != &contexts[2] ||
@@ -91,8 +120,13 @@ static i32 finish_span(void *opaque, const struct ipc_model_request *m)
 {
     (void)opaque;
     assert(m->source.slot < 2 && pins[m->source.slot]);
-    i32 rc = lease_revoke(&leases[m->source.slot], m->target.slot + 1);
+    struct lease_descriptor loan;
+    struct lease_handle handle = {m->tag, m->span_id, m->span_generation};
+    i32 rc = lease_resolve(&handle, &loan);
     if (rc) return rc;
+    rc = lease_revoke(&loan, m->target.slot + 1);
+    if (rc) return rc;
+    assert(!lease_release(&loan));
     --pins[m->source.slot];
     return IPC_OK;
 }
@@ -132,6 +166,7 @@ int main(void)
         u32 arena = lease_arena_register(LEASE_ARENA_KIND_CAPSULE,
             LEASE_CACHE_WBC_OFF, i + 1, (u64)(usize)payload[i], sizeof(payload[i]));
         assert(arena != LEASE_ARENA_NONE);
+        arenas[i] = arena;
         assert(!lease_acquire(arena, 4, LEASE_F_READONLY | LEASE_F_CAPSULE,
                              LEASE_SRC_CAPSULE_MEM, i + 1, &leases[i]));
         u8 *p = lease_ptr(&leases[i]);
