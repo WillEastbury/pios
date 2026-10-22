@@ -25,14 +25,20 @@ When continuation notes below conflict with current code, this block and
   MAC recovery plus the established watchdog signal. It does **not** call
   `net_poll()` or publish protocol work. New WiFi paths use `adrv`.
 
-The lengthy notes below preserve investigation history; they are not an
-alternative implementation specification.
+The dated status/continuation notes below preserve investigation history; they
+are not an alternative implementation specification or a current backlog.
+Within them, "now", "current", "this session", completed checklists and test
+counts refer only to the recorded investigation/image, not the present checkout
+or live board. Historical follow-ups may already be complete or superseded.
+Use open issues, the architecture decision log and current code for task status;
+use fresh command output for build, test and deployment claims.
 
 ---
 
 ## Operational quick reference (build / OTA / diagnostics / console)
 
-Verified working this session. Read this first after a machine restart.
+Operational commands and prerequisites. Read this first after a machine restart;
+verify tool availability, target reachability and results in the current environment.
 
 ### Environment
 
@@ -47,9 +53,24 @@ cmd.exe /d /c "C:\source\pios\build_bootstrap.bat"    # Pi 5 stage0 + stage2 (re
 cmd.exe /d /c "C:\source\pios\build_qemu_full.bat"     # QEMU direct-boot image (build_qemu_full\PIOS_QEMU_FULL.BIN)
 ```
 
-`include/build_version.h` is **regenerated on every build**. Always
-`git checkout -- include/build_version.h` before staging, or it shows up as a
-spurious diff.
+`include/build_version.h` is **regenerated on every build**. Preserve its exact
+pre-build contents, including any existing edits, and restore those bytes in
+`finally`. Do not reset it to HEAD or stage generated metadata accidentally:
+
+```powershell
+$versionPath = Join-Path (Get-Location) 'include\build_version.h'
+$versionBefore = [IO.File]::ReadAllBytes($versionPath)
+try {
+    cmd.exe /d /c "C:\source\pios\build_bootstrap.bat"
+    if ($LASTEXITCODE -ne 0) { throw "Bootstrap build failed: $LASTEXITCODE" }
+} finally {
+    [IO.File]::WriteAllBytes($versionPath, $versionBefore)
+}
+```
+
+Run from the repository root and do not run builds that regenerate this shared
+header concurrently. Record the candidate version from the build output before
+restoring the header; use that candidate version for OTA verification.
 
 ### Reproducible build prerequisites
 
@@ -112,12 +133,15 @@ resulting crypto or LSE instructions are not supported on those CPUs.
 
 ```powershell
 python tests\run_host_tests.py                                    # pure-logic suites (adrv, airq, pctl, qbank, swake, ...)
-$env:PYTHONIOENCODING="utf-8"; python tools\qemu_smoke.py          # 29/29 + load battery
+$env:PYTHONIOENCODING="utf-8"; python tools\qemu_smoke.py          # smoke + load battery
 python tools\qemu_smoke.py --no-load                              # smoke only (faster)
 python tools\qemu_smoke.py --build                                # build then smoke
 python tools\qemu_preempt_soak.py                                 # ADR-018 preemption proof (QEMU)
 python tools\qemu_preempt_soak.py --host 192.168.0.201 --units 60 # same, against the live board
 ```
+
+Test counts depend on the checkout and harness. Report the actual run's results;
+historical counts below are not the current acceptance threshold.
 
 ### Deploy to the live Pi 5 (`192.168.0.201`)
 
@@ -192,7 +216,7 @@ Under QEMU the serial console is redirected to a file
 
 ---
 
-### Status: ADR-021 implemented and proven on live Pi 5.
+### Historical status (2026-08-06): ADR-021 implemented and proven on live Pi 5
 
 **Preemption was inert, not merely untested.** ADR-012/013 declared it mandatory and
 fixed the ctx-switch mechanism, but `src/el0_entry.S` was eret-ing to EL0 with
@@ -229,7 +253,7 @@ timer IRQ now crosses the EL2 stage-2 cage into a running EL0 process on real
 BCM2712 under load. Pi 5 selftests 14/14, QEMU 29/29 + load battery, host tests
 all pass, `rx_wedge=0`, `rx_hole_recover=0`.
 
-### Key architectural facts established this session
+### Architectural facts established in the 2026-08-06 investigation
 
 - **The `I` bit is not a privilege grant.** The IRQ is taken *to EL1* on kernel
   vectors either way; EL0 cannot re-mask it (`SCTLR_EL1.UMA` is never set).
@@ -243,7 +267,7 @@ all pass, `rx_wedge=0`, `rx_hole_recover=0`.
   no syscalls, the timer IRQ is the *only* kernel re-entry path from a running EL0
   process.
 
-### Next steps
+### Historical follow-ups (2026-08-06; not the current backlog)
 
 **The theme of the remaining work is decoupling processes from cores.** ADR-024
 (dynamic allocation) is a hard prerequisite for ADR-025 (balancing/migration): a
@@ -273,7 +297,7 @@ process cannot move while its memory lives inside the owning core's 16 MB region
 5. Still open: **Q1/Q2** (CYW43455 assoc on `adrv`, `adrv_supervise()`), WiFi
    issues #65/#68/#69, and WPA2 association.
 
-### Done this session beyond ADR-021
+### Other work recorded on 2026-08-06 beyond ADR-021
 
 - **Q6** — trimmed `airq`'s never-used HARDWARE level (~9 KB). **The self-diagonal
   is NOT dead and must not be trimmed**: `airq_post_from(CORE_NET,
@@ -479,9 +503,9 @@ important tests assert that a stalled operation **never** pets the watchdog, tha
 exceed its budget, that a saturated `CRITICAL` source **cannot** silence the cross-core FIFO
 doorbell, and that a queue flood **cannot** starve the scheduler out of its quantum.
 
-### Wiring (live as of `v20260806.101152`)
+### Historical wiring snapshot (`v20260806.101152`)
 
-The end-to-end path is now:
+The end-to-end path recorded for that image was:
 
 ```text
 hardware IRQ (level 0, trigger only)
@@ -510,8 +534,10 @@ Key points:
 - Each cross-core FIFO doorbell has **its own source per target core**
   (`AIRQ_SRC_FIFO_CORE(n)`), because a source is bound to one owning core at registration. The
   record must land on the core that will service it, not the core that took the interrupt.
-- `adrv`'s liveness hook is `wifi_upload_progress` (net_poll + MAC recovery + watchdog pet), so any
-  long async operation keeps the wired fail-safe path draining.
+- The historical liveness hook used `wifi_upload_progress`. Its old direct
+  `net_poll()` behavior is superseded: the current hook provides bounded hardware
+  recovery only, with the established watchdog signal. Protocol progress belongs
+  to FIFO/AIRQ handlers, not this hook.
 - `adrv`'s watchdog hook is `watchdog_hw_pet`, called **only** on proven forward progress.
 - Core 0's reactor and FIFO drain are registered as `sched-core0`/`fifo-core0` in the service map,
   and each user core registers `sched-coreN`/`fifo-coreN`, so scheduler and doorbell time is
@@ -581,7 +607,7 @@ target: it is the last remaining seconds-long blocking loop on core 0.
 
 ## Continuation note — Pi5 WiFi legacy scan fallback (2026-07-26)
 
-### Status: SDIO2 multi-block throughput fixed; radio scan remains.
+### Historical status: SDIO2 multi-block throughput fixed; radio scan remained
 
 - Added bounded legacy `WLC_SCAN` / `WLC_SCAN_RESULTS` fallback with ID-correlated BCDC GET
   responses and fully bounds-checked `brcmf_scan_results` / `brcmf_bss_info_le` parsing.
@@ -710,7 +736,7 @@ reliable; the guest AP roams between ch6/ch8/ch36, which explains the earlier ap
 The targeted join then sends a valid chanspec — `malformed chanspec 0x0` no longer appears — and the
 same RF-neutral poke is armed for the association window.
 
-### Open hazard: association wedges the WIRED NIC (root-caused 2026-08-05)
+### Historical hazard: association wedged the WIRED NIC (2026-08-05)
 
 `v20260805.224239` left the board unreachable to both HTTP and ICMP. The live symptom was
 `896/896` with `BNA=Y`: the **wired** GEM RX ring was completely full and RX DMA had halted. The
@@ -723,14 +749,15 @@ so the reactor's `macb_rx_recover()` path never runs and the wedge is permanent.
 `CORE0_IO_MAINT` recovery cadence cannot help either, because the reactor itself is not running
 while the join loop blocks.
 
-Fix (`v20260805.231100`): the association poll loop now invokes the existing `wifi_upload_progress`
-hook every iteration, which pairs `net_poll()` with `macb_rx_recover()` /
-`macb_rx_hole_recover()` / `macb_rx_liveness_recover()` and pets the watchdog. The hook is now
-installed for `wifi joinpmk`, `wifi join` and `wifi join3` as well as `wifi init` / `wifi load`.
+Historical mitigation (`v20260805.231100`): the association loop invoked
+`wifi_upload_progress()` to service network/recovery work while blocked. That
+polling workaround is superseded and must not be copied into new paths.
 
-**Rule: any WiFi path that blocks core 0 for more than a few milliseconds must drive
-`wifi_upload_progress()` (or an equivalent net_poll + MAC recovery pairing).** Blocking core 0
-without it silently destroys the wired fail-safe management path.
+**Current rule:** WiFi work must return within its admitted budget and use `adrv`
+state machines rather than blocking core 0. Protocol ingress runs only through
+IRQ/FIFO/AIRQ handoffs. The legacy progress hook may perform bounded hardware
+recovery and the established watchdog signal, never `net_poll()` or protocol
+publication; watchdog feeding still requires proven forward progress.
 
 ### Reactor cadence must be adaptive (`v20260806.000238`)
 
@@ -755,7 +782,7 @@ bring-up path must not do. Callers that must not block check transmit credit *be
 
 ## Continuation note — PicoScript V3D QPU Tensor acceleration (2026-07-24)
 
-### Status: verified on Pi5; guarded enablement is live.
+### Historical status: verified on Pi5; guarded enablement was live
 
 - Fixed V3D/ARM coherence by synchronously completing the pre-dispatch L2T invalidate and matching
   Linux's 100 ms cache-clean timeout. QPU writes are now immediately ARM-visible.
@@ -846,7 +873,7 @@ bring-up path must not do. Callers that must not block check transmit credit *be
 
 ## Continuation note — QEMU stage0 boot chain + real-tls-offload phase 2 (2026-07-24)
 
-### Status: QEMU stage0 boot chain and real TLS 1.3 server COMPLETE end-to-end.
+### Historical status: QEMU stage0 boot chain and real TLS 1.3 server complete
 
 ### QEMU now boots through the SAME stage0->trampoline->stage2 chain as real Pi5 hardware
 Previously QEMU only ever booted a monolithic direct-`-kernel` image (`PIOS_QEMU_FULL.BIN`),
@@ -957,7 +984,7 @@ unchanged and fail-closed; this fixes wrap-key persistence without pretending th
   only its transport/random/x509/connection-pool/diagnostic adapter. Pi5 OTA
   `v20260724.183930` validated the integrated library (external TLS+HTTP + selftests 14/14).
 
-### Next steps
+### Historical follow-ups (2026-07-24; not the current backlog)
 1. Extract the reusable TLS server/record/handshake bridge into the new
    `C:\source\picotlsserver` repository and consume it from PIOS.
 2. Wire a `qemu_stage0_boot.py`-style launch/test harness (mirroring `qemu_smoke.py`'s structure)
@@ -987,7 +1014,7 @@ $env:PYTHONIOENCODING="utf-8"; python tools\qemu_smoke.py --build               
 
 ## Continuation note — net-stack capsule redesign: PicoScript VM execution now live (2026-07-23)
 
-### Status
+### Historical status (2026-07-23; superseded by the TLS completion note above)
 Priority order (per explicit instruction): 3 (dashboard capsule/service map) → 4 (WALFS terminal
 card ops) → 5 (network client CLI ops) → 1 (net-stack-irq-cascade-redesign) → 2 (real TLS offload).
 Todos 1, 3, 4, 5 are all done. Only todo 2 (`real-tls-offload`) remains.
@@ -1034,7 +1061,7 @@ battery PASS).
    `httpd.c` for the identical code shape). Full root-cause narrative is in the top-of-file comments
    in `user/capsvc_host.c` and `user/httpd.c`.
 
-### Next steps
+### Historical follow-ups (2026-07-23; not the current backlog)
 1. Todo 2 — `real-tls-offload`: replace the custom CHLO/SHLO handshake in `src/tls.c` (three-phase
    plan already logged: picocrypto ECDSA-verify gap → new `picotlsservice` upstream library → PIOS-
    side vendoring).
@@ -1140,7 +1167,7 @@ $env:PYTHONIOENCODING="utf-8"; python tools\qemu_smoke.py --build               
 
 ## Continuation note — real-tls-offload: TLS 1.3 server, phase 1 (2026-07-24)
 
-### Status: IN PROGRESS. Foundation built and validated; handshake state machine not yet written.
+### Historical phase-1 status (superseded): handshake state machine not yet written
 
 This is the last remaining todo (`real-tls-offload`, priority 2). It replaces `src/tls.c`'s custom
 CHLO/SHLO handshake (NOT real TLS wire format at all -- a 4-byte magic + 32-byte random exchanged in
@@ -1196,7 +1223,8 @@ every AES-GCM use in PIOS (including the current fake-TLS data phase), not just 
   logic, fully host-tested in `tests/test_tls13_clienthello.c` against a **real captured RFC 8448
   ClientHello** (196 bytes) plus a hand-built secp256r1-key_share case and truncation/malformed
   negative tests. ServerHello/EncryptedExtensions/Certificate/CertificateVerify/Finished
-  construction and the client Finished parser are NOT yet written (see Next steps).
+  construction and the client Finished parser were not yet written at this phase
+  (see historical phase-1 follow-ups).
 - **`src/x509.c`/`include/x509.h`**: added `x509_generate_p256_cert()` (self-signed P-256/ECDSA-
   SHA256 certificate -- mirrors the existing Ed25519 `x509_generate_dev_cert()` exactly, reusing
   the P-256 SPKI builder and `ecdsa_p256_sha256_sign()`/`ecdsa_p256_encode_der()` already used by
@@ -1226,7 +1254,7 @@ every AES-GCM use in PIOS (including the current fake-TLS data phase), not just 
   `ssl`, `curl --tlsv1.3`, `openssl s_client`), not just internal self-consistency -- directly
   motivated by the AES-GCM bug above.
 
-### Next steps (not yet started)
+### Historical phase-1 follow-ups (superseded by the TLS completion note above)
 1. ServerHello/EncryptedExtensions/Certificate/CertificateVerify/Finished message construction
    (mirror `tls13_parse_client_hello()`'s bounds-checked style) + client Finished parsing.
    Transcript-hash management (running SHA-256 over every handshake message in order, using
@@ -1367,7 +1395,7 @@ could not advance past the missing ownership publication.
       margin). Verified QEMU smoke 29/29 and five consecutive no-retry load
       batteries.
 
-### Next steps
+### Historical follow-ups (RX investigation; not the current backlog)
 1. WiFi bring-up (CYW43455 over BCM2712 SDIO2) is the active work item — CMD5 (IO_SEND_OP_COND)
    still fails; see the "WiFi — CYW43455 via BCM2712 SDIO2 (WIP)" section in
    `.github/copilot-instructions.md` for hardware findings and next probes. Pi Zero 2W WiFi
