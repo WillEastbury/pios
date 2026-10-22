@@ -271,7 +271,8 @@ static struct {
 static struct {
     volatile u64 sequence;
     u64 deadline;
-    u8 _pad[48];
+    u32 posted;
+    u8 _pad[44];
 } ALIGNED(64) trigger;
 static struct {
     u64 acknowledged;
@@ -284,12 +285,15 @@ static struct {
 static void native_irq(void)
 {
     gic_disable_irq(B50_ROOT_MSI_INTID);
-    trigger.deadline = timer_monotonic_ms() + 100U;
-    u64 sequence = trigger.sequence + 1U;
-    if (!sequence) sequence = ~0ULL;
+    /* This lifecycle is one-shot: retain the first unexpected IRQ until
+     * quarantine, even if another pending GIC delivery survives masking. */
+    if (trigger.sequence)
+        return;
+    u64 now = timer_monotonic_ms();
+    trigger.deadline = now > ~0ULL - 100U ? ~0ULL : now + 100U;
     dmb();
-    trigger.sequence = sequence;
-    (void)airq_post_from(0U, AIRQ_SRC_PCIE1_MSI, 0U);
+    trigger.sequence = 1U;
+    trigger.posted = airq_post_from(0U, AIRQ_SRC_PCIE1_MSI, 0U);
 }
 
 static const char *quarantine(void);
@@ -1098,11 +1102,14 @@ static u32 boot_prepare_continue(void *ctx, u64 deadline_ms, u32 ads_bytes)
 static void native_bottom(const struct airq_record *record, void *ctx)
 {
     (void)ctx;
-    if (!record || core_id() || record->origin_core || record->target_core)
+    if (!record || core_id() || record->origin_core || record->target_core ||
+        record->source != AIRQ_SRC_PCIE1_MSI)
         return;
     u64 sequence = trigger.sequence;
     dmb();
     if (sequence == continuation.acknowledged)
+        return;
+    if (!trigger.posted && continuation.queued != sequence)
         return;
     uart_puts(quarantine());
     continuation.acknowledged = sequence;
@@ -1824,7 +1831,7 @@ static void b50_native_service_impl(void)
         continuation.acknowledged = sequence;
         return;
     }
-    if (continuation.queued != sequence &&
+    if (!trigger.posted && continuation.queued != sequence &&
         airq_post_from(0U, AIRQ_SRC_PCIE1_MSI, 0U))
         continuation.queued = sequence;
 #endif

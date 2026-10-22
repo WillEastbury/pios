@@ -274,7 +274,9 @@ static void contains(u32 op, const char *text) {
         fprintf(stderr, "expected [%s], got: %s", text, reply);
     assert(strstr(reply, text));
 }
-int main(void) {
+int main(int argc, char **argv) {
+    bool backpressure = argc > 1 && !strcmp(argv[1], "backpressure");
+    bool timeout = argc > 1 && !strcmp(argv[1], "timeout");
     for (u32 i = 0U; i < sizeof(firmware_blob); i++)
         firmware_blob[i] = (u8)(i * 17U + 3U);
     for (u32 i = 0U; i < 5U; i++)
@@ -434,24 +436,56 @@ int main(void) {
     assert(gpu_regs[0x0C310U / 4U] == 0x5E1C0U);
     assert(gpu_regs[0x0C200U / 4U] == 0x0105E1C0U);
     assert(gpu_regs[0x0C064U / 4U] == 0x03008602U);
-    /* A full AIRQ lane retains the sequence, masks immediately, and retries
-     * from scheduled service. It never manufactures a successful completion. */
-    post_ok = false;
+    /* One IRQ owns one event/deadline, including pending redelivery and AIRQ
+     * backpressure. Neither transport progress nor an IRQ proves completion. */
+    post_ok = !backpressure && !timeout;
     u32 before = writes;
+    u64 first_irq = clock_ms;
     top();
-    assert(writes == before && !pending);
+    assert(writes == before && pending == (post_ok ? 1U : 0U));
     b50_native_service();
-    assert(!pending);
-    post_ok = true;
+    assert(writes == before && pending == (post_ok ? 1U : 0U));
+    clock_ms += 50U;
+    top();
+    assert(writes == before && pending == (post_ok ? 1U : 0U));
     b50_native_service();
-    assert(pending == 1U);
+    assert(pending == (post_ok ? 1U : 0U));
     struct airq_record event = {.source = AIRQ_SRC_PCIE1_MSI};
-    bottom(&event, NULL);
+    if (timeout) {
+        /* Pending deliveries cannot keep moving the original deadline. */
+        clock_ms = first_irq + 100U;
+        top();
+        b50_native_service();
+        assert(!pending);
+    } else {
+        if (backpressure) {
+            /* A forged dispatch cannot consume an event not yet published. */
+            bottom(&event, NULL);
+            contains(B50_NATIVE_STATUS, "attached;");
+            assert(writes == before);
+            post_ok = true;
+            b50_native_service();
+            assert(pending == 1U);
+        }
+        for (u32 i = 0; i < 3U; i++) b50_native_service();
+        assert(pending == 1U);
+        struct airq_record wrong = event;
+        wrong.source = AIRQ_SRC_ETH_RX;
+        bottom(&wrong, NULL);
+        contains(B50_NATIVE_STATUS, "attached;");
+        assert(writes == before);
+        bottom(&event, NULL);
+    }
     contains(B50_NATIVE_STATUS, "detached");
     for (u32 i = 0U; i < 5U; i++)
         assert(!(commands[path_buses[i]][path_devices[i]] & 4U));
     assert(b50_native_blocks_legacy());
     contains(B50_NATIVE_ATTACH, "retired lifecycle");
+    before = writes;
+    top();
+    bottom(&event, NULL);
+    b50_native_service();
+    assert(writes == before && pending == (timeout ? 0U : 1U));
     assert(masks > 0U);
     puts("b50 native: PASS");
     return 0;
