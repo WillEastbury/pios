@@ -3271,6 +3271,17 @@ continuation. An unexpected IRQ quarantines rather than fabricating a
 completion. `b50 canary` explicitly rejects the missing firmware/queue/
 completion adapter, and never sets BME merely to make a status gate green.
 
+**2026-10-22 handoff correction (#189).** The unexpected-IRQ fallback retains
+the first masked trigger and its original deadline for this one-shot lifecycle.
+An IRQ-side successful AIRQ publication suppresses scheduled republication;
+backpressure retries only until one publication succeeds. Repeated pending
+deliveries cannot allocate another event or extend the timeout. Dispatch checks
+the registered source and requires a published event before quarantine; timeout
+still revokes BME if no event can be dispatched. This restores the existing
+bounded continuation contract, not normal completion-MSI support. MSI decode
+and the pure contract's activation gate are unchanged. Host-backed DMA canaries
+remain evidence of a bounded transfer, not per-endpoint hostile-DMA isolation.
+
 ---
 
 <a name="adr-083"></a>

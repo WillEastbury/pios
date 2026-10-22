@@ -373,11 +373,14 @@ def main() -> int:
             print(build.stderr[-2000:])
             total_fail += 1
             continue
-        run = subprocess.run([str(exe)], capture_output=True, text=True)
-        sys.stdout.write(run.stdout)
-        if run.returncode != 0:
-            sys.stdout.write(run.stderr)
-            total_fail += 1
+        cases = ((), ("backpressure",), ("timeout",)) if test == "test_b50_native.c" else ((),)
+        for args in cases:
+            run = subprocess.run([str(exe), *args], capture_output=True, text=True)
+            sys.stdout.write(run.stdout)
+            if run.returncode != 0:
+                print(f"[FAIL] {test} {' '.join(args)}")
+                sys.stdout.write(run.stderr)
+                total_fail += 1
 
     for test in ("test_network_dispatch.py", "test_net_fifo_contract.py",
                  "test_pcie1_dashboard.py",
